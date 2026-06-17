@@ -648,7 +648,7 @@ psutil==7.1.3
     # via
     #   game-agent-backend
     #   opentelemetry-instrumentation-system-metrics
-py-serializable==0.15.0
+py-serializable==2.1.0
     # via cyclonedx-python-lib
 pyasn1==0.6.1
     # via
