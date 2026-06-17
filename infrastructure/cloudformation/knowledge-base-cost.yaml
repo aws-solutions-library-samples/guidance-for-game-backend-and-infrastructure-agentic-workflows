@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - Cost Optimization Knowledge Base with S3 Vectors'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name for resource naming
+  EmbeddingDimension:
+    Type: Number
+    Default: 1024
+    AllowedValues:
+      - 256
+      - 512
+      - 1024
+    Description: Titan Embed v2 dimension (256/512/1024). Lower = cheaper and faster, higher = better retrieval quality.
+
+Resources:
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties:
+      VectorBucketName: !Sub '${ProjectName}-kb-cost-vectors'
+      EncryptionConfiguration:
+        SseType: AES256
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      IndexName: !Sub '${ProjectName}-cost-index'
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      Dimension: !Ref EmbeddingDimension
+      DataType: float32
+      DistanceMetric: cosine
+
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    # No DeletionPolicy - let CloudFormation manage full lifecycle
+    # Docs are ephemeral (scraped from AWS) and can be re-downloaded
+    Properties:
+      BucketName: !Sub '${ProjectName}-kb-cost-docs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Security: Enable S3 access logging (BSC43)
+      LoggingConfiguration:
+        DestinationBucketName:
+          Fn::ImportValue: !Sub '${ProjectName}-AccessLogsBucketName'
+        LogFilePrefix: !Sub 'kb-cost-docs/'
+
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-kb-cost-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DocumentBucket.Arn
+                  - !Sub '${DocumentBucket.Arn}/*'
+        - PolicyName: S3VectorsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3vectors:QueryVectors
+                  - s3vectors:GetVectors
+                  - s3vectors:PutVectors
+                  - s3vectors:DeleteVectors
+                  - s3vectors:GetVectorBucket
+                  - s3vectors:PutVectorBucketPolicy
+                  - s3vectors:GetVectorBucketPolicy
+                Resource:
+                  - !GetAtt VectorBucket.VectorBucketArn
+                  - !Sub '${VectorBucket.VectorBucketArn}/*'
+        - PolicyName: BedrockEmbeddings
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: VectorIndex
+    Properties:
+      Name: !Sub '${ProjectName}-cost-kb'
+      Description: 'Cost optimization documentation knowledge base'
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+          IndexName: !Sub '${ProjectName}-cost-index'
+
+  DataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub '${ProjectName}-cost-docs'
+      Description: 'Cost optimization documentation'
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataDeletionPolicy: RETAIN
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt DocumentBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 256
+            OverlapPercentage: 10
+
+Outputs:
+  KnowledgeBaseId:
+    Description: Cost Knowledge Base ID
+    Value: !Ref KnowledgeBase
+    Export:
+      Name: !Sub '${ProjectName}-cost-kb-id'
+
+  KnowledgeBaseArn:
+    Description: Cost Knowledge Base ARN
+    Value: !GetAtt KnowledgeBase.KnowledgeBaseArn
+    Export:
+      Name: !Sub '${ProjectName}-cost-kb-arn'
+
+  DataSourceId:
+    Description: Data Source ID
+    Value: !Ref DataSource
+    Export:
+      Name: !Sub '${ProjectName}-cost-kb-datasource-id'
+
+  DocumentBucketName:
+    Description: S3 Bucket for source documents
+    Value: !Ref DocumentBucket
+    Export:
+      Name: !Sub '${ProjectName}-cost-kb-bucket'
+
+  VectorBucketArn:
+    Description: S3 Vector Bucket ARN
+    Value: !GetAtt VectorBucket.VectorBucketArn
+    Export:
+      Name: !Sub '${ProjectName}-cost-kb-vector-bucket-arn'

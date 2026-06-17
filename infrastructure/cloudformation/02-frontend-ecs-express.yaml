@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - Frontend ECS Express Gateway Service'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming
+
+  RuntimeId:
+    Type: String
+    Description: AgentCore Runtime ID
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Docker image tag to deploy
+
+  Port:
+    Type: Number
+    Default: 3000
+    Description: Container port
+
+  Cpu:
+    Type: String
+    Default: '1024'
+    Description: CPU units (1024 = 1 vCPU)
+
+  Memory:
+    Type: String
+    Default: '2048'
+    Description: Memory in MB
+
+  MinTasks:
+    Type: Number
+    Default: 1
+    Description: Minimum number of tasks
+
+  MaxTasks:
+    Type: Number
+    Default: 4
+    Description: Maximum number of tasks
+
+Resources:
+  FrontendService:
+    Type: AWS::ECS::ExpressGatewayService
+    Properties:
+      ServiceName: !Sub '${ProjectName}-frontend'
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub '${ProjectName}-ECSTaskExecutionRoleArn'
+      InfrastructureRoleArn:
+        Fn::ImportValue: !Sub '${ProjectName}-ECSInfrastructureRoleArn'
+      TaskRoleArn:
+        Fn::ImportValue: !Sub '${ProjectName}-ECSTaskRoleArn'
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      HealthCheckPath: /api/health
+      PrimaryContainer:
+        Image: !Sub
+          - '${RepositoryUri}:${ImageTag}'
+          - RepositoryUri:
+              Fn::ImportValue: !Sub '${ProjectName}-FrontendRepositoryUri'
+            ImageTag: !Ref ImageTag
+        ContainerPort: !Ref Port
+        Environment:
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: COGNITO_USER_POOL_ID
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-UserPoolId'
+          - Name: COGNITO_CLIENT_ID
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
+          - Name: NEXT_PUBLIC_SKIP_AUTH
+            Value: 'false'
+          - Name: NEXT_PUBLIC_COGNITO_USER_POOL_ID
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-UserPoolId'
+          - Name: NEXT_PUBLIC_COGNITO_CLIENT_ID
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
+          - Name: NEXT_PUBLIC_COGNITO_REGION
+            Value: !Ref AWS::Region
+          - Name: AGENTCORE_RUNTIME_ID
+            Value: !Ref RuntimeId
+          - Name: HOSTNAME
+            Value: '0.0.0.0'
+          - Name: NODE_ENV
+            Value: production
+          - Name: PORT
+            Value: !Ref Port
+      ScalingTarget:
+        MinTaskCount: !Ref MinTasks
+        MaxTaskCount: !Ref MaxTasks
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: production
+        - Key: ManagedBy
+          Value: cloudformation
+
+Outputs:
+  ServiceUrl:
+    Description: Frontend service URL
+    Value: !GetAtt FrontendService.Endpoint
+    Export:
+      Name: !Sub '${ProjectName}-FrontendUrl'
+
+  ServiceArn:
+    Description: Frontend service ARN
+    Value: !GetAtt FrontendService.ServiceArn
+    Export:
+      Name: !Sub '${ProjectName}-FrontendServiceArn'
+
+  LoadBalancerArn:
+    Description: Frontend load balancer ARN
+    Value: !GetAtt FrontendService.ECSManagedResourceArns.IngressPath.LoadBalancerArn
+    Export:
+      Name: !Sub '${ProjectName}-FrontendLoadBalancerArn'

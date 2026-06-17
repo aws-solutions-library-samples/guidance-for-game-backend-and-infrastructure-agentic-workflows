@@ -1,0 +1,37 @@
+dependencies = {
+    1.0 = {
+        # Core AgentCore packages (REQUIRED)
+        Python-strands-agents = 1.x;
+        Python-bedrock-agentcore = 0.x;
+
+        # MCP Server packages (these get baked into Docker layers)
+        Python-awslabs.eks-mcp-server = 0.x;
+        Python-awslabs.ccapi-mcp-server = 1.x;
+        Python-awslabs.cost-explorer-mcp-server = 0.x;
+        Python-awslabs.aws-api-mcp-server = 1.x;
+
+        # MCP core
+        Python-mcp = 1.x;
+
+        # AWS SDK
+        Boto3 = 1.x;
+        Python-botocore = 1.x;
+
+        # Core utilities
+        Python-loguru = 0.x;
+        Python-pydantic = 2.x;
+        Python-python-dotenv = 1.x;
+        Python-PyJWT = 2.x;
+        Python-httpx = 0.x;
+        Python-PyYAML = 6.x;
+        Python-psutil = 6.x;
+        Python-uv = 0.x;
+
+        # OpenTelemetry for observability
+        Python-aws-opentelemetry-distro = 0.x;
+        Python-opentelemetry-instrumentation = 0.x;
+
+        # AWS certificates
+        PyAmazonCACerts = 1.0;
+    };
+};

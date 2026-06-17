@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - Bedrock Guardrails for Production Security'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name for resource naming
+
+Resources:
+  # Bedrock Guardrail for Game Agent
+  GameAgentGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub '${ProjectName}-guardrails'
+      Description: 'Production guardrails for Game Agent AI assistant'
+      BlockedInputMessaging: 'I can only help with AWS GameLift, EKS, and cost management questions. Please ask about your AWS infrastructure.'
+      BlockedOutputsMessaging: 'I cannot provide that information. Please ask about AWS GameLift, EKS, or cost management.'
+
+      # Denied Topics - Keep conversations focused on AWS infrastructure
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Name: 'Personal Advice'
+            Definition: 'Questions about personal life, relationships, health, medical advice, legal matters, or financial planning unrelated to AWS costs'
+            Type: 'DENY'
+            Examples:
+              - 'How do I deal with stress?'
+              - 'What should I do about my relationship?'
+              - 'Can you give me legal advice?'
+
+          - Name: 'Non-AWS Infrastructure'
+            Definition: 'Questions about non-AWS cloud providers (Azure, GCP, etc.), on-premise infrastructure, or general IT topics not related to AWS GameLift, EKS, or AWS cost management'
+            Type: 'DENY'
+            Examples:
+              - 'How do I set up Azure Kubernetes?'
+              - 'Tell me about Google Cloud Platform'
+              - 'How do I configure my on-premise servers?'
+
+          - Name: 'General Programming'
+            Definition: 'General programming questions, coding tutorials, or software development topics not specifically related to AWS GameLift, EKS, or AWS infrastructure management'
+            Type: 'DENY'
+            Examples:
+              - 'How do I write a Python function?'
+              - 'Teach me JavaScript'
+              - 'What is object-oriented programming?'
+
+          - Name: 'Entertainment and Casual Chat'
+            Definition: 'Entertainment, jokes, games, casual conversation, or topics unrelated to AWS infrastructure management'
+            Type: 'DENY'
+            Examples:
+              - 'Tell me a joke'
+              - 'What movies should I watch?'
+              - 'Let us play a game'
+
+      # Sensitive Information Filters - Anonymize/Block PII in responses
+      # Security: Protect against data leakage (GenAI data protection)
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - Type: 'EMAIL'
+            Action: 'ANONYMIZE'
+          - Type: 'PHONE'
+            Action: 'ANONYMIZE'
+          - Type: 'CREDIT_DEBIT_CARD_NUMBER'
+            Action: 'BLOCK'
+          - Type: 'US_SOCIAL_SECURITY_NUMBER'
+            Action: 'BLOCK'
+          - Type: 'IP_ADDRESS'
+            Action: 'ANONYMIZE'
+          - Type: 'AWS_ACCESS_KEY'
+            Action: 'BLOCK'
+          - Type: 'AWS_SECRET_KEY'
+            Action: 'BLOCK'
+          - Type: 'PASSWORD'
+            Action: 'BLOCK'
+          - Type: 'USERNAME'
+            Action: 'ANONYMIZE'
+        # Custom regex patterns for additional sensitive data
+        RegexesConfig:
+          - Name: 'AWS Account ID'
+            Description: 'Block AWS account IDs from being exposed'
+            Pattern: '\b\d{12}\b'
+            Action: 'ANONYMIZE'
+          - Name: 'Internal Hostnames'
+            Description: 'Block internal AWS hostnames'
+            Pattern: '\b[a-z0-9-]+\.internal\b'
+            Action: 'ANONYMIZE'
+          - Name: 'Kubernetes Secrets'
+            Description: 'Block potential Kubernetes secret references'
+            Pattern: 'kubectl\s+get\s+secret|base64\s+-d'
+            Action: 'BLOCK'
+
+      # Content Filter Policy - Block harmful content
+      # Security: Additional layer of content protection
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: 'HATE'
+            InputStrength: 'HIGH'
+            OutputStrength: 'HIGH'
+          - Type: 'INSULTS'
+            InputStrength: 'HIGH'
+            OutputStrength: 'HIGH'
+          - Type: 'SEXUAL'
+            InputStrength: 'HIGH'
+            OutputStrength: 'HIGH'
+          - Type: 'VIOLENCE'
+            InputStrength: 'HIGH'
+            OutputStrength: 'HIGH'
+          - Type: 'MISCONDUCT'
+            InputStrength: 'HIGH'
+            OutputStrength: 'HIGH'
+          - Type: 'PROMPT_ATTACK'
+            InputStrength: 'HIGH'
+            OutputStrength: 'NONE'
+
+      # Word Policy - Block specific terms
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+          - Type: 'PROFANITY'
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: AI Safety and Security
+
+Outputs:
+  GuardrailId:
+    Description: Bedrock Guardrail ID
+    Value: !GetAtt GameAgentGuardrail.GuardrailId
+    Export:
+      Name: !Sub '${ProjectName}-GuardrailId'
+
+  GuardrailArn:
+    Description: Bedrock Guardrail ARN
+    Value: !GetAtt GameAgentGuardrail.GuardrailArn
+    Export:
+      Name: !Sub '${ProjectName}-GuardrailArn'
+
+  GuardrailVersion:
+    Description: Bedrock Guardrail Version
+    Value: !GetAtt GameAgentGuardrail.Version
+    Export:
+      Name: !Sub '${ProjectName}-GuardrailVersion'

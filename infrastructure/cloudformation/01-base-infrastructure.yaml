@@ -1,0 +1,695 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - Base Infrastructure (Cognito, IAM, ECR)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming
+
+Resources:
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Environment: production
+        Owner: game-agent
+        CostCenter: game-infrastructure
+        ManagedBy: cloudformation
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-web'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # Cognito User Groups
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      Description: Administrator group with full access
+      UserPoolId: !Ref UserPool
+      Precedence: 1
+
+  UsersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: users
+      Description: Standard users group
+      UserPoolId: !Ref UserPool
+      Precedence: 10
+
+  # ECR Repository for Backend
+  BackendRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-backend'
+      EmptyOnDelete: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: production
+        - Key: Owner
+          Value: game-agent
+        - Key: CostCenter
+          Value: game-infrastructure
+        - Key: ManagedBy
+          Value: cloudformation
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+
+  # ECR Repository for Frontend
+  FrontendRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-frontend'
+      EmptyOnDelete: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: production
+        - Key: Owner
+          Value: game-agent
+        - Key: CostCenter
+          Value: game-infrastructure
+        - Key: ManagedBy
+          Value: cloudformation
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": { "type": "expire" }
+            }]
+          }
+
+  # IAM Role for AgentCore Runtime
+  # Security: Uses least-privilege permissions instead of FullAccess managed policies
+  AgentCoreExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-agentcore-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      # Security: Removed FullAccess policies, using scoped read-only where needed
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsReadOnlyAccess
+        - arn:aws:iam::aws:policy/CostOptimizationHubReadOnlyAccess
+      Policies:
+        # Security: Scoped Bedrock access - only invoke models and access knowledge bases
+        - PolicyName: BedrockScopedAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  # Regional foundation models
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  # Global foundation models (region-less ARNs for newer models)
+                  - 'arn:aws:bedrock:::foundation-model/*'
+                  # AWS-managed cross-region inference profiles (global.* models)
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::inference-profile/*'
+                  # Account-specific inference profiles
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+              - Sid: BedrockKnowledgeBaseAccess
+                Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              - Sid: BedrockGuardrailAccess
+                Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                  - bedrock:GetGuardrail
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*'
+              - Sid: BedrockPromptManagementAccess
+                Effect: Allow
+                Action:
+                  - bedrock:GetPrompt
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/*'
+        # Security: Scoped AgentCore access
+        - PolicyName: AgentCoreScopedAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AgentCoreRuntimeAccess
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                  - bedrock-agentcore:GetAgentRuntime
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+              - Sid: AgentCoreMemoryAccess
+                Effect: Allow
+                Action:
+                  # Memory resource management
+                  - bedrock-agentcore:CreateMemory
+                  - bedrock-agentcore:GetMemory
+                  - bedrock-agentcore:UpdateMemory
+                  - bedrock-agentcore:DeleteMemory
+                  - bedrock-agentcore:ListMemories
+                  # Memory record operations (for LTM)
+                  - bedrock-agentcore:BatchCreateMemoryRecords
+                  - bedrock-agentcore:BatchDeleteMemoryRecords
+                  - bedrock-agentcore:BatchUpdateMemoryRecords
+                  - bedrock-agentcore:GetMemoryRecord
+                  - bedrock-agentcore:DeleteMemoryRecord
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  # Event operations (for STM session memory)
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:ListEvents
+                  # Memory extraction
+                  - bedrock-agentcore:StartMemoryExtractionJob
+                  - bedrock-agentcore:ListMemoryExtractionJobs
+                  # Session and actor management
+                  - bedrock-agentcore:ListActors
+                  - bedrock-agentcore:ListSessions
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*'
+        # Security: Scoped service access for MCP servers
+        - PolicyName: AgentCoreServiceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CostExplorerReadAccess
+                Effect: Allow
+                Action:
+                  - ce:GetCostForecast
+                  - ce:GetCostAndUsage
+                  - ce:GetTags
+                  - ce:GetAnomalies
+                  - ce:GetUsageReport
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: CloudControlReadAccess
+                Effect: Allow
+                Action:
+                  - cloudcontrol:ListResources
+                  - cloudcontrol:GetResource
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: GameLiftReadAccess
+                Effect: Allow
+                Action:
+                  - gamelift:DescribeFleetAttributes
+                  - gamelift:DescribeFleetCapacity
+                  - gamelift:DescribeFleetEvents
+                  - gamelift:DescribeFleetPortSettings
+                  - gamelift:DescribeFleetUtilization
+                  - gamelift:DescribeGameSessions
+                  - gamelift:DescribeInstances
+                  - gamelift:DescribePlayerSessions
+                  - gamelift:DescribeRuntimeConfiguration
+                  - gamelift:DescribeScalingPolicies
+                  - gamelift:ListFleets
+                  - gamelift:ListAliases
+                  - gamelift:ListBuilds
+                  - gamelift:ListScripts
+                  - gamelift:ListGameServers
+                  - gamelift:DescribeGameServer
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: EKSReadAccess
+                Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:ListNodegroups
+                  - eks:DescribeNodegroup
+                  - eks:ListFargateProfiles
+                  - eks:DescribeFargateProfile
+                  - eks:ListAddons
+                  - eks:DescribeAddon
+                  - eks:ListIdentityProviderConfigs
+                  - eks:DescribeIdentityProviderConfig
+                  - eks:AccessKubernetesApi
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: EC2ReadAccess
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: ECRReadAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: BudgetsReadAccess
+                Effect: Allow
+                Action:
+                  - budgets:ViewBudget
+                  - budgets:DescribeBudgets
+                Resource:
+                  - !Sub 'arn:aws:budgets::${AWS::AccountId}:budget/*'
+              - Sid: ComputeOptimizerReadAccess
+                Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetLambdaFunctionRecommendations
+                  - compute-optimizer:GetEBSVolumeRecommendations
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
+                Resource: '*'
+              - Sid: MiscReadAccess
+                Effect: Allow
+                Action:
+                  - s3:GetStorageLensConfiguration
+                  - freetier:GetFreeTierUsage
+                  - pricing:GetProducts
+                Resource: '*'
+        # Security: Scoped logging access
+        - PolicyName: ObservabilityAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/spans/*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/spans/*:*'
+              - Sid: CloudWatchLogsRead
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:GetLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - Sid: CloudWatchMetricsRead
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+  # IAM Role for ECS Tasks (Application Permissions)
+  # Security: Uses least-privilege permissions instead of FullAccess managed policies
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+      # Security: Removed CloudWatchLogsFullAccess, using scoped permissions
+      Policies:
+        # Security: Scoped CloudWatch Logs access
+        - PolicyName: CloudWatchLogsScopedAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}*:*'
+        # Security: Scoped AgentCore access
+        - PolicyName: BedrockAgentCoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AgentCoreInvoke
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                  - bedrock-agentcore:InvokeAgentRuntimeForUser
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+              - Sid: BedrockModelInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+        # Security: Scoped AWS service read access
+        - PolicyName: AWSServiceReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EKSReadAccess
+                Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:ListNodegroups
+                  - eks:DescribeNodegroup
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: GameLiftReadAccess
+                Effect: Allow
+                Action:
+                  - gamelift:ListFleets
+                  - gamelift:DescribeFleetAttributes
+                  - gamelift:DescribeFleetUtilization
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: CostExplorerAccess
+                Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetCostForecast
+                  - ce:GetAnomalies
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: BudgetsAccess
+                Effect: Allow
+                Action:
+                  - budgets:ViewBudget
+                  - budgets:DescribeBudgets
+                Resource:
+                  - !Sub 'arn:aws:budgets::${AWS::AccountId}:budget/*'
+              - Sid: ComputeOptimizerAccess
+                Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetLambdaFunctionRecommendations
+                  - compute-optimizer:GetEBSVolumeRecommendations
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
+                Resource: '*'
+              - Sid: CostOptimizationHubAccess
+                Effect: Allow
+                Action:
+                  - cost-optimization-hub:ListRecommendations
+                  - cost-optimization-hub:GetRecommendation
+                Resource: '*'
+              - Sid: MiscReadAccess
+                Effect: Allow
+                Action:
+                  - s3:GetStorageLensConfiguration
+                  - freetier:GetFreeTierUsage
+                  - pricing:GetProducts
+                Resource: '*'
+              - Sid: CloudWatchMetricsAccess
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+        # Security: STS access for identity verification
+        - PolicyName: STSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetCallerIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+  # IAM Role for ECS Task Execution (ECR pulls + CloudWatch logs)
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # IAM Role for ECS Infrastructure (ALB, security groups, auto-scaling)
+  ECSInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-infrastructure-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRoleforExpressGatewayServices
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Security: S3 Access Logging Bucket (BSC43)
+  # Stores access logs for all project S3 buckets
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: access-logging
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Bucket policy to allow S3 service to write access logs
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-*'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${ProjectName}-UserPoolClientId'
+
+  BackendRepositoryUri:
+    Description: Backend ECR Repository URI
+    Value: !GetAtt BackendRepository.RepositoryUri
+    Export:
+      Name: !Sub '${ProjectName}-BackendRepositoryUri'
+
+  FrontendRepositoryUri:
+    Description: Frontend ECR Repository URI
+    Value: !GetAtt FrontendRepository.RepositoryUri
+    Export:
+      Name: !Sub '${ProjectName}-FrontendRepositoryUri'
+
+  AgentCoreExecutionRoleArn:
+    Description: AgentCore Execution Role ARN
+    Value: !GetAtt AgentCoreExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-AgentCoreExecutionRoleArn'
+
+  ECSTaskExecutionRoleArn:
+    Description: ECS Task Execution Role ARN
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ECSTaskExecutionRoleArn'
+
+  ECSInfrastructureRoleArn:
+    Description: ECS Infrastructure Role ARN
+    Value: !GetAtt ECSInfrastructureRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ECSInfrastructureRoleArn'
+
+  ECSTaskRoleArn:
+    Description: ECS Task Role ARN
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ECSTaskRoleArn'
+
+  AccessLogsBucketName:
+    Description: S3 Access Logs Bucket Name
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${ProjectName}-AccessLogsBucketName'

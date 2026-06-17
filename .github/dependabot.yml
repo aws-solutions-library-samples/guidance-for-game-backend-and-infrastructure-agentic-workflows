@@ -1,0 +1,134 @@
+# Dependabot configuration for automated dependency updates
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  # Python dependencies (backend)
+  - package-ecosystem: "pip"
+    directory: "/backend"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "game-agent-maintainers"
+    labels:
+      - "dependencies"
+      - "python"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    # Group minor and patch updates together
+    groups:
+      python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Allow both direct and indirect dependency updates
+    allow:
+      - dependency-type: "all"
+    # Ignore specific dependencies with documented reasons
+    ignore:
+      # MCP pinned due to eks-mcp-server incompatibility
+      - dependency-name: "mcp"
+        versions: [">=1.19.0"]
+      # Core MCP server pinned due to ARM64 build failures
+      - dependency-name: "awslabs.core-mcp-server"
+        versions: [">1.0.7"]
+      # EKS MCP server pinned due to mcp version conflict
+      - dependency-name: "awslabs.eks-mcp-server"
+        versions: [">0.1.14"]
+
+  # npm dependencies (frontend)
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "game-agent-maintainers"
+    labels:
+      - "dependencies"
+      - "npm"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    # Group minor and patch updates together
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Allow both direct and indirect dependency updates
+    allow:
+      - dependency-type: "all"
+    # Automatically rebase PRs when conflicts occur
+    rebase-strategy: "auto"
+
+  # Docker base images (frontend)
+  - package-ecosystem: "docker"
+    directory: "/ui"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "game-agent-maintainers"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Docker base images (backend - AgentCore generated Dockerfile)
+  - package-ecosystem: "docker"
+    directory: "/backend/.bedrock_agentcore/gameagentruntime"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "game-agent-maintainers"
+    labels:
+      - "dependencies"
+      - "docker"
+      - "security"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # GitHub Actions dependencies
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "game-agent-maintainers"
+    labels:
+      - "dependencies"
+      - "github-actions"
+      - "ci-cd"
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"

@@ -1,0 +1,85 @@
+/* Global Styles for Game Agent Command Center */
+
+/* Import Google Fonts */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* Import our layout styles */
+@import './command-center-layout.css';
+@import './chat-layout.css';
+
+/* Reset and base styles */
+html,
+body {
+  padding: 0;
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background: #0f0f23;
+  color: #ffffff;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Ensure full height layout */
+#__next {
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* Remove default button styles */
+button {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* Improve text rendering */
+body {
+  text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+  -ms-text-size-adjust: 100%;
+}
+
+/* Hide scrollbars on body to prevent double scrollbars */
+body {
+  overflow: hidden;
+}
+
+/* Ensure proper stacking context */
+.ga-layout {
+  position: relative;
+  z-index: 0;
+}
+
+/* Selection styling */
+::selection {
+  background: rgba(139, 69, 255, 0.3);
+  color: #ffffff;
+}
+
+/* Focus states */
+*:focus {
+  outline: 2px solid #8b45ff;
+  outline-offset: 2px;
+}
+
+/* Accessibility - Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

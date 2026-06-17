@@ -1,0 +1,5 @@
+# Downloaded KB documentation (regenerated on deploy)
+kb-sources/**/*.md
+
+# Scraper cache
+.kb-cache/

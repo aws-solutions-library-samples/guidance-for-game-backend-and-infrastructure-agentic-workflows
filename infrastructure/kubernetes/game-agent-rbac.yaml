@@ -1,0 +1,193 @@
+---
+# Security: Namespace definitions for environment isolation (BSC55)
+# Production and testing environments are separated by namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: game-agent-production
+  labels:
+    app.kubernetes.io/name: game-agent
+    app.kubernetes.io/component: production
+    environment: production
+    # Security: Enable Pod Security Standards
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: game-agent-testing
+  labels:
+    app.kubernetes.io/name: game-agent
+    app.kubernetes.io/component: testing
+    environment: testing
+    # Security: Enable Pod Security Standards (baseline for testing)
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+# Security: NetworkPolicy to isolate production namespace
+# Only allows traffic from game-agent components
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: game-agent-production-isolation
+  namespace: game-agent-production
+spec:
+  podSelector: {}  # Apply to all pods in namespace
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from same namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/name: game-agent
+              environment: production
+    # Allow traffic from monitoring
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow traffic to same namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/name: game-agent
+              environment: production
+    # Allow AWS API endpoints (HTTPS)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Security: NetworkPolicy to isolate testing namespace
+# Prevents testing from accessing production
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: game-agent-testing-isolation
+  namespace: game-agent-testing
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from same namespace only
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/name: game-agent
+              environment: testing
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+    # Allow traffic to same namespace
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/name: game-agent
+              environment: testing
+    # Allow AWS API endpoints (HTTPS)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# ClusterRole: Read-only access for Game Agent monitoring
+# Security: Excludes secrets for least privilege (BSC28, BSC29)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: game-agent-monitoring-role
+  labels:
+    app.kubernetes.io/name: game-agent
+    app.kubernetes.io/component: rbac
+rules:
+  # Core resources (no secrets)
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - namespaces
+      - events
+      - configmaps
+      - persistentvolumes
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch"]
+
+  # Apps resources
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs: ["get", "list", "watch"]
+
+  # Batch resources
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+    verbs: ["get", "list", "watch"]
+
+  # Metrics
+  - apiGroups: ["metrics.k8s.io"]
+    resources:
+      - nodes
+      - pods
+    verbs: ["get", "list"]
+
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch"]
+
+  # Storage
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+    verbs: ["get", "list", "watch"]
+
+---
+# ClusterRoleBinding: Bind role to game-agent-monitoring-group
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: game-agent-monitoring-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: game-agent-monitoring-role
+subjects:
+  - kind: Group
+    name: game-agent-monitoring-group
+    apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - Security Infrastructure (CloudTrail + WAF on ALB)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming
+
+  FrontendResourceArn:
+    Type: String
+    Description: ARN of the frontend ALB to attach WAF to
+
+  RateLimitPerIP:
+    Type: Number
+    Default: 2000
+    Description: Maximum requests per 5-minute window per IP address
+
+  CloudTrailRetentionDays:
+    Type: Number
+    Default: 90
+    Description: Number of days to retain CloudTrail logs in S3
+
+  AIChatMode:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Enable relaxed rate limiting for AI chat applications (higher limits, body size rules)
+
+Conditions:
+  IsAIChatMode: !Equals [!Ref AIChatMode, 'true']
+
+Resources:
+  # ====================
+  # CloudTrail Resources
+  # ====================
+
+  # S3 Bucket for CloudTrail Logs
+  CloudTrailLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-cloudtrail-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: !Ref CloudTrailRetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cloudtrail-logs
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # Bucket Policy for CloudTrail
+  CloudTrailLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogsBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail'
+
+  # CloudWatch Log Group for CloudTrail
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/cloudtrail/${ProjectName}'
+      RetentionInDays: !Ref CloudTrailRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cloudtrail-logs
+
+  # IAM Role for CloudTrail to write to CloudWatch Logs
+  CloudTrailCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cloudtrail-cloudwatch-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  # CloudTrail Trail
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailLogsBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-trail'
+      S3BucketName: !Ref CloudTrailLogsBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: api-audit-logging
+
+  # ====================
+  # WAF Resources (Regional scope for ALB)
+  # ====================
+
+  # WAF Web ACL - Regional scope (for ALB)
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ProjectName}-web-acl'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Description: WAF Web ACL for Game Agent frontend
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-waf-metrics'
+      Rules:
+        # Rate limiting per IP
+        - Name: RateLimitPerIP
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimitPerIP
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-rate-limit'
+
+        # AWS Managed Rules - Common Rule Set (OWASP Top 10)
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                # Exclude body size rules for AI chat (large prompts/responses)
+                - !If [IsAIChatMode, 'SizeRestrictions_BODY', !Ref 'AWS::NoValue']
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-common-rules'
+
+        # AWS Managed Rules - SQL Injection
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-sqli-rules'
+
+        # AWS Managed Rules - Known Bad Inputs
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 4
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-bad-inputs-rules'
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: web-application-firewall
+
+  # WAF Association with ALB
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref FrontendResourceArn
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # ====================
+  # SNS Topic for Security Alerts
+  # ====================
+
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-security-alerts'
+      DisplayName: Game Agent Security Alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: security-alerts
+
+  # CloudWatch Alarm for high WAF block rate
+  WAFBlockRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-waf-high-block-rate'
+      AlarmDescription: High rate of blocked requests by WAF
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub '${ProjectName}-web-acl'
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      AlarmActions:
+        - !Ref SecurityAlertsTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  CloudTrailArn:
+    Description: CloudTrail Trail ARN
+    Value: !GetAtt CloudTrail.Arn
+    Export:
+      Name: !Sub '${ProjectName}-CloudTrailArn'
+
+  CloudTrailLogsBucketName:
+    Description: CloudTrail Logs S3 Bucket Name
+    Value: !Ref CloudTrailLogsBucket
+    Export:
+      Name: !Sub '${ProjectName}-CloudTrailLogsBucketName'
+
+  CloudTrailLogGroupArn:
+    Description: CloudTrail CloudWatch Log Group ARN
+    Value: !GetAtt CloudTrailLogGroup.Arn
+    Export:
+      Name: !Sub '${ProjectName}-CloudTrailLogGroupArn'
+
+  WebACLArn:
+    Description: WAF Web ACL ARN (attached to ALB)
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${ProjectName}-WebACLArn'
+
+  WebACLAssociationStatus:
+    Description: WAF Association Status
+    Value: !Sub 'WAF attached to ALB: ${FrontendResourceArn}'
+
+  SecurityAlertsTopicArn:
+    Description: SNS Topic ARN for Security Alerts (subscribe to receive notifications)
+    Value: !Ref SecurityAlertsTopic
+    Export:
+      Name: !Sub '${ProjectName}-SecurityAlertsTopicArn'
+
+  RateLimitConfiguration:
+    Description: WAF Rate Limit Configuration
+    Value: !Sub '${RateLimitPerIP} requests per 5-minute window per IP'
+
+  ArchitectureSummary:
+    Description: Security Architecture
+    Value: 'WAF on ALB (ECS Express) + CloudTrail audit logging'

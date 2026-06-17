@@ -1,0 +1,686 @@
+/* Chat Layout - Centered Container Design (WORKING VERSION) */
+
+.ga-chat-wrapper {
+  flex: 1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+  position: relative !important;
+  min-height: 0 !important;
+}
+
+.ga-chat {
+  height: 100% !important;
+  width: 100% !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+}
+
+/* Fix CopilotKit layout within centered container */
+.copilotKitChat {
+  height: 100% !important;
+  display: flex !important;
+  flex-direction: column !important;
+  overflow: hidden !important;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+}
+
+/* Messages area - should take available space */
+.copilotKitMessages {
+  flex: 1 !important;
+  overflow-y: auto !important;
+  padding: 24px !important;
+  min-height: 0 !important;
+  background: transparent !important;
+}
+
+.copilotKitMessagesContainer {
+  max-width: 100% !important;
+  margin: 0 auto !important;
+}
+
+/* Bubble-style messages */
+.copilotKitMessage {
+  margin-bottom: 24px !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  max-width: 100% !important;
+  position: relative !important;
+  background: transparent !important;
+  border: none !important;
+}
+
+/* Assistant message bubbles - style the message container, not the markdown */
+.copilotKitAssistantMessage {
+  background: linear-gradient(135deg, rgba(139, 69, 255, 0.15) 0%, rgba(61, 90, 254, 0.15) 100%) !important;
+  border: 1px solid rgba(139, 69, 255, 0.3) !important;
+  border-radius: 18px 18px 18px 4px !important;
+  padding: 16px 20px !important;
+  margin: 0 0 24px 0 !important;
+  backdrop-filter: blur(10px) !important;
+  box-shadow: 0 8px 32px rgba(139, 69, 255, 0.1) !important;
+}
+
+/* Let CopilotKit handle markdown spacing naturally */
+.copilotKitAssistantMessage .copilotKitMarkdown {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+}
+
+/* User message bubbles - style the message container */
+.copilotKitUserMessage {
+  display: flex !important;
+  justify-content: flex-end !important;
+  margin: 0 0 24px 0 !important;
+  background: linear-gradient(135deg, rgba(0, 188, 212, 0.15) 0%, rgba(57, 255, 20, 0.15) 100%) !important;
+  border: 1px solid rgba(0, 188, 212, 0.3) !important;
+  border-radius: 18px 18px 4px 18px !important;
+  padding: 16px 20px !important;
+  max-width: 80% !important;
+  margin-left: auto !important;
+  backdrop-filter: blur(10px) !important;
+  box-shadow: 0 8px 32px rgba(0, 188, 212, 0.1) !important;
+}
+
+/* Let CopilotKit handle user message markdown naturally */
+.copilotKitUserMessage .copilotKitMarkdown {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  backdrop-filter: none !important;
+  box-shadow: none !important;
+}
+
+/* Simplified message text styling - let CopilotKit handle formatting */
+.copilotKitMarkdown {
+  color: #ffffff !important;
+  /* Remove problematic overrides - let CopilotKit handle spacing and formatting */
+}
+
+/* Keep only essential overrides for dark theme */
+.copilotKitMarkdown p,
+.copilotKitMarkdown h1,
+.copilotKitMarkdown h2,
+.copilotKitMarkdown h3,
+.copilotKitMarkdown h4,
+.copilotKitMarkdown h5,
+.copilotKitMarkdown h6,
+.copilotKitMarkdown li,
+.copilotKitMarkdown span {
+  color: #ffffff !important;
+}
+
+.copilotKitMarkdown strong {
+  color: #8b45ff !important;
+}
+
+.copilotKitMarkdown code {
+  background: rgba(0, 0, 0, 0.3) !important;
+  color: #00bcd4 !important;
+  padding: 2px 6px !important;
+  border-radius: 4px !important;
+}
+
+/* Message controls positioning */
+.copilotKitMessageControls {
+  position: absolute !important;
+  bottom: -32px !important;
+  left: 0 !important;
+  display: flex !important;
+  gap: 8px !important;
+  z-index: 10 !important;
+}
+
+.copilotKitMessageControlButton {
+  background: rgba(0, 0, 0, 0.7) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  color: rgba(255, 255, 255, 0.7) !important;
+  padding: 6px !important;
+  border-radius: 8px !important;
+  cursor: pointer !important;
+  transition: all 0.2s ease !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: 28px !important;
+  height: 28px !important;
+  backdrop-filter: blur(10px) !important;
+}
+
+.copilotKitMessageControlButton:hover {
+  background: rgba(139, 69, 255, 0.8) !important;
+  color: #ffffff !important;
+  border-color: #8b45ff !important;
+  transform: translateY(-1px) !important;
+  box-shadow: 0 4px 12px rgba(139, 69, 255, 0.3) !important;
+}
+
+/* Input container - enhanced styling */
+.copilotKitInputContainer {
+  flex-shrink: 0 !important;
+  padding: 20px 24px !important;
+  border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
+  background: linear-gradient(135deg, rgba(139, 69, 255, 0.05) 0%, rgba(61, 90, 254, 0.05) 100%) !important;
+  position: relative !important;
+}
+
+/* Input field styling */
+.copilotKitInput {
+  display: flex !important;
+  align-items: flex-end !important;  /* Keep this for proper button alignment */
+  gap: 12px !important;
+  padding: 16px 20px !important;     /* Increased padding for more breathing room */
+  background: rgba(0, 0, 0, 0.3) !important;
+  border: 2px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 16px !important;
+  transition: all 0.3s ease !important;
+  backdrop-filter: blur(20px) !important;
+  min-height: 80px !important;       /* Ensure container accommodates larger textarea */
+}
+
+.copilotKitInput:focus-within {
+  border-color: #8b45ff !important;
+  box-shadow: 0 0 20px rgba(139, 69, 255, 0.3) !important;
+  background: rgba(0, 0, 0, 0.4) !important;
+}
+
+.copilotKitInput textarea {
+  flex: 1 !important;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  color: #ffffff !important;
+  font-size: 16px !important;
+  line-height: 1.6 !important;
+  resize: none !important;
+  min-height: 48px !important;  /* Doubled from 24px for more comfortable typing */
+  max-height: 200px !important; /* Increased from 120px to allow more lines */
+  font-family: 'Inter', sans-serif !important;
+  padding: 12px 0 !important;   /* Added vertical padding for breathing room */
+  overflow-y: auto !important;  /* Ensure scrolling works smoothly */
+  word-wrap: break-word !important;  /* Handle long words gracefully */
+  white-space: pre-wrap !important;  /* Preserve line breaks and wrap text */
+}
+
+.copilotKitInput textarea::placeholder {
+  color: rgba(255, 255, 255, 0.5) !important;
+}
+
+/* Send button */
+.copilotKitInputControlButton {
+  background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%) !important;
+  border: none !important;
+  color: #ffffff !important;
+  padding: 12px !important;
+  border-radius: 12px !important;
+  cursor: pointer !important;
+  transition: all 0.2s ease !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  min-width: 48px !important;
+  height: 48px !important;
+  box-shadow: 0 4px 16px rgba(139, 69, 255, 0.3) !important;
+}
+
+.copilotKitInputControlButton:hover:not(:disabled) {
+  transform: translateY(-2px) !important;
+  box-shadow: 0 8px 24px rgba(139, 69, 255, 0.4) !important;
+}
+
+.copilotKitInputControlButton:disabled {
+  background: rgba(255, 255, 255, 0.1) !important;
+  color: rgba(255, 255, 255, 0.4) !important;
+  cursor: not-allowed !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+/* Progress bar for AI thinking state - Enhanced with glow effect */
+.ga-progress-bar {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 4px !important;
+  background: transparent !important;
+  z-index: 1000 !important;
+  opacity: 0 !important;
+  transition: opacity 0.3s ease !important;
+  overflow: hidden !important;
+}
+
+.ga-progress-bar.active {
+  opacity: 1 !important;
+}
+
+.ga-progress-bar::before {
+  content: '' !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  background: linear-gradient(90deg,
+    rgba(139, 69, 255, 0.8) 0%,
+    rgba(61, 90, 254, 0.9) 25%,
+    rgba(0, 188, 212, 1) 50%,
+    rgba(0, 255, 136, 0.9) 75%,
+    rgba(139, 69, 255, 0.8) 100%
+  ) !important;
+  background-size: 200% 100% !important;
+  animation: progress-glow 2s linear infinite !important;
+  box-shadow:
+    0 0 10px rgba(139, 69, 255, 0.6),
+    0 0 20px rgba(61, 90, 254, 0.4),
+    0 0 30px rgba(0, 188, 212, 0.3) !important;
+}
+
+.ga-progress-bar::after {
+  content: '' !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: -100% !important;
+  width: 30% !important;
+  height: 100% !important;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.8) 50%,
+    transparent 100%
+  ) !important;
+  animation: progress-shimmer 1.5s ease-in-out infinite !important;
+}
+
+@keyframes progress-glow {
+  0% {
+    background-position: 200% 0;
+    filter: hue-rotate(0deg) brightness(1);
+  }
+  50% {
+    filter: hue-rotate(90deg) brightness(1.2);
+  }
+  100% {
+    background-position: -200% 0;
+    filter: hue-rotate(180deg) brightness(1);
+  }
+}
+
+@keyframes progress-shimmer {
+  0% {
+    left: -100%;
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    left: 100%;
+    opacity: 0;
+  }
+}
+
+/* Enhanced Loading States & Thinking Indicators */
+
+/* Thinking indicator overlay - will be moved into messages container via JS */
+/* Thinking indicator overlay - rendered via React Portal */
+.ga-thinking-overlay {
+  position: relative !important;
+  pointer-events: none !important;
+  z-index: 1 !important;
+  padding: 0 24px 24px 24px !important;
+  width: 100% !important;
+}
+
+.ga-thinking-overlay .ga-thinking-indicator {
+  pointer-events: none !important;
+}
+
+/* Send button loading state */
+.copilotKitInputControlButton[data-copilotkit-in-progress="true"] {
+  background: linear-gradient(135deg, #00ff88 0%, #00bcd4 100%) !important;
+  color: #000000 !important;
+  position: relative !important;
+  overflow: hidden !important;
+}
+
+.copilotKitInputControlButton[data-copilotkit-in-progress="true"]::before {
+  content: '' !important;
+  position: absolute !important;
+  top: 0 !important;
+  left: -100% !important;
+  width: 100% !important;
+  height: 100% !important;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent) !important;
+  animation: shimmer 1.5s infinite !important;
+}
+
+.copilotKitInputControlButton[data-copilotkit-in-progress="true"] svg {
+  color: #000000 !important;
+  animation: pulse-spin 2s ease-in-out infinite !important;
+}
+
+/* Thinking indicator that appears in message area */
+.ga-thinking-indicator {
+  display: flex !important;
+  justify-content: flex-start !important;
+  margin-bottom: 24px !important;
+  padding: 0 !important;
+  animation: fadeInUp 0.3s ease-out !important;
+}
+
+.ga-thinking-bubble {
+  background: linear-gradient(135deg, rgba(139, 69, 255, 0.1) 0%, rgba(61, 90, 254, 0.1) 100%) !important;
+  border: 1px solid rgba(139, 69, 255, 0.2) !important;
+  border-radius: 18px 18px 18px 4px !important;
+  padding: 16px 20px !important;
+  backdrop-filter: blur(10px) !important;
+  box-shadow: 0 8px 32px rgba(139, 69, 255, 0.05) !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 12px !important;
+  min-width: 120px !important;
+}
+
+.ga-thinking-avatar {
+  font-size: 20px !important;
+  opacity: 0.8 !important;
+  animation: gentle-pulse 2s ease-in-out infinite !important;
+}
+
+.ga-thinking-dots {
+  display: flex !important;
+  gap: 4px !important;
+  align-items: center !important;
+}
+
+.ga-thinking-dot {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 50% !important;
+  background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%) !important;
+  animation: thinking-bounce 1.4s ease-in-out infinite !important;
+}
+
+.ga-thinking-dot:nth-child(1) { animation-delay: 0s !important; }
+.ga-thinking-dot:nth-child(2) { animation-delay: 0.2s !important; }
+.ga-thinking-dot:nth-child(3) { animation-delay: 0.4s !important; }
+
+.ga-thinking-text {
+  color: rgba(255, 255, 255, 0.7) !important;
+  font-size: 0.9rem !important;
+  font-style: italic !important;
+  margin-left: 8px !important;
+  animation: text-fade 2s ease-in-out infinite !important;
+}
+
+/* Enhanced status indicators in header - removed global animation */
+.ga-status-dot {
+  /* No animation by default - solid green when stable */
+}
+
+/* Animation delays removed - no longer needed */
+
+/* Animations */
+@keyframes shimmer {
+  0% { left: -100%; }
+  100% { left: 100%; }
+}
+
+@keyframes pulse-spin {
+  0%, 100% {
+    transform: rotate(0deg) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: rotate(180deg) scale(1.1);
+    opacity: 0.8;
+  }
+}
+
+@keyframes thinking-bounce {
+  0%, 60%, 100% {
+    transform: translateY(0);
+    opacity: 0.7;
+  }
+  30% {
+    transform: translateY(-10px);
+    opacity: 1;
+  }
+}
+
+@keyframes gentle-pulse {
+  0%, 100% {
+    opacity: 0.8;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes text-fade {
+  0%, 100% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Removed unused status-pulse keyframes */
+
+/* Input area enhancements */
+.copilotKitInput {
+  position: relative !important;
+  transition: all 0.3s ease !important;
+}
+
+.copilotKitInput:focus-within {
+  transform: translateY(-2px) !important;
+  box-shadow: 0 12px 40px rgba(139, 69, 255, 0.15) !important;
+}
+
+.copilotKitInput textarea {
+  transition: all 0.2s ease !important;
+}
+
+.copilotKitInput textarea:focus {
+  box-shadow: 0 0 0 2px rgba(139, 69, 255, 0.3) !important;
+}
+
+/* Enhanced message appearance animation */
+.copilotKitMessage {
+  animation: messageSlideIn 0.4s ease-out !important;
+}
+
+@keyframes messageSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Subtle hover effects for message bubbles */
+.copilotKitAssistantMessage .copilotKitMarkdown:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 12px 40px rgba(139, 69, 255, 0.15) !important;
+  transition: all 0.2s ease !important;
+}
+
+.copilotKitUserMessage .copilotKitMarkdown:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 12px 40px rgba(0, 188, 212, 0.15) !important;
+  transition: all 0.2s ease !important;
+}
+/* "Powered by CopilotKit" styling - transparent background to inherit from container */
+.copilotKitInputContainer .poweredBy {
+  background: transparent !important;
+  color: rgba(255, 255, 255, 0.3) !important;
+  font-size: 11px !important;
+  padding: 10px 0 !important;
+  margin: 0 !important;
+  text-align: center !important;
+  visibility: visible !important;
+  display: block !important;
+}
+
+/* Scrollbar styling */
+.copilotKitMessages::-webkit-scrollbar {
+  width: 6px;
+}
+
+.copilotKitMessages::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.copilotKitMessages::-webkit-scrollbar-thumb {
+  background: rgba(139, 69, 255, 0.3);
+  border-radius: 3px;
+}
+
+.copilotKitMessages::-webkit-scrollbar-thumb:hover {
+  background: rgba(139, 69, 255, 0.5);
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+  .copilotKitMessages {
+    padding: 16px !important;
+  }
+
+  .copilotKitMessage {
+    margin-bottom: 20px !important;
+  }
+
+  .copilotKitAssistantMessage,
+  .copilotKitUserMessage {
+    padding: 12px 16px !important;
+    border-radius: 16px 16px 16px 4px !important;
+  }
+
+  .copilotKitUserMessage {
+    border-radius: 16px 16px 4px 16px !important;
+    max-width: 90% !important;
+  }
+
+  .copilotKitInputContainer {
+    padding: 16px !important;
+  }
+
+  .copilotKitInput {
+    padding: 12px 16px !important;
+    min-height: 60px !important;
+  }
+
+  .copilotKitInput textarea {
+    font-size: 16px !important;
+    min-height: 36px !important;
+    max-height: 120px !important;
+  }
+
+  .copilotKitInputControlButton {
+    min-width: 44px !important;
+    height: 44px !important;
+    padding: 10px !important;
+  }
+
+  .ga-thinking-bubble {
+    padding: 12px 16px !important;
+    min-width: 100px !important;
+  }
+
+  .ga-thinking-text {
+    font-size: 0.85rem !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .copilotKitMessages {
+    padding: 12px !important;
+  }
+
+  .copilotKitAssistantMessage,
+  .copilotKitUserMessage {
+    padding: 10px 14px !important;
+    font-size: 0.9rem !important;
+  }
+
+  .copilotKitUserMessage {
+    max-width: 95% !important;
+  }
+
+  .copilotKitInputContainer {
+    padding: 12px !important;
+  }
+
+  .copilotKitInput {
+    padding: 10px 14px !important;
+    min-height: 56px !important;
+    border-radius: 14px !important;
+  }
+
+  .copilotKitInput textarea {
+    font-size: 16px !important;
+    min-height: 32px !important;
+    max-height: 100px !important;
+  }
+
+  .copilotKitInputControlButton {
+    min-width: 40px !important;
+    height: 40px !important;
+    padding: 8px !important;
+    border-radius: 10px !important;
+  }
+
+  .ga-thinking-bubble {
+    padding: 10px 14px !important;
+    min-width: 80px !important;
+  }
+
+  .ga-thinking-avatar {
+    font-size: 18px !important;
+  }
+
+  .ga-thinking-dot {
+    width: 6px !important;
+    height: 6px !important;
+  }
+
+  .ga-thinking-text {
+    font-size: 0.8rem !important;
+    margin-left: 6px !important;
+  }
+
+  .ga-progress-bar {
+    height: 3px !important;
+  }
+}

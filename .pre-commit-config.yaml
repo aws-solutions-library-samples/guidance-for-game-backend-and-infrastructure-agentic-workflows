@@ -1,0 +1,59 @@
+# Pre-commit hooks for Game Agent
+# See https://pre-commit.com for more information
+
+repos:
+  # Python formatting and linting
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+        language_version: python3.13
+        files: ^backend/.*\.py$
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        language_version: python3.13
+        files: ^backend/.*\.py$
+        args: ["--profile", "black"]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.13.0
+    hooks:
+      - id: mypy
+        language_version: python3.13
+        files: ^backend/src/.*\.py$
+        args: ["--ignore-missing-imports", "--no-strict-optional"]
+        additional_dependencies:
+          - types-boto3
+          - types-requests
+
+  # TypeScript/JavaScript linting
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.16.0
+    hooks:
+      - id: eslint
+        files: ^ui/src/.*\.(ts|tsx|js|jsx)$
+        types: [file]
+        args: ["--fix"]
+        additional_dependencies:
+          - eslint@8.57.1
+          - "@typescript-eslint/parser@7.18.0"
+          - "@typescript-eslint/eslint-plugin@7.18.0"
+          - eslint-config-next@15.0.3
+
+  # General checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(.*\.md|.*\.txt)$
+      - id: end-of-file-fixer
+        exclude: ^(.*\.md|.*\.txt)$
+      - id: check-yaml
+        args: ["--unsafe"]
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+      - id: check-merge-conflict
+      - id: detect-private-key

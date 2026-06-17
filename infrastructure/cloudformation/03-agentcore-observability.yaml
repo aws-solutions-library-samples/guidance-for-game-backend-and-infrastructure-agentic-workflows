@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - AgentCore OTEL Observability (AWS-Managed)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming
+
+  RuntimeId:
+    Type: String
+    Description: AgentCore Runtime ID (changes per deployment)
+
+Resources:
+  # Runtime-Specific Spans Log Group (CRITICAL for ADOT trace export)
+  # AgentCore ADOT exporter writes spans to /aws/spans/{RuntimeId}
+  # This is SEPARATE from account-wide /aws/spans/default
+  RuntimeSpansLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete  # Application-specific, safe to delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/spans/${RuntimeId}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: runtime-specific-spans
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: ObservabilityType
+          Value: OTEL-native
+
+  # OTEL Exporter Log Group (CRITICAL for ADOT trace export)
+  # ADOT exporter writes serialized trace data here
+  # AWS should auto-create this but doesn't reliably - we manage it explicitly
+  RuntimeOTELExporterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete  # Application-specific, safe to delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock-agentcore/runtimes/${RuntimeId}/otel-exporter'
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: otel-exporter-destination
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: ObservabilityType
+          Value: OTEL-exporter
+
+  # NOTE: AWS auto-creates these log groups - DO NOT manage in CloudFormation
+  #
+  # /aws/bedrock-agentcore/runtimes/{RuntimeId}/otel-rt-logs - Auto-created by ADOT
+  # /aws/bedrock-agentcore/runtimes/{RuntimeId}/otel-traces - Auto-created by AWS
+  # /aws/bedrock-agentcore/runtimes/{RuntimeId}-DEFAULT - Auto-created by AgentCore
+  #
+  # These are AWS-MANAGED resources that appear automatically when needed.
+  # Attempting to manage them in CloudFormation causes "AlreadyExists" errors.
+
+  # NOTE: Account-wide resources are NOT managed by this stack
+  #
+  # aws/spans (NO leading /) - AWS-reserved log group for X-Ray Transaction Search
+  #   Created by AWS when Transaction Search is toggled (not on first API enable).
+  #   setup-account-observability.sh handles this by toggling if missing.
+  #   Log stream 'default' inside this log group receives sampled spans.
+  #   See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
+  #
+  # These are ACCOUNT-WIDE resources shared by ALL applications.
+  # Setup: Run scripts/infrastructure/setup-account-observability.sh (called by deploy.sh)
+  # Teardown: NEVER delete (shared by other applications)
+
+Outputs:
+  RuntimeSpansLogGroup:
+    Description: Runtime-specific spans log group (application-specific)
+    Value: !Ref RuntimeSpansLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-RuntimeSpansLogGroup'
+
+  RuntimeOTELExporterLogGroup:
+    Description: OTEL exporter destination log group (application-specific)
+    Value: !Ref RuntimeOTELExporterLogGroup
+    Export:
+      Name: !Sub '${ProjectName}-RuntimeOTELExporterLogGroup'
+
+  AccountWideSpansLogGroup:
+    Description: Account-wide spans log group (not managed by this stack)
+    Value: '/aws/spans/default'
+
+  AutoCreatedOTELRuntimeLogs:
+    Description: OTEL runtime logs (auto-created by AWS)
+    Value: !Sub '/aws/bedrock-agentcore/runtimes/${RuntimeId}/otel-rt-logs'
+
+  AutoCreatedOTELTraces:
+    Description: OTEL traces (auto-created by AWS)
+    Value: !Sub '/aws/bedrock-agentcore/runtimes/${RuntimeId}/otel-traces'
+
+  ObservabilityType:
+    Description: Observability implementation type
+    Value: 'AWS-managed (Auto-created log groups)'

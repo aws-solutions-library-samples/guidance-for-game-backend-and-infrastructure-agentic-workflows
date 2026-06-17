@@ -1,214 +1,445 @@
-# Guidance Title (required)
+# Guidance for Game Backend & Infrastructure Agentic Workflows
+
+This guidance demonstrates how to build an AI-powered game server management platform using a multi-specialist agent architecture on AWS. It uses Amazon Bedrock AgentCore Runtime with Strands Agents and Model Context Protocol (MCP) servers to provide natural language interaction with AWS game infrastructure services including Amazon GameLift, Amazon EKS, and AWS Cost Explorer.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Deployment](#deployment)
+- [Local Development](#local-development)
+- [Usage](#usage)
+- [MCP Integration](#mcp-integration)
+- [Testing](#testing)
+- [Monitoring and Observability](#monitoring-and-observability)
+- [Project Structure](#project-structure)
+- [Security](#security)
+- [Cleanup](#cleanup)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Overview
+
+This solution implements a conversational AI assistant that helps game developers manage AWS infrastructure through natural language queries. A central orchestrator agent routes requests to domain-specific specialist agents, each equipped with MCP servers or AWS SDK tools for their respective AWS services.
+
+Key capabilities:
+
+- **GameLift Management** -- Fleet monitoring, scaling configuration, and game session analysis
+- **EKS/Kubernetes Operations** -- Cluster management, pod monitoring, and troubleshooting
+- **Cost Intelligence** -- Spending analysis, forecasting, and optimization recommendations
+- **Conversation Memory** -- Session-scoped context with optional cross-session long-term memory
+- **Guardrails** -- Content filtering, PII protection, and prompt injection detection via Amazon Bedrock Guardrails
+
+### Specialist Agents
+
+| Agent | Domain | Integration |
+|-------|--------|-------------|
+| **Orchestrator** | Query routing and multi-turn reasoning | Delegates to specialists |
+| **GameLift Specialist** | Fleet management, scaling, optimization | boto3 tools + Knowledge Base |
+| **EKS Specialist** | Kubernetes cluster operations | EKS MCP Server + Knowledge Base |
+| **Cost Specialist** | Spending analysis and forecasting | Cost Explorer MCP Server + Knowledge Base |
+
+## Architecture
+
+The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers. All MCP servers run as subprocesses within the AgentCore container -- no external infrastructure is required for the agent backend.
+
+```
++-----------------+     +------------------+     +------------------------+
+|   User Browser  |---->|  ECS Express     |---->|  Bedrock AgentCore     |
+|                 |     |  (Fargate + ALB) |     |  Runtime               |
+|                 |     |  (Next.js +      |     |  (Strands Agents +     |
+|                 |     |   CopilotKit)    |     |   Embedded MCP)        |
++-----------------+     +------------------+     +------------------------+
+       |                       |                          |
+       v                       v                          v
++-----------------+     +------------------+     +------------------------+
+| Amazon Cognito  |     | Amazon CloudWatch|     | AWS Services           |
+| (Authentication)|     | + AWS X-Ray      |     | - Amazon GameLift      |
+|                 |     | (Observability)  |     | - Amazon EKS           |
++-----------------+     +------------------+     | - AWS Cost Explorer    |
+                                                 | - Amazon Bedrock       |
+                                                 | - Bedrock Knowledge    |
+                                                 |   Bases (RAG)          |
+                                                 +------------------------+
+```
+
+### Request Flow
+
+1. User authenticates via Amazon Cognito (JWT tokens in HttpOnly cookies)
+2. User sends a natural language query through the Next.js frontend on ECS Express (Fargate + ALB)
+3. Frontend invokes Bedrock AgentCore Runtime using the AWS SDK with SigV4 authentication
+4. AgentCore routes the request to the Orchestrator agent
+5. Amazon Bedrock Guardrails filter input for prompt injection, off-topic content, and PII
+6. Orchestrator classifies the query and delegates to the appropriate specialist agent
+7. Specialist queries its Bedrock Knowledge Base for domain-specific context (RAG)
+8. Specialist invokes MCP servers (EKS, Cost Explorer) or boto3 tools (GameLift) for live AWS data
+9. Read-only API calls execute against target AWS services with least-privilege IAM policies
+10. Response flows back through the chain to the user
+
+### Technology Stack
+
+| Layer | Technology |
+|-------|------------|
+| Frontend | Next.js, TypeScript, CopilotKit, AWS SDK v3 |
+| Backend | Python 3.13, Strands Agents, Bedrock AgentCore SDK |
+| AI Models | Amazon Bedrock (Claude Haiku 4.5 for orchestration, Claude Sonnet 4.5 for specialists) |
+| MCP Servers | AWS Labs MCP servers (EKS, CCAPI, Cost Explorer) via stdio transport |
+| Authentication | Amazon Cognito with group-based authorization |
+| Infrastructure | AWS CloudFormation, ECS Express (Fargate + ALB), ECR |
+| Observability | Amazon CloudWatch, AWS X-Ray, OpenTelemetry |
+
+## Prerequisites
+
+### Required Tools
+
+| Tool | Version | Installation |
+|------|---------|--------------|
+| AWS CLI | v2+ | [Install Guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) |
+| Node.js | 18+ | [Download](https://nodejs.org/) |
+| uv | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| yq | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
+| Docker | Latest (optional) | [Install Guide](https://docs.docker.com/get-docker/) |
 
-The Guidance title should be consistent with the title established first in Alchemy.
+Python 3.13 and the AgentCore CLI are automatically installed by `uv` during setup. Docker is only required for building and deploying the frontend container image; frontend deployment steps are skipped if Docker is not available.
 
-**Example:** *Guidance for Product Substitutions on AWS*
+### AWS Account Requirements
 
-This title correlates exactly to the Guidance it’s linked to, including its corresponding sample code repository. 
+- **Bedrock Model Access**: Claude Sonnet 4.5 and Claude Haiku 4.5 enabled in your target region
+- **Service Quotas**: Default quotas are sufficient for most deployments
+- **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
+<details>
+<summary><strong>Minimum IAM permissions (click to expand)</strong></summary>
 
-## Table of Contents (required)
+If you cannot use Administrator access, the deploying principal needs permissions for:
 
-List the top-level sections of the README template, along with a hyperlink to the specific section.
+| Service | Actions Required | Purpose |
+|---------|-----------------|---------|
+| CloudFormation | Full stack CRUD | Deploy/update/delete all stacks |
+| IAM | Create/manage roles and policies | Service roles for ECS, AgentCore, etc. |
+| Amazon ECR | Repository CRUD, image push | Frontend container registry |
+| Amazon ECS | Service/task management | Frontend hosting |
+| Amazon Cognito | User pool CRUD | Authentication |
+| Amazon Bedrock | Model access, Guardrails, Knowledge Bases, AgentCore | AI agents and safety |
+| Amazon S3 | Bucket CRUD, object operations | Knowledge Base storage, CloudTrail logs |
+| CloudWatch Logs | Log group CRUD, delivery management | Observability |
+| AWS X-Ray | Trace read/write | Distributed tracing |
+| AWS CodeBuild | Project CRUD, build execution | AgentCore Runtime deployment |
+| AWS WAF | WebACL CRUD | Frontend protection |
+| AWS CloudTrail | Trail CRUD | API audit logging |
+| Amazon Inspector | Enable scanning | Container vulnerability scanning |
+| AWS STS | GetCallerIdentity | Credential verification |
 
-### Required
+The CloudFormation templates use `CAPABILITY_NAMED_IAM` to create scoped service roles with least-privilege access.
 
-1. [Overview](#overview-required)
-    - [Cost](#cost)
-2. [Prerequisites](#prerequisites-required)
-    - [Operating System](#operating-system-required)
-3. [Deployment Steps](#deployment-steps-required)
-4. [Deployment Validation](#deployment-validation-required)
-5. [Running the Guidance](#running-the-guidance-required)
-6. [Next Steps](#next-steps-required)
-7. [Cleanup](#cleanup-required)
-8. [Notices](#notices-optional)
+</details>
 
-***Optional***
+To enable Bedrock models:
 
-8. [FAQ, known issues, additional considerations, and limitations](#faq-known-issues-additional-considerations-and-limitations-optional)
-9. [Revisions](#revisions-optional)
-10. [Authors](#authors-optional)
+1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock/)
+2. Navigate to **Model access**
+3. Enable Anthropic Claude 4.5 Sonnet and Anthropic Claude 4.5 Haiku
+4. Save changes
 
-## Overview (required)
+### Windows Users
 
-1. Provide a brief overview explaining the what, why, or how of your Guidance. You can answer any one of the following to help you write this:
+Native Windows support is provided via the PowerShell module in `scripts/powershell/`. See [scripts/powershell/README.md](scripts/powershell/README.md) for setup and usage.
 
-    - **Why did you build this Guidance?**
-    - **What problem does this Guidance solve?**
+```powershell
+Import-Module ./scripts/powershell/GameAgent.psd1
+Deploy-GameAgent -Profile <your-profile>   # Full deployment
+Remove-GameAgent -Profile <your-profile>   # Full teardown
+```
 
-2. Include the architecture diagram image, as well as the steps explaining the high-level overview and flow of the architecture. 
-    - To add a screenshot, create an ‘assets/images’ folder in your repository and upload your screenshot to it. Then, using the relative file path, add it to your README. 
+**Prerequisites:** PowerShell 7.0+ and AWS CLI v2. No WSL2 or Linux environment required.
 
-### Cost ( required )
+## Deployment
 
-This section is for a high-level cost estimate. Think of a likely straightforward scenario with reasonable assumptions based on the problem the Guidance is trying to solve. Provide an in-depth cost breakdown table in this section below ( you should use AWS Pricing Calculator to generate cost breakdown ).
+### Full AWS Deployment
 
-Start this section with the following boilerplate text:
+**Step 1:** Configure and verify AWS credentials (run `aws configure` separately — it's interactive):
+```bash
+aws configure
+aws sts get-caller-identity  # Verify credentials work
+```
 
-_You are responsible for the cost of the AWS services used while running this Guidance. As of <month> <year>, the cost for running this Guidance with the default settings in the <Default AWS Region (Most likely will be US East (N. Virginia)) > is approximately $<n.nn> per month for processing ( <nnnnn> records )._
+**Step 2:** Create environment configuration and deploy:
+```bash
+# Create environment configuration
+cp ui/.env.local.example ui/.env.local
 
-Replace this amount with the approximate cost for running your Guidance in the default Region. This estimate should be per month and for processing/serving resonable number of requests/entities.
+# Deploy all infrastructure (8 automated steps)
+./deploy-all.sh
+# Optional: override AWS profile (can also be set in ui/.env.local)
+# AWS_PROFILE=<your-profile> ./deploy-all.sh
 
-Suggest you keep this boilerplate text:
-_We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance._
+# Create an admin user for the Cognito user pool
+./scripts/infrastructure/add-admin-user.sh
 
-### Sample Cost Table ( required )
+# Run tests against the deployed stack
+./test-full.sh
+```
 
-**Note : Once you have created a sample cost table using AWS Pricing Calculator, copy the cost breakdown to below table and upload a PDF of the cost estimation on BuilderSpace. Do not add the link to the pricing calculator in the ReadMe.**
+The deployment script provisions the following resources:
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month.
+1. Base infrastructure (Cognito user pool, IAM roles, ECR repositories)
+2. Bedrock Guardrails (content filtering, PII protection)
+3. Managed prompts (Bedrock Prompt Management)
+4. Account-level observability configuration
+5. AgentCore Runtime (backend container via CodeBuild)
+6. Bedrock Knowledge Bases (GameLift, EKS, Cost documentation)
+7. Frontend infrastructure (ECS Express + ALB)
+8. Security infrastructure (WAF, CloudTrail, Inspector)
 
-| AWS service  | Dimensions | Cost [USD] |
-| ----------- | ------------ | ------------ |
-| Amazon API Gateway | 1,000,000 REST API calls per month  | $ 3.50month |
-| Amazon Cognito | 1,000 active users per month without advanced security feature | $ 0.00 |
+See [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) for detailed step-by-step deployment instructions and environment variable reference.
 
-## Prerequisites (required)
+## Local Development
 
-### Operating System (required)
+```bash
+# Install backend dependencies
+cd backend && uv sync && cd ..
 
-- Talk about the base Operating System (OS) and environment that can be used to run or deploy this Guidance, such as *Mac, Linux, or Windows*. Include all installable packages or modules required for the deployment. 
-- By default, assume Amazon Linux 2/Amazon Linux 2023 AMI as the base environment. All packages that are not available by default in AMI must be listed out.  Include the specific version number of the package or module.
+# Create environment configuration (if not already done)
+cp ui/.env.local.example ui/.env.local
 
-**Example:**
-“These deployment instructions are optimized to best work on **<Amazon Linux 2 AMI>**.  Deployment in another OS may require additional steps.”
+# Start both backend (port 8080) and frontend (port 3000)
+./dev-start.sh
 
-- Include install commands for packages, if applicable.
+# Access the UI at http://localhost:3000
 
+# Stop all services
+./dev-stop.sh
+```
 
-### Third-party tools (If applicable)
+In local development mode:
 
-*List any installable third-party tools required for deployment.*
+- AgentCore Runtime runs locally with all specialist agents
+- MCP servers run embedded via stdio transport
+- Frontend connects directly to the local backend (no Cognito auth by default)
+- AWS service access (GameLift, EKS, Cost Explorer) uses your local AWS credentials
 
+### Backend Only
 
-### AWS account requirements (If applicable)
+```bash
+cd backend
+uv sync
+source .venv/bin/activate
+python src/agentcore_main.py
+```
 
-*List out pre-requisites required on the AWS account if applicable, this includes enabling AWS regions, requiring ACM certificate.*
+### Frontend Only
 
-**Example:** “This deployment requires you have public ACM certificate available in your AWS account”
+```bash
+cd ui
+npm install
+npm run dev
+```
 
-**Example resources:**
-- ACM certificate 
-- DNS record
-- S3 bucket
-- VPC
-- IAM role with specific permissions
-- Enabling a Region or service etc.
+## Usage
 
+Once the application is running (locally or deployed), interact with the AI assistant through the chat interface.
 
-### aws cdk bootstrap (if sample code has aws-cdk)
+### GameLift Management
 
-<If using aws-cdk, include steps for account bootstrap for new cdk users.>
+```
+"Show me my GameLift fleets"
+"How is my production fleet performing?"
+"What scaling configuration does my fleet use?"
+```
 
-**Example blurb:** “This Guidance uses aws-cdk. If you are using aws-cdk for first time, please perform the below bootstrapping....”
+### EKS/Kubernetes Operations
 
-### Service limits  (if applicable)
+```
+"List my EKS clusters"
+"Show me failing pods in the default namespace"
+"What's the status of my game-agones-cluster?"
+```
 
-<Talk about any critical service limits that affect the regular functioning of the Guidance. If the Guidance requires service limit increase, include the service name, limit name and link to the service quotas page.>
+### Cost Analysis
 
-### Supported Regions (if applicable)
+```
+"What's my current AWS spending?"
+"How much am I spending on GameLift vs EKS?"
+"Show me cost optimization opportunities"
+```
 
-<If the Guidance is built for specific AWS Regions, or if the services used in the Guidance do not support all Regions, please specify the Region this Guidance is best suited for>
+### Authentication
 
+- **Development mode** (`NEXT_PUBLIC_SKIP_AUTH=true`): No authentication required (default in `.env.local`)
+- **Production mode** (`NEXT_PUBLIC_SKIP_AUTH=false`): Cognito authentication enforced; users must be in the `admin` or `users` group
 
-## Deployment Steps (required)
+## MCP Integration
 
-Deployment steps must be numbered, comprehensive, and usable to customers at any level of AWS expertise. The steps must include the precise commands to run, and describe the action it performs.
+All three MCP servers use stdio transport exclusively. They run as embedded subprocesses within the AgentCore Runtime container.
 
-* All steps must be numbered.
-* If the step requires manual actions from the AWS console, include a screenshot if possible.
-* The steps must start with the following command to clone the repo. ```git clone xxxxxxx```
-* If applicable, provide instructions to create the Python virtual environment, and installing the packages using ```requirement.txt```.
-* If applicable, provide instructions to capture the deployed resource ARN or ID using the CLI command (recommended), or console action.
+| MCP Server | Purpose | Specialist |
+|------------|---------|------------|
+| `awslabs.eks-mcp-server` | Kubernetes cluster management | EKS Specialist |
+| `awslabs.ccapi-mcp-server` | CloudFormation resource discovery | GameLift Specialist |
+| `awslabs.cost-explorer-mcp-server` | Cost analysis and forecasting | Cost Specialist |
 
- 
-**Example:**
+MCP clients are created through a thread-safe factory (`utils/mcp_client_factory.py`) with automatic retry and fallback to boto3 when MCP servers are unavailable.
 
-1. Clone the repo using command ```git clone xxxxxxxxxx```
-2. cd to the repo folder ```cd <repo-name>```
-3. Install packages in requirements using command ```pip install requirement.txt```
-4. Edit content of **file-name** and replace **s3-bucket** with the bucket name in your account.
-5. Run this command to deploy the stack ```cdk deploy``` 
-6. Capture the domain name created by running this CLI command ```aws apigateway ............```
+### Enrolling EKS Clusters
 
+To enable full Kubernetes API access (pods, deployments, services), enroll your EKS clusters:
 
+```bash
+cd infrastructure/kubernetes
 
-## Deployment Validation  (required)
+# Basic enrollment
+./enroll-cluster.sh my-cluster us-west-2
 
-<Provide steps to validate a successful deployment, such as terminal output, verifying that the resource is created, status of the CloudFormation template, etc.>
+# With audit logging
+./enroll-cluster.sh my-cluster us-west-2 --enable-audit-logs
 
+# Deregister a cluster
+./deregister-cluster.sh my-cluster us-west-2
+```
 
-**Examples:**
+Enrollment configures read-only Kubernetes RBAC and updates the `aws-auth` ConfigMap. Secrets are explicitly excluded from the read-only permissions.
 
-* Open CloudFormation console and verify the status of the template with the name starting with xxxxxx.
-* If deployment is successful, you should see an active database instance with the name starting with <xxxxx> in        the RDS console.
-*  Run the following CLI command to validate the deployment: ```aws cloudformation describe xxxxxxxxxxxxx```
+## Testing
 
+The project includes unit, integration, end-to-end, and AI evaluation tests.
+
+### Quick Start
+
+```bash
+# Unit tests only (no deployment or running services needed)
+./test-unit.sh
 
+# Full smart test suite (auto-detects deployment status)
+./test-full.sh
+```
 
-## Running the Guidance (required)
+### Test Categories
 
-<Provide instructions to run the Guidance with the sample data or input provided, and interpret the output received.> 
+| Command | Description | Requirements |
+|---------|-------------|--------------|
+| `./test-unit.sh` | Backend + frontend unit tests | None |
+| `./test-local.sh` | Unit tests only | None |
+| `./test-cloud.sh` | Cloud integration tests | Deployed stack |
+| `./test-e2e.sh` | End-to-end browser tests | Running services |
+| `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack |
+| `./test-stress.sh` | Performance and load tests | Deployed stack |
+| `./test-memory.sh` | Memory subsystem tests | Deployed stack |
+
+### Backend Tests (pytest)
+
+```bash
+cd backend
+pytest -m unit              # Fast unit tests (mocked)
+pytest -m integration       # Integration tests (real services)
+pytest -m cloud             # Cloud-only tests (requires deployment)
+pytest -m ai_eval           # AI evaluation tests
+```
 
-This section should include:
+### Frontend Tests
 
-* Guidance inputs
-* Commands to run
-* Expected output (provide screenshot if possible)
-* Output description
+```bash
+cd ui
+npm test                    # Jest unit tests
+npm run test:coverage       # Coverage report
+npm run test:e2e            # Playwright E2E tests
+npm run test:e2e:smoke      # Smoke tests only
+```
 
+## Monitoring and Observability
 
+The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing.
 
-## Next Steps (required)
+- **CloudWatch Logs**: Structured JSON logs from all components (14-day retention for application logs, 90-day for audit logs)
+- **AWS X-Ray**: Distributed tracing across the full request flow, from frontend through AgentCore to AWS service calls
+- **OpenTelemetry**: Instrumentation for traces and metrics exported via ADOT (AWS Distro for OpenTelemetry)
 
-Provide suggestions and recommendations about how customers can modify the parameters and the components of the Guidance to further enhance it according to their requirements.
+```bash
+# View runtime logs
+aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT --follow
 
+# View frontend logs
+aws logs tail /ecs/game-agent-frontend --follow
+```
 
-## Cleanup (required)
+X-Ray traces are available in the AWS Console under CloudWatch > Gen AI Observability > AgentCore.
 
-- Include detailed instructions, commands, and console actions to delete the deployed Guidance.
-- If the Guidance requires manual deletion of resources, such as the content of an S3 bucket, please specify.
+## Project Structure
 
+```
+sample-game-backend-agentic-workflows/
+├── backend/                        # Python AgentCore Runtime backend
+│   ├── src/
+│   │   ├── agents/                 # Orchestrator and specialist agents
+│   │   ├── config/                 # Configuration (settings.py)
+│   │   ├── models/                 # AI model configurations
+│   │   ├── utils/                  # MCP client factory, logging, timing
+│   │   └── agentcore_main.py       # AgentCore Runtime entrypoint
+│   └── tests/                      # Unit, integration, and AI evaluation tests
+├── ui/                             # Next.js frontend
+│   ├── src/
+│   │   ├── components/             # React components (Chat)
+│   │   ├── pages/                  # Next.js pages and API routes
+│   │   └── lib/                    # Utility libraries
+│   └── __tests__/                  # Frontend tests
+├── infrastructure/                 # CloudFormation templates and Kubernetes scripts
+│   ├── cloudformation/             # IaC deployment templates
+│   └── kubernetes/                 # EKS cluster enrollment scripts
+├── scripts/                        # Deployment and development automation
+│   ├── deploy.sh                   # Main deployment logic
+│   ├── teardown.sh                 # Main teardown logic
+│   ├── powershell/                 # PowerShell module for Windows (Deploy-GameAgent, etc.)
+│   ├── dev/                        # Development environment scripts
+│   ├── test/                       # Testing automation
+│   └── infrastructure/             # Infrastructure utilities
+├── docs/                           # Additional documentation
+│   ├── ARCHITECTURE.md             # Detailed architecture documentation
+│   ├── DEPLOYMENT_GUIDE.md         # Step-by-step deployment guide
+│   ├── SECURITY.md                 # Security controls and compliance
+│   ├── THREAT_MODEL.md             # STRIDE threat analysis
+│   └── DEPENDENCY_MATRIX.md        # Dependency versions and pinning rationale
+├── deploy-all.sh                   # Full AWS deployment (wrapper)
+├── teardown-all.sh                 # Full AWS teardown (wrapper)
+├── dev-start.sh                    # Start local development
+├── dev-stop.sh                     # Stop local development
+├── test-full.sh                    # Run all tests (auto-detects mode)
+└── test-unit.sh                    # Run unit tests
+```
 
+Root-level shell scripts are convenience wrappers that delegate to the corresponding scripts in `scripts/`.
 
-## FAQ, known issues, additional considerations, and limitations (optional)
+## Security
 
+> **📖 Full documentation:** [SECURITY.md](SECURITY.md) (encryption, data protection, trust boundaries, patching) | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) (STRIDE threat analysis with attack trees)
 
-**Known issues (optional)**
+This solution implements defense-in-depth security controls across all layers:
 
-<If there are common known issues, or errors that can occur during the Guidance deployment, describe the issue and resolution steps here>
+| Layer | Controls |
+|-------|----------|
+| **Authentication** | Amazon Cognito with JWT tokens, group-based authorization, admin-only user creation |
+| **Transport** | TLS 1.2+ enforced on all connections (AWS-managed certificates) |
+| **Encryption** | AES-256 encryption at rest for all data (S3, CloudWatch, AgentCore Memory) |
+| **Authorization** | IAM least-privilege policies with read-only access to target services |
+| **AI Safety** | Amazon Bedrock Guardrails for content filtering, PII anonymization, and prompt injection detection |
+| **Input Validation** | Prompt sanitization, injection pattern detection, sensitive data redaction ([utils/security.py](backend/src/utils/security.py)) |
+| **Audit** | CloudTrail logging for all AWS API calls, CloudWatch for application activity |
+| **Vulnerability Scanning** | AWS Inspector for container images, Dependabot for dependency updates |
+| **No Static Credentials** | All service-to-service authentication uses IAM roles with automatic credential rotation |
 
+## Cleanup
 
-**Additional considerations (if applicable)**
+To remove all deployed resources:
 
-<Include considerations the customer must know while using the Guidance, such as anti-patterns, or billing considerations.>
+```bash
+AWS_PROFILE=<your-profile> ./teardown-all.sh
+```
 
-**Examples:**
+The teardown script is idempotent and removes resources in reverse deployment order.
 
-- “This Guidance creates a public AWS bucket required for the use-case.”
-- “This Guidance created an Amazon SageMaker notebook that is billed per hour irrespective of usage.”
-- “This Guidance creates unauthenticated public API endpoints.”
+## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs, suggesting features, and submitting pull requests.
 
-Provide a link to the *GitHub issues page* for users to provide feedback.
+## License
 
-
-**Example:** *“For any feedback, questions, or suggestions, please use the issues tab under this repo.”*
-
-## Revisions (optional)
-
-Document all notable changes to this project.
-
-Consider formatting this section based on Keep a Changelog, and adhering to Semantic Versioning.
-
-## Notices ( required )
-
-Include below mandatory legal disclaimer for Guidance
-
-*Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided “as is” without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.*
-
-
-## Authors (optional)
-
-Name of code contributors
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
