@@ -871,7 +871,7 @@ wcwidth==0.2.14
     #   prompt-toolkit
 websocket-client==1.9.0
     # via kubernetes
-websockets==15.0.1
+websockets==16.0
     # via bedrock-agentcore
 win32-setctime==1.2.0 ; sys_platform == 'win32'
     # via loguru
