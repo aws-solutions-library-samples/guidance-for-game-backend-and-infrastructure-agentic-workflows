@@ -2,9 +2,9 @@
 #    uv pip compile pyproject.toml -o requirements.txt
 aiodns==3.6.1
     # via checkov
-aiohappyeyeballs==2.6.1
+aiohappyeyeballs==2.6.2
     # via aiohttp
-aiohttp==3.13.2
+aiohttp==3.14.1
     # via
     #   checkov
     #   openai
@@ -15,15 +15,15 @@ aiosignal==1.4.0
     # via aiohttp
 annotated-types==0.7.0
     # via pydantic
-anyio==4.11.0
+anyio==4.14.0
     # via
     #   httpx
     #   mcp
 aiodns==3.6.1
     # via checkov
-aiohappyeyeballs==2.6.1
+aiohappyeyeballs==2.6.2
     # via aiohttp
-aiohttp==3.13.2
+aiohttp==3.14.1
     # via
     #   checkov
     #   openai
@@ -34,7 +34,7 @@ aiosignal==1.4.0
     # via aiohttp
 annotated-types==0.7.0
     # via pydantic
-anyio==4.11.0
+anyio==4.14.0
     # via
     #   httpx
     #   mcp
@@ -42,14 +42,14 @@ anyio==4.11.0
     #   starlette
 argcomplete==3.6.3
     # via checkov
-asgiref==3.10.0
+asgiref==3.11.1
     # via opentelemetry-instrumentation-asgi
 attrs==25.4.0
     # via
     #   aiohttp
     #   jsonschema
     #   referencing
-aws-opentelemetry-distro==0.14.0
+aws-opentelemetry-distro==0.17.1
     # via game-agent-backend
 aws-requests-auth==0.4.3
     # via strands-agents-tools
@@ -61,24 +61,24 @@ awslabs-cost-explorer-mcp-server==0.0.13
     # via game-agent-backend
 awslabs-eks-mcp-server==0.1.14
     # via game-agent-backend
-bc-detect-secrets==1.4.30
+bc-detect-secrets==1.5.47
     # via checkov
 bc-jsonpath-ng==1.6.1
     # via checkov
-bc-python-hcl2==0.4.2
+bc-python-hcl2==0.4.3
     # via checkov
 beartype==0.22.9
     # via spdx-tools
-beautifulsoup4==4.14.2
+beautifulsoup4==4.15.0
     # via
     #   game-agent-backend
     #   markdownify
     #   policy-sentry
-bedrock-agentcore==1.1.1
+bedrock-agentcore==1.14.1
     # via game-agent-backend
 boolean-py==5.0
     # via license-expression
-boto3==1.42.10
+boto3==1.43.32
     # via
     #   awslabs-ccapi-mcp-server
     #   awslabs-core-mcp-server
@@ -89,7 +89,7 @@ boto3==1.42.10
     #   cloudsplaining
     #   game-agent-backend
     #   strands-agents
-botocore==1.42.10
+botocore==1.43.32
     # via
     #   awslabs-ccapi-mcp-server
     #   bedrock-agentcore
@@ -118,13 +118,13 @@ cffi==2.0.0
     #   pycares
 cfgv==3.5.0
     # via pre-commit
-charset-normalizer==3.4.4
+charset-normalizer==3.4.7
     # via
     #   checkov
     #   requests
-checkov==3.1.47
+checkov==3.3.1
     # via awslabs-ccapi-mcp-server
-click==8.3.0
+click==8.4.1
     # via
     #   checkov
     #   click-option-group
@@ -135,7 +135,7 @@ click==8.3.0
     #   uvicorn
 click-option-group==0.5.9
     # via cloudsplaining
-cloudsplaining==0.8.2
+cloudsplaining==0.9.1
     # via checkov
 colorama==0.4.6
     # via
@@ -143,13 +143,13 @@ colorama==0.4.6
     #   click
     #   loguru
     #   tqdm
-configargparse==1.7.1
+configargparse==1.7.5
     # via checkov
 cryptography==46.0.3
     # via pyjwt
 cyclonedx-python-lib==5.2.0
     # via checkov
-decorator==5.2.1
+decorator==5.3.1
     # via bc-jsonpath-ng
 defusedxml==0.7.1
     # via py-serializable
@@ -160,21 +160,21 @@ deprecated==1.3.1
     #   opentelemetry-exporter-otlp-proto-http
     #   opentelemetry-propagator-b3
     #   opentelemetry-semantic-conventions
-dill==0.4.0
+dill==0.4.1
     # via strands-agents-tools
-distlib==0.4.0
+distlib==0.4.3
     # via virtualenv
 docker==7.1.0
     # via checkov
 dockerfile-parse==2.0.1
     # via checkov
-docstring-parser==0.17.0
+docstring-parser==0.18.0
     # via strands-agents
-dpath==2.1.3
+dpath==2.2.0
     # via checkov
 durationpy==0.10
     # via kubernetes
-filelock==3.20.0
+filelock==3.29.4
     # via virtualenv
 frozenlist==1.8.0
     # via
@@ -182,15 +182,15 @@ frozenlist==1.8.0
     #   aiosignal
 gitdb==4.0.12
     # via gitpython
-gitpython==3.1.45
+gitpython==3.1.50
     # via checkov
-google-auth==2.44.0
+google-auth==2.55.0
     # via kubernetes
-googleapis-common-protos==1.71.0
+googleapis-common-protos==1.75.0
     # via
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-grpcio==1.76.0
+grpcio==1.81.1
     # via opentelemetry-exporter-otlp-proto-grpc
 h11==0.16.0
     # via
@@ -209,9 +209,9 @@ httpx-auth-awssigv4==0.1.4
     # via game-agent-backend
 httpx-sse==0.4.3
     # via mcp
-identify==2.6.15
+identify==2.6.19
     # via pre-commit
-idna==3.11
+idna==3.18
     # via
     #   anyio
     #   httpx
@@ -225,12 +225,12 @@ importlib-metadata==8.6.1
     #   opentelemetry-api
 jinja2==3.1.6
     # via cloudsplaining
-jmespath==1.0.1
+jmespath==1.1.0
     # via
     #   boto3
     #   botocore
     #   checkov
-jsonschema==4.25.1
+jsonschema==4.26.0
     # via
     #   checkov
     #   mcp
@@ -257,11 +257,11 @@ loguru==0.7.3
     #   awslabs-cost-explorer-mcp-server
     #   awslabs-eks-mcp-server
     #   game-agent-backend
-markdown==3.10
+markdown==3.10.2
     # via cloudsplaining
-markdown-it-py==4.0.0
+markdown-it-py==4.2.0
     # via rich
-markdownify==1.2.0
+markdownify==1.2.2
     # via strands-agents-tools
 markupsafe==3.0.3
     # via jinja2
@@ -275,17 +275,17 @@ mcp==1.18.0
     #   strands-agents
 mdurl==0.1.2
     # via markdown-it-py
-mpmath==1.3.0
+mpmath==1.4.1
     # via sympy
-multidict==6.7.0
+multidict==6.7.1
     # via
     #   aiohttp
     #   yarl
 networkx==2.6.3
     # via checkov
-nodeenv==1.9.1
+nodeenv==1.10.0
     # via pre-commit
-numpy==2.3.5
+numpy==2.4.6
     # via
     #   pandas
     #   rustworkx
@@ -295,7 +295,7 @@ oauthlib==3.3.1
     #   requests-oauthlib
 openai==0.28.1
     # via checkov
-opentelemetry-api==1.33.1
+opentelemetry-api==1.42.1
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-distro
@@ -354,20 +354,20 @@ opentelemetry-api==1.33.1
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
     #   strands-agents
-opentelemetry-distro==0.54b1
+opentelemetry-distro==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-exporter-otlp-proto-common==1.33.1
+opentelemetry-exporter-otlp-proto-common==1.42.1
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-exporter-otlp-proto-grpc==1.33.1
+opentelemetry-exporter-otlp-proto-grpc==1.42.1
     # via aws-opentelemetry-distro
-opentelemetry-exporter-otlp-proto-http==1.33.1
+opentelemetry-exporter-otlp-proto-http==1.42.1
     # via
     #   aws-opentelemetry-distro
     #   strands-agents
-opentelemetry-instrumentation==0.54b1
+opentelemetry-instrumentation==0.63b1
     # via
     #   aws-opentelemetry-distro
     #   game-agent-backend
@@ -417,36 +417,36 @@ opentelemetry-instrumentation==0.54b1
     #   opentelemetry-instrumentation-urllib
     #   opentelemetry-instrumentation-urllib3
     #   opentelemetry-instrumentation-wsgi
-opentelemetry-instrumentation-aio-pika==0.54b1
+opentelemetry-instrumentation-aio-pika==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-aiohttp-client==0.54b1
+opentelemetry-instrumentation-aiohttp-client==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-aiokafka==0.54b1
+opentelemetry-instrumentation-aiokafka==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-aiopg==0.54b1
+opentelemetry-instrumentation-aiopg==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-asgi==0.54b1
+opentelemetry-instrumentation-asgi==0.63b1
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-instrumentation-fastapi
     #   opentelemetry-instrumentation-starlette
-opentelemetry-instrumentation-asyncpg==0.54b1
+opentelemetry-instrumentation-asyncpg==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-aws-lambda==0.54b1
+opentelemetry-instrumentation-aws-lambda==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-boto==0.54b1
+opentelemetry-instrumentation-boto==0.61b0
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-boto3sqs==0.54b1
+opentelemetry-instrumentation-boto3sqs==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-botocore==0.54b1
+opentelemetry-instrumentation-botocore==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-cassandra==0.54b1
+opentelemetry-instrumentation-cassandra==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-celery==0.54b1
+opentelemetry-instrumentation-celery==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-confluent-kafka==0.54b1
+opentelemetry-instrumentation-confluent-kafka==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-dbapi==0.54b1
+opentelemetry-instrumentation-dbapi==0.63b1
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-instrumentation-aiopg
@@ -455,92 +455,92 @@ opentelemetry-instrumentation-dbapi==0.54b1
     #   opentelemetry-instrumentation-psycopg2
     #   opentelemetry-instrumentation-pymysql
     #   opentelemetry-instrumentation-sqlite3
-opentelemetry-instrumentation-django==0.54b1
+opentelemetry-instrumentation-django==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-elasticsearch==0.54b1
+opentelemetry-instrumentation-elasticsearch==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-falcon==0.54b1
+opentelemetry-instrumentation-falcon==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-fastapi==0.54b1
+opentelemetry-instrumentation-fastapi==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-flask==0.54b1
+opentelemetry-instrumentation-flask==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-grpc==0.54b1
+opentelemetry-instrumentation-grpc==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-httpx==0.54b1
+opentelemetry-instrumentation-httpx==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-jinja2==0.54b1
+opentelemetry-instrumentation-jinja2==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-kafka-python==0.54b1
+opentelemetry-instrumentation-kafka-python==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-logging==0.54b1
+opentelemetry-instrumentation-logging==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-mysql==0.54b1
+opentelemetry-instrumentation-mysql==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-mysqlclient==0.54b1
+opentelemetry-instrumentation-mysqlclient==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-pika==0.54b1
+opentelemetry-instrumentation-pika==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-psycopg2==0.54b1
+opentelemetry-instrumentation-psycopg2==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-pymemcache==0.54b1
+opentelemetry-instrumentation-pymemcache==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-pymongo==0.54b1
+opentelemetry-instrumentation-pymongo==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-pymysql==0.54b1
+opentelemetry-instrumentation-pymysql==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-pyramid==0.54b1
+opentelemetry-instrumentation-pyramid==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-redis==0.54b1
+opentelemetry-instrumentation-redis==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-remoulade==0.54b1
+opentelemetry-instrumentation-remoulade==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-requests==0.54b1
+opentelemetry-instrumentation-requests==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-sqlalchemy==0.54b1
+opentelemetry-instrumentation-sqlalchemy==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-sqlite3==0.54b1
+opentelemetry-instrumentation-sqlite3==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-starlette==0.54b1
+opentelemetry-instrumentation-starlette==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-system-metrics==0.54b1
+opentelemetry-instrumentation-system-metrics==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-threading==0.54b1
+opentelemetry-instrumentation-threading==0.63b1
     # via strands-agents
-opentelemetry-instrumentation-tornado==0.54b1
+opentelemetry-instrumentation-tornado==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-tortoiseorm==0.54b1
+opentelemetry-instrumentation-tortoiseorm==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-urllib==0.54b1
+opentelemetry-instrumentation-urllib==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-urllib3==0.54b1
+opentelemetry-instrumentation-urllib3==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-instrumentation-wsgi==0.54b1
+opentelemetry-instrumentation-wsgi==0.63b1
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-instrumentation-django
     #   opentelemetry-instrumentation-falcon
     #   opentelemetry-instrumentation-flask
     #   opentelemetry-instrumentation-pyramid
-opentelemetry-processor-baggage==0.54b1
+opentelemetry-processor-baggage==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-propagator-aws-xray==1.0.1
+opentelemetry-propagator-aws-xray==1.0.2
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-instrumentation-aws-lambda
     #   opentelemetry-instrumentation-botocore
-opentelemetry-propagator-b3==1.33.1
+opentelemetry-propagator-b3==1.42.1
     # via aws-opentelemetry-distro
-opentelemetry-propagator-jaeger==1.33.1
+opentelemetry-propagator-jaeger==1.42.1
     # via aws-opentelemetry-distro
-opentelemetry-propagator-ot-trace==0.54b1
+opentelemetry-propagator-ot-trace==0.63b1
     # via aws-opentelemetry-distro
-opentelemetry-proto==1.33.1
+opentelemetry-proto==1.42.1
     # via
     #   opentelemetry-exporter-otlp-proto-common
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
-opentelemetry-sdk==1.33.1
+opentelemetry-sdk==1.42.1
     # via
     #   aws-opentelemetry-distro
     #   opentelemetry-distro
@@ -550,9 +550,9 @@ opentelemetry-sdk==1.33.1
     #   opentelemetry-propagator-ot-trace
     #   opentelemetry-sdk-extension-aws
     #   strands-agents
-opentelemetry-sdk-extension-aws==2.0.2
+opentelemetry-sdk-extension-aws==2.1.0
     # via aws-opentelemetry-distro
-opentelemetry-semantic-conventions==0.54b1
+opentelemetry-semantic-conventions==0.63b1
     # via
     #   opentelemetry-instrumentation
     #   opentelemetry-instrumentation-aiohttp-client
@@ -588,7 +588,7 @@ opentelemetry-semantic-conventions==0.54b1
     #   opentelemetry-instrumentation-urllib3
     #   opentelemetry-instrumentation-wsgi
     #   opentelemetry-sdk
-opentelemetry-util-http==0.54b1
+opentelemetry-util-http==0.63b1
     # via
     #   opentelemetry-instrumentation-aiohttp-client
     #   opentelemetry-instrumentation-asgi
@@ -604,7 +604,7 @@ opentelemetry-util-http==0.54b1
     #   opentelemetry-instrumentation-urllib
     #   opentelemetry-instrumentation-urllib3
     #   opentelemetry-instrumentation-wsgi
-orjson==3.11.5
+orjson==3.11.9
     # via policy-sentry
 packageurl-python==0.17.6
     # via
@@ -622,21 +622,21 @@ pandas==2.3.3
     # via awslabs-cost-explorer-mcp-server
 pillow==11.3.0
     # via strands-agents-tools
-platformdirs==4.5.1
+platformdirs==4.10.0
     # via virtualenv
 ply==3.11
     # via
     #   bc-jsonpath-ng
     #   spdx-tools
-policy-sentry==0.14.2
+policy-sentry==0.15.2
     # via cloudsplaining
-pre-commit==4.5.0
+pre-commit==4.6.0
     # via bedrock-agentcore
 prettytable==3.17.0
     # via checkov
 prompt-toolkit==3.0.52
     # via strands-agents-tools
-propcache==0.4.1
+propcache==0.5.2
     # via
     #   aiohttp
     #   yarl
@@ -644,13 +644,13 @@ protobuf==5.29.5
     # via
     #   googleapis-common-protos
     #   opentelemetry-proto
-psutil==7.1.3
+psutil==7.2.2
     # via
     #   game-agent-backend
     #   opentelemetry-instrumentation-system-metrics
 py-serializable==0.15.0
     # via cyclonedx-python-lib
-pyasn1==0.6.1
+pyasn1==0.6.3
     # via
     #   pyasn1-modules
     #   rsa
@@ -658,11 +658,11 @@ pyasn1-modules==0.4.2
     # via google-auth
 pycares==4.11.0
     # via aiodns
-pycep-parser==0.4.1
+pycep-parser==0.7.0
     # via checkov
 pycparser==2.23 ; implementation_name != 'PyPy'
     # via cffi
-pydantic==2.12.3
+pydantic==2.13.4
     # via
     #   awslabs-ccapi-mcp-server
     #   awslabs-core-mcp-server
@@ -674,32 +674,32 @@ pydantic==2.12.3
     #   mcp
     #   pydantic-settings
     #   strands-agents
-pydantic-core==2.41.4
+pydantic-core==2.47.0
     # via pydantic
-pydantic-settings==2.11.0
+pydantic-settings==2.14.1
     # via mcp
-pygments==2.19.2
+pygments==2.20.0
     # via rich
-pyjwt==2.10.1
+pyjwt==2.13.0
     # via
     #   game-agent-backend
     #   strands-agents-tools
-pyparsing==3.2.5
+pyparsing==3.3.2
     # via rdflib
-pypdf==6.4.2
+pypdf==6.13.3
     # via game-agent-backend
 python-dateutil==2.9.0.post0
     # via
     #   botocore
     #   kubernetes
     #   pandas
-python-dotenv==1.2.1
+python-dotenv==1.2.2
     # via
     #   awslabs-core-mcp-server
     #   game-agent-backend
     #   mcp
     #   pydantic-settings
-python-multipart==0.0.20
+python-multipart==0.0.32
     # via mcp
 pytz==2025.2
     # via pandas
@@ -718,15 +718,15 @@ pyyaml==6.0.3
     #   policy-sentry
     #   pre-commit
     #   spdx-tools
-rdflib==7.5.0
+rdflib==7.6.0
     # via spdx-tools
-referencing==0.36.2
+referencing==0.37.0
     # via
     #   jsonschema
     #   jsonschema-specifications
 regex==2025.11.3
     # via pycep-parser
-requests==2.32.5
+requests==2.34.2
     # via
     #   aws-requests-auth
     #   awslabs-eks-mcp-server
@@ -758,7 +758,7 @@ rsa==4.9.1
     # via google-auth
 rustworkx==0.17.1
     # via checkov
-s3transfer==0.16.0
+s3transfer==0.19.0
     # via boto3
 schema==0.7.8
     # via
@@ -777,48 +777,48 @@ six==1.17.0
     #   kubernetes
     #   markdownify
     #   python-dateutil
-slack-bolt==1.26.0
+slack-bolt==1.28.0
     # via strands-agents-tools
-slack-sdk==3.37.0
+slack-sdk==3.42.0
     # via slack-bolt
-smmap==5.0.2
+smmap==5.0.3
     # via gitdb
 sniffio==1.3.1
     # via anyio
 sortedcontainers==2.4.0
     # via cyclonedx-python-lib
-soupsieve==2.8
+soupsieve==2.8.4
     # via beautifulsoup4
-spdx-tools==0.8.3
+spdx-tools==0.8.5
     # via checkov
-sse-starlette==3.0.3
+sse-starlette==3.4.4
     # via mcp
 starlette==0.50.0
     # via
     #   bedrock-agentcore
     #   mcp
-strands-agents==1.20.0
+strands-agents==1.44.0
     # via
     #   bedrock-agentcore
     #   game-agent-backend
     #   strands-agents-tools
-strands-agents-tools==0.2.17
+strands-agents-tools==0.8.1
     # via game-agent-backend
 sympy==1.14.0
     # via strands-agents-tools
-tabulate==0.9.0
+tabulate==0.10.0
     # via checkov
-tenacity==9.1.2
+tenacity==9.1.4
     # via strands-agents-tools
-termcolor==3.2.0
+termcolor==3.3.0
     # via checkov
 texttable==1.7.0
     # via igraph
-tqdm==4.67.1
+tqdm==4.68.3
     # via
     #   checkov
     #   openai
-typer==0.20.0
+typer==0.26.7
     # via mcp
 typing-extensions==4.15.0
     # via
@@ -848,14 +848,14 @@ update-checker==0.18.0
     # via checkov
 uritools==5.0.0
     # via spdx-tools
-urllib3==2.5.0
+urllib3==2.7.0
     # via
     #   bedrock-agentcore
     #   botocore
     #   docker
     #   kubernetes
     #   requests
-uvicorn==0.38.0
+uvicorn==0.49.0
     # via
     #   bedrock-agentcore
     #   mcp
@@ -865,7 +865,7 @@ watchdog==6.0.0
     # via
     #   strands-agents
     #   strands-agents-tools
-wcwidth==0.2.14
+wcwidth==0.8.1
     # via
     #   prettytable
     #   prompt-toolkit
@@ -898,9 +898,9 @@ wrapt==1.17.3
     #   opentelemetry-instrumentation-threading
     #   opentelemetry-instrumentation-urllib3
     #   opentelemetry-processor-baggage
-xmltodict==1.0.2
+xmltodict==1.0.4
     # via spdx-tools
-yarl==1.22.0
+yarl==1.24.2
     # via
     #   aiohttp
     #   checkov
