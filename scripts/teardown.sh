@@ -275,6 +275,17 @@ else
   echo "⚠️  Infrastructure stack not found"
 fi
 
+# Step 5c: Delete Solution ID tracking stack
+echo ""
+echo "🗑️  Step 5c: Deleting Solution ID tracking stack..."
+if aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-solution-tracking --region $AWS_REGION &>/dev/null; then
+  aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-solution-tracking --region $AWS_REGION
+  aws cloudformation wait stack-delete-complete --stack-name ${PROJECT_NAME}-solution-tracking --region $AWS_REGION
+  echo "✅ Solution tracking stack deleted"
+else
+  echo "ℹ️  Solution tracking stack not found (already deleted or never deployed)"
+fi
+
 # Step 6: Clean up downloaded KB documentation
 echo ""
 echo "🗑️  Step 6: Cleaning up downloaded documentation..."
