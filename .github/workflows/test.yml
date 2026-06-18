@@ -44,9 +44,17 @@ jobs:
         cache: 'npm'
         cache-dependency-path: './ui/package-lock.json'
 
+    - name: Cache node_modules
+      id: cache-node-modules
+      uses: actions/cache@v5
+      with:
+        path: ui/node_modules
+        key: node-modules-${{ runner.os }}-node24-${{ hashFiles('ui/package-lock.json') }}
+
     - name: Install dependencies
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
       working-directory: ./ui
-      run: npm ci
+      run: npm ci --prefer-offline --no-audit
 
     - name: Run frontend unit tests
       working-directory: ./ui
@@ -70,9 +78,17 @@ jobs:
         cache: 'npm'
         cache-dependency-path: './ui/package-lock.json'
 
+    - name: Cache node_modules
+      id: cache-node-modules
+      uses: actions/cache@v5
+      with:
+        path: ui/node_modules
+        key: node-modules-${{ runner.os }}-node24-${{ hashFiles('ui/package-lock.json') }}
+
     - name: Install frontend dependencies
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
       working-directory: ./ui
-      run: npm ci
+      run: npm ci --prefer-offline --no-audit
 
     - name: Install Playwright
       working-directory: ./ui
