@@ -88,6 +88,16 @@ bash "$SCRIPT_DIR/infrastructure/download-kb-docs.sh"
 echo "✅ Documentation downloaded"
 echo ""
 
+# Step 0.5: Deploy Solution ID tracking stack (for WWSO deployment metrics)
+echo "📊 Step 0.5: Deploying Solution ID tracking stack..."
+aws cloudformation deploy \
+  --template-file "$PROJECT_ROOT/infrastructure/cloudformation/00-solution-tracking.yaml" \
+  --stack-name "${PROJECT_NAME}-solution-tracking" \
+  --region $AWS_REGION \
+  --no-fail-on-empty-changeset
+echo "✅ Solution tracking deployed (SO9693)"
+echo ""
+
 # Step 1: Deploy base infrastructure
 echo "📦 Step 1: Deploying base infrastructure..."
 aws cloudformation deploy \

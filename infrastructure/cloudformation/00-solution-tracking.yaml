@@ -1,0 +1,5 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Guidance ID (SO9693)"
+Resources:
+  EmptyResource:
+    Type: AWS::CloudFormation::WaitConditionHandle
