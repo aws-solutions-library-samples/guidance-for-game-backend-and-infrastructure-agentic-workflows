@@ -182,11 +182,14 @@ function Deploy-GameAgent {
         $newDeps = (Get-Content requirements.txt.tmp | Where-Object { $_ -notmatch '^#|^\s*$' }) -join "`n"
         if ($oldDeps -ne $newDeps) {
             Write-GameAgentStatus 'requirements.txt out of sync, updating...' -Type Warning
-            $header = Get-Content requirements.txt -TotalCount 21
-            $deps = Get-Content requirements.txt.tmp | Where-Object { $_ -notmatch '^#|^\s*$' }
-            ($header + $deps) | Set-Content requirements.txt
+            # `uv export` already writes a complete, correct file (its own 2-line
+            # header + full dependency list), so use it as-is. The previous
+            # `-TotalCount 21` header copy assumed a 21-line header and duplicated
+            # the first ~19 packages.
+            Move-Item requirements.txt.tmp requirements.txt -Force
+        } else {
+            Remove-Item requirements.txt.tmp -ErrorAction SilentlyContinue
         }
-        Remove-Item requirements.txt.tmp -ErrorAction SilentlyContinue
         Write-GameAgentStatus 'requirements.txt verified' -Type Success
 
         # Configure or skip
