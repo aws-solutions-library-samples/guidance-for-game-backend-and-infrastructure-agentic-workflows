@@ -171,7 +171,7 @@ logger.info(f"Bedrock Model ID: {BEDROCK_MODEL_ID}")
 # Log MCP configuration
 logger.info("MCP Configuration: All servers use stdio transport within AgentCore Runtime")
 logger.info("- EKS MCP: stdio transport via console scripts (pre-installed packages)")
-logger.info("- CCAPI MCP: stdio transport via console scripts (pre-installed packages)")
+logger.info("- AWS API MCP: stdio transport via console scripts (pre-installed packages)")
 logger.info("- Cost Explorer MCP: stdio transport via console scripts (pre-installed packages)")
 
 # Log Memory configuration

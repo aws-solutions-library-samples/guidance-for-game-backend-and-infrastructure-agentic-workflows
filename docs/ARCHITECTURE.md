@@ -162,7 +162,7 @@ The architecture follows these 12 steps:
 
 ### Integration
 - **MCP Servers**: Model Context Protocol servers for AWS service integration (stdio transport)
-  - EKS MCP + CCAPI MCP: Kubernetes cluster management and resource discovery
+  - EKS MCP + AWS API MCP: Kubernetes cluster management and AWS CLI-based resource discovery
   - Cost Explorer MCP: Cost analysis and optimization
 - **boto3 Tools**: Native AWS SDK integration for GameLift fleet management
 
@@ -289,9 +289,9 @@ if __name__ == "__main__":
    - Command: `awslabs.eks-mcp-server` (pre-installed package)
    - Tools: Advanced EKS cluster management and troubleshooting
 
-2. **CCAPI MCP Server** - CloudFormation resource discovery
+2. **AWS API MCP Server** - AWS CLI bridge for resource discovery
    - Command: `awslabs.aws-api-mcp-server` (pre-installed package)
-   - Tools: `list_resources`, `get_resource`
+   - Tools: `call_aws` (runs AWS CLI commands, e.g., `aws eks list-clusters` for EKS cluster discovery)
 
 3. **Cost Explorer MCP Server** - Cost analysis and billing operations
    - Command: `awslabs.cost-explorer-mcp-server` (pre-installed package)

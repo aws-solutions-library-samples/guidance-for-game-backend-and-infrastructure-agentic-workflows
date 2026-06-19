@@ -159,8 +159,22 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
                 aws_api_workdir = os.path.join(tmp_base, "workdir")
                 os.makedirs(aws_api_home, exist_ok=True)
                 os.makedirs(aws_api_workdir, exist_ok=True)
+                # Redirecting HOME relocates the server's $HOME/.aws/aws-api-mcp
+                # log off the read-only container FS. But it also hides
+                # ~/.aws/{config,credentials} from the subprocess. Deployed
+                # AgentCore uses container-role env creds (unaffected), but local
+                # AWS_PROFILE-based dev would break — so pin the AWS cred/config
+                # files to the ORIGINAL home (only if not already set explicitly).
+                original_home = os.environ.get("HOME")
+                if original_home:
+                    env.setdefault("AWS_CONFIG_FILE", os.path.join(original_home, ".aws", "config"))
+                    env.setdefault("AWS_SHARED_CREDENTIALS_FILE", os.path.join(original_home, ".aws", "credentials"))
                 env["HOME"] = aws_api_home
                 env["AWS_API_MCP_WORKING_DIR"] = aws_api_workdir
+                # Read-only: the EKS specialist only needs discovery (eks list/
+                # describe). NOTE: aws-api-mcp-server classifies read vs write via a
+                # service-reference lookup; if that lookup can't be reached in a
+                # restricted-egress runtime it falls back to rejecting all calls.
                 env["READ_OPERATIONS_ONLY"] = "true"
 
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
