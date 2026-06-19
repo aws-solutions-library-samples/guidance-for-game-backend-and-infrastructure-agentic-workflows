@@ -158,6 +158,11 @@ class TestMCPClientFactoryEdgeCases:
         assert env["READ_OPERATIONS_ONLY"] == "true"
         assert env["AWS_API_MCP_WORKING_DIR"].startswith("/") and os.path.isdir(env["AWS_API_MCP_WORKING_DIR"])
         assert "aws-api-mcp" in env["HOME"] and os.path.isdir(env["HOME"])
+        # HOME is redirected, so AWS cred/config files must be pinned to the
+        # original home or local AWS_PROFILE dev breaks (issue #103 #2).
+        assert env["AWS_CONFIG_FILE"].endswith("/.aws/config")
+        assert env["AWS_SHARED_CREDENTIALS_FILE"].endswith("/.aws/credentials")
+        assert "aws-api-mcp" not in env["AWS_CONFIG_FILE"]  # points at real home, not the /tmp redirect
 
     @patch("utils.mcp_client_factory.stdio_client")
     @patch("utils.mcp_client_factory.MCPClient")
