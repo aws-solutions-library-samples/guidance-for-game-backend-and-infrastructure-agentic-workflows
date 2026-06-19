@@ -142,14 +142,17 @@ BEDROCK_QUOTA_RPM = int(os.getenv("GBAW_BEDROCK_QUOTA_RPM", "100"))
 # Orchestrator: deterministic routing, short responses
 # Cost: precise numbers, no creativity
 # GameLift/EKS: slight creativity for recommendations
-# NOTE: Cost stays on the PRIMARY (Haiku) for now — its deep cost-explorer
-# multi-tool conversations trip a Sonnet ConverseStream validation error
-# ("toolResult blocks exceed toolUse blocks of previous turn"); see #155.
-# Restore Cost to the secondary once that toolUse/toolResult pairing bug is fixed.
+# TEMPORARY: all agents pinned to PRIMARY (Haiku) until #155 is fixed. Live
+# testing showed ANY specialist on the SECONDARY (Sonnet) that runs multi-round
+# tool calls (EKS multi-region discovery, Cost cost-explorer) trips a Sonnet
+# ConverseStream validation error: "toolResult blocks exceed toolUse blocks of
+# previous turn". Haiku tolerates the same (mis-paired) message history. This is
+# a Strands 1.44 toolUse/toolResult pairing bug, not a model-quality choice.
+# Once #155 lands, flip eks/gamelift/cost back to BEDROCK_MODEL_ID_SECONDARY.
 INFERENCE_CONFIG = {
     "orchestrator": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
-    "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
-    "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
+    "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
+    "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
     "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
 }
 

@@ -18,20 +18,21 @@ pytestmark = pytest.mark.unit
 class TestInferenceConfigModelTier:
     """INFERENCE_CONFIG pins the intended model per agent."""
 
-    def test_specialists_use_secondary_orchestrator_uses_primary(self):
+    def test_every_agent_pins_a_model_id(self):
         # Local modules
         from config.settings import BEDROCK_MODEL_ID, BEDROCK_MODEL_ID_SECONDARY, INFERENCE_CONFIG
 
-        # Orchestrator on primary (fast routing); EKS/GameLift on secondary (Sonnet).
+        # Every agent must explicitly pin model_id (the bug was that none did, so
+        # all silently inherited the primary). Valid values are the primary or
+        # secondary constant.
+        valid = {BEDROCK_MODEL_ID, BEDROCK_MODEL_ID_SECONDARY}
+        for agent in ("orchestrator", "gamelift", "eks", "cost"):
+            assert INFERENCE_CONFIG[agent].get("model_id") in valid, f"{agent} must pin a known model_id"
+        # Orchestrator always on the fast primary for routing.
         assert INFERENCE_CONFIG["orchestrator"]["model_id"] == BEDROCK_MODEL_ID
-        for specialist in ("gamelift", "eks"):
-            assert (
-                INFERENCE_CONFIG[specialist]["model_id"] == BEDROCK_MODEL_ID_SECONDARY
-            ), f"{specialist} should run on the secondary (Sonnet) model"
-        # Cost stays on primary until the Sonnet multi-tool ConverseStream bug
-        # (#155) is fixed — its deep cost-explorer conversations trip Sonnet's
-        # stricter toolUse/toolResult validation.
-        assert INFERENCE_CONFIG["cost"]["model_id"] == BEDROCK_MODEL_ID
+        # NOTE: specialists are TEMPORARILY pinned to primary (Haiku) until #155
+        # (Sonnet multi-tool ConverseStream toolUse/toolResult bug) is fixed; flip
+        # eks/gamelift/cost to secondary here once it lands.
 
     def test_primary_and_secondary_are_distinct(self):
         # Local modules
