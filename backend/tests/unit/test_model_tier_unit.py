@@ -22,11 +22,16 @@ class TestInferenceConfigModelTier:
         # Local modules
         from config.settings import BEDROCK_MODEL_ID, BEDROCK_MODEL_ID_SECONDARY, INFERENCE_CONFIG
 
+        # Orchestrator on primary (fast routing); EKS/GameLift on secondary (Sonnet).
         assert INFERENCE_CONFIG["orchestrator"]["model_id"] == BEDROCK_MODEL_ID
-        for specialist in ("gamelift", "eks", "cost"):
+        for specialist in ("gamelift", "eks"):
             assert (
                 INFERENCE_CONFIG[specialist]["model_id"] == BEDROCK_MODEL_ID_SECONDARY
             ), f"{specialist} should run on the secondary (Sonnet) model"
+        # Cost stays on primary until the Sonnet multi-tool ConverseStream bug
+        # (#155) is fixed — its deep cost-explorer conversations trip Sonnet's
+        # stricter toolUse/toolResult validation.
+        assert INFERENCE_CONFIG["cost"]["model_id"] == BEDROCK_MODEL_ID
 
     def test_primary_and_secondary_are_distinct(self):
         # Local modules

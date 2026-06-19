@@ -142,11 +142,15 @@ BEDROCK_QUOTA_RPM = int(os.getenv("GBAW_BEDROCK_QUOTA_RPM", "100"))
 # Orchestrator: deterministic routing, short responses
 # Cost: precise numbers, no creativity
 # GameLift/EKS: slight creativity for recommendations
+# NOTE: Cost stays on the PRIMARY (Haiku) for now — its deep cost-explorer
+# multi-tool conversations trip a Sonnet ConverseStream validation error
+# ("toolResult blocks exceed toolUse blocks of previous turn"); see #155.
+# Restore Cost to the secondary once that toolUse/toolResult pairing bug is fixed.
 INFERENCE_CONFIG = {
     "orchestrator": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
     "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
     "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
-    "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
+    "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
 }
 
 # Resilience settings (Well-Architected GenAI Lens: Reliability 2)
