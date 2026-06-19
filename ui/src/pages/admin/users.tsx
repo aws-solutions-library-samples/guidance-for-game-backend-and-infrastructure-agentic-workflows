@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import Head from 'next/head';
 import Navigation from '../../components/Navigation';
 
@@ -14,16 +14,22 @@ export default function AdminUsers() {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    fetchUsers();
-  }, []);
-
-  const fetchUsers = async () => {
+  // Declared before the effect that calls it (and memoized) so the rule of hooks
+  // is satisfied and the effect dependency is stable.
+  const fetchUsers = useCallback(async () => {
     const res = await fetch('/api/admin/users');
     const data = await res.json();
     setUsers(data.users || []);
     setLoading(false);
-  };
+  }, []);
+
+  useEffect(() => {
+    // Async IIFE so the setState calls inside fetchUsers run after an await
+    // (in a microtask), not synchronously in the effect body.
+    void (async () => {
+      await fetchUsers();
+    })();
+  }, [fetchUsers]);
 
   const approveUser = async (username: string) => {
     await fetch('/api/admin/approve', {

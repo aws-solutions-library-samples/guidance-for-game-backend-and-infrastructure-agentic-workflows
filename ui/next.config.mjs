@@ -6,10 +6,8 @@ const nextConfig = {
   // Standalone output for Docker/container deployment
   output: 'standalone',
 
-  // Enable instrumentation hook for OpenTelemetry/ADOT
-  experimental: {
-    instrumentationHook: true,
-  },
+  // Note: instrumentation.ts (OpenTelemetry/ADOT) auto-loads in Next 16;
+  // the former experimental.instrumentationHook flag was removed upstream.
 
   // Transpile CopilotKit packages (required for proper bundling)
   transpilePackages: [

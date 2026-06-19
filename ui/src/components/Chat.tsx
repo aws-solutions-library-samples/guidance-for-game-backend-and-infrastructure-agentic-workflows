@@ -32,24 +32,36 @@ interface ChatProps {
 export function Chat({ className, onThinkingChange }: ChatProps) {
   const [isThinking, setIsThinking] = useState(false);
   const [messagesContainer, setMessagesContainer] = useState<Element | null>(null);
-  const [progressMessage, setProgressMessage] = useState(PROGRESS_MESSAGES[0]);
+  const [messageIndex, setMessageIndex] = useState(0);
+  const progressMessage = PROGRESS_MESSAGES[Math.min(messageIndex, PROGRESS_MESSAGES.length - 1)];
 
-  // Rotate progress messages while thinking
+  // Wrap CopilotChat's progress callback so the rotation resets at the start of
+  // each thinking session. Resetting here (an event handler) instead of inside
+  // an effect avoids a synchronous setState-in-effect cascade.
+  const handleInProgress = (thinking: boolean) => {
+    if (thinking) {
+      setMessageIndex(0);
+    }
+    setIsThinking(thinking);
+  };
+
+  // Rotate progress messages while thinking. setMessageIndex runs only inside the
+  // interval callback (async), never synchronously in the effect body.
   useEffect(() => {
     if (!isThinking) {
-      setProgressMessage(PROGRESS_MESSAGES[0]); // Reset to first message
       return;
     }
 
-    let messageIndex = 0;
     const interval = setInterval(() => {
-      messageIndex++;
-      if (messageIndex < PROGRESS_MESSAGES.length) {
-        setProgressMessage(PROGRESS_MESSAGES[messageIndex]);
-      } else {
-        // Stop at last message - don't loop back
-        clearInterval(interval);
-      }
+      setMessageIndex((index) => {
+        const next = index + 1;
+        if (next >= PROGRESS_MESSAGES.length) {
+          // Stop at last message - don't loop back
+          clearInterval(interval);
+          return index;
+        }
+        return next;
+      });
     }, 3000); // Rotate every 3 seconds
 
     return () => clearInterval(interval);
@@ -62,10 +74,19 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
     }
   }, [isThinking, onThinkingChange]);
 
-  // Find the messages container for Portal (only once)
+  // Find the messages container for Portal. CopilotChat renders it on mount, so
+  // poll until present and stop once found; setMessagesContainer runs inside the
+  // interval callback rather than synchronously in the effect body.
   useEffect(() => {
-    const container = document.querySelector('.copilotKitMessages');
-    setMessagesContainer(container);
+    const interval = setInterval(() => {
+      const container = document.querySelector('.copilotKitMessages');
+      if (container) {
+        setMessagesContainer(container);
+        clearInterval(interval);
+      }
+    }, 50);
+
+    return () => clearInterval(interval);
   }, []);
 
   return (
@@ -80,7 +101,7 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
         <div className="ga-chat-wrapper">
           <CopilotChat
             className={`ga-chat ${className || ''}`}
-            onInProgress={setIsThinking}
+            onInProgress={handleInProgress}
             labels={{
             title: "🎮 Game Agent",
             initial: `**Welcome to Game Agent!** 🎮
