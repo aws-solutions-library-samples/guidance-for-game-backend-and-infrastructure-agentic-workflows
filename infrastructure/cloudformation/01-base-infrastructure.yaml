@@ -210,43 +210,42 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # Least-privilege (#151): scope to gameagent*-named resources (the
+              # account is shared with other projects, e.g. echelon_*) and limit
+              # to the actions the REQUEST PATH actually needs. Memory/runtime
+              # LIFECYCLE (create/update/delete) belongs to deploy/teardown, not
+              # the runtime role — removed here so a compromised/jailbroken
+              # runtime can't delete its own or another project's memory.
               - Sid: AgentCoreRuntimeAccess
                 Effect: Allow
                 Action:
                   - bedrock-agentcore:InvokeAgentRuntime
                   - bedrock-agentcore:GetAgentRuntime
                 Resource:
-                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/gameagent*'
               - Sid: AgentCoreMemoryAccess
                 Effect: Allow
                 Action:
-                  # Memory resource management
-                  - bedrock-agentcore:CreateMemory
+                  # Read own memory config
                   - bedrock-agentcore:GetMemory
-                  - bedrock-agentcore:UpdateMemory
-                  - bedrock-agentcore:DeleteMemory
                   - bedrock-agentcore:ListMemories
-                  # Memory record operations (for LTM)
+                  # Memory record operations (LTM read + write; NO delete)
                   - bedrock-agentcore:BatchCreateMemoryRecords
-                  - bedrock-agentcore:BatchDeleteMemoryRecords
                   - bedrock-agentcore:BatchUpdateMemoryRecords
                   - bedrock-agentcore:GetMemoryRecord
-                  - bedrock-agentcore:DeleteMemoryRecord
                   - bedrock-agentcore:ListMemoryRecords
                   - bedrock-agentcore:RetrieveMemoryRecords
-                  # Event operations (for STM session memory)
+                  # Event operations (STM session memory — the strands session
+                  # manager creates/lists/deletes events within a session)
                   - bedrock-agentcore:CreateEvent
                   - bedrock-agentcore:GetEvent
                   - bedrock-agentcore:DeleteEvent
                   - bedrock-agentcore:ListEvents
-                  # Memory extraction
-                  - bedrock-agentcore:StartMemoryExtractionJob
-                  - bedrock-agentcore:ListMemoryExtractionJobs
-                  # Session and actor management
+                  # Session and actor enumeration
                   - bedrock-agentcore:ListActors
                   - bedrock-agentcore:ListSessions
                 Resource:
-                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/gameagent*'
         # Security: Scoped service access for MCP servers
         - PolicyName: AgentCoreServiceAccess
           PolicyDocument:
@@ -449,7 +448,8 @@ Resources:
                   - bedrock-agentcore:InvokeAgentRuntime
                   - bedrock-agentcore:InvokeAgentRuntimeForUser
                 Resource:
-                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+                  # Scoped to this project's runtimes (#151) — shared account.
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/gameagent*'
               - Sid: BedrockModelInvoke
                 Effect: Allow
                 Action:
