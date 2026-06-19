@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { logInfo, logError } from '@/utils/logger';
+import { logInfo, logError, logDebug, redact } from '@/utils/logger';
 import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
@@ -178,7 +178,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           groups: groups
         };
 
-        logInfo(`[${requestId}] 👤 User: ${decoded.email}, Admin: ${groups.includes('admin')}`);
+        logInfo(`[${requestId}] 👤 User: ${redact(decoded.email)}, Admin: ${groups.includes('admin')}`);
       } catch {
         logError(`[${requestId}] ❌ Failed to decode JWT`);
         return res.status(400).json({
@@ -283,11 +283,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     logInfo(`[${requestId}] 📦 Conversation history: ${conversationHistory.length} messages`);
     logInfo(`[${requestId}] 📦 Found ${userMessages.length} user messages`);
-    logInfo(`[${requestId}] 📥 Last user message: ${message.substring(0, 100)}...`);
+    // User prompt content is PII-bearing — log only its length at info level;
+    // the content itself is dev-only (logDebug).
+    logInfo(`[${requestId}] 📥 Last user message: ${message.length} chars`);
+    logDebug(`[${requestId}] 📥 Last user message content: ${message.substring(0, 100)}...`);
 
     if (!message) {
       logError(`[${requestId}] ❌ No user message found in messages array`);
-      logError(`[${requestId}] 📦 Messages: ${JSON.stringify(messages).substring(0, 500)}`);
+      logDebug(`[${requestId}] 📦 Messages: ${JSON.stringify(messages).substring(0, 500)}`);
       return res.status(400).json({ error: 'No message provided', requestId });
     }
 
@@ -340,12 +343,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] ========================================`);
     logInfo(`[${requestId}] 🧠 MEMORY CONTEXT PREPARATION`);
     logInfo(`[${requestId}] ========================================`);
+    // Identity fields are PII — redact at info level; full values dev-only.
     logInfo(`[${requestId}] 👤 User Identity:`);
     logInfo(`[${requestId}]   Type: ${userIdentity?.authType}`);
-    logInfo(`[${requestId}]   User ID: ${userIdentity?.userId}`);
-    logInfo(`[${requestId}]   Username: ${userIdentity?.username}`);
-    logInfo(`[${requestId}]   Display: ${userIdentity?.displayName}`);
-    logInfo(`[${requestId}]   Email: ${userIdentity?.email}`);
+    logInfo(`[${requestId}]   User ID: ${redact(userIdentity?.userId)}`);
+    logInfo(`[${requestId}]   Username: ${redact(userIdentity?.username)}`);
+    logDebug(`[${requestId}]   Display: ${userIdentity?.displayName}`);
+    logDebug(`[${requestId}]   Email: ${userIdentity?.email}`);
 
     // Environment-specific session isolation
     // Dev and prod use different session ID prefixes to prevent memory collision
@@ -365,7 +369,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (isProduction) {
       // Production: Use AWS SDK to invoke AgentCore Runtime
       logInfo(`[${requestId}] 🚀 Calling AgentCore Runtime via AWS SDK`);
-      logInfo(`[${requestId}] 📤 Sending prompt: ${message.substring(0, 100)}...`);
+      logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
+      logDebug(`[${requestId}] 📤 Prompt content: ${message.substring(0, 100)}...`);
 
       const runtimeId = process.env.AGENTCORE_RUNTIME_ID;
       if (!runtimeId) {
@@ -403,9 +408,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       logInfo(`[${requestId}] 📦 Payload to AgentCore:`);
       logInfo(`[${requestId}]   prompt: ${message.substring(0, 50)}...`);
       logInfo(`[${requestId}]   thread_id: ${isolatedThreadId}`);
-      logInfo(`[${requestId}]   user_context.user_id: ${payload.user_context.user_id}`);
-      logInfo(`[${requestId}]   user_context.session_id: ${payload.user_context.session_id}`);
-      logInfo(`[${requestId}]   user_context.display_name: ${payload.user_context.display_name}`);
+      logInfo(`[${requestId}]   user_context.user_id: ${redact(payload.user_context.user_id)}`);
+      logInfo(`[${requestId}]   user_context.session_id: ${redact(payload.user_context.session_id)}`);
+      logDebug(`[${requestId}]   user_context.display_name: ${payload.user_context.display_name}`);
 
       const payloadString = JSON.stringify(payload);
       const payloadBytes = new TextEncoder().encode(payloadString);
@@ -427,8 +432,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       logInfo(`[${requestId}] 🧠 AgentCore Memory Parameters:`);
-      logInfo(`[${requestId}]   runtimeSessionId: ${runtimeSessionIdValue} (STM: conversation history)`);
-      logInfo(`[${requestId}]   runtimeUserId: ${runtimeUserIdValue} (LTM: user preferences)`);
+      logInfo(`[${requestId}]   runtimeSessionId: ${redact(runtimeSessionIdValue)} (STM: conversation history)`);
+      logInfo(`[${requestId}]   runtimeUserId: ${redact(runtimeUserIdValue)} (LTM: user preferences)`);
 
       const command = new InvokeAgentRuntimeCommand({
         agentRuntimeArn,
@@ -454,7 +459,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
         logInfo(`[${requestId}] 📦 STAGE 1 - RAW SDK STREAM`);
         logInfo(`[${requestId}] Type: ${typeof responseContent}`);
-        logInfo(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
+        logDebug(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
         logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
         logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
 
@@ -488,7 +493,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       const backendUrl = process.env.BACKEND_URL || 'http://localhost:8080';
 
       logInfo(`[${requestId}] 🚀 Calling local AgentCore at ${backendUrl}/invocations`);
-      logInfo(`[${requestId}] 📤 Sending prompt: ${message.substring(0, 100)}...`);
+      logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
+      logDebug(`[${requestId}] 📤 Prompt content: ${message.substring(0, 100)}...`);
 
       const response = await fetch(`${backendUrl}/invocations`, {
         method: 'POST',
@@ -519,7 +525,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 STAGE 1 - RAW BACKEND RESPONSE`);
       logInfo(`[${requestId}] Type: ${typeof backendData}`);
-      logInfo(`[${requestId}] Value: ${JSON.stringify(backendData).substring(0, 200)}`);
+      logDebug(`[${requestId}] Value: ${JSON.stringify(backendData).substring(0, 200)}`);
 
       // Ensure we always get a string
       if (typeof backendData === 'string') {
@@ -536,7 +542,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 STAGE 2 - AFTER EXTRACTION`);
       logInfo(`[${requestId}] Type: ${typeof responseContent}`);
-      logInfo(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
+      logDebug(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
       logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
       logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
     }
@@ -544,7 +550,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] 📦 STAGE 3 - BEFORE COPILOTKIT FORMATTING`);
     logInfo(`[${requestId}] Type: ${typeof responseContent}`);
     logInfo(`[${requestId}] Length: ${responseContent.length}`);
-    logInfo(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
+    logDebug(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
     logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
     logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
 
@@ -585,7 +591,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] 📦 STAGE 4 - COPILOTKIT RESPONSE`);
     logInfo(`[${requestId}] Content array length: ${copilotResponse.data.generateCopilotResponse.messages[0].content.length}`);
     logInfo(`[${requestId}] Content[0] type: ${typeof copilotResponse.data.generateCopilotResponse.messages[0].content[0]}`);
-    logInfo(`[${requestId}] Content[0] first 200 chars: ${copilotResponse.data.generateCopilotResponse.messages[0].content[0].substring(0, 200)}`);
+    logDebug(`[${requestId}] Content[0] first 200 chars: ${copilotResponse.data.generateCopilotResponse.messages[0].content[0].substring(0, 200)}`);
 
     logInfo(`[${requestId}] 📤 Sending CopilotKit formatted response`);
     logInfo(`[${requestId}] ========================================`);
