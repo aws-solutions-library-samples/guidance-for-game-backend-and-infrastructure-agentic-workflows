@@ -197,12 +197,17 @@ def _is_likely_name(text: str) -> bool:
     return first_word not in _NON_NAME_WORDS
 
 
-# Pre-compiled regex patterns for performance
+# Pre-compiled regex patterns for performance.
+# The optional second word (for real surnames like "John Smith") must NOT be a
+# common sentence connector, or "my name is Zephyr and I run X" would capture
+# "Zephyr and". The negative lookahead blocks connectors; the trailing \b keeps
+# genuine surnames that merely START with those letters (e.g. "Anderson", "Orwell").
+_NAME_SECOND_WORD = r"(?:\s+(?!(?:and|or|but|who|the|is|a|an|i|we|from|here|there|too)\b)\w+)?"
 _NAME_PATTERNS = [
-    re.compile(r"my name is (\w+(?:\s+\w+)?)", re.IGNORECASE),
-    re.compile(r"i'm (\w+(?:\s+\w+)?)", re.IGNORECASE),
-    re.compile(r"call me (\w+(?:\s+\w+)?)", re.IGNORECASE),
-    re.compile(r"i am (\w+(?:\s+\w+)?)", re.IGNORECASE),
+    re.compile(rf"my name is (\w+{_NAME_SECOND_WORD})", re.IGNORECASE),
+    re.compile(rf"i'm (\w+{_NAME_SECOND_WORD})", re.IGNORECASE),
+    re.compile(rf"call me (\w+{_NAME_SECOND_WORD})", re.IGNORECASE),
+    re.compile(rf"i am (\w+{_NAME_SECOND_WORD})", re.IGNORECASE),
 ]
 
 # Game type/genre patterns - (pattern, label)
