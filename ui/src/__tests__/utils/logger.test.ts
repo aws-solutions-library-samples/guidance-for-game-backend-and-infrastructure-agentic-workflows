@@ -15,19 +15,21 @@ afterEach(() => {
 })
 
 describe('Logger Utility', () => {
+  // Messages are passed behind a fixed '%s' specifier so user-influenced
+  // content can't be interpreted as a format string (js/tainted-format-string).
   it('should log messages', () => {
     logInfo('Test message')
-    expect(console.log).toHaveBeenCalledWith('Test message')
+    expect(console.log).toHaveBeenCalledWith('%s', 'Test message')
   })
 
   it('should log errors', () => {
     logError('Test error')
-    expect(console.error).toHaveBeenCalledWith('Test error', undefined)
+    expect(console.error).toHaveBeenCalledWith('%s', 'Test error', undefined)
   })
 
   it('should log warnings', () => {
     logWarning('Test warning')
-    expect(console.warn).toHaveBeenCalledWith('Test warning')
+    expect(console.warn).toHaveBeenCalledWith('%s', 'Test warning')
   })
 
   it('should log debug messages', () => {

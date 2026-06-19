@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
+# Least-privilege default token: jobs only read repo contents. Tightens the
+# GITHUB_TOKEN from the broad default (CodeQL: actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 jobs:
   backend-tests:
     runs-on: ubuntu-latest
