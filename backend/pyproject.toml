@@ -74,8 +74,8 @@ dev = [
     # Code quality tools
     "pre-commit>=4.6.0",
     "black>=26.5.1",
-    "isort>=5.13.2",
-    "mypy>=1.13.0",
+    "isort>=8.0.1",
+    "mypy>=2.1.0",
 ]
 
 [tool.black]
