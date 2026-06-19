@@ -44,7 +44,7 @@ argcomplete==3.6.3
     # via checkov
 asgiref==3.10.0
     # via opentelemetry-instrumentation-asgi
-attrs==25.4.0
+attrs==26.1.0
     # via
     #   aiohttp
     #   jsonschema
