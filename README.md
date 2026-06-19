@@ -46,25 +46,7 @@ Key capabilities:
 
 The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers. All MCP servers run as subprocesses within the AgentCore container -- no external infrastructure is required for the agent backend.
 
-```
-+-----------------+     +------------------+     +------------------------+
-|   User Browser  |---->|  ECS Express     |---->|  Bedrock AgentCore     |
-|                 |     |  (Fargate + ALB) |     |  Runtime               |
-|                 |     |  (Next.js +      |     |  (Strands Agents +     |
-|                 |     |   CopilotKit)    |     |   Embedded MCP)        |
-+-----------------+     +------------------+     +------------------------+
-       |                       |                          |
-       v                       v                          v
-+-----------------+     +------------------+     +------------------------+
-| Amazon Cognito  |     | Amazon CloudWatch|     | AWS Services           |
-| (Authentication)|     | + AWS X-Ray      |     | - Amazon GameLift      |
-|                 |     | (Observability)  |     | - Amazon EKS           |
-+-----------------+     +------------------+     | - AWS Cost Explorer    |
-                                                 | - Amazon Bedrock       |
-                                                 | - Bedrock Knowledge    |
-                                                 |   Bases (RAG)          |
-                                                 +------------------------+
-```
+![](diagrams/MultiAgent_Architecture.jpg)
 
 ### Request Flow
 
@@ -93,29 +75,29 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$724.30 per month** for processing approximately 10,000 agent queries per month.
+You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,129.23 per month** for processing approximately 10,000 agent queries per month.
 
 We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
 ### Sample Cost Table
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month, assuming approximately 10,000 agent queries.
+The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context).
 
 | AWS service | Dimensions | Cost [USD] |
 | ----------- | ------------ | ------------ |
-| Amazon Bedrock (Claude Sonnet 4.5) | ~10,000 specialist queries, ~8K input + 2K output tokens each | $390.00/month |
-| Amazon Bedrock (Claude Haiku 4.5) | ~10,000 orchestration queries, ~4K input + 1K output tokens each | $50.00/month |
-| Amazon OpenSearch Serverless (Knowledge Bases) | 3 Knowledge Bases, minimum 2 OCUs (indexing + search) | $175.20/month |
-| Amazon ECS (Fargate) | 1 task, 0.5 vCPU / 1 GB, running 24/7 | $14.60/month |
-| Elastic Load Balancing (ALB) | 1 Application Load Balancer, low LCU usage | $18.00/month |
-| Amazon Bedrock AgentCore Runtime | ~10,000 invocations, average 30s duration | $40.00/month |
-| Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00/month |
-| Amazon CloudWatch + AWS X-Ray | Logs, metrics, and traces for all components | $25.00/month |
-| AWS WAF | 1 WebACL, default managed rules, ~1M requests | $8.00/month |
-| AWS CloudTrail | Management events (first trail free), data events | $2.00/month |
-| Amazon ECR | Image storage (~2 GB) | $0.20/month |
-| Amazon Inspector | Container image scanning (~10 images) | $1.30/month |
-| **Total** | | **~$724.30/month** |
+| Amazon Bedrock (Claude Sonnet 4.5) | 80M input tokens @ $3.30/M + 20M output tokens @ $16.50/M (specialist agents) | $594.00 |
+| Amazon OpenSearch Serverless (Knowledge Bases) | 2 OCUs (indexing + search) @ $0.24/OCU-hour × 730 hours | $350.40 |
+| Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.10/M + 10M output tokens @ $5.50/M (orchestrator) | $99.00 |
+| Amazon CloudWatch + AWS X-Ray | Logs, metrics, and distributed traces for all components | $25.00 |
+| Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hour × 730 hours + ~730 LCU-hours @ $0.008 | $22.27 |
+| Amazon ECS (Fargate) | 1 task, 0.5 vCPU @ $0.04048/hour + 1 GB @ $0.004445/GB-hour × 730 hours | $18.02 |
+| Amazon Bedrock AgentCore Runtime | ~10,000 invocations, ~30s each: 1 vCPU @ $0.0895/hour + 2 GB @ $0.00945/GB-hour | $9.04 |
+| AWS WAF | 1 WebACL with managed rules + ~1M requests | $8.00 |
+| AWS CloudTrail | Management events (first trail free) + data events | $2.00 |
+| Amazon Inspector | Container image scanning (~10 images) | $1.30 |
+| Amazon ECR | Image storage (~2 GB) @ $0.10/GB-month | $0.20 |
+| Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00 |
+| **Total** | | **~$1,129.23/month** |
 
 ## Prerequisites
 
