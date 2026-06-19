@@ -11,11 +11,12 @@ Performance Optimization:
 
 # Standard library
 import hashlib
+import os
 import threading
-import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 # Third-party packages
+from cachetools import TTLCache
 from strands import tool
 from strands_tools.retrieve import retrieve as _retrieve_impl
 
@@ -24,9 +25,13 @@ from config.settings import RETRY_BASE_DELAY, RETRY_MAX_ATTEMPTS
 from utils.logger import logger
 from utils.resilience import retry_with_backoff
 
-# KB result cache configuration
-_KB_CACHE_TTL_SECONDS = 3600  # 1 hour cache TTL
-_kb_cache: Dict[str, Tuple[float, Any]] = {}  # {cache_key: (timestamp, result)}
+# KB result cache configuration. TTLCache gives both time-based expiry (lazy +
+# on access) AND a hard size cap (LRU eviction) — the previous hand-rolled dict
+# expired entries only on lookup and had no max size, so distinct query strings
+# could grow it without bound in a long-lived runtime.
+_KB_CACHE_TTL_SECONDS = int(os.getenv("GBAW_KB_CACHE_TTL_SECONDS", "3600"))  # 1 hour
+_KB_CACHE_MAX_ENTRIES = int(os.getenv("GBAW_KB_CACHE_MAX_ENTRIES", "1000"))
+_kb_cache: "TTLCache[str, Any]" = TTLCache(maxsize=_KB_CACHE_MAX_ENTRIES, ttl=_KB_CACHE_TTL_SECONDS)
 _kb_cache_lock = threading.Lock()
 
 
@@ -39,21 +44,16 @@ def _get_cache_key(kb_id: str, text: str, num_results: int, score: float) -> str
 def _get_cached_result(cache_key: str) -> Optional[Any]:
     """Get cached result if valid, None if expired or not found."""
     with _kb_cache_lock:
-        if cache_key in _kb_cache:
-            timestamp, result = _kb_cache[cache_key]
-            if time.time() - timestamp < _KB_CACHE_TTL_SECONDS:
-                logger.debug(f"♻️ KB cache hit: {cache_key[:8]}...")
-                return result
-            else:
-                # Expired, remove from cache
-                del _kb_cache[cache_key]
-    return None
+        result = _kb_cache.get(cache_key)  # TTLCache drops expired entries automatically
+        if result is not None:
+            logger.debug(f"♻️ KB cache hit: {cache_key[:8]}...")
+        return result
 
 
 def _set_cached_result(cache_key: str, result: Any) -> None:
     """Store result in cache."""
     with _kb_cache_lock:
-        _kb_cache[cache_key] = (time.time(), result)
+        _kb_cache[cache_key] = result
         logger.debug(f"💾 KB result cached: {cache_key[:8]}...")
 
 
@@ -171,21 +171,14 @@ def clear_kb_cache() -> None:
 
 
 def get_kb_cache_stats() -> Dict[str, Any]:
-    """Get KB cache statistics."""
+    """Get KB cache statistics.
+
+    TTLCache evicts expired entries on access, so every entry currently present
+    is valid; size is bounded by maxsize (LRU eviction beyond that).
+    """
     with _kb_cache_lock:
-        valid_count = 0
-        expired_count = 0
-        current_time = time.time()
-
-        for cache_key, (timestamp, _) in _kb_cache.items():
-            if current_time - timestamp < _KB_CACHE_TTL_SECONDS:
-                valid_count += 1
-            else:
-                expired_count += 1
-
         return {
             "total_entries": len(_kb_cache),
-            "valid_entries": valid_count,
-            "expired_entries": expired_count,
+            "max_entries": _KB_CACHE_MAX_ENTRIES,
             "ttl_seconds": _KB_CACHE_TTL_SECONDS,
         }

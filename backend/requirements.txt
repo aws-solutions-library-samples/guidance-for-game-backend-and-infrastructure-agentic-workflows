@@ -74,6 +74,7 @@ cachetools==6.2.4
     # via
     #   aws-opentelemetry-distro
     #   awslabs-eks-mcp-server
+    #   game-agent-backend
     #   py-key-value-aio
 caio==0.9.25
     # via aiofile

@@ -38,6 +38,7 @@ dependencies = [
     "pydantic>=2.13.4",
     "loguru>=0.7.3",
     "PyYAML>=6.0.1",
+    "cachetools>=6.2.4",  # bounded TTL caches (rate-limit, KB, memory dedup)
 
     # OpenTelemetry / ADOT for AgentCore observability
     "aws-opentelemetry-distro>=0.17.1",
