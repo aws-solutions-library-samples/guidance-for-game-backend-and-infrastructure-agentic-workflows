@@ -145,15 +145,18 @@ def reset_model_cache():
         logger.debug("🔄 Model cache reset")
 
 
-def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: int = 4096):
+def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: int = 4096, model_id: str = ""):
     """Create a non-singleton BedrockModel with custom inference parameters.
 
     Used by specialist agents that need per-agent tuning (e.g. orchestrator
-    uses temp=0.0 for deterministic routing).
+    uses temp=0.0 for deterministic routing; specialists run on Sonnet for
+    deeper reasoning while the orchestrator stays on Haiku for fast routing).
 
     Args:
         temperature: Sampling temperature (0.0 = deterministic, 1.0 = creative).
         max_tokens: Maximum output tokens.
+        model_id: Bedrock model id to use. Defaults to the primary
+            (BEDROCK_MODEL_ID) when empty, preserving prior behavior.
 
     Returns:
         BedrockModel configured with the given parameters.
@@ -162,7 +165,7 @@ def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: in
         os.environ["AWS_PROFILE"] = AWS_PROFILE
 
     model_config = {
-        "model_id": BEDROCK_MODEL_ID,
+        "model_id": model_id or BEDROCK_MODEL_ID,
         "cache_prompt": "default",
         "cache_tools": "default",
         "temperature": temperature,
