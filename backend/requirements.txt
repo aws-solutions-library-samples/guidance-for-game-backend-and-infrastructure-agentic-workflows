@@ -713,7 +713,7 @@ referencing==0.36.2
     # via
     #   jsonschema
     #   jsonschema-specifications
-regex==2025.11.3
+regex==2026.5.9
     # via pycep-parser
 requests==2.34.2
     # via
