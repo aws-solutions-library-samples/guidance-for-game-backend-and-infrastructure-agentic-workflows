@@ -134,14 +134,24 @@ BEDROCK_EXPECTED_RPM = int(os.getenv("GBAW_BEDROCK_EXPECTED_RPM", "20"))
 BEDROCK_QUOTA_RPM = int(os.getenv("GBAW_BEDROCK_QUOTA_RPM", "100"))
 
 # Per-agent inference parameters (Well-Architected GenAI Lens: Performance Efficiency 2)
+# Model tier (intentional): the orchestrator runs on the fast/cheap PRIMARY
+# (Haiku) for low-latency routing, while the domain specialists run on the more
+# capable SECONDARY (Sonnet) for deeper reasoning over tool output. Each entry
+# pins model_id explicitly — without it every agent silently inherited the
+# primary (Haiku), contradicting the documented design.
 # Orchestrator: deterministic routing, short responses
 # Cost: precise numbers, no creativity
 # GameLift/EKS: slight creativity for recommendations
+# Model tier (intentional): orchestrator on the fast/cheap PRIMARY (Haiku) for
+# low-latency routing; domain specialists on the more capable SECONDARY (Sonnet)
+# for deeper reasoning over tool output. Each entry pins model_id explicitly —
+# without it every agent silently inherited the primary (Haiku), contradicting
+# the documented design.
 INFERENCE_CONFIG = {
-    "orchestrator": {"temperature": 0.0, "max_tokens": 4096},
-    "gamelift": {"temperature": 0.1, "max_tokens": 4096},
-    "eks": {"temperature": 0.1, "max_tokens": 4096},
-    "cost": {"temperature": 0.0, "max_tokens": 4096},
+    "orchestrator": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
+    "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
+    "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
+    "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
 }
 
 # Resilience settings (Well-Architected GenAI Lens: Reliability 2)
