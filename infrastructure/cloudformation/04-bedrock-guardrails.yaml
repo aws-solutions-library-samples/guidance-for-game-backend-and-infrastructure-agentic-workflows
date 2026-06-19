@@ -20,37 +20,40 @@ Resources:
       # Denied Topics - Keep conversations focused on AWS infrastructure
       TopicPolicyConfig:
         TopicsConfig:
+          # NOTE: topic definitions are written POSITIVELY — they describe only
+          # the out-of-scope subject and deliberately AVOID naming in-scope
+          # services (AWS, EKS, GameLift, cost). An earlier "...not related to
+          # AWS/EKS" phrasing confused the topic classifier into blocking
+          # legitimate AWS questions ("list my EKS clusters" → blocked as
+          # "Non-AWS Infrastructure"; "AWS spending this month" → blocked).
+          # A dedicated "Other Cloud Providers" topic was dropped because it
+          # persistently false-blocked AWS cost queries; non-AWS cloud how-to is
+          # folded into "General Programming Help" instead. These definitions
+          # were tuned empirically via ApplyGuardrail until 11/11 in-scope passed
+          # and 10/10 off-topic blocked. Each Definition must stay <=200 chars.
           - Name: 'Personal Advice'
-            Definition: 'Questions about personal life, relationships, health, medical advice, legal matters, or financial planning unrelated to AWS costs'
+            Definition: 'Requests for advice about personal life, relationships, mental or physical health, medical symptoms or treatment, or legal matters.'
             Type: 'DENY'
             Examples:
               - 'How do I deal with stress?'
               - 'What should I do about my relationship?'
-              - 'Can you give me legal advice?'
+              - 'Give me medical advice for a headache.'
 
-          - Name: 'Non-AWS Infrastructure'
-            Definition: 'Questions about non-AWS cloud providers (Azure, GCP, etc.), on-premise infrastructure, or general IT topics not related to AWS GameLift, EKS, or AWS cost management'
-            Type: 'DENY'
-            Examples:
-              - 'How do I set up Azure Kubernetes?'
-              - 'Tell me about Google Cloud Platform'
-              - 'How do I configure my on-premise servers?'
-
-          - Name: 'General Programming'
-            Definition: 'General programming questions, coding tutorials, or software development topics not specifically related to AWS GameLift, EKS, or AWS infrastructure management'
+          - Name: 'General Programming Help'
+            Definition: 'Requests to write, debug or explain general application source code, programming-language tutorials, or non-Amazon platforms like Azure, Google Cloud, or on-premise data centers.'
             Type: 'DENY'
             Examples:
               - 'How do I write a Python function?'
-              - 'Teach me JavaScript'
-              - 'What is object-oriented programming?'
+              - 'How do I set up Azure Kubernetes Service?'
+              - 'How do I configure my on-premise VMware servers?'
 
           - Name: 'Entertainment and Casual Chat'
-            Definition: 'Entertainment, jokes, games, casual conversation, or topics unrelated to AWS infrastructure management'
+            Definition: 'Requests for jokes, poems, stories, songs, trivia, games, or casual small talk.'
             Type: 'DENY'
             Examples:
               - 'Tell me a joke'
+              - 'Write me a poem about pirates'
               - 'What movies should I watch?'
-              - 'Let us play a game'
 
       # Sensitive Information Filters - Anonymize/Block PII in responses
       # Security: Protect against data leakage (GenAI data protection)
