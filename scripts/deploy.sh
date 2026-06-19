@@ -176,12 +176,13 @@ if command -v uv &> /dev/null; then
   # Compare only the dependency lines (skip headers)
   if ! diff <(grep -v '^#' requirements.txt | grep -v '^$') <(grep -v '^#' requirements.txt.tmp | grep -v '^$') > /dev/null 2>&1; then
     echo "⚠️  requirements.txt dependencies out of sync, updating..."
-    # Preserve custom header, update dependencies
-    head -n 21 requirements.txt > requirements.txt.new
-    grep -v '^#' requirements.txt.tmp | grep -v '^$' >> requirements.txt.new
-    mv requirements.txt.new requirements.txt
+    # `uv export` already writes a complete, correct file (its own 2-line header
+    # + the full dependency list), so use it as-is. The previous `head -n 21`
+    # approach assumed a 21-line header and duplicated the first ~19 packages.
+    mv requirements.txt.tmp requirements.txt
+  else
+    rm requirements.txt.tmp
   fi
-  rm requirements.txt.tmp
   echo "✅ requirements.txt verified"
 else
   echo "⚠️  UV not found, using existing requirements.txt"
