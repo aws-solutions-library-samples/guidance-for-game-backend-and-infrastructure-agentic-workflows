@@ -12,8 +12,11 @@ Tests security controls including:
 # Third-party packages
 import pytest
 
-# Mark all tests in this module as localhost tests (fast, no AWS calls)
-pytestmark = pytest.mark.localhost
+# Fast, no AWS calls — these are pure input-validation/sanitization/injection-
+# pattern tests. Marked `unit` so CI (which runs `pytest -m unit`) actually
+# exercises the security controls. (Previously `localhost`, an unregistered
+# marker that CI's `-m unit` selector skipped — so these never ran in CI.)
+pytestmark = pytest.mark.unit
 
 
 class TestInputValidation:
