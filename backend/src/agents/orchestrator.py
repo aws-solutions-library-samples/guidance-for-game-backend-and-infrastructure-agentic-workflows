@@ -106,6 +106,16 @@ def run_orchestrator(query: str, context: dict = None):
                             strategy_id="user_facts",  # LTM semantic memory strategy
                         )
                     },
+                    # Strip historical toolUse/toolResult blocks when replaying a
+                    # session's stored events into model context. AgentCore events
+                    # are immutable, and an interrupted turn (request timeout, a
+                    # parallel-tool exception, process death) can persist a toolUse
+                    # with no matching toolResult. Without this, that orphan is
+                    # replayed every turn and Bedrock Converse rejects the whole
+                    # session ("toolResult blocks exceed toolUse blocks of previous
+                    # turn") — permanently bricking it, regardless of model. We keep
+                    # the conversational text; prior tool I/O is re-fetchable. (#155)
+                    filter_restored_tool_context=True,
                 )
                 logger.debug(f"✅ Config created with LTM retrieval enabled")
                 logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {actor_id})")
