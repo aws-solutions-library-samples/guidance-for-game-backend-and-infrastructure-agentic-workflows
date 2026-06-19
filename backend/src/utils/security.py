@@ -348,11 +348,23 @@ def get_rate_limit_key(user_id: str | None, endpoint: str) -> str:
 # Addresses Well-Architected GenAI Lens: Operational Excellence 2.2
 # ---------------------------------------------------------------------------
 import collections
+import os
 import threading
 import time as _time
 
+# Third-party packages
+from cachetools import TTLCache
+
 _rate_limit_lock = threading.Lock()
-_rate_limit_windows: dict[str, collections.deque] = {}
+# Bounded so a flood of distinct keys (per-user / per-IP) can't grow the dict
+# without limit. Idle keys expire after the longest plausible window; the cap is
+# a hard backstop. An evicted key simply starts a fresh window (correct, fail-open
+# only after inactivity). Sized generously for concurrent active callers.
+_RATE_LIMIT_MAX_KEYS = int(os.getenv("GBAW_RATE_LIMIT_MAX_KEYS", "10000"))
+_RATE_LIMIT_KEY_TTL_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_KEY_TTL_SECONDS", "3600"))
+_rate_limit_windows: "TTLCache[str, collections.deque]" = TTLCache(
+    maxsize=_RATE_LIMIT_MAX_KEYS, ttl=_RATE_LIMIT_KEY_TTL_SECONDS
+)
 
 
 class RateLimitExceeded(Exception):

@@ -10,6 +10,7 @@ Performance Optimization:
 
 # Standard library
 import hashlib
+import os
 import re
 import uuid
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from typing import Dict, Optional, Set
 
 # Third-party packages
 import boto3
+from cachetools import TTLCache
 
 # Local modules
 from config.settings import AWS_REGION, BEDROCK_AGENTCORE_MEMORY_ID, BOTO3_CLIENT_CONFIG
@@ -25,9 +27,16 @@ from utils.logger import logger
 # Module-level boto3 client cache for performance
 _memory_client = None
 
-# Deduplication cache: stores hashes of saved memories per actor_id
-# Format: {actor_id: {content_hash, ...}}
-_saved_memory_hashes: Dict[str, Set[str]] = {}
+# Deduplication cache: per-actor set of saved-content hashes, format
+# {actor_id: {content_hash, ...}}. Bounded by a TTLCache on the actor dimension
+# (LRU + TTL eviction) so it can't grow without limit in a long-lived runtime —
+# dedup is a best-effort optimization, so evicting an idle actor's hashes at
+# worst allows one duplicate memory write, which is harmless.
+_MEMORY_DEDUP_MAX_ACTORS = int(os.getenv("GBAW_MEMORY_DEDUP_MAX_ACTORS", "5000"))
+_MEMORY_DEDUP_TTL_SECONDS = int(os.getenv("GBAW_MEMORY_DEDUP_TTL_SECONDS", "86400"))  # 24h
+_saved_memory_hashes: "TTLCache[str, Set[str]]" = TTLCache(
+    maxsize=_MEMORY_DEDUP_MAX_ACTORS, ttl=_MEMORY_DEDUP_TTL_SECONDS
+)
 
 
 def _get_memory_client():
