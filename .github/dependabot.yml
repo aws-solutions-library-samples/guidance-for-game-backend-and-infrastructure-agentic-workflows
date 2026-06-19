@@ -96,24 +96,11 @@ updates:
       - dependency-name: "node"
         update-types: ["version-update:semver-major"]
 
-  # Docker base images (backend - AgentCore generated Dockerfile)
-  - package-ecosystem: "docker"
-    directory: "/backend/.bedrock_agentcore/gameagentruntime"
-    schedule:
-      interval: "monthly"
-      day: "monday"
-      time: "09:00"
-      timezone: "America/Los_Angeles"
-    open-pull-requests-limit: 5
-    reviewers:
-      - "game-agent-maintainers"
-    labels:
-      - "dependencies"
-      - "docker"
-      - "security"
-    commit-message:
-      prefix: "chore(deps)"
-      include: "scope"
+  # (Removed: docker ecosystem for /backend/.bedrock_agentcore/gameagentruntime.
+  #  That Dockerfile is generated at deploy time by `agentcore configure` and is
+  #  gitignored / never committed, so Dependabot had no file to scan there and
+  #  the updater errored. The base image is tracked via the AgentCore toolkit
+  #  itself, not this repo.)
 
   # GitHub Actions dependencies
   - package-ecosystem: "github-actions"
