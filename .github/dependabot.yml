@@ -3,8 +3,11 @@
 
 version: 2
 updates:
-  # Python dependencies (backend)
-  - package-ecosystem: "pip"
+  # Python dependencies (backend) — managed by uv (pyproject.toml + uv.lock).
+  # Must use the "uv" ecosystem, not "pip": the pip ecosystem only updates the
+  # generated requirements.txt, which `uv sync` ignores and scripts/deploy.sh
+  # regenerates from uv.lock on deploy, so those updates never take effect.
+  - package-ecosystem: "uv"
     directory: "/backend"
     schedule:
       interval: "monthly"
