@@ -93,3 +93,40 @@ jobs:
         name: playwright-report
         path: ui/playwright-report/
         retention-days: 14
+
+  powershell-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v6
+
+    # pwsh (PowerShell 7) is preinstalled on both ubuntu-latest and windows-latest.
+    - name: Cache PowerShell modules
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.local/share/powershell/Modules
+          ~/Documents/PowerShell/Modules
+        key: psmodules-${{ runner.os }}-pester5
+
+    - name: Install Pester
+      shell: pwsh
+      run: |
+        if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge '5.0.0' })) {
+          Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -Scope CurrentUser -SkipPublisherCheck
+        }
+
+    - name: Run Pester tests
+      shell: pwsh
+      run: |
+        Import-Module Pester -MinimumVersion 5.0.0
+        $config = New-PesterConfiguration
+        $config.Run.Path = 'scripts/powershell/Tests'
+        $config.Run.Exit = $true
+        $config.Output.Verbosity = 'Detailed'
+        $config.Should.ErrorAction = 'Stop'
+        Invoke-Pester -Configuration $config
