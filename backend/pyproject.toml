@@ -5,7 +5,7 @@ description = "AI-powered game server management backend"
 requires-python = ">=3.13.9,<3.14"
 dependencies = [
     # Strands packages with OTEL support
-    "strands-agents[otel]>=1.19.0",
+    "strands-agents[otel]>=1.44.0",
     "strands-agents-tools>=0.8.1",
 
     # MCP client. Previously pinned <1.19.0 due to an eks-mcp-server
@@ -28,7 +28,7 @@ dependencies = [
     "PyJWT[crypto]>=2.13.0",
 
     # AgentCore SDK with Strands integration
-    "bedrock-agentcore[strands-agents]>=1.0.6",
+    "bedrock-agentcore[strands-agents]>=1.15.0",
 
     # HTTP client with AWS SigV4 signing
     "httpx>=0.28.1",
