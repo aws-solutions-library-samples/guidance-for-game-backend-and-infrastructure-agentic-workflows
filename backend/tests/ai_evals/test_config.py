@@ -8,6 +8,7 @@ Uses shared get_deployment_info() from conftest.py for consistent detection.
 import json
 import os
 import sys
+import uuid
 
 # Third-party packages
 import pytest
@@ -52,7 +53,20 @@ def make_agent_request(query: str, config: dict = None):
 
             client = boto3.client("bedrock-agentcore", region_name=config["region"])
 
-            payload = json.dumps({"prompt": query})
+            # Use a FRESH unique session per request. Without this, requests fall
+            # to the shared anonymous/"default" session, where one interrupted turn
+            # (orphaned toolUse) bricks every later call for the whole test run
+            # (see #155). A unique session_id per request isolates each test.
+            unique = uuid.uuid4().hex
+            payload = json.dumps(
+                {
+                    "prompt": query,
+                    "user_context": {
+                        "user_id": f"aieval-{unique}",
+                        "session_id": f"aieval-session-{unique}",
+                    },
+                }
+            )
             payload_bytes = payload.encode("utf-8")
 
             response = client.invoke_agent_runtime(
