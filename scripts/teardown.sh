@@ -5,6 +5,7 @@
 cd "$(dirname "$0")/.."
 
 set -e
+set -o pipefail  # fail if any command in a pipe fails (not just the last)
 
 PROJECT_NAME="game-agent"
 

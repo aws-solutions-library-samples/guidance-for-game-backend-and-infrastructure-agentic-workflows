@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -o pipefail  # fail if any command in a pipe fails (not just the last)
 
 # Game Agent - Complete Deployment Script
 # Uses AgentCore direct code deployment (CodeBuild)
