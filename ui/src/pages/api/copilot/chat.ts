@@ -5,39 +5,61 @@ import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { parse } from 'cookie';
 
-// JWT verifier for production (lazy-initialized)
-let jwtVerifier: ReturnType<typeof CognitoJwtVerifier.create> | null = null;
+// JWT verifiers for production (lazy-initialized). Separate verifiers per token
+// use: aws-jwt-verify enforces the token_use claim, so the access token must be
+// verified with an 'access' verifier and the id token with an 'id' verifier.
+let accessVerifier: ReturnType<typeof CognitoJwtVerifier.create> | null = null;
+let idVerifier: ReturnType<typeof CognitoJwtVerifier.create> | null = null;
 
-async function validateJWT(req: NextApiRequest): Promise<boolean> {
+function getAccessVerifier() {
+  if (!accessVerifier) {
+    accessVerifier = CognitoJwtVerifier.create({
+      userPoolId: process.env.COGNITO_USER_POOL_ID!,
+      tokenUse: 'access',
+      clientId: process.env.COGNITO_CLIENT_ID!,
+    });
+  }
+  return accessVerifier;
+}
 
+function getIdVerifier() {
+  if (!idVerifier) {
+    idVerifier = CognitoJwtVerifier.create({
+      userPoolId: process.env.COGNITO_USER_POOL_ID!,
+      tokenUse: 'id',
+      clientId: process.env.COGNITO_CLIENT_ID!,
+    });
+  }
+  return idVerifier;
+}
+
+/**
+ * Verify the access-token cookie and return its decoded payload (or null).
+ *
+ * In non-production (local dev) auth is skipped — callers treat a null payload
+ * in dev as "authenticated, no verified identity". The returned `sub` is used to
+ * bind the id token to this access token so a valid access token cannot be paired
+ * with a forged id token.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function verifyAccessToken(req: NextApiRequest): Promise<{ ok: boolean; payload: any }> {
   // Skip JWT validation in development
   if (process.env.NODE_ENV !== 'production') {
-    return true;
+    return { ok: true, payload: null };
   }
 
-  // Production: validate JWT from HttpOnly cookie
   const cookies = parse(req.headers.cookie || '');
   const token = cookies.cognito_access_token;
-
   if (!token) {
-    return false;
+    return { ok: false, payload: null };
   }
 
   try {
-    // Lazy-initialize verifier
-    if (!jwtVerifier) {
-      jwtVerifier = CognitoJwtVerifier.create({
-        userPoolId: process.env.COGNITO_USER_POOL_ID!,
-        tokenUse: 'access',
-        clientId: process.env.COGNITO_CLIENT_ID!,
-      });
-    }
-
-    await jwtVerifier.verify(token);
-    return true;
+    const payload = await getAccessVerifier().verify(token);
+    return { ok: true, payload };
   } catch (error) {
-    logError('JWT validation failed:', error instanceof Error ? error : new Error(String(error)));
-    return false;
+    logError('Access token validation failed:', error instanceof Error ? error : new Error(String(error)));
+    return { ok: false, payload: null };
   }
 }
 
@@ -137,55 +159,63 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] Received ${sanitizedMethod} request to /api/copilot/chat`);
 
     // Validate JWT in production
-    const isAuthenticated = await validateJWT(req);
+    const { ok: isAuthenticated, payload: accessPayload } = await verifyAccessToken(req);
     if (!isAuthenticated) {
       logError(`[${requestId}] ❌ Unauthorized: Invalid or missing JWT token`);
       return res.status(401).json({ error: 'Unauthorized', requestId });
     }
 
-    // Extract user context from JWT
+    // Extract user context from the ID token. The ID token is CRYPTOGRAPHICALLY
+    // VERIFIED (signature + token_use + expiry) — not raw-decoded — because its
+    // claims (cognito:groups, sub) drive the approval gate and the isAdmin flag.
+    // It is also bound to the verified access token (matching sub) so a valid
+    // access token can't be paired with a forged/other id token. (#117)
     const cookies = parse(req.headers.cookie || '');
     const idToken = cookies.cognito_id_token;
     let userContext = {};
+    // Verified ID-token claims, reused later for the memory-identity block so the
+    // token is verified exactly once (no second raw decode).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let verifiedIdClaims: any = null;
 
     if (idToken) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let decoded: any;
       try {
-        const parts = idToken.split('.');
-        if (parts.length !== 3) {
-          throw new Error('Invalid JWT format');
-        }
+        decoded = await getIdVerifier().verify(idToken);
+        verifiedIdClaims = decoded;
+      } catch (error) {
+        logError(`[${requestId}] ❌ ID token verification failed`, error instanceof Error ? error : new Error(String(error)));
+        return res.status(401).json({ error: 'Invalid token', requestId });
+      }
 
-        const decoded = JSON.parse(
-          Buffer.from(parts[1], 'base64').toString()
-        ) as { sub: string; email: string; 'cognito:groups'?: string[] };
+      // Bind id token to the verified access token (production only — in dev the
+      // access token is not verified, so there is no sub to bind against).
+      if (accessPayload?.sub && decoded.sub !== accessPayload.sub) {
+        logError(`[${requestId}] ❌ Token binding mismatch (id sub != access sub)`);
+        return res.status(401).json({ error: 'Token mismatch', requestId });
+      }
 
-        const groups = decoded['cognito:groups'] || [];
+      const groups = (decoded['cognito:groups'] as string[]) || [];
 
-        // Check if user is confirmed and approved
-        if (!groups.includes('admin') && !groups.includes('users')) {
-          logError(`[${requestId}] ❌ User not approved`);
-          return res.status(403).json({
-            error: 'Account pending approval',
-            message: 'Your account is awaiting admin approval. Please contact an administrator.',
-            requestId
-          });
-        }
-
-        userContext = {
-          userId: decoded.sub,
-          email: decoded.email,
-          isAdmin: groups.includes('admin'),
-          groups: groups
-        };
-
-        logInfo(`[${requestId}] 👤 User: ${redact(decoded.email)}, Admin: ${groups.includes('admin')}`);
-      } catch {
-        logError(`[${requestId}] ❌ Failed to decode JWT`);
-        return res.status(400).json({
-          error: 'Invalid token format',
+      // Check if user is confirmed and approved
+      if (!groups.includes('admin') && !groups.includes('users')) {
+        logError(`[${requestId}] ❌ User not approved`);
+        return res.status(403).json({
+          error: 'Account pending approval',
+          message: 'Your account is awaiting admin approval. Please contact an administrator.',
           requestId
         });
       }
+
+      userContext = {
+        userId: decoded.sub,
+        email: decoded.email,
+        isAdmin: groups.includes('admin'),
+        groups: groups
+      };
+
+      logInfo(`[${requestId}] 👤 User: ${redact(decoded.email as string)}, Admin: ${groups.includes('admin')}`);
     }
 
     // Handle different HTTP methods appropriately
@@ -311,23 +341,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         });
       }
 
-      try {
-        const decoded = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString());
-        userIdentity = {
-          userId: decoded.sub,           // Persistent Cognito user ID
-          email: decoded.email,
-          username: decoded.email || decoded.sub,
-          displayName: decoded.email,
-          authType: 'cognito'
-        };
-      } catch (error) {
-        logError(`[${requestId}] Failed to decode JWT token`, error instanceof Error ? error : new Error(String(error)));
+      // Reuse the ID-token claims verified earlier (signature + token_use +
+      // binding to the access token) rather than raw-decoding again. If the
+      // earlier verification didn't run/populate this, treat it as unauthenticated.
+      const decoded = verifiedIdClaims;
+      if (!decoded?.sub) {
+        logError(`[${requestId}] ❌ ID token not verified`);
         return res.status(401).json({
           error: 'Invalid authentication',
           message: 'Please sign in again',
           requestId
         });
       }
+      userIdentity = {
+        userId: decoded.sub,           // Persistent Cognito user ID
+        email: decoded.email,
+        username: decoded.email || decoded.sub,
+        displayName: decoded.email,
+        authType: 'cognito'
+      };
     }
 
     // Development: Ensure we have AWS credentials identity
