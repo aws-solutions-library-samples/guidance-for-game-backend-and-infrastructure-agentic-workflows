@@ -145,7 +145,7 @@ colorama==0.4.6
     #   tqdm
 configargparse==1.7.1
     # via checkov
-cryptography==46.0.3
+cryptography==49.0.0
     # via pyjwt
 cyclonedx-python-lib==5.2.0
     # via checkov
