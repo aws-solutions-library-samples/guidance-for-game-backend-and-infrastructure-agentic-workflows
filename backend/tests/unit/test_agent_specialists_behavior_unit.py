@@ -35,17 +35,53 @@ class TestGameLiftSpecialistBehavior:
         # Local modules
         from agents.gamelift_specialist import list_gamelift_fleets
 
-        # Mock boto3 client
+        # Mock boto3 client (empty account: paginator yields a single empty page)
         with patch("agents.gamelift_specialist.boto3.client") as mock_client:
             mock_gamelift = MagicMock()
-            mock_gamelift.list_fleets.return_value = {"FleetIds": []}
-            mock_gamelift.describe_fleet_attributes.return_value = {"FleetAttributes": []}
+            mock_gamelift.get_paginator.return_value.paginate.return_value = [{"FleetIds": []}]
             mock_client.return_value = mock_gamelift
 
             result = list_gamelift_fleets()
 
             assert isinstance(result, dict)
-            assert "FleetAttributes" in result
+            assert result["FleetAttributes"] == []
+            # No fleets -> must not call describe_fleet_attributes
+            mock_gamelift.describe_fleet_attributes.assert_not_called()
+
+    def test_list_fleets_paginates_and_chunks(self):
+        """list_gamelift_fleets pages all fleets and chunks describe calls at 100.
+
+        Regression for #124: a single list_fleets() call truncated large
+        accounts. With 150 fleets across 2 pages, all 150 must be described via
+        two describe_fleet_attributes calls (100 + 50).
+        """
+        # Standard library
+        from unittest.mock import MagicMock, patch
+
+        # Local modules
+        from agents.gamelift_specialist import list_gamelift_fleets
+
+        page1 = [f"fleet-{i}" for i in range(100)]
+        page2 = [f"fleet-{i}" for i in range(100, 150)]
+
+        with patch("agents.gamelift_specialist.boto3.client") as mock_client:
+            mock_gamelift = MagicMock()
+            mock_gamelift.get_paginator.return_value.paginate.return_value = [
+                {"FleetIds": page1},
+                {"FleetIds": page2},
+            ]
+            mock_gamelift.describe_fleet_attributes.side_effect = lambda FleetIds: {
+                "FleetAttributes": [{"FleetId": fid} for fid in FleetIds]
+            }
+            mock_client.return_value = mock_gamelift
+
+            result = list_gamelift_fleets()
+
+            # All 150 fleets described, none dropped
+            assert len(result["FleetAttributes"]) == 150
+            # describe called twice with <=100 IDs each (100, then 50)
+            calls = mock_gamelift.describe_fleet_attributes.call_args_list
+            assert [len(c.kwargs["FleetIds"]) for c in calls] == [100, 50]
 
 
 class TestEKSSpecialistBehavior:
