@@ -59,24 +59,22 @@ jobs:
   e2e-tests:
     runs-on: ubuntu-latest
     needs: [backend-tests, frontend-tests]
+    # Official Playwright image (Microsoft Container Registry CDN) ships
+    # browsers + all system libraries pre-installed. Pinned to the
+    # @playwright/test version in ui/package-lock.json — bump in lockstep.
+    # Avoids `playwright install --with-deps`, which apt-installs ~80 system
+    # libs from the (slow/flaky) Azure Ubuntu mirror on every run.
+    container:
+      image: mcr.microsoft.com/playwright:v1.57.0-noble
 
     steps:
     - uses: actions/checkout@v6
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v6
-      with:
-        node-version: '24'
-        cache: 'npm'
-        cache-dependency-path: './ui/package-lock.json'
-
+    # --ignore-scripts skips the postinstall playwright-install hook (the apt
+    # path); browsers are already in the image. Mirrors ui/Dockerfile.
     - name: Install frontend dependencies
       working-directory: ./ui
-      run: npm ci
-
-    - name: Install Playwright
-      working-directory: ./ui
-      run: npx playwright install --with-deps chromium
+      run: npm ci --ignore-scripts
 
     - name: Build frontend
       working-directory: ./ui
