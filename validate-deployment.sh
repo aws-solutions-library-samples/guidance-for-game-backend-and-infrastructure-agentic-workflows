@@ -6,6 +6,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_NAME="game-agent"
 
+# Default region (script uses `set -u`, so a bare $AWS_REGION would abort). Honor
+# an exported AWS_REGION, else the profile's configured region, else us-west-2.
+AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo us-west-2)}"
+
 # Resolve AWS profile from environment or ui/.env.local (matches scripts/deploy.sh).
 # An explicitly set AWS_PROFILE always wins; otherwise fall back to ui/.env.local.
 if [ -z "${AWS_PROFILE:-}" ] && [ -f "$SCRIPT_DIR/ui/.env.local" ]; then

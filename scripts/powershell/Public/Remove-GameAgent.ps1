@@ -187,7 +187,7 @@ function Remove-GameAgent {
         # ── Step 4b: Orphaned resources ──
         Write-GameAgentStatus 'Checking for orphaned AgentCore resources...' -Type Info
         $orphanRuntimes = (& aws bedrock-agentcore-control list-agent-runtimes --region $Region @profileArgs `
-            --query "agentRuntimes[?starts_with(agentRuntimeName, ``game-agent``)].agentRuntimeId" --output text 2>$null) | Out-String
+            --query "agentRuntimes[?starts_with(agentRuntimeName, ``gameagent``)].agentRuntimeId" --output text 2>$null) | Out-String
         $orphanRuntimes = $orphanRuntimes.Trim()
         if ($orphanRuntimes) {
             foreach ($rid in ($orphanRuntimes -split '\s+')) {
@@ -200,7 +200,7 @@ function Remove-GameAgent {
         }
 
         $orphanMemories = (& aws bedrock-agentcore-control list-memories --region $Region @profileArgs `
-            --query "memories[?starts_with(id, ``game-agent``)].id" --output text 2>$null) | Out-String
+            --query "memories[?starts_with(id, ``gameagent``)].id" --output text 2>$null) | Out-String
         $orphanMemories = $orphanMemories.Trim()
         if ($orphanMemories) {
             foreach ($mid in ($orphanMemories -split '\s+')) {
