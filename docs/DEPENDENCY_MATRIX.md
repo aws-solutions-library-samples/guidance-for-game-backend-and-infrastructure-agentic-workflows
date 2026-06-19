@@ -24,11 +24,10 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 | Package | Version | Purpose | License | Security Notes |
 |---------|---------|---------|---------|----------------|
-| mcp | >=1.11.0,<1.19.0 | MCP client library | Apache-2.0 | Pinned due to eks-mcp-server incompatibility |
+| mcp | >=1.23.0 | MCP client library | Apache-2.0 | Resolves GHSA-9h52-p55h-vw2f. Former <1.19.0 pin lifted (awslabs/mcp#1577 fixed in eks-mcp-server>=0.1.32) |
 | awslabs.ccapi-mcp-server | >=1.0.8 | CloudControl API MCP server | Apache-2.0 | AWS managed |
 | awslabs.cost-explorer-mcp-server | >=0.0.12 | Cost Explorer MCP server | Apache-2.0 | AWS managed |
-| awslabs.eks-mcp-server | ==0.1.14 | EKS MCP server | Apache-2.0 | Pinned version |
-| awslabs.core-mcp-server | ==1.0.7 | Core AWS MCP server | Apache-2.0 | Pinned version |
+| awslabs.eks-mcp-server | >=0.1.32 | EKS MCP server | Apache-2.0 | Requires mcp>=1.23.0 (unpinned from 0.1.14) |
 
 ### AWS SDK Dependencies
 

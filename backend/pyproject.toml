@@ -8,9 +8,12 @@ dependencies = [
     "strands-agents[otel]>=1.19.0",
     "strands-agents-tools>=0.8.1",
 
-    # MCP client - Pinned to <1.19.0 due to eks-mcp-server incompatibility
-    # See: https://github.com/awslabs/mcp/issues/1577
-    "mcp>=1.11.0,<1.19.0",
+    # MCP client. Previously pinned <1.19.0 due to an eks-mcp-server
+    # incompatibility (awslabs/mcp#1577: mcp 1.19 added stricter type
+    # validation that broke eks-mcp-server's Union[CallToolResult] pattern).
+    # Fixed upstream: eks-mcp-server>=0.1.32 now requires mcp[cli]>=1.23.0,
+    # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
+    "mcp>=1.23.0",
 
     # AWS SDK
     "boto3>=1.43.33",
@@ -19,8 +22,8 @@ dependencies = [
     # Environment variables
     "python-dotenv>=1.2.2",
 
-    # JWT authentication
-    "PyJWT[crypto]>=2.8.0",
+    # JWT authentication (floor raised to the patched version, CVE fix)
+    "PyJWT[crypto]>=2.13.0",
 
     # AgentCore SDK with Strands integration
     "bedrock-agentcore[strands-agents]>=1.0.6",
@@ -42,10 +45,11 @@ dependencies = [
     "psutil>=7.2.2",
 
     # AWS Labs MCP Servers - stdio transport
+    # (core-mcp-server removed: it was never imported/launched by this codebase
+    #  and pulled a large unused tree of other awslabs servers.)
     "awslabs.ccapi-mcp-server>=1.0.8",
     "awslabs.cost-explorer-mcp-server>=0.0.12",
-    "awslabs.eks-mcp-server==0.1.14",
-    "awslabs.core-mcp-server==1.0.7",
+    "awslabs.eks-mcp-server>=0.1.32",
 
     # Documentation scraper dependencies
     "requests>=2.34.2",

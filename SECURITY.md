@@ -257,7 +257,7 @@ with its rationale rather than ignored.
 
 | Advisory | Package | Status | Rationale |
 |----------|---------|--------|-----------|
-| [GHSA-9h52-p55h-vw2f](https://github.com/advisories/GHSA-9h52-p55h-vw2f) — MCP Python SDK DNS rebinding protection not enabled by default (high) | `mcp` (pinned `>=1.11.0,<1.19.0`) | **Accepted / not applicable** | The advisory affects MCP servers exposed over **HTTP/SSE** transports. This project runs all MCP servers as embedded **stdio** subprocesses (`StdioServerParameters` / `stdio_client` in `backend/src/utils/mcp_client_factory.py`) — no network listener — so DNS rebinding does not apply. `mcp` is held below 1.19.0 due to an `eks-mcp-server` incompatibility (see `.github/dependabot.yml`). Re-evaluate the pin + upgrade to ≥1.23.0 when the downstream MCP servers support it. |
+| [GHSA-9h52-p55h-vw2f](https://github.com/advisories/GHSA-9h52-p55h-vw2f) — MCP Python SDK DNS rebinding protection not enabled by default (high) | `mcp` (`>=1.23.0`) | **Resolved (patched)** | Upgraded `mcp` to ≥1.23.0 (patched line). Previously blocked by a `<1.19.0` pin for an `eks-mcp-server` incompatibility (awslabs/mcp#1577); that is fixed upstream — `eks-mcp-server>=0.1.32` itself now requires `mcp[cli]>=1.23.0` — so the pin was lifted. (Only stdio transport is used here, so the DNS-rebinding vector did not apply regardless.) |
 
 ### AWS Inspector
 
@@ -405,7 +405,7 @@ npm update    # Update dependencies
 ### Version Pinning Strategy
 
 **Critical Dependencies**: Pinned to specific versions with documented reasons  
-**Example**: `mcp>=1.11.0,<1.19.0` (pinned due to eks-mcp-server incompatibility)
+**Example**: `awslabs.eks-mcp-server>=0.1.32` (requires `mcp>=1.23.0`; the former `mcp<1.19.0` pin was lifted once awslabs/mcp#1577 was fixed upstream)
 
 **Documentation Location**: `backend/pyproject.toml` (inline comments)
 

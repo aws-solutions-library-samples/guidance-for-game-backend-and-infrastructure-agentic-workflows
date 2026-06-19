@@ -35,17 +35,10 @@ updates:
     # Allow both direct and indirect dependency updates
     allow:
       - dependency-type: "all"
-    # Ignore specific dependencies with documented reasons
-    ignore:
-      # MCP pinned due to eks-mcp-server incompatibility
-      - dependency-name: "mcp"
-        versions: [">=1.19.0"]
-      # Core MCP server pinned due to ARM64 build failures
-      - dependency-name: "awslabs.core-mcp-server"
-        versions: [">1.0.7"]
-      # EKS MCP server pinned due to mcp version conflict
-      - dependency-name: "awslabs.eks-mcp-server"
-        versions: [">0.1.14"]
+    # (Former mcp / eks-mcp-server / core-mcp-server ignores removed: the
+    #  upstream eks-mcp-server<->mcp 1.19 incompatibility (awslabs/mcp#1577) is
+    #  fixed in eks-mcp-server>=0.1.32, which requires mcp>=1.23.0; and the
+    #  unused core-mcp-server dependency was dropped. Let Dependabot track these.)
 
   # npm dependencies (frontend)
   - package-ecosystem: "npm"

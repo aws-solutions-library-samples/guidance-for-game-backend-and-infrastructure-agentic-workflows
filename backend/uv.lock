@@ -328,22 +328,6 @@ wheels = [
 ]
 
 [[package]]
-name = "awslabs-core-mcp-server"
-version = "1.0.7"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "boto3" },
-    { name = "loguru" },
-    { name = "mcp", extra = ["cli"] },
-    { name = "pydantic" },
-    { name = "python-dotenv" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/57/a8/459824b943a230053e0975fcf8ad3cd2ca1ace5384e466b7fdb6b009555e/awslabs_core_mcp_server-1.0.7.tar.gz", hash = "sha256:49dafaae33d3ae69693f62c7e9b94b7b8fc8f51bec0c8fa5f9d38b16f5cbdfa0", size = 82540, upload-time = "2025-08-21T18:24:54.831Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ce/84/82538bf46f2a6b8d231a516b806a66d319ba9e0fc881946665d9cfdb84eb/awslabs_core_mcp_server-1.0.7-py3-none-any.whl", hash = "sha256:ecafd32e44d97ce627086fcb0f464f662b2142e9615a6779b0b5c4294a090e6c", size = 16962, upload-time = "2025-08-21T18:24:53.585Z" },
-]
-
-[[package]]
 name = "awslabs-cost-explorer-mcp-server"
 version = "0.0.13"
 source = { registry = "https://pypi.org/simple" }
@@ -361,7 +345,7 @@ wheels = [
 
 [[package]]
 name = "awslabs-eks-mcp-server"
-version = "0.1.14"
+version = "0.1.32"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -374,9 +358,9 @@ dependencies = [
     { name = "requests" },
     { name = "requests-auth-aws-sigv4" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0d/44/9b1d1a75014fcf653750e5eb71153a5090c7def85409c268097bc2719e11/awslabs_eks_mcp_server-0.1.14.tar.gz", hash = "sha256:f5997f6e3a59c47368f21f989c2b2920f1796885e2ce79223a12f1fdd41db090", size = 184738, upload-time = "2025-10-13T20:58:47.165Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/7f/0b81e04ae04e7274036794e425ba747b7fc38553fdca83ffc653aad97f57/awslabs_eks_mcp_server-0.1.32.tar.gz", hash = "sha256:e4a6dc45f742c80802c7c66c653e8267b37ebbb880447b51b1efd61268f7a650", size = 227031, upload-time = "2026-06-17T22:51:54.463Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/a1/5e4b0021e78cb927f1994556d3a59ffd475d7c663c3ae15dee36bb00331e/awslabs_eks_mcp_server-0.1.14-py3-none-any.whl", hash = "sha256:fd23b859d495a107cecb2e68cdaade360655ef240f2e8398fa39352579a6eca5", size = 80637, upload-time = "2025-10-13T20:58:41.307Z" },
+    { url = "https://files.pythonhosted.org/packages/17/f3/05945a8a96c972daf25b6949f891f94240bdf431ce9194ac467cabb4f016/awslabs_eks_mcp_server-0.1.32-py3-none-any.whl", hash = "sha256:021e62121b55b4707cd67d1990cb94dce90997a99c441937303b5a5ae521fbd2", size = 85275, upload-time = "2026-06-17T22:51:52.603Z" },
 ]
 
 [[package]]
@@ -1118,7 +1102,6 @@ source = { virtual = "." }
 dependencies = [
     { name = "aws-opentelemetry-distro" },
     { name = "awslabs-ccapi-mcp-server" },
-    { name = "awslabs-core-mcp-server" },
     { name = "awslabs-cost-explorer-mcp-server" },
     { name = "awslabs-eks-mcp-server" },
     { name = "beautifulsoup4" },
@@ -1161,9 +1144,8 @@ dev = [
 requires-dist = [
     { name = "aws-opentelemetry-distro", specifier = ">=0.17.1" },
     { name = "awslabs-ccapi-mcp-server", specifier = ">=1.0.8" },
-    { name = "awslabs-core-mcp-server", specifier = "==1.0.7" },
     { name = "awslabs-cost-explorer-mcp-server", specifier = ">=0.0.12" },
-    { name = "awslabs-eks-mcp-server", specifier = "==0.1.14" },
+    { name = "awslabs-eks-mcp-server", specifier = ">=0.1.32" },
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
     { name = "bedrock-agentcore", extras = ["strands-agents"], specifier = ">=1.0.6" },
     { name = "boto3", specifier = ">=1.43.33" },
@@ -1172,11 +1154,11 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "httpx-auth-awssigv4", specifier = ">=0.1.4" },
     { name = "loguru", specifier = ">=0.7.3" },
-    { name = "mcp", specifier = ">=1.11.0,<1.19.0" },
+    { name = "mcp", specifier = ">=1.23.0" },
     { name = "opentelemetry-instrumentation", specifier = ">=0.54b0" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pydantic", specifier = ">=2.13.4" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8.0" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.13.0" },
     { name = "pypdf", specifier = ">=6.13.3" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pyyaml", specifier = ">=6.0.1" },
@@ -1728,7 +1710,7 @@ wheels = [
 
 [[package]]
 name = "mcp"
-version = "1.18.0"
+version = "1.28.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1737,15 +1719,18 @@ dependencies = [
     { name = "jsonschema" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "sse-starlette" },
     { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
     { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1a/e0/fe34ce16ea2bacce489ab859abd1b47ae28b438c3ef60b9c5eee6c02592f/mcp-1.18.0.tar.gz", hash = "sha256:aa278c44b1efc0a297f53b68df865b988e52dd08182d702019edcf33a8e109f6", size = 482926, upload-time = "2025-10-16T19:19:55.125Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c1/ee/94c6c50ffc5b5cf4737052275d11b57367f32d1a8516e31dcd60591b3916/mcp-1.28.0.tar.gz", hash = "sha256:559d3f9943674cafbe5744c5d3794f3237e8b47f9bbc58e20c0fad680d8487c2", size = 636040, upload-time = "2026-06-16T21:37:17.996Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/44/f5970e3e899803823826283a70b6003afd46f28e082544407e24575eccd3/mcp-1.18.0-py3-none-any.whl", hash = "sha256:42f10c270de18e7892fdf9da259029120b1ea23964ff688248c69db9d72b1d0a", size = 168762, upload-time = "2025-10-16T19:19:53.2Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/e1/4c1dc1fbb688641a712d34650c3d58bbbdcb314ddb75bc5817bbf33515a4/mcp-1.28.0-py3-none-any.whl", hash = "sha256:9c1e7cf3a9125557e418ecd4fed8e9adddce81b0dfdae4d6601d700f5beb71a4", size = 221959, upload-time = "2026-06-16T21:37:16.579Z" },
 ]
 
 [package.optional-dependencies]

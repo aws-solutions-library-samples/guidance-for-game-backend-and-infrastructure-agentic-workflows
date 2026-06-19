@@ -36,11 +36,9 @@ aws-requests-auth==0.4.3
     # via strands-agents-tools
 awslabs-ccapi-mcp-server==1.0.10
     # via game-agent-backend
-awslabs-core-mcp-server==1.0.7
-    # via game-agent-backend
 awslabs-cost-explorer-mcp-server==0.0.13
     # via game-agent-backend
-awslabs-eks-mcp-server==0.1.14
+awslabs-eks-mcp-server==0.1.32
     # via game-agent-backend
 bc-detect-secrets==1.4.30
     # via checkov
@@ -62,7 +60,6 @@ boolean-py==5.0
 boto3==1.43.33
     # via
     #   awslabs-ccapi-mcp-server
-    #   awslabs-core-mcp-server
     #   awslabs-cost-explorer-mcp-server
     #   awslabs-eks-mcp-server
     #   bedrock-agentcore
@@ -230,7 +227,6 @@ license-expression==30.4.4
 loguru==0.7.3
     # via
     #   awslabs-ccapi-mcp-server
-    #   awslabs-core-mcp-server
     #   awslabs-cost-explorer-mcp-server
     #   awslabs-eks-mcp-server
     #   game-agent-backend
@@ -242,10 +238,9 @@ markdownify==1.2.0
     # via strands-agents-tools
 markupsafe==3.0.3
     # via jinja2
-mcp==1.18.0
+mcp==1.28.0
     # via
     #   awslabs-ccapi-mcp-server
-    #   awslabs-core-mcp-server
     #   awslabs-cost-explorer-mcp-server
     #   awslabs-eks-mcp-server
     #   game-agent-backend
@@ -657,7 +652,6 @@ pycparser==2.23 ; implementation_name != 'PyPy'
 pydantic==2.13.4
     # via
     #   awslabs-ccapi-mcp-server
-    #   awslabs-core-mcp-server
     #   awslabs-cost-explorer-mcp-server
     #   awslabs-eks-mcp-server
     #   bedrock-agentcore
@@ -675,6 +669,7 @@ pygments==2.20.0
 pyjwt==2.13.0
     # via
     #   game-agent-backend
+    #   mcp
     #   strands-agents-tools
 pyparsing==3.2.5
     # via rdflib
@@ -689,7 +684,6 @@ python-discovery==1.4.2
     # via virtualenv
 python-dotenv==1.2.2
     # via
-    #   awslabs-core-mcp-server
     #   game-agent-backend
     #   mcp
     #   pydantic-settings
@@ -821,6 +815,7 @@ typing-extensions==4.15.0
     #   bedrock-agentcore
     #   checkov
     #   grpcio
+    #   mcp
     #   opentelemetry-api
     #   opentelemetry-exporter-otlp-proto-grpc
     #   opentelemetry-exporter-otlp-proto-http
@@ -837,6 +832,7 @@ typing-extensions==4.15.0
     #   typing-inspection
 typing-inspection==0.4.2
     # via
+    #   mcp
     #   pydantic
     #   pydantic-settings
 tzdata==2025.2
