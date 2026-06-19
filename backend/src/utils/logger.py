@@ -22,16 +22,24 @@ from config import settings
 # Detect if running in containerized environment (AgentCore Runtime)
 IS_CONTAINERIZED = not settings.IS_DEVELOPMENT
 
+# Verbose diagnostics (loguru `diagnose` annotates tracebacks with local VALUES —
+# it can leak secrets/tokens/PII into logs, so it must NEVER be on in production).
+# Gate it (and DEBUG level) on the explicit dev-only debug flag.
+_DEBUG_LOGGING = settings.ENABLE_DEBUG_LOGGING
+_STDOUT_LEVEL = "DEBUG" if _DEBUG_LOGGING else settings.LOG_LEVEL
+
 # Configure logger with more detailed formatting
 logger.remove()  # Remove default handler
 
-# ALWAYS log to stdout (ADOT will capture it)
+# ALWAYS log to stdout (ADOT will capture it). In production: honor LOG_LEVEL
+# (default INFO) and disable diagnose/backtrace so exception logs can't dump
+# local variable values (credentials, tokens, prompts) into CloudWatch.
 logger.add(
     sys.stdout,
-    level="DEBUG",
+    level=_STDOUT_LEVEL,
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-    backtrace=True,
-    diagnose=True,
+    backtrace=_DEBUG_LOGGING,
+    diagnose=_DEBUG_LOGGING,
 )
 
 if IS_CONTAINERIZED:
@@ -213,16 +221,6 @@ def log_mcp_health_check(server_type: str, status: str, metrics: Dict[str, Any])
 
     status_emoji = {"healthy": "✅", "unhealthy": "❌", "degraded": "⚠️"}.get(status, "❓")
     logger.info(f"{status_emoji} MCP health check: {server_type} is {status}", **health_data)
-
-
-__all__ = [
-    "logger",
-    "log_mcp_operation",
-    "log_mcp_error",
-    "log_mcp_performance",
-    "log_mcp_fallback",
-    "log_mcp_health_check",
-]
 
 
 __all__ = [
