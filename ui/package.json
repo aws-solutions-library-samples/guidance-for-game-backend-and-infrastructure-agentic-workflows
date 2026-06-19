@@ -76,7 +76,9 @@
     "typescript": "5.9.2"
   },
   "overrides": {
-    "prismjs": "^1.30.0"
+    "prismjs": "^1.30.0",
+    "postcss": "^8.5.10",
+    "js-yaml": "^4.2.0"
   },
   "jest": {
     "testEnvironment": "jsdom",
