@@ -9,6 +9,10 @@ import handler from '../../../pages/api/copilot/chat';
 jest.mock('@/utils/logger', () => ({
   logInfo: jest.fn(),
   logError: jest.fn(),
+  logDebug: jest.fn(),
+  // redact must return a string (it's interpolated into log messages); the real
+  // impl keeps a short prefix, the mock just needs to not be undefined.
+  redact: jest.fn((v?: string | null) => (v ? `${v.slice(0, 2)}…(redacted)` : '<none>')),
 }));
 
 jest.mock('@aws-sdk/client-bedrock-agentcore');
