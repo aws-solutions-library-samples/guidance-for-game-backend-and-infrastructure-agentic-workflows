@@ -739,7 +739,7 @@ rich==14.2.0
     # via
     #   strands-agents-tools
     #   typer
-rpds-py==0.28.0
+rpds-py==2026.5.1
     # via
     #   jsonschema
     #   referencing
