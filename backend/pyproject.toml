@@ -5,7 +5,7 @@ description = "AI-powered game server management backend"
 requires-python = ">=3.13.9"
 dependencies = [
     # Strands packages with OTEL support
-    "strands-agents[otel]>=1.19.0",
+    "strands-agents[otel]>=1.44.0",
     "strands-agents-tools>=0.8.1",
 
     # MCP client. Previously pinned <1.19.0 due to an eks-mcp-server
