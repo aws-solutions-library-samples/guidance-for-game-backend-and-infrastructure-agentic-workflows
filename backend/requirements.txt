@@ -79,7 +79,7 @@ botocore==1.43.33
     #   strands-agents-tools
 cached-property==2.0.1
     # via cloudsplaining
-cachetools==6.2.4
+cachetools==7.1.4
     # via
     #   aws-opentelemetry-distro
     #   awslabs-eks-mcp-server
