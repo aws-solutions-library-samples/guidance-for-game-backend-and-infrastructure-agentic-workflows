@@ -618,7 +618,7 @@ packaging==25.0
     #   opentelemetry-instrumentation-flask
     #   opentelemetry-instrumentation-pika
     #   opentelemetry-instrumentation-sqlalchemy
-pandas==2.3.3
+pandas==3.0.3
     # via awslabs-cost-explorer-mcp-server
 pillow==11.3.0
     # via strands-agents-tools
