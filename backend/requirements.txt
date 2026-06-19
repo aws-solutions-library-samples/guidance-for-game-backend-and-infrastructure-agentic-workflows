@@ -191,7 +191,7 @@ idna==3.18
     #   httpx
     #   requests
     #   yarl
-igraph==0.10.8
+igraph==1.0.0
     # via checkov
 importlib-metadata==8.6.1
     # via
