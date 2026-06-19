@@ -177,4 +177,9 @@ def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: in
         model_config["guardrail_version"] = BEDROCK_GUARDRAIL_VERSION
         model_config["guardrail_trace"] = "enabled"
 
+    # Log the selected model so per-agent tier is observable at runtime — the
+    # singleton path logs "Engines online", but these per-agent models were
+    # otherwise silent, hiding which tier each specialist actually used.
+    logger.info(f"🧠 Model (overrides): {model_config['model_id']} (temp={temperature})")
+
     return BedrockModel(**model_config)
