@@ -211,21 +211,10 @@ function Deploy-GameAgent {
             Write-GameAgentStatus 'AgentCore already configured, skipping configure step' -Type Info
         }
 
-        # Patch Dockerfile for MCP server compatibility
-        $dockerfile = '.bedrock_agentcore/gameagentruntime/Dockerfile'
-        if ((Test-Path $dockerfile) -and -not (Select-String -Path $dockerfile -Pattern 'ccapi_mcp_server/.schemas' -Quiet)) {
-            Write-GameAgentStatus 'Patching Dockerfile for MCP server compatibility...' -Type Info
-            $content = Get-Content $dockerfile -Raw
-            $patch = @"
-
-# Fix: Create writable cache directories for MCP servers
-RUN mkdir -p /usr/local/lib/python3.13/site-packages/awslabs/ccapi_mcp_server/.schemas && \
-    chmod 755 /usr/local/lib/python3.13/site-packages/awslabs/ccapi_mcp_server/.schemas
-"@
-            $content = $content -replace '(RUN uv pip install aws-opentelemetry-distro[^`\n]*)', "`$1`n$patch"
-            Set-Content $dockerfile $content -NoNewline
-            Write-GameAgentStatus 'Dockerfile patched' -Type Success
-        }
+        # Note: no Dockerfile patching needed for MCP servers. ccapi-mcp-server (which
+        # needed a writable .schemas dir) was replaced by aws-api-mcp-server, whose
+        # log/working-dir are redirected to /tmp via environment variables in
+        # utils/mcp_client_factory.create_mcp_client (no filesystem patch needed).
 
         # Launch or skip
         if (-not $existingRuntime) {

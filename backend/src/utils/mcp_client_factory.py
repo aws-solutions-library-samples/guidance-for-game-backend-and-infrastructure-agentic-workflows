@@ -66,29 +66,10 @@ def _build_startup_code(server_name: str, module: str, func: str) -> str:
     """
     Build Python startup code for an MCP server entry point.
 
-    Includes runtime patches for known issues:
-    - ccapi-mcp-server: Redirects schema cache to /tmp for read-only filesystems.
-      The schema_manager.py creates .schemas relative to __file__, which fails
-      on read-only filesystems like AgentCore direct_code_deploy (/var/task/).
+    (Read-only-filesystem workarounds for individual servers are handled via
+    environment variables in create_mcp_client, not via import-time patches.)
     """
-    startup = f"from {module} import {func}; {func}()"
-
-    if "ccapi" in server_name:
-        # Redirect ccapi schema cache dir to writable /tmp before module import.
-        # schema_manager.py line 35: cache_dir = os.path.join(os.path.dirname(__file__), '.schemas')
-        # The module-level singleton is created at import time, so we must patch
-        # os.path.dirname BEFORE the import triggers SchemaManager.__init__.
-        schema_fix = (
-            "import os as _os; "
-            "_sd = _os.path.join(_os.environ.get('TMPDIR', '/tmp'), '.ccapi_schemas'); "
-            "_os.makedirs(_sd, exist_ok=True); "
-            "_od = _os.path.dirname; "
-            "_os.path.dirname = lambda p, _r=_od, _c=_sd: "
-            "_c if 'ccapi_mcp_server' in str(p) and str(p).endswith('schema_manager.py') else _r(p); "
-        )
-        startup = schema_fix + startup
-
-    return startup
+    return f"from {module} import {func}; {func}()"
 
 
 def _resolve_mcp_command(server_name: str) -> List[str]:
@@ -124,7 +105,7 @@ def _resolve_mcp_command(server_name: str) -> List[str]:
         logger.debug(f"📍 {server_name}: entry point lookup failed: {e}")
 
     # Last resort: derive module path from AWS Labs naming convention
-    # e.g., ccapi-mcp-server -> awslabs.ccapi_mcp_server.server:main
+    # e.g., aws-api-mcp-server -> awslabs.aws_api_mcp_server.server:main
     module_name = f"awslabs.{server_name.replace('-', '_')}.server"
     logger.debug(f"📍 {server_name}: using naming convention {module_name}:main")
     return [sys.executable, "-c", _build_startup_code(server_name, module_name, "main")]
@@ -135,7 +116,7 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
     Create or retrieve cached MCP client using pre-installed AWS Labs MCP servers.
 
     Args:
-        server_name: MCP server name (e.g., "ccapi-mcp-server")
+        server_name: MCP server name (e.g., "aws-api-mcp-server")
         use_cache: If True, return cached client if available (default: True)
 
     Returns:
@@ -165,6 +146,22 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
             env = dict(os.environ)
             env["AWS_REGION"] = AWS_REGION
             env["AWS_DEFAULT_REGION"] = AWS_REGION
+
+            # aws-api-mcp-server writes a log under $HOME/.aws/aws-api-mcp and
+            # requires an existing working dir. On the read-only AgentCore
+            # container both would fail, so redirect them to writable /tmp. There
+            # is no env to relocate the log other than HOME. READ_OPERATIONS_ONLY
+            # caps it to read calls (the EKS specialist only does discovery, e.g.
+            # `aws eks list-clusters`). Both dirs MUST exist before launch.
+            if "aws-api" in server_name:
+                tmp_base = os.path.join(os.environ.get("TMPDIR", "/tmp"), "aws-api-mcp")
+                aws_api_home = os.path.join(tmp_base, "home")
+                aws_api_workdir = os.path.join(tmp_base, "workdir")
+                os.makedirs(aws_api_home, exist_ok=True)
+                os.makedirs(aws_api_workdir, exist_ok=True)
+                env["HOME"] = aws_api_home
+                env["AWS_API_MCP_WORKING_DIR"] = aws_api_workdir
+                env["READ_OPERATIONS_ONLY"] = "true"
 
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
             wrapper_path = os.path.join(os.path.dirname(__file__), "mcp_wrapper.py")

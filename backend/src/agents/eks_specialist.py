@@ -2,7 +2,7 @@
 EKS specialist agent.
 
 Handles EKS cluster management, Kubernetes operations, troubleshooting,
-and optimization using both EKS and CCAPI MCP servers.
+and optimization using the AWS API and EKS MCP servers.
 """
 
 # Local modules
@@ -51,13 +51,13 @@ kubectl logs <pod-name> -n <namespace>
 # ============================================================================
 
 # EKS agent needs BOTH MCP servers:
-# - CCAPI MCP: Lists EKS clusters (resource discovery)
-# - EKS MCP: Gets cluster details (operations)
+# - AWS API MCP: Discovers EKS clusters via `aws eks list-clusters` (resource discovery)
+# - EKS MCP: Gets cluster details and runs Kubernetes operations
 
 eks_agent = create_specialist_agent(
     service_name="EKS",
     emoji="☸️",
-    mcp_server_names=["ccapi-mcp-server", "eks-mcp-server"],
+    mcp_server_names=["aws-api-mcp-server", "eks-mcp-server"],
     kb_id=EKS_KB_ID,
     prompt_fn=get_optimized_eks_prompt,
     fallback_fn=_get_eks_aws_cli_fallback,

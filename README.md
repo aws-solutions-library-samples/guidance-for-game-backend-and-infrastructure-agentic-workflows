@@ -276,7 +276,7 @@ All three MCP servers use stdio transport exclusively. They run as embedded subp
 | MCP Server | Purpose | Specialist |
 |------------|---------|------------|
 | `awslabs.eks-mcp-server` | Kubernetes cluster management | EKS Specialist |
-| `awslabs.ccapi-mcp-server` | CloudFormation resource discovery | GameLift Specialist |
+| `awslabs.aws-api-mcp-server` | AWS CLI bridge for resource discovery (e.g. `aws eks list-clusters`) | EKS Specialist |
 | `awslabs.cost-explorer-mcp-server` | Cost analysis and forecasting | Cost Specialist |
 
 MCP clients are created through a thread-safe factory (`utils/mcp_client_factory.py`) with automatic retry and fallback to boto3 when MCP servers are unavailable.

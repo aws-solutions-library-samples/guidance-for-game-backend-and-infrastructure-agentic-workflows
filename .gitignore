@@ -100,6 +100,7 @@ ui/src/lib/  # Old frontend agent implementations
 # Test artifacts
 ui/test-results/
 ui/playwright-report/
+ui/playwright-report-live/
 backend/.pytest_cache/
 .coverage
 htmlcov/

@@ -2,7 +2,7 @@
 name = "game-agent-backend"
 version = "1.0.0"
 description = "AI-powered game server management backend"
-requires-python = ">=3.13.9"
+requires-python = ">=3.13.9,<3.14"
 dependencies = [
     # Strands packages with OTEL support
     "strands-agents[otel]>=1.19.0",
@@ -15,9 +15,11 @@ dependencies = [
     # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
     "mcp>=1.23.0",
 
-    # AWS SDK
-    "boto3>=1.43.33",
-    "botocore>=1.43.33",
+    # AWS SDK. Floors at 1.43.32 (not .33) so the resolver can satisfy the
+    # awscli==1.45.32 bundled by awslabs.aws-api-mcp-server, which pins
+    # botocore==1.43.32 exactly.
+    "boto3>=1.43.32",
+    "botocore>=1.43.32",
 
     # Environment variables
     "python-dotenv>=1.2.2",
@@ -47,7 +49,11 @@ dependencies = [
     # AWS Labs MCP Servers - stdio transport
     # (core-mcp-server removed: it was never imported/launched by this codebase
     #  and pulled a large unused tree of other awslabs servers.)
-    "awslabs.ccapi-mcp-server>=1.0.8",
+    # aws-api-mcp-server replaces the YANKED ccapi-mcp-server (issue #92): it's an
+    # AWS CLI bridge (call_aws) used by the EKS specialist for cluster discovery
+    # (`aws eks list-clusters`). Its log/workdir are redirected to /tmp via env in
+    # mcp_client_factory.create_mcp_client (it writes under $HOME otherwise).
+    "awslabs.aws-api-mcp-server>=1.3.45",
     "awslabs.cost-explorer-mcp-server>=0.0.12",
     "awslabs.eks-mcp-server>=0.1.32",
 
