@@ -841,7 +841,7 @@ tzdata==2025.2
     #   strands-agents-tools
 unidiff==0.7.5
     # via bc-detect-secrets
-update-checker==0.18.0
+update-checker==1.0.0
     # via checkov
 uritools==5.0.0
     # via spdx-tools
