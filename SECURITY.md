@@ -249,6 +249,16 @@ SEMANTIC_MEMORY_STRATEGY = "BEDROCK_AGENTCORE"
 
 ## Vulnerability Management
 
+### Known Advisories & Risk Acceptance
+
+We remediate dependency advisories by upgrading to patched versions rather than
+suppressing scanners. Where an advisory cannot be patched, it is documented here
+with its rationale rather than ignored.
+
+| Advisory | Package | Status | Rationale |
+|----------|---------|--------|-----------|
+| [GHSA-9h52-p55h-vw2f](https://github.com/advisories/GHSA-9h52-p55h-vw2f) — MCP Python SDK DNS rebinding protection not enabled by default (high) | `mcp` (pinned `>=1.11.0,<1.19.0`) | **Accepted / not applicable** | The advisory affects MCP servers exposed over **HTTP/SSE** transports. This project runs all MCP servers as embedded **stdio** subprocesses (`StdioServerParameters` / `stdio_client` in `backend/src/utils/mcp_client_factory.py`) — no network listener — so DNS rebinding does not apply. `mcp` is held below 1.19.0 due to an `eks-mcp-server` incompatibility (see `.github/dependabot.yml`). Re-evaluate the pin + upgrade to ≥1.23.0 when the downstream MCP servers support it. |
+
 ### AWS Inspector
 
 AWS Inspector is enabled by default (`EnableInspector: true`) for continuous vulnerability scanning:
