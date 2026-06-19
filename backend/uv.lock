@@ -380,12 +380,11 @@ wheels = [
 
 [[package]]
 name = "bedrock-agentcore"
-version = "1.1.1"
+version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
     { name = "botocore" },
-    { name = "pre-commit" },
     { name = "pydantic" },
     { name = "starlette" },
     { name = "typing-extensions" },
@@ -393,13 +392,14 @@ dependencies = [
     { name = "uvicorn" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fc/f2/8bc5c85c72a33c02b498705e1a34c6bc5a5ae1b45c3dbe3b949b1e0349e1/bedrock_agentcore-1.1.1.tar.gz", hash = "sha256:3fa5c7358b0f328ee3a5f38d11374721447d64701186b09243f6c13b2bf6b6ea", size = 396373, upload-time = "2025-12-03T19:16:26.531Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/f5/67609addb733822c92c0044afe4c5e5e0eaeafaccab22d5ecd0b18b0a655/bedrock_agentcore-1.15.0.tar.gz", hash = "sha256:fe799363b336cd7401918382f077baaa40eae7f7c17d7c7a4145752a26dd40a1", size = 930030, upload-time = "2026-06-17T22:28:36.051Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/36/b7/2f1cebebe92d5142f2e2814778f9a2a385cfbee85d359b5d9558c4bb6086/bedrock_agentcore-1.1.1-py3-none-any.whl", hash = "sha256:f6cd9cde770077155317ce5f622aa3e3773dcb004c83555f71f61e6fa2c4e7ca", size = 112943, upload-time = "2025-12-03T19:16:25.091Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/0e/f4bf7d8ab2308690fe0e36693c5fc9fb1bfe65f8a8c5f2ce4d2ce26e06e2/bedrock_agentcore-1.15.0-py3-none-any.whl", hash = "sha256:f465ed310cb51d2295ad2c566a4ee62617b6e8a7120ceb5dbb6cf1269bd2fcee", size = 429614, upload-time = "2026-06-17T22:28:34.556Z" },
 ]
 
 [package.optional-dependencies]
 strands-agents = [
+    { name = "mcp" },
     { name = "strands-agents" },
 ]
 
@@ -938,7 +938,7 @@ requires-dist = [
     { name = "awslabs-cost-explorer-mcp-server", specifier = ">=0.0.12" },
     { name = "awslabs-eks-mcp-server", specifier = ">=0.1.32" },
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
-    { name = "bedrock-agentcore", extras = ["strands-agents"], specifier = ">=1.0.6" },
+    { name = "bedrock-agentcore", extras = ["strands-agents"], specifier = ">=1.15.0" },
     { name = "boto3", specifier = ">=1.43.32" },
     { name = "botocore", specifier = ">=1.43.32" },
     { name = "html2text", specifier = ">=2024.2.26" },
