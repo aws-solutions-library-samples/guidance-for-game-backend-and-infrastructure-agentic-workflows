@@ -656,7 +656,7 @@ pyasn1==0.6.1
     #   rsa
 pyasn1-modules==0.4.2
     # via google-auth
-pycares==4.11.0
+pycares==5.0.1
     # via aiodns
 pycep-parser==0.4.1
     # via checkov
