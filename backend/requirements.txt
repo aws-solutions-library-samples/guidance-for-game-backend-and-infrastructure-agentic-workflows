@@ -843,7 +843,7 @@ unidiff==0.7.5
     # via bc-detect-secrets
 update-checker==0.18.0
     # via checkov
-uritools==5.0.0
+uritools==6.1.2
     # via spdx-tools
 urllib3==2.7.0
     # via
