@@ -31,20 +31,28 @@ class TestGuardrailsConfiguration:
         assert isinstance(BEDROCK_GUARDRAIL_ENABLED, bool)
 
     def test_model_includes_guardrails_when_configured(self):
-        """Model should include guardrails when ID is configured."""
+        """Model should pass FLAT guardrail params that strands BedrockModel accepts.
+
+        Regression guard: strands expects guardrail_id / guardrail_version, NOT a
+        nested guardrail_config dict (which strands silently drops with only a
+        warning, leaving guardrails disabled). See issue #135.
+        """
         reset_model_cache()  # Ensure fresh cache for this test
         with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ID", "test-guardrail-id"):
-            with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ENABLED", True):
-                with patch("models.cached_bedrock.BedrockModel") as mock_model:
-                    # Local modules
-                    from models.cached_bedrock import create_cached_bedrock_model
+            with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_VERSION", "7"):
+                with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ENABLED", True):
+                    with patch("models.cached_bedrock.BedrockModel") as mock_model:
+                        # Local modules
+                        from models.cached_bedrock import create_cached_bedrock_model
 
-                    create_cached_bedrock_model()
+                        create_cached_bedrock_model()
 
-                    # Verify BedrockModel was called with guardrail_config
-                    call_kwargs = mock_model.call_args[1]
-                    assert "guardrail_config" in call_kwargs
-                    assert call_kwargs["guardrail_config"]["guardrailIdentifier"] == "test-guardrail-id"
+                        call_kwargs = mock_model.call_args[1]
+                        # Flat params strands actually honors
+                        assert call_kwargs["guardrail_id"] == "test-guardrail-id"
+                        assert call_kwargs["guardrail_version"] == "7"
+                        # The nested form must never come back (it silently disables guardrails)
+                        assert "guardrail_config" not in call_kwargs
 
     def test_model_works_without_guardrails(self):
         """Model should work when guardrails are not configured."""
@@ -72,6 +80,7 @@ class TestGuardrailsConfiguration:
 
                     create_cached_bedrock_model()
 
-                    # Verify guardrail_config was NOT included
+                    # Verify no guardrail params were included
                     call_kwargs = mock_model.call_args[1]
+                    assert "guardrail_id" not in call_kwargs
                     assert "guardrail_config" not in call_kwargs
