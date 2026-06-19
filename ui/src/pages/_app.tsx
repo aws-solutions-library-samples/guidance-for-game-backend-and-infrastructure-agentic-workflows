@@ -1,6 +1,7 @@
 import '../styles/globals.css';
 import '@copilotkit/react-ui/styles.css';
 import type { AppProps } from 'next/app';
+import Head from 'next/head';
 import { useEffect, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
 import type { CognitoUser } from 'amazon-cognito-identity-js';
@@ -48,8 +49,10 @@ function MyApp({ Component, pageProps }: AppProps) {
       });
   }, []);
 
+  // Render the appropriate view for the current auth state.
+  let content;
   if (authMode === 'loading') {
-    return (
+    content = (
       <div style={{
         display: 'flex',
         justifyContent: 'center',
@@ -64,20 +67,30 @@ function MyApp({ Component, pageProps }: AppProps) {
         </div>
       </div>
     );
+  } else if (authMode === 'skip' || user) {
+    content = <Component {...pageProps} user={user} />;
+  } else {
+    content = (
+      <CognitoAuth
+        userPoolId={config?.cognito.userPoolId || ''}
+        clientId={config?.cognito.clientId || ''}
+        onAuthenticated={(cognitoUser) => {
+          setUser(cognitoUser);
+        }}
+      />
+    );
   }
 
-  if (authMode === 'skip' || user) {
-    return <Component {...pageProps} user={user} />;
-  }
-
+  // Default document title for ALL auth states (incl. the login screen, which
+  // otherwise had a blank tab title). Authenticated pages may override via
+  // their own <Head>.
   return (
-    <CognitoAuth
-      userPoolId={config?.cognito.userPoolId || ''}
-      clientId={config?.cognito.clientId || ''}
-      onAuthenticated={(cognitoUser) => {
-        setUser(cognitoUser);
-      }}
-    />
+    <>
+      <Head>
+        <title>Game Agent - AI-Powered Game Server Management</title>
+      </Head>
+      {content}
+    </>
   );
 }
 
