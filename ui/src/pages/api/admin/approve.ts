@@ -4,9 +4,13 @@ import { parse } from 'cookie';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { logError } from '@/utils/logger';
 
+// Verify the ID token (read from the cognito_id_token cookie below). It must be
+// tokenUse: 'id' — aws-jwt-verify checks the token_use claim, so an 'access'
+// verifier rejects an ID token outright, breaking admin auth. The ID token also
+// reliably carries cognito:groups (used for the admin check).
 const verifier = CognitoJwtVerifier.create({
   userPoolId: process.env.COGNITO_USER_POOL_ID!,
-  tokenUse: 'access',
+  tokenUse: 'id',
   clientId: process.env.COGNITO_CLIENT_ID!,
 });
 
