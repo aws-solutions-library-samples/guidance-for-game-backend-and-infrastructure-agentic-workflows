@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Install uv
       uses: astral-sh/setup-uv@v7
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Set up Node.js
       uses: actions/setup-node@v6
@@ -68,7 +68,7 @@ jobs:
       image: mcr.microsoft.com/playwright:v1.57.0-noble
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     # --ignore-scripts skips the postinstall playwright-install hook (the apt
     # path); browsers are already in the image. Mirrors ui/Dockerfile.
@@ -102,7 +102,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     # pwsh (PowerShell 7) is preinstalled on both ubuntu-latest and windows-latest.
     - name: Cache PowerShell modules
