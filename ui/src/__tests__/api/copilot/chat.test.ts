@@ -17,89 +17,52 @@ jest.mock('@/utils/logger', () => ({
 
 jest.mock('@aws-sdk/client-bedrock-agentcore');
 jest.mock('@aws-sdk/client-sts');
-jest.mock('aws-jwt-verify');
+
+// Shared verifier mock: chat.ts builds verifiers via CognitoJwtVerifier.create();
+// each created verifier exposes this `mockVerify` so tests can control whether the
+// ID token verifies (returns claims) or is rejected (throws).
+const mockVerify = jest.fn();
+jest.mock('aws-jwt-verify', () => ({
+  CognitoJwtVerifier: {
+    create: jest.fn(() => ({ verify: mockVerify })),
+  },
+}));
 
 describe('/api/copilot/chat - JWT decoding', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
+    // Default: a valid, approved ID token (tests override as needed).
+    mockVerify.mockResolvedValue({
+      sub: 'user123',
+      email: 'test@example.com',
+      'cognito:groups': ['users'],
+    });
   });
 
-  it('handles malformed JWT with invalid format', async () => {
+  // An ID token that fails cryptographic verification (bad signature, wrong
+  // token_use, malformed, expired) must be REJECTED with 401 — not raw-decoded.
+  it.each([
+    ['malformed format', 'cognito_id_token=invalid.token'],
+    ['invalid signature/base64', 'cognito_id_token=header.payload.bad-signature'],
+    ['expired/invalid token', 'cognito_id_token=header.payload.signature'],
+  ])('rejects an ID token that fails verification (%s)', async (_label, cookie) => {
+    mockVerify.mockRejectedValue(new Error('JwtInvalidSignatureError'));
+
     const { req, res } = createMocks({
       method: 'POST',
-      headers: {
-        cookie: 'cognito_id_token=invalid.token'
-      },
+      headers: { cookie },
       body: {
         operationName: 'generateCopilotResponse',
-        variables: {
-          data: {
-            messages: [{
-              textMessage: { role: 'user', content: 'test' }
-            }]
-          }
-        }
+        variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } }
       }
     });
 
     await handler(req, res);
 
-    expect(res._getStatusCode()).toBe(400);
+    expect(res._getStatusCode()).toBe(401);
     const data = JSON.parse(res._getData());
-    expect(data.error).toBe('Invalid token format');
-  });
-
-  it('handles JWT with invalid base64 encoding', async () => {
-    const { req, res } = createMocks({
-      method: 'POST',
-      headers: {
-        cookie: 'cognito_id_token=header.!!!invalid-base64!!!.signature'
-      },
-      body: {
-        operationName: 'generateCopilotResponse',
-        variables: {
-          data: {
-            messages: [{
-              textMessage: { role: 'user', content: 'test' }
-            }]
-          }
-        }
-      }
-    });
-
-    await handler(req, res);
-
-    expect(res._getStatusCode()).toBe(400);
-    const data = JSON.parse(res._getData());
-    expect(data.error).toBe('Invalid token format');
-  });
-
-  it('handles JWT with invalid JSON', async () => {
-    const invalidJson = Buffer.from('{invalid json}').toString('base64');
-
-    const { req, res } = createMocks({
-      method: 'POST',
-      headers: {
-        cookie: `cognito_id_token=header.${invalidJson}.signature`
-      },
-      body: {
-        operationName: 'generateCopilotResponse',
-        variables: {
-          data: {
-            messages: [{
-              textMessage: { role: 'user', content: 'test' }
-            }]
-          }
-        }
-      }
-    });
-
-    await handler(req, res);
-
-    expect(res._getStatusCode()).toBe(400);
-    const data = JSON.parse(res._getData());
-    expect(data.error).toBe('Invalid token format');
+    expect(data.error).toBe('Invalid token');
   });
 
   it('successfully decodes valid JWT', async () => {
@@ -133,17 +96,13 @@ describe('/api/copilot/chat - JWT decoding', () => {
   });
 
   it('returns 403 when user not approved', async () => {
-    const payload = {
-      sub: 'user123',
-      email: 'test@example.com',
-      'cognito:groups': []
-    };
-    const validPayload = Buffer.from(JSON.stringify(payload)).toString('base64');
+    // Verified ID token, but no approved group.
+    mockVerify.mockResolvedValue({ sub: 'user123', email: 'test@example.com', 'cognito:groups': [] });
 
     const { req, res } = createMocks({
       method: 'POST',
       headers: {
-        cookie: `cognito_id_token=header.${validPayload}.signature`
+        cookie: 'cognito_id_token=header.payload.signature'
       },
       body: {
         operationName: 'generateCopilotResponse',
