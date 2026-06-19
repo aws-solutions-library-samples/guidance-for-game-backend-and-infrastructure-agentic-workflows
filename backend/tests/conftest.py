@@ -8,7 +8,6 @@ Handles proper MCP client cleanup to prevent logging errors during teardown.
 import os
 import subprocess
 import sys
-import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -112,23 +111,25 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: mark test as slow running")
 
 
-@pytest.fixture(autouse=True)
-def test_timeout():
-    """Add automatic timeout to all tests to prevent hanging."""
-    timeout_seconds = 30  # 30 second timeout for all tests
+def pytest_collection_modifyitems(config, items):
+    """Raise the per-test timeout for tests that make real, slow service calls.
 
-    def timeout_handler():
-        time.sleep(timeout_seconds)
-        # Force exit if test is still running
-        os._exit(1)
+    The base timeout (pytest.ini: timeout = 30) suits mocked unit tests. But
+    cloud/integration/e2e/ai_eval/stress tests invoke the live AgentCore runtime
+    (orchestrator -> specialist -> MCP tool calls -> Bedrock), which routinely
+    takes well over 30s — the app's own per-request budget
+    (GBAW_AGENT_TIMEOUT_REQUEST_SECONDS) defaults to 180s. Without this, every
+    real-service test trips the 30s timeout and fails spuriously.
 
-    timer = threading.Timer(timeout_seconds, timeout_handler)
-    timer.start()
-
-    try:
-        yield
-    finally:
-        timer.cancel()
+    Applied via the pytest-timeout plugin (already a dependency) so a timeout
+    fails only the offending test — it does NOT kill the whole process.
+    """
+    slow_markers = {"cloud", "integration", "e2e", "ai_eval", "stress"}
+    for item in items:
+        if slow_markers.intersection(item.keywords):
+            # Only set if the test hasn't pinned its own @pytest.mark.timeout
+            if not item.get_closest_marker("timeout"):
+                item.add_marker(pytest.mark.timeout(180))
 
 
 @pytest.fixture(autouse=True)
