@@ -1,8 +1,5 @@
 /* Global Styles for Game Agent Command Center */
 
-/* Import Google Fonts */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
 /* Import our layout styles */
 @import './command-center-layout.css';
 @import './chat-layout.css';

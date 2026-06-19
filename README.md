@@ -6,6 +6,7 @@ This guidance demonstrates how to build an AI-powered game server management pla
 
 - [Overview](#overview)
 - [Architecture](#architecture)
+- [Cost](#cost)
 - [Prerequisites](#prerequisites)
 - [Deployment](#deployment)
 - [Local Development](#local-development)
@@ -18,6 +19,7 @@ This guidance demonstrates how to build an AI-powered game server management pla
 - [Cleanup](#cleanup)
 - [Contributing](#contributing)
 - [License](#license)
+- [Notices](#notices)
 
 ## Overview
 
@@ -88,6 +90,32 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 | Authentication | Amazon Cognito with group-based authorization |
 | Infrastructure | AWS CloudFormation, ECS Express (Fargate + ALB), ECR |
 | Observability | Amazon CloudWatch, AWS X-Ray, OpenTelemetry |
+
+## Cost
+
+You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$724.30 per month** for processing approximately 10,000 agent queries per month.
+
+We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
+
+### Sample Cost Table
+
+The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month, assuming approximately 10,000 agent queries.
+
+| AWS service | Dimensions | Cost [USD] |
+| ----------- | ------------ | ------------ |
+| Amazon Bedrock (Claude Sonnet 4.5) | ~10,000 specialist queries, ~8K input + 2K output tokens each | $390.00/month |
+| Amazon Bedrock (Claude Haiku 4.5) | ~10,000 orchestration queries, ~4K input + 1K output tokens each | $50.00/month |
+| Amazon OpenSearch Serverless (Knowledge Bases) | 3 Knowledge Bases, minimum 2 OCUs (indexing + search) | $175.20/month |
+| Amazon ECS (Fargate) | 1 task, 0.5 vCPU / 1 GB, running 24/7 | $14.60/month |
+| Elastic Load Balancing (ALB) | 1 Application Load Balancer, low LCU usage | $18.00/month |
+| Amazon Bedrock AgentCore Runtime | ~10,000 invocations, average 30s duration | $40.00/month |
+| Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00/month |
+| Amazon CloudWatch + AWS X-Ray | Logs, metrics, and traces for all components | $25.00/month |
+| AWS WAF | 1 WebACL, default managed rules, ~1M requests | $8.00/month |
+| AWS CloudTrail | Management events (first trail free), data events | $2.00/month |
+| Amazon ECR | Image storage (~2 GB) | $0.20/month |
+| Amazon Inspector | Container image scanning (~10 images) | $1.30/month |
+| **Total** | | **~$724.30/month** |
 
 ## Prerequisites
 
@@ -443,3 +471,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs, suggest
 ## License
 
 This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
+
+## Notices
+
+Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.
