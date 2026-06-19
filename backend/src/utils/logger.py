@@ -99,7 +99,7 @@ def log_mcp_operation(server_type: str, operation: str, message: str, level: str
     Log MCP-specific operations with structured data
 
     Args:
-        server_type: MCP server type (eks, ccapi, cost_explorer)
+        server_type: MCP server type (eks, aws_api, cost_explorer)
         operation: Operation being performed (start, stop, execute_tool, etc.)
         message: Log message
         level: Log level (DEBUG, INFO, WARNING, ERROR)

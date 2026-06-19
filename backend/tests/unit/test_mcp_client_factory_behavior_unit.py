@@ -31,7 +31,7 @@ class TestMCPClientFactoryBehavior:
 
     def test_create_mcp_client_known_server_types(self):
         """Test create_mcp_client recognizes known server types."""
-        known_servers = ["ccapi-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
+        known_servers = ["aws-api-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
 
         for server_type in known_servers:
             clear_mcp_cache()  # Clear cache before each iteration
@@ -47,7 +47,7 @@ class TestMCPClientFactoryBehavior:
         """Test handles MCPClient creation failure gracefully."""
         mock_mcp_client.side_effect = Exception("Failed to create client")
 
-        result = create_mcp_client("ccapi-mcp-server")
+        result = create_mcp_client("aws-api-mcp-server")
         assert result is None
 
     @patch("utils.mcp_client_factory.MCPClient")
@@ -57,7 +57,7 @@ class TestMCPClientFactoryBehavior:
         mock_client = Mock()
         mock_mcp_client.return_value = mock_client
 
-        result = create_mcp_client("ccapi-mcp-server")
+        result = create_mcp_client("aws-api-mcp-server")
 
         # Verify MCPClient was called
         mock_mcp_client.assert_called_once()
@@ -68,7 +68,7 @@ class TestMCPClientFactoryBehavior:
         # Local modules
         from utils.mcp_client_factory import MCP_CREATE_MAX_ATTEMPTS
 
-        valid_types = ["ccapi-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
+        valid_types = ["aws-api-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
 
         invalid_types = ["invalid-server", "random-type", "", None]
 
@@ -126,7 +126,7 @@ class TestMCPClientFactoryEdgeCases:
                 "AWS_SESSION_TOKEN": "test_token",
             },
         ):
-            result = create_mcp_client("ccapi-mcp-server")
+            result = create_mcp_client("aws-api-mcp-server")
 
         # Should have attempted to create client
         mock_mcp_client.assert_called_once()
@@ -143,6 +143,34 @@ class TestMCPClientFactoryEdgeCases:
         # Should have attempted to create client with region
         mock_mcp_client.assert_called_once()
 
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_aws_api_server_gets_readonly_fs_env(self, mock_mcp_client, mock_stdio):
+        """aws-api-mcp-server gets HOME/workdir/read-only env (read-only FS workaround)."""
+        # Capture the StdioServerParameters passed to stdio_client by invoking the
+        # transport factory lambda that create_mcp_client hands to MCPClient.
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+
+        create_mcp_client("aws-api-mcp-server")
+
+        params = mock_stdio.call_args[0][0]  # StdioServerParameters
+        env = params.env
+        assert env["READ_OPERATIONS_ONLY"] == "true"
+        assert env["AWS_API_MCP_WORKING_DIR"].startswith("/") and os.path.isdir(env["AWS_API_MCP_WORKING_DIR"])
+        assert "aws-api-mcp" in env["HOME"] and os.path.isdir(env["HOME"])
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_non_aws_api_servers_skip_readonly_fs_env(self, mock_mcp_client, mock_stdio):
+        """eks/cost servers must NOT get the aws-api-specific env keys."""
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+
+        create_mcp_client("eks-mcp-server")
+
+        env = mock_stdio.call_args[0][0].env
+        assert "AWS_API_MCP_WORKING_DIR" not in env
+        assert "READ_OPERATIONS_ONLY" not in env
+
 
 class TestMCPServerPatternValidation:
     """Test pattern-based MCP server validation."""
@@ -154,7 +182,7 @@ class TestMCPServerPatternValidation:
 
         # Valid patterns
         assert is_valid_aws_labs_mcp_server("cost-explorer-mcp-server") == True
-        assert is_valid_aws_labs_mcp_server("ccapi-mcp-server") == True
+        assert is_valid_aws_labs_mcp_server("aws-api-mcp-server") == True
         assert is_valid_aws_labs_mcp_server("eks-mcp-server") == True
         assert is_valid_aws_labs_mcp_server("new-service-mcp-server") == True
         assert is_valid_aws_labs_mcp_server("multi-word-service-mcp-server") == True
@@ -201,11 +229,11 @@ class TestMCPClientCaching:
         mock_mcp_client.return_value = mock_client
 
         # Create a client
-        result1 = create_mcp_client("ccapi-mcp-server")
+        result1 = create_mcp_client("aws-api-mcp-server")
         assert get_cached_client_count() == 1
 
         # Create same client again - should be cached
-        result2 = create_mcp_client("ccapi-mcp-server")
+        result2 = create_mcp_client("aws-api-mcp-server")
         assert get_cached_client_count() == 1  # Still 1 (cached)
 
         # Both should return the same instance
@@ -220,8 +248,8 @@ class TestMCPClientCaching:
         mock_mcp_client.side_effect = [mock_client1, mock_client2]
 
         # Create without caching
-        result1 = create_mcp_client("ccapi-mcp-server", use_cache=False)
-        result2 = create_mcp_client("ccapi-mcp-server", use_cache=False)
+        result1 = create_mcp_client("aws-api-mcp-server", use_cache=False)
+        result2 = create_mcp_client("aws-api-mcp-server", use_cache=False)
 
         # Should be different instances
         assert result1 is not result2
@@ -237,7 +265,7 @@ class TestMCPClientCaching:
 
         mock_mcp_client.return_value = Mock()
 
-        create_mcp_client("ccapi-mcp-server")
+        create_mcp_client("aws-api-mcp-server")
         assert get_cached_client_count() == 1
 
         create_mcp_client("eks-mcp-server")
@@ -250,40 +278,30 @@ class TestMCPClientCaching:
 class TestBuildStartupCode:
     """Test _build_startup_code generates correct Python bootstrap commands."""
 
-    def test_ccapi_server_includes_schema_cache_fix(self):
-        """ccapi-mcp-server startup must redirect schema cache to /tmp."""
-        code = _build_startup_code("ccapi-mcp-server", "awslabs.ccapi_mcp_server.server", "main")
-        assert ".ccapi_schemas" in code
-        assert "os.makedirs" in code or "makedirs" in code
-        assert "schema_manager.py" in code
-        assert "from awslabs.ccapi_mcp_server.server import main; main()" in code
+    @pytest.mark.parametrize(
+        "server_name,module",
+        [
+            ("aws-api-mcp-server", "awslabs.aws_api_mcp_server.server"),
+            ("eks-mcp-server", "awslabs.eks_mcp_server.server"),
+            ("cost-explorer-mcp-server", "awslabs.cost_explorer_mcp_server.server"),
+        ],
+    )
+    def test_startup_is_plain_import_for_all_servers(self, server_name, module):
+        """No server gets import-time monkeypatches (read-only FS handled via env).
 
-    def test_eks_server_no_schema_fix(self):
-        """eks-mcp-server should NOT get the schema cache fix."""
-        code = _build_startup_code("eks-mcp-server", "awslabs.eks_mcp_server.server", "main")
+        The former ccapi schema-cache patch was removed; aws-api-mcp-server's
+        filesystem needs are handled by env vars in create_mcp_client instead.
+        """
+        code = _build_startup_code(server_name, module, "main")
+        assert code == f"from {module} import main; main()"
         assert ".ccapi_schemas" not in code
-        assert code == "from awslabs.eks_mcp_server.server import main; main()"
+        assert "makedirs" not in code
 
-    def test_cost_explorer_server_no_schema_fix(self):
-        """cost-explorer-mcp-server should NOT get the schema cache fix."""
-        code = _build_startup_code("cost-explorer-mcp-server", "awslabs.cost_explorer_mcp_server.server", "main")
-        assert ".ccapi_schemas" not in code
-        assert code == "from awslabs.cost_explorer_mcp_server.server import main; main()"
-
-    def test_ccapi_schema_fix_patches_dirname_before_import(self):
-        """Schema fix must patch os.path.dirname BEFORE the server import statement."""
-        code = _build_startup_code("ccapi-mcp-server", "awslabs.ccapi_mcp_server.server", "main")
-        dirname_patch_pos = code.index("_os.path.dirname")
-        import_pos = code.index("from awslabs.ccapi_mcp_server.server import main")
-        assert dirname_patch_pos < import_pos, "dirname patch must come before server import"
-
-    def test_ccapi_schema_fix_is_valid_python(self):
-        """Schema fix generates syntactically valid Python code."""
-        code = _build_startup_code("ccapi-mcp-server", "awslabs.ccapi_mcp_server.server", "main")
-        # Remove the actual import/call at the end to avoid ImportError during compile
-        # Just verify the schema fix portion compiles
-        fix_portion = code.split("from awslabs")[0]
-        compile(fix_portion, "<test>", "exec")  # Raises SyntaxError if invalid
+    def test_startup_code_is_valid_python(self):
+        """Startup code is syntactically valid (sans the import that needs the pkg)."""
+        code = _build_startup_code("aws-api-mcp-server", "awslabs.aws_api_mcp_server.server", "main")
+        # The string is a single import+call; confirm it parses.
+        compile(code, "<test>", "exec")
 
 
 class TestResolveMcpCommand:
@@ -300,18 +318,16 @@ class TestResolveMcpCommand:
     def test_tier2_entry_point_resolution(self, mock_which):
         """When console script is not on PATH, resolve via importlib.metadata."""
         mock_ep = Mock()
-        mock_ep.name = "awslabs.ccapi-mcp-server"
-        mock_ep.value = "awslabs.ccapi_mcp_server.server:main"
+        mock_ep.name = "awslabs.aws-api-mcp-server"
+        mock_ep.value = "awslabs.aws_api_mcp_server.server:main"
         mock_ep.group = "console_scripts"
 
         with patch("utils.mcp_client_factory.importlib.metadata.entry_points", return_value=[mock_ep]):
-            cmd = _resolve_mcp_command("ccapi-mcp-server")
+            cmd = _resolve_mcp_command("aws-api-mcp-server")
 
         assert cmd[0] == sys.executable
         assert cmd[1] == "-c"
-        # Should contain the schema fix AND the server startup
-        assert ".ccapi_schemas" in cmd[2]
-        assert "from awslabs.ccapi_mcp_server.server import main; main()" in cmd[2]
+        assert cmd[2] == "from awslabs.aws_api_mcp_server.server import main; main()"
 
     @patch("utils.mcp_client_factory.shutil.which", return_value=None)
     def test_tier3_naming_convention_fallback(self, mock_which):
@@ -325,20 +341,20 @@ class TestResolveMcpCommand:
         assert cmd[0] == sys.executable
         assert cmd[1] == "-c"
         assert "from awslabs.eks_mcp_server.server import main; main()" in cmd[2]
-        # eks-mcp-server should NOT have schema fix
+        # No server carries an import-time schema patch anymore
         assert ".ccapi_schemas" not in cmd[2]
 
     @patch("utils.mcp_client_factory.shutil.which", return_value=None)
-    def test_tier3_ccapi_naming_convention_includes_schema_fix(self, mock_which):
-        """ccapi naming convention fallback must still include schema fix."""
+    def test_tier3_aws_api_naming_convention(self, mock_which):
+        """aws-api naming-convention fallback resolves to the plain import."""
         with patch(
             "utils.mcp_client_factory.importlib.metadata.entry_points",
             side_effect=Exception("metadata unavailable"),
         ):
-            cmd = _resolve_mcp_command("ccapi-mcp-server")
+            cmd = _resolve_mcp_command("aws-api-mcp-server")
 
-        assert ".ccapi_schemas" in cmd[2]
-        assert "from awslabs.ccapi_mcp_server.server import main; main()" in cmd[2]
+        assert cmd[2] == "from awslabs.aws_api_mcp_server.server import main; main()"
+        assert ".ccapi_schemas" not in cmd[2]
 
     @patch("utils.mcp_client_factory.shutil.which", return_value=None)
     def test_entry_point_not_found_falls_to_tier3(self, mock_which):

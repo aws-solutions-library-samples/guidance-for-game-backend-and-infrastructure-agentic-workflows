@@ -203,23 +203,10 @@ else
   echo "📝 AgentCore already configured, skipping configure step"
 fi
 
-# Patch Dockerfile for MCP server compatibility
-# ccapi-mcp-server needs a writable .schemas directory, but container filesystem is read-only
-DOCKERFILE=".bedrock_agentcore/gameagentruntime/Dockerfile"
-if [ -f "$DOCKERFILE" ]; then
-  if ! grep -q "ccapi_mcp_server/.schemas" "$DOCKERFILE"; then
-    echo "🔧 Patching Dockerfile for MCP server compatibility..."
-    # Insert the fix after the opentelemetry install line
-    sed -i.bak '/RUN uv pip install aws-opentelemetry-distro/a\
-\
-# Fix: Create writable cache directories for MCP servers\
-# ccapi-mcp-server writes to .schemas inside package dir (read-only in container)\
-RUN mkdir -p /usr/local/lib/python3.13/site-packages/awslabs/ccapi_mcp_server/.schemas \&\& \\\
-    chmod 777 /usr/local/lib/python3.13/site-packages/awslabs/ccapi_mcp_server/.schemas' "$DOCKERFILE"
-    rm -f "${DOCKERFILE}.bak"
-    echo "✅ Dockerfile patched"
-  fi
-fi
+# Note: no Dockerfile patching needed for MCP servers. The previous ccapi-mcp-server
+# required a writable .schemas dir (read-only in the container); it was replaced by
+# aws-api-mcp-server, whose log/working-dir are redirected to /tmp via environment
+# variables in utils/mcp_client_factory.create_mcp_client (no filesystem patch needed).
 
 # Check if runtime already exists
 EXISTING_RUNTIME=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_arn' .bedrock_agentcore.yaml 2>/dev/null || echo "")

@@ -91,7 +91,7 @@ Knowledge Bases (GameLift, EKS, Cost) are deployed and seeded separately; KB IDs
 
 **EKS enrollment** is optional: `infrastructure/kubernetes/enroll-cluster.sh` configures read-only RBAC (pods, deployments, services; secrets excluded) and updates aws-auth ConfigMap.
 
-**Container note**: `ccapi-mcp-server` writes to `.schemas` at a path that's read-only in the default container image. The deploy script patches this by creating a writable directory during the Docker image build.
+**Container note**: `aws-api-mcp-server` (the EKS specialist's resource-discovery server, replacing the yanked `ccapi-mcp-server`) writes a log under `$HOME` and needs a writable working dir — both read-only in the container. `utils/mcp_client_factory.create_mcp_client` redirects `HOME` and `AWS_API_MCP_WORKING_DIR` to `/tmp` (and sets `READ_OPERATIONS_ONLY=true`) via the server's environment — no Dockerfile patch needed.
 
 ## Code Style
 

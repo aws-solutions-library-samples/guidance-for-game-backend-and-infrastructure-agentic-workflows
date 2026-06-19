@@ -84,7 +84,7 @@ The architecture follows these 12 steps:
 │  │                                                         │  │
 │  │  Embedded MCP Servers (stdio processes):                │  │
 │  │  • awslabs.eks-mcp-server (pre-installed)               │  │
-│  │  • awslabs.ccapi-mcp-server (pre-installed)             │  │
+│  │  • awslabs.aws-api-mcp-server (pre-installed)           │  │
 │  │  • awslabs.cost-explorer-mcp-server (pre-installed)     │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬─────────────────────────────────┘
@@ -131,7 +131,7 @@ The architecture follows these 12 steps:
 │  │                                                         │  │
 │  │  Embedded MCP Servers (stdio):                          │  │
 │  │  • awslabs.eks-mcp-server (pre-installed)               │  │
-│  │  • awslabs.ccapi-mcp-server (pre-installed)             │  │
+│  │  • awslabs.aws-api-mcp-server (pre-installed)           │  │
 │  │  • awslabs.cost-explorer-mcp-server (pre-installed)     │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬─────────────────────────────────┘
@@ -290,7 +290,7 @@ if __name__ == "__main__":
    - Tools: Advanced EKS cluster management and troubleshooting
 
 2. **CCAPI MCP Server** - CloudFormation resource discovery
-   - Command: `awslabs.ccapi-mcp-server` (pre-installed package)
+   - Command: `awslabs.aws-api-mcp-server` (pre-installed package)
    - Tools: `list_resources`, `get_resource`
 
 3. **Cost Explorer MCP Server** - Cost analysis and billing operations
@@ -344,7 +344,7 @@ Local Machine:
 ├── Backend: http://localhost:8080 (AgentCore Runtime)
 │   └── Embedded MCP Servers (stdio processes)
 │       ├── awslabs.eks-mcp-server
-│       ├── awslabs.ccapi-mcp-server
+│       ├── awslabs.aws-api-mcp-server
 │       └── awslabs.cost-explorer-mcp-server
 └── AWS Services: Direct boto3 integration
 ```
