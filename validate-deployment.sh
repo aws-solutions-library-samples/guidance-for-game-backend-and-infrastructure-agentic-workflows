@@ -73,7 +73,10 @@ if [ -f backend/.bedrock_agentcore.yaml ]; then
     RUNTIME_ID=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_id' backend/.bedrock_agentcore.yaml 2>/dev/null || echo "")
     if [ -n "$RUNTIME_ID" ]; then
         check "Runtime registered (${RUNTIME_ID})" test -n "$RUNTIME_ID"
-        warn_check "Runtime reachable" aws bedrock-agentcore get-agent-runtime --agent-runtime-id "$RUNTIME_ID" --query "status" --output text
+        # get-agent-runtime lives on bedrock-agentcore-CONTROL, not bedrock-agentcore
+        # (the latter has no such operation, so the check always WARNed even when
+        # the runtime was READY).
+        warn_check "Runtime reachable" aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$RUNTIME_ID" --region "$AWS_REGION" --query "status" --output text
     else
         echo -e "  ${RED}FAIL${NC} Runtime ID not found in .bedrock_agentcore.yaml"
         FAIL=$((FAIL + 1))
