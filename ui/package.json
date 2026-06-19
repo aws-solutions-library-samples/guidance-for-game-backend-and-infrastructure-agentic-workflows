@@ -52,7 +52,7 @@
     "amazon-cognito-identity-js": "^6.3.15",
     "aws-jwt-verify": "^5.2.1",
     "cookie": "^1.1.1",
-    "next": "^15.5.19",
+    "next": "^16.2.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
