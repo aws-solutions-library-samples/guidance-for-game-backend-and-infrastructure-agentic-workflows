@@ -25,10 +25,24 @@ def list_gamelift_fleets() -> dict:  # type: ignore
     """List all GameLift fleets with their attributes."""
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        fleets = client.list_fleets()
-        if fleets.get("FleetIds"):
-            return client.describe_fleet_attributes(FleetIds=fleets["FleetIds"])  # type: ignore
-        return {"FleetAttributes": []}
+
+        # Page through ALL fleets — list_fleets returns at most one page, so an
+        # account with many fleets would otherwise be silently truncated.
+        fleet_ids: list[str] = []
+        for page in client.get_paginator("list_fleets").paginate():
+            fleet_ids.extend(page.get("FleetIds", []))
+
+        if not fleet_ids:
+            return {"FleetAttributes": []}
+
+        # describe_fleet_attributes accepts at most 100 fleet IDs per call.
+        attributes: list = []
+        for i in range(0, len(fleet_ids), 100):
+            chunk = fleet_ids[i : i + 100]
+            resp = client.describe_fleet_attributes(FleetIds=chunk)
+            attributes.extend(resp.get("FleetAttributes", []))
+
+        return {"FleetAttributes": attributes}
     except Exception as e:
         logger.error(f"Failed to list GameLift fleets: {e}")
         return {"error": str(e), "FleetAttributes": []}
