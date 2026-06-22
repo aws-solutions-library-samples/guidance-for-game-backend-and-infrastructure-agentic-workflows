@@ -66,9 +66,28 @@ def _build_startup_code(server_name: str, module: str, func: str) -> str:
     """
     Build Python startup code for an MCP server entry point.
 
-    (Read-only-filesystem workarounds for individual servers are handled via
-    environment variables in create_mcp_client, not via import-time patches.)
+    Most servers just import+call their entry point; read-only-filesystem needs
+    are handled via env vars in create_mcp_client. The billing-cost-management
+    server is the exception: it writes a SQLite session DB to a path hardcoded
+    relative to its own package dir (utilities/sql_utils.py:get_session_db_path),
+    with NO env/CLI override, so on the read-only AgentCore container it crashes
+    on first SQL-tool use. We pin its session-DB path into a writable /tmp dir
+    (from GBAW_BILLING_MCP_DB_DIR, set in create_mcp_client) by pre-seeding the
+    module's _SESSION_DB_PATH global before main() runs. Guarded so an upstream
+    refactor degrades gracefully rather than hard-failing startup.
     """
+    if "billing-cost-management" in server_name:
+        return (
+            "import os, uuid\n"
+            "try:\n"
+            "    from awslabs.billing_cost_management_mcp_server.utilities import sql_utils as _sql\n"
+            "    _dir = os.environ.get('GBAW_BILLING_MCP_DB_DIR', os.path.join(os.environ.get('TMPDIR', '/tmp'), 'billing-cost-mcp'))\n"
+            "    os.makedirs(_dir, exist_ok=True)\n"
+            "    _sql._SESSION_DB_PATH = os.path.join(_dir, f'session_{uuid.uuid4().hex[:8]}.db')\n"
+            "except Exception as _e:\n"
+            "    import sys as _sys; print(f'billing-mcp db-path patch skipped: {_e}', file=_sys.stderr)\n"
+            f"from {module} import {func}; {func}()"
+        )
     return f"from {module} import {func}; {func}()"
 
 
@@ -176,6 +195,25 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
                 # service-reference lookup; if that lookup can't be reached in a
                 # restricted-egress runtime it falls back to rejecting all calls.
                 env["READ_OPERATIONS_ONLY"] = "true"
+
+            # billing-cost-management-mcp-server writes to its own package dir in
+            # TWO places that fail on the read-only container:
+            #   1) a log file under <pkg>/logs at IMPORT time (logging_utils) — but
+            #      it honors FASTMCP_LOG_FILE, so point that at /tmp to skip the
+            #      package-dir makedirs entirely.
+            #   2) a SQLite session DB under <pkg>/sessions (sql_utils) with no env
+            #      override — relocated by the _build_startup_code patch, which
+            #      reads GBAW_BILLING_MCP_DB_DIR (set here).
+            # FASTMCP_LOG_FILE must be set or the import-time log makedirs crashes
+            # BEFORE the DB patch can run.
+            if "billing-cost-management" in server_name:
+                billing_base = os.path.join(os.environ.get("TMPDIR", "/tmp"), "billing-cost-mcp")
+                billing_db_dir = os.path.join(billing_base, "sessions")
+                billing_log_dir = os.path.join(billing_base, "logs")
+                os.makedirs(billing_db_dir, exist_ok=True)
+                os.makedirs(billing_log_dir, exist_ok=True)
+                env["GBAW_BILLING_MCP_DB_DIR"] = billing_db_dir
+                env["FASTMCP_LOG_FILE"] = os.path.join(billing_log_dir, "billing-cost-management-mcp-server.log")
 
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
             wrapper_path = os.path.join(os.path.dirname(__file__), "mcp_wrapper.py")

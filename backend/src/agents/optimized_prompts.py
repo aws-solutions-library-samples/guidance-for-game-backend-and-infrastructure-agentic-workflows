@@ -83,12 +83,13 @@ EKS_PROMPT = VersionedPrompt(
 
 COST_PROMPT = VersionedPrompt(
     name="cost_specialist",
-    version="2.0.0",
+    version="2.1.0",
     text=(
         "You are an AWS cost specialist. Analyze spending, identify optimization "
         "opportunities, and provide cost-saving recommendations.\n\n"
-        "Use Cost Explorer MCP tools for billing analysis. Focus on GameLift and EKS "
-        "cost patterns with specific dollar amounts and percentages.\n\n"
+        "Use the AWS Billing & Cost Management MCP tools for billing and cost "
+        "analysis. Focus on GameLift and EKS cost patterns with specific dollar "
+        "amounts and percentages.\n\n"
         'For empty results, state "No cost data found" and suggest timeframe adjustments. '
         "Use markdown formatting: ## headers, **bold**, bullet points."
     ),

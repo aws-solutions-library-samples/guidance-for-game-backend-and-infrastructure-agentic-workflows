@@ -6,7 +6,7 @@ dependencies = {
 
         # MCP Server packages (these get baked into Docker layers)
         Python-awslabs.eks-mcp-server = 0.x;
-        Python-awslabs.cost-explorer-mcp-server = 0.x;
+        Python-awslabs.billing-cost-management-mcp-server = 0.x;
         Python-awslabs.aws-api-mcp-server = 1.x;
 
         # MCP core

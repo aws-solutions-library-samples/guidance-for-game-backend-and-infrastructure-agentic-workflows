@@ -31,7 +31,7 @@ class TestMCPClientFactoryBehavior:
 
     def test_create_mcp_client_known_server_types(self):
         """Test create_mcp_client recognizes known server types."""
-        known_servers = ["aws-api-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
+        known_servers = ["aws-api-mcp-server", "eks-mcp-server", "billing-cost-management-mcp-server"]
 
         for server_type in known_servers:
             clear_mcp_cache()  # Clear cache before each iteration
@@ -68,7 +68,7 @@ class TestMCPClientFactoryBehavior:
         # Local modules
         from utils.mcp_client_factory import MCP_CREATE_MAX_ATTEMPTS
 
-        valid_types = ["aws-api-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
+        valid_types = ["aws-api-mcp-server", "eks-mcp-server", "billing-cost-management-mcp-server"]
 
         invalid_types = ["invalid-server", "random-type", "", None]
 
@@ -167,12 +167,34 @@ class TestMCPClientFactoryEdgeCases:
     @patch("utils.mcp_client_factory.stdio_client")
     @patch("utils.mcp_client_factory.MCPClient")
     def test_non_aws_api_servers_skip_readonly_fs_env(self, mock_mcp_client, mock_stdio):
-        """eks/cost servers must NOT get the aws-api-specific env keys."""
+        """eks/billing servers must NOT get the aws-api-specific env keys."""
         mock_mcp_client.side_effect = lambda factory: factory() or Mock()
 
         create_mcp_client("eks-mcp-server")
 
         env = mock_stdio.call_args[0][0].env
+        assert "AWS_API_MCP_WORKING_DIR" not in env
+        assert "READ_OPERATIONS_ONLY" not in env
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_billing_server_gets_writable_db_dir_env(self, mock_mcp_client, mock_stdio):
+        """billing-cost-management gets GBAW_BILLING_MCP_DB_DIR pointing at a
+        writable /tmp dir (so its hardcoded package-dir SQLite path is relocated)."""
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+
+        create_mcp_client("billing-cost-management-mcp-server")
+
+        env = mock_stdio.call_args[0][0].env
+        assert env["GBAW_BILLING_MCP_DB_DIR"].startswith("/")
+        assert os.path.isdir(env["GBAW_BILLING_MCP_DB_DIR"])
+        assert "billing-cost-mcp" in env["GBAW_BILLING_MCP_DB_DIR"]
+        # FASTMCP_LOG_FILE must point at /tmp so the import-time log makedirs
+        # doesn't hit the read-only package dir (crashes before the DB patch).
+        assert env["FASTMCP_LOG_FILE"].startswith("/")
+        assert os.path.isdir(os.path.dirname(env["FASTMCP_LOG_FILE"]))
+        assert "billing-cost-mcp" in env["FASTMCP_LOG_FILE"]
+        # Must not leak the aws-api-specific keys.
         assert "AWS_API_MCP_WORKING_DIR" not in env
         assert "READ_OPERATIONS_ONLY" not in env
 
@@ -276,7 +298,7 @@ class TestMCPClientCaching:
         create_mcp_client("eks-mcp-server")
         assert get_cached_client_count() == 2
 
-        create_mcp_client("cost-explorer-mcp-server")
+        create_mcp_client("billing-cost-management-mcp-server")
         assert get_cached_client_count() == 3
 
 
@@ -288,25 +310,41 @@ class TestBuildStartupCode:
         [
             ("aws-api-mcp-server", "awslabs.aws_api_mcp_server.server"),
             ("eks-mcp-server", "awslabs.eks_mcp_server.server"),
-            ("cost-explorer-mcp-server", "awslabs.cost_explorer_mcp_server.server"),
         ],
     )
-    def test_startup_is_plain_import_for_all_servers(self, server_name, module):
-        """No server gets import-time monkeypatches (read-only FS handled via env).
-
-        The former ccapi schema-cache patch was removed; aws-api-mcp-server's
-        filesystem needs are handled by env vars in create_mcp_client instead.
-        """
+    def test_startup_is_plain_import_for_plain_servers(self, server_name, module):
+        """aws-api / eks get a plain import (their FS needs are handled via env)."""
         code = _build_startup_code(server_name, module, "main")
         assert code == f"from {module} import main; main()"
         assert ".ccapi_schemas" not in code
-        assert "makedirs" not in code
+
+    def test_billing_server_gets_db_path_patch(self):
+        """billing-cost-management gets a startup patch repointing its SQLite DB.
+
+        The server hardcodes its session DB inside the package dir (read-only on
+        the container) with no env override, so _build_startup_code must seed
+        _SESSION_DB_PATH from GBAW_BILLING_MCP_DB_DIR before main() (#105).
+        """
+        code = _build_startup_code(
+            "billing-cost-management-mcp-server",
+            "awslabs.billing_cost_management_mcp_server.server",
+            "main",
+        )
+        assert "GBAW_BILLING_MCP_DB_DIR" in code
+        assert "_SESSION_DB_PATH" in code
+        assert "sql_utils" in code
+        assert "from awslabs.billing_cost_management_mcp_server.server import main; main()" in code
+        # Still ends by invoking the real entry point.
+        assert code.rstrip().endswith("main()")
 
     def test_startup_code_is_valid_python(self):
         """Startup code is syntactically valid (sans the import that needs the pkg)."""
-        code = _build_startup_code("aws-api-mcp-server", "awslabs.aws_api_mcp_server.server", "main")
-        # The string is a single import+call; confirm it parses.
-        compile(code, "<test>", "exec")
+        for sn, mod in [
+            ("aws-api-mcp-server", "awslabs.aws_api_mcp_server.server"),
+            ("billing-cost-management-mcp-server", "awslabs.billing_cost_management_mcp_server.server"),
+        ]:
+            code = _build_startup_code(sn, mod, "main")
+            compile(code, "<test>", "exec")
 
 
 class TestResolveMcpCommand:
