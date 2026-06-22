@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { CognitoUserPool, CognitoUser, AuthenticationDetails, CognitoUserAttribute, CognitoUserSession } from 'amazon-cognito-identity-js';
+import { CognitoUserPool, CognitoUser, AuthenticationDetails, CognitoUserSession } from 'amazon-cognito-identity-js';
 
 interface CognitoAuthProps {
   userPoolId: string;
@@ -7,7 +7,9 @@ interface CognitoAuthProps {
   onAuthenticated: (user: CognitoUser, session: CognitoUserSession) => void;
 }
 
-type AuthMode = 'signin' | 'signup' | 'verify' | 'forgot' | 'reset';
+// Self-signup is intentionally unsupported (admin-create-only pool, #154):
+// users are provisioned via script. Only sign-in + password reset are exposed.
+type AuthMode = 'signin' | 'forgot' | 'reset';
 
 export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: CognitoAuthProps) {
   const [mode, setMode] = useState<AuthMode>('signin');
@@ -67,62 +69,6 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
         setError(err.message || 'Authentication failed');
         setLoading(false);
       },
-    });
-  };
-
-  const handleSignUp = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError('');
-
-    if (password !== confirmPassword) {
-      setError('Passwords do not match');
-      setLoading(false);
-      return;
-    }
-
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters');
-      setLoading(false);
-      return;
-    }
-
-    const attributeList = [
-      new CognitoUserAttribute({ Name: 'email', Value: email }),
-    ];
-
-    userPool.signUp(email, password, attributeList, [], (err) => {
-      if (err) {
-        setError(err.message || 'Sign up failed');
-        setLoading(false);
-        return;
-      }
-      setMessage('Account created! Check your email for verification code.');
-      setMode('verify');
-      setLoading(false);
-    });
-  };
-
-  const handleVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError('');
-
-    const user = new CognitoUser({
-      Username: email,
-      Pool: userPool,
-    });
-
-    user.confirmRegistration(verificationCode, true, (err) => {
-      if (err) {
-        setError(err.message || 'Verification failed');
-        setLoading(false);
-        return;
-      }
-      setMessage('Email verified! You can now sign in.');
-      setMode('signin');
-      setVerificationCode('');
-      setLoading(false);
     });
   };
 
@@ -192,9 +138,12 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
 
         {mode === 'signin' && (
           <>
+            {/* Self-signup is intentionally not offered: the Cognito user pool is
+                admin-create-only (AdminCreateUserConfig.AllowAdminCreateUserOnly),
+                so userPool.signUp() always fails. Accounts are provisioned by an
+                administrator. (#154) */}
             <div className="auth-tabs">
               <button className="active">Sign In</button>
-              <button onClick={() => setMode('signup')}>Sign Up</button>
             </div>
 
             <form onSubmit={handleSignIn}>
@@ -230,87 +179,8 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
               <button type="button" className="auth-link" onClick={() => setMode('forgot')}>
                 Forgot password?
               </button>
-            </form>
-          </>
-        )}
 
-        {mode === 'signup' && (
-          <>
-            <div className="auth-tabs">
-              <button onClick={() => setMode('signin')}>Sign In</button>
-              <button className="active">Sign Up</button>
-            </div>
-
-            <form onSubmit={handleSignUp}>
-              <div className="form-group">
-                <label>Email</label>
-                <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="your@email.com"
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Password</label>
-                <input
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Confirm Password</label>
-                <input
-                  type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="••••••••"
-                  required
-                />
-              </div>
-
-              {error && <div className="auth-error">{error}</div>}
-
-              <button type="submit" className="auth-submit" disabled={loading}>
-                {loading ? 'Creating account...' : 'Create Account'}
-              </button>
-            </form>
-          </>
-        )}
-
-        {mode === 'verify' && (
-          <>
-            <div className="auth-back">
-              <button onClick={() => setMode('signin')}>← Back to Sign In</button>
-            </div>
-
-            <h2>Verify Your Email</h2>
-            <p className="auth-subtitle">Enter the verification code sent to {email}</p>
-
-            <form onSubmit={handleVerify}>
-              <div className="form-group">
-                <label>Verification Code</label>
-                <input
-                  type="text"
-                  value={verificationCode}
-                  onChange={(e) => setVerificationCode(e.target.value)}
-                  placeholder="123456"
-                  required
-                />
-              </div>
-
-              {error && <div className="auth-error">{error}</div>}
-              {message && <div className="auth-success">{message}</div>}
-
-              <button type="submit" className="auth-submit" disabled={loading}>
-                {loading ? 'Verifying...' : 'Verify Email'}
-              </button>
+              <p className="auth-note">Need access? Contact your administrator to be invited.</p>
             </form>
           </>
         )}
