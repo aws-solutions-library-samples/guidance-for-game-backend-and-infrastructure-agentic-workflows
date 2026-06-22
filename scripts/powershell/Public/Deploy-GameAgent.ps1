@@ -364,7 +364,7 @@ function Deploy-GameAgent {
 
         Deploy-Stack -StackName "$ProjectName-security" `
             -TemplateFile (Join-Path $infraPath '05-security-infrastructure.yaml') `
-            -Params @("ProjectName=$ProjectName", "FrontendResourceArn=$frontendAlbArn", "RateLimitPerIP=2000", "CloudTrailRetentionDays=90", "AIChatMode=true")
+            -Params @("ProjectName=$ProjectName", "FrontendResourceArn=$frontendAlbArn", "RateLimitPerIP=2000", "AuthAdminRateLimitPerIP=100", "CloudTrailRetentionDays=90", "AIChatMode=true")
 
         # Enable Inspector
         Write-GameAgentStatus 'Step 8b: Enabling AWS Inspector for ECR scanning...' -Type Info

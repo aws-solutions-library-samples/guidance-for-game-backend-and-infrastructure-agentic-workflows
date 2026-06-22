@@ -16,6 +16,16 @@ Parameters:
     Default: 2000
     Description: Maximum requests per 5-minute window per IP address
 
+  AuthAdminRateLimitPerIP:
+    Type: Number
+    Default: 100
+    MinValue: 100
+    Description: >-
+      Tighter per-IP request limit (per 5-minute window) for the sensitive
+      /api/auth/* and /api/admin/* paths. WAFv2 rate-based rules enforce a
+      minimum of 100. Lower than the global limit to throttle credential
+      stuffing / admin-endpoint abuse.
+
   CloudTrailRetentionDays:
     Type: Number
     Default: 90
@@ -221,9 +231,58 @@ Resources:
         CloudWatchMetricsEnabled: true
         MetricName: !Sub '${ProjectName}-waf-metrics'
       Rules:
-        # Rate limiting per IP
-        - Name: RateLimitPerIP
+        # Tighter rate limit for /api/auth/* (credential endpoints). Evaluated
+        # before the global limit so auth abuse is throttled at a much lower
+        # threshold. ScopeDownStatement restricts the rate count to URIs with
+        # the /api/auth/ prefix; other paths fall through to later rules.
+        - Name: RateLimitAuthPaths
           Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref AuthAdminRateLimitPerIP
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: /api/auth/
+                  TextTransformations:
+                    - Priority: 0
+                      Type: LOWERCASE
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-rate-limit-auth'
+
+        # Tighter rate limit for /api/admin/* (privileged endpoints).
+        - Name: RateLimitAdminPaths
+          Priority: 2
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref AuthAdminRateLimitPerIP
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: /api/admin/
+                  TextTransformations:
+                    - Priority: 0
+                      Type: LOWERCASE
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-rate-limit-admin'
+
+        # Global rate limiting per IP (all other paths)
+        - Name: RateLimitPerIP
+          Priority: 3
           Statement:
             RateBasedStatement:
               Limit: !Ref RateLimitPerIP
@@ -237,7 +296,7 @@ Resources:
 
         # AWS Managed Rules - Common Rule Set (OWASP Top 10)
         - Name: AWSManagedRulesCommonRuleSet
-          Priority: 2
+          Priority: 4
           OverrideAction:
             None: {}
           Statement:
@@ -254,7 +313,7 @@ Resources:
 
         # AWS Managed Rules - SQL Injection
         - Name: AWSManagedRulesSQLiRuleSet
-          Priority: 3
+          Priority: 5
           OverrideAction:
             None: {}
           Statement:
@@ -268,7 +327,7 @@ Resources:
 
         # AWS Managed Rules - Known Bad Inputs
         - Name: AWSManagedRulesKnownBadInputsRuleSet
-          Priority: 4
+          Priority: 6
           OverrideAction:
             None: {}
           Statement:
