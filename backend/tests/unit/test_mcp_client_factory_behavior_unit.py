@@ -189,6 +189,11 @@ class TestMCPClientFactoryEdgeCases:
         assert env["GBAW_BILLING_MCP_DB_DIR"].startswith("/")
         assert os.path.isdir(env["GBAW_BILLING_MCP_DB_DIR"])
         assert "billing-cost-mcp" in env["GBAW_BILLING_MCP_DB_DIR"]
+        # FASTMCP_LOG_FILE must point at /tmp so the import-time log makedirs
+        # doesn't hit the read-only package dir (crashes before the DB patch).
+        assert env["FASTMCP_LOG_FILE"].startswith("/")
+        assert os.path.isdir(os.path.dirname(env["FASTMCP_LOG_FILE"]))
+        assert "billing-cost-mcp" in env["FASTMCP_LOG_FILE"]
         # Must not leak the aws-api-specific keys.
         assert "AWS_API_MCP_WORKING_DIR" not in env
         assert "READ_OPERATIONS_ONLY" not in env

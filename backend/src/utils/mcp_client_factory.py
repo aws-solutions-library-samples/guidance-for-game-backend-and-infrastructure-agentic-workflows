@@ -196,14 +196,24 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
                 # restricted-egress runtime it falls back to rejecting all calls.
                 env["READ_OPERATIONS_ONLY"] = "true"
 
-            # billing-cost-management-mcp-server writes a SQLite session DB to a
-            # path hardcoded inside its package dir (read-only on the container).
-            # Point it at a writable /tmp dir; the startup patch in
-            # _build_startup_code reads GBAW_BILLING_MCP_DB_DIR to relocate it.
+            # billing-cost-management-mcp-server writes to its own package dir in
+            # TWO places that fail on the read-only container:
+            #   1) a log file under <pkg>/logs at IMPORT time (logging_utils) — but
+            #      it honors FASTMCP_LOG_FILE, so point that at /tmp to skip the
+            #      package-dir makedirs entirely.
+            #   2) a SQLite session DB under <pkg>/sessions (sql_utils) with no env
+            #      override — relocated by the _build_startup_code patch, which
+            #      reads GBAW_BILLING_MCP_DB_DIR (set here).
+            # FASTMCP_LOG_FILE must be set or the import-time log makedirs crashes
+            # BEFORE the DB patch can run.
             if "billing-cost-management" in server_name:
-                billing_db_dir = os.path.join(os.environ.get("TMPDIR", "/tmp"), "billing-cost-mcp")
+                billing_base = os.path.join(os.environ.get("TMPDIR", "/tmp"), "billing-cost-mcp")
+                billing_db_dir = os.path.join(billing_base, "sessions")
+                billing_log_dir = os.path.join(billing_base, "logs")
                 os.makedirs(billing_db_dir, exist_ok=True)
+                os.makedirs(billing_log_dir, exist_ok=True)
                 env["GBAW_BILLING_MCP_DB_DIR"] = billing_db_dir
+                env["FASTMCP_LOG_FILE"] = os.path.join(billing_log_dir, "billing-cost-management-mcp-server.log")
 
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
             wrapper_path = os.path.join(os.path.dirname(__file__), "mcp_wrapper.py")
