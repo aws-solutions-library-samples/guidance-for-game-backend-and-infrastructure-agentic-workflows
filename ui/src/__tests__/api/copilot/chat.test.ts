@@ -122,4 +122,37 @@ describe('/api/copilot/chat - JWT decoding', () => {
     const data = JSON.parse(res._getData());
     expect(data.error).toBe('Account pending approval');
   });
+
+  it('handles loadAgentState with 200 + empty state (not a 400)', async () => {
+    // CopilotKit issues loadAgentState on page load; it must not 400 (#60).
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: { cookie: 'cognito_id_token=header.payload.signature' },
+      body: {
+        operationName: 'loadAgentState',
+        variables: { data: { threadId: 'thread-abc', agentName: 'game-agent' } }
+      }
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = JSON.parse(res._getData());
+    expect(data.data.loadAgentState.threadExists).toBe(false);
+    expect(data.data.loadAgentState.threadId).toBe('thread-abc');
+    expect(data.data.loadAgentState.messages).toBe('[]');
+  });
+
+  it('still rejects a genuinely unknown operation with 400', async () => {
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: { cookie: 'cognito_id_token=header.payload.signature' },
+      body: { operationName: 'bogusOperation', variables: { data: {} } }
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(400);
+    expect(JSON.parse(res._getData()).error).toBe('Unknown operation');
+  });
 });

@@ -286,6 +286,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
     }
 
+    // CopilotKit's CopilotMessages provider issues loadAgentState on page load
+    // to restore prior agent/thread state. We don't persist LangGraph-style agent
+    // state (conversation memory lives server-side in AgentCore), so return an
+    // empty, non-existent thread. Without this, the request fell through to the
+    // catch-all 400 below, logging a spurious "Unknown operation" on every load
+    // (#60). Shape mirrors the loadAgentState query selection set.
+    if (operation === 'loadAgentState') {
+      logInfo(`[${requestId}] 📥 loadAgentState (no persisted agent state) → empty`);
+      return res.status(200).json({
+        data: {
+          loadAgentState: {
+            threadId: data.threadId || '',
+            threadExists: false,
+            state: '{}',
+            messages: '[]',
+            __typename: 'LoadAgentStateResponse'
+          }
+        }
+      });
+    }
+
     if (operation !== 'generateCopilotResponse') {
       logError(`[${requestId}] ❌ Unknown operation: ${operation}`);
       return res.status(400).json({ error: 'Unknown operation', requestId });
