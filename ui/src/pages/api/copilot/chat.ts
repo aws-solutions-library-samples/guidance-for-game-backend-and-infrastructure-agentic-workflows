@@ -3,7 +3,16 @@ import { logInfo, logError, logDebug, redact } from '@/utils/logger';
 import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import { parse } from 'cookie';
+
+// Server-side proxy fetch timeouts. Plain fetch() has no default timeout, so a
+// hung backend would tie up the Node serverless function until the platform
+// kills it. PING is a quick health probe; INVOCATION is set just above the
+// backend's own wall-clock cap (GBAW_AGENT_TIMEOUT_REQUEST_SECONDS, default
+// 180s) so the backend returns a clean error before this abort fires.
+const PING_TIMEOUT_MS = 5_000;
+const INVOCATION_TIMEOUT_MS = 185_000;
 
 // JWT verifiers for production (lazy-initialized). Separate verifiers per token
 // use: aws-jwt-verify enforces the token_use claim, so the access token must be
@@ -238,10 +247,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           headers['Authorization'] = 'Bearer mock-jwt-token-for-testing';
         }
 
-        const response = await fetch(`${backendUrl}/ping`, {
+        const response = await fetchWithTimeout(`${backendUrl}/ping`, {
           method: 'GET',
           headers,
-        });
+        }, PING_TIMEOUT_MS);
 
         logInfo(`[${requestId}] ✅ Backend connectivity test: ${response.status}`);
         return res.status(response.status).json({ status: 'connected', requestId });
@@ -552,7 +561,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
       logDebug(`[${requestId}] 📤 Prompt content: ${message.substring(0, 100)}...`);
 
-      const response = await fetch(`${backendUrl}/invocations`, {
+      const response = await fetchWithTimeout(`${backendUrl}/invocations`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -573,7 +582,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             ...userContext
           }
         }),
-      });
+      }, INVOCATION_TIMEOUT_MS);
 
       logInfo(`[${requestId}] ✅ Local AgentCore responded with status: ${response.status}`);
 
