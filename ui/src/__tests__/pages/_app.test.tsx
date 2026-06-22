@@ -120,7 +120,7 @@ describe('MyApp - Logout behavior', () => {
     });
   });
 
-  it('handles config fetch failure gracefully', async () => {
+  it('fails CLOSED to the login screen when config fetch fails (production)', async () => {
     (global.fetch as jest.Mock).mockRejectedValue(new Error('Network error'));
 
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
@@ -129,7 +129,22 @@ describe('MyApp - Logout behavior', () => {
     render(<MyApp Component={mockComponent} pageProps={mockPageProps} />);
 
     await waitFor(() => {
-      // Should skip auth on config failure
+      // A config fetch failure must NOT silently skip auth (#131). In production
+      // it falls closed to the Cognito login screen.
+      expect(screen.getByTestId('cognito-auth')).toBeInTheDocument();
+    });
+  });
+
+  it('still honors the explicit dev bypass when config fetch fails', async () => {
+    (global.fetch as jest.Mock).mockRejectedValue(new Error('Network error'));
+
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
+    process.env.NODE_ENV = 'development';
+
+    render(<MyApp Component={mockComponent} pageProps={mockPageProps} />);
+
+    await waitFor(() => {
+      // Explicit dev bypass (dev + SKIP_AUTH) still renders the app on failure.
       expect(screen.getByTestId('app-content')).toBeInTheDocument();
     });
   });

@@ -44,26 +44,29 @@ class TestCachedBedrockModel:
         assert result == mock_model
 
     @patch("models.cached_bedrock.BedrockModel")
-    def test_sets_aws_profile_when_provided(self, mock_bedrock_model):
-        """Test sets AWS_PROFILE environment variable when provided."""
-        mock_model = Mock()
-        mock_bedrock_model.return_value = mock_model
+    def test_does_not_mutate_global_aws_profile_env(self, mock_bedrock_model):
+        """Model creation must NOT write os.environ['AWS_PROFILE'] (#131).
 
-        # Save original AWS_PROFILE
+        The old code re-asserted AWS_PROFILE into the process env on every model
+        build — a global-state side effect (boto3 reads the profile from the
+        session/env already). The module no longer references AWS_PROFILE at all;
+        confirm building a model leaves the env exactly as it found it.
+        """
+        mock_bedrock_model.return_value = Mock()
         original_profile = os.environ.get("AWS_PROFILE")
 
         try:
-            with patch("models.cached_bedrock.AWS_PROFILE", "test-profile"):
-                # Local modules
-                from models.cached_bedrock import create_cached_bedrock_model
+            os.environ.pop("AWS_PROFILE", None)
+            # Local modules
+            from models.cached_bedrock import create_cached_bedrock_model
 
-                reset_model_cache()  # Reset after patch to ensure fresh creation
-                create_cached_bedrock_model()
+            reset_model_cache()
+            create_cached_bedrock_model()
 
-            assert os.environ.get("AWS_PROFILE") == "test-profile"
+            # The module must not have introduced AWS_PROFILE into the process env.
+            assert "AWS_PROFILE" not in os.environ
         finally:
-            # Restore original AWS_PROFILE
-            if original_profile:
+            if original_profile is not None:
                 os.environ["AWS_PROFILE"] = original_profile
             elif "AWS_PROFILE" in os.environ:
                 del os.environ["AWS_PROFILE"]

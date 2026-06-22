@@ -20,32 +20,24 @@ function MyApp({ Component, pageProps }: AppProps) {
   const [user, setUser] = useState<CognitoUser | null>(null);
 
   useEffect(() => {
+    // Dev-only auth bypass is decided from build-time env (NOT from cookies):
+    // the cognito_id_token cookie is HttpOnly, so it's invisible to document.cookie
+    // — the old client-side cookie read was dead code. The real session check is
+    // server-side (every /api route verifies the token); here we only pick which
+    // top-level view to render.
+    const isDev = process.env.NODE_ENV === 'development';
+    const skipAuth = process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
+
     fetch('/api/config')
       .then(res => res.json())
       .then((cfg: Config) => {
         setConfig(cfg);
-
-        const isDev = process.env.NODE_ENV === 'development';
-        const skipAuth = process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
-
-        if (isDev && skipAuth) {
-          setAuthMode('skip');
-        } else {
-          // Check if user has valid session
-          const cookies = document.cookie.split(';').reduce((acc, cookie) => {
-            const [key, value] = cookie.trim().split('=');
-            acc[key] = value;
-            return acc;
-          }, {} as Record<string, string>);
-
-          if (!cookies.cognito_id_token) {
-            setUser(null);
-          }
-          setAuthMode('cognito');
-        }
+        setAuthMode(isDev && skipAuth ? 'skip' : 'cognito');
       })
       .catch(() => {
-        setAuthMode('skip');
+        // Fail CLOSED: if config can't load, require Cognito login rather than
+        // silently skipping auth. Only the explicit dev bypass skips.
+        setAuthMode(isDev && skipAuth ? 'skip' : 'cognito');
       });
   }, []);
 
