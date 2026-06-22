@@ -20,6 +20,14 @@ jest.mock('aws-jwt-verify');
 describe('chat.ts - Log injection prevention', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Model local dev so the handler proceeds past the access-token check into the
+    // method-handling logs these tests assert on (NODE_ENV alone no longer skips).
+    process.env.NODE_ENV = 'development';
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
+  });
+
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
   });
 
   it('sanitizes newline characters in req.method to prevent log injection', async () => {

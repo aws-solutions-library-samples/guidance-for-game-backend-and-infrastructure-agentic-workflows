@@ -32,12 +32,20 @@ describe('/api/copilot/chat - JWT decoding', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
+    // Local dev: the access-token check is skipped only via the explicit bypass
+    // (NEXT_PUBLIC_SKIP_AUTH=true), which is what .env.local ships. NODE_ENV alone
+    // no longer skips. ID-token verification still runs regardless of this flag.
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
     // Default: a valid, approved ID token (tests override as needed).
     mockVerify.mockResolvedValue({
       sub: 'user123',
       email: 'test@example.com',
       'cognito:groups': ['users'],
     });
+  });
+
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
   });
 
   // An ID token that fails cryptographic verification (bad signature, wrong
@@ -154,5 +162,26 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
     expect(res._getStatusCode()).toBe(400);
     expect(JSON.parse(res._getData()).error).toBe('Unknown operation');
+  });
+
+  // A non-production HOSTED env (staging/preview) is also NODE_ENV !== 'production'.
+  // Without the explicit NEXT_PUBLIC_SKIP_AUTH bypass it must NOT skip auth — a
+  // request with no verified access token is rejected, not silently let through.
+  it('enforces the access-token check in non-prod when SKIP_AUTH is not set', async () => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH; // hosted staging/preview, no local bypass
+
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: {}, // no cognito_access_token cookie
+      body: {
+        operationName: 'generateCopilotResponse',
+        variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } }
+      }
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(401);
+    expect(JSON.parse(res._getData()).error).toBe('Unauthorized');
   });
 });
