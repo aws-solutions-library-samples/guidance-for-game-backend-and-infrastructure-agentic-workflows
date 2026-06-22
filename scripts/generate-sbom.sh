@@ -30,12 +30,13 @@ BACKEND_SBOM="backend-sbom-${TIMESTAMP}.spdx.json"
 FRONTEND_SBOM="frontend-sbom-${TIMESTAMP}.spdx.json"
 
 # Backend SBOM (from source - scans pyproject.toml, requirements.txt, uv.lock)
+# NOTE: the flag is --source-name (syft renamed it from the old --name); stderr
+# is NOT suppressed so a syft failure surfaces instead of silently exiting 1.
 echo ""
 echo "📦 Generating backend SBOM from source..."
 syft dir:"$PROJECT_ROOT/backend" \
     -o spdx-json="$SBOM_DIR/$BACKEND_SBOM" \
-    --name "game-agent-backend" \
-    2>/dev/null
+    --source-name "game-agent-backend"
 echo "✅ Backend SBOM: sbom/$BACKEND_SBOM"
 
 # Frontend SBOM
@@ -47,15 +48,13 @@ if [ -n "$1" ]; then
     echo "📦 Generating frontend SBOM from image: $FRONTEND_IMAGE..."
     syft "$FRONTEND_IMAGE" \
         -o spdx-json="$SBOM_DIR/$FRONTEND_SBOM" \
-        --name "game-agent-frontend" \
-        2>/dev/null
+        --source-name "game-agent-frontend"
 else
     echo ""
     echo "📦 Generating frontend SBOM from source..."
     syft dir:"$PROJECT_ROOT/ui" \
         -o spdx-json="$SBOM_DIR/$FRONTEND_SBOM" \
-        --name "game-agent-frontend" \
-        2>/dev/null
+        --source-name "game-agent-frontend"
 fi
 echo "✅ Frontend SBOM: sbom/$FRONTEND_SBOM"
 
