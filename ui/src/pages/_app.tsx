@@ -5,6 +5,7 @@ import Head from 'next/head';
 import { useEffect, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
 import type { CognitoUser } from 'amazon-cognito-identity-js';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 
 interface Config {
   cognito: {
@@ -28,7 +29,7 @@ function MyApp({ Component, pageProps }: AppProps) {
     const isDev = process.env.NODE_ENV === 'development';
     const skipAuth = process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
 
-    fetch('/api/config')
+    fetchWithTimeout('/api/config')
       .then(res => res.json())
       .then((cfg: Config) => {
         setConfig(cfg);

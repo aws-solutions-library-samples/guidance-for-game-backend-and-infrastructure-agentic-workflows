@@ -6,6 +6,7 @@ import React, { useState, useEffect } from 'react';
 import Head from 'next/head';
 import Link from 'next/link';
 import { Chat } from '../components/Chat';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 
 interface HomeProps {
   user?: {
@@ -26,7 +27,7 @@ export default function Home({ user }: HomeProps) {
   // Fetch user info from API when user is authenticated
   useEffect(() => {
     if (user) {
-      fetch('/api/auth/user')
+      fetchWithTimeout('/api/auth/user')
         .then(res => res.ok ? res.json() : null)
         .then(data => {
           if (data) {
@@ -44,7 +45,7 @@ export default function Home({ user }: HomeProps) {
 
   const handleSignOut = async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetchWithTimeout('/api/auth/logout', { method: 'POST' });
       // Clear local state
       setUserInfo(null);
       // Force reload to clear all state

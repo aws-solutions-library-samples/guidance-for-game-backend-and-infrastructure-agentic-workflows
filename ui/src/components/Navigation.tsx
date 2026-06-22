@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { logError } from '@/utils/logger';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 
 interface NavigationProps {
   pageTitle?: string;
@@ -15,7 +16,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
 
   // Fetch user info when component mounts
   useEffect(() => {
-    fetch('/api/auth/user')
+    fetchWithTimeout('/api/auth/user')
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (data) {
@@ -29,7 +30,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
 
   const handleSignOut = async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetchWithTimeout('/api/auth/logout', { method: 'POST' });
       setUserInfo(null);
       window.location.href = '/';
     } catch (error) {

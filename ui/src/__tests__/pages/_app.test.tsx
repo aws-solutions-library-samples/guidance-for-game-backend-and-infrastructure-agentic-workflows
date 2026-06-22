@@ -176,6 +176,7 @@ describe('MyApp - Logout behavior', () => {
       expect(screen.getByTestId('cognito-auth')).toBeInTheDocument();
     });
 
-    expect(global.fetch).toHaveBeenCalledWith('/api/config');
+    // fetchWithTimeout passes an AbortController signal in the options.
+    expect(global.fetch).toHaveBeenCalledWith('/api/config', expect.objectContaining({ signal: expect.anything() }));
   });
 });

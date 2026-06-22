@@ -1,6 +1,7 @@
 import { useCallback, useState, useEffect } from 'react';
 import Head from 'next/head';
 import Navigation from '../../components/Navigation';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 
 interface User {
   username: string;
@@ -17,7 +18,7 @@ export default function AdminUsers() {
   // Declared before the effect that calls it (and memoized) so the rule of hooks
   // is satisfied and the effect dependency is stable.
   const fetchUsers = useCallback(async () => {
-    const res = await fetch('/api/admin/users');
+    const res = await fetchWithTimeout('/api/admin/users');
     const data = await res.json();
     setUsers(data.users || []);
     setLoading(false);
@@ -32,7 +33,7 @@ export default function AdminUsers() {
   }, [fetchUsers]);
 
   const approveUser = async (username: string) => {
-    await fetch('/api/admin/approve', {
+    await fetchWithTimeout('/api/admin/approve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, action: 'approve' })
@@ -42,7 +43,7 @@ export default function AdminUsers() {
 
   const denyUser = async (username: string) => {
     if (confirm(`Delete user ${username}?`)) {
-      await fetch('/api/admin/approve', {
+      await fetchWithTimeout('/api/admin/approve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, action: 'deny' })
