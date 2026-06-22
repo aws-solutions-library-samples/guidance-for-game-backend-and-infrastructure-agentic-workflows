@@ -100,9 +100,37 @@ class TestInvokeAgent:
         result = invoke_agent({"prompt": "test prompt"})
 
         assert result == "Test response"
+
+    def test_invoke_agent_returns_readiness_message_when_credentials_unavailable(self, mock_orchestrator):
+        """If startup creds failed AND the re-check still fails, return a clear
+        'initializing' message instead of calling the orchestrator (#123)."""
+        # Local modules
+        import agentcore_main
+
+        with (
+            patch.object(agentcore_main, "_CREDENTIALS_OK", False),
+            patch.object(agentcore_main, "validate_aws_credentials", return_value=False),
+        ):
+            result = agentcore_main.invoke_agent("test prompt")
+
+        assert "initializing" in result.lower()
+        # Must short-circuit — orchestrator never called when not ready.
+        mock_orchestrator.assert_not_called()
+
+    def test_invoke_agent_recovers_when_credentials_become_available(self, mock_orchestrator):
+        """If startup creds failed but the lazy re-check succeeds, proceed."""
+        # Local modules
+        import agentcore_main
+
+        with (
+            patch.object(agentcore_main, "_CREDENTIALS_OK", False),
+            patch.object(agentcore_main, "validate_aws_credentials", return_value=True),
+        ):
+            result = agentcore_main.invoke_agent("test prompt")
+
+        assert result == "Test response"
         mock_orchestrator.assert_called_once()
-        call_args = mock_orchestrator.call_args
-        assert call_args.kwargs["query"] == "test prompt"
+        assert mock_orchestrator.call_args.kwargs["query"] == "test prompt"
 
     def test_invoke_agent_with_empty_dict(self, mock_orchestrator):
         """Test invoke_agent with empty dict returns validation error.

@@ -135,8 +135,13 @@ def prewarm_container():
         logger.warning(f"⚠️ Pre-warming partially failed ({elapsed:.2f}s): {e}")
 
 
-# Validate credentials at module load
-validate_aws_credentials()
+# Validate credentials at module load. Keep the result as a readiness signal
+# instead of discarding it: a credential failure here means AWS calls will fail,
+# so the entrypoint can return a clear "initializing/unavailable" message rather
+# than an opaque downstream error on the first real request (#123). We do NOT
+# hard-fail startup — that would crash-loop the container on a transient STS
+# blip, and IAM role creds typically resolve momentarily after start.
+_CREDENTIALS_OK = validate_aws_credentials()
 
 # Pre-warm container at startup
 prewarm_container()
@@ -192,6 +197,16 @@ def invoke_agent(prompt, context=None):
         logger.info("=" * 80)
         logger.info("🚀 AGENTCORE INVOCATION START")
         logger.info("=" * 80)
+
+        # Readiness gate (#123): if credentials failed at startup, re-check once
+        # here (they may have resolved post-start) and return a clear message
+        # rather than letting the request fail opaquely deep in an AWS call.
+        global _CREDENTIALS_OK
+        if not _CREDENTIALS_OK:
+            _CREDENTIALS_OK = validate_aws_credentials()
+            if not _CREDENTIALS_OK:
+                logger.error("❌ Service not ready: AWS credentials unavailable")
+                return "The service is still initializing and can't reach AWS yet. Please retry in a few moments."
 
         # DIAGNOSTIC: Check AgentCore context object
         logger.info("🔍 AgentCore Context Inspection:")
