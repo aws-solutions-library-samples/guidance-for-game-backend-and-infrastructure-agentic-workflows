@@ -19,8 +19,6 @@ from strands.models import BedrockModel
 
 # Local modules
 from config.settings import (
-    AWS_PROFILE,
-    AWS_REGION,
     BEDROCK_GUARDRAIL_ENABLED,
     BEDROCK_GUARDRAIL_ID,
     BEDROCK_GUARDRAIL_VERSION,
@@ -59,9 +57,6 @@ def create_cached_bedrock_model():
         # Double-check after acquiring lock (another thread may have initialized)
         if _primary_model is not None:
             return _primary_model
-
-        if AWS_PROFILE:
-            os.environ["AWS_PROFILE"] = AWS_PROFILE
 
         # Base model configuration
         model_config = {
@@ -122,9 +117,6 @@ def create_secondary_bedrock_model():
         if _secondary_model is not None:
             return _secondary_model
 
-        if AWS_PROFILE:
-            os.environ["AWS_PROFILE"] = AWS_PROFILE
-
         _secondary_model = BedrockModel(
             model_id=BEDROCK_MODEL_ID_SECONDARY,
             cache_prompt="default",
@@ -161,9 +153,6 @@ def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: in
     Returns:
         BedrockModel configured with the given parameters.
     """
-    if AWS_PROFILE:
-        os.environ["AWS_PROFILE"] = AWS_PROFILE
-
     model_config = {
         "model_id": model_id or BEDROCK_MODEL_ID,
         "cache_prompt": "default",
