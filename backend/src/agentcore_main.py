@@ -15,7 +15,6 @@ Performance Optimization:
 """
 
 # Standard library
-import concurrent.futures
 import os
 import sys
 import time
@@ -33,7 +32,6 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp  # type: ignore[import
 # Local modules
 from agents.orchestrator import run_orchestrator
 from config.settings import (
-    AGENT_TIMEOUT_REQUEST_SECONDS,
     AWS_REGION,
     BOTO3_CLIENT_CONFIG,
     RATE_LIMIT_MAX_REQUESTS,
@@ -290,17 +288,16 @@ def invoke_agent(prompt, context=None):
         logger.info(f"   Actor ID: {actor_id}")
         logger.info(f"   Session ID: {session_id}")
 
-        logger.info(f"🎯 Calling run_orchestrator (timeout: {AGENT_TIMEOUT_REQUEST_SECONDS}s)...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_orchestrator, query=user_prompt, context=agent_context)
-            try:
-                response = future.result(timeout=AGENT_TIMEOUT_REQUEST_SECONDS)
-            except concurrent.futures.TimeoutError:
-                logger.error(f"⏰ Request timed out after {AGENT_TIMEOUT_REQUEST_SECONDS}s")
-                return (
-                    "I'm sorry, but your request took too long to process. "
-                    "Please try a simpler query or break your question into smaller parts."
-                )
+        # Run the orchestrator inline. Timeouts are enforced INSIDE the agent loop
+        # by WallClockTimeoutHook (orchestrator 150s, specialists 90s), which
+        # cancels the next tool call cleanly — emitting a paired toolResult so the
+        # turn is never left half-written. The previous ThreadPoolExecutor +
+        # future.result(timeout) ABANDONED the worker thread on timeout: it kept
+        # running mid-tool-call and could persist a toolUse with no toolResult,
+        # permanently poisoning the session (#155 / #125). The in-loop hooks fire
+        # before the old 180s outer budget would have, so no coverage is lost.
+        logger.info("🎯 Calling run_orchestrator (in-loop wall-clock hooks enforce timeout)...")
+        response = run_orchestrator(query=user_prompt, context=agent_context)
 
         logger.info(f"✅ Orchestrator returned response")
         logger.info(f"   Response type: {type(response)}")
