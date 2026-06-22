@@ -3,6 +3,7 @@ import { CognitoIdentityProviderClient, AdminConfirmSignUpCommand, AdminAddUserT
 import { parse } from 'cookie';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { logError } from '@/utils/logger';
+import { isSameOrigin } from '@/utils/csrf';
 
 // Verify the ID token (read from the cognito_id_token cookie below). It must be
 // tokenUse: 'id' — aws-jwt-verify checks the token_use claim, so an 'access'
@@ -17,6 +18,11 @@ const verifier = CognitoJwtVerifier.create({
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  // CSRF defense-in-depth: reject cross-origin state-changing requests.
+  if (!isSameOrigin(req)) {
+    return res.status(403).json({ error: 'Cross-origin request blocked' });
   }
 
   try {

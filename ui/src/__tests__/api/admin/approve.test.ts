@@ -30,6 +30,10 @@ describe('/api/admin/approve', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // Local-dev bypass also satisfies the same-origin (CSRF) check, so these
+    // existing cases (which don't set an Origin header) exercise the auth logic
+    // they were written for. A dedicated test below covers the CSRF block.
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
     const { CognitoJwtVerifier } = await import('aws-jwt-verify');
     const { CognitoIdentityProviderClient } = await import('@aws-sdk/client-cognito-identity-provider');
 
@@ -40,6 +44,41 @@ describe('/api/admin/approve', () => {
     CognitoIdentityProviderClient.mockImplementation(() => ({
       send: mockSend,
     }));
+  });
+
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+  });
+
+  it('blocks a cross-origin request with 403 (CSRF defense-in-depth)', async () => {
+    // No dev bypass → the same-origin check is enforced.
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: { host: 'app.example.com', origin: 'https://evil.example.com', cookie: 'cognito_id_token=valid_token' },
+      body: { username: 'someone', action: 'approve' },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(403);
+    expect(JSON.parse(res._getData())).toEqual({ error: 'Cross-origin request blocked' });
+  });
+
+  it('allows a same-origin request through the CSRF check', async () => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    mockVerify.mockResolvedValue({ sub: 'admin-1', 'cognito:groups': ['admin'] });
+
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: { host: 'app.example.com', origin: 'https://app.example.com', cookie: 'cognito_id_token=valid_token' },
+      body: { username: 'someone', action: 'approve' },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
   });
 
   it('returns 401 when token is missing', async () => {
