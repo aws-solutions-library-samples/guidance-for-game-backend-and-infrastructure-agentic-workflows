@@ -58,8 +58,8 @@ uv run --directory backend pre-commit run --all-files  # Same, manual
 
 ### Agent Hierarchy
 - **Orchestrator** (`agents/orchestrator.py`) — Routes queries to specialists, uses Claude Haiku 4.5 for fast classification; optionally uses `AgentCoreMemorySessionManager` for session + long-term memory (controlled by `GBAW_USE_BEDROCK_SESSIONS`)
-- **Specialist agents** (`agents/{gamelift,eks,cost}_specialist.py`) — Domain experts using Claude Sonnet 4.5, created via `base_specialist.py` factory (`create_specialist_agent()`)
-- **MCP servers** — EKS, Cost Explorer, and CCAPI servers run as embedded stdio subprocesses; module-level thread-safe cache in `utils/mcp_client_factory.py` reuses clients across calls; automatic fallback to boto3 if MCP unavailable
+- **Specialist agents** (`agents/{gamelift,eks,cost}_specialist.py`) — Domain experts using Claude Sonnet 4.5, created via `base_specialist.py` factory (`create_specialist_agent()`). Each agent's `model_id`/temperature is pinned per-agent in `settings.INFERENCE_CONFIG`; without explicit pinning every agent silently inherited the orchestrator's Haiku model
+- **MCP servers** — Each specialist declares its servers via `mcp_server_names`: EKS uses `aws-api-mcp-server` (account-wide resource discovery via `call_aws`) + `eks-mcp-server` (in-cluster ops); Cost uses `billing-cost-management-mcp-server`; GameLift uses boto3 directly (no MCP). Servers run as embedded stdio subprocesses; a module-level thread-safe cache in `utils/mcp_client_factory.py` reuses clients across calls, with automatic fallback to boto3 if MCP is unavailable
 
 ### Startup Pre-warming
 `agentcore_main.py` initializes Bedrock model singleton, all 3 MCP clients, and KB tools at module load time (not per-request). This cuts first-request latency by 2–4s. Failures are logged as debug and don't block startup.
@@ -80,14 +80,18 @@ uv run --directory backend pre-commit run --all-files  # Same, manual
 - Auth via Amazon Cognito (skippable in dev with `NEXT_PUBLIC_SKIP_AUTH=true`)
 
 ### Infrastructure
-Five CloudFormation stacks deployed in order via `scripts/deploy.sh`:
-1. **Base** — Cognito, IAM, ECR
-2. **Guardrails** — Bedrock Guardrails
-3. **AgentCore Runtime** — deployed via CodeBuild direct-code (no FastAPI wrapper); prompt ARNs written to `backend/.env.local` then passed as env vars
-4. **Frontend** — ECS Express (managed Fargate + ALB)
-5. **Security** — WAF on ALB, CloudTrail, Inspector ECR scanning
+`scripts/deploy.sh` runs an ordered, idempotent sequence (templates in `infrastructure/cloudformation/`, stacks prefixed `game-agent-`). Re-running is safe — each step skips or updates in place:
+1. **solution-tracking** — Solution ID (SO9693) stack for deployment metrics
+2. **infrastructure** (base) — Cognito, IAM, ECR
+3. **guardrails** — Bedrock Guardrails (the returned `GuardrailId` is wired into the runtime)
+4. **Managed Prompts** — `scripts/infrastructure/deploy_prompts.py` publishes the four agent prompts to Bedrock Prompt Management; it is text-hash-idempotent (only re-publishes changed prompts) and writes prompt ARNs to `backend/.env.local`, which are read back and passed to the runtime as `GBAW_*_PROMPT_ARN` env vars
+5. **AgentCore Runtime** — direct-code deploy via CodeBuild (ARM64, no FastAPI wrapper); a re-launch step rewires KB IDs + prompt ARNs as env vars
+6. **observability** — account-wide CloudWatch/X-Ray trace delivery
+7. **Knowledge Bases** (GameLift, EKS, Cost) — deployed then seeded
+8. **frontend** — ECS Express (managed Fargate + ALB)
+9. **security** — WAF on ALB, CloudTrail (KMS-encrypted logs), Inspector ECR scanning
 
-Knowledge Bases (GameLift, EKS, Cost) are deployed and seeded separately; KB IDs are wired to the runtime via env vars after stack creation. Run `scripts/infrastructure/seed-kb-{gamelift,eks,cost}.sh` after KB stack creation to populate them — querying an unseeded KB returns empty results without errors.
+**Managed prompts are the source of truth in prod**: editing `optimized_prompts.py` alone is a no-op until re-seeded, but `./deploy-all.sh` re-seeds automatically (step 4). Knowledge Base IDs are wired to the runtime via env vars after stack creation; run `scripts/infrastructure/seed-kb-{gamelift,eks,cost}.sh` after KB stack creation to populate them — querying an unseeded KB returns empty results without errors.
 
 **EKS enrollment** is optional: `infrastructure/kubernetes/enroll-cluster.sh` configures read-only RBAC (pods, deployments, services; secrets excluded) and updates aws-auth ConfigMap.
 
@@ -96,9 +100,10 @@ Knowledge Bases (GameLift, EKS, Cost) are deployed and seeded separately; KB IDs
 ## Code Style
 
 ### Python
-- **Formatter**: Black, 120 char line length, Python 3.13 target
+- **Formatter**: Black, 120 char line length, Python target pinned `>=3.13.9,<3.14` (the upper bound stops uv from solving impossible 3.14 dependency splits)
 - **Imports**: isort with Black profile; sections ordered: stdlib → third-party → local; each section has a heading comment (e.g., `# Standard library`, `# Third-party packages`, `# Local modules`)
 - **Type checking**: mypy (lenient — `disallow_untyped_defs = false`, `ignore_missing_imports = true`)
+- **Dependencies**: `pyproject.toml` + `uv.lock` are the source of truth. `backend/requirements.txt` is **generated** (`uv export --no-dev --no-hashes`, run by `deploy.sh`) for the CodeBuild runtime — never hand-edit it; change `pyproject.toml` and re-lock instead
 
 ### TypeScript/JavaScript
 - ESLint with `next/core-web-vitals` and `next/typescript` configs
