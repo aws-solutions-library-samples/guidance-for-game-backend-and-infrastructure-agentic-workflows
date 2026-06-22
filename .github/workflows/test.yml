@@ -99,6 +99,27 @@ jobs:
         path: ui/playwright-report/
         retention-days: 14
 
+  vulnerability-scan:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+
+    # Official Anchore actions install pinned syft + grype binaries (no curl|sh).
+    - name: Install Syft
+      uses: anchore/sbom-action/download-syft@v0
+
+    - name: Install Grype
+      uses: anchore/scan-action/download-grype@v6
+
+    # scripts/scan-vulnerabilities.sh generates SBOMs (syft dir:backend, dir:ui —
+    # reads uv.lock / package-lock.json, no build needed) then greps them with
+    # grype. FAIL_ON=high so the build fails only on high/critical findings;
+    # medium/low are surfaced in the log without blocking.
+    - name: Scan dependencies for vulnerabilities
+      run: bash scripts/scan-vulnerabilities.sh
+      env:
+        FAIL_ON: high
+
   powershell-tests:
     strategy:
       fail-fast: false
