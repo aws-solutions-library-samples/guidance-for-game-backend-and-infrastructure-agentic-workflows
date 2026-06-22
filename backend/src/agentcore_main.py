@@ -109,7 +109,7 @@ def prewarm_container():
         # Local modules
         from utils.mcp_client_factory import create_mcp_client
 
-        mcp_servers = ["aws-api-mcp-server", "eks-mcp-server", "cost-explorer-mcp-server"]
+        mcp_servers = ["aws-api-mcp-server", "eks-mcp-server", "billing-cost-management-mcp-server"]
         for server in mcp_servers:
             try:
                 create_mcp_client(server)

@@ -48,7 +48,7 @@ aws ce get-savings-utilization --region {region}
 cost_agent = create_specialist_agent(
     service_name="Cost",
     emoji="💰",
-    mcp_server_names=["cost-explorer-mcp-server"],
+    mcp_server_names=["billing-cost-management-mcp-server"],
     kb_id=COST_KB_ID,
     prompt_fn=get_optimized_cost_prompt,
     fallback_fn=_get_cost_aws_cli_fallback,

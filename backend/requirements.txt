@@ -40,7 +40,7 @@ awscrt==0.32.2
     # via botocore
 awslabs-aws-api-mcp-server==1.3.45
     # via game-agent-backend
-awslabs-cost-explorer-mcp-server==0.0.13
+awslabs-billing-cost-management-mcp-server==0.0.24
     # via game-agent-backend
 awslabs-eks-mcp-server==0.1.32
     # via game-agent-backend
@@ -55,7 +55,7 @@ bedrock-agentcore==1.15.0
 boto3==1.43.32
     # via
     #   awslabs-aws-api-mcp-server
-    #   awslabs-cost-explorer-mcp-server
+    #   awslabs-billing-cost-management-mcp-server
     #   awslabs-eks-mcp-server
     #   bedrock-agentcore
     #   game-agent-backend
@@ -122,7 +122,9 @@ email-validator==2.3.0
 exceptiongroup==1.3.1
     # via fastmcp-slim
 fastmcp==3.4.2
-    # via awslabs-aws-api-mcp-server
+    # via
+    #   awslabs-aws-api-mcp-server
+    #   awslabs-billing-cost-management-mcp-server
 fastmcp-slim==3.4.2
     # via fastmcp
 frozenlist==1.8.0
@@ -201,7 +203,7 @@ kubernetes==36.0.2
 loguru==0.7.3
     # via
     #   awslabs-aws-api-mcp-server
-    #   awslabs-cost-explorer-mcp-server
+    #   awslabs-billing-cost-management-mcp-server
     #   awslabs-eks-mcp-server
     #   game-agent-backend
 lxml==6.1.1
@@ -213,7 +215,7 @@ markdownify==1.2.0
 mcp==1.28.0
     # via
     #   awslabs-aws-api-mcp-server
-    #   awslabs-cost-explorer-mcp-server
+    #   awslabs-billing-cost-management-mcp-server
     #   awslabs-eks-mcp-server
     #   bedrock-agentcore
     #   fastmcp-slim
@@ -231,8 +233,6 @@ multidict==6.7.0
     # via
     #   aiohttp
     #   yarl
-numpy==2.3.5
-    # via pandas
 oauthlib==3.3.1
     # via requests-oauthlib
 openapi-pydantic==0.5.1
@@ -567,8 +567,6 @@ packaging==26.2
     #   opentelemetry-instrumentation-flask
     #   opentelemetry-instrumentation-pika
     #   opentelemetry-instrumentation-sqlalchemy
-pandas==2.3.3
-    # via awslabs-cost-explorer-mcp-server
 pathable==0.4.4
     # via jsonschema-path
 pillow==12.2.0
@@ -599,7 +597,7 @@ pycparser==2.23 ; implementation_name != 'PyPy' and platform_python_implementati
 pydantic==2.13.4
     # via
     #   awslabs-aws-api-mcp-server
-    #   awslabs-cost-explorer-mcp-server
+    #   awslabs-billing-cost-management-mcp-server
     #   awslabs-eks-mcp-server
     #   bedrock-agentcore
     #   fastmcp-slim
@@ -631,9 +629,9 @@ python-dateutil==2.9.0.post0
     # via
     #   botocore
     #   kubernetes
-    #   pandas
 python-dotenv==1.2.2
     # via
+    #   awslabs-billing-cost-management-mcp-server
     #   fastmcp-slim
     #   game-agent-backend
     #   mcp
@@ -646,8 +644,6 @@ python-multipart==0.0.32
     # via
     #   fastmcp-slim
     #   mcp
-pytz==2025.2
-    # via pandas
 pywin32==311 ; sys_platform == 'win32'
     # via mcp
 pywin32-ctypes==0.2.3 ; sys_platform == 'win32'
@@ -766,10 +762,8 @@ typing-inspection==0.4.2
     #   mcp
     #   pydantic
     #   pydantic-settings
-tzdata==2026.2
-    # via
-    #   pandas
-    #   strands-agents-tools
+tzdata==2026.2 ; sys_platform == 'win32'
+    # via strands-agents-tools
 uncalled-for==0.3.2
     # via fastmcp-slim
 urllib3==2.7.0
