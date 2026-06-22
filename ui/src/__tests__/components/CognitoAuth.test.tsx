@@ -167,14 +167,20 @@ describe('CognitoAuth - handleSignIn error handling', () => {
       expect(mockOnAuthenticated).toHaveBeenCalled();
     }, { timeout: 3000 });
 
-    expect(global.fetch).toHaveBeenCalledWith('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        accessToken: 'access-token',
-        idToken: 'id-token',
-        refreshToken: 'refresh-token',
-      }),
-    });
+    // fetchWithTimeout adds an AbortController signal to the options, so match
+    // the meaningful fields with objectContaining rather than the exact object.
+    expect(global.fetch).toHaveBeenCalledWith(
+      '/api/auth/login',
+      expect.objectContaining({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accessToken: 'access-token',
+          idToken: 'id-token',
+          refreshToken: 'refresh-token',
+        }),
+        signal: expect.anything(),
+      })
+    );
   });
 });

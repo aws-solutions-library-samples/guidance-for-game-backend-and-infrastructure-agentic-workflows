@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { CognitoUserPool, CognitoUser, AuthenticationDetails, CognitoUserSession } from 'amazon-cognito-identity-js';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 
 interface CognitoAuthProps {
   userPoolId: string;
@@ -45,7 +46,7 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
       onSuccess: async (session) => {
         try {
           // Store tokens in HttpOnly cookies via API
-          const response = await fetch('/api/auth/login', {
+          const response = await fetchWithTimeout('/api/auth/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
