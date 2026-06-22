@@ -178,7 +178,15 @@ def _load_from_bedrock_pm():
             _prompt_source = "bedrock_pm"
 
     except Exception:
-        pass  # Fallback to code-defined prompts silently
+        # Fall back to code-defined prompts (safe), but surface WHY — a
+        # misconfigured Prompt Management ARN or missing IAM permission would
+        # otherwise be invisible, silently shipping stale code prompts in prod.
+        # Local import: logger isn't imported at module top here, and this runs
+        # at import time (container startup).
+        # Local modules
+        from utils.logger import logger
+
+        logger.warning("Bedrock Prompt Management load failed; using code-defined prompts", exc_info=True)
 
 
 # Run at import time (container startup)

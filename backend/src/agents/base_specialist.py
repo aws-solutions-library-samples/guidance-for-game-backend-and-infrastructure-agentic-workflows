@@ -99,11 +99,15 @@ def create_specialist_agent(
 
                     return result
 
-                except Exception as e:
-                    logger.error(f"❌ {service_name} agent failed: {e}")
+                except Exception:
+                    # Log the full exception (with traceback) server-side, but do
+                    # NOT interpolate it into the user-facing string — the raw
+                    # message can leak internal details (ARNs, stack frames, SDK
+                    # errors). Return a generic message instead.
+                    logger.error(f"❌ {service_name} agent failed", exc_info=True)
                     if fallback_fn:
                         return fallback_fn(AWS_REGION)
-                    return f"Unable to process {service_name} request: {e}"
+                    return f"Unable to process the {service_name} request right now. Please try again."
 
         # Set unique name and docstring
         agent_func.__name__ = f"{service_name.lower()}_agent"
