@@ -1,9 +1,15 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { serialize } from 'cookie';
+import { isSameOrigin } from '@/utils/csrf';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  // CSRF defense-in-depth: reject cross-origin state-changing requests.
+  if (!isSameOrigin(req)) {
+    return res.status(403).json({ error: 'Cross-origin request blocked' });
   }
 
   const { accessToken, idToken, refreshToken } = req.body;
