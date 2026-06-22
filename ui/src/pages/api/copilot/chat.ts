@@ -43,8 +43,11 @@ function getIdVerifier() {
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function verifyAccessToken(req: NextApiRequest): Promise<{ ok: boolean; payload: any }> {
-  // Skip JWT validation in development
-  if (process.env.NODE_ENV !== 'production') {
+  // Skip JWT validation ONLY for the explicit local-dev bypass. NODE_ENV alone is
+  // unsafe: a hosted staging/preview deploy is also !== 'production', and gating on
+  // it would serve this route with no auth. Local dev sets NEXT_PUBLIC_SKIP_AUTH=true
+  // (and has no Cognito cookies — identity comes from STS), so it still skips here.
+  if (process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_SKIP_AUTH === 'true') {
     return { ok: true, payload: null };
   }
 

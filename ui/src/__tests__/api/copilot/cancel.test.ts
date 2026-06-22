@@ -10,7 +10,14 @@ import handler from '@/pages/api/copilot/chat';
 describe('Chat Cancellation', () => {
   beforeEach(() => {
     process.env.NODE_ENV = 'development';
+    // Local-dev bypass flag (matches .env.local); NODE_ENV alone no longer skips
+    // the access-token check.
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
     process.env.BACKEND_URL = 'http://localhost:8080';
+  });
+
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
   });
 
   it('should handle client disconnect gracefully', async () => {
