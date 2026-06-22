@@ -437,6 +437,7 @@ aws cloudformation deploy \
     ProjectName="$PROJECT_NAME" \
     FrontendResourceArn="$FRONTEND_ALB_ARN" \
     RateLimitPerIP=2000 \
+    AuthAdminRateLimitPerIP=100 \
     CloudTrailRetentionDays=90 \
     AIChatMode=true \
   --capabilities CAPABILITY_NAMED_IAM \
