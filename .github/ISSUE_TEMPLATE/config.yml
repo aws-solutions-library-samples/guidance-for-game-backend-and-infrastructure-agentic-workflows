@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://aws.amazon.com/security/vulnerability-reporting/
+    about: Please report potential security vulnerabilities to AWS Security instead of opening a public issue.
+  - name: Contribution guidelines
+    url: https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/blob/main/CONTRIBUTING.md
+    about: Review the contribution guidelines before opening issues or pull requests.
