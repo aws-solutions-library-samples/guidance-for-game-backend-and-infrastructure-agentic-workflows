@@ -16,7 +16,7 @@ updates:
       timezone: "America/Los_Angeles"
     open-pull-requests-limit: 10
     reviewers:
-      - "game-agent-maintainers"
+      - "aws-solutions-library-samples/maintainers"
     labels:
       - "dependencies"
       - "python"
@@ -50,7 +50,7 @@ updates:
       timezone: "America/Los_Angeles"
     open-pull-requests-limit: 10
     reviewers:
-      - "game-agent-maintainers"
+      - "aws-solutions-library-samples/maintainers"
     labels:
       - "dependencies"
       - "npm"
@@ -82,7 +82,7 @@ updates:
       timezone: "America/Los_Angeles"
     open-pull-requests-limit: 5
     reviewers:
-      - "game-agent-maintainers"
+      - "aws-solutions-library-samples/maintainers"
     labels:
       - "dependencies"
       - "docker"
@@ -112,7 +112,7 @@ updates:
       timezone: "America/Los_Angeles"
     open-pull-requests-limit: 5
     reviewers:
-      - "game-agent-maintainers"
+      - "aws-solutions-library-samples/maintainers"
     labels:
       - "dependencies"
       - "github-actions"

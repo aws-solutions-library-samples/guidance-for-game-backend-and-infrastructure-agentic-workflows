@@ -1,0 +1,5 @@
+# Temporary repository-wide owner for launch readiness governance.
+# Replace with @aws-solutions-library-samples/game-agent-maintainers after that
+# team exists and has repository access. Do not enable CODEOWNERS review
+# enforcement until the maintainer team and branch rules are ready.
+* @aws-solutions-library-samples/maintainers
