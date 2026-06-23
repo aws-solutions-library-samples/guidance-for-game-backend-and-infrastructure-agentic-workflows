@@ -16,6 +16,30 @@ from agents.eks_specialist import eks_agent
 from agents.gamelift_specialist import gamelift_agent
 
 
+def assert_no_agent_error(response: str) -> None:
+    """Assert a specialist response is a real answer, not an agent failure.
+
+    Matches indicators ANCHORED to actual failure modes — colon-prefixed error
+    formatting (``error:``, ``exception:``, ``failed:``) and the specialists'
+    real fallback/error strings — rather than naive substrings. The previous
+    check flagged ``"unable to"`` anywhere, which false-failed on legitimate KB
+    prose like "...players unable to join games during traffic spikes."
+    """
+    lo = response.lower()
+    # Colon-anchored error formatting (a stack/SDK error printed into the reply).
+    formatted_errors = ["error:", "exception:", "failed:", "traceback"]
+    # The specialists' actual fallback / generic-failure strings (base_specialist
+    # + eks_specialist). These are what a genuine failure surfaces to the user.
+    real_failure_strings = [
+        "unable to process the",  # base_specialist generic failure
+        "mcp servers unavailable",  # eks_specialist fallback
+        "mcp unavailable",
+        "encountered an error processing",  # runtime entrypoint failure
+    ]
+    hits = [s for s in (formatted_errors + real_failure_strings) if s in lo]
+    assert not hits, f"Response contains a real error indicator {hits}: {response[:200]}"
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("GBAW_GAMELIFT_KB_ID"), reason="GameLift KB not deployed")
 class TestGameLiftKB:
@@ -32,10 +56,8 @@ class TestGameLiftKB:
         assert len(response) > 50, "Response should have meaningful content"
         assert len(response) < 10000, "Response should be reasonable length"
 
-        # Should not contain error indicators
-        response_lower = response.lower()
-        error_indicators = ["error:", "exception:", "failed:", "unable to"]
-        assert not any(err in response_lower for err in error_indicators), f"Response contains error: {response[:200]}"
+        # Should not contain real error/failure indicators (anchored, not naive substrings)
+        assert_no_agent_error(response)
 
     def test_fleet_scaling_best_practices(self):
         """Test: GameLift agent responds to scaling queries"""
@@ -48,10 +70,8 @@ class TestGameLiftKB:
         assert len(response) > 50, "Response should have meaningful content"
         assert len(response) < 10000, "Response should be reasonable length"
 
-        # Should not contain error indicators
-        response_lower = response.lower()
-        error_indicators = ["error:", "exception:", "failed:", "unable to"]
-        assert not any(err in response_lower for err in error_indicators), f"Response contains error: {response[:200]}"
+        # Should not contain real error/failure indicators (anchored, not naive substrings)
+        assert_no_agent_error(response)
 
     def test_fleet_instance_churn_troubleshooting(self):
         """Test: GameLift agent responds to troubleshooting queries"""
@@ -64,10 +84,8 @@ class TestGameLiftKB:
         assert len(response) > 50, "Response should have meaningful content"
         assert len(response) < 10000, "Response should be reasonable length"
 
-        # Should not contain error indicators
-        response_lower = response.lower()
-        error_indicators = ["error:", "exception:", "failed:", "unable to"]
-        assert not any(err in response_lower for err in error_indicators), f"Response contains error: {response[:200]}"
+        # Should not contain real error/failure indicators (anchored, not naive substrings)
+        assert_no_agent_error(response)
 
     def test_spot_instance_usage(self):
         """Test: GameLift agent responds to spot instance queries"""
@@ -80,10 +98,8 @@ class TestGameLiftKB:
         assert len(response) > 50, "Response should have meaningful content"
         assert len(response) < 10000, "Response should be reasonable length"
 
-        # Should not contain error indicators
-        response_lower = response.lower()
-        error_indicators = ["error:", "exception:", "failed:", "unable to"]
-        assert not any(err in response_lower for err in error_indicators), f"Response contains error: {response[:200]}"
+        # Should not contain real error/failure indicators (anchored, not naive substrings)
+        assert_no_agent_error(response)
 
 
 @pytest.mark.integration
@@ -128,10 +144,8 @@ class TestEKSKB:
         assert len(response) > 50, "Response should have meaningful content"
         assert len(response) < 10000, "Response should be reasonable length"
 
-        # Should not contain error indicators
-        response_lower = response.lower()
-        error_indicators = ["error:", "exception:", "failed:", "unable to"]
-        assert not any(err in response_lower for err in error_indicators), f"Response contains error: {response[:200]}"
+        # Should not contain real error/failure indicators (anchored, not naive substrings)
+        assert_no_agent_error(response)
 
     def test_cluster_autoscaler_setup(self):
         """Test: How do I set up cluster autoscaler for my EKS game cluster?"""
