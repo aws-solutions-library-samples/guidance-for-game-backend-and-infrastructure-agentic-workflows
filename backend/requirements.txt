@@ -22,7 +22,7 @@ anyio==4.14.0
     #   watchfiles
 asgiref==3.11.1
     # via opentelemetry-instrumentation-asgi
-attrs==25.4.0
+attrs==26.1.0
     # via
     #   aiohttp
     #   cyclopts
