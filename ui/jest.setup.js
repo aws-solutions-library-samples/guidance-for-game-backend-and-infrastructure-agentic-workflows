@@ -1,5 +1,10 @@
 require('@testing-library/jest-dom')
 
+const { TextDecoder, TextEncoder } = require('util')
+
+global.TextDecoder = global.TextDecoder || TextDecoder
+global.TextEncoder = global.TextEncoder || TextEncoder
+
 // Mock Next.js router
 jest.mock('next/router', () => ({
   useRouter() {
