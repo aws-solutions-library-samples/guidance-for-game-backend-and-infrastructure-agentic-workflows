@@ -2,8 +2,15 @@
 
 This document provides comprehensive security information for Game Agent, including encryption, data protection, access controls, and compliance measures.
 
+## Reporting Security Issues
+
+If you discover a potential security issue in this project, report it to AWS/Amazon Security through the [AWS vulnerability reporting page](https://aws.amazon.com/security/vulnerability-reporting/). Do not create a public GitHub issue or pull request for suspected vulnerabilities.
+
+Include reproduction steps, affected versions or deployment details, and potential impact when possible.
+
 ## Table of Contents
 
+- [Reporting Security Issues](#reporting-security-issues)
 - [Data Encryption](#data-encryption)
 - [Transport Layer Security (TLS)](#transport-layer-security-tls)
 - [Key Management](#key-management)
