@@ -592,7 +592,7 @@ py-key-value-aio==0.4.5
     # via fastmcp-slim
 pyasn1==0.6.3
     # via rsa
-pycparser==2.23 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
 pydantic==2.13.4
     # via
