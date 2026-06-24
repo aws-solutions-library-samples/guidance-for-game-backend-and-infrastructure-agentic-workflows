@@ -41,8 +41,8 @@ dependencies = [
     "cachetools>=6.2.4",  # bounded TTL caches (rate-limit, KB, memory dedup)
 
     # OpenTelemetry / ADOT for AgentCore observability
-    "aws-opentelemetry-distro>=0.17.1",
-    "opentelemetry-instrumentation>=0.54b0",
+    "aws-opentelemetry-distro>=0.18.0",
+    "opentelemetry-instrumentation>=0.63b1",
 
     # Process monitoring
     "psutil>=7.2.2",
@@ -65,7 +65,7 @@ dependencies = [
     "requests>=2.34.2",
     "beautifulsoup4>=4.15.0",
     "html2text>=2024.2.26",
-    "pypdf>=6.13.3",
+    "pypdf>=6.14.2",
 ]
 
 [dependency-groups]
@@ -73,10 +73,10 @@ dev = [
     # CLI/interactive tools (not needed in production)
     "strands-agents-builder>=0.1.10",
     "bedrock-agentcore-starter-toolkit>=0.3.9",
-    "uv>=0.11.22",
+    "uv>=0.11.24",
 
     # Testing
-    "pytest>=8.4.2",
+    "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.3.1",
