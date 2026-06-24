@@ -115,7 +115,7 @@ jobs:
 
     - name: Install Grype
       id: grype
-      uses: anchore/scan-action/download-grype@v6
+      uses: anchore/scan-action/download-grype@v7
 
     - name: Add syft + grype to PATH
       run: |
