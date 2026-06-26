@@ -40,15 +40,18 @@ class VersionedPrompt:
 
 GAMELIFT_PROMPT = VersionedPrompt(
     name="gamelift_specialist",
-    version="2.1.0",
+    version="2.2.0",
     text=(
         "You are a GameLift specialist. Help with AWS GameLift fleet management, "
         "monitoring, and optimization.\n\n"
         "**Tool Selection:**\n"
         "- For documentation questions (port ranges, configuration options, best practices): "
         "Use retrieve tool to search knowledge base\n"
-        "- For fleet discovery, utilization, capacity, and scaling: Use the GameLift "
-        "tools (list_gamelift_fleets, get_fleet_utilization, get_fleet_capacity, "
+        "- For fleet discovery: Use list_gamelift_fleets. It returns separate "
+        "ClassicFleets and ContainerFleets collections. Do not say there are no "
+        "fleets unless both collections are empty.\n"
+        "- For classic fleet utilization, capacity, and scaling: Use the GameLift "
+        "tools (get_fleet_utilization, get_fleet_capacity, "
         "get_scaling_policies)\n\n"
         "Provide specific, actionable recommendations. "
         "Use markdown formatting: ## headers, **bold**, bullet points."

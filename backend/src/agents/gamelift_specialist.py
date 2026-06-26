@@ -5,6 +5,9 @@ Handles GameLift fleet management, scaling, monitoring, and optimization
 using boto3 for AWS GameLift operations.
 """
 
+# Standard library
+from typing import Any
+
 # Third-party packages
 import boto3
 from strands import tool
@@ -20,32 +23,231 @@ from utils.logger import logger
 # ============================================================================
 
 
+def _empty_fleet_response(error: str | None = None) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "FleetAttributes": [],
+        "ClassicFleets": [],
+        "ContainerFleets": [],
+        "ContainerGroupDefinitions": [],
+        "FleetCounts": {
+            "Classic": 0,
+            "Container": 0,
+            "Total": 0,
+        },
+        "Warnings": [],
+    }
+    if error:
+        response["error"] = error
+        response["Warnings"].append({"Source": "gamelift", "Message": error})
+    return response
+
+
+def _compact_dict(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _paginate_items(client: Any, operation_name: str, result_key: str, **kwargs: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for page in client.get_paginator(operation_name).paginate(**kwargs):
+        items.extend(page.get(result_key, []))
+    return items
+
+
+def _extract_definition_version(definition_arn: str | None) -> int | None:
+    if not definition_arn:
+        return None
+
+    _, _, version = definition_arn.rpartition(":")
+    if version.isdigit():
+        return int(version)
+    return None
+
+
+def _string_value(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _container_group_summary(definition: dict[str, Any] | None) -> dict[str, Any]:
+    if not definition:
+        return {}
+
+    return _compact_dict(
+        {
+            "Name": definition.get("Name"),
+            "VersionNumber": definition.get("VersionNumber"),
+            "ContainerGroupType": definition.get("ContainerGroupType"),
+            "Status": definition.get("Status"),
+            "OperatingSystem": definition.get("OperatingSystem"),
+            "TotalMemoryLimitMebibytes": definition.get("TotalMemoryLimitMebibytes"),
+            "TotalVcpuLimit": definition.get("TotalVcpuLimit"),
+        }
+    )
+
+
+def _deployment_status(deployments: list[dict[str, Any]], latest_deployment_id: str | None) -> str | None:
+    if not deployments:
+        return None
+
+    if latest_deployment_id:
+        for deployment in deployments:
+            if deployment.get("DeploymentId") == latest_deployment_id:
+                return _string_value(deployment.get("DeploymentStatus"))
+
+    return _string_value(deployments[0].get("DeploymentStatus"))
+
+
+def _summarize_container_fleet(
+    fleet: dict[str, Any],
+    group_definition: dict[str, Any] | None = None,
+    deployments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    deployment_details = fleet.get("DeploymentDetails", {})
+    latest_deployment_id = deployment_details.get("LatestDeploymentId")
+    log_configuration = fleet.get("LogConfiguration", {})
+    group_definition_version = _extract_definition_version(fleet.get("GameServerContainerGroupDefinitionArn"))
+
+    return _compact_dict(
+        {
+            "FleetType": "container",
+            "Status": fleet.get("Status"),
+            "InstanceType": fleet.get("InstanceType"),
+            "BillingType": fleet.get("BillingType"),
+            "GameServerContainerGroupDefinitionName": fleet.get("GameServerContainerGroupDefinitionName"),
+            "GameServerContainerGroupDefinitionVersion": group_definition_version,
+            "GameServerContainerGroupsPerInstance": fleet.get("GameServerContainerGroupsPerInstance"),
+            "MaximumGameServerContainerGroupsPerInstance": fleet.get("MaximumGameServerContainerGroupsPerInstance"),
+            "DeploymentStatus": _deployment_status(deployments or [], latest_deployment_id),
+            "LogDestinationType": log_configuration.get("LogDestination"),
+            "PlayerGatewayMode": fleet.get("PlayerGatewayMode"),
+            "LocationCount": len(fleet.get("LocationAttributes", [])),
+            "ContainerGroupDefinition": _container_group_summary(group_definition),
+        }
+    )
+
+
+def _list_classic_fleet_attributes(client: Any) -> list[dict[str, Any]]:
+    # Page through ALL fleets. list_fleets returns at most one page, so an
+    # account with many fleets would otherwise be silently truncated.
+    fleet_ids: list[str] = []
+    for page in client.get_paginator("list_fleets").paginate():
+        fleet_ids.extend(page.get("FleetIds", []))
+
+    if not fleet_ids:
+        return []
+
+    # describe_fleet_attributes accepts at most 100 fleet IDs per call.
+    attributes: list[dict[str, Any]] = []
+    for i in range(0, len(fleet_ids), 100):
+        chunk = fleet_ids[i : i + 100]
+        resp = client.describe_fleet_attributes(FleetIds=chunk)
+        attributes.extend(resp.get("FleetAttributes", []))
+
+    return attributes
+
+
+def _list_container_fleet_summaries(client: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    warnings: list[dict[str, str]] = []
+    summaries: list[dict[str, Any]] = []
+
+    container_fleets = _paginate_items(client, "list_container_fleets", "ContainerFleets")
+    if not container_fleets:
+        return [], warnings
+
+    group_definitions_by_key: dict[tuple[str | None, int | None], dict[str, Any]] = {}
+    try:
+        for definition in _paginate_items(client, "list_container_group_definitions", "ContainerGroupDefinitions"):
+            group_definitions_by_key[(definition.get("Name"), definition.get("VersionNumber"))] = definition
+            group_definitions_by_key.setdefault((definition.get("Name"), None), definition)
+    except Exception as e:
+        logger.warning(f"Failed to list GameLift container group definitions: {e}")
+        warnings.append({"Source": "container_group_definitions", "Message": str(e)})
+
+    described_group_definitions: dict[tuple[str | None, int | None], dict[str, Any]] = {}
+    for listed_fleet in container_fleets:
+        fleet = listed_fleet
+        fleet_id = listed_fleet.get("FleetId")
+        if fleet_id:
+            try:
+                fleet = client.describe_container_fleet(FleetId=fleet_id).get("ContainerFleet", listed_fleet)
+            except Exception as e:
+                logger.warning(f"Failed to describe GameLift container fleet: {e}")
+                warnings.append({"Source": "container_fleet", "Message": str(e)})
+
+        group_name = fleet.get("GameServerContainerGroupDefinitionName")
+        group_version = _extract_definition_version(fleet.get("GameServerContainerGroupDefinitionArn"))
+        group_key = (group_name, group_version)
+        group_definition = group_definitions_by_key.get(group_key) or group_definitions_by_key.get((group_name, None))
+
+        if group_name and group_key not in described_group_definitions:
+            try:
+                describe_kwargs: dict[str, Any] = {"Name": group_name}
+                if group_version:
+                    describe_kwargs["VersionNumber"] = group_version
+                group_definition = client.describe_container_group_definition(**describe_kwargs).get(
+                    "ContainerGroupDefinition",
+                    group_definition,
+                )
+                described_group_definitions[group_key] = group_definition
+            except Exception as e:
+                logger.warning(f"Failed to describe GameLift container group definition: {e}")
+                warnings.append({"Source": "container_group_definition", "Message": str(e)})
+        elif group_key in described_group_definitions:
+            group_definition = described_group_definitions[group_key]
+
+        deployments: list[dict[str, Any]] = []
+        if fleet_id:
+            try:
+                deployments = _paginate_items(client, "list_fleet_deployments", "FleetDeployments", FleetId=fleet_id)
+            except Exception as e:
+                logger.warning(f"Failed to list GameLift fleet deployments: {e}")
+                warnings.append({"Source": "fleet_deployments", "Message": str(e)})
+
+        summaries.append(_summarize_container_fleet(fleet, group_definition, deployments))
+
+    return summaries, warnings
+
+
 @tool
 def list_gamelift_fleets() -> dict:  # type: ignore
-    """List all GameLift fleets with their attributes."""
+    """List classic and container GameLift fleets with their attributes."""
+    classic_fleets: list[dict[str, Any]] = []
+    container_fleets: list[dict[str, Any]] = []
+    warnings: list[dict[str, str]] = []
+
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+    except Exception as e:
+        logger.error(f"Failed to create GameLift client: {e}")
+        return _empty_fleet_response(str(e))
 
-        # Page through ALL fleets — list_fleets returns at most one page, so an
-        # account with many fleets would otherwise be silently truncated.
-        fleet_ids: list[str] = []
-        for page in client.get_paginator("list_fleets").paginate():
-            fleet_ids.extend(page.get("FleetIds", []))
-
-        if not fleet_ids:
-            return {"FleetAttributes": []}
-
-        # describe_fleet_attributes accepts at most 100 fleet IDs per call.
-        attributes: list = []
-        for i in range(0, len(fleet_ids), 100):
-            chunk = fleet_ids[i : i + 100]
-            resp = client.describe_fleet_attributes(FleetIds=chunk)
-            attributes.extend(resp.get("FleetAttributes", []))
-
-        return {"FleetAttributes": attributes}
+    try:
+        classic_fleets = _list_classic_fleet_attributes(client)
     except Exception as e:
         logger.error(f"Failed to list GameLift fleets: {e}")
-        return {"error": str(e), "FleetAttributes": []}
+        warnings.append({"Source": "classic_fleets", "Message": str(e)})
+
+    try:
+        container_fleets, container_warnings = _list_container_fleet_summaries(client)
+        warnings.extend(container_warnings)
+    except Exception as e:
+        logger.error(f"Failed to list GameLift container fleets: {e}")
+        warnings.append({"Source": "container_fleets", "Message": str(e)})
+
+    response: dict[str, Any] = {
+        "FleetAttributes": classic_fleets,
+        "ClassicFleets": classic_fleets,
+        "ContainerFleets": container_fleets,
+        "FleetCounts": {
+            "Classic": len(classic_fleets),
+            "Container": len(container_fleets),
+            "Total": len(classic_fleets) + len(container_fleets),
+        },
+        "Warnings": warnings,
+    }
+    if warnings and not classic_fleets and not container_fleets:
+        response["error"] = "; ".join(warning["Message"] for warning in warnings)
+
+    return response
 
 
 @tool
