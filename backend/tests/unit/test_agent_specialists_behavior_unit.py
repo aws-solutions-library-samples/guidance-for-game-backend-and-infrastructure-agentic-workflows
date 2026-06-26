@@ -229,7 +229,7 @@ class TestGameLiftSpecialistBehavior:
             assert "LogGroupArn" not in result["ContainerFleets"][0]
 
     def test_list_fleets_mixed_classic_and_container(self):
-        """Classic and container fleets are both returned in distinct collections."""
+        """Container IDs returned by list_fleets are not described as classic fleets."""
         # Local modules
         from agents.gamelift_specialist import list_gamelift_fleets
 
@@ -238,7 +238,7 @@ class TestGameLiftSpecialistBehavior:
 
             def get_paginator(operation):
                 if operation == "list_fleets":
-                    return self._paginator([{"FleetIds": ["classic-fleet"]}])
+                    return self._paginator([{"FleetIds": ["classic-fleet", "container-fleet"]}])
                 if operation == "list_container_fleets":
                     return self._paginator([{"ContainerFleets": [{"FleetId": "container-fleet"}]}])
                 if operation == "list_container_group_definitions":
@@ -248,9 +248,12 @@ class TestGameLiftSpecialistBehavior:
                 raise AssertionError(f"Unexpected paginator: {operation}")
 
             mock_gamelift.get_paginator.side_effect = get_paginator
-            mock_gamelift.describe_fleet_attributes.return_value = {
-                "FleetAttributes": [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
-            }
+
+            def describe_fleet_attributes(FleetIds):
+                assert FleetIds == ["classic-fleet"]
+                return {"FleetAttributes": [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]}
+
+            mock_gamelift.describe_fleet_attributes.side_effect = describe_fleet_attributes
             mock_gamelift.describe_container_fleet.return_value = {
                 "ContainerFleet": {
                     "FleetId": "container-fleet",
@@ -276,6 +279,7 @@ class TestGameLiftSpecialistBehavior:
             assert result["ContainerFleets"][0]["FleetType"] == "container"
             assert result["ContainerFleets"][0]["GameServerContainerGroupDefinitionVersion"] == 3
             assert result["FleetCounts"] == {"Classic": 1, "Container": 1, "Total": 2}
+            mock_gamelift.describe_fleet_attributes.assert_called_once()
 
     def test_list_fleets_container_api_failure_preserves_classic_results(self):
         """Classic fleet results still return when container APIs fail."""

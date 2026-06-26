@@ -125,33 +125,57 @@ def _summarize_container_fleet(
     )
 
 
-def _list_classic_fleet_attributes(client: Any) -> list[dict[str, Any]]:
+def _list_classic_fleet_attributes(
+    client: Any, excluded_fleet_ids: set[str] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     # Page through ALL fleets. list_fleets returns at most one page, so an
     # account with many fleets would otherwise be silently truncated.
+    warnings: list[dict[str, str]] = []
     fleet_ids: list[str] = []
     for page in client.get_paginator("list_fleets").paginate():
         fleet_ids.extend(page.get("FleetIds", []))
 
+    if excluded_fleet_ids:
+        fleet_ids = [fleet_id for fleet_id in fleet_ids if fleet_id not in excluded_fleet_ids]
+
     if not fleet_ids:
-        return []
+        return [], warnings
 
     # describe_fleet_attributes accepts at most 100 fleet IDs per call.
     attributes: list[dict[str, Any]] = []
     for i in range(0, len(fleet_ids), 100):
         chunk = fleet_ids[i : i + 100]
-        resp = client.describe_fleet_attributes(FleetIds=chunk)
-        attributes.extend(resp.get("FleetAttributes", []))
+        try:
+            resp = client.describe_fleet_attributes(FleetIds=chunk)
+            attributes.extend(resp.get("FleetAttributes", []))
+        except Exception as e:
+            logger.warning(f"Failed to describe GameLift classic fleet chunk: {e}")
+            warnings.append(
+                {
+                    "Source": "classic_fleets",
+                    "Message": "Some fleet IDs returned by ListFleets were not valid classic fleets and were skipped.",
+                }
+            )
+            for fleet_id in chunk:
+                try:
+                    resp = client.describe_fleet_attributes(FleetIds=[fleet_id])
+                    attributes.extend(resp.get("FleetAttributes", []))
+                except Exception as single_error:
+                    logger.warning(f"Skipping non-classic GameLift fleet candidate: {single_error}")
 
-    return attributes
+    return attributes, warnings
 
 
-def _list_container_fleet_summaries(client: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def _list_container_fleet_summaries(
+    client: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], set[str]]:
     warnings: list[dict[str, str]] = []
     summaries: list[dict[str, Any]] = []
 
     container_fleets = _paginate_items(client, "list_container_fleets", "ContainerFleets")
+    container_fleet_ids = {fleet["FleetId"] for fleet in container_fleets if isinstance(fleet.get("FleetId"), str)}
     if not container_fleets:
-        return [], warnings
+        return [], warnings, container_fleet_ids
 
     group_definitions_by_key: dict[tuple[str | None, int | None], dict[str, Any]] = {}
     try:
@@ -204,7 +228,7 @@ def _list_container_fleet_summaries(client: Any) -> tuple[list[dict[str, Any]], 
 
         summaries.append(_summarize_container_fleet(fleet, group_definition, deployments))
 
-    return summaries, warnings
+    return summaries, warnings, container_fleet_ids
 
 
 @tool
@@ -212,6 +236,7 @@ def list_gamelift_fleets() -> dict:  # type: ignore
     """List classic and container GameLift fleets with their attributes."""
     classic_fleets: list[dict[str, Any]] = []
     container_fleets: list[dict[str, Any]] = []
+    container_fleet_ids: set[str] = set()
     warnings: list[dict[str, str]] = []
 
     try:
@@ -221,17 +246,20 @@ def list_gamelift_fleets() -> dict:  # type: ignore
         return _empty_fleet_response(str(e))
 
     try:
-        classic_fleets = _list_classic_fleet_attributes(client)
-    except Exception as e:
-        logger.error(f"Failed to list GameLift fleets: {e}")
-        warnings.append({"Source": "classic_fleets", "Message": str(e)})
-
-    try:
-        container_fleets, container_warnings = _list_container_fleet_summaries(client)
+        container_fleets, container_warnings, container_fleet_ids = _list_container_fleet_summaries(client)
         warnings.extend(container_warnings)
     except Exception as e:
         logger.error(f"Failed to list GameLift container fleets: {e}")
         warnings.append({"Source": "container_fleets", "Message": str(e)})
+
+    try:
+        classic_fleets, classic_warnings = _list_classic_fleet_attributes(
+            client, excluded_fleet_ids=container_fleet_ids
+        )
+        warnings.extend(classic_warnings)
+    except Exception as e:
+        logger.error(f"Failed to list GameLift fleets: {e}")
+        warnings.append({"Source": "classic_fleets", "Message": str(e)})
 
     response: dict[str, Any] = {
         "FleetAttributes": classic_fleets,
