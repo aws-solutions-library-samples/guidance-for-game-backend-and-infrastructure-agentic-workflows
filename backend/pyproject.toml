@@ -28,7 +28,7 @@ dependencies = [
     "PyJWT[crypto]>=2.13.0",
 
     # AgentCore SDK with Strands integration
-    "bedrock-agentcore[strands-agents]>=1.15.0",
+    "bedrock-agentcore[strands-agents]>=1.16.0",
 
     # HTTP client with AWS SigV4 signing
     "httpx>=0.28.1",
