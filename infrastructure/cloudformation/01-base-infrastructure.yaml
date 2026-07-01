@@ -275,8 +275,11 @@ Resources:
               - Sid: GameLiftReadAccess
                 Effect: Allow
                 Action:
+                  - gamelift:DescribeContainerFleet
+                  - gamelift:DescribeContainerGroupDefinition
                   - gamelift:DescribeFleetAttributes
                   - gamelift:DescribeFleetCapacity
+                  - gamelift:DescribeFleetDeployment
                   - gamelift:DescribeFleetEvents
                   - gamelift:DescribeFleetPortSettings
                   - gamelift:DescribeFleetUtilization
@@ -285,6 +288,9 @@ Resources:
                   - gamelift:DescribePlayerSessions
                   - gamelift:DescribeRuntimeConfiguration
                   - gamelift:DescribeScalingPolicies
+                  - gamelift:ListContainerFleets
+                  - gamelift:ListContainerGroupDefinitions
+                  - gamelift:ListFleetDeployments
                   - gamelift:ListFleets
                   - gamelift:ListAliases
                   - gamelift:ListBuilds
@@ -476,9 +482,15 @@ Resources:
               - Sid: GameLiftReadAccess
                 Effect: Allow
                 Action:
+                  - gamelift:DescribeContainerFleet
+                  - gamelift:DescribeContainerGroupDefinition
                   - gamelift:ListFleets
                   - gamelift:DescribeFleetAttributes
+                  - gamelift:DescribeFleetDeployment
                   - gamelift:DescribeFleetUtilization
+                  - gamelift:ListContainerFleets
+                  - gamelift:ListContainerGroupDefinitions
+                  - gamelift:ListFleetDeployments
                 Resource: '*'
                 Condition:
                   StringEquals:
