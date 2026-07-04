@@ -54,29 +54,39 @@ npm run dev                          # Dev server on port 3000
 uv run --directory backend pre-commit run --all-files  # Same, manual
 ```
 
+## Governance Invariants
+
+- Required branch-protection checks must report on every PR type, including docs-only and lockfile-only dependency PRs. Do not require checks that can be absent, skipped, or neutral for valid PRs.
+- Prefer stable aggregate required contexts such as `codeql-required` or `policy-required` over raw matrix job names or default-tool contexts whose names/presence can drift.
+- Path-sensitive gates must use an always-reporting policy job that decides internally whether cloud tests, AI evals, stress tests, rollback notes, or docs updates are required.
+- Keep any maintainer bypass scoped to status-check recovery. PR review, CODEOWNERS review, conversation resolution, direct-push, deletion, and force-push protections should live in a separate baseline ruleset with no routine bypass.
+- Test branch-protection changes with a dependency-only PR before declaring governance complete.
+
 ## Architecture
 
 ### Agent Hierarchy
-- **Orchestrator** (`agents/orchestrator.py`) — Routes queries to specialists, uses Claude Haiku 4.5 for fast classification; optionally uses `AgentCoreMemorySessionManager` for session + long-term memory (controlled by `GBAW_USE_BEDROCK_SESSIONS`)
-- **Specialist agents** (`agents/{gamelift,eks,cost}_specialist.py`) — Domain experts using Claude Sonnet 4.5, created via `base_specialist.py` factory (`create_specialist_agent()`). Each agent's `model_id`/temperature is pinned per-agent in `settings.INFERENCE_CONFIG`; without explicit pinning every agent silently inherited the orchestrator's Haiku model
-- **MCP servers** — Each specialist declares its servers via `mcp_server_names`: EKS uses `aws-api-mcp-server` (account-wide resource discovery via `call_aws`) + `eks-mcp-server` (in-cluster ops); Cost uses `billing-cost-management-mcp-server`; GameLift uses boto3 directly (no MCP). Servers run as embedded stdio subprocesses; a module-level thread-safe cache in `utils/mcp_client_factory.py` reuses clients across calls, with automatic fallback to boto3 if MCP is unavailable
+- **Orchestrator** (`backend/src/agents/orchestrator.py`) — Routes queries to specialists, uses Claude Haiku 4.5 for fast classification; optionally uses `AgentCoreMemorySessionManager` for session + long-term memory (controlled by `GBAW_USE_BEDROCK_SESSIONS`)
+- **Specialist agents** (`backend/src/agents/{gamelift,eks,cost}_specialist.py`) — Domain experts using Claude Sonnet 4.5, created via `backend/src/agents/base_specialist.py` factory (`create_specialist_agent()`). Each agent's `model_id`/temperature is pinned per-agent in `settings.INFERENCE_CONFIG`; without explicit pinning every agent silently inherited the orchestrator's Haiku model
+- **MCP servers** — Each specialist declares its servers via `mcp_server_names`: EKS uses `aws-api-mcp-server` (account-wide resource discovery via `call_aws`) + `eks-mcp-server` (in-cluster ops); Cost uses `billing-cost-management-mcp-server`; GameLift uses boto3 directly (no MCP). Servers run as embedded stdio subprocesses; a module-level thread-safe cache in `backend/src/utils/mcp_client_factory.py` reuses clients across calls, with automatic fallback to boto3 if MCP is unavailable
 
 ### Startup Pre-warming
-`agentcore_main.py` initializes Bedrock model singleton, all 3 MCP clients, and KB tools at module load time (not per-request). This cuts first-request latency by 2–4s. Failures are logged as debug and don't block startup.
+`backend/src/agentcore_main.py` initializes Bedrock model singleton, all 3 MCP clients, and KB tools at module load time (not per-request). `backend/agentcore_main.py` is the deployment wrapper that delegates to the `src` implementation. This cuts first-request latency by 2–4s. Failures are logged as debug and don't block startup.
 
 ### Key Backend Modules
-- `config/settings.py` — All configuration via env vars (prefixed `GBAW_`), loads from `ui/.env.local` locally; global boto3 config sets adaptive retry mode (max 3 attempts)
-- `models/cached_bedrock.py` — Bedrock model initialization with caching
-- `utils/security.py` — Input validation, rate limiting, sanitization
-- `utils/kb_tools.py` — Bedrock Knowledge Base retrieval tools (GameLift, EKS, Cost KBs)
-- `utils/wall_clock_timeout_hook.py` — Strands hook enforcing `GBAW_AGENT_TIMEOUT_REQUEST_SECONDS`
-- `utils/max_turns_hook.py` — Strands hook enforcing `GBAW_AGENT_MAX_TURNS_*` limits
-- `agents/optimized_prompts.py` — Prompt caching setup; edit here to tune agent system prompts
-- `agentcore_main.py` — Runtime entrypoint, uses `BedrockAgentCoreApp`
+- `backend/src/config/settings.py` — All configuration via env vars (prefixed `GBAW_`), loads from `ui/.env.local` locally; global boto3 config sets adaptive retry mode (max 3 attempts)
+- `backend/src/models/cached_bedrock.py` — Bedrock model initialization with caching
+- `backend/src/utils/security.py` — Input validation, rate limiting, sanitization
+- `backend/src/utils/mcp_wrapper.py` — Wraps AWS Labs MCP servers to redirect their non-JSON startup stdout to stderr; without this the diagnostic banners corrupt the stdio JSON-RPC channel
+- `backend/src/utils/semantic_memory.py` — Long-term (semantic) memory save/retrieve against AgentCore Memory
+- `backend/src/utils/kb_tools.py` — Bedrock Knowledge Base retrieval tools (GameLift, EKS, Cost KBs)
+- `backend/src/utils/wall_clock_timeout_hook.py` — Strands hook enforcing `GBAW_AGENT_TIMEOUT_REQUEST_SECONDS`
+- `backend/src/utils/max_turns_hook.py` — Strands hook enforcing `GBAW_AGENT_MAX_TURNS_*` limits
+- `backend/src/agents/optimized_prompts.py` — Prompt caching setup; edit here to tune agent system prompts
+- `backend/src/agentcore_main.py` — Runtime entrypoint, uses `BedrockAgentCoreApp`
 
 ### Frontend
 - Next.js with CopilotKit for chat UI
-- API routes in `pages/api/` proxy to backend
+- API routes in `ui/src/pages/api/` proxy to backend
 - Auth via Amazon Cognito (skippable in dev with `NEXT_PUBLIC_SKIP_AUTH=true`)
 
 ### Infrastructure
@@ -91,11 +101,11 @@ uv run --directory backend pre-commit run --all-files  # Same, manual
 8. **frontend** — ECS Express (managed Fargate + ALB)
 9. **security** — WAF on ALB, CloudTrail (KMS-encrypted logs), Inspector ECR scanning
 
-**Managed prompts are the source of truth in prod**: editing `optimized_prompts.py` alone is a no-op until re-seeded, but `./deploy-all.sh` re-seeds automatically (step 4). Knowledge Base IDs are wired to the runtime via env vars after stack creation; run `scripts/infrastructure/seed-kb-{gamelift,eks,cost}.sh` after KB stack creation to populate them — querying an unseeded KB returns empty results without errors.
+**Managed prompts are the source of truth in prod**: editing `backend/src/agents/optimized_prompts.py` alone is a no-op until re-seeded, but `./deploy-all.sh` re-seeds automatically (step 4). Knowledge Base IDs are wired to the runtime via env vars after stack creation; run `scripts/infrastructure/seed-kb-{gamelift,eks,cost}.sh` after KB stack creation to populate them — querying an unseeded KB returns empty results without errors.
 
 **EKS enrollment** is optional: `infrastructure/kubernetes/enroll-cluster.sh` configures read-only RBAC (pods, deployments, services; secrets excluded) and updates aws-auth ConfigMap.
 
-**Container note**: `aws-api-mcp-server` (the EKS specialist's resource-discovery server, replacing the yanked `ccapi-mcp-server`) writes a log under `$HOME` and needs a writable working dir — both read-only in the container. `utils/mcp_client_factory.create_mcp_client` redirects `HOME` and `AWS_API_MCP_WORKING_DIR` to `/tmp` (and sets `READ_OPERATIONS_ONLY=true`) via the server's environment — no Dockerfile patch needed.
+**Container note**: `aws-api-mcp-server` (the EKS specialist's resource-discovery server, replacing the yanked `ccapi-mcp-server`) writes a log under `$HOME` and needs a writable working dir — both read-only in the container. `backend/src/utils/mcp_client_factory.create_mcp_client` redirects `HOME` and `AWS_API_MCP_WORKING_DIR` to `/tmp` (and sets `READ_OPERATIONS_ONLY=true`) via the server's environment — no Dockerfile patch needed.
 
 ## Code Style
 
