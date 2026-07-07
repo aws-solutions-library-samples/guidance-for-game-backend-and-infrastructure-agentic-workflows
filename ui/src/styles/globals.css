@@ -40,6 +40,7 @@
   --ga-assistant-border: rgba(139, 69, 255, 0.3);
   --ga-user-message-bg: linear-gradient(135deg, rgba(0, 188, 212, 0.15) 0%, rgba(57, 255, 20, 0.15) 100%);
   --ga-user-message-border: rgba(0, 188, 212, 0.3);
+  --ga-user-message-text: #ffffff;
   --ga-input-container-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.05) 0%, rgba(61, 90, 254, 0.05) 100%);
   --ga-segment-bg: rgba(0, 0, 0, 0.26);
   --ga-control-hover-bg: rgba(139, 69, 255, 0.14);
@@ -91,6 +92,7 @@
   --ga-assistant-border: rgba(99, 102, 241, 0.24);
   --ga-user-message-bg: linear-gradient(135deg, rgba(0, 188, 212, 0.12) 0%, rgba(31, 150, 118, 0.1) 100%);
   --ga-user-message-border: rgba(0, 143, 170, 0.24);
+  --ga-user-message-text: #132033;
   --ga-input-container-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.045) 0%, rgba(0, 188, 212, 0.045) 100%);
   --ga-segment-bg: rgba(255, 255, 255, 0.78);
   --ga-control-hover-bg: rgba(99, 102, 241, 0.1);

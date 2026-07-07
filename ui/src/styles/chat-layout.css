@@ -85,12 +85,27 @@
   margin: 0 0 24px 0 !important;
   background: var(--ga-user-message-bg) !important;
   border: 1px solid var(--ga-user-message-border) !important;
+  color: var(--ga-user-message-text) !important;
   border-radius: 18px 18px 4px 18px !important;
   padding: 16px 20px !important;
   max-width: 80% !important;
   margin-left: auto !important;
   backdrop-filter: blur(10px) !important;
   box-shadow: 0 8px 32px rgba(0, 188, 212, 0.1) !important;
+}
+
+.copilotKitUserMessage,
+.copilotKitUserMessage .copilotKitMarkdown,
+.copilotKitUserMessage .copilotKitMarkdown p,
+.copilotKitUserMessage .copilotKitMarkdown h1,
+.copilotKitUserMessage .copilotKitMarkdown h2,
+.copilotKitUserMessage .copilotKitMarkdown h3,
+.copilotKitUserMessage .copilotKitMarkdown h4,
+.copilotKitUserMessage .copilotKitMarkdown h5,
+.copilotKitUserMessage .copilotKitMarkdown h6,
+.copilotKitUserMessage .copilotKitMarkdown li,
+.copilotKitUserMessage .copilotKitMarkdown span {
+  color: var(--ga-user-message-text) !important;
 }
 
 /* Let CopilotKit handle user message markdown naturally */
