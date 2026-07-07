@@ -4,7 +4,7 @@ import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/clie
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
-import { parse } from 'cookie';
+import { parse } from '@/utils/cookieCompat';
 
 // Server-side proxy fetch timeouts. Plain fetch() has no default timeout, so a
 // hung backend would tie up the Node serverless function until the platform
