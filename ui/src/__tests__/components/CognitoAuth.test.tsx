@@ -6,6 +6,7 @@ import React from 'react';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import CognitoAuth from '../../components/CognitoAuth';
+import { ThemeProvider } from '../../components/ThemeProvider';
 
 // Mock amazon-cognito-identity-js
 const mockAuthenticateUser = jest.fn();
@@ -33,6 +34,16 @@ describe('CognitoAuth - handleSignIn error handling', () => {
     getRefreshToken: mockGetRefreshToken,
   };
 
+  const renderAuth = () => render(
+    <ThemeProvider>
+      <CognitoAuth
+        userPoolId="test-pool"
+        clientId="test-client"
+        onAuthenticated={mockOnAuthenticated}
+      />
+    </ThemeProvider>,
+  );
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetAccessToken.mockReturnValue({ getJwtToken: () => 'access-token' });
@@ -47,13 +58,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
       callbacks.onSuccess(mockSession);
     });
 
-    render(
-      <CognitoAuth
-        userPoolId="test-pool"
-        clientId="test-client"
-        onAuthenticated={mockOnAuthenticated}
-      />
-    );
+    renderAuth();
 
     const emailInput = screen.getByPlaceholderText('your@email.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
@@ -79,13 +84,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
       callbacks.onSuccess(mockSession);
     });
 
-    render(
-      <CognitoAuth
-        userPoolId="test-pool"
-        clientId="test-client"
-        onAuthenticated={mockOnAuthenticated}
-      />
-    );
+    renderAuth();
 
     const emailInput = screen.getByPlaceholderText('your@email.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
@@ -116,13 +115,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
       callbacks.onSuccess(circularSession);
     });
 
-    render(
-      <CognitoAuth
-        userPoolId="test-pool"
-        clientId="test-client"
-        onAuthenticated={mockOnAuthenticated}
-      />
-    );
+    renderAuth();
 
     const emailInput = screen.getByPlaceholderText('your@email.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
@@ -148,13 +141,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
       callbacks.onSuccess(mockSession);
     });
 
-    render(
-      <CognitoAuth
-        userPoolId="test-pool"
-        clientId="test-client"
-        onAuthenticated={mockOnAuthenticated}
-      />
-    );
+    renderAuth();
 
     const emailInput = screen.getByPlaceholderText('your@email.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');

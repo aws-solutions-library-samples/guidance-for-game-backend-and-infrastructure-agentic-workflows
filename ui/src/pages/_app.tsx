@@ -6,6 +6,7 @@ import { useEffect, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
 import type { CognitoUser } from 'amazon-cognito-identity-js';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
+import { ThemeProvider } from '../components/ThemeProvider';
 
 interface Config {
   cognito: {
@@ -51,12 +52,12 @@ function MyApp({ Component, pageProps }: AppProps) {
         justifyContent: 'center',
         alignItems: 'center',
         height: '100vh',
-        background: 'linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%)',
+        background: 'var(--ga-bg-gradient)',
         fontFamily: 'Inter, system-ui'
       }}>
         <div style={{ textAlign: 'center' }}>
           <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🛡️</div>
-          <div style={{ color: 'white' }}>Loading Game Agent...</div>
+          <div style={{ color: 'var(--ga-text)' }}>Loading Game Agent...</div>
         </div>
       </div>
     );
@@ -78,12 +79,12 @@ function MyApp({ Component, pageProps }: AppProps) {
   // otherwise had a blank tab title). Authenticated pages may override via
   // their own <Head>.
   return (
-    <>
+    <ThemeProvider>
       <Head>
         <title>Game Agent - AI-Powered Game Server Management</title>
       </Head>
       {content}
-    </>
+    </ThemeProvider>
   );
 }
 
