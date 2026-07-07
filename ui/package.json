@@ -116,7 +116,7 @@
       ]
     },
     "transformIgnorePatterns": [
-      "/node_modules/(?!(@copilotkit)/)"
+      "/node_modules/(?!(@copilotkit|cookie)/)"
     ]
   }
 }

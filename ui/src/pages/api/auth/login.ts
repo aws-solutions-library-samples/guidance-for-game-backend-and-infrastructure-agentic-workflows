@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { serialize } from 'cookie';
+import { serialize } from '@/utils/cookieCompat';
 import { isSameOrigin } from '@/utils/csrf';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
