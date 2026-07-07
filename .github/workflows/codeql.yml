@@ -1,0 +1,77 @@
+name: CodeQL Advanced
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly scan on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
+
+# Least-privilege permissions aligned with test.yml.
+# CodeQL needs security-events: write to upload SARIF results.
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: codeql-analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Analyze all three languages used in this project.
+        # - actions: GitHub Actions workflow security
+        # - javascript-typescript: Frontend (ui/)
+        # - python: Backend (backend/)
+        language: [actions, javascript-typescript, python]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # Aggregate job that provides a single stable check name for branch protection.
+  # This job ALWAYS creates a check run (if: always()), making it deterministic
+  # for required status checks regardless of PR type (lockfile-only, docs-only, etc.).
+  # It passes only when analysis succeeds or is explicitly skipped.
+  codeql-required:
+    name: codeql-required
+    runs-on: ubuntu-latest
+    needs: [analyze]
+    if: always()
+
+    steps:
+      - name: Check CodeQL analysis result
+        run: |
+          echo "CodeQL analysis job result: ${{ needs.analyze.result }}"
+
+          case "${{ needs.analyze.result }}" in
+            success|skipped)
+              echo "CodeQL analysis completed successfully or was skipped for this PR."
+              ;;
+            failure)
+              echo "::error::CodeQL analysis failed. Please review the analysis job logs."
+              exit 1
+              ;;
+            cancelled)
+              echo "::error::CodeQL analysis was cancelled before completion."
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected CodeQL analysis result: ${{ needs.analyze.result }}"
+              exit 1
+              ;;
+          esac

@@ -77,7 +77,7 @@
   "overrides": {
     "prismjs": "^1.30.0",
     "postcss": "^8.5.10",
-    "js-yaml": "^4.2.0",
+    "js-yaml": "^4.3.0",
     "uuid": "^11.1.1"
   },
   "jest": {
