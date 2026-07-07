@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { CognitoIdentityProviderClient, ListUsersCommand, AdminListGroupsForUserCommand } from '@aws-sdk/client-cognito-identity-provider';
-import { parse } from 'cookie';
+import { parse } from '@/utils/cookieCompat';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { logError } from '@/utils/logger';
 
