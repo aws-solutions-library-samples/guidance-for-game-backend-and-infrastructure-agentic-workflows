@@ -60,7 +60,7 @@ export default function AdminUsers() {
         </Head>
         <div className="ga-layout">
           <Navigation pageTitle="User Management" showBackButton={true} />
-          <div style={{ padding: '40px', color: 'white', textAlign: 'center' }}>
+          <div style={{ padding: '40px', color: 'var(--ga-text)', textAlign: 'center' }}>
             <div style={{ fontSize: '18px' }}>Loading users...</div>
           </div>
         </div>
@@ -135,8 +135,8 @@ export default function AdminUsers() {
       <style jsx>{`
         .ga-layout {
           min-height: 100vh;
-          background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
-          color: white;
+          background: var(--ga-bg-gradient);
+          color: var(--ga-text);
         }
 
         .ga-admin-main {
@@ -157,7 +157,7 @@ export default function AdminUsers() {
           margin: 0 0 8px 0;
           font-size: 2rem;
           font-weight: 700;
-          background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 50%, #00bcd4 100%);
+          background: var(--ga-brand-gradient);
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
           background-clip: text;
@@ -165,13 +165,13 @@ export default function AdminUsers() {
 
         .ga-admin-header p {
           margin: 0;
-          color: rgba(255, 255, 255, 0.7);
+          color: var(--ga-text-muted);
           font-size: 1rem;
         }
 
         .ga-users-table-container {
-          background: rgba(26, 26, 46, 0.6);
-          border: 1px solid rgba(139, 69, 255, 0.3);
+          background: var(--ga-surface);
+          border: 1px solid var(--ga-accent-border);
           border-radius: 12px;
           padding: 24px;
           backdrop-filter: blur(10px);
@@ -186,14 +186,14 @@ export default function AdminUsers() {
           padding: 16px 12px;
           text-align: left;
           font-weight: 600;
-          color: rgba(255, 255, 255, 0.9);
-          border-bottom: 2px solid rgba(139, 69, 255, 0.4);
+          color: var(--ga-text);
+          border-bottom: 2px solid var(--ga-accent-border-strong);
           font-size: 14px;
         }
 
         .ga-users-table td {
           padding: 16px 12px;
-          border-bottom: 1px solid rgba(139, 69, 255, 0.2);
+          border-bottom: 1px solid var(--ga-accent-border);
           font-size: 14px;
         }
 
@@ -206,15 +206,15 @@ export default function AdminUsers() {
         }
 
         .ga-status-badge.confirmed {
-          background: rgba(0, 255, 136, 0.2);
-          color: #00ff88;
-          border: 1px solid rgba(0, 255, 136, 0.3);
+          background: var(--ga-success-bg);
+          color: var(--ga-success);
+          border: 1px solid var(--ga-success-border);
         }
 
         .ga-status-badge.unconfirmed {
-          background: rgba(255, 165, 0, 0.2);
-          color: #ffa500;
-          border: 1px solid rgba(255, 165, 0, 0.3);
+          background: var(--ga-warning-bg);
+          color: var(--ga-warning);
+          border: 1px solid var(--ga-warning-border);
         }
 
         .ga-action-buttons {
@@ -224,10 +224,10 @@ export default function AdminUsers() {
 
         .ga-approve-button {
           padding: 6px 12px;
-          background: rgba(0, 255, 136, 0.2);
-          border: 1px solid rgba(0, 255, 136, 0.3);
+          background: var(--ga-success-bg);
+          border: 1px solid var(--ga-success-border);
           border-radius: 6px;
-          color: #00ff88;
+          color: var(--ga-success);
           font-size: 12px;
           font-weight: 500;
           cursor: pointer;
@@ -235,16 +235,16 @@ export default function AdminUsers() {
         }
 
         .ga-approve-button:hover {
-          background: rgba(0, 255, 136, 0.3);
-          border-color: rgba(0, 255, 136, 0.5);
+          background: var(--ga-success-bg);
+          border-color: var(--ga-success-border);
         }
 
         .ga-deny-button {
           padding: 6px 12px;
-          background: rgba(255, 69, 69, 0.2);
-          border: 1px solid rgba(255, 69, 69, 0.3);
+          background: var(--ga-danger-bg);
+          border: 1px solid var(--ga-danger-border);
           border-radius: 6px;
-          color: #ff6b6b;
+          color: var(--ga-danger);
           font-size: 12px;
           font-weight: 500;
           cursor: pointer;
@@ -252,8 +252,8 @@ export default function AdminUsers() {
         }
 
         .ga-deny-button:hover {
-          background: rgba(255, 69, 69, 0.3);
-          border-color: rgba(255, 69, 69, 0.5);
+          background: var(--ga-danger-bg);
+          border-color: var(--ga-danger-border);
         }
       `}</style>
     </>

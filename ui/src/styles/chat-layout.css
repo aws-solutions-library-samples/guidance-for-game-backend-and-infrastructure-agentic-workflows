@@ -58,8 +58,8 @@
 
 /* Assistant message bubbles - style the message container, not the markdown */
 .copilotKitAssistantMessage {
-  background: linear-gradient(135deg, rgba(139, 69, 255, 0.15) 0%, rgba(61, 90, 254, 0.15) 100%) !important;
-  border: 1px solid rgba(139, 69, 255, 0.3) !important;
+  background: var(--ga-assistant-bg) !important;
+  border: 1px solid var(--ga-assistant-border) !important;
   border-radius: 18px 18px 18px 4px !important;
   padding: 16px 20px !important;
   margin: 0 0 24px 0 !important;
@@ -83,14 +83,29 @@
   display: flex !important;
   justify-content: flex-end !important;
   margin: 0 0 24px 0 !important;
-  background: linear-gradient(135deg, rgba(0, 188, 212, 0.15) 0%, rgba(57, 255, 20, 0.15) 100%) !important;
-  border: 1px solid rgba(0, 188, 212, 0.3) !important;
+  background: var(--ga-user-message-bg) !important;
+  border: 1px solid var(--ga-user-message-border) !important;
+  color: var(--ga-user-message-text) !important;
   border-radius: 18px 18px 4px 18px !important;
   padding: 16px 20px !important;
   max-width: 80% !important;
   margin-left: auto !important;
   backdrop-filter: blur(10px) !important;
   box-shadow: 0 8px 32px rgba(0, 188, 212, 0.1) !important;
+}
+
+.copilotKitUserMessage,
+.copilotKitUserMessage .copilotKitMarkdown,
+.copilotKitUserMessage .copilotKitMarkdown p,
+.copilotKitUserMessage .copilotKitMarkdown h1,
+.copilotKitUserMessage .copilotKitMarkdown h2,
+.copilotKitUserMessage .copilotKitMarkdown h3,
+.copilotKitUserMessage .copilotKitMarkdown h4,
+.copilotKitUserMessage .copilotKitMarkdown h5,
+.copilotKitUserMessage .copilotKitMarkdown h6,
+.copilotKitUserMessage .copilotKitMarkdown li,
+.copilotKitUserMessage .copilotKitMarkdown span {
+  color: var(--ga-user-message-text) !important;
 }
 
 /* Let CopilotKit handle user message markdown naturally */
@@ -106,7 +121,7 @@
 
 /* Simplified message text styling - let CopilotKit handle formatting */
 .copilotKitMarkdown {
-  color: #ffffff !important;
+  color: var(--ga-text) !important;
   /* Remove problematic overrides - let CopilotKit handle spacing and formatting */
 }
 
@@ -120,16 +135,16 @@
 .copilotKitMarkdown h6,
 .copilotKitMarkdown li,
 .copilotKitMarkdown span {
-  color: #ffffff !important;
+  color: var(--ga-text) !important;
 }
 
 .copilotKitMarkdown strong {
-  color: #8b45ff !important;
+  color: var(--ga-accent) !important;
 }
 
 .copilotKitMarkdown code {
-  background: rgba(0, 0, 0, 0.3) !important;
-  color: #00bcd4 !important;
+  background: var(--ga-code-bg) !important;
+  color: var(--ga-cyan) !important;
   padding: 2px 6px !important;
   border-radius: 4px !important;
 }
@@ -145,9 +160,9 @@
 }
 
 .copilotKitMessageControlButton {
-  background: rgba(0, 0, 0, 0.7) !important;
-  border: 1px solid rgba(255, 255, 255, 0.2) !important;
-  color: rgba(255, 255, 255, 0.7) !important;
+  background: var(--ga-surface-strong) !important;
+  border: 1px solid var(--ga-border-strong) !important;
+  color: var(--ga-text-muted) !important;
   padding: 6px !important;
   border-radius: 8px !important;
   cursor: pointer !important;
@@ -163,7 +178,7 @@
 .copilotKitMessageControlButton:hover {
   background: rgba(139, 69, 255, 0.8) !important;
   color: #ffffff !important;
-  border-color: #8b45ff !important;
+  border-color: var(--ga-accent) !important;
   transform: translateY(-1px) !important;
   box-shadow: 0 4px 12px rgba(139, 69, 255, 0.3) !important;
 }
@@ -172,8 +187,8 @@
 .copilotKitInputContainer {
   flex-shrink: 0 !important;
   padding: 20px 24px !important;
-  border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
-  background: linear-gradient(135deg, rgba(139, 69, 255, 0.05) 0%, rgba(61, 90, 254, 0.05) 100%) !important;
+  border-top: 1px solid var(--ga-border) !important;
+  background: var(--ga-input-container-bg) !important;
   position: relative !important;
 }
 
@@ -183,8 +198,8 @@
   align-items: flex-end !important;  /* Keep this for proper button alignment */
   gap: 12px !important;
   padding: 16px 20px !important;     /* Increased padding for more breathing room */
-  background: rgba(0, 0, 0, 0.3) !important;
-  border: 2px solid rgba(255, 255, 255, 0.1) !important;
+  background: var(--ga-input-bg) !important;
+  border: 2px solid var(--ga-border) !important;
   border-radius: 16px !important;
   transition: all 0.3s ease !important;
   backdrop-filter: blur(20px) !important;
@@ -192,9 +207,9 @@
 }
 
 .copilotKitInput:focus-within {
-  border-color: #8b45ff !important;
+  border-color: var(--ga-accent) !important;
   box-shadow: 0 0 20px rgba(139, 69, 255, 0.3) !important;
-  background: rgba(0, 0, 0, 0.4) !important;
+  background: var(--ga-input-focus-bg) !important;
 }
 
 .copilotKitInput textarea {
@@ -202,7 +217,7 @@
   background: transparent !important;
   border: none !important;
   outline: none !important;
-  color: #ffffff !important;
+  color: var(--ga-text) !important;
   font-size: 16px !important;
   line-height: 1.6 !important;
   resize: none !important;
@@ -216,12 +231,12 @@
 }
 
 .copilotKitInput textarea::placeholder {
-  color: rgba(255, 255, 255, 0.5) !important;
+  color: var(--ga-text-subtle) !important;
 }
 
 /* Send button */
 .copilotKitInputControlButton {
-  background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%) !important;
+  background: var(--ga-action-gradient) !important;
   border: none !important;
   color: #ffffff !important;
   padding: 12px !important;
@@ -242,8 +257,8 @@
 }
 
 .copilotKitInputControlButton:disabled {
-  background: rgba(255, 255, 255, 0.1) !important;
-  color: rgba(255, 255, 255, 0.4) !important;
+  background: var(--ga-control-hover-bg) !important;
+  color: var(--ga-text-faint) !important;
   cursor: not-allowed !important;
   transform: none !important;
   box-shadow: none !important;
@@ -350,7 +365,7 @@
 
 /* Send button loading state */
 .copilotKitInputControlButton[data-copilotkit-in-progress="true"] {
-  background: linear-gradient(135deg, #00ff88 0%, #00bcd4 100%) !important;
+  background: linear-gradient(135deg, var(--ga-status-dot) 0%, var(--ga-cyan) 100%) !important;
   color: #000000 !important;
   position: relative !important;
   overflow: hidden !important;
@@ -382,8 +397,8 @@
 }
 
 .ga-thinking-bubble {
-  background: linear-gradient(135deg, rgba(139, 69, 255, 0.1) 0%, rgba(61, 90, 254, 0.1) 100%) !important;
-  border: 1px solid rgba(139, 69, 255, 0.2) !important;
+  background: var(--ga-assistant-bg) !important;
+  border: 1px solid var(--ga-assistant-border) !important;
   border-radius: 18px 18px 18px 4px !important;
   padding: 16px 20px !important;
   backdrop-filter: blur(10px) !important;
@@ -410,7 +425,7 @@
   width: 8px !important;
   height: 8px !important;
   border-radius: 50% !important;
-  background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%) !important;
+  background: var(--ga-action-gradient) !important;
   animation: thinking-bounce 1.4s ease-in-out infinite !important;
 }
 
@@ -419,7 +434,7 @@
 .ga-thinking-dot:nth-child(3) { animation-delay: 0.4s !important; }
 
 .ga-thinking-text {
-  color: rgba(255, 255, 255, 0.7) !important;
+  color: var(--ga-text-muted) !important;
   font-size: 0.9rem !important;
   font-style: italic !important;
   margin-left: 8px !important;
@@ -544,7 +559,7 @@
 /* "Powered by CopilotKit" styling - transparent background to inherit from container */
 .copilotKitInputContainer .poweredBy {
   background: transparent !important;
-  color: rgba(255, 255, 255, 0.3) !important;
+  color: var(--ga-text-faint) !important;
   font-size: 11px !important;
   padding: 10px 0 !important;
   margin: 0 !important;
@@ -563,12 +578,12 @@
 }
 
 .copilotKitMessages::-webkit-scrollbar-thumb {
-  background: rgba(139, 69, 255, 0.3);
+  background: var(--ga-accent-border);
   border-radius: 3px;
 }
 
 .copilotKitMessages::-webkit-scrollbar-thumb:hover {
-  background: rgba(139, 69, 255, 0.5);
+  background: var(--ga-accent-border-strong);
 }
 
 /* Responsive adjustments */
@@ -644,14 +659,16 @@
 
   .copilotKitInput {
     padding: 10px 14px !important;
-    min-height: 56px !important;
+    min-height: 72px !important;
     border-radius: 14px !important;
   }
 
   .copilotKitInput textarea {
     font-size: 16px !important;
-    min-height: 32px !important;
+    line-height: 1.4 !important;
+    min-height: 48px !important;
     max-height: 100px !important;
+    padding: 6px 0 !important;
   }
 
   .copilotKitInputControlButton {

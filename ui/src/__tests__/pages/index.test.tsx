@@ -1,6 +1,7 @@
 import React from 'react'
 import { render, screen } from '@testing-library/react'
 import Home from '../../pages/index'
+import { ThemeProvider } from '../../components/ThemeProvider'
 
 // Mock CopilotKit components
 jest.mock('@copilotkit/react-core', () => ({
@@ -21,25 +22,31 @@ jest.mock('@copilotkit/react-ui', () => ({
 }))
 
 describe('Home Page', () => {
+  const renderHome = () => render(
+    <ThemeProvider>
+      <Home />
+    </ThemeProvider>,
+  )
+
   it('renders without crashing', () => {
-    render(<Home />)
+    renderHome()
     expect(screen.getByTestId('copilot-provider')).toBeInTheDocument()
   })
 
   it('displays the Game Agent title', () => {
-    render(<Home />)
+    renderHome()
     const title = screen.getByRole('heading', { name: /Game Agent/i })
     expect(title).toBeInTheDocument()
   })
 
   it('displays the shield emoji', () => {
-    render(<Home />)
+    renderHome()
     const shield = screen.getByText('🛡️')
     expect(shield).toBeInTheDocument()
   })
 
   it('has the correct page structure', () => {
-    render(<Home />)
+    renderHome()
 
     // Check for main container
     const container = screen.getByRole('main') || screen.getByTestId('main-container')
@@ -50,14 +57,18 @@ describe('Home Page', () => {
   })
 
   it('applies correct CSS classes', () => {
-    const { container } = render(<Home />)
+    const { container } = render(
+      <ThemeProvider>
+        <Home />
+      </ThemeProvider>,
+    )
 
     // Check that the component renders with some structure
     expect(container.firstChild).toBeTruthy()
   })
 
   it('is accessible', () => {
-    render(<Home />)
+    renderHome()
 
     // Check for heading structure
     const headings = screen.getAllByRole('heading', { level: 1 })

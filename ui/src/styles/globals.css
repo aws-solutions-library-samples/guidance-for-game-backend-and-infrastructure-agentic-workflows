@@ -4,6 +4,115 @@
 @import './command-center-layout.css';
 @import './chat-layout.css';
 
+:root {
+  color-scheme: dark;
+  --ga-bg: #0f0f23;
+  --ga-bg-gradient: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
+  --ga-header-gradient: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  --ga-scan-gradient: linear-gradient(90deg, transparent, rgba(139, 69, 255, 0.1), transparent);
+  --ga-brand-gradient: linear-gradient(135deg, #8b45ff 0%, #3d5afe 50%, #00bcd4 100%);
+  --ga-action-gradient: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%);
+  --ga-auth-action-gradient: linear-gradient(135deg, #8b45ff 0%, #00d4ff 100%);
+  --ga-accent: #8b45ff;
+  --ga-cyan: #00bcd4;
+  --ga-status-dot: #00ff88;
+  --ga-text: #ffffff;
+  --ga-text-muted: rgba(255, 255, 255, 0.72);
+  --ga-text-subtle: rgba(255, 255, 255, 0.55);
+  --ga-text-faint: rgba(255, 255, 255, 0.35);
+  --ga-surface: rgba(26, 26, 46, 0.6);
+  --ga-surface-strong: rgba(26, 26, 46, 0.9);
+  --ga-surface-elevated: linear-gradient(135deg, rgba(26, 26, 46, 0.98) 0%, rgba(22, 33, 62, 0.98) 100%);
+  --ga-surface-muted: rgba(15, 15, 35, 0.5);
+  --ga-footer-bg: rgba(26, 26, 46, 0.8);
+  --ga-border: rgba(255, 255, 255, 0.1);
+  --ga-border-strong: rgba(255, 255, 255, 0.2);
+  --ga-accent-border: rgba(139, 69, 255, 0.3);
+  --ga-accent-border-strong: rgba(139, 69, 255, 0.5);
+  --ga-badge-bg: rgba(0, 0, 0, 0.3);
+  --ga-input-bg: rgba(0, 0, 0, 0.3);
+  --ga-input-focus-bg: rgba(0, 0, 0, 0.4);
+  --ga-code-bg: rgba(0, 0, 0, 0.3);
+  --ga-overlay-bg: rgba(0, 0, 0, 0.8);
+  --ga-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  --ga-elevated-shadow: 0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(139, 69, 255, 0.1);
+  --ga-small-shadow: 0 2px 8px rgba(139, 69, 255, 0.12);
+  --ga-assistant-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.15) 0%, rgba(61, 90, 254, 0.15) 100%);
+  --ga-assistant-border: rgba(139, 69, 255, 0.3);
+  --ga-user-message-bg: linear-gradient(135deg, rgba(0, 188, 212, 0.15) 0%, rgba(57, 255, 20, 0.15) 100%);
+  --ga-user-message-border: rgba(0, 188, 212, 0.3);
+  --ga-user-message-text: #ffffff;
+  --ga-input-container-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.05) 0%, rgba(61, 90, 254, 0.05) 100%);
+  --ga-segment-bg: rgba(0, 0, 0, 0.26);
+  --ga-control-hover-bg: rgba(139, 69, 255, 0.14);
+  --ga-control-active-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.95) 0%, rgba(61, 90, 254, 0.95) 100%);
+  --ga-control-active-text: #ffffff;
+  --ga-control-active-shadow: 0 3px 10px rgba(139, 69, 255, 0.28);
+  --ga-danger: #ff6b6b;
+  --ga-danger-strong: #ff5252;
+  --ga-danger-bg: rgba(255, 69, 69, 0.14);
+  --ga-danger-border: rgba(255, 69, 69, 0.3);
+  --ga-success: #00ff88;
+  --ga-success-bg: rgba(0, 255, 136, 0.16);
+  --ga-success-border: rgba(0, 255, 136, 0.3);
+  --ga-warning: #ffa500;
+  --ga-warning-bg: rgba(255, 165, 0, 0.16);
+  --ga-warning-border: rgba(255, 165, 0, 0.3);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --ga-bg: #f6f8fc;
+  --ga-bg-gradient: linear-gradient(135deg, #f8fbff 0%, #eef4ff 50%, #e9f7f7 100%);
+  --ga-header-gradient: linear-gradient(135deg, rgba(255, 255, 255, 0.96) 0%, rgba(237, 243, 255, 0.96) 100%);
+  --ga-scan-gradient: linear-gradient(90deg, transparent, rgba(61, 90, 254, 0.1), transparent);
+  --ga-text: #182033;
+  --ga-text-muted: rgba(24, 32, 51, 0.7);
+  --ga-text-subtle: rgba(24, 32, 51, 0.56);
+  --ga-text-faint: rgba(24, 32, 51, 0.38);
+  --ga-accent: #5b35d8;
+  --ga-cyan: #007c91;
+  --ga-status-dot: #047857;
+  --ga-surface: rgba(255, 255, 255, 0.78);
+  --ga-surface-strong: rgba(255, 255, 255, 0.94);
+  --ga-surface-elevated: linear-gradient(135deg, rgba(255, 255, 255, 0.98) 0%, rgba(244, 248, 255, 0.98) 100%);
+  --ga-surface-muted: rgba(239, 244, 255, 0.82);
+  --ga-footer-bg: rgba(255, 255, 255, 0.78);
+  --ga-border: rgba(24, 32, 51, 0.12);
+  --ga-border-strong: rgba(24, 32, 51, 0.2);
+  --ga-accent-border: rgba(99, 102, 241, 0.26);
+  --ga-accent-border-strong: rgba(99, 102, 241, 0.42);
+  --ga-badge-bg: rgba(255, 255, 255, 0.74);
+  --ga-input-bg: rgba(255, 255, 255, 0.78);
+  --ga-input-focus-bg: #ffffff;
+  --ga-code-bg: rgba(24, 32, 51, 0.08);
+  --ga-overlay-bg: rgba(15, 23, 42, 0.42);
+  --ga-shadow: 0 20px 60px rgba(28, 36, 61, 0.14);
+  --ga-elevated-shadow: 0 16px 40px rgba(28, 36, 61, 0.18), 0 0 0 1px rgba(99, 102, 241, 0.08);
+  --ga-small-shadow: 0 2px 8px rgba(28, 36, 61, 0.08);
+  --ga-assistant-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.1) 0%, rgba(61, 90, 254, 0.09) 100%);
+  --ga-assistant-border: rgba(99, 102, 241, 0.24);
+  --ga-user-message-bg: linear-gradient(135deg, rgba(0, 188, 212, 0.12) 0%, rgba(31, 150, 118, 0.1) 100%);
+  --ga-user-message-border: rgba(0, 143, 170, 0.24);
+  --ga-user-message-text: #132033;
+  --ga-input-container-bg: linear-gradient(135deg, rgba(139, 69, 255, 0.045) 0%, rgba(0, 188, 212, 0.045) 100%);
+  --ga-segment-bg: rgba(255, 255, 255, 0.78);
+  --ga-control-hover-bg: rgba(99, 102, 241, 0.1);
+  --ga-control-active-bg: #182033;
+  --ga-control-active-text: #ffffff;
+  --ga-control-active-shadow: 0 3px 10px rgba(28, 36, 61, 0.16);
+  --ga-danger: #c73636;
+  --ga-danger-strong: #a92323;
+  --ga-danger-bg: rgba(199, 54, 54, 0.1);
+  --ga-danger-border: rgba(199, 54, 54, 0.22);
+  --ga-success: #047857;
+  --ga-success-bg: rgba(4, 120, 87, 0.1);
+  --ga-success-border: rgba(4, 120, 87, 0.22);
+  --ga-warning: #b45309;
+  --ga-warning-bg: rgba(180, 83, 9, 0.1);
+  --ga-warning-border: rgba(180, 83, 9, 0.22);
+}
+
 /* Reset and base styles */
 html,
 body {
@@ -13,8 +122,8 @@ body {
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #0f0f23;
-  color: #ffffff;
+  background: var(--ga-bg);
+  color: var(--ga-text);
 }
 
 a {
@@ -61,12 +170,16 @@ body {
 /* Selection styling */
 ::selection {
   background: rgba(139, 69, 255, 0.3);
-  color: #ffffff;
+  color: var(--ga-text);
 }
 
 /* Focus states */
 *:focus {
-  outline: 2px solid #8b45ff;
+  outline: none;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--ga-accent);
   outline-offset: 2px;
 }
 

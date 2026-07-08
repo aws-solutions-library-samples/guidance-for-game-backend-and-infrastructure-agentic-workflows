@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { CognitoUserPool, CognitoUser, AuthenticationDetails, CognitoUserSession } from 'amazon-cognito-identity-js';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
+import ThemeToggle from './ThemeToggle';
 
 interface CognitoAuthProps {
   userPoolId: string;
@@ -130,6 +131,9 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
 
   return (
     <div className="auth-container">
+      <div className="auth-theme-toggle">
+        <ThemeToggle />
+      </div>
       <div className="auth-card">
         <div className="auth-header">
           <div className="auth-logo">🛡️</div>
@@ -277,10 +281,17 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           display: flex;
           align-items: center;
           justify-content: center;
-          background: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
+          background: var(--ga-bg-gradient);
           padding: 20px;
           position: relative;
           overflow: hidden;
+        }
+
+        .auth-theme-toggle {
+          position: fixed;
+          top: 20px;
+          right: 20px;
+          z-index: 2;
         }
 
         .auth-container::before {
@@ -290,7 +301,7 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           left: 0;
           right: 0;
           bottom: 0;
-          background: linear-gradient(90deg, transparent, rgba(139, 69, 255, 0.1), transparent);
+          background: var(--ga-scan-gradient);
           animation: scan 4s infinite;
         }
 
@@ -300,13 +311,13 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
         }
 
         .auth-card {
-          background: rgba(26, 26, 46, 0.9);
-          border: 1px solid rgba(139, 69, 255, 0.3);
+          background: var(--ga-surface-strong);
+          border: 1px solid var(--ga-accent-border);
           border-radius: 16px;
           padding: 48px;
           width: 100%;
           max-width: 440px;
-          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+          box-shadow: var(--ga-shadow);
           backdrop-filter: blur(10px);
           position: relative;
           z-index: 1;
@@ -326,14 +337,14 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           font-size: 28px;
           font-weight: 700;
           margin: 0 0 8px 0;
-          background: linear-gradient(135deg, #8b45ff 0%, #00d4ff 100%);
+          background: var(--ga-auth-action-gradient);
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
           background-clip: text;
         }
 
         .auth-header p {
-          color: rgba(255, 255, 255, 0.6);
+          color: var(--ga-text-subtle);
           margin: 0;
           font-size: 14px;
         }
@@ -341,11 +352,11 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
         h2 {
           font-size: 24px;
           margin: 0 0 8px 0;
-          color: white;
+          color: var(--ga-text);
         }
 
         .auth-subtitle {
-          color: rgba(255, 255, 255, 0.6);
+          color: var(--ga-text-subtle);
           margin: 0 0 24px 0;
           font-size: 14px;
         }
@@ -354,7 +365,7 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           display: flex;
           gap: 8px;
           margin-bottom: 32px;
-          background: rgba(15, 15, 35, 0.5);
+          background: var(--ga-surface-muted);
           padding: 4px;
           border-radius: 8px;
         }
@@ -365,12 +376,12 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           border-radius: 6px;
           font-weight: 500;
           transition: all 0.2s;
-          color: rgba(255, 255, 255, 0.6);
+          color: var(--ga-text-subtle);
         }
 
         .auth-tabs button.active {
-          background: linear-gradient(135deg, #8b45ff 0%, #00d4ff 100%);
-          color: white;
+          background: var(--ga-auth-action-gradient);
+          color: #ffffff;
         }
 
         .auth-back {
@@ -378,14 +389,14 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
         }
 
         .auth-back button {
-          color: rgba(255, 255, 255, 0.6);
+          color: var(--ga-text-subtle);
           font-size: 14px;
           padding: 8px 0;
           transition: color 0.2s;
         }
 
         .auth-back button:hover {
-          color: #8b45ff;
+          color: var(--ga-accent);
         }
 
         .form-group {
@@ -397,46 +408,46 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           margin-bottom: 8px;
           font-weight: 500;
           font-size: 14px;
-          color: rgba(255, 255, 255, 0.9);
+          color: var(--ga-text);
         }
 
         .form-group input {
           width: 100%;
           padding: 12px 16px;
-          background: rgba(15, 15, 35, 0.5);
-          border: 1px solid rgba(139, 69, 255, 0.3);
+          background: var(--ga-input-bg);
+          border: 1px solid var(--ga-accent-border);
           border-radius: 8px;
-          color: white;
+          color: var(--ga-text);
           font-size: 14px;
           transition: all 0.2s;
         }
 
         .form-group input:focus {
           outline: none;
-          border-color: #8b45ff;
+          border-color: var(--ga-accent);
           box-shadow: 0 0 0 3px rgba(139, 69, 255, 0.1);
         }
 
         .form-group input::placeholder {
-          color: rgba(255, 255, 255, 0.3);
+          color: var(--ga-text-faint);
         }
 
         .auth-error {
           padding: 12px;
-          background: rgba(255, 69, 69, 0.1);
-          border: 1px solid rgba(255, 69, 69, 0.3);
+          background: var(--ga-danger-bg);
+          border: 1px solid var(--ga-danger-border);
           border-radius: 8px;
-          color: #ff6b6b;
+          color: var(--ga-danger);
           font-size: 14px;
           margin-bottom: 20px;
         }
 
         .auth-success {
           padding: 12px;
-          background: rgba(69, 255, 69, 0.1);
-          border: 1px solid rgba(69, 255, 69, 0.3);
+          background: var(--ga-success-bg);
+          border: 1px solid var(--ga-success-border);
           border-radius: 8px;
-          color: #6bff6b;
+          color: var(--ga-success);
           font-size: 14px;
           margin-bottom: 20px;
         }
@@ -444,8 +455,8 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
         .auth-submit {
           width: 100%;
           padding: 14px;
-          background: linear-gradient(135deg, #8b45ff 0%, #00d4ff 100%);
-          color: white;
+          background: var(--ga-auth-action-gradient);
+          color: #ffffff;
           font-weight: 600;
           font-size: 16px;
           border-radius: 8px;
@@ -466,13 +477,29 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
         .auth-link {
           width: 100%;
           padding: 8px;
-          color: rgba(255, 255, 255, 0.6);
+          color: var(--ga-text-subtle);
           font-size: 14px;
           transition: color 0.2s;
         }
 
         .auth-link:hover {
-          color: #8b45ff;
+          color: var(--ga-accent);
+        }
+
+        @media (max-width: 640px) {
+          .auth-container {
+            align-items: flex-start;
+            padding-top: 84px;
+          }
+
+          .auth-theme-toggle {
+            top: 16px;
+            right: 16px;
+          }
+
+          .auth-card {
+            padding: 32px 24px;
+          }
         }
       `}</style>
     </div>
