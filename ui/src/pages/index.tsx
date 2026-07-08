@@ -6,6 +6,7 @@ import React, { useState, useEffect } from 'react';
 import Head from 'next/head';
 import Link from 'next/link';
 import { Chat } from '../components/Chat';
+import ThemeToggle from '../components/ThemeToggle';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 
 interface HomeProps {
@@ -90,6 +91,7 @@ export default function Home({ user }: HomeProps) {
           </div>
 
           <div className="ga-status-indicators">
+            <ThemeToggle />
             <div className="ga-status-badge">
               <div className="ga-status-dot"></div>
               <span>System Online</span>
@@ -133,11 +135,11 @@ export default function Home({ user }: HomeProps) {
                         style={{
                           display: 'block',
                           padding: '12px 16px',
-                          color: '#8B45FF',
+                          color: 'var(--ga-accent)',
                           textDecoration: 'none',
                           fontSize: '14px',
                           fontWeight: 500,
-                          borderBottom: '1px solid rgba(139, 69, 255, 0.2)'
+                          borderBottom: '1px solid var(--ga-accent-border)'
                         }}
                       >
                         Manage Users

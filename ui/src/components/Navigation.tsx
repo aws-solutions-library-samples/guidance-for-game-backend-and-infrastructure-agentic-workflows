@@ -3,6 +3,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { logError } from '@/utils/logger';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
+import ThemeToggle from './ThemeToggle';
 
 interface NavigationProps {
   pageTitle?: string;
@@ -76,6 +77,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
         </div>
 
         <div className="ga-nav-right">
+          <ThemeToggle />
           <div className="ga-status-badge">
             <div className="ga-status-dot"></div>
             <span>System Online</span>
@@ -127,8 +129,8 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
 
       <style jsx>{`
         .ga-nav-header {
-          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-          border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+          background: var(--ga-header-gradient);
+          border-bottom: 1px solid var(--ga-border);
           padding: 16px 0;
           position: relative;
           overflow: visible;
@@ -142,7 +144,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           left: 0;
           right: 0;
           bottom: 0;
-          background: linear-gradient(90deg, transparent, rgba(139, 69, 255, 0.1), transparent);
+          background: var(--ga-scan-gradient);
           animation: navScan 4s infinite;
         }
 
@@ -182,7 +184,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
         .ga-logo {
           width: 48px;
           height: 48px;
-          background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%);
+          background: var(--ga-action-gradient);
           border-radius: 12px;
           display: flex;
           align-items: center;
@@ -196,7 +198,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           margin: 0;
           font-size: 1.5rem;
           font-weight: 700;
-          background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 50%, #00bcd4 100%);
+          background: var(--ga-brand-gradient);
           -webkit-background-clip: text;
           -webkit-text-fill-color: transparent;
           background-clip: text;
@@ -205,17 +207,17 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
 
         .ga-page-title {
           margin: 2px 0 0 0;
-          color: rgba(255, 255, 255, 0.7);
+          color: var(--ga-text-muted);
           font-size: 0.85rem;
           font-weight: 500;
         }
 
         .ga-back-button {
-          background: rgba(139, 69, 255, 0.2);
-          border: 1px solid rgba(139, 69, 255, 0.4);
+          background: var(--ga-control-hover-bg);
+          border: 1px solid var(--ga-accent-border);
           border-radius: 8px;
           padding: 8px 16px;
-          color: #8b45ff;
+          color: var(--ga-accent);
           font-size: 14px;
           font-weight: 500;
           cursor: pointer;
@@ -223,8 +225,8 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
         }
 
         .ga-back-button:hover {
-          background: rgba(139, 69, 255, 0.3);
-          border-color: rgba(139, 69, 255, 0.6);
+          background: var(--ga-control-hover-bg);
+          border-color: var(--ga-accent-border-strong);
         }
 
         .ga-nav-right {
@@ -232,35 +234,40 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           align-items: center;
           gap: 20px;
           justify-self: end;
+          min-width: 0;
         }
 
         .ga-status-badge {
-          background: rgba(0, 0, 0, 0.3);
-          border: 1px solid rgba(255, 255, 255, 0.1);
+          background: var(--ga-badge-bg);
+          border: 1px solid var(--ga-border);
           border-radius: 20px;
           padding: 8px 14px;
           display: flex;
           align-items: center;
           gap: 8px;
           font-size: 12px;
-          color: rgba(255, 255, 255, 0.8);
+          color: var(--ga-text-muted);
+          flex: 0 0 auto;
+          white-space: nowrap;
         }
 
         .ga-status-dot {
           width: 8px;
           height: 8px;
-          background: #00ff88;
+          background: var(--ga-status-dot);
           border-radius: 50%;
           /* Solid green - no animation when system is stable */
         }
 
         .ga-user-menu {
           position: relative;
+          flex: 0 0 auto;
+          min-width: 0;
         }
 
         .ga-user-button {
-          background: rgba(0, 0, 0, 0.3);
-          border: 1px solid rgba(255, 255, 255, 0.1);
+          background: var(--ga-badge-bg);
+          border: 1px solid var(--ga-border);
           border-radius: 25px;
           padding: 6px 16px 6px 6px;
           display: flex;
@@ -268,29 +275,38 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           gap: 10px;
           cursor: pointer;
           transition: all 0.2s;
-          color: white;
+          color: var(--ga-text);
+          max-width: 190px;
+          min-width: 0;
         }
 
         .ga-user-button:hover {
-          background: rgba(139, 69, 255, 0.2);
-          border-color: rgba(139, 69, 255, 0.4);
+          background: var(--ga-control-hover-bg);
+          border-color: var(--ga-accent-border);
         }
 
         .ga-user-avatar {
           width: 32px;
           height: 32px;
-          background: linear-gradient(135deg, #8b45ff 0%, #3d5afe 100%);
+          background: var(--ga-action-gradient);
           border-radius: 50%;
           display: flex;
           align-items: center;
           justify-content: center;
           font-weight: 600;
           font-size: 14px;
+          color: #ffffff;
+          flex: 0 0 auto;
         }
 
         .ga-user-name {
           font-size: 14px;
           font-weight: 500;
+          min-width: 0;
+          max-width: 108px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
 
         /* Mobile Responsiveness */
@@ -410,31 +426,31 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           top: 100%;
           right: 0;
           margin-top: 8px;
-          background: rgba(26, 26, 46, 0.95);
-          border: 1px solid rgba(139, 69, 255, 0.3);
+          background: var(--ga-surface-elevated);
+          border: 1px solid var(--ga-accent-border);
           border-radius: 12px;
           padding: 16px;
           min-width: 200px;
-          box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+          box-shadow: var(--ga-elevated-shadow);
           backdrop-filter: blur(10px);
           z-index: 1000;
         }
 
         .ga-user-info {
           padding-bottom: 12px;
-          border-bottom: 1px solid rgba(139, 69, 255, 0.2);
+          border-bottom: 1px solid var(--ga-accent-border);
           margin-bottom: 12px;
         }
 
         .ga-user-email {
-          color: rgba(255, 255, 255, 0.8);
+          color: var(--ga-text-muted);
           font-size: 13px;
         }
 
         .ga-admin-link {
           display: block;
           padding: 8px 12px;
-          color: #8B45FF;
+          color: var(--ga-accent);
           text-decoration: none;
           font-size: 14px;
           font-weight: 500;
@@ -444,16 +460,16 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
         }
 
         .ga-admin-link:hover {
-          background: rgba(139, 69, 255, 0.1);
+          background: var(--ga-control-hover-bg);
         }
 
         .ga-signout-button {
           width: 100%;
           padding: 8px 12px;
-          background: rgba(255, 69, 69, 0.2);
-          border: 1px solid rgba(255, 69, 69, 0.3);
+          background: var(--ga-danger-bg);
+          border: 1px solid var(--ga-danger-border);
           border-radius: 6px;
-          color: #ff6b6b;
+          color: var(--ga-danger);
           font-size: 14px;
           font-weight: 500;
           cursor: pointer;
@@ -461,8 +477,8 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
         }
 
         .ga-signout-button:hover {
-          background: rgba(255, 69, 69, 0.3);
-          border-color: rgba(255, 69, 69, 0.5);
+          background: var(--ga-danger-bg);
+          border-color: var(--ga-danger-border);
         }
       `}</style>
     </header>
