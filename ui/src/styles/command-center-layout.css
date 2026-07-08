@@ -37,7 +37,7 @@
 }
 
 .ga-hero-content {
-  max-width: 1200px;
+  max-width: 1360px;
   margin: 0 auto;
   padding: 0 24px;
   display: flex;
@@ -92,8 +92,9 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 12px;
+  min-width: 0;
 }
 
 .ga-status-badge {
@@ -107,6 +108,7 @@
   font-size: 0.8rem;
   color: var(--ga-text-muted);
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 
 .ga-status-dot {
@@ -231,6 +233,36 @@
 }
 
 /* Responsive Design */
+@media (max-width: 1240px) {
+  .ga-hero-content {
+    flex-wrap: wrap;
+    justify-content: center;
+    row-gap: 18px;
+  }
+
+  .ga-logo-container {
+    flex: 0 1 100%;
+    justify-content: center;
+    text-align: center;
+  }
+
+  .ga-status-indicators {
+    margin-left: 0;
+    justify-content: center;
+  }
+}
+
+@media (max-width: 1040px) and (min-width: 769px) {
+  .ga-status-indicators {
+    flex-wrap: wrap;
+  }
+
+  .ga-user-menu {
+    order: -1;
+    margin-left: 0;
+  }
+}
+
 @media (max-width: 768px) {
   .ga-hero-content {
     padding: 0 20px;
@@ -281,7 +313,8 @@
 /* User Menu */
 .ga-user-menu {
   position: relative;
-  margin-left: 16px;
+  margin-left: 4px;
+  flex: 0 0 auto;
   z-index: 10000;
 }
 
@@ -297,6 +330,8 @@
   cursor: pointer;
   transition: all 0.3s ease;
   box-shadow: 0 2px 8px rgba(139, 69, 255, 0.1);
+  max-width: 190px;
+  min-width: 0;
 }
 
 .ga-user-button:hover {
@@ -323,12 +358,18 @@
   font-size: 15px;
   color: #ffffff;
   box-shadow: 0 2px 8px rgba(139, 69, 255, 0.3);
+  flex: 0 0 auto;
 }
 
 .ga-user-name {
   font-size: 14px;
   font-weight: 500;
   color: var(--ga-text);
+  min-width: 0;
+  max-width: 108px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ga-user-dropdown {

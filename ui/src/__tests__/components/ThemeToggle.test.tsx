@@ -45,6 +45,19 @@ describe('ThemeToggle', () => {
     expect(screen.getByRole('button', { name: 'System' })).toHaveAttribute('aria-pressed', 'true');
   });
 
+  it('hydrates a saved explicit theme preference after mount', async () => {
+    window.localStorage.setItem('game-agent-theme', 'light');
+
+    renderThemeToggle();
+
+    await waitFor(() => {
+      expect(document.documentElement).toHaveAttribute('data-theme-mode', 'light');
+      expect(document.documentElement).toHaveAttribute('data-theme', 'light');
+    });
+
+    expect(screen.getByRole('button', { name: 'Light' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
   it('persists a selected explicit theme', async () => {
     renderThemeToggle();
 

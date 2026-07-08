@@ -234,6 +234,7 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           align-items: center;
           gap: 20px;
           justify-self: end;
+          min-width: 0;
         }
 
         .ga-status-badge {
@@ -246,6 +247,8 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           gap: 8px;
           font-size: 12px;
           color: var(--ga-text-muted);
+          flex: 0 0 auto;
+          white-space: nowrap;
         }
 
         .ga-status-dot {
@@ -258,6 +261,8 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
 
         .ga-user-menu {
           position: relative;
+          flex: 0 0 auto;
+          min-width: 0;
         }
 
         .ga-user-button {
@@ -271,6 +276,8 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           cursor: pointer;
           transition: all 0.2s;
           color: var(--ga-text);
+          max-width: 190px;
+          min-width: 0;
         }
 
         .ga-user-button:hover {
@@ -288,11 +295,18 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
           justify-content: center;
           font-weight: 600;
           font-size: 14px;
+          color: #ffffff;
+          flex: 0 0 auto;
         }
 
         .ga-user-name {
           font-size: 14px;
           font-weight: 500;
+          min-width: 0;
+          max-width: 108px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
 
         /* Mobile Responsiveness */

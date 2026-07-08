@@ -1,4 +1,5 @@
-import { ThemeMode, useTheme } from './ThemeProvider';
+import type { ThemeMode } from './ThemeProvider';
+import { useTheme } from './ThemeProvider';
 
 const themeOptions: Array<{ mode: ThemeMode; label: string; title: string }> = [
   { mode: 'light', label: 'Light', title: 'Use light theme' },
@@ -22,6 +23,7 @@ export default function ThemeToggle() {
           className={mode === option.mode ? 'active' : ''}
           aria-pressed={mode === option.mode}
           title={option.title}
+          onMouseDown={event => event.preventDefault()}
           onClick={() => setMode(option.mode)}
         >
           {option.label}
@@ -50,13 +52,25 @@ export default function ThemeToggle() {
           font-size: 12px;
           font-weight: 600;
           line-height: 1;
-          transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+          outline: none !important;
+          -webkit-tap-highlight-color: transparent;
+          transition: background 0.2s ease, color 0.2s ease;
           white-space: nowrap;
+        }
+
+        .ga-theme-toggle button:focus-visible {
+          outline: 2px solid var(--ga-accent) !important;
+          outline-offset: 2px;
         }
 
         .ga-theme-toggle button:hover {
           color: var(--ga-text);
           background: var(--ga-control-hover-bg);
+        }
+
+        .ga-theme-toggle button:not(.active):not(:focus-visible) {
+          outline: none;
+          box-shadow: none;
         }
 
         .ga-theme-toggle button.active {

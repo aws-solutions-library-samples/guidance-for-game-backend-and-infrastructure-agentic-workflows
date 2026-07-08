@@ -659,14 +659,16 @@
 
   .copilotKitInput {
     padding: 10px 14px !important;
-    min-height: 56px !important;
+    min-height: 72px !important;
     border-radius: 14px !important;
   }
 
   .copilotKitInput textarea {
     font-size: 16px !important;
-    min-height: 32px !important;
+    line-height: 1.4 !important;
+    min-height: 48px !important;
     max-height: 100px !important;
+    padding: 6px 0 !important;
   }
 
   .copilotKitInputControlButton {

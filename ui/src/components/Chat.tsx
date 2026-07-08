@@ -130,7 +130,7 @@ For instance, you can ask me:
 - How much am I spending on GameLift?
 
 **What would you like to explore first?**`,
-            placeholder: "Ask about your game servers, costs, or infrastructure...",
+            placeholder: "Ask about game infrastructure...",
           }}
           instructions={`You are Game Agent, an expert AI assistant for game server management and AWS infrastructure.
 

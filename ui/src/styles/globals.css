@@ -5,6 +5,7 @@
 @import './chat-layout.css';
 
 :root {
+  color-scheme: dark;
   --ga-bg: #0f0f23;
   --ga-bg-gradient: linear-gradient(135deg, #0f0f23 0%, #1a1a2e 50%, #16213e 100%);
   --ga-header-gradient: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
@@ -60,6 +61,7 @@
 }
 
 :root[data-theme='light'] {
+  color-scheme: light;
   --ga-bg: #f6f8fc;
   --ga-bg-gradient: linear-gradient(135deg, #f8fbff 0%, #eef4ff 50%, #e9f7f7 100%);
   --ga-header-gradient: linear-gradient(135deg, rgba(255, 255, 255, 0.96) 0%, rgba(237, 243, 255, 0.96) 100%);
@@ -122,11 +124,6 @@ body {
   -moz-osx-font-smoothing: grayscale;
   background: var(--ga-bg);
   color: var(--ga-text);
-  color-scheme: dark;
-}
-
-:root[data-theme='light'] body {
-  color-scheme: light;
 }
 
 a {
@@ -178,6 +175,10 @@ body {
 
 /* Focus states */
 *:focus {
+  outline: none;
+}
+
+*:focus-visible {
   outline: 2px solid var(--ga-accent);
   outline-offset: 2px;
 }
