@@ -58,14 +58,19 @@ updates:
     commit-message:
       prefix: "chore(deps)"
       include: "scope"
-    # Group minor and patch updates together
-    groups:
-      npm-minor-patch:
-        patterns:
-          - "*"
-        update-types:
-          - "minor"
-          - "patch"
+    # GA freeze: keep frontend dependency PRs narrow and reviewable. Runtime UI
+    # dependency sweeps need deliberate validation, not one broad grouped bump.
+    ignore:
+      # CopilotKit 1.11+ is a protocol migration for our custom chat proxy,
+      # which currently speaks the 1.10.x GraphQL transport.
+      - dependency-name: "@copilotkit/*"
+        versions:
+          - ">= 1.11.0"
+      # ESLint 10 is not yet supported by the current eslint-config-next plugin
+      # stack used by this app.
+      - dependency-name: "eslint"
+        versions:
+          - ">= 10.0.0"
     # Allow both direct and indirect dependency updates
     allow:
       - dependency-type: "all"
