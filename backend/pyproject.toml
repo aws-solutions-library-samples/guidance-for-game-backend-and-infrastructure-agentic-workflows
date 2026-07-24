@@ -58,8 +58,8 @@ dependencies = [
     # Replaces the YANKED awslabs.cost-explorer-mcp-server (#105). Its SQLite
     # session DB path is hardcoded in the package dir (read-only on container);
     # mcp_client_factory relocates it to /tmp via a startup patch.
-    "awslabs.billing-cost-management-mcp-server>=0.0.24",
-    "awslabs.eks-mcp-server>=0.1.32",
+    "awslabs.billing-cost-management-mcp-server>=0.0.26",
+    "awslabs.eks-mcp-server>=0.1.33",
 
     # Documentation scraper dependencies
     "requests>=2.34.2",
@@ -73,7 +73,7 @@ dev = [
     # CLI/interactive tools (not needed in production)
     "strands-agents-builder>=0.1.10",
     "bedrock-agentcore-starter-toolkit>=0.3.10",
-    "uv>=0.11.26",
+    "uv>=0.11.28",
 
     # Testing
     "pytest>=9.1.1",
@@ -85,7 +85,7 @@ dev = [
     "pre-commit>=4.6.0",
     "black>=26.5.1",
     "isort>=8.0.1",
-    "mypy>=2.1.0",
+    "mypy>=2.2.0",
 ]
 
 [tool.black]
