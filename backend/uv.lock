@@ -382,7 +382,7 @@ wheels = [
 
 [[package]]
 name = "bedrock-agentcore"
-version = "1.16.0"
+version = "1.18.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -394,9 +394,9 @@ dependencies = [
     { name = "uvicorn" },
     { name = "websockets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/cd/1eada82c8edfa65a721f91807e7d00333de2362baa5b7bb21a3d3d743aad/bedrock_agentcore-1.16.0.tar.gz", hash = "sha256:4f1cfebec9e5e118b89bb2902424f6958b4f4371a3ac322d2e053033806d9753", size = 935606, upload-time = "2026-06-30T21:14:28.409Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/88/e8/8149bb168ef3825884685eb98ef868f5bb5f796e4ea58eb98e8df3248937/bedrock_agentcore-1.18.1.tar.gz", hash = "sha256:ed4aa8822e39aa5846b9d68d1461afee19f2f795c1f6d71a61bc650ecc00ee31", size = 1030729, upload-time = "2026-07-17T19:55:21.354Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/6a/0ea3fd0864242f6e6d6a528ed10e4363f4b4ba191024949208b8089a8340/bedrock_agentcore-1.16.0-py3-none-any.whl", hash = "sha256:0292de4cb9baa69e648d44b2b48fd96c526f1d22b8c573f6332f4393a630b86d", size = 431070, upload-time = "2026-06-30T21:14:26.638Z" },
+    { url = "https://files.pythonhosted.org/packages/45/fe/26cc0a66920035d2740c062bd46df252b15708b7723e13ccae0ab7b334db/bedrock_agentcore-1.18.1-py3-none-any.whl", hash = "sha256:6d8001f09cdfca0a20650ea691426149f521037d8d56917057fc191c00801086", size = 450684, upload-time = "2026-07-17T19:55:19.334Z" },
 ]
 
 [package.optional-dependencies]
@@ -941,7 +941,7 @@ requires-dist = [
     { name = "awslabs-billing-cost-management-mcp-server", specifier = ">=0.0.26" },
     { name = "awslabs-eks-mcp-server", specifier = ">=0.1.33" },
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
-    { name = "bedrock-agentcore", extras = ["strands-agents"], specifier = ">=1.16.0" },
+    { name = "bedrock-agentcore", extras = ["strands-agents"], specifier = ">=1.18.1" },
     { name = "boto3", specifier = ">=1.43.32" },
     { name = "botocore", specifier = ">=1.43.32" },
     { name = "cachetools", specifier = ">=6.2.4" },
