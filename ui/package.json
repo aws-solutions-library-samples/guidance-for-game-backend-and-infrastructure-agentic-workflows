@@ -117,7 +117,7 @@
       ]
     },
     "transformIgnorePatterns": [
-      "/node_modules/(?!(@copilotkit|cookie)/)"
+      "/node_modules/(?!(@copilotkit|cookie|@aws-sdk|@smithy)/)"
     ]
   }
 }
