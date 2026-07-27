@@ -5,6 +5,14 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # Scheduled vulnerability scan of main: grype's advisory DB updates daily, so
+  # a new GHSA against deps already in our lockfiles can start failing PRs at
+  # any time (e.g. GHSA-29w2-fq35-v728 / #247). The cron catches that within a
+  # day and opens an issue, instead of surfacing as a red X on whoever happens
+  # to open the next PR. Test jobs are gated off `schedule` — only the scan runs.
+  schedule:
+    - cron: '0 15 * * 1-5'   # weekdays 8am PT (15:00 UTC)
+  workflow_dispatch:
 
 # Least-privilege default token: jobs only read repo contents. Tightens the
 # GITHUB_TOKEN from the broad default (CodeQL: actions/missing-workflow-permissions).
@@ -13,6 +21,9 @@ permissions:
 
 jobs:
   backend-tests:
+    # Scheduled runs are vulnerability-scan only (code didn't change; deps didn't
+    # change; only grype's advisory DB did).
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -37,6 +48,7 @@ jobs:
       run: uv run pytest -m unit -v --tb=short
 
   frontend-tests:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     steps:
@@ -62,6 +74,7 @@ jobs:
       run: npm run lint
 
   e2e-tests:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     needs: [backend-tests, frontend-tests]
     # Official Playwright image (Microsoft Container Registry CDN) ships
@@ -101,6 +114,11 @@ jobs:
 
   vulnerability-scan:
     runs-on: ubuntu-latest
+    # issues:write is only needed by the alert step on scheduled runs; the
+    # workflow default stays contents:read for every other job.
+    permissions:
+      contents: read
+      issues: write
     steps:
     - uses: actions/checkout@v7
 
@@ -125,13 +143,49 @@ jobs:
     # scripts/scan-vulnerabilities.sh generates SBOMs (syft dir:backend, dir:ui —
     # reads uv.lock / package-lock.json, no build needed) then greps them with
     # grype. FAIL_ON=high so the build fails only on high/critical findings;
-    # medium/low are surfaced in the log without blocking.
+    # medium/low are surfaced in the log without blocking. Output is teed so the
+    # scheduled-run alert step below can attach the findings to the issue.
     - name: Scan dependencies for vulnerabilities
-      run: bash scripts/scan-vulnerabilities.sh
+      # Explicit `shell: bash` enables pipefail (the implicit default `bash -e`
+      # does not) — without it, `| tee` would mask the scan's failing exit code.
+      shell: bash
+      run: bash scripts/scan-vulnerabilities.sh 2>&1 | tee /tmp/scan-output.txt
       env:
         FAIL_ON: high
 
+    # On scheduled runs only: a failure means a new high/critical advisory now
+    # matches deps already on main — every PR will start failing this same gate.
+    # Surface it as a labeled issue (refreshed in place, not duplicated) instead
+    # of a red X nobody is watching for.
+    - name: Open or update alert issue (scheduled runs)
+      if: failure() && github.event_name == 'schedule'
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        TITLE="Scheduled vulnerability scan: high/critical findings on main"
+        BODY_FILE=$(mktemp)
+        {
+          echo "The scheduled grype scan found high/critical vulnerabilities in dependencies currently on \`main\`."
+          echo "Until fixed, the required \`vulnerability-scan\` check will fail on every PR."
+          echo ""
+          echo "Run: $RUN_URL"
+          echo ""
+          echo '```'
+          grep -iE 'high|critical|vulnerab|GHSA|CVE' /tmp/scan-output.txt | head -50 || tail -50 /tmp/scan-output.txt
+          echo '```'
+          echo ""
+          echo "Fix guidance: bump the affected package (pyproject.toml + uv.lock + regenerated requirements.txt, or ui/package.json + package-lock.json) — do not add grype ignore rules."
+        } > "$BODY_FILE"
+        EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+        if [ -n "$EXISTING" ]; then
+          gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+        else
+          gh issue create --title "$TITLE" --label security --body-file "$BODY_FILE"
+        fi
+
   powershell-tests:
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
