@@ -25,7 +25,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 | Package | Version | Purpose | License | Security Notes |
 |---------|---------|---------|---------|----------------|
 | mcp | >=1.23.0 | MCP client library | Apache-2.0 | Resolves GHSA-9h52-p55h-vw2f. Former <1.19.0 pin lifted (awslabs/mcp#1577 fixed in eks-mcp-server>=0.1.32) |
-| awslabs.aws-api-mcp-server | >=1.3.45 | AWS API (CLI) MCP server — resource discovery | Apache-2.0 | Replaces YANKED ccapi-mcp-server (issue #92); log/workdir redirected to /tmp via env |
+| awslabs.aws-api-mcp-server | >=1.3.47 | AWS API (CLI) MCP server — resource discovery | Apache-2.0 | Floor resolves GHSA-29w2-fq35-v728. Replaces YANKED ccapi-mcp-server (issue #92); log/workdir redirected to /tmp via env |
 | awslabs.cost-explorer-mcp-server | >=0.0.12 | Cost Explorer MCP server | Apache-2.0 | AWS managed |
 | awslabs.eks-mcp-server | >=0.1.32 | EKS MCP server | Apache-2.0 | Requires mcp>=1.23.0 (unpinned from 0.1.14) |
 
