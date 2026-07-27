@@ -77,9 +77,17 @@
   "overrides": {
     "prismjs": "^1.30.0",
     "sharp": "^0.35.0",
-    "postcss": "^8.5.10",
+    "postcss": "^8.5.18",
     "js-yaml": "^4.3.0",
-    "uuid": "^11.1.1"
+    "uuid": "^11.1.1",
+    "glob": {
+      "minimatch": "^10.2.5"
+    },
+    "test-exclude": {
+      "glob": {
+        "minimatch": "^3.1.2"
+      }
+    }
   },
   "jest": {
     "testEnvironment": "jsdom",
