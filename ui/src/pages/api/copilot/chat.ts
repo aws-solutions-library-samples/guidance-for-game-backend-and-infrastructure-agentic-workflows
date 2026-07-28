@@ -160,6 +160,40 @@ async function getUserIdentity() {
   return null;
 }
 
+// Render an error as a well-formed CopilotKit assistant message. CopilotKit only
+// surfaces 200 responses in the generateCopilotResponse shape — a bare HTTP 500
+// is silently dropped, so an invocation failure showed the user nothing at all
+// (issue #250). Returning the failure as a normal assistant turn makes it visible
+// and retryable. The text is deliberately generic (no internal detail leak); the
+// requestId lets a user quote it when reporting.
+function copilotErrorMessage(threadId: string, requestId: string) {
+  const now = Date.now();
+  return {
+    data: {
+      generateCopilotResponse: {
+        threadId,
+        runId: `run-${now}`,
+        messages: [
+          {
+            id: `msg-${now}`,
+            createdAt: new Date().toISOString(),
+            content: [
+              `⚠️ Something went wrong and I couldn't complete that request. ` +
+                `This can happen on very long-running queries. Please try again — ` +
+                `if it keeps happening, try a more specific question or start a new chat.\n\n` +
+                `_Request ID: ${requestId}_`,
+            ],
+            role: 'assistant',
+            status: { code: 'Success' },
+            __typename: 'TextMessageOutput',
+          },
+        ],
+        __typename: 'CopilotResponse',
+      },
+    },
+  };
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const requestId = Math.random().toString(36).substring(2, 15);
   const sanitizedMethod = req.method?.replace(/[\r\n]/g, '') || 'UNKNOWN';
@@ -691,6 +725,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Generic error handling
     logError(`[${requestId}] ❌ Error processing request:`, error instanceof Error ? error : new Error(String(error)));
+
+    // For a chat turn, surface the failure as a visible assistant message —
+    // CopilotKit silently drops non-200 / non-generateCopilotResponse bodies, so
+    // a bare 500 left the user staring at nothing (issue #250). Protocol
+    // operations (loadAgentState, availableAgents, …) keep plain JSON errors: a
+    // fabricated chat message there would corrupt client state.
+    if (req.body?.operationName === 'generateCopilotResponse') {
+      const threadId = req.body?.variables?.data?.threadId || `thread-${Date.now()}`;
+      return res.status(200).json(copilotErrorMessage(threadId, requestId));
+    }
+
     return res.status(500).json({
       error: 'Internal server error',
       details: error instanceof Error ? error.message : String(error),
