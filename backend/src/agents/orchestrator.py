@@ -26,6 +26,7 @@ from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.gamelift_specialist import gamelift_agent
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
+from connector.config import ConnectorConfig
 from config.settings import (
     AGENT_MAX_TURNS_ORCHESTRATOR,
     AGENT_TIMEOUT_ORCHESTRATOR_SECONDS,
@@ -78,6 +79,32 @@ def run_orchestrator(query: str, context: dict = None):
         inf = INFERENCE_CONFIG.get("orchestrator", {})
         orch_model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
 
+        # Conditionally register the Source Control Connector specialist. The write
+        # path (proposing IaC changes as pull requests) is the platform's only mutation
+        # capability, so the specialist is added to the orchestrator tool set ONLY when
+        # the Connector is enabled and validly configured (Req 1.2). When disabled, the
+        # baseline read-only specialist set is unchanged, so the platform behaves exactly
+        # as it does today (Req 1.3). Built once and reused in both Agent constructions
+        # below to avoid divergence between the memory and fallback paths.
+        specialist_tools = [gamelift_agent, eks_agent, cost_agent]
+        orchestrator_prompt = get_optimized_orchestrator_prompt()
+        if ConnectorConfig.load().enabled:
+            # Local import: keeps the connector out of the import graph for read-only
+            # deployments and avoids a hard dependency when the Connector is disabled.
+            # Local modules
+            from agents.source_control_specialist import source_control_agent
+
+            specialist_tools.append(source_control_agent)
+            # Add the single routing rule for infrastructure-change proposals. Appended
+            # only when enabled so the base prompt (and its version) is untouched for
+            # read-only deployments.
+            orchestrator_prompt = (
+                orchestrator_prompt
+                + "\n\n- sourcecontrol_agent: infrastructure CHANGE PROPOSALS — "
+                "open a pull request / modify or update an IaC template "
+                "(CloudFormation, Terraform). Never mutates live AWS."
+            )
+
         # Extract memory parameters from context
         actor_id = None
         session_id = None
@@ -124,8 +151,8 @@ def run_orchestrator(query: str, context: dict = None):
                 # Create session manager and agent with memory
                 session_manager = AgentCoreMemorySessionManager(agentcore_memory_config=config, region_name=AWS_REGION)
                 agent = Agent(
-                    system_prompt=get_optimized_orchestrator_prompt(),
-                    tools=[gamelift_agent, eks_agent, cost_agent],
+                    system_prompt=orchestrator_prompt,
+                    tools=specialist_tools,
                     model=orch_model,
                     session_manager=session_manager,
                     hooks=[
@@ -145,8 +172,8 @@ def run_orchestrator(query: str, context: dict = None):
         # Fallback: Create agent without memory
         if agent is None:
             agent = Agent(
-                system_prompt=get_optimized_orchestrator_prompt(),
-                tools=[gamelift_agent, eks_agent, cost_agent],
+                system_prompt=orchestrator_prompt,
+                tools=specialist_tools,
                 model=orch_model,
                 hooks=[
                     MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),

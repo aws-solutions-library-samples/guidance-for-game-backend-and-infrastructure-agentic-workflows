@@ -198,6 +198,8 @@ keyring==25.7.0
     # via py-key-value-aio
 kubernetes==36.0.2
     # via awslabs-eks-mcp-server
+lark==1.3.1
+    # via python-hcl2
 loguru==0.7.3
     # via
     #   awslabs-aws-api-mcp-server
@@ -637,6 +639,8 @@ python-dotenv==1.2.2
     #   pydantic-settings
 python-frontmatter==1.3.0
     # via awslabs-aws-api-mcp-server
+python-hcl2==8.1.2
+    # via game-agent-backend
 python-json-logger==4.1.0
     # via awslabs-aws-api-mcp-server
 python-multipart==0.0.32
@@ -663,6 +667,8 @@ referencing==0.36.2
     #   jsonschema
     #   jsonschema-path
     #   jsonschema-specifications
+regex==2026.7.19
+    # via python-hcl2
 requests==2.34.2
     # via
     #   aws-requests-auth

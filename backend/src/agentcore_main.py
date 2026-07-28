@@ -39,6 +39,7 @@ from config.settings import (
     USE_BEDROCK_SESSIONS,
 )
 from utils.logger import logger
+from utils.request_context import reset_request_context, set_request_context
 from utils.response_parser import ResponseParser
 from utils.security import (
     InputValidationError,
@@ -312,7 +313,16 @@ def invoke_agent(prompt, context=None):
         # permanently poisoning the session (#155 / #125). The in-loop hooks fire
         # before the old 180s outer budget would have, so no coverage is lost.
         logger.info("🎯 Calling run_orchestrator (in-loop wall-clock hooks enforce timeout)...")
-        response = run_orchestrator(query=user_prompt, context=agent_context)
+        # Set the request-scoped identity context immediately before running the
+        # orchestrator so downstream components (e.g. the Source Control Connector
+        # service) can read the validated user_id/groups/session_id without relying
+        # on spoofable model/tool arguments. The token is reset in a finally block so
+        # identity is isolated per invocation and never leaks across requests.
+        _context_token = set_request_context(agent_context)
+        try:
+            response = run_orchestrator(query=user_prompt, context=agent_context)
+        finally:
+            reset_request_context(_context_token)
 
         logger.info(f"✅ Orchestrator returned response")
         logger.info(f"   Response type: {type(response)}")

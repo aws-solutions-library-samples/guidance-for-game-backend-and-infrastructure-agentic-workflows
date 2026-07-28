@@ -7,6 +7,21 @@ Parameters:
     Default: game-agent
     Description: Project name used for resource naming
 
+  ScmCredentialSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. ARN of the Secrets Manager secret holding the Source Control
+      Connector write credential (SCM_Credential). Leave empty for read-only
+      deployments. When set, the AgentCore execution role is granted
+      secretsmanager:GetSecretValue scoped to this single secret ARN and no
+      additional (live-infrastructure) permissions.
+
+Conditions:
+  # Gate the Source Control Connector credential-read grant on a non-empty ARN.
+  # Read-only deployments that never set ScmCredentialSecretArn are unaffected.
+  ScmCredentialConfigured: !Not [!Equals [!Ref ScmCredentialSecretArn, '']]
+
 Resources:
   # Cognito User Pool
   UserPool:
@@ -403,6 +418,22 @@ Resources:
                   - xray:PutTraceSegments
                   - xray:PutTelemetryRecords
                 Resource: '*'
+        # Security: Source Control Connector credential read (opt-in, #SCM).
+        # Grants ONLY secretsmanager:GetSecretValue scoped to the single
+        # operator-provisioned connector secret. Added only when
+        # ScmCredentialSecretArn is set; adds NO live-infrastructure write
+        # actions. The runtime role stays read-only against live AWS.
+        - !If
+          - ScmCredentialConfigured
+          - PolicyName: ScmCredentialAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: ScmCredentialRead
+                  Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref ScmCredentialSecretArn
+          - !Ref 'AWS::NoValue'
 
   # IAM Role for ECS Tasks (Application Permissions)
   # Security: Uses least-privilege permissions instead of FullAccess managed policies

@@ -100,6 +100,33 @@ AGENT_TIMEOUT_SPECIALIST_SECONDS = int(
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("GBAW_RATE_LIMIT_MAX_REQUESTS", "10"))  # requests per window
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_WINDOW_SECONDS", "60"))  # window in seconds
 
+# =============================================================================
+# SOURCE CONTROL CONNECTOR (opt-in GitOps write path, disabled by default)
+# =============================================================================
+# Raw parsing of the connector's GBAW_SCM_* configuration, following the same
+# GBAW_-prefixed os.getenv() convention as RATE_LIMIT_* above.
+#
+# Per Requirement 12.1, connector configuration is read EXCLUSIVELY from these
+# GBAW_-prefixed environment variables; no other configuration source is
+# consulted. Values are intentionally kept as raw strings here — validation,
+# range checks, and the enabled/disabled decision live in
+# ConnectorConfig.load() so that misconfiguration results in a disabled
+# connector plus an audit entry rather than an import-time crash.
+SCM_CONNECTOR_ENABLED = os.getenv("GBAW_SCM_CONNECTOR_ENABLED", "false")  # truthy: true/1/yes
+SCM_PROVIDER = os.getenv("GBAW_SCM_PROVIDER")  # e.g. "github"
+SCM_CREDENTIAL_SECRET_ID = os.getenv("GBAW_SCM_CREDENTIAL_SECRET_ID")  # Secrets Manager id/ARN
+SCM_REPO_ALLOWLIST = os.getenv("GBAW_SCM_REPO_ALLOWLIST")  # "repo=branch,branch;repo=branch" grammar
+SCM_AUTHORIZED_GROUPS = os.getenv("GBAW_SCM_AUTHORIZED_GROUPS")  # comma-separated Cognito groups
+SCM_RATE_LIMIT_MAX = os.getenv("GBAW_SCM_RATE_LIMIT_MAX", "5")  # 1..1000, default 5
+SCM_RATE_LIMIT_WINDOW_SECONDS = os.getenv("GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS", "3600")  # 60..86400, default 3600
+SCM_PROVIDER_TIMEOUT_SECONDS = os.getenv("GBAW_SCM_PROVIDER_TIMEOUT_SECONDS", "30")  # 1..300, default 30
+SCM_RETRY_MAX_ATTEMPTS = os.getenv("GBAW_SCM_RETRY_MAX_ATTEMPTS", "3")  # 1..10, default 3
+SCM_MAX_FILES_PER_REQUEST = os.getenv("GBAW_SCM_MAX_FILES_PER_REQUEST", "20")  # max files per read request
+# Optional dedicated Knowledge Base for IaC/GitOps documentation. When set, the
+# source_control_agent is built with a KB retrieve tool (mirrors GAMELIFT_KB_ID /
+# EKS_KB_ID / COST_KB_ID above); when unset the specialist is built without it (Req 3.5).
+SCM_IAC_KB_ID = os.getenv("GBAW_SCM_IAC_KB_ID")
+
 # Vector store embedding configuration (Well-Architected GenAI Lens: Cost 3.4, Performance Efficiency)
 # Titan Embed v2 supports 256, 512, 1024 dimensions.
 # Lower dimensions = cheaper storage/queries, faster retrieval, slightly lower quality.

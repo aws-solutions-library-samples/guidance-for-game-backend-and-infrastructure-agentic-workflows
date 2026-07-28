@@ -322,6 +322,32 @@ GAMELIFT_KB_ID=$(grep "^GBAW_GAMELIFT_KB_ID=" .env.local 2>/dev/null | cut -d'='
 EKS_KB_ID=$(grep "^GBAW_EKS_KB_ID=" .env.local 2>/dev/null | cut -d'=' -f2 || echo "")
 COST_KB_ID=$(grep "^GBAW_COST_KB_ID=" .env.local 2>/dev/null | cut -d'=' -f2 || echo "")
 
+# Source Control Connector (disabled by default). Wire GBAW_SCM_* vars through the
+# same -env mechanism, including only the ones that are set so read-only deployments
+# that never configure the connector are unaffected. Only the Secrets Manager secret
+# id (GBAW_SCM_CREDENTIAL_SECRET_ID) is passed — never a raw credential value (Req 12.2).
+SCM_ENV_ARGS=()
+for _scm_var in \
+  GBAW_SCM_CONNECTOR_ENABLED \
+  GBAW_SCM_PROVIDER \
+  GBAW_SCM_CREDENTIAL_SECRET_ID \
+  GBAW_SCM_REPO_ALLOWLIST \
+  GBAW_SCM_AUTHORIZED_GROUPS \
+  GBAW_SCM_RATE_LIMIT_MAX \
+  GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS \
+  GBAW_SCM_PROVIDER_TIMEOUT_SECONDS \
+  GBAW_SCM_RETRY_MAX_ATTEMPTS \
+  GBAW_SCM_MAX_FILES_PER_REQUEST; do
+  # Prefer the value already exported in the environment; fall back to .env.local
+  _scm_val="${!_scm_var:-$(grep "^${_scm_var}=" .env.local 2>/dev/null | cut -d'=' -f2- || echo "")}"
+  if [ -n "$_scm_val" ]; then
+    SCM_ENV_ARGS+=(-env "${_scm_var}=${_scm_val}")
+  fi
+done
+if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
+  echo "   Source Control Connector: wiring ${#SCM_ENV_ARGS[@]} GBAW_SCM_* env var(s)"
+fi
+
 if [ -n "$GAMELIFT_KB_ID" ] && [ -n "$EKS_KB_ID" ] && [ -n "$COST_KB_ID" ]; then
   echo "   GameLift KB: $GAMELIFT_KB_ID"
   echo "   EKS KB: $EKS_KB_ID"
@@ -336,7 +362,8 @@ if [ -n "$GAMELIFT_KB_ID" ] && [ -n "$EKS_KB_ID" ] && [ -n "$COST_KB_ID" ]; then
     -env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN" \
     -env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN" \
     -env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN" \
-    -env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN"
+    -env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN" \
+    "${SCM_ENV_ARGS[@]}"
   echo "✅ AgentCore Runtime updated with KB IDs and Prompt ARNs"
 else
   echo "⚠️  KB IDs not found in .env.local - skipping runtime update"

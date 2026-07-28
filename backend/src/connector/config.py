@@ -1,0 +1,370 @@
+"""Connector configuration, validation, and the fail-closed enablement gate.
+
+This module turns the raw ``GBAW_SCM_*`` environment values parsed in
+``config/settings.py`` into a frozen, validated :class:`ConnectorConfig`. It is the
+single decision point for whether the Source Control Connector is *enabled*.
+
+Design contract (see ``.kiro/specs/source-control-connector/design.md`` → Data Models):
+
+- ``ConnectorConfig.load()`` reads connector configuration **exclusively** from the
+  ``GBAW_``-prefixed values exposed by ``config/settings.py`` and ignores every other
+  source (Req 12.1).
+- Enablement is truthy only when the flag case-insensitively (whitespace-trimmed)
+  matches one of ``{"true", "1", "yes"}`` (Req 1.4, 1.5).
+- ``load()`` **accumulates every validation failure** into ``config_errors`` rather than
+  raising, and any non-empty ``config_errors`` forces ``enabled=False`` — misconfiguration
+  yields a disabled connector plus an audit entry, never an import-time crash (Req 1.6,
+  12.4).
+- When the flag is truthy but a required value is missing/invalid, a single
+  configuration-error audit entry is emitted via the existing ``logger`` with every field
+  passed through ``sanitize_log_data`` so no raw credential can leak (Req 1.6, 12.3, 12.4).
+- The credential is referenced **only** by a Secrets Manager secret id/ARN; a value that
+  looks like a raw credential (token/PEM/AWS-key shape) is rejected and its value is
+  excluded from all audit output (Req 12.2, 12.3).
+
+Validation rules enforced by ``load()`` (all failures accumulate):
+
+- Enablement flag not truthy → disabled, **no error** (normal off state) (Req 1.1, 1.5).
+- ``provider`` unset/empty → error (Req 9.5). The provider *name* is validated later by
+  the provider factory (``get_provider``); here we only require it be present/non-empty.
+- ``credential_secret_id`` unset → error; raw-credential-shaped value → error and the
+  value is omitted from audit output (Req 12.2, 12.3).
+- Allowlist unparsable or zero entries → error (Req 5.4).
+- ``authorized_groups`` empty → error (Req 7.5).
+- ``rate_limit_max`` outside 1..1000 or ``rate_limit_window_seconds`` outside 60..86400 →
+  error; absent → defaults 5 / 3600 (Req 8.3, 8.4, 8.5).
+- ``provider_timeout_seconds`` outside 1..300 → error; absent → 30 (Req 10.1).
+- ``retry_max_attempts`` outside 1..10 → error; absent → 3 (Req 10.5).
+- ``max_files_per_request`` not a positive integer → error; absent → 20 (Req 3.2).
+"""
+
+# Standard library
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+# Local modules
+from config import settings
+from utils.logger import logger
+from utils.security import sanitize_log_data
+
+__all__ = ["AllowlistEntry", "ConnectorConfig"]
+
+# Accepted truthy enablement values (compared case-insensitively, whitespace-trimmed).
+_TRUTHY_VALUES = frozenset({"true", "1", "yes"})
+
+# Permitted ranges and defaults for the numeric tuning values.
+_RATE_LIMIT_MAX_MIN, _RATE_LIMIT_MAX_MAX, _RATE_LIMIT_MAX_DEFAULT = 1, 1000, 5
+_RATE_WINDOW_MIN, _RATE_WINDOW_MAX, _RATE_WINDOW_DEFAULT = 60, 86400, 3600
+_TIMEOUT_MIN, _TIMEOUT_MAX, _TIMEOUT_DEFAULT = 1, 300, 30
+_RETRY_MIN, _RETRY_MAX, _RETRY_DEFAULT = 1, 10, 3
+_MAX_FILES_DEFAULT = 20
+
+# A Secrets Manager secret ARN, e.g.
+# arn:aws:secretsmanager:us-west-2:123456789012:secret:my/secret-AbCdEf
+_SECRET_ARN_RE = re.compile(
+    r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$"
+)
+
+# Shapes that indicate a RAW credential was supplied in place of a secret id (Req 12.2,
+# 12.3). Matching any of these rejects the value; the value itself is never logged.
+_RAW_CREDENTIAL_PATTERNS = (
+    r"-----BEGIN",  # PEM private key / certificate block
+    r"github_pat_[A-Za-z0-9_]{20,}",  # GitHub fine-grained PAT
+    r"gh[pousr]_[A-Za-z0-9]{20,}",  # GitHub classic tokens (ghp_/gho_/ghu_/ghs_/ghr_)
+    r"xox[baprs]-",  # Slack-style tokens (defensive)
+    r"AKIA[0-9A-Z]{16}",  # AWS access key id
+)
+
+
+@dataclass(frozen=True)
+class AllowlistEntry:
+    """One repository paired with the branches the Connector may target (Req 5.1).
+
+    ``repo`` is an exact repository identifier (e.g. ``"org/iac-repo"``) and
+    ``target_branches`` is one or more exact branch names. Comparison at the tool
+    boundary is case-sensitive, full-string (Req 5.2).
+    """
+
+    repo: str
+    target_branches: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ConnectorConfig:
+    """Validated, immutable connector configuration and the ``enabled`` decision.
+
+    A non-empty ``config_errors`` always corresponds to ``enabled is False`` (Req 1.6,
+    12.4). Numeric fields always hold a valid in-range value (falling back to the
+    documented default when the supplied value was absent or invalid) so downstream code
+    can rely on them regardless of the enablement outcome.
+    """
+
+    enabled: bool
+    provider: str | None
+    credential_secret_id: str | None
+    allowlist: tuple[AllowlistEntry, ...]
+    authorized_groups: tuple[str, ...]
+    rate_limit_max: int
+    rate_limit_window_seconds: int
+    provider_timeout_seconds: int
+    retry_max_attempts: int
+    max_files_per_request: int
+    config_errors: tuple[str, ...]
+
+    @classmethod
+    def load(cls) -> "ConnectorConfig":
+        """Read ``GBAW_SCM_*`` config, validate it, and resolve the ``enabled`` gate.
+
+        Reads exclusively from the ``GBAW_``-prefixed values on ``config.settings``
+        (Req 12.1). Never raises: every failure is accumulated into ``config_errors`` and
+        forces ``enabled=False``. When the enablement flag is truthy but validation fails,
+        a configuration-error audit entry is emitted (Req 1.6, 12.4).
+        """
+        errors: list[str] = []
+
+        raw_flag = (settings.SCM_CONNECTOR_ENABLED or "").strip().lower()
+        truthy = raw_flag in _TRUTHY_VALUES
+
+        # Not truthy is the normal off state: the connector is disabled with NO error and
+        # no audit entry (Req 1.1, 1.5). Short-circuit before validation so a default
+        # read-only deployment reports empty config_errors.
+        if not truthy:
+            return cls._disabled_off_state()
+
+        # --- Provider: present/non-empty only. The provider *name* is validated later
+        # by the provider factory (get_provider); config just requires it exists. ---
+        provider = (settings.SCM_PROVIDER or "").strip() or None
+        if provider is None:
+            errors.append("provider: GBAW_SCM_PROVIDER is required but was not set")
+
+        # --- Credential secret id: required, and must be a secret id/ARN, not a raw value.
+        raw_secret = (settings.SCM_CREDENTIAL_SECRET_ID or "").strip()
+        credential_secret_id: str | None = raw_secret or None
+        if credential_secret_id is None:
+            errors.append(
+                "credential_secret_id: GBAW_SCM_CREDENTIAL_SECRET_ID is required but was not set"
+            )
+        elif _looks_like_raw_credential(credential_secret_id):
+            # Req 12.3: reject and NEVER echo the raw value into the error/audit output.
+            credential_secret_id = None
+            errors.append(
+                "credential_secret_id: a raw credential value was supplied in place of an "
+                "AWS Secrets Manager secret id; value rejected and omitted"
+            )
+
+        # --- Repository allowlist: must parse to at least one entry (Req 5.1, 5.4). ---
+        allowlist, allowlist_errors = _parse_allowlist(settings.SCM_REPO_ALLOWLIST)
+        errors.extend(allowlist_errors)
+        if not allowlist and not allowlist_errors:
+            errors.append(
+                "allowlist: GBAW_SCM_REPO_ALLOWLIST is required and must contain at least one entry"
+            )
+
+        # --- Authorized groups: comma-separated, at least one non-empty (Req 7.5). ---
+        authorized_groups = tuple(
+            g.strip() for g in (settings.SCM_AUTHORIZED_GROUPS or "").split(",") if g.strip()
+        )
+        if not authorized_groups:
+            errors.append(
+                "authorized_groups: GBAW_SCM_AUTHORIZED_GROUPS is required and must list at "
+                "least one Cognito group"
+            )
+
+        # --- Numeric tuning values: parse + range-check, falling back to defaults. ---
+        rate_limit_max = _parse_ranged_int(
+            settings.SCM_RATE_LIMIT_MAX,
+            name="rate_limit_max",
+            env="GBAW_SCM_RATE_LIMIT_MAX",
+            minimum=_RATE_LIMIT_MAX_MIN,
+            maximum=_RATE_LIMIT_MAX_MAX,
+            default=_RATE_LIMIT_MAX_DEFAULT,
+            errors=errors,
+        )
+        rate_limit_window_seconds = _parse_ranged_int(
+            settings.SCM_RATE_LIMIT_WINDOW_SECONDS,
+            name="rate_limit_window_seconds",
+            env="GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS",
+            minimum=_RATE_WINDOW_MIN,
+            maximum=_RATE_WINDOW_MAX,
+            default=_RATE_WINDOW_DEFAULT,
+            errors=errors,
+        )
+        provider_timeout_seconds = _parse_ranged_int(
+            settings.SCM_PROVIDER_TIMEOUT_SECONDS,
+            name="provider_timeout_seconds",
+            env="GBAW_SCM_PROVIDER_TIMEOUT_SECONDS",
+            minimum=_TIMEOUT_MIN,
+            maximum=_TIMEOUT_MAX,
+            default=_TIMEOUT_DEFAULT,
+            errors=errors,
+        )
+        retry_max_attempts = _parse_ranged_int(
+            settings.SCM_RETRY_MAX_ATTEMPTS,
+            name="retry_max_attempts",
+            env="GBAW_SCM_RETRY_MAX_ATTEMPTS",
+            minimum=_RETRY_MIN,
+            maximum=_RETRY_MAX,
+            default=_RETRY_DEFAULT,
+            errors=errors,
+        )
+        max_files_per_request = _parse_ranged_int(
+            settings.SCM_MAX_FILES_PER_REQUEST,
+            name="max_files_per_request",
+            env="GBAW_SCM_MAX_FILES_PER_REQUEST",
+            minimum=1,
+            maximum=None,
+            default=_MAX_FILES_DEFAULT,
+            errors=errors,
+        )
+
+        # Enablement gate: the flag is truthy here (non-truthy short-circuited above), so
+        # enablement hinges solely on whether validation accumulated any errors (Req 1.4,
+        # 1.6). The operator asked for the connector but validation failed → emit a single
+        # configuration-error audit entry (Req 1.6, 12.4).
+        enabled = not errors
+        if errors:
+            _emit_config_error_audit(errors)
+
+        return cls(
+            enabled=enabled,
+            provider=provider,
+            credential_secret_id=credential_secret_id,
+            allowlist=allowlist,
+            authorized_groups=authorized_groups,
+            rate_limit_max=rate_limit_max,
+            rate_limit_window_seconds=rate_limit_window_seconds,
+            provider_timeout_seconds=provider_timeout_seconds,
+            retry_max_attempts=retry_max_attempts,
+            max_files_per_request=max_files_per_request,
+            config_errors=tuple(errors),
+        )
+
+    @classmethod
+    def _disabled_off_state(cls) -> "ConnectorConfig":
+        """Return the disabled config for the normal off state (flag not truthy).
+
+        No validation is performed and no error/audit is produced (Req 1.1, 1.5); numeric
+        fields carry their documented defaults so the object is always well-formed.
+        """
+        return cls(
+            enabled=False,
+            provider=None,
+            credential_secret_id=None,
+            allowlist=(),
+            authorized_groups=(),
+            rate_limit_max=_RATE_LIMIT_MAX_DEFAULT,
+            rate_limit_window_seconds=_RATE_WINDOW_DEFAULT,
+            provider_timeout_seconds=_TIMEOUT_DEFAULT,
+            retry_max_attempts=_RETRY_DEFAULT,
+            max_files_per_request=_MAX_FILES_DEFAULT,
+            config_errors=(),
+        )
+
+
+def _looks_like_raw_credential(value: str) -> bool:
+    """Return ``True`` if ``value`` looks like a raw credential, not a secret id/ARN.
+
+    A valid Secrets Manager ARN is accepted outright. Otherwise the value is rejected if
+    it matches a known credential shape (PEM, GitHub/Slack token, AWS access key), if it
+    is a bare 40-char base64 string (AWS-secret-key shape), or if it contains whitespace
+    (never valid in a Secrets Manager id). This is a defensive heuristic (Req 12.2, 12.3).
+    """
+    if _SECRET_ARN_RE.match(value):
+        return False
+    if any(ch.isspace() for ch in value):
+        return True
+    for pattern in _RAW_CREDENTIAL_PATTERNS:
+        if re.search(pattern, value):
+            return True
+    # A bare AWS-secret-key-shaped string (exactly 40 base64 chars) is a raw credential,
+    # whereas a real secret *name* virtually always contains other characters/structure.
+    if re.fullmatch(r"[A-Za-z0-9/+=]{40}", value):
+        return True
+    return False
+
+
+def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[str]]:
+    """Parse the ``GBAW_SCM_REPO_ALLOWLIST`` grammar into ``AllowlistEntry`` values.
+
+    Grammar (Req 5.1)::
+
+        allowlist := entry ( ";" entry )*
+        entry     := repo "=" branch ( "," branch )*
+
+    Returns the parsed entries (order preserved) and a list of per-entry parse errors.
+    Empty ``;``-separated segments are ignored so a trailing separator is harmless.
+    """
+    errors: list[str] = []
+    if not raw or not raw.strip():
+        return (), errors
+
+    entries: list[AllowlistEntry] = []
+    for segment in raw.split(";"):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if "=" not in segment:
+            errors.append(
+                f"allowlist: entry '{segment}' is malformed (expected 'repo=branch[,branch...]')"
+            )
+            continue
+        repo_part, branches_part = segment.split("=", 1)
+        repo = repo_part.strip()
+        branches = tuple(b.strip() for b in branches_part.split(",") if b.strip())
+        if not repo:
+            errors.append(f"allowlist: entry '{segment}' has an empty repository identifier")
+            continue
+        if not branches:
+            errors.append(f"allowlist: repository '{repo}' has no target branches")
+            continue
+        entries.append(AllowlistEntry(repo=repo, target_branches=branches))
+
+    return tuple(entries), errors
+
+
+def _parse_ranged_int(
+    raw: str | None,
+    *,
+    name: str,
+    env: str,
+    minimum: int,
+    maximum: int | None,
+    default: int,
+    errors: list[str],
+) -> int:
+    """Parse ``raw`` as an int, validate its range, and append an error on failure.
+
+    On any failure (non-integer or out of ``[minimum, maximum]``) the documented
+    ``default`` is returned so the frozen config always holds a usable value, while an
+    explanatory message is appended to ``errors`` (Req 8.5, 10.1, 10.5).
+    """
+    text = (raw or "").strip()
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        errors.append(f"{name}: {env} value is not a valid integer")
+        return default
+
+    if value < minimum or (maximum is not None and value > maximum):
+        bound = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        errors.append(f"{name}: {env} value {value} is outside the permitted range ({bound})")
+        return default
+
+    return value
+
+
+def _emit_config_error_audit(errors: list[str]) -> None:
+    """Emit a single configuration-error audit entry (Req 1.6, 12.4).
+
+    Every error string is passed through ``sanitize_log_data`` as defense-in-depth so no
+    sensitive value can leak into the audit log (Req 12.3). The connector remains disabled.
+    """
+    sanitized = [sanitize_log_data(err) for err in errors]
+    logger.error(
+        "Source Control Connector configuration error; connector disabled",
+        event="scm_config_error",
+        outcome="disabled",
+        config_errors=sanitized,
+    )

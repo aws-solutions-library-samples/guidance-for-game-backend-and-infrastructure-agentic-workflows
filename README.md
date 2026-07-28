@@ -1,459 +1,380 @@
-# Guidance for Game Backend & Infrastructure Agentic Workflows
+# Source Control Connector
 
-This guidance demonstrates how to build an AI-powered game server management platform using a multi-specialist agent architecture on AWS. It uses Amazon Bedrock AgentCore Runtime with Strands Agents and Model Context Protocol (MCP) servers to provide natural language interaction with AWS game infrastructure services including Amazon GameLift, Amazon EKS, and AWS Cost Explorer.
+> **Reference:** This document covers the **Source Control Connector** only. For the full
+> platform guidance (overview, cost, deployment of the whole stack, MCP integration, testing,
+> and more), see the public README:
+> [aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows).
+
+The Source Control Connector (the "Connector") adds a safe, **opt-in write path** to the Game
+Backend & Infrastructure Agentic Workflows (GBAW) platform, which is otherwise read-only against
+live AWS infrastructure. Instead of mutating live resources, the agent proposes
+Infrastructure-as-Code (IaC) changes as **pull requests** against an IaC source repository. A
+human reviews the proposal; the existing CI/CD pipeline applies it after merge.
 
 ## Table of Contents
 
-- [Overview](#overview)
 - [Architecture](#architecture)
-- [Cost](#cost)
-- [Prerequisites](#prerequisites)
-- [Deployment](#deployment)
-- [Local Development](#local-development)
-- [Usage](#usage)
-- [MCP Integration](#mcp-integration)
-- [Testing](#testing)
-- [Monitoring and Observability](#monitoring-and-observability)
-- [Project Structure](#project-structure)
-- [Security](#security)
-- [Cleanup](#cleanup)
-- [Contributing](#contributing)
-- [License](#license)
-- [Notices](#notices)
-
-## Overview
-
-This solution implements a conversational AI assistant that helps game developers manage AWS infrastructure through natural language queries. A central orchestrator agent routes requests to domain-specific specialist agents, each equipped with MCP servers or AWS SDK tools for their respective AWS services.
-
-Key capabilities:
-
-- **GameLift Management** -- Fleet monitoring, scaling configuration, and game session analysis
-- **EKS/Kubernetes Operations** -- Cluster management, pod monitoring, and troubleshooting
-- **Cost Intelligence** -- Spending analysis, forecasting, and optimization recommendations
-- **Conversation Memory** -- Session-scoped context with optional cross-session long-term memory
-- **Guardrails** -- Content filtering, PII protection, and prompt injection detection via Amazon Bedrock Guardrails
-
-### Specialist Agents
-
-| Agent | Domain | Integration |
-|-------|--------|-------------|
-| **Orchestrator** | Query routing and multi-turn reasoning | Delegates to specialists |
-| **GameLift Specialist** | Fleet management, scaling, optimization | boto3 tools + Knowledge Base |
-| **EKS Specialist** | Kubernetes cluster operations | EKS MCP Server + Knowledge Base |
-| **Cost Specialist** | Spending analysis and forecasting | Cost Explorer MCP Server + Knowledge Base |
+- [Safety Posture](#safety-posture)
+- [Component Layering](#component-layering)
+- [Enablement Gate](#enablement-gate)
+- [Request Flow](#request-flow-propose-a-change)
+- [The Safety Pipeline](#the-safety-pipeline)
+- [Identity & Context Propagation](#identity--context-propagation)
+- [Provider Abstraction](#provider-abstraction)
+- [Configuration](#configuration)
+- [IAM & Credential Isolation](#iam--credential-isolation)
+- [Deployment Steps](#deployment-steps)
+- [IaC Validation](#iac-validation)
+- [Correctness Properties](#correctness-properties)
+- [Source Layout](#source-layout)
 
 ## Architecture
 
-The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers. All MCP servers run as subprocesses within the AgentCore container -- no external infrastructure is required for the agent backend.
+The Connector is delivered as a **new dedicated specialist agent** built with the existing
+`create_specialist_agent` factory and registered on the Orchestrator alongside the GameLift,
+EKS, and Cost specialists. It exposes provider-agnostic `@tool` functions and routes all
+source-control operations through a **common provider abstraction**, so additional providers
+(GitLab, CodeCommit) can be added later without touching the agent-facing tools.
 
 ![](diagrams/MultiAgent_Architecture.jpg)
 
-### Request Flow
+The Connector reuses existing platform components rather than re-implementing them:
 
-1. User authenticates via Amazon Cognito (JWT tokens in HttpOnly cookies)
-2. User sends a natural language query through the Next.js frontend on ECS Express (Fargate + ALB)
-3. Frontend invokes Bedrock AgentCore Runtime using the AWS SDK with SigV4 authentication
-4. AgentCore routes the request to the Orchestrator agent
-5. Amazon Bedrock Guardrails filter input for prompt injection, off-topic content, and PII
-6. Orchestrator classifies the query and delegates to the appropriate specialist agent
-7. Specialist queries its Bedrock Knowledge Base for domain-specific context (RAG)
-8. Specialist invokes MCP servers (EKS, Cost Explorer) or boto3 tools (GameLift) for live AWS data
-9. Read-only API calls execute against target AWS services with least-privilege IAM policies
-10. Response flows back through the chain to the user
+| Concern | Reused component |
+|---|---|
+| Agent/tool construction | `agents/base_specialist.py::create_specialist_agent` |
+| Credential retrieval | `utils/secrets.py::get_secret` (Secrets Manager, 5-min TTL cache, audit logging) |
+| Config | `config/settings.py` (`GBAW_`-prefixed env vars) |
+| Rate limiting | `utils/security.py::check_rate_limit`, `get_rate_limit_key`, `RateLimitExceeded` |
+| Input validation / injection detection | `utils/security.py::validate_prompt`, `INJECTION_PATTERNS` |
+| Audit redaction | `utils/security.py::sanitize_log_data`, `SENSITIVE_PATTERNS` |
+| Authorization | `utils/security.py::verify_request_authorization` |
+| Logging / audit sink | `utils/logger.py::logger` → stdout → ADOT/CloudWatch |
 
-### Technology Stack
+## Safety Posture
 
-| Layer | Technology |
-|-------|------------|
-| Frontend | Next.js, TypeScript, CopilotKit, AWS SDK v3 |
-| Backend | Python 3.13, Strands Agents, Bedrock AgentCore SDK |
-| AI Models | Amazon Bedrock (Claude Haiku 4.5 for orchestration, Claude Sonnet 4.5 for specialists) |
-| MCP Servers | AWS Labs MCP servers (EKS, CCAPI, Cost Explorer) via stdio transport |
-| Authentication | Amazon Cognito with group-based authorization |
-| Infrastructure | AWS CloudFormation, ECS Express (Fargate + ALB), ECR |
-| Observability | Amazon CloudWatch, AWS X-Ray, OpenTelemetry |
+The design preserves the platform's core safety guarantees:
 
-## Cost
+- **The AgentCore Runtime IAM role stays read-only against live AWS infrastructure.** The only
+  new grant is `secretsmanager:GetSecretValue` scoped to a single secret ARN.
+- **The write credential lives in a Secrets Manager secret** — never in IAM, never in an
+  environment variable. That secret is the isolation boundary.
+- **The Connector is disabled by default.** When disabled, the platform behaves exactly as it
+  does today, and the `source_control_agent` is never registered on the Orchestrator.
+- **The abstraction defines only read/propose operations.** There is deliberately **no** merge,
+  approve, or close operation, so it is structurally impossible for the Connector to merge or
+  close a proposal. Every change requires a human review and merge.
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,129.23 per month** for processing approximately 10,000 agent queries per month.
+## Component Layering
 
-We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
+The Connector is organized into four layers, from agent-facing down to the provider wire:
 
-### Sample Cost Table
+1. **Agent-facing tool layer** (`connector/tools.py`) — `@tool` functions
+   (`get_iac_file`, `propose_infrastructure_change`) with provider-agnostic, JSON-serialisable
+   signatures. Registered on the `source_control_agent` specialist. This is the only layer the
+   Orchestrator/LLM sees. Tools never raise to the model; they return structured, secret-free
+   dicts.
+2. **Connector service layer** (`connector/service.py`) — orchestrates the safety pipeline for
+   every operation (see below). Provider-agnostic.
+3. **Provider abstraction layer** (`connector/provider.py`) — `SourceControlProvider` ABC
+   defining a fixed operation set; a factory selects the concrete adapter from
+   `GBAW_SCM_PROVIDER`.
+4. **Provider adapter layer** (`connector/github_provider.py`) — `GitHubProvider` implements
+   every operation against the GitHub REST API. Provider-specific types never escape this layer.
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context).
+## Enablement Gate
 
-| AWS service | Dimensions | Cost [USD] |
-| ----------- | ------------ | ------------ |
-| Amazon Bedrock (Claude Sonnet 4.5) | 80M input tokens @ $3.30/M + 20M output tokens @ $16.50/M (specialist agents) | $594.00 |
-| Amazon OpenSearch Serverless (Knowledge Bases) | 2 OCUs (indexing + search) @ $0.24/OCU-hour × 730 hours | $350.40 |
-| Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.10/M + 10M output tokens @ $5.50/M (orchestrator) | $99.00 |
-| Amazon CloudWatch + AWS X-Ray | Logs, metrics, and distributed traces for all components | $25.00 |
-| Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hour × 730 hours + ~730 LCU-hours @ $0.008 | $22.27 |
-| Amazon ECS (Fargate) | 1 task, 0.5 vCPU @ $0.04048/hour + 1 GB @ $0.004445/GB-hour × 730 hours | $18.02 |
-| Amazon Bedrock AgentCore Runtime | ~10,000 invocations, ~30s each: 1 vCPU @ $0.0895/hour + 2 GB @ $0.00945/GB-hour | $9.04 |
-| AWS WAF | 1 WebACL with managed rules + ~1M requests | $8.00 |
-| AWS CloudTrail | Management events (first trail free) + data events | $2.00 |
-| Amazon Inspector | Container image scanning (~10 images) | $1.30 |
-| Amazon ECR | Image storage (~2 GB) @ $0.10/GB-month | $0.20 |
-| Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00 |
-| **Total** | | **~$1,129.23/month** |
+At container startup (in `prewarm_container()` in `agentcore_main.py`), the Connector evaluates a
+single `ConnectorConfig.load()` call that reads all `GBAW_SCM_*` variables and validates them.
+The result is a frozen `ConnectorConfig` with an `enabled` boolean:
 
-## Prerequisites
+- `enabled` is `True` **only when** the enablement flag is truthy **and** every required value is
+  present and valid — a supported provider with an available adapter, a non-empty allowlist,
+  non-empty authorized groups, a secret **id** that is not a raw credential, and rate-limit /
+  timeout / retry values in range.
+- When `enabled` is `False`, the `source_control_agent` is **not** added to the Orchestrator's
+  `tools=[...]` list, so no change-proposal tools are exposed. Any config error that forced
+  disablement is written to the audit log identifying the offending values.
 
-### Required Tools
+Disablement is the safe default and the *only* state reachable on misconfiguration —
+`ConnectorConfig.load()` never raises; it accumulates every validation failure into
+`config_errors` and forces `enabled=False`.
 
-| Tool | Version | Installation |
-|------|---------|--------------|
-| AWS CLI | v2+ | [Install Guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) |
-| Node.js | 18+ | [Download](https://nodejs.org/) |
-| uv | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| yq | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
-| Docker | Latest (optional) | [Install Guide](https://docs.docker.com/get-docker/) |
+## Request Flow (propose a change)
 
-Python 3.13 and the AgentCore CLI are automatically installed by `uv` during setup. Docker is only required for building and deploying the frontend container image; frontend deployment steps are skipped if Docker is not available.
+```mermaid
+flowchart TD
+    U[Requesting_User query] --> FE[UI proxy chat.ts]
+    FE --> IA["agentcore_main.invoke_agent<br/>validate_prompt + user_context"]
+    IA -->|set request_context contextvar| RO["run_orchestrator(query, context)"]
+    RO --> ORCH[Orchestrator Agent]
+    ORCH -->|routes IaC change| SCA[source_control_agent specialist]
+    SCA -->|"@tool propose_infrastructure_change"| SVC[Connector Service]
 
-### AWS Account Requirements
+    subgraph Safety pipeline
+      SVC --> G1{enabled?}
+      G1 -- no --> DECL[decline]
+      G1 -- yes --> G2["validate_prompt / injection re-check"]
+      G2 --> G3["authorize groups"]
+      G3 --> G4["allowlist exact-match"]
+      G4 --> G5["rate limit per user"]
+      G5 --> G6["get_secret SCM_Credential"]
+      G6 --> G7["validate IaC parse"]
+    end
 
-- **Bedrock Model Access**: Claude Sonnet 4.5 and Claude Haiku 4.5 enabled in your target region
-- **Service Quotas**: Default quotas are sufficient for most deployments
-- **IAM Permissions**: Administrator access (or equivalent) for initial deployment
-
-<details>
-<summary><strong>Minimum IAM permissions (click to expand)</strong></summary>
-
-If you cannot use Administrator access, the deploying principal needs permissions for:
-
-| Service | Actions Required | Purpose |
-|---------|-----------------|---------|
-| CloudFormation | Full stack CRUD | Deploy/update/delete all stacks |
-| IAM | Create/manage roles and policies | Service roles for ECS, AgentCore, etc. |
-| Amazon ECR | Repository CRUD, image push | Frontend container registry |
-| Amazon ECS | Service/task management | Frontend hosting |
-| Amazon Cognito | User pool CRUD | Authentication |
-| Amazon Bedrock | Model access, Guardrails, Knowledge Bases, AgentCore | AI agents and safety |
-| Amazon S3 | Bucket CRUD, object operations | Knowledge Base storage, CloudTrail logs |
-| CloudWatch Logs | Log group CRUD, delivery management | Observability |
-| AWS X-Ray | Trace read/write | Distributed tracing |
-| AWS CodeBuild | Project CRUD, build execution | AgentCore Runtime deployment |
-| AWS WAF | WebACL CRUD | Frontend protection |
-| AWS CloudTrail | Trail CRUD | API audit logging |
-| Amazon Inspector | Enable scanning | Container vulnerability scanning |
-| AWS STS | GetCallerIdentity | Credential verification |
-
-The CloudFormation templates use `CAPABILITY_NAMED_IAM` to create scoped service roles with least-privilege access.
-
-</details>
-
-To enable Bedrock models:
-
-1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock/)
-2. Navigate to **Model access**
-3. Enable Anthropic Claude 4.5 Sonnet and Anthropic Claude 4.5 Haiku
-4. Save changes
-
-### Windows Users
-
-Native Windows support is provided via the PowerShell module in `scripts/powershell/`. See [scripts/powershell/README.md](scripts/powershell/README.md) for setup and usage.
-
-```powershell
-Import-Module ./scripts/powershell/GameAgent.psd1
-Deploy-GameAgent -Profile <your-profile>   # Full deployment
-Remove-GameAgent -Profile <your-profile>   # Full teardown
+    G7 --> PF[Provider factory -> GitHubProvider]
+    PF --> P1[read latest target-branch HEAD]
+    P1 --> P2[create unique proposal branch]
+    P2 --> P3[commit modified files]
+    P3 --> P4[open pull request w/ attribution]
+    P4 --> AUD["audit log (redacted)"]
+    AUD --> RES[return PR id + URL]
+    RES --> SCA
 ```
 
-**Prerequisites:** PowerShell 7.0+ and AWS CLI v2. No WSL2 or Linux environment required.
+Every gate runs **before** any source-control operation is issued and, on failure, returns a
+typed error to the agent and records an audit entry — never leaving partial state.
 
-## Deployment
+## The Safety Pipeline
 
-### Full AWS Deployment
+`propose_change` runs these gates in **exact order**, failing closed at each step:
 
-**Step 1:** Configure and verify AWS credentials (run `aws configure` separately — it's interactive):
-```bash
-aws configure
-aws sts get-caller-identity  # Verify credentials work
+1. **Enablement** — a disabled connector declines cleanly and exposes nothing.
+2. **Input validation / injection** — `validate_prompt(intent, strict_mode=True)` plus an
+   `INJECTION_PATTERNS` re-check across `intent`/`title`/`description`. Guardrails already run
+   upstream in `invoke_agent`; this is the tool-boundary re-check. A flag → reject + audit.
+3. **Authorization** — identity/groups are read **from the request contextvar** (never model
+   input); `verify_request_authorization(...)` requires an authenticated user in one of
+   `config.authorized_groups`. Unauthenticated vs. wrong-group are distinguished in the audit.
+4. **Allowlist** — a **case-sensitive, full-string** match of `(repo, target_branch)` against
+   `config.allowlist` (no partial/prefix/substring/wildcard). The effective repo/branch are
+   taken from the **matched allowlist entry**, never from model input, so injected input cannot
+   redirect a write.
+5. **Rate limit** — `check_rate_limit(get_rate_limit_key(user_id, "scm_propose"), ...)`
+   per-user; exceeding it returns a message stating the limit and reset time.
+6. **Credential fetch** — `get_secret(config.credential_secret_id, source="secretsmanager")`
+   within the provider timeout. Failure or timeout fails closed with no branch/PR.
+7. **IaC validation** — `validate_iac(files, iac_format)`. Empty file sets are declined cleanly;
+   malformed content is declined with the offending file named.
+8. **Provider ops** (transient-only retries, up to `retry_max_attempts`):
+   `latest_commit_sha` → generate a unique `proposal_branch` (regenerated on collision) →
+   `create_branch` → `commit_files` → `open_pull_request` with agent + user attribution. A
+   `ProviderAuthError` is **never** retried; only `ProviderTransientError` is.
+9. **Audit + return** — writes a success audit entry; if that audit write fails, the action is
+   aborted atomically and an audit-persistence error is returned. Success is **never** reported
+   without a durable audit record.
+
+Failure-mode mapping: connect/read timeout → `ProviderUnavailableError`/`ProviderTransientError`;
+HTTP 401/403 → `ProviderAuthError` (no retry); HTTP 409 → `ProviderConflictError` (no destructive
+resolution); HTTP 5xx/429 → `ProviderTransientError` (retryable). If PR creation fails **after**
+a branch was created, the Connector reports failure and never reports success.
+
+## Identity & Context Propagation
+
+The `create_specialist_agent` factory produces a `@tool` whose only declared argument is
+`query: str`, so the Connector tools cannot receive the `Requesting_User` identity through the
+tool call. Deriving identity from tool/model arguments would also be **spoofable** by a
+prompt-injected model.
+
+The chosen mechanism is a request-scoped `contextvars.ContextVar` in `utils/request_context.py`:
+
+```python
+_request_context: ContextVar[dict] = ContextVar("gbaw_request_context", default={})
+def set_request_context(ctx: dict) -> Token: return _request_context.set(ctx)
+def get_request_context() -> dict: return _request_context.get()
+def reset_request_context(token) -> None: _request_context.reset(token)
 ```
 
-**Step 2:** Create environment configuration and deploy:
-```bash
-# Create environment configuration
-cp ui/.env.local.example ui/.env.local
+It is **set** in `agentcore_main.invoke_agent` immediately before `run_orchestrator` and **reset**
+in a `finally` block, so identity is isolated per invocation and never leaks across requests:
 
-# Deploy all infrastructure (8 automated steps)
-./deploy-all.sh
-# Optional: override AWS profile (can also be set in ui/.env.local)
-# AWS_PROFILE=<your-profile> ./deploy-all.sh
-
-# Create an admin user for the Cognito user pool
-./scripts/infrastructure/add-admin-user.sh
-
-# Run tests against the deployed stack
-./test-full.sh
+```python
+_token = set_request_context(agent_context)
+try:
+    response = run_orchestrator(query=user_prompt, context=agent_context)
+finally:
+    reset_request_context(_token)
 ```
 
-The deployment script provisions the following resources:
+The Connector service layer reads `user_id` and Cognito `groups` via `get_request_context()`.
+**The Connector derives the Requesting_User strictly from the request context, never from
+agent/model-supplied input.**
 
-1. Base infrastructure (Cognito user pool, IAM roles, ECR repositories)
-2. Bedrock Guardrails (content filtering, PII protection)
-3. Managed prompts (Bedrock Prompt Management)
-4. Account-level observability configuration
-5. AgentCore Runtime (backend container via CodeBuild)
-6. Bedrock Knowledge Bases (GameLift, EKS, Cost documentation)
-7. Frontend infrastructure (ECS Express + ALB)
-8. Security infrastructure (WAF, CloudTrail, Inspector)
+## Provider Abstraction
 
-See [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) for detailed step-by-step deployment instructions and environment variable reference.
+A fixed operation set shared by all adapters. All parameters and return values use
+provider-agnostic dataclasses; no GitHub type is referenced in the signatures.
 
-## Local Development
-
-```bash
-# Install backend dependencies
-cd backend && uv sync && cd ..
-
-# Create environment configuration (if not already done)
-cp ui/.env.local.example ui/.env.local
-
-# Start both backend (port 8080) and frontend (port 3000)
-./dev-start.sh
-
-# Access the UI at http://localhost:3000
-
-# Stop all services
-./dev-stop.sh
+```python
+class SourceControlProvider(ABC):
+    def get_file(self, repo, branch, path) -> FileContent | None: ...
+    def get_files(self, repo, branch, paths) -> FileFetchResult: ...
+    def branch_exists(self, repo, branch) -> bool: ...
+    def latest_commit_sha(self, repo, branch) -> str: ...
+    def create_branch(self, repo, new_branch, from_sha) -> None: ...
+    def commit_files(self, repo, branch, files, message) -> str: ...
+    def open_pull_request(self, repo, head, base, title, body) -> PullRequestResult: ...
 ```
 
-In local development mode:
+Typed exceptions (`ProviderUnavailableError`, `ProviderAuthError`, `ProviderConflictError`,
+`ProviderTransientError`, `UnsupportedProviderError`) let the service layer react uniformly. The
+factory selects the adapter:
 
-- AgentCore Runtime runs locally with all specialist agents
-- MCP servers run embedded via stdio transport
-- Frontend connects directly to the local backend (no Cognito auth by default)
-- AWS service access (GameLift, EKS, Cost Explorer) uses your local AWS credentials
-
-### Backend Only
-
-```bash
-cd backend
-uv sync
-source .venv/bin/activate
-python src/agentcore_main.py
+```python
+def get_provider(config: ConnectorConfig) -> SourceControlProvider:
+    if config.provider == "github":
+        return GitHubProvider(config)
+    raise UnsupportedProviderError(config.provider)   # caught at load -> disabled
 ```
 
-### Frontend Only
+**GitHub adapter details.** Uses `httpx` (pinned) with a per-request timeout from
+`GBAW_SCM_PROVIDER_TIMEOUT_SECONDS`; **no local `git clone`** (the container FS is read-only) —
+it uses the GitHub Git Data / Contents REST endpoints. The credential is fetched per-operation
+via `get_secret(...)`, placed in the `Authorization` header, and never logged. Outbound HTTPS to
+`api.github.com` (or a configured GitHub Enterprise base URL) must be allowed from the AgentCore
+runtime.
 
-```bash
-cd ui
-npm install
-npm run dev
-```
+## Configuration
 
-## Usage
+All configuration is read **exclusively** from `GBAW_`-prefixed environment variables; any other
+source is ignored. Raw parsing lives in `config/settings.py`; validation and the `enabled`
+decision live in `ConnectorConfig.load()` so misconfiguration → disabled + audit, never an
+import-time crash.
 
-Once the application is running (locally or deployed), interact with the AI assistant through the chat interface.
+| Variable | Default | Notes |
+|---|---|---|
+| `GBAW_SCM_CONNECTOR_ENABLED` | `false` | Truthy = case-insensitive `{"true","1","yes"}` (trimmed) |
+| `GBAW_SCM_PROVIDER` | — | e.g. `github` |
+| `GBAW_SCM_CREDENTIAL_SECRET_ID` | — | Secrets Manager id/ARN (a **raw credential** value is rejected) |
+| `GBAW_SCM_REPO_ALLOWLIST` | — | See grammar below |
+| `GBAW_SCM_AUTHORIZED_GROUPS` | — | Comma-separated Cognito groups |
+| `GBAW_SCM_RATE_LIMIT_MAX` | `5` | 1..1000 |
+| `GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS` | `3600` | 60..86400 |
+| `GBAW_SCM_PROVIDER_TIMEOUT_SECONDS` | `30` | 1..300 |
+| `GBAW_SCM_RETRY_MAX_ATTEMPTS` | `3` | 1..10 |
+| `GBAW_SCM_MAX_FILES_PER_REQUEST` | `20` | Read-path cap |
+| `GBAW_SCM_IAC_KB_ID` | — | Optional IaC Knowledge Base; wires a `retrieve` tool when set |
 
-### GameLift Management
-
-```
-"Show me my GameLift fleets"
-"How is my production fleet performing?"
-"What scaling configuration does my fleet use?"
-```
-
-### EKS/Kubernetes Operations
-
-```
-"List my EKS clusters"
-"Show me failing pods in the default namespace"
-"What's the status of my game-agones-cluster?"
-```
-
-### Cost Analysis
-
-```
-"What's my current AWS spending?"
-"How much am I spending on GameLift vs EKS?"
-"Show me cost optimization opportunities"
-```
-
-### Authentication
-
-- **Development mode** (`NEXT_PUBLIC_SKIP_AUTH=true`): No authentication required (default in `.env.local`)
-- **Production mode** (`NEXT_PUBLIC_SKIP_AUTH=false`): Cognito authentication enforced; users must be in the `admin` or `users` group
-
-## MCP Integration
-
-All three MCP servers use stdio transport exclusively. They run as embedded subprocesses within the AgentCore Runtime container.
-
-| MCP Server | Purpose | Specialist |
-|------------|---------|------------|
-| `awslabs.eks-mcp-server` | Kubernetes cluster management | EKS Specialist |
-| `awslabs.aws-api-mcp-server` | AWS CLI bridge for resource discovery (e.g. `aws eks list-clusters`) | EKS Specialist |
-| `awslabs.cost-explorer-mcp-server` | Cost analysis and forecasting | Cost Specialist |
-
-MCP clients are created through a thread-safe factory (`utils/mcp_client_factory.py`) with automatic retry and fallback to boto3 when MCP servers are unavailable.
-
-### Enrolling EKS Clusters
-
-To enable full Kubernetes API access (pods, deployments, services), enroll your EKS clusters:
-
-```bash
-cd infrastructure/kubernetes
-
-# Basic enrollment
-./enroll-cluster.sh my-cluster us-west-2
-
-# With audit logging
-./enroll-cluster.sh my-cluster us-west-2 --enable-audit-logs
-
-# Deregister a cluster
-./deregister-cluster.sh my-cluster us-west-2
-```
-
-Enrollment configures read-only Kubernetes RBAC and updates the `aws-auth` ConfigMap. Secrets are explicitly excluded from the read-only permissions.
-
-## Testing
-
-The project includes unit, integration, end-to-end, and AI evaluation tests.
-
-### Quick Start
-
-```bash
-# Unit tests only (no deployment or running services needed)
-./test-unit.sh
-
-# Full smart test suite (auto-detects deployment status)
-./test-full.sh
-```
-
-### Test Categories
-
-| Command | Description | Requirements |
-|---------|-------------|--------------|
-| `./test-unit.sh` | Backend + frontend unit tests | None |
-| `./test-local.sh` | Unit tests only | None |
-| `./test-cloud.sh` | Cloud integration tests | Deployed stack |
-| `./test-e2e.sh` | End-to-end browser tests | Running services |
-| `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack |
-| `./test-stress.sh` | Performance and load tests | Deployed stack |
-| `./test-memory.sh` | Memory subsystem tests | Deployed stack |
-
-### Backend Tests (pytest)
-
-```bash
-cd backend
-pytest -m unit              # Fast unit tests (mocked)
-pytest -m integration       # Integration tests (real services)
-pytest -m cloud             # Cloud-only tests (requires deployment)
-pytest -m ai_eval           # AI evaluation tests
-```
-
-### Frontend Tests
-
-```bash
-cd ui
-npm test                    # Jest unit tests
-npm run test:coverage       # Coverage report
-npm run test:e2e            # Playwright E2E tests
-npm run test:e2e:smoke      # Smoke tests only
-```
-
-## Monitoring and Observability
-
-The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing.
-
-- **CloudWatch Logs**: Structured JSON logs from all components (14-day retention for application logs, 90-day for audit logs)
-- **AWS X-Ray**: Distributed tracing across the full request flow, from frontend through AgentCore to AWS service calls
-- **OpenTelemetry**: Instrumentation for traces and metrics exported via ADOT (AWS Distro for OpenTelemetry)
-
-```bash
-# View runtime logs
-aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT --follow
-
-# View frontend logs
-aws logs tail /ecs/game-agent-frontend --follow
-```
-
-X-Ray traces are available in the AWS Console under CloudWatch > Gen AI Observability > AgentCore.
-
-## Project Structure
+**Repository allowlist grammar** — a compact, env-friendly encoding parsed into `AllowlistEntry`s:
 
 ```
-sample-game-backend-agentic-workflows/
-├── backend/                        # Python AgentCore Runtime backend
-│   ├── src/
-│   │   ├── agents/                 # Orchestrator and specialist agents
-│   │   ├── config/                 # Configuration (settings.py)
-│   │   ├── models/                 # AI model configurations
-│   │   ├── utils/                  # MCP client factory, logging, timing
-│   │   └── agentcore_main.py       # AgentCore Runtime entrypoint
-│   └── tests/                      # Unit, integration, and AI evaluation tests
-├── ui/                             # Next.js frontend
-│   ├── src/
-│   │   ├── components/             # React components (Chat)
-│   │   ├── pages/                  # Next.js pages and API routes
-│   │   └── lib/                    # Utility libraries
-│   └── __tests__/                  # Frontend tests
-├── infrastructure/                 # CloudFormation templates and Kubernetes scripts
-│   ├── cloudformation/             # IaC deployment templates
-│   └── kubernetes/                 # EKS cluster enrollment scripts
-├── scripts/                        # Deployment and development automation
-│   ├── deploy.sh                   # Main deployment logic
-│   ├── teardown.sh                 # Main teardown logic
-│   ├── powershell/                 # PowerShell module for Windows (Deploy-GameAgent, etc.)
-│   ├── dev/                        # Development environment scripts
-│   ├── test/                       # Testing automation
-│   └── infrastructure/             # Infrastructure utilities
-├── docs/                           # Additional documentation
-│   ├── ARCHITECTURE.md             # Detailed architecture documentation
-│   ├── DEPLOYMENT_GUIDE.md         # Step-by-step deployment guide
-│   ├── SECURITY.md                 # Security controls and compliance
-│   ├── THREAT_MODEL.md             # STRIDE threat analysis
-│   └── DEPENDENCY_MATRIX.md        # Dependency versions and pinning rationale
-├── deploy-all.sh                   # Full AWS deployment (wrapper)
-├── teardown-all.sh                 # Full AWS teardown (wrapper)
-├── dev-start.sh                    # Start local development
-├── dev-stop.sh                     # Stop local development
-├── test-full.sh                    # Run all tests (auto-detects mode)
-└── test-unit.sh                    # Run unit tests
+allowlist  := entry ( ";" entry )*
+entry      := repo "=" branch ( "," branch )*
+# example:   org/iac-repo=main,release;org/other-iac=main
 ```
 
-Root-level shell scripts are convenience wrappers that delegate to the corresponding scripts in `scripts/`.
+Comparison at the tool boundary is case-sensitive, full-string on both `repo` and
+`target_branch` — no partial/prefix/wildcard matching.
 
-## Security
+## IAM & Credential Isolation
 
-> **📖 Full documentation:** [SECURITY.md](SECURITY.md) (encryption, data protection, trust boundaries, patching) | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) (STRIDE threat analysis with attack trees)
+Exactly one scoped statement is added to the existing `AgentCoreExecutionRole` in
+`infrastructure/cloudformation/01-base-infrastructure.yaml`. **No live-infrastructure write
+actions are added.**
 
-This solution implements defense-in-depth security controls across all layers:
-
-| Layer | Controls |
-|-------|----------|
-| **Authentication** | Amazon Cognito with JWT tokens, group-based authorization, admin-only user creation |
-| **Transport** | TLS 1.2+ enforced on all connections (AWS-managed certificates) |
-| **Encryption** | AES-256 encryption at rest for all data (S3, CloudWatch, AgentCore Memory) |
-| **Authorization** | IAM least-privilege policies with read-only access to target services |
-| **AI Safety** | Amazon Bedrock Guardrails for content filtering, PII anonymization, and prompt injection detection |
-| **Input Validation** | Prompt sanitization, injection pattern detection, sensitive data redaction ([utils/security.py](backend/src/utils/security.py)) |
-| **Audit** | CloudTrail logging for all AWS API calls, CloudWatch for application activity |
-| **Vulnerability Scanning** | AWS Inspector for container images, Dependabot for dependency updates |
-| **No Static Credentials** | All service-to-service authentication uses IAM roles with automatic credential rotation |
-
-## Cleanup
-
-To remove all deployed resources:
-
-```bash
-AWS_PROFILE=<your-profile> ./teardown-all.sh
+```yaml
+- PolicyName: ScmCredentialAccess
+  PolicyDocument:
+    Version: '2012-10-17'
+    Statement:
+      - Sid: ScmCredentialRead
+        Effect: Allow
+        Action: secretsmanager:GetSecretValue
+        Resource: !Ref ScmCredentialSecretArn   # scoped to the connector secret only
 ```
 
-The teardown script is idempotent and removes resources in reverse deployment order.
+`ScmCredentialSecretArn` is a template parameter defaulting to empty, gated by a `Condition`, so
+read-only deployments that never set it are unaffected. The secret is **operator-provisioned**
+(not created by the stack), so the write token never lives in template state.
 
-## Contributing
+## Deployment Steps
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs, suggesting features, and submitting pull requests.
+The Connector ships **disabled**. To enable it against a GitHub IaC repository:
 
-## License
+1. **Provision the write credential.** Create a Secrets Manager secret containing a scoped GitHub
+   token (or GitHub App installation token) with `contents:write` and `pull_requests:write` on
+   the target repo. Note its ARN.
 
-This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
+2. **Grant scoped read of that secret.** Deploy the base infrastructure stack with the
+   `ScmCredentialSecretArn` parameter set to the secret's ARN. This adds the single
+   `secretsmanager:GetSecretValue` statement scoped to that ARN (and nothing else).
 
-## Notices
+3. **Set the connector environment.** Provide the `GBAW_SCM_*` variables (see
+   [Configuration](#configuration)). At minimum:
 
-Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.
+   ```bash
+   export GBAW_SCM_CONNECTOR_ENABLED=true
+   export GBAW_SCM_PROVIDER=github
+   export GBAW_SCM_CREDENTIAL_SECRET_ID=<secrets-manager-id-or-arn>
+   export GBAW_SCM_REPO_ALLOWLIST="org/iac-repo=main,release"
+   export GBAW_SCM_AUTHORIZED_GROUPS="scm-writers"
+   ```
+
+   Only the **secret id** is ever passed as an env var — never the credential value.
+
+4. **Deploy.** `scripts/deploy.sh` wires all `GBAW_SCM_*` vars through the existing
+   `agentcore launch --auto-update-on-conflict -env KEY=VALUE` mechanism (the same path used for
+   KB IDs and prompt ARNs). Runtime dependencies `httpx` and `python-hcl2` are added in
+   `pyproject.toml`, locked in `uv.lock`, and exported to `requirements.txt`.
+
+5. **Allow egress.** Ensure the AgentCore runtime can reach the provider host
+   (`api.github.com` or your GitHub Enterprise base URL) over HTTPS.
+
+6. **Verify.** On startup, `ConnectorConfig.load()` validates the config. If enabled and valid,
+   the `source_control_agent` is registered on the Orchestrator and the routing rule for
+   infrastructure-change proposals becomes active. If anything is invalid, the Connector stays
+   disabled and the reason is written to the audit log.
+
+## IaC Validation
+
+Validation runs **before** any branch/commit/PR call and operates on the agent-proposed file
+contents in memory (read-only FS friendly):
+
+- **CloudFormation** — parsed with a CFN-aware YAML/JSON loader that tolerates intrinsic short
+  tags (`!Ref`, `!Sub`, `!GetAtt`, …). Structural checks require a non-empty top-level
+  `Resources` map with a `Type` on each resource.
+- **Terraform** — parsed with `python-hcl2`.
+
+Any parse or structural failure raises `IaCValidationError` naming the offending file and reason,
+and the proposal is declined without touching the repository.
+
+## Correctness Properties
+
+The Connector is validated by 22 property-based tests (Hypothesis, `@settings(max_examples=100)`)
+plus example, smoke, and a credential-gated integration test. Highlights:
+
+| # | Property |
+|---|---|
+| 1–2 | Truthy + valid config enables; not-truthy/any-invalid config disables and records offending values |
+| 3 | Enablement governs tool exposure (specialist registered iff enabled) |
+| 4–5 | Allowlist parse round-trip; operations occur **only** on an exact allowlist match |
+| 6 | Authorization gate (authenticated **and** in an authorized group) |
+| 7 | Per-user proposal rate limit |
+| 8–9 | Credential values never appear in output; credential-retrieval failure is fail-closed |
+| 10–11 | Successful proposal integrity; proposal branch is unique and based on the latest target commit |
+| 12–13 | File read scoping/limit/missing-file reporting; non-file-expressible requests declined cleanly |
+| 14–15 | IaC validation precedes writes; injection-flagged input blocks all operations |
+| 16–20 | Provider unavailability is safe; invalid credentials not retried; PR-failure-after-branch never reports success; conflicts reported without destructive resolution; transient errors retried up to the configured maximum |
+| 21–22 | Create/decline audit records are complete; audit-write failure aborts the action atomically |
+
+## Source Layout
+
+```
+backend/src/
+├── connector/
+│   ├── config.py            # ConnectorConfig, AllowlistEntry, load() + validation
+│   ├── models.py            # FileContent, FileFetchResult, ProposedFile, PullRequestResult, ProposalResult
+│   ├── provider.py          # SourceControlProvider ABC + typed exceptions
+│   ├── github_provider.py   # GitHubProvider adapter + get_provider factory
+│   ├── iac_validation.py    # CloudFormation / Terraform validation
+│   ├── service.py           # read_iac_files + propose_change safety pipeline
+│   └── tools.py             # get_iac_file, propose_infrastructure_change (@tool)
+├── agents/
+│   ├── source_control_specialist.py   # source_control_agent + GitOps prompt
+│   └── orchestrator.py                # conditional registration when enabled
+├── config/settings.py                 # GBAW_SCM_* env parsing
+└── utils/request_context.py           # request-scoped identity contextvar
+
+infrastructure/cloudformation/01-base-infrastructure.yaml   # scoped secret-read IAM grant
+scripts/deploy.sh                                           # GBAW_SCM_* env wiring
+```

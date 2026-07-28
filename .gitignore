@@ -151,3 +151,6 @@ sbom/
 
 # GameLift Documentation PDFs (downloaded during deployment)
 docs/gamelift/*.pdf
+
+# Connector config-disabled property test (excluded from VCS per maintainer decision)
+backend/tests/unit/test_config_disabled_property.py
