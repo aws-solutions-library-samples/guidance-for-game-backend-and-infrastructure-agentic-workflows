@@ -310,6 +310,61 @@
   }
 }
 
+/* Short-viewport compaction (issue #251). All the breakpoints above are
+   width-only, so a 14"/13" laptop (~900px tall, but >1240px wide) triggers none
+   of them: fixed vertical chrome (hero header + main padding + chat header +
+   input + footer) ate ~52% of the height, leaving only a sliver of chat. These
+   height-based rules shrink the chrome so the conversation gets the space.
+   Paired with a trimmed welcome message in Chat.tsx so the greeting fits above
+   the fold rather than being auto-scrolled past. */
+@media (max-height: 1000px) {
+  .ga-hero-header {
+    padding: 12px 0;
+  }
+
+  .ga-logo {
+    width: 44px;
+    height: 44px;
+    font-size: 24px;
+  }
+
+  .ga-branding h1 {
+    font-size: 1.6rem;
+  }
+
+  .ga-main {
+    padding: 12px 24px;
+  }
+
+  .ga-chat-header {
+    padding: 10px 24px;
+  }
+
+  .ga-footer {
+    padding: 8px 24px;
+  }
+}
+
+@media (max-height: 720px) {
+  .ga-hero-header {
+    padding: 8px 0;
+  }
+
+  .ga-logo {
+    width: 36px;
+    height: 36px;
+    font-size: 20px;
+  }
+
+  .ga-main {
+    padding: 8px 20px;
+  }
+
+  .ga-chat-subtitle {
+    display: none;
+  }
+}
+
 /* User Menu */
 .ga-user-menu {
   position: relative;

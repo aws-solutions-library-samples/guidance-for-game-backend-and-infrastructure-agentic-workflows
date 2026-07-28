@@ -206,6 +206,21 @@
   min-height: 80px !important;       /* Ensure container accommodates larger textarea */
 }
 
+/* Short-viewport compaction (issue #251): the input area is ~170px of fixed
+   chrome. Trim its padding and min-height on short laptops so more of the
+   height goes to the conversation. Mirrors the height breakpoints in
+   command-center-layout.css. */
+@media (max-height: 1000px) {
+  .copilotKitInputContainer {
+    padding: 12px 24px !important;
+  }
+
+  .copilotKitInput {
+    min-height: 60px !important;
+    padding: 12px 16px !important;
+  }
+}
+
 .copilotKitInput:focus-within {
   border-color: var(--ga-accent) !important;
   box-shadow: 0 0 20px rgba(139, 69, 255, 0.3) !important;
