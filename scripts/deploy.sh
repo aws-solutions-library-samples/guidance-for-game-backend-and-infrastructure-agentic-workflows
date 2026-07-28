@@ -411,6 +411,15 @@ FRONTEND_URL=$(aws cloudformation describe-stacks \
 echo "✅ Frontend deployed"
 echo ""
 
+# Step 7a: Align the managed ALB idle timeout with the app request budget.
+# The ECS ExpressGatewayService ALB defaults to a 60s idle timeout and exposes
+# no CloudFormation property to change it, so it must be set out-of-band here.
+# Without this, long-running (buffered) agent responses are cut off at 60s and
+# users have to re-ask. Configurable via FRONTEND_ALB_IDLE_TIMEOUT (default 185).
+echo "🕒 Step 7a: Aligning frontend ALB idle timeout..."
+bash "$SCRIPT_DIR/infrastructure/set-frontend-alb-timeout.sh"
+echo ""
+
 # Step 7b: Set retention on auto-created log groups
 echo "📋 Step 7b: Setting log retention on auto-created log groups..."
 bash "$SCRIPT_DIR/infrastructure/setup-app-observability.sh" "$RUNTIME_ID"
