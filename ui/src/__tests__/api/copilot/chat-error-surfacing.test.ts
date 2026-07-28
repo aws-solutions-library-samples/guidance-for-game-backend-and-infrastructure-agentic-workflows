@@ -9,6 +9,8 @@
  */
 
 import { createMocks } from 'node-mocks-http';
+import { BedrockAgentCoreClient } from '@aws-sdk/client-bedrock-agentcore';
+import { STSClient } from '@aws-sdk/client-sts';
 import handler from '../../../pages/api/copilot/chat';
 
 jest.mock('@/utils/logger', () => ({
@@ -35,10 +37,13 @@ jest.mock('@/utils/fetchWithTimeout', () => ({
   fetchWithTimeout: (...args: unknown[]) => mockFetchWithTimeout(...args),
 }));
 
-function chatRequest() {
+const mockAgentCoreSend = jest.fn();
+const mockStsSend = jest.fn();
+
+function chatRequest(cookie = 'cognito_id_token=header.payload.signature') {
   return createMocks({
     method: 'POST',
-    headers: { cookie: 'cognito_id_token=header.payload.signature' },
+    headers: { cookie },
     body: {
       operationName: 'generateCopilotResponse',
       variables: {
@@ -56,6 +61,9 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
+    (BedrockAgentCoreClient as jest.Mock).mockImplementation(() => ({ send: mockAgentCoreSend }));
+    (STSClient as jest.Mock).mockImplementation(() => ({ send: mockStsSend }));
+    mockStsSend.mockResolvedValue({ Account: '123456789012' });
     mockVerify.mockResolvedValue({
       sub: 'user123',
       email: 'test@example.com',
@@ -65,6 +73,7 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
 
   afterEach(() => {
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    delete process.env.AGENTCORE_RUNTIME_ID;
   });
 
   it('returns an invocation failure as a visible assistant message, not a bare 500', async () => {
@@ -108,6 +117,26 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
     const text = data.data.generateCopilotResponse.messages[0].content[0];
     expect(text).not.toContain('ECONNREFUSED');
     expect(text).not.toContain('10.0.2.17');
+  });
+
+  it('surfaces production AccessDenied failures as a visible assistant message', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.AGENTCORE_RUNTIME_ID = 'runtime-errtest';
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    const accessDenied = new Error('not authorized to invoke runtime');
+    accessDenied.name = 'AccessDeniedException';
+    mockAgentCoreSend.mockRejectedValue(accessDenied);
+
+    const { req, res } = chatRequest(
+      'cognito_access_token=access-token; cognito_id_token=id-token'
+    );
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    const data = JSON.parse(res._getData());
+    const message = data.data.generateCopilotResponse.messages[0];
+    expect(message.role).toBe('assistant');
+    expect(message.content[0]).toMatch(/something went wrong|couldn.t complete/i);
   });
 
   it('keeps plain HTTP errors for non-chat operations', async () => {

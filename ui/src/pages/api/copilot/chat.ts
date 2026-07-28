@@ -702,11 +702,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       logError(`[${requestId}] ❌ IAM Permission Error:`, error);
 
       // Check if it's the specific InvokeAgentRuntimeForUser permission issue
-      if (error.message.includes('InvokeAgentRuntimeForUser')) {
+      const isMemoryPermissionError = error.message.includes('InvokeAgentRuntimeForUser');
+      if (isMemoryPermissionError) {
         logError(`[${requestId}] 💡 Missing IAM permission: bedrock-agentcore:InvokeAgentRuntimeForUser`);
         logError(`[${requestId}] 💡 This permission is required when using runtimeUserId for memory features`);
         logError(`[${requestId}] 💡 Fix: Add bedrock-agentcore:InvokeAgentRuntimeForUser to ECS task role`);
+      }
 
+      // CopilotKit drops non-200 chat responses, including IAM failures.
+      if (req.body?.operationName === 'generateCopilotResponse') {
+        const threadId = req.body?.variables?.data?.threadId || `thread-${Date.now()}`;
+        return res.status(200).json(copilotErrorMessage(threadId, requestId));
+      }
+
+      if (isMemoryPermissionError) {
         return res.status(500).json({
           error: 'Memory feature configuration error',
           message: 'The AI assistant is experiencing a configuration issue with memory features. Please contact support.',
