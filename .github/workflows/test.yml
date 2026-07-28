@@ -114,11 +114,8 @@ jobs:
 
   vulnerability-scan:
     runs-on: ubuntu-latest
-    # issues:write is only needed by the alert step on scheduled runs; the
-    # workflow default stays contents:read for every other job.
-    permissions:
-      contents: read
-      issues: write
+    outputs:
+      scan-outcome: ${{ steps.scan.outcome }}
     steps:
     - uses: actions/checkout@v7
 
@@ -146,6 +143,7 @@ jobs:
     # medium/low are surfaced in the log without blocking. Output is teed so the
     # scheduled-run alert step below can attach the findings to the issue.
     - name: Scan dependencies for vulnerabilities
+      id: scan
       # Explicit `shell: bash` enables pipefail (the implicit default `bash -e`
       # does not) — without it, `| tee` would mask the scan's failing exit code.
       shell: bash
@@ -153,12 +151,31 @@ jobs:
       env:
         FAIL_ON: high
 
-    # On scheduled runs only: a failure means a new high/critical advisory now
-    # matches deps already on main — every PR will start failing this same gate.
-    # Surface it as a labeled issue (refreshed in place, not duplicated) instead
-    # of a red X nobody is watching for.
+    - name: Upload failed scheduled scan output
+      if: ${{ always() && github.event_name == 'schedule' && steps.scan.outcome == 'failure' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: vulnerability-scan-output
+        path: /tmp/scan-output.txt
+        retention-days: 7
+
+  vulnerability-alert:
+    needs: vulnerability-scan
+    if: ${{ always() && github.event_name == 'schedule' && needs.vulnerability-scan.outputs.scan-outcome == 'failure' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+    - name: Download scan output
+      uses: actions/download-artifact@v8
+      with:
+        name: vulnerability-scan-output
+        path: /tmp
+
+    # A failed scheduled scan means a new high/critical advisory now matches
+    # dependencies already on main. Surface it as a labeled issue (refreshed in
+    # place, not duplicated) instead of a red X nobody is watching for.
     - name: Open or update alert issue (scheduled runs)
-      if: failure() && github.event_name == 'schedule'
       env:
         GH_TOKEN: ${{ github.token }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
