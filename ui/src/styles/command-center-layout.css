@@ -333,7 +333,7 @@
   }
 
   .ga-main {
-    padding: 12px 24px;
+    padding-block: 12px;
   }
 
   .ga-chat-header {
@@ -357,7 +357,7 @@
   }
 
   .ga-main {
-    padding: 8px 20px;
+    padding-block: 8px;
   }
 
   .ga-chat-subtitle {

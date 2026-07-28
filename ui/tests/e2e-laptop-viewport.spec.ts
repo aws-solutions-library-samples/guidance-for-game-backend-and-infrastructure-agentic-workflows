@@ -9,6 +9,7 @@ import { test, expect } from '@playwright/test';
 
 // 14" MacBook Pro logical viewport (default scaled resolution).
 const LAPTOP_VIEWPORT = { width: 1512, height: 982 };
+const PHONE_VIEWPORT = { width: 390, height: 844 };
 
 test.describe('#251 - chat visibility on laptop-height viewport', { tag: ['@e2e', '@visual', '@fast'] }, () => {
   test.use({ viewport: LAPTOP_VIEWPORT });
@@ -37,5 +38,21 @@ test.describe('#251 - chat visibility on laptop-height viewport', { tag: ['@e2e'
     // tail and users had to scroll UP to see how the message started).
     const scrollTop = await messages.evaluate((el) => el.scrollTop);
     expect(scrollTop).toBe(0);
+  });
+});
+
+test.describe('#251 - short mobile viewport', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+  test.use({ viewport: PHONE_VIEWPORT });
+
+  test('retains mobile horizontal padding', async ({ page }) => {
+    await page.goto('/');
+    const main = page.locator('.ga-main');
+    await expect(main).toBeVisible();
+
+    const padding = await main.evaluate((element) => {
+      const styles = getComputedStyle(element);
+      return { left: styles.paddingLeft, right: styles.paddingRight };
+    });
+    expect(padding).toEqual({ left: '12px', right: '12px' });
   });
 });
