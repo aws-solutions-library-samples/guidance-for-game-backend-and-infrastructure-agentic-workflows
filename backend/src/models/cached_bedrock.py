@@ -71,10 +71,15 @@ def create_cached_bedrock_model():
         # FLAT guardrail_id / guardrail_version (a nested guardrail_config dict
         # is silently dropped — strands warns but does not raise — which leaves
         # guardrails disabled at runtime).
+        # guardrail_latest_message: input policies must evaluate ONLY the new
+        # user message — without it the PROMPT_ATTACK filter scans the entire
+        # AgentCore-Memory replayed history and false-blocks valid follow-ups
+        # (issue #201).
         if BEDROCK_GUARDRAIL_ENABLED and BEDROCK_GUARDRAIL_ID:
             model_config["guardrail_id"] = BEDROCK_GUARDRAIL_ID
             model_config["guardrail_version"] = BEDROCK_GUARDRAIL_VERSION
             model_config["guardrail_trace"] = "enabled"
+            model_config["guardrail_latest_message"] = True
             logger.debug(f"🛡️ Guardrails enabled: {BEDROCK_GUARDRAIL_ID}")
 
         try:
@@ -95,11 +100,12 @@ def create_cached_bedrock_model():
                 "max_tokens": BEDROCK_MAX_TOKENS,
             }
 
-            # Apply guardrails to fallback too (flat params, see above)
+            # Apply guardrails to fallback too (flat params + latest-message, see above)
             if BEDROCK_GUARDRAIL_ENABLED and BEDROCK_GUARDRAIL_ID:
                 fallback_config["guardrail_id"] = BEDROCK_GUARDRAIL_ID
                 fallback_config["guardrail_version"] = BEDROCK_GUARDRAIL_VERSION
                 fallback_config["guardrail_trace"] = "enabled"
+                fallback_config["guardrail_latest_message"] = True
 
             _primary_model = BedrockModel(**fallback_config)
             logger.info(f"✅ Fallback engines online: {BEDROCK_MODEL_ID_SECONDARY} (singleton)")
@@ -165,6 +171,7 @@ def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: in
         model_config["guardrail_id"] = BEDROCK_GUARDRAIL_ID
         model_config["guardrail_version"] = BEDROCK_GUARDRAIL_VERSION
         model_config["guardrail_trace"] = "enabled"
+        model_config["guardrail_latest_message"] = True
 
     # Log the selected model so per-agent tier is observable at runtime — the
     # singleton path logs "Engines online", but these per-agent models were
