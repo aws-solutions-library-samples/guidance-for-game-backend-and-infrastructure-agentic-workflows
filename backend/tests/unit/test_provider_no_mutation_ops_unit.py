@@ -23,7 +23,7 @@ from connector.provider import SourceControlProvider
 pytestmark = pytest.mark.unit
 
 
-# The complete, fixed operation set the abstraction is permitted to expose (Req 9.2).
+# The fixed set of *abstract* read/propose operations every adapter must implement (Req 9.2).
 EXPECTED_OPERATIONS = {
     "get_file",
     "get_files",
@@ -33,6 +33,17 @@ EXPECTED_OPERATIONS = {
     "commit_files",
     "open_change_proposal",
 }
+
+# Optional, provider-neutral operations that carry a safe default implementation on the ABC
+# (so they are NOT abstract) and are all read-only. Added by the hardening spec:
+# ``find_open_change_proposal`` powers reconcile-before-retry (Req 12.4). Read-only, so it
+# introduces no merge/approve/close/mutation capability.
+OPTIONAL_OPERATIONS = {
+    "find_open_change_proposal",
+}
+
+# The complete set of public operations the abstraction is permitted to expose.
+ALL_PUBLIC_OPERATIONS = EXPECTED_OPERATIONS | OPTIONAL_OPERATIONS
 
 # Substrings that would indicate a forbidden mutation/finalization operation on the
 # proposal (or the repository) sneaking onto the abstraction (Req 2.5, 6.2).
@@ -65,8 +76,9 @@ def test_abstract_method_set_is_exactly_the_propose_read_set():
 
 
 def test_public_operations_are_exactly_the_propose_read_set():
-    """No public operation exists on the ABC beyond the fixed read/propose set."""
-    assert _public_operations(SourceControlProvider) == EXPECTED_OPERATIONS
+    """No public operation exists on the ABC beyond the read/propose set plus optional
+    read-only reconciliation helpers."""
+    assert _public_operations(SourceControlProvider) == ALL_PUBLIC_OPERATIONS
 
 
 def test_no_merge_approve_or_close_operation_is_defined():

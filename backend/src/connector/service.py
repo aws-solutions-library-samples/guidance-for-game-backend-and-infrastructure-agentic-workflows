@@ -44,7 +44,12 @@ from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
 from connector.config import ConnectorConfig
 from connector.iac_validation import IaCValidationError, validate_iac
 from connector.registry import get_provider
-from connector.models import FileFetchResult, ProposalResult, ProposedFile
+from connector.models import (
+    ChangeProposalResult,
+    FileFetchResult,
+    ProposalResult,
+    ProposedFile,
+)
 from connector.provider import (
     ProviderAuthError,
     ProviderConflictError,
@@ -107,13 +112,13 @@ def _resolve_provider(
     return provider if provider is not None else get_provider(config)
 
 
-def _configured_repo_and_branch(config: ConnectorConfig) -> tuple[str, str]:
-    """Return the effective ``(repository, target_branch)`` for a read operation.
+def _default_repo_and_branch(config: ConnectorConfig) -> tuple[str, str]:
+    """Return the default ``(repository, target_branch)`` selectors for an operation.
 
-    The read path operates against the **configured** IaC repository and target branch
-    (Req 3.1), which are taken from the allowlist — never from agent/model input — so an
-    injected path list can never redirect a read to an unapproved repository (Req 5.5,
-    11.5). The first allowlist entry and its first branch are the configured defaults.
+    When a caller omits the ``repository``/``target_branch`` selectors, the connector
+    defaults to the first allowlist entry and its first branch. These are still only
+    *requested* selectors: they are matched against the allowlist and the effective
+    repo/branch always come from the matched entry (Req 11.3, 11.4).
     """
     entry = config.allowlist[0]
     return entry.repo, entry.target_branches[0]
@@ -122,20 +127,28 @@ def _configured_repo_and_branch(config: ConnectorConfig) -> tuple[str, str]:
 def read_iac_files(
     paths: list[str],
     *,
+    repository: str | None = None,
+    target_branch: str | None = None,
     config: ConnectorConfig | None = None,
     provider: SourceControlProvider | None = None,
 ) -> FileFetchResult:
-    """Fetch existing IaC files from the configured repository and target branch.
+    """Fetch existing IaC files from a selected allowlisted repository and target branch.
 
-    Behavior (Req 3.1, 3.2, 3.4):
+    Behavior (Req 3.1, 3.2, 3.4, 11.2, 11.3, 11.4, 11.5):
 
     - If the number of requested ``paths`` exceeds ``config.max_files_per_request``, no
       provider fetch is performed and a :class:`FileFetchResult` with
       ``limit_exceeded=True`` (and empty ``files``/``missing``) is returned (Req 3.2).
-    - Otherwise the configured provider fetches exactly the requested paths from the
-      configured repository/target branch; the returned result carries the files that
-      were found and names every path that does not exist in ``missing``, without
-      creating any proposal (Req 3.1, 3.4).
+    - The requested ``repository``/``target_branch`` selectors are matched against the
+      **whole** allowlist by exact, case-sensitive, full-string comparison via
+      :func:`_match_allowlist`. When they are omitted, they default to the first allowlist
+      entry and its first branch, preserving prior single-entry behavior. On a selector
+      MISS (no exact allowlist entry) the read is rejected: no provider fetch is performed,
+      the rejection is logged, and an empty :class:`FileFetchResult` is returned (Req 11.5).
+    - On a match the configured provider fetches exactly the requested paths from the
+      **matched allowlist entry's** repository/branch (never free-form input); the returned
+      result carries the files that were found and names every path that does not exist in
+      ``missing``, without creating any proposal (Req 3.1, 3.4, 11.4).
 
     ``config`` and ``provider`` are optional injection points for testing; production
     callers omit them so the validated config is loaded and the concrete adapter selected
@@ -156,10 +169,31 @@ def read_iac_files(
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=True)
 
-    repo, branch = _configured_repo_and_branch(resolved_config)
+    # Requested selectors default to the first allowlist entry when omitted; when supplied
+    # they must match an entry exactly. The effective repo/branch always come from the
+    # matched allowlist entry, never from free-form input (Req 11.2, 11.3, 11.4).
+    default_repo, default_branch = _default_repo_and_branch(resolved_config)
+    req_repo = repository if repository is not None else default_repo
+    req_branch = target_branch if target_branch is not None else default_branch
+
+    matched = _match_allowlist(resolved_config, req_repo, req_branch)
+    if matched is None:
+        # Req 11.5: a read-path selector miss is rejected with NO provider fetch.
+        logger.warning(
+            "IaC file read rejected: repository/branch not in allowlist",
+            event="scm_rejected",
+            action="read",
+            outcome="rejected",
+            repository=req_repo,
+            target_branch=req_branch,
+            reason="allowlist_miss",
+        )
+        return FileFetchResult(files=(), missing=(), limit_exceeded=False)
+    repo, branch = matched
+
     resolved_provider = _resolve_provider(resolved_config, provider)
 
-    # Req 3.1 / 3.4: fetch exactly the requested paths from the configured repo+branch.
+    # Req 3.1 / 3.4: fetch exactly the requested paths from the matched repo+branch.
     # The provider reports missing paths in the result; no proposal is created here.
     result = resolved_provider.get_files(repo, branch, list(paths))
 
@@ -227,6 +261,62 @@ def _retry_transient(
             return operation()
         except ProviderTransientError as exc:
             last_exc = exc
+            if attempt == max_attempts:
+                raise
+            delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+            time.sleep(delay + random.uniform(0, delay * 0.25))
+    raise last_exc  # pragma: no cover - loop always returns or raises above
+
+
+# Sentinel returned by a reconcile callable to say "the mutating effect is already applied,
+# do NOT repeat the operation" for ops whose real return value is ``None`` (create_branch)
+# or otherwise unused (commit_files). It is deliberately distinct from ``None`` so the
+# reconcile short-circuit is unambiguous even when the effect carries no meaningful value.
+_ALREADY_APPLIED: object = object()
+
+
+def _retry_mutating(
+    operation: Callable[[], _T],
+    reconcile: Callable[[], _T | object | None],
+    *,
+    max_attempts: int,
+    base_delay: float = 0.5,
+    max_delay: float = 10.0,
+) -> _T | object:
+    """Run a **mutating** op with reconcile-before-retry so retries never duplicate state.
+
+    This is the idempotent counterpart to :func:`_retry_transient`. It shares the same
+    retry-count semantics (at most ``max_attempts`` attempts, only
+    :class:`ProviderTransientError` is retried, every other typed error propagates
+    immediately — Req 10.2, 10.5, 10.6) but, because repeating a mutating operation after
+    an *ambiguous* transient failure could create a duplicate branch/commit/proposal
+    (Req 12.5), it **reconciles the provider state before each retry** instead of blindly
+    re-invoking the operation (Req 12.1).
+
+    ``reconcile`` is a zero-argument callable that re-queries the provider (a read-only
+    operation, safe to repeat) and returns:
+
+    - a **non-``None`` value** when the intended effect is already present on the provider —
+      the operation must NOT be repeated. The value is returned to the caller as the
+      operation's result. Ops with a meaningful result (``open_change_proposal``) return the
+      existing artifact; ops without one return the :data:`_ALREADY_APPLIED` sentinel
+      (Req 12.2, 12.3, 12.4).
+    - ``None`` when the effect is not yet present — it is safe to retry the operation.
+
+    Reconciliation is also performed once after the final failed attempt, so an effect that
+    landed on the last try is recognized rather than reported as a failure.
+    """
+    last_exc: ProviderTransientError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except ProviderTransientError as exc:
+            last_exc = exc
+            # Ambiguous transient failure: reconcile provider state BEFORE deciding whether
+            # to retry, so an already-applied effect is never duplicated (Req 12.1, 12.5).
+            reconciled = reconcile()
+            if reconciled is not None:
+                return reconciled
             if attempt == max_attempts:
                 raise
             delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
@@ -640,25 +730,64 @@ def propose_change(
         if not proposal_branch:
             raise ProviderError("could not generate a unique proposal branch name")
 
-        # Create the branch, then commit the complete file set (Req 2.1, 2.3).
-        _retry_transient(
+        # Create the branch, then commit the complete file set (Req 2.1, 2.3). These are
+        # MUTATING ops, so each retry reconciles provider state first to avoid duplicates
+        # after an ambiguous transient failure (Req 12.1, 12.2, 12.3, 12.5).
+
+        # Reconcile create_branch: if the proposal branch now exists, the create already
+        # landed — skip it and continue from the existing branch (Req 12.2).
+        def _reconcile_branch() -> object | None:
+            exists = _retry_transient(
+                lambda: resolved_provider.branch_exists(repo, proposal_branch),
+                max_attempts=attempts,
+            )
+            return _ALREADY_APPLIED if exists else None
+
+        _retry_mutating(
             lambda: resolved_provider.create_branch(repo, proposal_branch, base_sha),
+            _reconcile_branch,
             max_attempts=attempts,
         )
         branch_created = True
 
-        _retry_transient(
+        # Reconcile commit_files with a best-effort heuristic (Req 12.3): the proposal
+        # branch was created pointing at ``base_sha``; if its head has since advanced to a
+        # different SHA, a commit beyond the base was applied, so treat the commit as done
+        # and skip it. This can only mistake a concurrent external push on the freshly
+        # created proposal branch for our commit, which is acceptable for a proposal branch
+        # the connector owns; the alternative (blindly re-committing) risks a duplicate
+        # commit, which Req 12.3/12.5 forbid.
+        def _reconcile_commit() -> object | None:
+            head = _retry_transient(
+                lambda: resolved_provider.latest_commit_sha(repo, proposal_branch),
+                max_attempts=attempts,
+            )
+            return _ALREADY_APPLIED if head and head != base_sha else None
+
+        _retry_mutating(
             lambda: resolved_provider.commit_files(
                 repo, proposal_branch, proposed_files, commit_message
             ),
+            _reconcile_commit,
             max_attempts=attempts,
         )
 
         # Open exactly one change proposal with agent+user attribution (Req 2.2, 2.6, 6.5).
-        proposal = _retry_transient(
+        # Reconcile open_change_proposal: if an open proposal for head→base already exists,
+        # return it instead of opening a duplicate (Req 12.4).
+        def _reconcile_proposal() -> ChangeProposalResult | None:
+            return _retry_transient(
+                lambda: resolved_provider.find_open_change_proposal(
+                    repo, proposal_branch, branch
+                ),
+                max_attempts=attempts,
+            )
+
+        proposal = _retry_mutating(
             lambda: resolved_provider.open_change_proposal(
                 repo, proposal_branch, branch, effective_title, body
             ),
+            _reconcile_proposal,
             max_attempts=attempts,
         )
     except ProviderAuthError:

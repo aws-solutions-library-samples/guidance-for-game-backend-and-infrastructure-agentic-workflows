@@ -73,12 +73,15 @@ _IAC_FORMAT = "cloudformation"
 # The provider operations reached on the proposal path, each invoked exactly once on the
 # success path. Injecting a bounded number of transient failures at any one of them
 # exercises that op's retry loop; Hypothesis picks which op fails.
+# NOTE (hardening spec, task 6.1/6.3): the propose pipeline now uses reconcile-before-retry
+# for the MUTATING ops (create_branch, commit_files, open_change_proposal) so they are no
+# longer blindly repeated after an ambiguous transient failure. Their retry/idempotency
+# coverage moves to hardening Property H4 (test_reconcile_before_retry_property, task 6.2).
+# This baseline Property 20 test is scoped to the READ-ONLY ops, which keep simple transient
+# retry (safe to repeat) and whose attempt-count semantics are unchanged.
 _PROVIDER_OPS = (
     "latest_commit_sha",
     "branch_exists",
-    "create_branch",
-    "commit_files",
-    "open_change_proposal",
 )
 
 # Benign, injection-free words used to build varying intents/titles so the input-validation

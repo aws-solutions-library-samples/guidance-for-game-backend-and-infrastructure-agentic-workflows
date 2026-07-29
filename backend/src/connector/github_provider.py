@@ -275,6 +275,45 @@ class GitHubProvider(SourceControlProvider):
             proposal_url=payload.get("html_url", ""),
         )
 
+    def find_open_change_proposal(
+        self,
+        repo: str,
+        head: str,
+        base: str,
+    ) -> ChangeProposalResult | None:
+        """Return the first OPEN pull request for ``head`` → ``base``, or ``None`` (Req 12.4).
+
+        Used by the service layer's reconcile-before-retry logic: after an ambiguous
+        transient failure while opening a change proposal, this read-only query discovers a
+        pull request the provider may already have created for the same head→base pair so a
+        duplicate is not opened.
+
+        Queries ``GET /repos/{repo}/pulls?state=open&head={owner}:{head}&base={base}``. The
+        GitHub ``head`` filter is namespaced by owner, so the owner is parsed from ``repo``
+        (``"owner/name"`` → ``"owner"``) and prefixed to ``head``. The first element of the
+        returned list is mapped to a provider-neutral :class:`ChangeProposalResult`
+        (``number`` → ``proposal_id`` as a string, ``html_url`` → ``proposal_url``); an
+        empty list yields ``None``. Wire failures map through the same typed-exception
+        handling used by every other GET (see :meth:`_request`); the credential is never
+        logged.
+        """
+        owner = repo.split("/", 1)[0]
+        headers = self._auth_headers()
+        response = self._request(
+            "GET",
+            f"/repos/{repo}/pulls",
+            headers,
+            params={"state": "open", "head": f"{owner}:{head}", "base": base},
+        )
+        payload = response.json()
+        if not isinstance(payload, list) or not payload:
+            return None
+        first = payload[0]
+        return ChangeProposalResult(
+            proposal_id=str(first.get("number", "")),
+            proposal_url=first.get("html_url", ""),
+        )
+
     # -------------------------------------------------------------------- helpers
 
     def _auth_headers(self) -> dict[str, str]:

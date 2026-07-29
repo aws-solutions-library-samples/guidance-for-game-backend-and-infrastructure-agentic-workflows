@@ -22,6 +22,7 @@ Validates: Requirements 9.1
 
 # Standard library
 import inspect
+import types
 import typing
 
 # Third-party packages
@@ -77,14 +78,22 @@ def _resolved_origin_types(annotation) -> set:
     """Flatten an annotation into the concrete origin types it is built from.
 
     ``list[str]`` -> {list, str}; ``dict`` -> {dict}; ``str | None`` -> {str, NoneType}.
+
+    A union (``str | None`` / ``typing.Optional[str]`` / ``typing.Union[...]``) is a type
+    *constructor*, not a leaf type, so the union origin itself is not added to the result;
+    only the concrete member types it composes are checked (they are all agnostic here).
     """
     origin = typing.get_origin(annotation)
     if origin is None:
         return {annotation}
-    types = {origin}
+    resolved: set = set()
+    # Do not treat a union origin (types.UnionType / typing.Union) as a concrete type; it
+    # merely composes agnostic member types (e.g. ``str | None``).
+    if origin not in (types.UnionType, typing.Union):
+        resolved.add(origin)
     for arg in typing.get_args(annotation):
-        types |= _resolved_origin_types(arg)
-    return types
+        resolved |= _resolved_origin_types(arg)
+    return resolved
 
 
 def _contains_forbidden_token(text: str) -> list:

@@ -180,3 +180,26 @@ class SourceControlProvider(ABC):
         human review (Req 6.1).
         """
         raise NotImplementedError
+
+    def find_open_change_proposal(
+        self,
+        repo: str,
+        head: str,
+        base: str,
+    ) -> ChangeProposalResult | None:
+        """Return an existing OPEN Change_Proposal for ``head`` → ``base``, or ``None``.
+
+        This is an **optional, provider-neutral reconciliation query** used by the service
+        layer's reconcile-before-retry logic (Req 12.4): after an ambiguous transient
+        failure while opening a change proposal, the service consults this operation to
+        discover whether the provider already opened one for the same head→base pair, so it
+        can return the existing proposal instead of opening a duplicate.
+
+        Unlike the other operations this method is **not abstract**: it has a default
+        implementation that returns ``None`` ("cannot determine / none found"). Adapters
+        that can query their native change-proposal listing (e.g. the GitHub adapter)
+        override it; adapters that cannot degrade safely to "none found", which makes the
+        service fall back to a plain retry rather than a duplicate-avoiding short-circuit.
+        The method is read-only and safe to repeat.
+        """
+        return None

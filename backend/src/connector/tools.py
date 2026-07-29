@@ -37,16 +37,29 @@ from utils.logger import logger
 
 
 @tool
-def get_iac_file(paths: list[str]) -> dict:
-    """Read existing IaC file(s) from the configured repository/branch for review.
+def get_iac_file(
+    paths: list[str],
+    repository: str | None = None,
+    target_branch: str | None = None,
+) -> dict:
+    """Read existing IaC file(s) from an allowlisted repository/branch for review.
 
     Use this before proposing a change so your proposal is consistent with the current
-    source of truth. Reads are scoped to the operator-configured repository and target
-    branch; the ``paths`` you pass select which files to read, not which repository.
+    source of truth. Reads are always scoped to an operator-approved allowlist entry; the
+    ``paths`` you pass select which files to read, not which repository.
 
     Args:
         paths: Repository-relative file paths to read (e.g. ``["infra/vpc.yaml"]``).
             The number of paths is capped by the configured per-request maximum.
+        repository: Optionally selects which allowlisted repository to read from. The
+            value must exactly match a configured allowlist entry (case-sensitive,
+            full-string); a value that is not on the allowlist is rejected and no read is
+            performed. When omitted, the first allowlist entry is used.
+        target_branch: Optionally selects which allowlisted target branch to read from,
+            matched the same exact way against the selected repository's branches. When
+            omitted, the first branch of the selected repository is used. The effective
+            repository/branch always come from the matched allowlist entry, never from
+            free-form input.
 
     Returns:
         A JSON-serialisable dict:
@@ -58,7 +71,9 @@ def get_iac_file(paths: list[str]) -> dict:
         ``files``/``missing``.
     """
     try:
-        result = read_iac_files(list(paths))
+        result = read_iac_files(
+            list(paths), repository=repository, target_branch=target_branch
+        )
         return {
             "files": [{"path": f.path, "content": f.content} for f in result.files],
             "missing": list(result.missing),
@@ -81,13 +96,16 @@ def propose_infrastructure_change(
     iac_format: str,
     title: str,
     description: str,
+    repository: str | None = None,
+    target_branch: str | None = None,
 ) -> dict:
     """Open a change proposal for Infrastructure-as-Code changes for human review.
 
     This never mutates live AWS resources. It creates a uniquely-named branch off the
-    configured target branch, commits the proposed files, and opens exactly one unmerged
-    change proposal attributed to the agent on behalf of the requesting user. The change
-    flows through review and the existing CI/CD pipeline after a human approves and merges.
+    selected allowlisted target branch, commits the proposed files, and opens exactly one
+    unmerged change proposal attributed to the agent on behalf of the requesting user. The
+    change flows through review and the existing CI/CD pipeline after a human approves and
+    merges.
 
     Args:
         intent: A short natural-language description of the change being proposed.
@@ -98,6 +116,15 @@ def propose_infrastructure_change(
             ``{"cloudformation", "terraform"}``.
         title: A non-empty change proposal title.
         description: A description identifying the intended change and affected files.
+        repository: Optionally selects which allowlisted repository the proposal targets.
+            The value must exactly match a configured allowlist entry (case-sensitive,
+            full-string); a value that is not on the allowlist is rejected and no proposal
+            is created. When omitted, the first allowlist entry is used.
+        target_branch: Optionally selects which allowlisted target branch the proposal is
+            opened against, matched the same exact way against the selected repository's
+            branches. When omitted, the first branch of the selected repository is used.
+            The effective repository/branch always come from the matched allowlist entry,
+            never from free-form input.
 
     Returns:
         A JSON-serialisable dict:
@@ -122,6 +149,8 @@ def propose_infrastructure_change(
             iac_format=iac_format,
             title=title,
             description=description,
+            repository=repository,
+            target_branch=target_branch,
         )
         return {
             "status": result.status,

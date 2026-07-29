@@ -61,6 +61,7 @@ OPERATIONS: tuple[str, ...] = (
     "create_branch",
     "commit_files",
     "open_change_proposal",
+    "find_open_change_proposal",
 )
 
 
@@ -364,6 +365,34 @@ class FakeProvider(SourceControlProvider):
             }
         )
         return ChangeProposalResult(proposal_id=pr_id, proposal_url=pr_url)
+
+    def find_open_change_proposal(
+        self,
+        repo: str,
+        head: str,
+        base: str,
+    ) -> ChangeProposalResult | None:
+        """Reconciliation query used by reconcile-before-retry (Req 12.4).
+
+        Records the call and honors programmed outcomes exactly like the other operations
+        (a pinned ``returns`` value, a queued ``side_effects`` sequence, or an injected
+        typed failure). When nothing is programmed it falls back to the deterministic
+        in-memory model: it returns the most recent recorded open proposal whose
+        ``head``/``base`` match the query, or ``None`` when none has been opened — mirroring
+        the base ABC default of "none found".
+        """
+        self._record(
+            "find_open_change_proposal", repo=repo, head=head, base=base
+        )
+        outcome = self._programmed_outcome("find_open_change_proposal")
+        if outcome is not _UNSET:
+            return self._apply(outcome, repo=repo, head=head, base=base)
+        for pr in reversed(self.pull_requests):
+            if pr["repo"] == repo and pr["head"] == head and pr["base"] == base:
+                return ChangeProposalResult(
+                    proposal_id=pr["proposal_id"], proposal_url=pr["proposal_url"]
+                )
+        return None
 
     # --------------------------------------------------------------- introspection
 
