@@ -12,17 +12,17 @@ tests):
    ``source_control_agent`` IS appended (positive control). We capture the ``tools`` kwarg
    passed to the ``Agent`` constructor at the smallest seam and assert membership.
 
-2. **IaC KB wiring (Req 3.5).** The ``source_control_agent`` is built through the shared
-   ``create_specialist_agent`` factory with ``kb_id=SCM_IAC_KB_ID``. When an IaC KB id is
-   configured (truthy), the specialist is built with the KB ``retrieve`` tool (the factory
-   invokes ``create_kb_retrieve_tool`` and appends the result to the agent's tools); when
-   unset, no KB tool is wired. We exercise the factory seam directly and also confirm the
-   real ``source_control_specialist`` threads the configured KB id through to the factory.
+2. **IaC KB wiring (Req 9.1, 9.2).** The ``create_specialist_agent`` factory wires a KB
+   ``retrieve`` tool only when a truthy ``kb_id`` is passed. The dead IaC-KB configuration
+   has been removed, so the real ``source_control_agent`` is now built with ``kb_id=None``
+   and therefore carries no KB tool — only the write-path tools. We exercise the factory
+   seam directly (truthy vs falsy ``kb_id``) and confirm the real specialist is built with
+   no IaC KB tool and that ``SCM_IAC_KB_ID`` is no longer defined on settings.
 
 These are structural/wiring guarantees, so the Bedrock model, MCP, memory, and the KB
 retrieve tool are mocked — no real network or model calls occur.
 
-Validates: Requirements 1.3, 3.5
+Validates: Requirements 1.3, 9.1, 9.2
 """
 
 # Standard library
@@ -195,20 +195,24 @@ def test_unset_iac_kb_builds_specialist_without_retrieve_tool(monkeypatch):
     assert tools == [extra_tool]
 
 
-def test_real_source_control_specialist_threads_configured_kb_id_to_factory():
-    """The real specialist passes SCM_IAC_KB_ID through to create_specialist_agent (Req 3.5).
+def test_real_source_control_specialist_built_without_iac_kb_tool():
+    """The real specialist is built with NO IaC KB retrieve tool (Req 9.1, 9.2).
 
-    Combined with the factory tests above (truthy kb_id => KB retrieve tool wired), this
-    proves that configuring an IaC KB causes the source_control specialist to be built with
-    the KB retrieve tool. Uses manual patch + reload with a guaranteed restore so no reloaded
-    module state leaks to other tests.
+    The dead IaC-KB configuration was removed: ``config.settings`` no longer defines
+    ``SCM_IAC_KB_ID`` and the specialist is constructed with ``kb_id=None`` so the factory
+    wires no KB ``retrieve`` tool. Combined with the factory tests above (falsy kb_id => no
+    KB retrieve tool), this proves the specialist carries only the write-path tools. Uses
+    manual patch + reload with a guaranteed restore so no reloaded module state leaks to
+    other tests.
     """
     # Local modules
     import agents.base_specialist as base
     import agents.source_control_specialist as scs
     import config.settings as settings
 
-    original_kb = settings.SCM_IAC_KB_ID
+    # The removed setting must not be defined or read anywhere (Req 9.1).
+    assert not hasattr(settings, "SCM_IAC_KB_ID")
+
     original_factory = base.create_specialist_agent
 
     captured = {}
@@ -218,19 +222,18 @@ def test_real_source_control_specialist_threads_configured_kb_id_to_factory():
         return MagicMock(name="source_control_agent")
 
     try:
-        settings.SCM_IAC_KB_ID = "iac-kb-42"
         base.create_specialist_agent = _fake_factory
         importlib.reload(scs)
 
-        assert captured.get("kb_id") == "iac-kb-42"
-        # The write-path tools are still wired regardless of KB configuration.
+        # No IaC KB is wired: the specialist is built with kb_id=None (Req 9.2).
+        assert captured.get("kb_id") is None
+        # The write-path tools are still wired.
         additional = captured.get("additional_tools") or []
         names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in additional}
         assert "get_iac_file" in names
         assert "propose_infrastructure_change" in names
     finally:
-        # Restore settings and the real factory, then rebuild the real specialist object so
-        # subsequent tests (and the orchestrator's local import) see the genuine agent.
-        settings.SCM_IAC_KB_ID = original_kb
+        # Restore the real factory, then rebuild the real specialist object so subsequent
+        # tests (and the orchestrator's local import) see the genuine agent.
         base.create_specialist_agent = original_factory
         importlib.reload(scs)

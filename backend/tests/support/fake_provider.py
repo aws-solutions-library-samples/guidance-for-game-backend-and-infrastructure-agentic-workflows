@@ -39,7 +39,7 @@ from connector.models import (
     FileContent,
     FileFetchResult,
     ProposedFile,
-    PullRequestResult,
+    ChangeProposalResult,
 )
 from connector.provider import SourceControlProvider
 
@@ -60,7 +60,7 @@ OPERATIONS: tuple[str, ...] = (
     "latest_commit_sha",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 )
 
 
@@ -88,7 +88,7 @@ class FakeProvider(SourceControlProvider):
     >>> fake.add_file("org/iac", "main", "a.yaml", "Resources: {}")
     >>> fake.get_file("org/iac", "main", "a.yaml").content
     'Resources: {}'
-    >>> fake.fail("open_pull_request", ProviderConflictError("boom"))
+    >>> fake.fail("open_change_proposal", ProviderConflictError("boom"))
     >>> [c.operation for c in fake.calls]
     ['get_file']
     """
@@ -328,23 +328,23 @@ class FakeProvider(SourceControlProvider):
         self._head_shas[(repo, branch)] = sha
         return sha
 
-    def open_pull_request(
+    def open_change_proposal(
         self,
         repo: str,
         head: str,
         base: str,
         title: str,
         body: str,
-    ) -> PullRequestResult:
+    ) -> ChangeProposalResult:
         self._record(
-            "open_pull_request",
+            "open_change_proposal",
             repo=repo,
             head=head,
             base=base,
             title=title,
             body=body,
         )
-        outcome = self._programmed_outcome("open_pull_request")
+        outcome = self._programmed_outcome("open_change_proposal")
         if outcome is not _UNSET:
             return self._apply(
                 outcome, repo=repo, head=head, base=base, title=title, body=body
@@ -359,11 +359,11 @@ class FakeProvider(SourceControlProvider):
                 "base": base,
                 "title": title,
                 "body": body,
-                "pull_request_id": pr_id,
-                "pull_request_url": pr_url,
+                "proposal_id": pr_id,
+                "proposal_url": pr_url,
             }
         )
-        return PullRequestResult(pull_request_id=pr_id, pull_request_url=pr_url)
+        return ChangeProposalResult(proposal_id=pr_id, proposal_url=pr_url)
 
     # --------------------------------------------------------------- introspection
 

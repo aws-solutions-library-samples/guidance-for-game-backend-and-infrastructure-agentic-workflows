@@ -8,7 +8,7 @@ propose pipeline's transient-only retry behavior (Req 10.5) and the exhausted-re
 reporting (Req 10.6) through ``connector.service.propose_change``.
 
 For any single provider operation reached during a proposal (``latest_commit_sha``,
-``branch_exists``, ``create_branch``, ``commit_files``, ``open_pull_request``), the fake
+``branch_exists``, ``create_branch``, ``commit_files``, ``open_change_proposal``), the fake
 provider is programmed to raise ``ProviderTransientError`` for the next ``k`` calls (via
 ``FakeProvider.fail_times``) and then fall back to its default success behavior. Two
 facets, selected by comparing the Hypothesis-generated ``k`` against the generated
@@ -78,7 +78,7 @@ _PROVIDER_OPS = (
     "branch_exists",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 )
 
 # Benign, injection-free words used to build varying intents/titles so the input-validation
@@ -126,6 +126,8 @@ def _make_config(retry_max_attempts: int) -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=retry_max_attempts,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -221,8 +223,8 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
 
         # The proposal ultimately succeeds and a pull request is created (Req 10.5).
         assert result.status == "created", result.message
-        assert result.pull_request_id is not None
-        assert result.pull_request_url is not None
+        assert result.proposal_id is not None
+        assert result.proposal_url is not None
         assert len(provider.pull_requests) == 1
     else:
         # Facet (b): retries are exhausted. The op is attempted EXACTLY max times — never
@@ -232,8 +234,8 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
         # The result is a non-success error and no pull request is created (Req 10.6).
         assert result.status == "error"
         assert result.status != "created"
-        assert result.pull_request_id is None
-        assert result.pull_request_url is None
+        assert result.proposal_id is None
+        assert result.proposal_url is None
         assert provider.pull_requests == []
 
         # Req 10.6: the exhausted-retry outcome is recorded in the audit log.

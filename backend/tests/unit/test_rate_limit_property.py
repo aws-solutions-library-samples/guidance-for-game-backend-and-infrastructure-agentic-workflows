@@ -78,6 +78,8 @@ def _make_config(*, rate_limit_max: int) -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -136,22 +138,22 @@ def test_property7_per_user_proposal_rate_limit(rate_limit_max, extra_calls):
     allowed = results[:rate_limit_max]
     for result in allowed:
         assert result.status == "created"
-        assert result.pull_request_id
-        assert result.pull_request_url
+        assert result.proposal_id
+        assert result.proposal_url
 
     # Every request beyond the limit is rejected with a rate-limit message stating the
     # limit and the reset time, and creates no branch or proposal (Req 8.2).
     rejected = results[rate_limit_max:]
     for result in rejected:
         assert result.status == "rejected"
-        assert result.pull_request_id is None
-        assert result.pull_request_url is None
+        assert result.proposal_id is None
+        assert result.proposal_url is None
         assert str(rate_limit_max) in result.message
         assert "resets" in result.message.lower()
 
     # Exactly N pull requests were opened for user A — the excess requests never reached
     # the provider mutation operations.
-    assert len(provider.calls_for("open_pull_request")) == rate_limit_max
+    assert len(provider.calls_for("open_change_proposal")) == rate_limit_max
     assert len(provider.calls_for("create_branch")) == rate_limit_max
 
     # Per-user isolation: a different user has its own budget, so its first proposal is
@@ -159,7 +161,7 @@ def test_property7_per_user_proposal_rate_limit(rate_limit_max, extra_calls):
     user_b = f"user-b-{next(_user_ids)}"
     result_b = _propose_as(user_b, config=config, provider=provider)
     assert result_b.status == "created"
-    assert result_b.pull_request_id
+    assert result_b.proposal_id
 
     # User B's success added exactly one more pull request (total N + 1 across both users).
-    assert len(provider.calls_for("open_pull_request")) == rate_limit_max + 1
+    assert len(provider.calls_for("open_change_proposal")) == rate_limit_max + 1

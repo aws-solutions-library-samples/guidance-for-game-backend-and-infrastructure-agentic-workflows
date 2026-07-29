@@ -12,7 +12,7 @@ for Req 10.2). Unlike transient errors — which the pipeline retries up to
 ``retry_max_attempts`` — a ``ProviderAuthError`` must propagate immediately, so the operation
 is attempted **exactly once** even when retries are available. This test injects that error
 at *each* provider operation reached during a proposal (``latest_commit_sha``,
-``branch_exists``, ``create_branch``, ``commit_files``, ``open_pull_request``) — chosen by
+``branch_exists``, ``create_branch``, ``commit_files``, ``open_change_proposal``) — chosen by
 Hypothesis — with a config whose ``retry_max_attempts`` is greater than one, and asserts:
 
 - the failing operation was invoked exactly once (``fake.calls_for(op)`` has length 1),
@@ -72,7 +72,7 @@ _PROVIDER_OPS = (
     "branch_exists",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 )
 
 # A small pool of benign words used to build varying, injection-free intents/titles so the
@@ -124,6 +124,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -215,8 +217,8 @@ def test_property17_invalid_credentials_are_not_retried(failing_op, files, inten
     # Req 10.2: the connector returns an authorization-error indication — a safe error result,
     # never a success. The status is "error" and no PR id/url is reported.
     assert result.status == "error"
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
 
     # Req 10.2: no proposal is created — the provider never records an opened pull request,
     # regardless of which operation raised the auth error.

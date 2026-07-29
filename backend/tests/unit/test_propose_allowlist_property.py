@@ -10,7 +10,7 @@ contained in agent or user input.
 Concretely, this proves the safety-critical gate:
 
 - **Exact match** → the connector performs provider operations (``create_branch`` +
-  ``commit_files`` + ``open_pull_request``), and the effective repository/branch used for
+  ``commit_files`` + ``open_change_proposal``), and the effective repository/branch used for
   those operations come from the matched allowlist entry (never free-form model input).
 - **Any non-match** (case difference, prefix/suffix/substring, wrong branch for a listed
   repo, or an absent repo) → the connector performs **zero** provider operations and returns
@@ -60,7 +60,7 @@ _ALLOWLIST = (
 _EXACT_PAIRS = [(entry.repo, branch) for entry in _ALLOWLIST for branch in entry.target_branches]
 
 # The provider operations that constitute a source-control "write".
-_WRITE_OPS = ("create_branch", "commit_files", "open_pull_request")
+_WRITE_OPS = ("create_branch", "commit_files", "open_change_proposal")
 
 # All provider operations (used to assert ZERO calls on a rejected path).
 _ALL_OPS = ("get_file", "get_files", "branch_exists", "latest_commit_sha", *_WRITE_OPS)
@@ -85,6 +85,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -216,8 +218,8 @@ def test_property5_exact_match_issues_operation_scoped_to_allowlist(pair):
 
     # A proposal was created (the pipeline reached and completed the provider ops).
     assert result.status == "created", result.message
-    assert result.pull_request_id is not None
-    assert result.pull_request_url is not None
+    assert result.proposal_id is not None
+    assert result.proposal_url is not None
 
     # Every write operation ran exactly the expected number of times.
     for op in _WRITE_OPS:
@@ -227,7 +229,7 @@ def test_property5_exact_match_issues_operation_scoped_to_allowlist(pair):
     assert _is_exact_match(requested_repo, requested_branch)
     create_call = fake.calls_for("create_branch")[0]
     commit_call = fake.calls_for("commit_files")[0]
-    pr_call = fake.calls_for("open_pull_request")[0]
+    pr_call = fake.calls_for("open_change_proposal")[0]
 
     assert create_call["repo"] == requested_repo
     assert commit_call["repo"] == requested_repo
@@ -261,8 +263,8 @@ def test_property5_non_match_performs_no_operation_and_audits(pair):
 
     # The request is rejected and no proposal is produced.
     assert result.status == "rejected"
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
 
     # ZERO provider operations of any kind were issued.
     assert fake.calls == []

@@ -101,10 +101,27 @@ echo ""
 
 # Step 1: Deploy base infrastructure
 echo "📦 Step 1: Deploying base infrastructure..."
+
+# Source Control Connector: source the credential secret ARN and (optional) audit
+# log-group name from the environment or backend/.env.local so the base stack can
+# apply the scoped credential-read grant (and, once available, provision the audit
+# log group). Only the secret ARN is passed to the stack — never the raw credential
+# value (Req 3.4). Both default to empty for read-only deployments (Req 3.3).
+SCM_CREDENTIAL_SECRET_ARN="${GBAW_SCM_CREDENTIAL_SECRET_ARN:-$(grep "^GBAW_SCM_CREDENTIAL_SECRET_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+SCM_AUDIT_LOG_GROUP="${GBAW_SCM_AUDIT_LOG_GROUP:-$(grep "^GBAW_SCM_AUDIT_LOG_GROUP=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+
+BASE_STACK_PARAMS=(ProjectName="$PROJECT_NAME" ScmCredentialSecretArn="$SCM_CREDENTIAL_SECRET_ARN")
+# The audit log-group parameter is added to the base template by task 7.2. Pass it
+# only when configured so deployments against the current template (which does not
+# yet define the parameter) are not broken when it is unset.
+if [ -n "$SCM_AUDIT_LOG_GROUP" ]; then
+  BASE_STACK_PARAMS+=(ScmAuditLogGroupName="$SCM_AUDIT_LOG_GROUP")
+fi
+
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/01-base-infrastructure.yaml" \
   --stack-name "${PROJECT_NAME}-infrastructure" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides "${BASE_STACK_PARAMS[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 
@@ -330,9 +347,11 @@ SCM_ENV_ARGS=()
 for _scm_var in \
   GBAW_SCM_CONNECTOR_ENABLED \
   GBAW_SCM_PROVIDER \
+  GBAW_SCM_PROVIDER_BASE_URL \
   GBAW_SCM_CREDENTIAL_SECRET_ID \
   GBAW_SCM_REPO_ALLOWLIST \
   GBAW_SCM_AUTHORIZED_GROUPS \
+  GBAW_SCM_AUDIT_LOG_GROUP \
   GBAW_SCM_RATE_LIMIT_MAX \
   GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS \
   GBAW_SCM_PROVIDER_TIMEOUT_SECONDS \
@@ -348,25 +367,39 @@ if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
   echo "   Source Control Connector: wiring ${#SCM_ENV_ARGS[@]} GBAW_SCM_* env var(s)"
 fi
 
+# Build the launch env-arg list. KB IDs, guardrail, and prompt ARNs are wired only
+# when all three KB IDs are present (unchanged behavior). The Source Control Connector
+# env args (SCM_ENV_ARGS) are appended UNCONDITIONALLY so the GBAW_SCM_* vars are
+# delivered to the runtime regardless of whether the KB IDs exist (Req 8.1-8.3).
+LAUNCH_ENV_ARGS=()
 if [ -n "$GAMELIFT_KB_ID" ] && [ -n "$EKS_KB_ID" ] && [ -n "$COST_KB_ID" ]; then
   echo "   GameLift KB: $GAMELIFT_KB_ID"
   echo "   EKS KB: $EKS_KB_ID"
   echo "   Cost KB: $COST_KB_ID"
-  echo "🚀 Updating AgentCore Runtime with KB environment variables..."
-  uv run agentcore launch --auto-update-on-conflict \
-    -env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID" \
-    -env "GBAW_EKS_KB_ID=$EKS_KB_ID" \
-    -env "GBAW_COST_KB_ID=$COST_KB_ID" \
-    -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID" \
-    -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT" \
-    -env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN" \
-    -env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN" \
-    -env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN" \
-    -env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN" \
-    "${SCM_ENV_ARGS[@]}"
-  echo "✅ AgentCore Runtime updated with KB IDs and Prompt ARNs"
+  LAUNCH_ENV_ARGS+=(
+    -env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID"
+    -env "GBAW_EKS_KB_ID=$EKS_KB_ID"
+    -env "GBAW_COST_KB_ID=$COST_KB_ID"
+    -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"
+    -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT"
+    -env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN"
+    -env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN"
+    -env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN"
+    -env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN"
+  )
 else
-  echo "⚠️  KB IDs not found in .env.local - skipping runtime update"
+  echo "⚠️  KB IDs not found in .env.local - skipping KB/prompt env wiring"
+fi
+
+# Always append the connector env args (decoupled from KB IDs — Req 8).
+LAUNCH_ENV_ARGS+=("${SCM_ENV_ARGS[@]}")
+
+if [ ${#LAUNCH_ENV_ARGS[@]} -gt 0 ]; then
+  echo "🚀 Updating AgentCore Runtime with environment variables..."
+  uv run agentcore launch --auto-update-on-conflict "${LAUNCH_ENV_ARGS[@]}"
+  echo "✅ AgentCore Runtime updated"
+else
+  echo "⚠️  No KB IDs or connector env vars found - skipping runtime update"
 fi
 
 cd "$PROJECT_ROOT"

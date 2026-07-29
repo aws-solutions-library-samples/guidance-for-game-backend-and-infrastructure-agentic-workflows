@@ -40,7 +40,7 @@ _branches = st.from_regex(r"[A-Za-z0-9._/-]{1,15}", fullmatch=True)
 _paths = st.from_regex(r"[A-Za-z0-9._/-]{1,25}", fullmatch=True)
 
 # The mutation operations that the read path must NEVER invoke (no proposal is created).
-_MUTATION_OPS = ("create_branch", "commit_files", "open_pull_request")
+_MUTATION_OPS = ("create_branch", "commit_files", "open_change_proposal")
 
 
 def _make_config(*, max_files: int, repo: str, branch: str) -> ConnectorConfig:
@@ -61,6 +61,8 @@ def _make_config(*, max_files: int, repo: str, branch: str) -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=max_files,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 

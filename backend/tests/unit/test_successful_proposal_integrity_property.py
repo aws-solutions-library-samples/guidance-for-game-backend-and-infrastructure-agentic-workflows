@@ -99,6 +99,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -182,16 +184,16 @@ def test_property10_successful_proposal_integrity(files, intent_words):
     assert result.status == "created", result.message
 
     # Req 2.2: exactly one pull request was opened.
-    pr_calls = provider.calls_for("open_pull_request")
+    pr_calls = provider.calls_for("open_change_proposal")
     assert len(pr_calls) == 1
     assert len(provider.pull_requests) == 1
 
     # Req 2.6: the result carries the PR id and url, matching the opened PR.
-    assert result.pull_request_id
-    assert result.pull_request_url
+    assert result.proposal_id
+    assert result.proposal_url
     opened_pr = provider.pull_requests[0]
-    assert result.pull_request_id == opened_pr["pull_request_id"]
-    assert result.pull_request_url == opened_pr["pull_request_url"]
+    assert result.proposal_id == opened_pr["proposal_id"]
+    assert result.proposal_url == opened_pr["proposal_url"]
 
     # Req 2.3: the commit carries the COMPLETE set of proposed files — every proposed path
     # and its exact content appears in the single recorded commit_files call.

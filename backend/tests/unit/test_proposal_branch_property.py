@@ -81,6 +81,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -133,7 +135,7 @@ def test_property11_branch_unique_and_based_on_latest_commit(latest_sha, collisi
 
     # The pipeline reached and completed the provider stage: exactly one proposal created.
     assert result.status == "created", result.message
-    assert result.pull_request_id is not None
+    assert result.proposal_id is not None
 
     # --- (Req 3.3) base commit ----------------------------------------------------------
     base_calls = fake.calls_for("latest_commit_sha")

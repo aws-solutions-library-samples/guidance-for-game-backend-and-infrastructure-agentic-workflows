@@ -26,9 +26,11 @@ pytestmark = pytest.mark.unit
 _SCM_KEYS = (
     "SCM_CONNECTOR_ENABLED",
     "SCM_PROVIDER",
+    "SCM_PROVIDER_BASE_URL",
     "SCM_CREDENTIAL_SECRET_ID",
     "SCM_REPO_ALLOWLIST",
     "SCM_AUTHORIZED_GROUPS",
+    "SCM_AUDIT_LOG_GROUP",
     "SCM_RATE_LIMIT_MAX",
     "SCM_RATE_LIMIT_WINDOW_SECONDS",
     "SCM_PROVIDER_TIMEOUT_SECONDS",
@@ -110,6 +112,7 @@ def test_gbaw_prefixed_vars_are_the_only_honored_source(monkeypatch):
         "GBAW_SCM_CREDENTIAL_SECRET_ID": "gbaw/scm/github-token",
         "GBAW_SCM_REPO_ALLOWLIST": "org/iac-repo=main",
         "GBAW_SCM_AUTHORIZED_GROUPS": "sre",
+        "GBAW_SCM_AUDIT_LOG_GROUP": "scm-audit-logs",
     }
     for key, value in prefixed.items():
         monkeypatch.setenv(key, value)

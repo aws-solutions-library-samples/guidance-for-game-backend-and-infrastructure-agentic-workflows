@@ -124,6 +124,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -232,8 +234,8 @@ def test_property22_audit_write_failure_aborts_atomically(files, intent_words, a
 
     # The result is specifically the audit-persistence error and carries no proposal handle.
     assert "audit record could not be persisted" in result.message
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
 
     # Defense-in-depth: the credential value never leaks into the agent-visible result.
     assert "ghp_fake_token_value" not in result.message

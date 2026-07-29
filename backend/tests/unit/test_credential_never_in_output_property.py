@@ -7,7 +7,7 @@ source-control credential (``SCM_Credential``) is fetched only from Secrets Mana
 Two observable surfaces exist for a ``connector.service.propose_change`` invocation:
 
   1. the returned :class:`ProposalResult` — its ``status``, ``message``,
-     ``pull_request_id`` and ``pull_request_url``; and
+     ``proposal_id`` and ``proposal_url``; and
   2. the audit log — every field of every ``connector.service.logger`` call.
 
 The property proven here is universal: for *any* credential value that ``get_secret``
@@ -98,6 +98,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=1,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -143,7 +145,7 @@ def _provider_for(scenario: str) -> FakeProvider:
     elif scenario == "provider_unavailable":
         fake.fail("latest_commit_sha", ProviderUnavailableError("unreachable"))
     elif scenario == "provider_conflict":
-        fake.fail("open_pull_request", ProviderConflictError("merge conflict"))
+        fake.fail("open_change_proposal", ProviderConflictError("merge conflict"))
     elif scenario == "provider_transient":
         fake.fail("latest_commit_sha", ProviderTransientError("temporary"))
     return fake
@@ -183,7 +185,7 @@ def test_property8_credential_never_appears_in_output(credential, scenario):
 
     For any credential returned by ``get_secret`` and across the success path and every
     decline/failure path, the exact credential string is absent from ``result.status``,
-    ``result.message``, ``result.pull_request_id``, ``result.pull_request_url`` and from
+    ``result.message``, ``result.proposal_id``, ``result.proposal_url`` and from
     every ``connector.service.logger`` call's args/kwargs (Req 4.7, 6.6).
     """
     # Isolate this example: fresh rate-limit window and a unique authorized user id.
@@ -218,7 +220,7 @@ def test_property8_credential_never_appears_in_output(credential, scenario):
     # below are meaningful (the credential gate was passed and each path was reached).
     if scenario == "success":
         assert result.status == "created", result.message
-        assert result.pull_request_id is not None
+        assert result.proposal_id is not None
     else:
         assert result.status in {"declined", "error"}, (scenario, result.status)
 
@@ -226,8 +228,8 @@ def test_property8_credential_never_appears_in_output(credential, scenario):
     for field_value in (
         result.status,
         result.message,
-        result.pull_request_id,
-        result.pull_request_url,
+        result.proposal_id,
+        result.proposal_url,
     ):
         if field_value is not None:
             assert credential not in field_value, (

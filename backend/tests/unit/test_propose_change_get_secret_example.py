@@ -79,6 +79,8 @@ def _enabled_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -136,7 +138,7 @@ def test_propose_change_fetches_credential_via_get_secret_and_reads_no_raw_env(m
 
     # The pipeline reached the provider ops and opened exactly one proposal.
     assert result.status == "created", result.message
-    assert result.pull_request_id is not None
+    assert result.proposal_id is not None
     assert len(fake.pull_requests) == 1
 
     # Req 4.2: the credential is fetched from Secrets Manager via get_secret, keyed by the

@@ -14,7 +14,7 @@ import inspect
 import pytest
 
 # Local modules
-from connector.models import FileContent, FileFetchResult, ProposedFile, PullRequestResult
+from connector.models import FileContent, FileFetchResult, ProposedFile, ChangeProposalResult
 from connector.provider import (
     ProviderAuthError,
     ProviderConflictError,
@@ -51,7 +51,7 @@ def test_records_all_calls_with_arguments():
         [ProposedFile("a.yaml", "Resources: {}", "cloudformation")],
         "msg",
     )
-    fake.open_pull_request("org/iac", "gbaw/x", "main", "title", "body")
+    fake.open_change_proposal("org/iac", "gbaw/x", "main", "title", "body")
 
     assert fake.call_operations == [
         "get_file",
@@ -60,7 +60,7 @@ def test_records_all_calls_with_arguments():
         "latest_commit_sha",
         "create_branch",
         "commit_files",
-        "open_pull_request",
+        "open_change_proposal",
     ]
 
     get_files_call = fake.calls_for("get_files")[0]
@@ -131,9 +131,9 @@ def test_default_branch_commit_and_pr_flow():
     )
     assert sha == fake.commits[0]["sha"]
 
-    pr = fake.open_pull_request("org/iac", "gbaw/x", "main", "t", "b")
-    assert isinstance(pr, PullRequestResult)
-    assert pr.pull_request_id == "1"
+    pr = fake.open_change_proposal("org/iac", "gbaw/x", "main", "t", "b")
+    assert isinstance(pr, ChangeProposalResult)
+    assert pr.proposal_id == "1"
     assert fake.pull_requests[0]["title"] == "t"
 
 
@@ -144,12 +144,12 @@ def test_default_branch_commit_and_pr_flow():
 def test_injectable_typed_failures(exc):
     """Any operation can be programmed to raise a typed provider exception."""
     fake = FakeProvider()
-    fake.fail("open_pull_request", exc)
+    fake.fail("open_change_proposal", exc)
     expected = exc if isinstance(exc, type) else type(exc)
     with pytest.raises(expected):
-        fake.open_pull_request("r", "h", "b", "t", "body")
+        fake.open_change_proposal("r", "h", "b", "t", "body")
     # The failing call is still recorded.
-    assert fake.call_operations == ["open_pull_request"]
+    assert fake.call_operations == ["open_change_proposal"]
 
 
 def test_fail_times_then_succeeds_for_retry_scenarios():

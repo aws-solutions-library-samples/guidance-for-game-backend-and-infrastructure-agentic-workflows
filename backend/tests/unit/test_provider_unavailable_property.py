@@ -10,7 +10,7 @@ The connector maps both "provider unreachable" and "provider timed out" onto
 :class:`connector.provider.ProviderUnavailableError` (see the design's failure-handling
 table for Req 10.1). This test injects that error at *each* provider operation reached
 during a proposal (``latest_commit_sha``, ``branch_exists``, ``create_branch``,
-``commit_files``, ``open_pull_request``) — chosen by Hypothesis — and asserts the outcome
+``commit_files``, ``open_change_proposal``) — chosen by Hypothesis — and asserts the outcome
 is always safe and non-destructive:
 
 - the result status is ``"error"`` (an availability-error indication),
@@ -67,7 +67,7 @@ _PROVIDER_OPS = (
     "branch_exists",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 )
 
 # A small pool of benign words used to build varying, injection-free intents/titles so the
@@ -114,6 +114,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -202,14 +204,14 @@ def test_property16_provider_unavailable_is_safe_and_non_destructive(
     # Req 10.1: the connector returns an availability-error indication — a safe error result,
     # never a success. The status is "error" and no PR id/url is reported.
     assert result.status == "error"
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
 
     # Req 10.1: no proposal is created — the provider never records an opened pull request,
     # regardless of which operation failed.
     assert provider.pull_requests == []
-    assert provider.calls_for("open_pull_request") == [] or failing_op == "open_pull_request"
-    # Even when open_pull_request itself is the failing op, no PR artifact is recorded.
+    assert provider.calls_for("open_change_proposal") == [] or failing_op == "open_change_proposal"
+    # Even when open_change_proposal itself is the failing op, no PR artifact is recorded.
     assert len(provider.pull_requests) == 0
 
     # Defense-in-depth: the credential value never leaks into the agent-visible result.

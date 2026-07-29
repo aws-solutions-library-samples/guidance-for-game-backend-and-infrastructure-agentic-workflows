@@ -31,7 +31,7 @@ EXPECTED_OPERATIONS = {
     "latest_commit_sha",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 }
 
 # Substrings that would indicate a forbidden mutation/finalization operation on the

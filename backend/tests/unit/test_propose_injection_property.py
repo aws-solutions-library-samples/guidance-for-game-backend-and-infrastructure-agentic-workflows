@@ -91,7 +91,7 @@ _ALL_OPS = (
     "latest_commit_sha",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 )
 
 
@@ -108,6 +108,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -201,8 +203,8 @@ def test_property15_injection_flagged_input_blocks_all_operations(inputs):
 
     # The request is rejected and no proposal is produced (never reports success).
     assert result.status == "rejected"
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
 
     # ZERO provider operations of any kind were issued.
     assert fake.calls == []

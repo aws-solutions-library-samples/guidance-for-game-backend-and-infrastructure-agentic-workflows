@@ -25,8 +25,13 @@ Design contract (see ``.kiro/specs/source-control-connector/design.md`` → Data
 Validation rules enforced by ``load()`` (all failures accumulate):
 
 - Enablement flag not truthy → disabled, **no error** (normal off state) (Req 1.1, 1.5).
-- ``provider`` unset/empty → error (Req 9.5). The provider *name* is validated later by
-  the provider factory (``get_provider``); here we only require it be present/non-empty.
+- ``provider`` unset/empty → error (Req 9.5); a provider with no registered adapter (per
+  ``connector.registry.is_supported``) → error and disabled, so an unsupported provider
+  fails closed at config-load time rather than at first use (Req 7.1, 7.2).
+- ``provider_base_url`` set but not an absolute https URL → error and disabled; unset →
+  ``None`` so the adapter uses the provider's public endpoint (Req 10.2, 10.3, 10.4).
+- ``audit_log_group`` absent on the enabled path → error and disabled (the durable audit
+  sink needs a target log group) (Req 13.1).
 - ``credential_secret_id`` unset → error; raw-credential-shaped value → error and the
   value is omitted from audit output (Req 12.2, 12.3).
 - Allowlist unparsable or zero entries → error (Req 5.4).
@@ -43,9 +48,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 # Local modules
 from config import settings
+from connector import registry
 from utils.logger import logger
 from utils.security import sanitize_log_data
 
@@ -103,9 +110,11 @@ class ConnectorConfig:
 
     enabled: bool
     provider: str | None
+    provider_base_url: str | None
     credential_secret_id: str | None
     allowlist: tuple[AllowlistEntry, ...]
     authorized_groups: tuple[str, ...]
+    audit_log_group: str | None
     rate_limit_max: int
     rate_limit_window_seconds: int
     provider_timeout_seconds: int
@@ -133,11 +142,30 @@ class ConnectorConfig:
         if not truthy:
             return cls._disabled_off_state()
 
-        # --- Provider: present/non-empty only. The provider *name* is validated later
-        # by the provider factory (get_provider); config just requires it exists. ---
+        # --- Provider: present/non-empty AND backed by a registered adapter. The registry
+        # is the single source of truth for which providers are supported; enablement fails
+        # closed when no adapter is registered for the configured provider (Req 7.1, 7.2). ---
         provider = (settings.SCM_PROVIDER or "").strip() or None
         if provider is None:
             errors.append("provider: GBAW_SCM_PROVIDER is required but was not set")
+        elif not registry.is_supported(provider):
+            errors.append(
+                f"provider: no source-control adapter is registered for provider '{provider}'; "
+                "connector disabled (fail-closed)"
+            )
+
+        # --- Provider base URL: optional. When set it MUST be an absolute HTTPS URL
+        # (scheme "https" + non-empty host); an invalid value fails closed with a config
+        # error and disables the connector. When unset the adapter defaults to the
+        # provider's public endpoint (Req 10.1, 10.2, 10.3, 10.4). ---
+        raw_base_url = (settings.SCM_PROVIDER_BASE_URL or "").strip()
+        provider_base_url: str | None = raw_base_url or None
+        if provider_base_url is not None and not _is_absolute_https_url(provider_base_url):
+            errors.append(
+                f"provider_base_url: GBAW_SCM_PROVIDER_BASE_URL value '{provider_base_url}' is "
+                "not a valid absolute https URL"
+            )
+            provider_base_url = None
 
         # --- Credential secret id: required, and must be a secret id/ARN, not a raw value.
         raw_secret = (settings.SCM_CREDENTIAL_SECRET_ID or "").strip()
@@ -170,6 +198,16 @@ class ConnectorConfig:
             errors.append(
                 "authorized_groups: GBAW_SCM_AUTHORIZED_GROUPS is required and must list at "
                 "least one Cognito group"
+            )
+
+        # --- Audit log group: required when the connector is enabled, since the durable
+        # audit sink needs a target CloudWatch Logs group. Absent/empty on the enabled path
+        # accumulates a config error and forces the connector disabled (Req 13.1). ---
+        audit_log_group = (settings.SCM_AUDIT_LOG_GROUP or "").strip() or None
+        if audit_log_group is None:
+            errors.append(
+                "audit_log_group: GBAW_SCM_AUDIT_LOG_GROUP is required when the connector is "
+                "enabled but was not set"
             )
 
         # --- Numeric tuning values: parse + range-check, falling back to defaults. ---
@@ -230,9 +268,11 @@ class ConnectorConfig:
         return cls(
             enabled=enabled,
             provider=provider,
+            provider_base_url=provider_base_url,
             credential_secret_id=credential_secret_id,
             allowlist=allowlist,
             authorized_groups=authorized_groups,
+            audit_log_group=audit_log_group,
             rate_limit_max=rate_limit_max,
             rate_limit_window_seconds=rate_limit_window_seconds,
             provider_timeout_seconds=provider_timeout_seconds,
@@ -251,9 +291,11 @@ class ConnectorConfig:
         return cls(
             enabled=False,
             provider=None,
+            provider_base_url=None,
             credential_secret_id=None,
             allowlist=(),
             authorized_groups=(),
+            audit_log_group=None,
             rate_limit_max=_RATE_LIMIT_MAX_DEFAULT,
             rate_limit_window_seconds=_RATE_WINDOW_DEFAULT,
             provider_timeout_seconds=_TIMEOUT_DEFAULT,
@@ -283,6 +325,20 @@ def _looks_like_raw_credential(value: str) -> bool:
     if re.fullmatch(r"[A-Za-z0-9/+=]{40}", value):
         return True
     return False
+
+
+def _is_absolute_https_url(value: str) -> bool:
+    """Return ``True`` if ``value`` is an absolute HTTPS URL (Req 10.4).
+
+    Requires the ``https`` scheme and a non-empty network location (host). Any parse
+    failure, a non-``https`` scheme, or a missing host makes the value invalid so the
+    connector fails closed on a misconfigured Provider_Base_URL.
+    """
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and bool(parsed.netloc)
 
 
 def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[str]]:

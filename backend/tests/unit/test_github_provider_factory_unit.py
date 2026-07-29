@@ -27,8 +27,9 @@ from unittest.mock import patch
 import pytest
 
 # Local modules
-from connector.github_provider import GitHubProvider, get_provider
+from connector.github_provider import GitHubProvider
 from connector.provider import SourceControlProvider, UnsupportedProviderError
+from connector.registry import get_provider
 
 pytestmark = pytest.mark.unit
 
@@ -36,14 +37,15 @@ pytestmark = pytest.mark.unit
 def _make_config(provider: str) -> SimpleNamespace:
     """Build a lightweight ConnectorConfig-shaped stub for the fields the adapter reads.
 
-    ``GitHubProvider`` only reads ``credential_secret_id`` and ``provider_timeout_seconds``
-    (and an optional ``api_base_url``); ``get_provider`` reads ``provider``. A stub keeps
-    the test focused on factory selection and interface completeness.
+    ``GitHubProvider`` only reads ``credential_secret_id``, ``provider_timeout_seconds``,
+    and ``provider_base_url``; ``get_provider`` reads ``provider``. A stub keeps the test
+    focused on factory selection and interface completeness.
     """
     return SimpleNamespace(
         provider=provider,
         credential_secret_id="scm/github-token",
         provider_timeout_seconds=30,
+        provider_base_url=None,
     )
 
 
@@ -99,6 +101,6 @@ def test_get_provider_result_exposes_the_full_operation_set(mock_get_secret):
         "latest_commit_sha",
         "create_branch",
         "commit_files",
-        "open_pull_request",
+        "open_change_proposal",
     ):
         assert callable(getattr(provider, op)), f"missing operation: {op}"

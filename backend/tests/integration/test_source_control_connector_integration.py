@@ -89,6 +89,8 @@ def _build_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -211,9 +213,9 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
             )
 
             assert proposal.status == "created", f"Unexpected proposal result: {proposal}"
-            assert proposal.pull_request_id, "Expected a pull request id (Req 2.6)"
-            assert proposal.pull_request_url, "Expected a pull request URL (Req 2.6)"
-            pr_number = proposal.pull_request_id
+            assert proposal.proposal_id, "Expected a pull request id (Req 2.6)"
+            assert proposal.proposal_url, "Expected a pull request URL (Req 2.6)"
+            pr_number = proposal.proposal_id
 
             # --- Step 3: confirm the PR exists and is UNMERGED (Req 6.1) -------------------
             pr = _get_pull_request(pr_number)

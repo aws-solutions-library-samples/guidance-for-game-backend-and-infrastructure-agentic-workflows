@@ -15,7 +15,6 @@ Agent shape).
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
-from config.settings import SCM_IAC_KB_ID
 from connector.tools import get_iac_file, propose_infrastructure_change
 
 # ============================================================================
@@ -65,13 +64,14 @@ def get_source_control_prompt() -> str:
 # ============================================================================
 
 # boto3/MCP not used: all operations go through the provider-agnostic connector
-# tools. The optional IaC KB retrieve tool is wired by the factory only when
-# SCM_IAC_KB_ID is configured (Req 3.5).
+# tools. The specialist is built with NO IaC Knowledge Base retrieve tool: the dead
+# IaC-KB configuration was removed, so kb_id is None until a real IaC KB is provisioned
+# (Req 9.1, 9.2).
 source_control_agent = create_specialist_agent(
     service_name="SourceControl",
     emoji="🔀",
     mcp_server_names=None,
-    kb_id=SCM_IAC_KB_ID,
+    kb_id=None,
     prompt_fn=get_source_control_prompt,
     fallback_fn=None,
     additional_tools=[get_iac_file, propose_infrastructure_change],

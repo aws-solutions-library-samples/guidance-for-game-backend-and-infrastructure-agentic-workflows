@@ -14,7 +14,7 @@ Contents:
 - :class:`FileContent` / :class:`FileFetchResult` — the read path: a single file and a
   batch fetch result carrying missing paths and a limit-exceeded flag (Req 3.2, 3.4).
 - :class:`ProposedFile` — one agent-proposed IaC file plus its declared format.
-- :class:`PullRequestResult` — the identifier and URL of an opened Change_Proposal
+- :class:`ChangeProposalResult` — the identifier and URL of an opened Change_Proposal
   (Req 2.6).
 - :class:`ProposalResult` — the safe, agent-visible outcome of a propose operation;
   its ``message`` never contains secrets.
@@ -58,11 +58,11 @@ class ProposedFile:
 
 
 @dataclass(frozen=True)
-class PullRequestResult:
+class ChangeProposalResult:
     """Identifier and URL of an opened Change_Proposal (Req 2.6)."""
 
-    pull_request_id: str
-    pull_request_url: str
+    proposal_id: str
+    proposal_url: str
 
 
 @dataclass(frozen=True)
@@ -73,6 +73,6 @@ class ProposalResult:
     """
 
     status: str  # "created" | "declined" | "rejected" | "error"
-    pull_request_id: str | None
-    pull_request_url: str | None
+    proposal_id: str | None
+    proposal_url: str | None
     message: str

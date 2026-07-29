@@ -4,7 +4,7 @@
 Covers Correctness Property 18 from the source-control-connector design: if a proposal's
 branch (and commit) are created successfully but opening the pull request fails with a
 provider error, the connector SHALL report failure and NEVER report success. In particular,
-for *any* provider error raised by ``open_pull_request`` (after ``create_branch`` and
+for *any* provider error raised by ``open_change_proposal`` (after ``create_branch`` and
 ``commit_files`` have already succeeded), ``connector.service.propose_change``:
 
 - returns an error result (``status == "error"``) — never ``"created"`` (Req 10.3),
@@ -15,7 +15,7 @@ for *any* provider error raised by ``open_pull_request`` (after ``create_branch`
 
 The service is exercised with a ``FakeProvider`` injected via ``provider=`` (its default
 behavior makes ``latest_commit_sha``/``branch_exists``/``create_branch``/``commit_files``
-succeed and records each op) programmed so *only* ``open_pull_request`` raises. The failure
+succeed and records each op) programmed so *only* ``open_change_proposal`` raises. The failure
 is varied by Hypothesis across the abstraction's provider error types
 (``ProviderConflictError``, ``ProviderUnavailableError``, ``ProviderTransientError``
 exhausted, and the base ``ProviderError``). An enabled :class:`ConnectorConfig` injected via
@@ -98,7 +98,7 @@ def _make_config() -> ConnectorConfig:
     """Build an enabled ConnectorConfig whose allowlist matches the requested repo/branch.
 
     ``retry_max_attempts`` is 1 so a ``ProviderTransientError`` raised by
-    ``open_pull_request`` is immediately exhausted (a single attempt, no backoff sleeps).
+    ``open_change_proposal`` is immediately exhausted (a single attempt, no backoff sleeps).
     """
     return ConnectorConfig(
         enabled=True,
@@ -111,6 +111,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=1,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -143,7 +145,7 @@ def _valid_cfn_files(draw):
 
 @st.composite
 def _pr_failures(draw):
-    """Generate a provider error for ``open_pull_request`` to raise.
+    """Generate a provider error for ``open_change_proposal`` to raise.
 
     Varies across every provider error type the pipeline can surface after a branch has
     been created: a conflict, provider unavailability, an exhausted transient failure, and
@@ -178,7 +180,7 @@ def _pr_failures(draw):
 def test_property18_pr_failure_after_branch_never_reports_success(files, intent_words, failure):
     """A PR-creation failure after the branch is created reports failure, never success.
 
-    For any provider error raised by ``open_pull_request`` after ``create_branch`` (and
+    For any provider error raised by ``open_change_proposal`` after ``create_branch`` (and
     ``commit_files``) succeeded, ``propose_change`` reports an error, never ``"created"``,
     and returns no pull-request id/url — even though a branch was created (Req 10.3).
     """
@@ -189,7 +191,7 @@ def test_property18_pr_failure_after_branch_never_reports_success(files, intent_
     provider = FakeProvider()
     # Only PR creation fails; every prior provider op (latest_commit_sha, branch_exists,
     # create_branch, commit_files) uses the fake's default success behavior.
-    provider.fail("open_pull_request", failure)
+    provider.fail("open_change_proposal", failure)
 
     user_id = f"user-{next(_user_ids)}"
     intent = " ".join(intent_words)
@@ -216,16 +218,16 @@ def test_property18_pr_failure_after_branch_never_reports_success(files, intent_
     assert len(create_calls) >= 1, "expected create_branch to be invoked before the PR step"
     assert provider.created_branches, "expected a branch to have been created"
 
-    # open_pull_request was actually attempted (and failed).
-    assert provider.calls_for("open_pull_request"), "expected open_pull_request to be attempted"
+    # open_change_proposal was actually attempted (and failed).
+    assert provider.calls_for("open_change_proposal"), "expected open_change_proposal to be attempted"
 
     # Req 10.3: failure is reported and success is NEVER reported.
     assert result.status == "error"
     assert result.status != "created"
 
     # No pull request id/url is returned, and no pull request exists on the provider.
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
     assert provider.pull_requests == [], "no pull request should have been created"
 
     # Defense-in-depth: the credential value never leaks into the agent-visible result.

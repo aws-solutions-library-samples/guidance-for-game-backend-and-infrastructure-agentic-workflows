@@ -48,9 +48,11 @@ def _truthy_flags(draw) -> str:
     return f"{draw(ws)}{cased}{draw(ws)}"
 
 
-# Provider name: any non-empty, whitespace-free token. config.load() only requires the
-# provider be present; the provider *name* is validated later by the factory (Req 9.5).
-_providers = st.from_regex(r"[a-z][a-z0-9_-]{2,12}", fullmatch=True)
+# Provider name: must name a provider that has a registered adapter, since enablement now
+# fails closed via the provider registry (registry.is_supported) — a valid config for an
+# unregistered provider is intentionally disabled (Req 7.1, 7.2; hardening Property H2).
+# "github" is the bundled, self-registered adapter, so it is the supported provider here.
+_providers = st.just("github")
 
 
 # A valid Secrets Manager ARN, matching the module's _SECRET_ARN_RE.
@@ -74,6 +76,17 @@ _branches = st.from_regex(r"[A-Za-z0-9._/-]{1,15}", fullmatch=True)
 
 # Cognito group names: whitespace-free, comma-free tokens.
 _groups = st.from_regex(r"[A-Za-z0-9._-]{1,20}", fullmatch=True)
+
+# Audit log group name: a dedicated CloudWatch Logs log group, required when enabled
+# (Req 13.1). Whitespace-free token so it survives load() unchanged.
+_audit_log_groups = st.from_regex(r"[A-Za-z0-9._/-]{1,40}", fullmatch=True)
+
+# Provider base URL: either unset (adapter uses the public endpoint) or an absolute HTTPS
+# URL (Req 10.2, 10.3). Both keep the connector enabled.
+_provider_base_urls = st.one_of(
+    st.none(),
+    st.from_regex(r"https://[a-z0-9.-]{1,20}\.example\.com(/[A-Za-z0-9._/-]{0,15})?", fullmatch=True),
+)
 
 
 @st.composite
@@ -113,10 +126,12 @@ def _valid_configs(draw) -> dict:
     return {
         "flag": draw(_truthy_flags()),
         "provider": draw(_providers),
+        "provider_base_url": draw(_provider_base_urls),
         "credential_secret_id": draw(_credential_secret_ids),
         "allowlist_encoded": allowlist_encoded,
         "expected_entries": expected_entries,
         "groups": groups,
+        "audit_log_group": draw(_audit_log_groups),
         "rate_limit_max": rate_limit_max,
         "rate_limit_window": rate_limit_window,
         "provider_timeout": provider_timeout,
@@ -135,9 +150,11 @@ def _patched_settings(cfg: dict):
         app_settings,
         SCM_CONNECTOR_ENABLED=cfg["flag"],
         SCM_PROVIDER=cfg["provider"],
+        SCM_PROVIDER_BASE_URL=cfg["provider_base_url"],
         SCM_CREDENTIAL_SECRET_ID=cfg["credential_secret_id"],
         SCM_REPO_ALLOWLIST=cfg["allowlist_encoded"],
         SCM_AUTHORIZED_GROUPS=",".join(cfg["groups"]),
+        SCM_AUDIT_LOG_GROUP=cfg["audit_log_group"],
         SCM_RATE_LIMIT_MAX=str(cfg["rate_limit_max"]),
         SCM_RATE_LIMIT_WINDOW_SECONDS=str(cfg["rate_limit_window"]),
         SCM_PROVIDER_TIMEOUT_SECONDS=str(cfg["provider_timeout"]),
@@ -167,6 +184,8 @@ def test_property1_truthy_valid_config_enables_connector(cfg):
 
     # Fields are parsed exactly as configured (values are whitespace-free by construction).
     assert config.provider == cfg["provider"]
+    assert config.provider_base_url == cfg["provider_base_url"]
+    assert config.audit_log_group == cfg["audit_log_group"]
     assert config.credential_secret_id == cfg["credential_secret_id"]
     assert config.allowlist == cfg["expected_entries"]
     assert config.authorized_groups == tuple(cfg["groups"])

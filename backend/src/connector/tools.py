@@ -14,7 +14,7 @@ Contract (design.md):
          "error": <optional>}
 
     propose_infrastructure_change(intent, files, iac_format, title, description) -> dict
-        {"status", "pull_request_id", "pull_request_url", "message"}
+        {"status", "proposal_id", "proposal_url", "message"}
 
 The real enforcement (enablement, validation, authorization, allowlist, rate limit,
 credential handling, IaC validation, audit) lives in :mod:`connector.service`; these
@@ -82,12 +82,12 @@ def propose_infrastructure_change(
     title: str,
     description: str,
 ) -> dict:
-    """Open a pull request proposing Infrastructure-as-Code changes for human review.
+    """Open a change proposal for Infrastructure-as-Code changes for human review.
 
     This never mutates live AWS resources. It creates a uniquely-named branch off the
     configured target branch, commits the proposed files, and opens exactly one unmerged
-    pull request attributed to the agent on behalf of the requesting user. The change flows
-    through review and the existing CI/CD pipeline after a human approves and merges.
+    change proposal attributed to the agent on behalf of the requesting user. The change
+    flows through review and the existing CI/CD pipeline after a human approves and merges.
 
     Args:
         intent: A short natural-language description of the change being proposed.
@@ -96,12 +96,12 @@ def propose_infrastructure_change(
             ``"iac_format"`` the top-level ``iac_format`` argument is used for it.
         iac_format: The default IaC format for the files, one of
             ``{"cloudformation", "terraform"}``.
-        title: A non-empty pull request title.
+        title: A non-empty change proposal title.
         description: A description identifying the intended change and affected files.
 
     Returns:
         A JSON-serialisable dict:
-        ``{"status": str, "pull_request_id": str | None, "pull_request_url": str | None,
+        ``{"status": str, "proposal_id": str | None, "proposal_url": str | None,
         "message": str}``. ``status`` is one of ``"created"``, ``"declined"``,
         ``"rejected"``, or ``"error"``; ``message`` is safe to relay and never contains
         secrets. On an unexpected failure a safe ``"error"`` dict is returned instead.
@@ -125,8 +125,8 @@ def propose_infrastructure_change(
         )
         return {
             "status": result.status,
-            "pull_request_id": result.pull_request_id,
-            "pull_request_url": result.pull_request_url,
+            "proposal_id": result.proposal_id,
+            "proposal_url": result.proposal_url,
             "message": result.message,
         }
     except Exception:  # noqa: BLE001 - tools must never raise to the model
@@ -137,7 +137,7 @@ def propose_infrastructure_change(
         )
         return {
             "status": "error",
-            "pull_request_id": None,
-            "pull_request_url": None,
+            "proposal_id": None,
+            "proposal_url": None,
             "message": "The change proposal could not be completed due to an internal error.",
         }

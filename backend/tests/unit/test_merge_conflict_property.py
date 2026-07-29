@@ -69,13 +69,13 @@ _PROPOSE_OPS = (
     "branch_exists",
     "create_branch",
     "commit_files",
-    "open_pull_request",
+    "open_change_proposal",
 )
 
 # Operations that mutate source control. None of these is a merge/approve/close/force op — the
 # abstraction intentionally has no such operation — so any destructive resolution is
 # structurally impossible; we additionally assert nothing runs *after* the conflict.
-_MUTATING_OPS = ("create_branch", "commit_files", "open_pull_request")
+_MUTATING_OPS = ("create_branch", "commit_files", "open_change_proposal")
 
 # Benign, injection-free words used to build varying intents/titles so input validation and
 # prompt-injection detection always pass and every request reaches the provider operations.
@@ -114,6 +114,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -200,15 +202,15 @@ def test_property19_merge_conflict_is_reported_without_destructive_resolution(
     assert result.status != "created"
 
     # No pull-request id/url is returned — nothing was successfully proposed.
-    assert result.pull_request_id is None
-    assert result.pull_request_url is None
+    assert result.proposal_id is None
+    assert result.proposal_url is None
 
     # The message conveys the conflict and that existing content was preserved (Req 10.4).
     message = result.message.lower()
     assert "conflict" in message
     assert "preserved" in message
 
-    # No pull request was ever opened (whether the conflict was on open_pull_request or earlier).
+    # No pull request was ever opened (whether the conflict was on open_change_proposal or earlier).
     assert provider.pull_requests == []
 
     # No destructive resolution: the failing op is the LAST provider call — nothing runs after

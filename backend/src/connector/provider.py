@@ -10,7 +10,7 @@ uniformly regardless of the underlying provider.
 Design guarantees encoded here:
 
 - Signatures reference only provider-agnostic types (`FileContent`, `FileFetchResult`,
-  `ProposedFile`, `PullRequestResult` from ``connector.models``) and Python primitives;
+  `ProposedFile`, `ChangeProposalResult` from ``connector.models``) and Python primitives;
   no provider-specific type ever appears in the contract (Req 9.1).
 - The abstraction defines a fixed operation set that adapters implement identically, so
   adding a provider requires no change to the agent-facing tools (Req 9.2).
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
         FileContent,
         FileFetchResult,
         ProposedFile,
-        PullRequestResult,
+        ChangeProposalResult,
     )
 
 
@@ -101,8 +101,8 @@ class SourceControlProvider(ABC):
     (Req 9.1, 9.2).
 
     The operation set is intentionally limited to reading files and proposing changes
-    (create branch, commit files, open pull request). It defines **no** merge, approve, or
-    close operation, structurally guaranteeing the Connector cannot merge or close a
+    (create branch, commit files, open change proposal). It defines **no** merge, approve,
+    or close operation, structurally guaranteeing the Connector cannot merge or close a
     Change_Proposal (Req 2.5, 6.1, 6.2).
     """
 
@@ -165,17 +165,17 @@ class SourceControlProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def open_pull_request(
+    def open_change_proposal(
         self,
         repo: str,
         head: str,
         base: str,
         title: str,
         body: str,
-    ) -> PullRequestResult:
+    ) -> ChangeProposalResult:
         """Open exactly one Change_Proposal from ``head`` into ``base`` on ``repo``.
 
-        Returns a :class:`~connector.models.PullRequestResult` with the proposal
+        Returns a :class:`~connector.models.ChangeProposalResult` with the proposal
         identifier and URL (Req 2.2, 2.6). The proposal is created unmerged and requires
         human review (Req 6.1).
         """

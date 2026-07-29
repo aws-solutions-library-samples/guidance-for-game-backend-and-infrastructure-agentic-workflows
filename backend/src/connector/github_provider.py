@@ -1,8 +1,11 @@
 """GitHub provider adapter for the Source Control Connector.
 
 This module implements the provider-agnostic :class:`SourceControlProvider` contract
-against the GitHub REST API (Req 9.3), plus the :func:`get_provider` factory that selects
-the concrete adapter from the validated :class:`ConnectorConfig` (Req 9.4, 9.6).
+against the GitHub REST API (Req 9.3). Provider *selection* no longer lives here: the
+adapter self-registers with the provider-neutral registry at import time
+(``registry.register("github", GitHubProvider)``) and the registry owns resolution via
+``connector.registry.get_provider`` (Req 4.1, 6.1, 6.3). Importing this module is what
+makes ``"github"`` a supported provider.
 
 Design guarantees encoded here (see
 ``.kiro/specs/source-control-connector/design.md`` → GitHub adapter):
@@ -36,11 +39,12 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 # Local modules
+from connector import registry
 from connector.models import (
     FileContent,
     FileFetchResult,
     ProposedFile,
-    PullRequestResult,
+    ChangeProposalResult,
 )
 from connector.provider import (
     ProviderAuthError,
@@ -49,7 +53,6 @@ from connector.provider import (
     ProviderTransientError,
     ProviderUnavailableError,
     SourceControlProvider,
-    UnsupportedProviderError,
 )
 from utils.secrets import get_secret
 
@@ -57,7 +60,7 @@ if TYPE_CHECKING:
     # Local modules
     from connector.config import ConnectorConfig
 
-__all__ = ["GitHubProvider", "get_provider"]
+__all__ = ["GitHubProvider"]
 
 # Public GitHub REST API host. GitHub Enterprise deployments would override this with a
 # configured base URL; the connector defaults to the public host.
@@ -82,7 +85,9 @@ class GitHubProvider(SourceControlProvider):
     def __init__(self, config: ConnectorConfig) -> None:
         self._credential_secret_id = config.credential_secret_id
         self._timeout = float(config.provider_timeout_seconds)
-        self._base_url = getattr(config, "api_base_url", None) or _DEFAULT_API_BASE_URL
+        # provider_base_url is a real, validated config field (absolute https or None). When
+        # unset the adapter falls back to the public GitHub API host (Req 10.2, 10.3).
+        self._base_url = config.provider_base_url or _DEFAULT_API_BASE_URL
 
     # ------------------------------------------------------------------ read path
 
@@ -245,14 +250,14 @@ class GitHubProvider(SourceControlProvider):
         )
         return new_commit_sha
 
-    def open_pull_request(
+    def open_change_proposal(
         self,
         repo: str,
         head: str,
         base: str,
         title: str,
         body: str,
-    ) -> PullRequestResult:
+    ) -> ChangeProposalResult:
         """Open exactly one pull request from ``head`` into ``base`` (Req 2.2, 2.6).
 
         The proposal is created unmerged and requires human review; the adapter exposes no
@@ -265,9 +270,9 @@ class GitHubProvider(SourceControlProvider):
             headers,
             json={"title": title, "head": head, "base": base, "body": body},
         ).json()
-        return PullRequestResult(
-            pull_request_id=str(payload.get("number", "")),
-            pull_request_url=payload.get("html_url", ""),
+        return ChangeProposalResult(
+            proposal_id=str(payload.get("number", "")),
+            proposal_url=payload.get("html_url", ""),
         )
 
     # -------------------------------------------------------------------- helpers
@@ -376,13 +381,8 @@ class GitHubProvider(SourceControlProvider):
         return payload["object"]["sha"]
 
 
-def get_provider(config: ConnectorConfig) -> SourceControlProvider:
-    """Return the provider adapter for the configured provider (Req 9.4).
-
-    Only ``"github"`` is implemented today. Any other provider name raises
-    :class:`UnsupportedProviderError`, which the config loader catches so the connector
-    stays disabled and read-only (Req 9.6).
-    """
-    if config.provider == "github":
-        return GitHubProvider(config)
-    raise UnsupportedProviderError(config.provider)
+# Self-register the bundled GitHub adapter with the provider-neutral registry so that
+# importing this module makes "github" a supported provider (Req 6.1, 7.1). The registry
+# owns provider selection now; there is no module-level get_provider factory here, and the
+# provider-neutral core (service/config) never imports this module directly (Req 4.1).
+registry.register("github", GitHubProvider)

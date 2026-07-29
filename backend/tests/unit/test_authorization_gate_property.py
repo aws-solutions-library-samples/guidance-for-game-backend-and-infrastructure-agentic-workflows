@@ -91,6 +91,8 @@ def _make_config(authorized_groups: tuple[str, ...]) -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -201,8 +203,8 @@ def test_property6_authorization_gate(scenario):
             f"expected authorized request to create a proposal, got {result.status}: "
             f"{result.message}"
         )
-        assert result.pull_request_id is not None
-        assert len(fake.calls_for("open_pull_request")) == 1
+        assert result.proposal_id is not None
+        assert len(fake.calls_for("open_change_proposal")) == 1
         assert len(fake.calls_for("create_branch")) == 1
     else:
         # (a)/(b) Unauthenticated OR no group overlap: rejected before any provider op.
@@ -210,7 +212,7 @@ def test_property6_authorization_gate(scenario):
             f"expected unauthorized request to be rejected, got {result.status}: "
             f"{result.message}"
         )
-        assert result.pull_request_id is None
-        assert result.pull_request_url is None
+        assert result.proposal_id is None
+        assert result.proposal_url is None
         # Req 7.3/7.4: zero source-control operations occurred.
         assert fake.calls == [], f"unauthorized request unexpectedly called provider: {fake.call_operations}"

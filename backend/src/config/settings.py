@@ -122,10 +122,13 @@ SCM_RATE_LIMIT_WINDOW_SECONDS = os.getenv("GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS", 
 SCM_PROVIDER_TIMEOUT_SECONDS = os.getenv("GBAW_SCM_PROVIDER_TIMEOUT_SECONDS", "30")  # 1..300, default 30
 SCM_RETRY_MAX_ATTEMPTS = os.getenv("GBAW_SCM_RETRY_MAX_ATTEMPTS", "3")  # 1..10, default 3
 SCM_MAX_FILES_PER_REQUEST = os.getenv("GBAW_SCM_MAX_FILES_PER_REQUEST", "20")  # max files per read request
-# Optional dedicated Knowledge Base for IaC/GitOps documentation. When set, the
-# source_control_agent is built with a KB retrieve tool (mirrors GAMELIFT_KB_ID /
-# EKS_KB_ID / COST_KB_ID above); when unset the specialist is built without it (Req 3.5).
-SCM_IAC_KB_ID = os.getenv("GBAW_SCM_IAC_KB_ID")
+# Optional Provider API base URL for self-hosted/enterprise endpoints. When set it must be
+# an absolute HTTPS URL (validated in ConnectorConfig.load); when unset the adapter defaults
+# to the provider's public API endpoint (Req 10.1, 10.2, 10.3).
+SCM_PROVIDER_BASE_URL = os.getenv("GBAW_SCM_PROVIDER_BASE_URL")
+# Dedicated CloudWatch Logs log group backing the durable audit sink. Required when the
+# connector is enabled (Req 13.1).
+SCM_AUDIT_LOG_GROUP = os.getenv("GBAW_SCM_AUDIT_LOG_GROUP")
 
 # Vector store embedding configuration (Well-Architected GenAI Lens: Cost 3.4, Performance Efficiency)
 # Titan Embed v2 supports 256, 512, 1024 dimensions.

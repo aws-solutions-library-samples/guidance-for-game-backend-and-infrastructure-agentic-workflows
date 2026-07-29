@@ -180,6 +180,8 @@ def _make_config() -> ConnectorConfig:
         provider_timeout_seconds=30,
         retry_max_attempts=3,
         max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
         config_errors=(),
     )
 
@@ -358,7 +360,7 @@ def test_property21_audit_records_are_complete(scenario, files, intent_words):
     # --- created outcome additionally records the proposal branch + PR id -----------------
     if scenario == "created":
         assert audit.get("proposal_branch")
-        assert audit.get("pull_request_id")
+        assert audit.get("proposal_id")
 
     # Defense-in-depth: the credential value never leaks into any audit field.
     for value in audit.values():
