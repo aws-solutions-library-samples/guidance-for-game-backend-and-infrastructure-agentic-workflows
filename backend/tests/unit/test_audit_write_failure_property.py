@@ -16,16 +16,22 @@ The service is exercised with a scenario that would otherwise succeed:
 - ``connector.service.get_secret`` mocked so no AWS call occurs, and
 - an authorized ``user_id`` supplied through the request contextvar.
 
-The audit sink is programmed to fail by patching ``connector.service.logger`` with a fake
-whose success-audit method (``info``) raises. Because the connector's ``_audit`` helper
-catches the exception and returns ``False``, ``_finalize`` converts the intended
-``status="created"`` result into an audit-persistence error (``status="error"``). The test
-asserts the returned result is that error and is never reported as ``created``.
+The audit trail now flows through the durable, confirmed CloudWatch Logs sink
+(``connector.audit.AuditSink``). This test drives that sink directly by patching
+``connector.service._get_audit_sink`` with a programmable fake whose ``write`` returns the
+confirmed/unconfirmed outcome under test:
+
+- an **unconfirmed** write (``write`` returns ``False``) models a durable-audit-sink failure
+  at the exact point the success would be recorded; the connector's ``_audit`` helper
+  returns ``False`` and ``_finalize`` converts the intended ``status="created"`` result into
+  an audit-persistence error (``status="error"``). Success is NEVER reported.
+- a **confirmed** write (``write`` returns ``True``) records the success durably and the
+  proposal is reported as ``created`` — success requires a confirmed durable write.
 
 Hypothesis varies the proposed file set, the (injection-free) intent/title/description text,
-and the exception raised by the audit sink so the property holds across many inputs.
+and the confirmed/unconfirmed write outcome so the property holds across many inputs.
 
-Validates: Requirements 6.4
+Validates: Requirements 6.4, 13.2, 13.3
 """
 
 # Standard library
@@ -39,6 +45,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
+from connector import service
 from connector.config import AllowlistEntry, ConnectorConfig
 from connector.models import ProposedFile
 from connector.service import propose_change
@@ -86,29 +93,22 @@ _RESOURCE_TYPES = [
 _user_ids = itertools.count(1)
 
 
-class _RaisingLogger:
-    """A fake ``logger`` whose success-audit method (``info``) raises the given exception.
+class _ProgrammableAuditSink:
+    """A fake :class:`connector.audit.AuditSink` whose ``write`` returns a fixed outcome.
 
-    Only ``info`` — the level used by the success audit in :func:`propose_change` — raises,
-    modeling a durable-audit-sink failure at the exact point the proposal would be reported
-    as created. Every other level is a no-op so any incidental audit call cannot mask the
-    behavior under test.
+    ``confirmed=False`` models a durable-audit-sink failure (an unconfirmed write): every
+    ``write`` returns ``False`` so the connector aborts the action and returns an
+    audit-persistence error. ``confirmed=True`` models a confirmed durable write so the
+    success can be reported. The events written are captured for optional inspection.
     """
 
-    def __init__(self, exc: Exception):
-        self._exc = exc
+    def __init__(self, confirmed: bool):
+        self.events: list[dict] = []
+        self._confirmed = confirmed
 
-    def info(self, *args, **kwargs):
-        raise self._exc
-
-    def warning(self, *args, **kwargs):
-        return None
-
-    def error(self, *args, **kwargs):
-        return None
-
-    def debug(self, *args, **kwargs):
-        return None
+    def write(self, event: dict) -> bool:
+        self.events.append(dict(event))
+        return self._confirmed
 
 
 def _make_config() -> ConnectorConfig:
@@ -161,50 +161,17 @@ def _valid_cfn_files(draw):
     return files
 
 
-@st.composite
-def _audit_failures(draw):
-    """Generate a varied exception instance for the audit sink to raise."""
-    exc_type = draw(
-        st.sampled_from([RuntimeError, OSError, ValueError, ConnectionError, Exception])
-    )
-    message = draw(
-        st.sampled_from(
-            [
-                "audit sink unavailable",
-                "disk full",
-                "log backend unreachable",
-                "failed to persist audit record",
-                "unexpected audit error",
-            ]
-        )
-    )
-    return exc_type(message)
-
-
 # --- Property 22 -----------------------------------------------------------
 
 
-# Feature: source-control-connector, Property 22: Audit-write failure aborts the action atomically
-@settings(max_examples=100)
-@given(
-    files=_valid_cfn_files(),
-    intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
-    audit_exc=_audit_failures(),
-)
-def test_property22_audit_write_failure_aborts_atomically(files, intent_words, audit_exc):
-    """When the success-audit write raises, propose_change returns an error, not ``created``.
-
-    For a scenario that would otherwise succeed (enabled, authorized, allowlist-matching,
-    valid IaC, provider succeeds), programming the audit sink to fail on the success write
-    causes the connector to abort the action atomically: the returned result is an
-    audit-persistence error (``status="error"``) and is NEVER reported as ``created`` — a
-    proposal is never reported successful without a durable audit record (Req 6.4).
-    """
+def _run(files, intent_words, *, confirmed: bool):
+    """Drive an otherwise-successful ``propose_change`` with a sink of the given outcome."""
     # Isolate this example: clear the shared sliding-window store and use a fresh user id.
     _rate_limit_windows.clear()
 
     config = _make_config()
     provider = FakeProvider()
+    sink = _ProgrammableAuditSink(confirmed=confirmed)
 
     user_id = f"user-{next(_user_ids)}"
     intent = " ".join(intent_words)
@@ -213,8 +180,8 @@ def test_property22_audit_write_failure_aborts_atomically(files, intent_words, a
 
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-1"})
     try:
-        with patch("connector.service.get_secret", return_value="ghp_fake_token_value"), patch(
-            "connector.service.logger", _RaisingLogger(audit_exc)
+        with patch("connector.service.get_secret", return_value="ghp_fake_token_value"), patch.object(
+            service, "_get_audit_sink", return_value=sink
         ):
             result = propose_change(
                 intent,
@@ -227,8 +194,28 @@ def test_property22_audit_write_failure_aborts_atomically(files, intent_words, a
             )
     finally:
         reset_request_context(token)
+    return result
 
-    # Req 6.4: success is NEVER reported when the durable audit record could not be written.
+
+# Feature: source-control-connector, Property 22: Audit-write failure aborts the action atomically
+@settings(max_examples=100)
+@given(
+    files=_valid_cfn_files(),
+    intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
+)
+def test_property22_unconfirmed_audit_write_aborts_atomically(files, intent_words):
+    """When the durable audit write is unconfirmed, propose_change returns an error, not created.
+
+    For a scenario that would otherwise succeed (enabled, authorized, allowlist-matching,
+    valid IaC, provider succeeds), an unconfirmed sink write (``write`` returns ``False``)
+    causes the connector to abort the action atomically: the returned result is an
+    audit-persistence error (``status="error"``) and is NEVER reported as ``created`` — a
+    proposal is never reported successful without a confirmed durable audit record
+    (Req 6.4, 13.2, 13.3).
+    """
+    result = _run(files, intent_words, confirmed=False)
+
+    # Req 13.3: success is NEVER reported when the durable audit write is not confirmed.
     assert result.status != "created", result.message
     assert result.status == "error", result.message
 
@@ -239,3 +226,24 @@ def test_property22_audit_write_failure_aborts_atomically(files, intent_words, a
 
     # Defense-in-depth: the credential value never leaks into the agent-visible result.
     assert "ghp_fake_token_value" not in result.message
+
+
+# Feature: source-control-connector, Property 22: Success requires a confirmed durable write
+@settings(max_examples=100)
+@given(
+    files=_valid_cfn_files(),
+    intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
+)
+def test_property22_confirmed_audit_write_reports_success(files, intent_words):
+    """When the durable audit write is confirmed, an otherwise-successful proposal is created.
+
+    The complement of the abort property: with the same otherwise-successful scenario a
+    confirmed sink write (``write`` returns ``True``) lets the connector report the proposal
+    as ``created`` — demonstrating that success requires, and follows from, a confirmed
+    durable audit record (Req 13.2, 13.3).
+    """
+    result = _run(files, intent_words, confirmed=True)
+
+    assert result.status == "created", result.message
+    assert result.proposal_id is not None
+    assert result.proposal_url is not None

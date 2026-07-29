@@ -24,10 +24,12 @@ Hypothesis drives every enabled terminal outcome:
 - **declined** — an empty file set, and a structurally invalid IaC file set,
 - **error**    — a failed credential retrieval, and a provider that reports unavailable.
 
-For each generated scenario the test patches ``connector.service.logger`` (a ``MagicMock``) and
-``connector.service.get_secret`` so no network/AWS call occurs, drives the outcome via a
-``FakeProvider`` (``provider=``) and an enabled ``ConnectorConfig`` (``config=``), then asserts
-the single audit entry emitted for that terminal outcome contains the required fields populated.
+For each generated scenario the test patches ``connector.service._get_audit_sink`` to return a
+recording fake ``AuditSink`` (whose ``write`` captures each event and confirms the durable
+write) and ``connector.service.get_secret`` so no network/AWS call occurs, drives the outcome
+via a ``FakeProvider`` (``provider=``) and an enabled ``ConnectorConfig`` (``config=``), then
+asserts the single audit event written to the sink for that terminal outcome contains the
+required fields populated.
 
 To keep examples independent, the shared sliding-window rate-limit store is cleared before each
 example and a unique ``user_id`` is used per example, so the rate-limit gate never rejects a
@@ -167,6 +169,25 @@ _EXPECTATIONS = {
 _user_ids = itertools.count(1)
 
 
+class _RecordingAuditSink:
+    """A fake :class:`connector.audit.AuditSink` that records the events it is asked to write.
+
+    Each terminal audit entry now flows through the durable, confirmed sink rather than the
+    fire-and-forget ``logger``. This fake captures every ``write(event)`` payload so the test
+    can assert the audit record's fields, and returns a confirmed (``True``) result so the
+    otherwise-successful ``created`` scenario is reported as created (a confirmed durable
+    write). Failure-mode coverage lives in the audit-write-failure property test.
+    """
+
+    def __init__(self, confirmed: bool = True):
+        self.events: list[dict] = []
+        self._confirmed = confirmed
+
+    def write(self, event: dict) -> bool:
+        self.events.append(dict(event))
+        return self._confirmed
+
+
 def _make_config() -> ConnectorConfig:
     """Build an enabled ConnectorConfig whose allowlist matches the requested repo/branch."""
     return ConnectorConfig(
@@ -263,13 +284,15 @@ def _run_scenario(scenario: str, files, intent_words):
             ProviderUnavailableError("provider unreachable"),
         )
 
+    sink = _RecordingAuditSink(confirmed=True)
+
     token = set_request_context(
         {"user_id": user_id, "groups": groups, "session_id": "s-1"}
     )
     try:
         with (
             mock.patch.object(service, "get_secret", return_value=secret_value),
-            mock.patch.object(service, "logger") as mock_logger,
+            mock.patch.object(service, "_get_audit_sink", return_value=sink),
         ):
             result = propose_change(
                 intent,
@@ -283,14 +306,10 @@ def _run_scenario(scenario: str, files, intent_words):
     finally:
         reset_request_context(token)
 
-    # Collect audit entries across every log level and keep only the connector's audit events.
-    all_calls = (
-        list(mock_logger.info.call_args_list)
-        + list(mock_logger.warning.call_args_list)
-        + list(mock_logger.error.call_args_list)
-    )
+    # Collect the audit events the connector wrote to the durable sink and keep only the
+    # connector's terminal audit events.
     audit_calls = [
-        call for call in all_calls if call.kwargs.get("event") in _AUDIT_EVENTS
+        event for event in sink.events if event.get("event") in _AUDIT_EVENTS
     ]
 
     return result, user_id, audit_calls
@@ -327,9 +346,9 @@ def test_property21_audit_records_are_complete(scenario, files, intent_words):
     # Exactly one terminal audit entry was written for this outcome.
     assert len(audit_calls) == 1, (
         f"scenario {scenario!r} expected exactly one audit entry, got {len(audit_calls)}: "
-        f"{[c.kwargs.get('event') for c in audit_calls]}"
+        f"{[c.get('event') for c in audit_calls]}"
     )
-    audit = audit_calls[0].kwargs
+    audit = audit_calls[0]
 
     # --- Required fields common to every terminal outcome ---------------------------------
 

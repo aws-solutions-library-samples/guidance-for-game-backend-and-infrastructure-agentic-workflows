@@ -17,10 +17,25 @@ Parameters:
       secretsmanager:GetSecretValue scoped to this single secret ARN and no
       additional (live-infrastructure) permissions.
 
+  ScmAuditLogGroupName:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional. Name of the dedicated CloudWatch Logs log group that backs the
+      Source Control Connector durable audit sink. Leave empty for read-only
+      deployments (connector audit disabled) — such deployments are unaffected.
+      When set, this template creates the log group and grants the AgentCore
+      execution role logs:CreateLogStream + logs:PutLogEvents scoped to that log
+      group ONLY, with no live-infrastructure write permissions.
+
 Conditions:
   # Gate the Source Control Connector credential-read grant on a non-empty ARN.
   # Read-only deployments that never set ScmCredentialSecretArn are unaffected.
   ScmCredentialConfigured: !Not [!Equals [!Ref ScmCredentialSecretArn, '']]
+
+  # Gate the dedicated audit log group + its scoped logs grant on a non-empty name.
+  # Read-only deployments that never set ScmAuditLogGroupName are unaffected.
+  ScmAuditLogGroupConfigured: !Not [!Equals [!Ref ScmAuditLogGroupName, '']]
 
 Resources:
   # Cognito User Pool
@@ -156,6 +171,26 @@ Resources:
               "action": { "type": "expire" }
             }]
           }
+
+  # Dedicated CloudWatch Logs log group backing the Source Control Connector
+  # durable audit sink (#SCM). Created ONLY when ScmAuditLogGroupName is set, so
+  # read-only deployments that never enable the connector are unaffected. This is
+  # the sole log group the connector is granted write access to (see the scoped
+  # ScmAuditLogAccess policy on AgentCoreExecutionRole). 90-day retention matches
+  # the platform's audit-log retention convention.
+  ScmAuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ScmAuditLogGroupConfigured
+    Properties:
+      LogGroupName: !Ref ScmAuditLogGroupName
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: scm-connector-audit
+        - Key: ManagedBy
+          Value: cloudformation
 
   # IAM Role for AgentCore Runtime
   # Security: Uses least-privilege permissions instead of FullAccess managed policies
@@ -433,6 +468,26 @@ Resources:
                   Effect: Allow
                   Action: secretsmanager:GetSecretValue
                   Resource: !Ref ScmCredentialSecretArn
+          - !Ref 'AWS::NoValue'
+        # Security: Source Control Connector durable audit sink (opt-in, #SCM).
+        # Grants ONLY logs:CreateLogStream + logs:PutLogEvents scoped to the
+        # dedicated connector audit log group (and its log-stream children).
+        # Added only when ScmAuditLogGroupName is set; adds NO live-infrastructure
+        # write actions. The runtime role stays read-only against live AWS.
+        - !If
+          - ScmAuditLogGroupConfigured
+          - PolicyName: ScmAuditLogAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Sid: ScmAuditLogWrite
+                  Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - !GetAtt ScmAuditLogGroup.Arn
+                    - !Sub '${ScmAuditLogGroup.Arn}:*'
           - !Ref 'AWS::NoValue'
 
   # IAM Role for ECS Tasks (Application Permissions)

@@ -41,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
 
 # Local modules
+from connector.audit import AuditSink
 from connector.config import ConnectorConfig
 from connector.iac_validation import IaCValidationError, validate_iac
 from connector.registry import get_provider
@@ -89,6 +90,46 @@ _INJECTION_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in INJECTIO
 
 # How many times to regenerate a proposal-branch name when it already exists (Req 2.8).
 _MAX_BRANCH_NAME_ATTEMPTS = 10
+
+# ---------------------------------------------------------------------------
+# Durable audit sink wiring (Req 13.1, 13.2, 13.3)
+# ---------------------------------------------------------------------------
+#
+# Audit entries are written through a durable, confirmed CloudWatch Logs sink
+# (``connector.audit.AuditSink``) instead of the fire-and-forget ``logger``. The sink is
+# cached per audit-log-group name so repeated proposals reuse one boto3 client and its
+# chained sequence token. ``_active_config`` holds the config resolved by the current
+# ``propose_change`` call so the signature-stable ``_audit``/``_finalize`` helpers can reach
+# ``config.audit_log_group`` without threading it through every terminal call site. Tests may
+# monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to inject a fake sink.
+_audit_sinks: dict[str, AuditSink] = {}
+_active_config: ConnectorConfig | None = None
+
+
+def _get_audit_sink(config: ConnectorConfig | None) -> AuditSink | None:
+    """Return a cached :class:`AuditSink` for ``config.audit_log_group`` (or ``None``).
+
+    The sink is cached per log-group name so a boto3 ``logs`` client and its sequence token
+    are reused across proposals. When ``config`` is missing or carries no ``audit_log_group``
+    there is no durable target, so ``None`` is returned and the audit write is treated as
+    failed by the caller (fail closed — Req 13.3). ``config.load()`` already requires
+    ``audit_log_group`` on the enabled path, so in practice a live proposal always has one.
+    """
+    log_group = getattr(config, "audit_log_group", None) if config is not None else None
+    if not log_group:
+        return None
+    sink = _audit_sinks.get(log_group)
+    if sink is None:
+        sink = AuditSink(log_group)
+        _audit_sinks[log_group] = sink
+    return sink
+
+
+def _reset_audit_sinks() -> None:
+    """Clear the cached sinks and active config (test hook)."""
+    global _active_config
+    _audit_sinks.clear()
+    _active_config = None
 
 
 def _resolve_config(config: ConnectorConfig | None) -> ConnectorConfig:
@@ -330,24 +371,42 @@ def _now_iso() -> str:
 
 
 def _audit(level: str, message: str, /, **fields: object) -> bool:
-    """Write one audit entry, returning ``False`` if the audit sink raised (Req 6.4).
+    """Write one audit entry to the durable sink, returning its confirmed-write result.
+
+    The structured event (``message`` + ``level`` + sanitized ``fields`` + ``timestamp``) is
+    written through the durable, confirmed CloudWatch Logs sink
+    (:func:`_get_audit_sink`). The returned ``bool`` is the sink's confirmed-write result:
+    ``True`` only when CloudWatch Logs confirmed the write, ``False`` on any unconfirmed write
+    or failure — including when no audit log group is configured (fail closed, Req 13.1,
+    13.2, 13.3). ``_finalize`` uses this to abort the action atomically rather than reporting
+    success without a durable audit record.
 
     Every string field is passed through ``sanitize_log_data`` as defense-in-depth so no
     secret can leak into the audit log (Req 6.6); the SCM_Credential is never placed in a
-    field in the first place. A timestamp is always attached (Req 6.3). If the underlying
-    logger raises, the failure is swallowed and reported to the caller so it can abort the
-    action atomically rather than reporting success without a durable audit record.
+    field in the first place. A timestamp is always attached (Req 6.3). The sink sanitizes
+    again, which is harmless.
+
+    A best-effort, non-durable ``logger`` line is also emitted for local/operator visibility;
+    it never gates the action — only the confirmed sink write does.
     """
     safe_fields = {
         key: (sanitize_log_data(value) if isinstance(value, str) else value)
         for key, value in fields.items()
     }
     safe_fields.setdefault("timestamp", _now_iso())
+
+    # Non-durable local visibility only; its outcome never gates the action.
     try:
         getattr(logger, level)(message, **safe_fields)
-        return True
-    except Exception:  # noqa: BLE001 - any audit-sink failure must abort the action
+    except Exception:  # noqa: BLE001 - local logging must never affect the audit result
+        pass
+
+    # The gating result is the CONFIRMED durable write to the dedicated audit log group.
+    sink = _get_audit_sink(_active_config)
+    if sink is None:
         return False
+    event = {"message": message, "level": level, **safe_fields}
+    return sink.write(event)
 
 
 def _audit_persistence_error() -> ProposalResult:
@@ -474,7 +533,11 @@ def propose_change(
     11.5). ``config`` and ``provider`` are optional injection points for testing; production
     callers omit them.
     """
+    global _active_config
     resolved_config = _resolve_config(config)
+    # Publish the resolved config so the signature-stable ``_audit``/``_finalize`` helpers can
+    # reach ``config.audit_log_group`` for the durable sink write (Req 13.1).
+    _active_config = resolved_config
 
     # --- Gate 1: enablement (Req 1.2) ---------------------------------------------------
     # A disabled connector exposes nothing and declines cleanly. No audit entry is required
