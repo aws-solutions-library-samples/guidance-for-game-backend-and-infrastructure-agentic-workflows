@@ -75,29 +75,36 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,129.23 per month** for processing approximately 10,000 agent queries per month.
+You are responsible for the cost of the AWS services used while running this Guidance. As of July 2026, the cost for running this Guidance with the default settings in the US West (Oregon) Region is approximately **~$783/month** for processing approximately 10,000 agent queries per month.
 
 We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
 ### Sample Cost Table
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US East (N. Virginia) Region for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context).
+The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US West (Oregon) Region (`us-west-2`) for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context, ~8 model turns per query). Prompt caching is enabled by default and can reduce effective model costs by 30–60%; the table shows full list prices as an upper bound.
 
 | AWS service | Dimensions | Cost [USD] |
 | ----------- | ------------ | ------------ |
 | Amazon Bedrock (Claude Sonnet 4.5) | 80M input tokens @ $3.30/M + 20M output tokens @ $16.50/M (specialist agents) | $594.00 |
-| Amazon OpenSearch Serverless (Knowledge Bases) | 2 OCUs (indexing + search) @ $0.24/OCU-hour × 730 hours | $350.40 |
 | Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.10/M + 10M output tokens @ $5.50/M (orchestrator) | $99.00 |
-| Amazon CloudWatch + AWS X-Ray | Logs, metrics, and distributed traces for all components | $25.00 |
-| Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hour × 730 hours + ~730 LCU-hours @ $0.008 | $22.27 |
-| Amazon ECS (Fargate) | 1 task, 0.5 vCPU @ $0.04048/hour + 1 GB @ $0.004445/GB-hour × 730 hours | $18.02 |
-| Amazon Bedrock AgentCore Runtime | ~10,000 invocations, ~30s each: 1 vCPU @ $0.0895/hour + 2 GB @ $0.00945/GB-hour | $9.04 |
-| AWS WAF | 1 WebACL with managed rules + ~1M requests | $8.00 |
-| AWS CloudTrail | Management events (first trail free) + data events | $2.00 |
-| Amazon Inspector | Container image scanning (~10 images) | $1.30 |
+| Amazon ECS (Fargate) | 1 task, 1 vCPU @ $0.04048/hr + 2 GB @ $0.004445/GB-hr × 730 hrs | $36.04 |
+| Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hr × 730 hrs + minimal LCU-hours at 10K requests/mo | ~$16.70 |
+| Amazon Bedrock Guardrails | Content filters + denied topics + PII filters: ~80K text units/mo @ [$0.15/1K text units](https://aws.amazon.com/bedrock/pricing/) | ~$12.00 |
+| AWS WAF | 1 WebACL ($5) + 6 rules ($6) + ~1M requests @ [$0.60/M](https://aws.amazon.com/waf/pricing/) | $11.60 |
+| Amazon CloudWatch + AWS X-Ray | ~5 GB log ingestion @ $0.50/GB + metrics + X-Ray traces (1% indexing, ~10K spans) | ~$7.50 |
+| Amazon Bedrock AgentCore Runtime | 10K invocations; billed on actual CPU + peak memory per second (I/O wait free). ~5s active CPU + 2 GB peak per 30s session | ~$2.84 |
+| Amazon Bedrock AgentCore Memory | Short-term memory: ~10K new events/mo @ [$0.25/1K events](https://aws.amazon.com/bedrock/agentcore/pricing/) | $2.50 |
+| AWS CloudTrail | Management events (first trail free); associated S3 + CloudWatch Logs delivery | ~$1.00 |
+| AWS KMS | 1 customer-managed key ($1/mo) + API requests | ~$1.00 |
+| Amazon S3 (logs + docs + artifacts) | 5 buckets, ~5 GB standard storage + requests | ~$0.50 |
+| Amazon Bedrock (Titan Text Embeddings V2) | KB ingestion (~50 doc chunks) + 10K retrieval queries @ [$0.02/M input tokens](https://aws.amazon.com/bedrock/pricing/) | ~$0.20 |
+| Amazon Inspector | ECR scanning: 2 images × $0.09 initial + monthly rescans @ $0.01 | ~$0.20 |
 | Amazon ECR | Image storage (~2 GB) @ $0.10/GB-month | $0.20 |
+| Amazon S3 Vectors (Knowledge Bases) | 3 indexes, ~50 vectors (1024-dim), 10K queries/mo @ [$2.50/M requests](https://aws.amazon.com/s3/pricing/) + data processed | ~$0.10 |
 | Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00 |
-| **Total** | | **~$1,129.23/month** |
+| **Total** | | **~$783/month** |
+
+> **Note:** The dominant cost driver is model token usage (Sonnet + Haiku = ~$693, or 89% of total). Infrastructure costs are minimal at this query volume. Token volumes above are upper-bound estimates; actual costs depend on conversation length, caching efficiency, and specialist complexity per query.
 
 ## Prerequisites
 

@@ -231,26 +231,32 @@ aws cloudformation describe-stack-events --stack-name game-agent-infrastructure
 
 ## Cost Estimates
 
-Approximate monthly costs at minimal usage (development/demo):
+Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| ECS Fargate | $30-70 | 1 vCPU, 2GB task (~$0.04048/vCPU-hour + $0.004445/GB-hour) |
-| Bedrock AgentCore | $10-30 | Compute time per request |
-| Bedrock (Claude Sonnet) | $20-100+ | ~$3/M input tokens, ~$15/M output tokens |
-| Knowledge Bases (S3 Vectors) | $5-15 | S3 storage + ~$0.0004/1K vector queries |
-| CloudWatch | $5-10 | Logs, metrics, dashboards |
+| Bedrock (Claude Sonnet + Haiku) | $20-700+ | Dominant cost; ~$3.30/M input, ~$16.50/M output (Sonnet); prompt caching reduces effective cost 30–60% |
+| ECS Fargate | $36-70 | 1 vCPU, 2 GB task (~$0.04048/vCPU-hour + $0.004445/GB-hour); scales 1–4 tasks |
+| Bedrock Guardrails | $1-12 | Content filters + PII @ $0.15/1K text units; scales with query volume |
+| Bedrock AgentCore Runtime | $1-10 | Billed on actual CPU + peak memory per second; I/O wait is free |
+| Bedrock AgentCore Memory | $1-3 | Short-term events @ $0.25/1K new events |
+| WAF | $11-12 | $5 WebACL + $6 rules + $0.60/M requests |
+| CloudWatch + X-Ray | $5-10 | Log ingestion, metrics, traces |
+| ALB | $16-20 | Fixed hourly + LCU-hours (minimal at low traffic) |
+| Knowledge Bases (S3 Vectors) | <$1 | S3 Vectors storage + $2.50/M query requests + Titan Embed V2 @ $0.02/M tokens |
+| CloudTrail + KMS | ~$2 | Management events (first trail free) + 1 CMK @ $1/mo |
+| S3 (docs + logs + artifacts) | $1-5 | Standard storage across 5 buckets |
 | Cognito | Free | Up to 50,000 MAUs |
-| S3 (source docs + logs) | $1-5 | Standard storage pricing |
 
-**Base infrastructure**: ~$50-100/month
-**AI usage (variable)**: $20-200+/month depending on query volume
+**Base infrastructure**: ~$70-130/month (Fargate, ALB, WAF, CloudWatch, KMS, CloudTrail)
+**AI usage (variable)**: $20-700+/month depending on query volume and conversation length
 
 ### Cost Optimization Tips
 
-- Use Bedrock prompt caching (enabled by default) to reduce token costs
-- Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage
+- Use Bedrock prompt caching (enabled by default) to reduce token costs by 30–60%
+- Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage — near-zero cost at small scale
 - ECS Fargate scales between 1-4 tasks based on load (configurable via MinTasks/MaxTasks)
+- AgentCore Runtime only charges for active CPU time; I/O wait (model response time) is free
 - Monitor CloudWatch dashboards to track AI token consumption
 
 ## Environment Variables Reference
