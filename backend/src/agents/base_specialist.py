@@ -80,7 +80,7 @@ def create_specialist_agent(
                 try:
                     # Per-agent inference parameters (WA GenAI Lens: Performance Efficiency 2)
                     agent_key = service_name.lower()
-                    inf = INFERENCE_CONFIG.get(agent_key, {})
+                    inf = INFERENCE_CONFIG.get(agent_key)
                     model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
 
                     with time_operation(f"{agent_key}_agent_execution", {"query_length": len(query)}):
