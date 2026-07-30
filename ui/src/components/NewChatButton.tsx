@@ -36,6 +36,13 @@ export function NewChatButton() {
   const handleNewChat = () => {
     reset();
     setThreadId(newThreadId());
+
+    // CopilotKit keeps the message scroller mounted when reset() replaces the
+    // conversation. Clear its old offset so the welcome message is not clipped.
+    const messages = document.querySelector<HTMLElement>(".copilotKitMessages");
+    if (messages) {
+      messages.scrollTop = 0;
+    }
   };
 
   return (
