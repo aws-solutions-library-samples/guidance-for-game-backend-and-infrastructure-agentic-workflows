@@ -61,7 +61,11 @@ describe('Chat Cancellation', () => {
     expect(res._getStatusCode()).toBe(200);
   });
 
-  it('should respect AbortSignal if provided', async () => {
+  it('surfaces an aborted/failed invocation as a visible assistant message', async () => {
+    // #250: a chat-turn invocation failure (timeout abort, backend error) must
+    // come back as a 200 generateCopilotResponse message — CopilotKit silently
+    // drops a bare 500, which is exactly the "no answer, no error" the bug
+    // reports. Previously this asserted a 500; that encoded the buggy contract.
     const { req, res } = createMocks({
       method: 'POST',
       body: {
@@ -94,10 +98,12 @@ describe('Chat Cancellation', () => {
 
     await handler(req, res);
 
-    // Should handle abort gracefully
-    expect(res._getStatusCode()).toBe(500);
+    // Handled gracefully AND visibly: 200 with an assistant message the user sees.
+    expect(res._getStatusCode()).toBe(200);
     const data = JSON.parse(res._getData());
-    expect(data.error).toBe('Internal server error');
+    const message = data.data.generateCopilotResponse.messages[0];
+    expect(message.role).toBe('assistant');
+    expect(message.content[0]).toMatch(/something went wrong|try again/i);
   });
 
   it('should cleanup resources on cancellation', async () => {

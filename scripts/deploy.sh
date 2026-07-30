@@ -365,9 +365,16 @@ echo "Frontend ECR Repository: $FRONTEND_ECR_REPO"
 aws ecr get-login-password --region $AWS_REGION | \
   docker login --username AWS --password-stdin $FRONTEND_ECR_REPO
 
-# Build and push
-docker build --platform linux/amd64 -t $FRONTEND_ECR_REPO:latest .
+# Build and push under BOTH :latest and a unique per-deploy tag. The unique tag
+# is passed to the frontend stack as ImageTag: with a constant tag the stack
+# parameters never change, CloudFormation no-ops, and ECS Express keeps running
+# the task it resolved at first deploy — new images land in ECR but are never
+# served (frontend fixes silently don't ship).
+FRONTEND_IMAGE_TAG="deploy-$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo manual)-$(date +%Y%m%d%H%M%S)"
+docker build --platform linux/amd64 -t $FRONTEND_ECR_REPO:latest -t $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG .
 docker push $FRONTEND_ECR_REPO:latest
+docker push $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG
+echo "   Frontend image tag: $FRONTEND_IMAGE_TAG"
 
 echo "✅ Frontend container pushed"
 
@@ -398,6 +405,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     ProjectName="$PROJECT_NAME" \
     RuntimeId="$RUNTIME_ID" \
+    ImageTag="$FRONTEND_IMAGE_TAG" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 
@@ -429,6 +437,24 @@ FRONTEND_ALB_ARN=$(aws cloudformation describe-stacks \
   --output text)
 
 echo "   ALB ARN: $FRONTEND_ALB_ARN"
+
+# Raise the ALB idle timeout above the agent wall-clock budget. The ECS Express
+# service manages its own ALB (no CloudFormation handle we can set attributes on),
+# and the AWS default idle timeout is 60s — but a complex multi-specialist agent
+# run can take up to GBAW_AGENT_TIMEOUT_REQUEST_SECONDS (180s) and the proxy waits
+# 185s. At the 60s default the ALB severs the connection mid-run, returning a 504
+# while the backend keeps working and persists the answer to memory — the user
+# sees no answer and no error (issue #250). 190s sits just above the proxy budget.
+# Idempotent: re-running just re-asserts the same value.
+if [ -n "$FRONTEND_ALB_ARN" ] && [ "$FRONTEND_ALB_ARN" != "None" ]; then
+  echo "   Setting ALB idle timeout to 190s (default 60s severs long agent runs — #250)..."
+  aws elbv2 modify-load-balancer-attributes \
+    --load-balancer-arn "$FRONTEND_ALB_ARN" \
+    --attributes Key=idle_timeout.timeout_seconds,Value=190 \
+    --region $AWS_REGION \
+    --query 'Attributes[?Key==`idle_timeout.timeout_seconds`].Value' \
+    --output text
+fi
 
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/05-security-infrastructure.yaml" \
