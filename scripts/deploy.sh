@@ -186,6 +186,7 @@ build_agentcore_env_args() {
   [ -n "${GAMELIFT_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID")
   [ -n "${EKS_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_EKS_KB_ID=$EKS_KB_ID")
   [ -n "${COST_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_COST_KB_ID=$COST_KB_ID")
+  return 0
 }
 
 build_agentcore_env_args
