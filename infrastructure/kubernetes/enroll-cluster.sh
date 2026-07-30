@@ -18,6 +18,7 @@ IAM_ROLE_NAME="game-agent-agentcore-execution-role"
 IAM_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME}"
 K8S_USERNAME="game-agent-agentcore-user"
 K8S_GROUP="game-agent-monitoring-group"
+EKS_VIEW_POLICY_ARN="arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
 
 # Colors
 RED='\033[0;31m'
@@ -32,10 +33,11 @@ echo ""
 
 # Check arguments
 if [ $# -lt 2 ]; then
-    echo -e "${RED}Usage: $0 <cluster-name> <region> [--role-name ROLE] [--enable-audit-logs] [--log-retention-days N]${NC}"
+    echo -e "${RED}Usage: $0 <cluster-name> <region> [--role-name ROLE] [--kube-role-arn ARN] [--enable-audit-logs] [--log-retention-days N]${NC}"
     echo ""
     echo "Examples:"
     echo "  $0 my-cluster us-west-2"
+    echo "  $0 my-cluster us-west-2 --kube-role-arn arn:aws:iam::123456789012:role/eks-admin"
     echo "  $0 my-cluster us-west-2 --enable-audit-logs"
     echo "  $0 my-cluster us-west-2 --role-name my-custom-role --enable-audit-logs"
     exit 1
@@ -45,6 +47,14 @@ CLUSTER_NAME=$1
 REGION=$2
 ENABLE_AUDIT_LOGS=false
 LOG_RETENTION_DAYS=7
+AUTH_MODE=""
+ACCESS_ENTRY_EXISTS=false
+ACCESS_ENTRY_JSON=""
+ALREADY_ENROLLED=false
+BACKUP_FILE=""
+KUBE_ROLE_ARN=""
+KUBECTL_ADMIN_AVAILABLE=true
+VIEW_POLICY_ASSOCIATED=false
 
 # Parse optional arguments
 shift 2
@@ -53,6 +63,10 @@ while [[ $# -gt 0 ]]; do
         --role-name)
             IAM_ROLE_NAME=$2
             IAM_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME}"
+            shift 2
+            ;;
+        --kube-role-arn)
+            KUBE_ROLE_ARN=$2
             shift 2
             ;;
         --enable-audit-logs)
@@ -70,11 +84,29 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# EKS access entries are required for API-only clusters and are preferred for
+# API_AND_CONFIG_MAP clusters. Legacy CONFIG_MAP clusters continue to use
+# aws-auth through eksctl.
+AUTH_MODE=$(aws eks describe-cluster \
+    --name "${CLUSTER_NAME}" \
+    --region "${REGION}" \
+    --query 'cluster.accessConfig.authenticationMode' \
+    --output text 2>/dev/null || echo "")
+
+if [ -z "$AUTH_MODE" ] || [ "$AUTH_MODE" = "None" ]; then
+    echo -e "${RED}Failed to determine the cluster authentication mode.${NC}"
+    exit 1
+fi
+
 echo -e "${BLUE}Configuration:${NC}"
 echo "  Cluster: ${CLUSTER_NAME}"
 echo "  Region: ${REGION}"
 echo "  AWS Account: ${AWS_ACCOUNT_ID}"
 echo "  IAM Role: ${IAM_ROLE_ARN}"
+echo "  Authentication Mode: ${AUTH_MODE}"
+if [ -n "$KUBE_ROLE_ARN" ]; then
+    echo "  Kubernetes Admin Role: ${KUBE_ROLE_ARN}"
+fi
 echo "  Audit Logs: ${ENABLE_AUDIT_LOGS}"
 if [ "$ENABLE_AUDIT_LOGS" = true ]; then
     echo "  Log Retention: ${LOG_RETENTION_DAYS} days"
@@ -99,7 +131,15 @@ echo ""
 
 # Update kubeconfig
 echo -e "${BLUE}📋 Step 2: Updating kubeconfig...${NC}"
-if ! aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${REGION}" &> /dev/null; then
+KUBECONFIG_ROLE_ARGS=()
+if [ -n "$KUBE_ROLE_ARN" ]; then
+    KUBECONFIG_ROLE_ARGS=(--role-arn "$KUBE_ROLE_ARN")
+fi
+
+if ! aws eks update-kubeconfig \
+    --name "${CLUSTER_NAME}" \
+    --region "${REGION}" \
+    "${KUBECONFIG_ROLE_ARGS[@]}" &> /dev/null; then
     echo -e "${RED}❌ Failed to update kubeconfig. Check cluster name and region.${NC}"
     exit 1
 fi
@@ -109,38 +149,83 @@ echo ""
 # Verify connection
 echo -e "${BLUE}📋 Step 3: Verifying cluster connection...${NC}"
 if ! kubectl cluster-info &> /dev/null; then
-    echo -e "${RED}❌ Cannot connect to cluster. Check your AWS credentials.${NC}"
-    exit 1
+    if [[ "$AUTH_MODE" == "API" || "$AUTH_MODE" == "API_AND_CONFIG_MAP" ]]; then
+        KUBECTL_ADMIN_AVAILABLE=false
+        echo -e "${YELLOW}⚠️  No Kubernetes admin connection is available${NC}"
+        echo "   Falling back to the AWS-managed EKS read-only access policy."
+    else
+        echo -e "${RED}❌ Cannot connect to cluster. Check your AWS credentials.${NC}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}✅ Connected to cluster${NC}"
 fi
-echo -e "${GREEN}✅ Connected to cluster${NC}"
 echo ""
 
-# Backup aws-auth ConfigMap
-echo -e "${BLUE}📋 Step 4: Backing up aws-auth ConfigMap...${NC}"
-BACKUP_FILE="${SCRIPT_DIR}/aws-auth-backup-${CLUSTER_NAME}-$(date +%Y%m%d-%H%M%S).yaml"
-if kubectl get configmap aws-auth -n kube-system -o yaml > "${BACKUP_FILE}" 2>/dev/null; then
-    echo -e "${GREEN}✅ Backup created: ${BACKUP_FILE}${NC}"
+# Backup the authentication mapping that this enrollment path manages.
+echo -e "${BLUE}📋 Step 4: Backing up cluster access configuration...${NC}"
+if [[ "$AUTH_MODE" == "API" || "$AUTH_MODE" == "API_AND_CONFIG_MAP" ]]; then
+    ACCESS_ENTRY_JSON=$(aws eks describe-access-entry \
+        --cluster-name "${CLUSTER_NAME}" \
+        --principal-arn "${IAM_ROLE_ARN}" \
+        --region "${REGION}" \
+        --output json 2>/dev/null || true)
+
+    if [ -n "$ACCESS_ENTRY_JSON" ]; then
+        ACCESS_ENTRY_EXISTS=true
+        BACKUP_FILE="${SCRIPT_DIR}/access-entry-backup-${CLUSTER_NAME}-$(date +%Y%m%d-%H%M%S).json"
+        printf '%s\n' "$ACCESS_ENTRY_JSON" > "${BACKUP_FILE}"
+        echo -e "${GREEN}✅ Access entry backup created: ${BACKUP_FILE}${NC}"
+
+        if aws eks list-associated-access-policies \
+            --cluster-name "${CLUSTER_NAME}" \
+            --principal-arn "${IAM_ROLE_ARN}" \
+            --region "${REGION}" \
+            --query "associatedAccessPolicies[?policyArn=='${EKS_VIEW_POLICY_ARN}'] | length(@)" \
+            --output text 2>/dev/null | grep -q '^1$'; then
+            VIEW_POLICY_ASSOCIATED=true
+        fi
+    else
+        echo -e "${YELLOW}⚠️  No existing access entry for the AgentCore role${NC}"
+    fi
 else
-    echo -e "${YELLOW}⚠️  aws-auth ConfigMap not found (will be created)${NC}"
+    BACKUP_FILE="${SCRIPT_DIR}/aws-auth-backup-${CLUSTER_NAME}-$(date +%Y%m%d-%H%M%S).yaml"
+    if kubectl get configmap aws-auth -n kube-system -o yaml > "${BACKUP_FILE}" 2>/dev/null; then
+        echo -e "${GREEN}✅ aws-auth backup created: ${BACKUP_FILE}${NC}"
+    else
+        BACKUP_FILE=""
+        echo -e "${YELLOW}⚠️  aws-auth ConfigMap not found (will be created)${NC}"
+    fi
 fi
 echo ""
 
 # Check if already enrolled
 echo -e "${BLUE}📋 Step 5: Checking enrollment status...${NC}"
-if kubectl get configmap aws-auth -n kube-system -o yaml 2>/dev/null | grep -q "${IAM_ROLE_NAME}"; then
-    echo -e "${YELLOW}⚠️  Cluster already enrolled with Game Agent${NC}"
-    read -p "Do you want to continue anyway? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${RED}❌ Aborted${NC}"
-        exit 1
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ] && [ "$VIEW_POLICY_ASSOCIATED" = true ]; then
+    ALREADY_ENROLLED=true
+elif [ "$ACCESS_ENTRY_EXISTS" = true ]; then
+    if echo "$ACCESS_ENTRY_JSON" | jq -e \
+        --arg group "$K8S_GROUP" \
+        '(.accessEntry.kubernetesGroups // []) | index($group) != null' > /dev/null; then
+        ALREADY_ENROLLED=true
     fi
+elif [[ "$AUTH_MODE" == "CONFIG_MAP" ]] && \
+    kubectl get configmap aws-auth -n kube-system -o yaml 2>/dev/null | grep -q "${IAM_ROLE_NAME}"; then
+    ALREADY_ENROLLED=true
+fi
+
+if [ "$ALREADY_ENROLLED" = true ]; then
+    echo -e "${YELLOW}⚠️  Cluster already enrolled with Game Agent${NC}"
+else
+    echo "AgentCore role is not enrolled yet"
 fi
 echo ""
 
 # Apply RBAC
 echo -e "${BLUE}📋 Step 6: Applying RBAC configuration...${NC}"
-if kubectl apply -f "${SCRIPT_DIR}/game-agent-rbac.yaml" &> /dev/null; then
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ]; then
+    echo "Skipping Kubernetes RBAC because no cluster-admin connection is available."
+elif kubectl apply -f "${SCRIPT_DIR}/game-agent-rbac.yaml" &> /dev/null; then
     echo -e "${GREEN}✅ RBAC configured${NC}"
 else
     echo -e "${RED}❌ Failed to apply RBAC${NC}"
@@ -148,23 +233,88 @@ else
 fi
 echo ""
 
-# Update aws-auth ConfigMap
-echo -e "${BLUE}📋 Step 7: Updating aws-auth ConfigMap...${NC}"
+# Configure cluster authentication
+echo -e "${BLUE}📋 Step 7: Configuring cluster authentication...${NC}"
 
-# Check if eksctl is available
-if command -v eksctl &> /dev/null; then
-    echo "Using eksctl for safe ConfigMap update..."
+if [[ "$AUTH_MODE" == "API" || "$AUTH_MODE" == "API_AND_CONFIG_MAP" ]]; then
+    if [ "$KUBECTL_ADMIN_AVAILABLE" = false ]; then
+        if [ "$ACCESS_ENTRY_EXISTS" = false ]; then
+            if aws eks create-access-entry \
+                --cluster-name "${CLUSTER_NAME}" \
+                --principal-arn "${IAM_ROLE_ARN}" \
+                --username "${K8S_USERNAME}" \
+                --type STANDARD \
+                --region "${REGION}" > /dev/null; then
+                ACCESS_ENTRY_EXISTS=true
+                echo -e "${GREEN}✅ EKS access entry created${NC}"
+            else
+                echo -e "${RED}❌ Failed to create EKS access entry${NC}"
+                exit 1
+            fi
+        fi
 
-    if eksctl create iamidentitymapping \
-        --cluster "${CLUSTER_NAME}" \
-        --region "${REGION}" \
-        --arn "${IAM_ROLE_ARN}" \
-        --username "${K8S_USERNAME}" \
-        --group "${K8S_GROUP}" 2>&1; then
-        echo -e "${GREEN}✅ IAM identity mapping created${NC}"
+        if [ "$VIEW_POLICY_ASSOCIATED" = true ]; then
+            echo -e "${GREEN}✅ EKS read-only access policy already associated${NC}"
+        elif aws eks associate-access-policy \
+            --cluster-name "${CLUSTER_NAME}" \
+            --principal-arn "${IAM_ROLE_ARN}" \
+            --policy-arn "${EKS_VIEW_POLICY_ARN}" \
+            --access-scope type=cluster \
+            --region "${REGION}" > /dev/null; then
+            VIEW_POLICY_ASSOCIATED=true
+            echo -e "${GREEN}✅ EKS read-only access policy associated${NC}"
+        else
+            echo -e "${RED}❌ Failed to associate EKS read-only access policy${NC}"
+            exit 1
+        fi
+    elif [ "$ALREADY_ENROLLED" = true ]; then
+        echo -e "${GREEN}✅ EKS access entry already contains the monitoring group${NC}"
+    elif [ "$ACCESS_ENTRY_EXISTS" = true ]; then
+        UPDATED_GROUPS=$(echo "$ACCESS_ENTRY_JSON" | jq -c \
+            --arg group "$K8S_GROUP" \
+            '(.accessEntry.kubernetesGroups // []) | if index($group) then . else . + [$group] end')
+
+        if aws eks update-access-entry \
+            --cluster-name "${CLUSTER_NAME}" \
+            --principal-arn "${IAM_ROLE_ARN}" \
+            --kubernetes-groups "$UPDATED_GROUPS" \
+            --region "${REGION}" > /dev/null; then
+            echo -e "${GREEN}✅ EKS access entry updated${NC}"
+        else
+            echo -e "${RED}❌ Failed to update EKS access entry${NC}"
+            exit 1
+        fi
     else
-        echo -e "${RED}❌ Failed to create IAM identity mapping${NC}"
-        exit 1
+        if aws eks create-access-entry \
+            --cluster-name "${CLUSTER_NAME}" \
+            --principal-arn "${IAM_ROLE_ARN}" \
+            --kubernetes-groups "${K8S_GROUP}" \
+            --username "${K8S_USERNAME}" \
+            --type STANDARD \
+            --region "${REGION}" > /dev/null; then
+            echo -e "${GREEN}✅ EKS access entry created${NC}"
+        else
+            echo -e "${RED}❌ Failed to create EKS access entry${NC}"
+            exit 1
+        fi
+    fi
+elif command -v eksctl &> /dev/null; then
+    if [ "$ALREADY_ENROLLED" = true ]; then
+        echo -e "${GREEN}✅ aws-auth identity mapping already exists${NC}"
+    else
+        echo "Using eksctl for safe ConfigMap update..."
+
+        if eksctl create iamidentitymapping \
+            --cluster "${CLUSTER_NAME}" \
+            --region "${REGION}" \
+            --arn "${IAM_ROLE_ARN}" \
+            --username "${K8S_USERNAME}" \
+            --group "${K8S_GROUP}" 2>&1; then
+            echo -e "${GREEN}✅ IAM identity mapping created${NC}"
+        else
+            echo -e "${RED}❌ Failed to create IAM identity mapping${NC}"
+            exit 1
+        fi
     fi
 else
     echo -e "${YELLOW}⚠️  eksctl not found - using manual method${NC}"
@@ -186,14 +336,18 @@ echo ""
 
 # Verify RBAC
 echo -e "${BLUE}📋 Step 8: Verifying RBAC configuration...${NC}"
-if kubectl get clusterrole game-agent-monitoring-role &> /dev/null; then
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ] && [ "$VIEW_POLICY_ASSOCIATED" = true ]; then
+    echo -e "${GREEN}✅ EKS read-only access policy is associated${NC}"
+elif kubectl get clusterrole game-agent-monitoring-role &> /dev/null; then
     echo -e "${GREEN}✅ ClusterRole created${NC}"
 else
     echo -e "${RED}❌ ClusterRole not found${NC}"
     exit 1
 fi
 
-if kubectl get clusterrolebinding game-agent-monitoring-binding &> /dev/null; then
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ]; then
+    :
+elif kubectl get clusterrolebinding game-agent-monitoring-binding &> /dev/null; then
     echo -e "${GREEN}✅ ClusterRoleBinding created${NC}"
 else
     echo -e "${RED}❌ ClusterRoleBinding not found${NC}"
@@ -203,13 +357,18 @@ echo ""
 
 # Test permissions
 echo -e "${BLUE}📋 Step 9: Testing permissions...${NC}"
-if kubectl auth can-i list pods --as="${K8S_USERNAME}" --as-group="${K8S_GROUP}" &> /dev/null; then
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ]; then
+    echo -e "${GREEN}✅ AmazonEKSViewPolicy grants read-only cluster access${NC}"
+    echo -e "${GREEN}✅ No write access policy is associated${NC}"
+elif kubectl auth can-i list pods --as="${K8S_USERNAME}" --as-group="${K8S_GROUP}" &> /dev/null; then
     echo -e "${GREEN}✅ Can list pods${NC}"
 else
     echo -e "${RED}❌ Cannot list pods${NC}"
 fi
 
-if kubectl auth can-i delete pods --as="${K8S_USERNAME}" --as-group="${K8S_GROUP}" 2>&1 | grep -q "no"; then
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ]; then
+    :
+elif kubectl auth can-i delete pods --as="${K8S_USERNAME}" --as-group="${K8S_GROUP}" 2>&1 | grep -q "no"; then
     echo -e "${GREEN}✅ Cannot delete pods (correct)${NC}"
 else
     echo -e "${YELLOW}⚠️  Unexpected delete permission${NC}"
@@ -257,7 +416,11 @@ echo ""
 echo -e "${BLUE}📊 Summary:${NC}"
 echo "  Cluster: ${CLUSTER_NAME}"
 echo "  Region: ${REGION}"
-echo "  RBAC: Read-only access configured"
+if [ "$KUBECTL_ADMIN_AVAILABLE" = false ]; then
+    echo "  Authorization: AmazonEKSViewPolicy (read-only)"
+else
+    echo "  Authorization: Kubernetes RBAC (read-only)"
+fi
 echo "  IAM Role: ${IAM_ROLE_ARN}"
 echo "  Kubernetes User: ${K8S_USERNAME}"
 echo "  Kubernetes Group: ${K8S_GROUP}"
@@ -269,7 +432,11 @@ echo -e "${BLUE}🔍 Verification:${NC}"
 echo "  kubectl auth can-i list pods --as=${K8S_USERNAME} --as-group=${K8S_GROUP}"
 echo ""
 echo -e "${BLUE}📋 Backup:${NC}"
-echo "  ${BACKUP_FILE}"
+if [ -n "$BACKUP_FILE" ]; then
+    echo "  ${BACKUP_FILE}"
+else
+    echo "  No prior AgentCore access mapping existed"
+fi
 echo ""
 echo -e "${BLUE}🔄 To deregister:${NC}"
 echo "  ${SCRIPT_DIR}/deregister-cluster.sh ${CLUSTER_NAME} ${REGION}"
