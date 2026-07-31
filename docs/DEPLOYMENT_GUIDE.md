@@ -236,19 +236,19 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
 | Bedrock (Claude Sonnet + Haiku) | $20-700+ | Dominant cost; ~$3.30/M input, ~$16.50/M output (Sonnet); prompt caching reduces effective cost 30–60% |
-| ECS Fargate | $36-70 | 1 vCPU, 2 GB task (~$0.04048/vCPU-hour + $0.004445/GB-hour); scales 1–4 tasks |
-| Bedrock Guardrails | $1-12 | Content filters + PII @ $0.15/1K text units; scales with query volume |
-| Bedrock AgentCore Runtime | $1-10 | Billed on actual CPU + peak memory per second; I/O wait is free |
-| Bedrock AgentCore Memory | $1-3 | Short-term events @ $0.25/1K new events |
-| WAF | $11-12 | $5 WebACL + $6 rules + $0.60/M requests |
+| ECS Fargate | $36-70 | 1 vCPU, 2 GB task (~$0.04048/vCPU-hour + $0.004445/GB-hour); MinTasks: 1 assumed for estimate, scales up to MaxTasks: 4 |
+| Bedrock Guardrails | $3-32 | Content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU); scales with query volume |
+| Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
+| Bedrock AgentCore Memory | $2-8 | STM: ~3 events per query @ $0.25/1K events; LTM retrieval minimal with default empty strategies |
+| WAF | $11 | $5 WebACL + $6 rules + $0.60/M requests (shared ~100K HTTP request assumption) |
 | CloudWatch + X-Ray | $5-10 | Log ingestion, metrics, traces |
-| ALB | $16-20 | Fixed hourly + LCU-hours (minimal at low traffic) |
+| ALB | $17-20 | Fixed hourly + LCU-hours (~100K HTTP requests/mo at 10K agent queries) |
 | Knowledge Bases (S3 Vectors) | <$1 | S3 Vectors storage + $2.50/M query requests + Titan Embed V2 @ $0.02/M tokens |
 | CloudTrail + KMS | ~$2 | Management events (first trail free) + 1 CMK @ $1/mo |
 | S3 (docs + logs + artifacts) | $1-5 | Standard storage across 5 buckets |
 | Cognito | Free | Up to 50,000 MAUs |
 
-**Base infrastructure**: ~$70-130/month (Fargate, ALB, WAF, CloudWatch, KMS, CloudTrail)
+**Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
 **AI usage (variable)**: $20-700+/month depending on query volume and conversation length
 
 ### Cost Optimization Tips
