@@ -34,7 +34,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
 from support.fake_provider import FakeProvider
@@ -65,9 +66,9 @@ _VALID_CFN = "Resources:\n  MyBucket:\n    Type: AWS::S3::Bucket\n"
 _user_ids = itertools.count(1)
 
 
-def _make_config(*, rate_limit_max: int) -> ConnectorConfig:
+def _make_config(*, rate_limit_max: int) -> SourceControlConfig:
     """Build an enabled ConnectorConfig whose per-user proposal limit is ``rate_limit_max``."""
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",
@@ -84,7 +85,7 @@ def _make_config(*, rate_limit_max: int) -> ConnectorConfig:
     )
 
 
-def _propose_as(user_id: str, *, config: ConnectorConfig, provider: FakeProvider):
+def _propose_as(user_id: str, *, config: SourceControlConfig, provider: FakeProvider):
     """Run one ``propose_change`` as ``user_id`` (authorized) and return the result.
 
     ``connector.service.get_secret`` is mocked so the credential fetch succeeds without any

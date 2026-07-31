@@ -36,7 +36,8 @@ from hypothesis import strategies as st
 
 # Local modules
 import utils.security as security
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
 from support.fake_provider import FakeProvider
@@ -73,14 +74,14 @@ _AUTHORIZED_POOL = ["writers", "admins", "sre", "platform", "infra"]
 _OTHER_POOL = ["viewers", "guests", "readonly", "analysts", "auditors"]
 
 
-def _make_config(authorized_groups: tuple[str, ...]) -> ConnectorConfig:
+def _make_config(authorized_groups: tuple[str, ...]) -> SourceControlConfig:
     """Build an enabled ConnectorConfig with the given ``authorized_groups``.
 
     ``rate_limit_max`` is set high so the rate-limit gate (which sits after
     authorization) never rejects an authorized request within a run; the rate-limit
     window store is also cleared per example in the test body.
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

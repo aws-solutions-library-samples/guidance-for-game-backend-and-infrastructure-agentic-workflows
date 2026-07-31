@@ -26,7 +26,7 @@ from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.gamelift_specialist import gamelift_agent
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
-from connector.config import ConnectorConfig
+from connector.config import SourceControlConfig
 from config.settings import (
     AGENT_MAX_TURNS_ORCHESTRATOR,
     AGENT_TIMEOUT_ORCHESTRATOR_SECONDS,
@@ -88,7 +88,7 @@ def run_orchestrator(query: str, context: dict = None):
         # below to avoid divergence between the memory and fallback paths.
         specialist_tools = [gamelift_agent, eks_agent, cost_agent]
         orchestrator_prompt = get_optimized_orchestrator_prompt()
-        if ConnectorConfig.load().enabled:
+        if SourceControlConfig.load().enabled:
             # Local import: keeps the connector out of the import graph for read-only
             # deployments and avoids a hard dependency when the Connector is disabled.
             # Local modules

@@ -74,7 +74,7 @@ def _run_orchestrator_capturing_tools(monkeypatch, enabled: bool):
 
     # ConnectorConfig.load() is a classmethod; replacing it with a zero-arg callable is
     # sufficient because run_orchestrator calls it as ``ConnectorConfig.load()``.
-    monkeypatch.setattr(orch.ConnectorConfig, "load", lambda: fake_config)
+    monkeypatch.setattr(orch.SourceControlConfig, "load", lambda: fake_config)
     monkeypatch.setattr(orch, "create_cached_bedrock_model", lambda *a, **k: MagicMock())
     monkeypatch.setattr(orch, "create_bedrock_model_with_overrides", lambda *a, **k: MagicMock())
     monkeypatch.setattr(orch, "Agent", _CapturingAgent)

@@ -30,7 +30,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector import service
 from connector.service import propose_change
@@ -74,9 +75,9 @@ _ALL_OPS = (
 )
 
 
-def _make_config() -> ConnectorConfig:
-    """Build an enabled ConnectorConfig backed by a single allowlist entry."""
-    return ConnectorConfig(
+def _make_config() -> SourceControlConfig:
+    """Build an enabled SourceControlConfig backed by a single allowlist entry."""
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

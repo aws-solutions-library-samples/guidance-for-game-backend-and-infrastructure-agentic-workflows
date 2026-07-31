@@ -64,7 +64,7 @@ def _reload_config():
     import connector.config
 
     importlib.reload(connector.config)
-    return connector.config.ConnectorConfig
+    return connector.config.SourceControlConfig
 
 
 def test_non_gbaw_env_vars_are_ignored_by_load(monkeypatch):
@@ -79,24 +79,24 @@ def test_non_gbaw_env_vars_are_ignored_by_load(monkeypatch):
     for key, value in _BARE_CONFIG.items():
         monkeypatch.setenv(key, value)
 
-    connector_config = _reload_config()
-    config = connector_config.load()
+    source_control_config = _reload_config()
+    config = source_control_config.load()
 
     # The bare env vars were ignored: the connector is in its default disabled off-state,
     # exactly as if nothing had been configured (Req 12.1, 1.1, 1.5).
     assert config.enabled is False
-    assert config.provider is None
-    assert config.credential_secret_id is None
-    assert config.allowlist == ()
-    assert config.authorized_groups == ()
+    assert config.connector.provider is None
+    assert config.adapter.credential_secret_arn is None
+    assert config.domain.authorization_policy == ()
+    assert config.domain.authorized_groups == ()
     # Off-state (no GBAW_ flag) produces NO configuration errors.
     assert config.config_errors == ()
     # Numeric tuning values reflect the documented defaults, not the bare-env overrides.
-    assert config.rate_limit_max == 5
-    assert config.rate_limit_window_seconds == 3600
-    assert config.provider_timeout_seconds == 30
-    assert config.retry_max_attempts == 3
-    assert config.max_files_per_request == 20
+    assert config.connector.rate_limit_max == 5
+    assert config.connector.rate_limit_window_seconds == 3600
+    assert config.connector.provider_timeout_seconds == 30
+    assert config.connector.retry_max_attempts == 3
+    assert config.connector.max_files_per_request == 20
 
 
 def test_gbaw_prefixed_vars_are_the_only_honored_source(monkeypatch):
@@ -130,12 +130,12 @@ def test_gbaw_prefixed_vars_are_the_only_honored_source(monkeypatch):
     monkeypatch.setenv("SCM_PROVIDER", "gitlab")
     monkeypatch.setenv("SCM_RATE_LIMIT_MAX", "999")
 
-    connector_config = _reload_config()
-    config = connector_config.load()
+    source_control_config = _reload_config()
+    config = source_control_config.load()
 
     assert config.enabled is True
     assert config.config_errors == ()
     # The provider came from the GBAW_-prefixed value, not the bare SCM_PROVIDER=gitlab.
-    assert config.provider == "github"
+    assert config.connector.provider == "github"
     # The default (not the bare SCM_RATE_LIMIT_MAX=999) is in effect.
-    assert config.rate_limit_max == 5
+    assert config.connector.rate_limit_max == 5

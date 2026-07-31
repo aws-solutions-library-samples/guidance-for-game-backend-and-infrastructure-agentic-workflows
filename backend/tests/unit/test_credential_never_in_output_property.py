@@ -42,7 +42,8 @@ from hypothesis import strategies as st
 
 # Local modules
 import utils.security as security
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.provider import (
     ProviderAuthError,
@@ -79,7 +80,7 @@ _INVALID_CFN = "NotResources:\n  junk: true\n"
 _user_ids = itertools.count(1)
 
 
-def _make_config() -> ConnectorConfig:
+def _make_config() -> SourceControlConfig:
     """Build an enabled ConnectorConfig for the propose path.
 
     ``rate_limit_max`` is high and the shared window store is cleared per example, so the
@@ -87,7 +88,7 @@ def _make_config() -> ConnectorConfig:
     transient-failure scenario fast (no backoff sleeps) while still exercising the failure
     path where a credential value could theoretically leak.
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

@@ -51,7 +51,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector import service
 from connector.provider import ProviderTransientError
@@ -112,13 +113,13 @@ _RESOURCE_TYPES = [
 _user_ids = itertools.count(1)
 
 
-def _make_config(retry_max_attempts: int) -> ConnectorConfig:
+def _make_config(retry_max_attempts: int) -> SourceControlConfig:
     """Build an enabled ConnectorConfig whose allowlist matches the requested repo/branch.
 
     ``retry_max_attempts`` is the Hypothesis-generated maximum so the property can assert
     the number of attempts against exactly the configured value.
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

@@ -25,7 +25,7 @@ from hypothesis import strategies as st
 
 # Local modules
 from config import settings as app_settings
-from connector.config import AllowlistEntry, ConnectorConfig, _parse_allowlist
+from connector.config import AllowlistEntry, SourceControlConfig, _parse_allowlist
 
 pytestmark = pytest.mark.unit
 
@@ -102,7 +102,9 @@ def test_property4_allowlist_round_trip_via_config_load(mapping):
         mock.patch.object(app_settings, "SCM_CONNECTOR_ENABLED", "true"),
         mock.patch.object(app_settings, "SCM_REPO_ALLOWLIST", raw),
     ):
-        config = ConnectorConfig.load()
+        config = SourceControlConfig.load()
 
-    reconstructed = {e.repo: list(e.target_branches) for e in config.allowlist}
+    reconstructed = {
+        e.repo: list(e.target_branches) for e in config.domain.authorization_policy
+    }
     assert reconstructed == mapping

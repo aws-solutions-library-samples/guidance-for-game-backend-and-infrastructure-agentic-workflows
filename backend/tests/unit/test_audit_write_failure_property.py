@@ -46,7 +46,8 @@ from hypothesis import strategies as st
 
 # Local modules
 from connector import service
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
 from support.fake_provider import FakeProvider
@@ -111,9 +112,9 @@ class _ProgrammableAuditSink:
         return self._confirmed
 
 
-def _make_config() -> ConnectorConfig:
-    """Build an enabled ConnectorConfig whose allowlist matches the requested repo/branch."""
-    return ConnectorConfig(
+def _make_config() -> SourceControlConfig:
+    """Build an enabled SourceControlConfig whose allowlist matches the requested repo/branch."""
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

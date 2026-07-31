@@ -13,9 +13,9 @@ dependency-inversion seam that lets the provider-neutral core (``connector.servi
 - ``ConnectorConfig.load()`` consults :func:`is_supported` so enablement fails closed when
   the configured provider has no registered adapter (Req 7.1, 7.2).
 
-To stay provider-neutral this module references only the abstraction. ``ConnectorConfig``
-and ``SourceControlProvider`` are imported solely for typing under ``TYPE_CHECKING`` to
-avoid import cycles; the only runtime import is the typed
+To stay provider-neutral this module references only the abstraction.
+``SourceControlConfig`` and ``SourceControlProvider`` are imported solely for typing under
+``TYPE_CHECKING`` to avoid import cycles; the only runtime import is the typed
 :class:`~connector.provider.UnsupportedProviderError` that :func:`get_provider` raises.
 """
 
@@ -29,14 +29,14 @@ from connector.provider import UnsupportedProviderError
 
 if TYPE_CHECKING:
     # Local modules
-    from connector.config import ConnectorConfig
+    from connector.config import SourceControlConfig
     from connector.provider import SourceControlProvider
 
 __all__ = ["ProviderFactory", "register", "is_supported", "get_provider"]
 
-# An adapter factory builds a concrete provider from the validated neutral config. The
-# type references only the abstraction/neutral config (both TYPE_CHECKING-only).
-ProviderFactory = Callable[["ConnectorConfig"], "SourceControlProvider"]
+# An adapter factory builds a concrete provider from the composed, validated config. The
+# type references only the abstraction/composed config (both TYPE_CHECKING-only).
+ProviderFactory = Callable[["SourceControlConfig"], "SourceControlProvider"]
 
 # Module-level registry mapping provider name -> adapter factory. Populated by adapters
 # self-registering at import time and resolved by is_supported/get_provider.
@@ -63,14 +63,16 @@ def is_supported(provider_name: str | None) -> bool:
     return provider_name in _REGISTRY
 
 
-def get_provider(config: "ConnectorConfig") -> "SourceControlProvider":
-    """Resolve and build the adapter for ``config.provider`` via the registry (Req 6.3).
+def get_provider(config: "SourceControlConfig") -> "SourceControlProvider":
+    """Resolve and build the adapter for ``config.connector.provider`` via the registry (Req 6.3).
 
     Raises :class:`~connector.provider.UnsupportedProviderError` when no adapter factory is
     registered for the configured provider, so a misconfigured provider fails closed rather
-    than reaching a concrete adapter (Req 7.2).
+    than reaching a concrete adapter (Req 7.2). The composed :class:`SourceControlConfig` is
+    passed to the factory so the adapter can read both its own :class:`AdapterConfig` fields
+    and the neutral :class:`ConnectorConfig` tuning (e.g. the provider timeout).
     """
-    provider_name = config.provider
+    provider_name = config.connector.provider
     factory = _REGISTRY.get(provider_name) if provider_name is not None else None
     if factory is None:
         raise UnsupportedProviderError(provider_name)

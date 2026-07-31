@@ -35,17 +35,23 @@ pytestmark = pytest.mark.unit
 
 
 def _make_config(provider: str) -> SimpleNamespace:
-    """Build a lightweight ConnectorConfig-shaped stub for the fields the adapter reads.
+    """Build a lightweight SourceControlConfig-shaped stub for the fields the adapter reads.
 
-    ``GitHubProvider`` only reads ``credential_secret_id``, ``provider_timeout_seconds``,
-    and ``provider_base_url``; ``get_provider`` reads ``provider``. A stub keeps the test
-    focused on factory selection and interface completeness.
+    After the v2 three-layer config split ``get_provider`` reads
+    ``config.connector.provider``; ``GitHubProvider`` reads
+    ``config.adapter.credential_secret_arn``, ``config.connector.provider_timeout_seconds``,
+    and ``config.adapter.provider_base_url``. A nested stub keeps the test focused on factory
+    selection and interface completeness.
     """
     return SimpleNamespace(
-        provider=provider,
-        credential_secret_id="scm/github-token",
-        provider_timeout_seconds=30,
-        provider_base_url=None,
+        connector=SimpleNamespace(
+            provider=provider,
+            provider_timeout_seconds=30,
+        ),
+        adapter=SimpleNamespace(
+            credential_secret_arn="scm/github-token",
+            provider_base_url=None,
+        ),
     )
 
 

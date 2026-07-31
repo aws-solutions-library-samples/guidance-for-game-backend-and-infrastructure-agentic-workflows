@@ -51,8 +51,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "src"))
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
 from connector.service import propose_change, read_iac_files
+from support.config_factory import make_source_control_config
 from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.integration
@@ -74,9 +75,14 @@ _AUTHORIZED_GROUP = "scm-proposers"
 _GITHUB_API = "https://api.github.com"
 
 
-def _build_config() -> ConnectorConfig:
-    """Build an enabled ConnectorConfig scoped to the disposable repo/branch."""
-    return ConnectorConfig(
+def _build_config() -> SourceControlConfig:
+    """Build an enabled SourceControlConfig scoped to the disposable repo/branch.
+
+    Built via the split-contract factory so the allowlist/authorized groups land on the
+    domain contract, the operational tuning + audit destination on the neutral connector
+    contract, and the credential + base URL on the adapter contract.
+    """
+    return make_source_control_config(
         enabled=True,
         provider="github",
         # Sentinel id: get_secret is patched to return the real token, so the connector

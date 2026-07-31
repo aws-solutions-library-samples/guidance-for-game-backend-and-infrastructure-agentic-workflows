@@ -25,7 +25,7 @@ from hypothesis import strategies as st
 
 # Local modules
 from config import settings as app_settings
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
 
 pytestmark = pytest.mark.unit
 
@@ -176,21 +176,22 @@ def test_property1_truthy_valid_config_enables_connector(cfg):
     meaningful if the connector acts on the operator's intended values (Req 1.4, 8.3).
     """
     with _patched_settings(cfg):
-        config = ConnectorConfig.load()
+        config = SourceControlConfig.load()
 
     # Core property: valid config enables the connector with no accumulated errors.
     assert config.enabled is True
     assert config.config_errors == ()
 
-    # Fields are parsed exactly as configured (values are whitespace-free by construction).
-    assert config.provider == cfg["provider"]
-    assert config.provider_base_url == cfg["provider_base_url"]
-    assert config.audit_log_group == cfg["audit_log_group"]
-    assert config.credential_secret_id == cfg["credential_secret_id"]
-    assert config.allowlist == cfg["expected_entries"]
-    assert config.authorized_groups == tuple(cfg["groups"])
-    assert config.rate_limit_max == cfg["rate_limit_max"]
-    assert config.rate_limit_window_seconds == cfg["rate_limit_window"]
-    assert config.provider_timeout_seconds == cfg["provider_timeout"]
-    assert config.retry_max_attempts == cfg["retry_max"]
-    assert config.max_files_per_request == cfg["max_files"]
+    # Fields are parsed exactly as configured, each on its owning split contract
+    # (values are whitespace-free by construction).
+    assert config.connector.provider == cfg["provider"]
+    assert config.adapter.provider_base_url == cfg["provider_base_url"]
+    assert config.connector.audit_log_group == cfg["audit_log_group"]
+    assert config.adapter.credential_secret_arn == cfg["credential_secret_id"]
+    assert config.domain.authorization_policy == cfg["expected_entries"]
+    assert config.domain.authorized_groups == tuple(cfg["groups"])
+    assert config.connector.rate_limit_max == cfg["rate_limit_max"]
+    assert config.connector.rate_limit_window_seconds == cfg["rate_limit_window"]
+    assert config.connector.provider_timeout_seconds == cfg["provider_timeout"]
+    assert config.connector.retry_max_attempts == cfg["retry_max"]
+    assert config.connector.max_files_per_request == cfg["max_files"]

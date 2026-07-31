@@ -14,10 +14,11 @@ Design guarantees encoded here (see
   direct call to the GitHub *Git Data* / *Contents* REST endpoints (get contents, get
   ref, create ref, create tree/commit, open pull request). Nothing is written to disk.
 - **Per-request timeout.** Every HTTP call is bounded by
-  ``config.provider_timeout_seconds`` (sourced from ``GBAW_SCM_PROVIDER_TIMEOUT_SECONDS``).
+  ``config.connector.provider_timeout_seconds`` (sourced from
+  ``GBAW_SCM_PROVIDER_TIMEOUT_SECONDS``).
 - **Per-operation credential fetch.** The SCM_Credential is fetched fresh for each public
-  operation via ``get_secret(config.credential_secret_id, source="secretsmanager")`` and
-  placed in the ``Authorization`` header. It is **never** logged (Req 4.7, 6.6).
+  operation via ``get_secret(config.adapter.credential_secret_arn, source="secretsmanager")``
+  and placed in the ``Authorization`` header. It is **never** logged (Req 4.7, 6.6).
 - **Typed error mapping** (Req 10.1, 10.2, 10.4, 10.5):
     - connection error / connect-timeout → :class:`ProviderUnavailableError`
     - read/write/pool timeout or other transport failure → :class:`ProviderTransientError`
@@ -58,7 +59,7 @@ from utils.secrets import get_secret
 
 if TYPE_CHECKING:
     # Local modules
-    from connector.config import ConnectorConfig
+    from connector.config import SourceControlConfig
 
 __all__ = ["GitHubProvider"]
 
@@ -82,12 +83,15 @@ class GitHubProvider(SourceControlProvider):
     the lifetime of a single HTTP request.
     """
 
-    def __init__(self, config: ConnectorConfig) -> None:
-        self._credential_secret_id = config.credential_secret_id
-        self._timeout = float(config.provider_timeout_seconds)
+    def __init__(self, config: SourceControlConfig) -> None:
+        # Credential + base URL are adapter-owned (AdapterConfig); the per-request timeout
+        # is neutral operational tuning (ConnectorConfig). The composed SourceControlConfig
+        # gives the adapter access to both after the v2 three-layer config split.
+        self._credential_secret_id = config.adapter.credential_secret_arn
+        self._timeout = float(config.connector.provider_timeout_seconds)
         # provider_base_url is a real, validated config field (absolute https or None). When
         # unset the adapter falls back to the public GitHub API host (Req 10.2, 10.3).
-        self._base_url = config.provider_base_url or _DEFAULT_API_BASE_URL
+        self._base_url = config.adapter.provider_base_url or _DEFAULT_API_BASE_URL
 
     # ------------------------------------------------------------------ read path
 

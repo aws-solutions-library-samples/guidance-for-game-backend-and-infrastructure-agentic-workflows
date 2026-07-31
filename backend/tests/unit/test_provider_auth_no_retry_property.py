@@ -47,7 +47,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.provider import ProviderAuthError
 from connector.service import propose_change
@@ -106,14 +107,14 @@ _RESOURCE_TYPES = [
 _user_ids = itertools.count(1)
 
 
-def _make_config() -> ConnectorConfig:
+def _make_config() -> SourceControlConfig:
     """Build an enabled ConnectorConfig whose allowlist matches the requested repo/branch.
 
     ``retry_max_attempts`` is deliberately > 1 (3) so that if the connector *did* retry an
     auth failure, the failing operation would be invoked more than once. The property proves
     it is invoked exactly once regardless.
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

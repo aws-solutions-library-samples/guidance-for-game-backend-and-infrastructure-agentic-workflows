@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
 
 # Local modules
 from connector.audit import AuditSink
-from connector.config import ConnectorConfig
+from connector.config import SourceControlConfig
 from connector.iac_validation import IaCValidationError, validate_iac
 from connector.registry import get_provider
 from connector.models import (
@@ -103,19 +103,20 @@ _MAX_BRANCH_NAME_ATTEMPTS = 10
 # ``config.audit_log_group`` without threading it through every terminal call site. Tests may
 # monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to inject a fake sink.
 _audit_sinks: dict[str, AuditSink] = {}
-_active_config: ConnectorConfig | None = None
+_active_config: SourceControlConfig | None = None
 
 
-def _get_audit_sink(config: ConnectorConfig | None) -> AuditSink | None:
-    """Return a cached :class:`AuditSink` for ``config.audit_log_group`` (or ``None``).
+def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
+    """Return a cached :class:`AuditSink` for ``config.connector.audit_log_group`` (or ``None``).
 
     The sink is cached per log-group name so a boto3 ``logs`` client and its sequence token
     are reused across proposals. When ``config`` is missing or carries no ``audit_log_group``
     there is no durable target, so ``None`` is returned and the audit write is treated as
-    failed by the caller (fail closed — Req 13.3). ``config.load()`` already requires
-    ``audit_log_group`` on the enabled path, so in practice a live proposal always has one.
+    failed by the caller (fail closed — Req 13.3). ``SourceControlConfig.load()`` already
+    requires ``audit_log_group`` on the enabled path, so a live proposal always has one.
     """
-    log_group = getattr(config, "audit_log_group", None) if config is not None else None
+    connector = getattr(config, "connector", None) if config is not None else None
+    log_group = getattr(connector, "audit_log_group", None) if connector is not None else None
     if not log_group:
         return None
     sink = _audit_sinks.get(log_group)
@@ -132,17 +133,17 @@ def _reset_audit_sinks() -> None:
     _active_config = None
 
 
-def _resolve_config(config: ConnectorConfig | None) -> ConnectorConfig:
+def _resolve_config(config: SourceControlConfig | None) -> SourceControlConfig:
     """Return the supplied ``config`` or load it fresh from ``GBAW_SCM_*`` env vars.
 
     Injection is supported so unit/property tests can pass a purpose-built config; in
     production the tools call with no argument and the validated config is loaded here.
     """
-    return config if config is not None else ConnectorConfig.load()
+    return config if config is not None else SourceControlConfig.load()
 
 
 def _resolve_provider(
-    config: ConnectorConfig,
+    config: SourceControlConfig,
     provider: SourceControlProvider | None,
 ) -> SourceControlProvider:
     """Return the supplied ``provider`` or build the adapter for ``config`` (Req 9.4).
@@ -153,15 +154,16 @@ def _resolve_provider(
     return provider if provider is not None else get_provider(config)
 
 
-def _default_repo_and_branch(config: ConnectorConfig) -> tuple[str, str]:
+def _default_repo_and_branch(config: SourceControlConfig) -> tuple[str, str]:
     """Return the default ``(repository, target_branch)`` selectors for an operation.
 
     When a caller omits the ``repository``/``target_branch`` selectors, the connector
     defaults to the first allowlist entry and its first branch. These are still only
     *requested* selectors: they are matched against the allowlist and the effective
-    repo/branch always come from the matched entry (Req 11.3, 11.4).
+    repo/branch always come from the matched entry (Req 11.3, 11.4). The allowlist now
+    lives on the domain contract's ``authorization_policy``.
     """
-    entry = config.allowlist[0]
+    entry = config.domain.authorization_policy[0]
     return entry.repo, entry.target_branches[0]
 
 
@@ -170,7 +172,7 @@ def read_iac_files(
     *,
     repository: str | None = None,
     target_branch: str | None = None,
-    config: ConnectorConfig | None = None,
+    config: SourceControlConfig | None = None,
     provider: SourceControlProvider | None = None,
 ) -> FileFetchResult:
     """Fetch existing IaC files from a selected allowlisted repository and target branch.
@@ -199,14 +201,14 @@ def read_iac_files(
 
     # Req 3.2: reject an over-limit request BEFORE contacting the provider so no
     # source-control fetch is issued when the caller asks for too many files.
-    if len(paths) > resolved_config.max_files_per_request:
+    if len(paths) > resolved_config.connector.max_files_per_request:
         logger.warning(
             "IaC file read rejected: request exceeds the configured per-request maximum",
             event="scm_read",
             action="read",
             outcome="limit_exceeded",
             requested_count=len(paths),
-            max_files_per_request=resolved_config.max_files_per_request,
+            max_files_per_request=resolved_config.connector.max_files_per_request,
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=True)
 
@@ -453,7 +455,7 @@ def _looks_injected(*texts: str) -> bool:
 
 
 def _match_allowlist(
-    config: ConnectorConfig,
+    config: SourceControlConfig,
     req_repo: str,
     req_branch: str,
 ) -> tuple[str, str] | None:
@@ -463,9 +465,9 @@ def _match_allowlist(
     no partial/prefix/substring/wildcard matching (Req 5.2). The returned values are taken
     from the matched allowlist entry, so a source-control operation is only ever issued
     against an operator-approved repository/branch regardless of model or user input
-    (Req 5.5, 11.5).
+    (Req 5.5, 11.5). The allowlist lives on the domain contract's ``authorization_policy``.
     """
-    for entry in config.allowlist:
+    for entry in config.domain.authorization_policy:
         if entry.repo == req_repo:
             for branch in entry.target_branches:
                 if branch == req_branch:
@@ -517,7 +519,7 @@ def propose_change(
     *,
     repository: str | None = None,
     target_branch: str | None = None,
-    config: ConnectorConfig | None = None,
+    config: SourceControlConfig | None = None,
     provider: SourceControlProvider | None = None,
 ) -> ProposalResult:
     """Run the full fail-closed propose pipeline and open exactly one Change_Proposal.
@@ -601,7 +603,7 @@ def propose_change(
     # --- Gate 3: authorization (Req 7.1-7.4) --------------------------------------------
     authorized = verify_request_authorization(
         user_id,
-        required_groups=list(resolved_config.authorized_groups),
+        required_groups=list(resolved_config.domain.authorized_groups),
         user_groups=user_groups,
         require_authentication=True,
     )
@@ -627,7 +629,7 @@ def propose_change(
     # Requested repo/branch default to the first allowlist entry when the caller omits them
     # (production tools operate on the configured repo); when supplied they must match an
     # entry exactly. The effective repo/branch always come from the matched entry.
-    default_entry: AllowlistEntry = resolved_config.allowlist[0]
+    default_entry: AllowlistEntry = resolved_config.domain.authorization_policy[0]
     req_repo = repository if repository is not None else default_entry.repo
     req_branch = target_branch if target_branch is not None else default_entry.target_branches[0]
 
@@ -656,13 +658,13 @@ def propose_change(
     try:
         check_rate_limit(
             get_rate_limit_key(user_id, _RATE_LIMIT_ENDPOINT),
-            resolved_config.rate_limit_max,
-            resolved_config.rate_limit_window_seconds,
+            resolved_config.connector.rate_limit_max,
+            resolved_config.connector.rate_limit_window_seconds,
         )
     except RateLimitExceeded:
         reset_at = (
             datetime.now(timezone.utc)
-            + timedelta(seconds=resolved_config.rate_limit_window_seconds)
+            + timedelta(seconds=resolved_config.connector.rate_limit_window_seconds)
         ).isoformat()
         return _finalize(
             ProposalResult(
@@ -670,8 +672,9 @@ def propose_change(
                 proposal_id=None,
                 proposal_url=None,
                 message=(
-                    f"Rate limit reached: at most {resolved_config.rate_limit_max} change "
-                    f"proposals per {resolved_config.rate_limit_window_seconds}s. "
+                    f"Rate limit reached: at most {resolved_config.connector.rate_limit_max} "
+                    f"change proposals per "
+                    f"{resolved_config.connector.rate_limit_window_seconds}s. "
                     f"Capacity resets by {reset_at}."
                 ),
             ),
@@ -692,7 +695,7 @@ def propose_change(
     # audit field or the returned message (Req 4.7, 6.6).
     try:
         credential = get_secret(
-            resolved_config.credential_secret_id, source="secretsmanager"
+            resolved_config.adapter.credential_secret_arn, source="secretsmanager"
         )
     except Exception:  # noqa: BLE001 - any retrieval failure is fail-closed
         credential = None
@@ -765,7 +768,7 @@ def propose_change(
 
     # --- Gate 8: provider operations (transient-only retries) ---------------------------
     resolved_provider = _resolve_provider(resolved_config, provider)
-    attempts = resolved_config.retry_max_attempts
+    attempts = resolved_config.connector.retry_max_attempts
 
     effective_title = title.strip() or f"Proposed IaC change: {_slug(intent)}"
     body = _build_change_proposal_body(description, intent, proposed_files, user_id or "unknown")

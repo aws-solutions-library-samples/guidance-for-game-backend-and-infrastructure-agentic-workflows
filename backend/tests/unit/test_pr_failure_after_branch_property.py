@@ -43,7 +43,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.provider import (
     ProviderConflictError,
@@ -94,13 +95,13 @@ _RESOURCE_TYPES = [
 _user_ids = itertools.count(1)
 
 
-def _make_config() -> ConnectorConfig:
+def _make_config() -> SourceControlConfig:
     """Build an enabled ConnectorConfig whose allowlist matches the requested repo/branch.
 
     ``retry_max_attempts`` is 1 so a ``ProviderTransientError`` raised by
     ``open_change_proposal`` is immediately exhausted (a single attempt, no backoff sleeps).
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

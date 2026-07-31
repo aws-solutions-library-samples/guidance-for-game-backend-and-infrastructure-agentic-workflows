@@ -36,7 +36,8 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector import service
 from connector.service import propose_change
 from support.fake_provider import FakeProvider
@@ -67,9 +68,9 @@ _ALL_OPS = (
 )
 
 
-def _make_config() -> ConnectorConfig:
-    """Build an enabled ConnectorConfig whose default allowlist entry matches the request."""
-    return ConnectorConfig(
+def _make_config() -> SourceControlConfig:
+    """Build an enabled config whose default allowlist entry matches the request."""
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",
@@ -82,7 +83,6 @@ def _make_config() -> ConnectorConfig:
         max_files_per_request=20,
         provider_base_url=None,
         audit_log_group="scm-audit",
-        config_errors=(),
     )
 
 

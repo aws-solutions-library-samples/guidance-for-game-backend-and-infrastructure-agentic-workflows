@@ -62,7 +62,7 @@ def _capture_orchestrator_tools(enabled: bool) -> list:
     fake_config = SimpleNamespace(enabled=enabled)
 
     with (
-        mock.patch.object(orch.ConnectorConfig, "load", lambda: fake_config),
+        mock.patch.object(orch.SourceControlConfig, "load", lambda: fake_config),
         mock.patch.object(orch, "create_cached_bedrock_model", lambda *a, **k: MagicMock()),
         mock.patch.object(orch, "create_bedrock_model_with_overrides", lambda *a, **k: MagicMock()),
         mock.patch.object(orch, "Agent", _CapturingAgent),

@@ -33,7 +33,8 @@ from unittest.mock import patch
 import pytest
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
 from support.fake_provider import FakeProvider
@@ -61,14 +62,14 @@ _VALID_CFN = (
 )
 
 
-def _enabled_config() -> ConnectorConfig:
-    """Build an enabled ConnectorConfig with a Secrets-Manager-style credential id.
+def _enabled_config() -> SourceControlConfig:
+    """Build an enabled SourceControlConfig with a Secrets-Manager-style credential id.
 
     The allowlist's first entry is the configured repository/target branch the propose
     path acts on; ``credential_secret_id`` is the id the pipeline must hand to
     ``get_secret``.
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id=_SECRET_ID,

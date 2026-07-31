@@ -1,20 +1,35 @@
 """Connector configuration, validation, and the fail-closed enablement gate.
 
 This module turns the raw ``GBAW_SCM_*`` environment values parsed in
-``config/settings.py`` into a frozen, validated :class:`ConnectorConfig`. It is the
-single decision point for whether the Source Control Connector is *enabled*.
+``config/settings.py`` into three frozen, validated configuration contracts composed by a
+:class:`SourceControlConfig`. It is the single decision point for whether the Source
+Control Connector is *enabled*.
 
-Design contract (see ``.kiro/specs/source-control-connector/design.md`` → Data Models):
+Design contract (see ``.kiro/specs/source-control-connector-v2/design.md`` → Component 1
+and the Data Models "field move" table). The v2 pass splits the previously monolithic
+``ConnectorConfig`` into three cohesive layers, each owning one contract:
 
-- ``ConnectorConfig.load()`` reads connector configuration **exclusively** from the
-  ``GBAW_``-prefixed values exposed by ``config/settings.py`` and ignores every other
-  source (Req 12.1).
-- Enablement is truthy only when the flag case-insensitively (whitespace-trimmed)
-  matches one of ``{"true", "1", "yes"}`` (Req 1.4, 1.5).
-- ``load()`` **accumulates every validation failure** into ``config_errors`` rather than
-  raising, and any non-empty ``config_errors`` forces ``enabled=False`` — misconfiguration
-  yields a disabled connector plus an audit entry, never an import-time crash (Req 1.6,
-  12.4).
+- :class:`DomainConfig` (IaC_Change_Domain) owns the authorization policy (the repository
+  allowlist) and the authorized Cognito groups.
+- :class:`ConnectorConfig` (Connector_Core, provider-neutral) owns operational tuning:
+  ``provider``, rate limiting, provider timeout, retry attempts, max files per request, and
+  the audit destination log group.
+- :class:`AdapterConfig` (Provider_Adapter) owns the credential secret ARN and the optional
+  provider base URL.
+
+Composition happens in :meth:`SourceControlConfig.load`, which builds all three contracts
+from the ``GBAW_SCM_*`` values and resolves a single ``enabled`` gate that is truthy **iff
+the enablement flag is truthy AND all three contracts validate**. Behavior that predates
+the split is preserved exactly, only re-homed:
+
+- ``load()`` reads connector configuration **exclusively** from the ``GBAW_``-prefixed
+  values exposed by ``config/settings.py`` and ignores every other source (Req 12.1).
+- Enablement is truthy only when the flag case-insensitively (whitespace-trimmed) matches
+  one of ``{"true", "1", "yes"}`` (Req 1.4, 1.5).
+- Each contract **accumulates every validation failure** into its own ``config_errors``
+  rather than raising; any non-empty ``config_errors`` on any contract forces
+  ``enabled=False`` — misconfiguration yields a disabled connector plus an audit entry,
+  never an import-time crash (Req 1.6, 12.4).
 - When the flag is truthy but a required value is missing/invalid, a single
   configuration-error audit entry is emitted via the existing ``logger`` with every field
   passed through ``sanitize_log_data`` so no raw credential can leak (Req 1.6, 12.3, 12.4).
@@ -22,17 +37,15 @@ Design contract (see ``.kiro/specs/source-control-connector/design.md`` → Data
   looks like a raw credential (token/PEM/AWS-key shape) is rejected and its value is
   excluded from all audit output (Req 12.2, 12.3).
 
-Validation rules enforced by ``load()`` (all failures accumulate):
+Per-contract validation rules (all failures accumulate on the owning contract):
 
 - Enablement flag not truthy → disabled, **no error** (normal off state) (Req 1.1, 1.5).
 - ``provider`` unset/empty → error (Req 9.5); a provider with no registered adapter (per
-  ``connector.registry.is_supported``) → error and disabled, so an unsupported provider
-  fails closed at config-load time rather than at first use (Req 7.1, 7.2).
+  ``connector.registry.is_supported``) → error and disabled (Req 7.1, 7.2).
 - ``provider_base_url`` set but not an absolute https URL → error and disabled; unset →
   ``None`` so the adapter uses the provider's public endpoint (Req 10.2, 10.3, 10.4).
-- ``audit_log_group`` absent on the enabled path → error and disabled (the durable audit
-  sink needs a target log group) (Req 13.1).
-- ``credential_secret_id`` unset → error; raw-credential-shaped value → error and the
+- ``audit_log_group`` absent on the enabled path → error and disabled (Req 13.1).
+- ``credential_secret_arn`` unset → error; raw-credential-shaped value → error and the
   value is omitted from audit output (Req 12.2, 12.3).
 - Allowlist unparsable or zero entries → error (Req 5.4).
 - ``authorized_groups`` empty → error (Req 7.5).
@@ -56,7 +69,13 @@ from connector import registry
 from utils.logger import logger
 from utils.security import sanitize_log_data
 
-__all__ = ["AllowlistEntry", "ConnectorConfig"]
+__all__ = [
+    "AllowlistEntry",
+    "DomainConfig",
+    "ConnectorConfig",
+    "AdapterConfig",
+    "SourceControlConfig",
+]
 
 # Accepted truthy enablement values (compared case-insensitively, whitespace-trimmed).
 _TRUTHY_VALUES = frozenset({"true", "1", "yes"})
@@ -99,88 +118,24 @@ class AllowlistEntry:
 
 
 @dataclass(frozen=True)
-class ConnectorConfig:
-    """Validated, immutable connector configuration and the ``enabled`` decision.
+class DomainConfig:
+    """IaC_Change_Domain configuration: authorization policy + authorized groups.
 
-    A non-empty ``config_errors`` always corresponds to ``enabled is False`` (Req 1.6,
-    12.4). Numeric fields always hold a valid in-range value (falling back to the
-    documented default when the supplied value was absent or invalid) so downstream code
-    can rely on them regardless of the enablement outcome.
+    Owns the operator-approved repository ``authorization_policy`` (the allowlist) and the
+    ``authorized_groups`` a requesting user must belong to. This task keeps the policy
+    minimal — it holds the existing tuple of :class:`AllowlistEntry` (repo + branch) and the
+    authorized groups exactly as before the split; the path/extension dimensions are added
+    by a later v2 task. ``config_errors`` accumulates this contract's validation failures.
     """
 
-    enabled: bool
-    provider: str | None
-    provider_base_url: str | None
-    credential_secret_id: str | None
-    allowlist: tuple[AllowlistEntry, ...]
+    authorization_policy: tuple[AllowlistEntry, ...]
     authorized_groups: tuple[str, ...]
-    audit_log_group: str | None
-    rate_limit_max: int
-    rate_limit_window_seconds: int
-    provider_timeout_seconds: int
-    retry_max_attempts: int
-    max_files_per_request: int
     config_errors: tuple[str, ...]
 
     @classmethod
-    def load(cls) -> "ConnectorConfig":
-        """Read ``GBAW_SCM_*`` config, validate it, and resolve the ``enabled`` gate.
-
-        Reads exclusively from the ``GBAW_``-prefixed values on ``config.settings``
-        (Req 12.1). Never raises: every failure is accumulated into ``config_errors`` and
-        forces ``enabled=False``. When the enablement flag is truthy but validation fails,
-        a configuration-error audit entry is emitted (Req 1.6, 12.4).
-        """
+    def load(cls) -> "DomainConfig":
+        """Build the domain contract from ``GBAW_SCM_*`` values, accumulating errors."""
         errors: list[str] = []
-
-        raw_flag = (settings.SCM_CONNECTOR_ENABLED or "").strip().lower()
-        truthy = raw_flag in _TRUTHY_VALUES
-
-        # Not truthy is the normal off state: the connector is disabled with NO error and
-        # no audit entry (Req 1.1, 1.5). Short-circuit before validation so a default
-        # read-only deployment reports empty config_errors.
-        if not truthy:
-            return cls._disabled_off_state()
-
-        # --- Provider: present/non-empty AND backed by a registered adapter. The registry
-        # is the single source of truth for which providers are supported; enablement fails
-        # closed when no adapter is registered for the configured provider (Req 7.1, 7.2). ---
-        provider = (settings.SCM_PROVIDER or "").strip() or None
-        if provider is None:
-            errors.append("provider: GBAW_SCM_PROVIDER is required but was not set")
-        elif not registry.is_supported(provider):
-            errors.append(
-                f"provider: no source-control adapter is registered for provider '{provider}'; "
-                "connector disabled (fail-closed)"
-            )
-
-        # --- Provider base URL: optional. When set it MUST be an absolute HTTPS URL
-        # (scheme "https" + non-empty host); an invalid value fails closed with a config
-        # error and disables the connector. When unset the adapter defaults to the
-        # provider's public endpoint (Req 10.1, 10.2, 10.3, 10.4). ---
-        raw_base_url = (settings.SCM_PROVIDER_BASE_URL or "").strip()
-        provider_base_url: str | None = raw_base_url or None
-        if provider_base_url is not None and not _is_absolute_https_url(provider_base_url):
-            errors.append(
-                f"provider_base_url: GBAW_SCM_PROVIDER_BASE_URL value '{provider_base_url}' is "
-                "not a valid absolute https URL"
-            )
-            provider_base_url = None
-
-        # --- Credential secret id: required, and must be a secret id/ARN, not a raw value.
-        raw_secret = (settings.SCM_CREDENTIAL_SECRET_ID or "").strip()
-        credential_secret_id: str | None = raw_secret or None
-        if credential_secret_id is None:
-            errors.append(
-                "credential_secret_id: GBAW_SCM_CREDENTIAL_SECRET_ID is required but was not set"
-            )
-        elif _looks_like_raw_credential(credential_secret_id):
-            # Req 12.3: reject and NEVER echo the raw value into the error/audit output.
-            credential_secret_id = None
-            errors.append(
-                "credential_secret_id: a raw credential value was supplied in place of an "
-                "AWS Secrets Manager secret id; value rejected and omitted"
-            )
 
         # --- Repository allowlist: must parse to at least one entry (Req 5.1, 5.4). ---
         allowlist, allowlist_errors = _parse_allowlist(settings.SCM_REPO_ALLOWLIST)
@@ -198,6 +153,55 @@ class ConnectorConfig:
             errors.append(
                 "authorized_groups: GBAW_SCM_AUTHORIZED_GROUPS is required and must list at "
                 "least one Cognito group"
+            )
+
+        return cls(
+            authorization_policy=allowlist,
+            authorized_groups=authorized_groups,
+            config_errors=tuple(errors),
+        )
+
+    @classmethod
+    def _empty(cls) -> "DomainConfig":
+        """Return the well-formed empty domain contract for the disabled off state."""
+        return cls(authorization_policy=(), authorized_groups=(), config_errors=())
+
+
+@dataclass(frozen=True)
+class ConnectorConfig:
+    """Connector_Core (provider-neutral) operational tuning contract.
+
+    Owns the ``provider`` name, rate-limit window, provider timeout, retry attempts, the
+    per-request file cap, and the durable audit destination log group. Numeric fields always
+    hold a valid in-range value (falling back to the documented default when the supplied
+    value was absent or invalid) so downstream code can rely on them regardless of the
+    enablement outcome. ``config_errors`` accumulates this contract's validation failures.
+    """
+
+    provider: str | None
+    rate_limit_max: int
+    rate_limit_window_seconds: int
+    provider_timeout_seconds: int
+    retry_max_attempts: int
+    max_files_per_request: int
+    audit_log_group: str | None
+    config_errors: tuple[str, ...]
+
+    @classmethod
+    def load(cls) -> "ConnectorConfig":
+        """Build the neutral core contract from ``GBAW_SCM_*`` values, accumulating errors."""
+        errors: list[str] = []
+
+        # --- Provider: present/non-empty AND backed by a registered adapter. The registry
+        # is the single source of truth for which providers are supported; enablement fails
+        # closed when no adapter is registered for the configured provider (Req 7.1, 7.2). ---
+        provider = (settings.SCM_PROVIDER or "").strip() or None
+        if provider is None:
+            errors.append("provider: GBAW_SCM_PROVIDER is required but was not set")
+        elif not registry.is_supported(provider):
+            errors.append(
+                f"provider: no source-control adapter is registered for provider '{provider}'; "
+                "connector disabled (fail-closed)"
             )
 
         # --- Audit log group: required when the connector is enabled, since the durable
@@ -257,51 +261,172 @@ class ConnectorConfig:
             errors=errors,
         )
 
-        # Enablement gate: the flag is truthy here (non-truthy short-circuited above), so
-        # enablement hinges solely on whether validation accumulated any errors (Req 1.4,
-        # 1.6). The operator asked for the connector but validation failed → emit a single
-        # configuration-error audit entry (Req 1.6, 12.4).
-        enabled = not errors
-        if errors:
-            _emit_config_error_audit(errors)
-
         return cls(
-            enabled=enabled,
             provider=provider,
-            provider_base_url=provider_base_url,
-            credential_secret_id=credential_secret_id,
-            allowlist=allowlist,
-            authorized_groups=authorized_groups,
-            audit_log_group=audit_log_group,
             rate_limit_max=rate_limit_max,
             rate_limit_window_seconds=rate_limit_window_seconds,
             provider_timeout_seconds=provider_timeout_seconds,
             retry_max_attempts=retry_max_attempts,
             max_files_per_request=max_files_per_request,
+            audit_log_group=audit_log_group,
             config_errors=tuple(errors),
         )
 
     @classmethod
-    def _disabled_off_state(cls) -> "ConnectorConfig":
-        """Return the disabled config for the normal off state (flag not truthy).
-
-        No validation is performed and no error/audit is produced (Req 1.1, 1.5); numeric
-        fields carry their documented defaults so the object is always well-formed.
-        """
+    def _defaults(cls) -> "ConnectorConfig":
+        """Return the neutral core contract with documented defaults (disabled off state)."""
         return cls(
-            enabled=False,
             provider=None,
-            provider_base_url=None,
-            credential_secret_id=None,
-            allowlist=(),
-            authorized_groups=(),
-            audit_log_group=None,
             rate_limit_max=_RATE_LIMIT_MAX_DEFAULT,
             rate_limit_window_seconds=_RATE_WINDOW_DEFAULT,
             provider_timeout_seconds=_TIMEOUT_DEFAULT,
             retry_max_attempts=_RETRY_DEFAULT,
             max_files_per_request=_MAX_FILES_DEFAULT,
+            audit_log_group=None,
             config_errors=(),
+        )
+
+
+@dataclass(frozen=True)
+class AdapterConfig:
+    """Provider_Adapter configuration: credential secret ARN + provider base URL.
+
+    Owns the credential reference (``credential_secret_arn``) the adapter uses to acquire
+    provider credentials and the optional ``provider_base_url`` for self-hosted/enterprise
+    endpoints. ``config_errors`` accumulates this contract's validation failures.
+
+    This task keeps the credential *value* sourced from the existing
+    ``GBAW_SCM_CREDENTIAL_SECRET_ID`` setting (the single-ARN consolidation and the move of
+    credential acquisition into the adapter are later v2 tasks); it is simply re-homed onto
+    this contract as ``credential_secret_arn``.
+    """
+
+    credential_secret_arn: str | None
+    provider_base_url: str | None
+    config_errors: tuple[str, ...]
+
+    @classmethod
+    def load(cls) -> "AdapterConfig":
+        """Build the adapter contract from ``GBAW_SCM_*`` values, accumulating errors."""
+        errors: list[str] = []
+
+        # --- Credential secret ARN: required, and must be a secret id/ARN, not a raw value.
+        raw_secret = (settings.SCM_CREDENTIAL_SECRET_ID or "").strip()
+        credential_secret_arn: str | None = raw_secret or None
+        if credential_secret_arn is None:
+            errors.append(
+                "credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ID is required but was not set"
+            )
+        elif _looks_like_raw_credential(credential_secret_arn):
+            # Req 12.3: reject and NEVER echo the raw value into the error/audit output.
+            credential_secret_arn = None
+            errors.append(
+                "credential_secret_arn: a raw credential value was supplied in place of an "
+                "AWS Secrets Manager secret id; value rejected and omitted"
+            )
+
+        # --- Provider base URL: optional. When set it MUST be an absolute HTTPS URL
+        # (scheme "https" + non-empty host); an invalid value fails closed with a config
+        # error and disables the connector. When unset the adapter defaults to the
+        # provider's public endpoint (Req 10.1, 10.2, 10.3, 10.4). ---
+        raw_base_url = (settings.SCM_PROVIDER_BASE_URL or "").strip()
+        provider_base_url: str | None = raw_base_url or None
+        if provider_base_url is not None and not _is_absolute_https_url(provider_base_url):
+            errors.append(
+                f"provider_base_url: GBAW_SCM_PROVIDER_BASE_URL value '{provider_base_url}' is "
+                "not a valid absolute https URL"
+            )
+            provider_base_url = None
+
+        return cls(
+            credential_secret_arn=credential_secret_arn,
+            provider_base_url=provider_base_url,
+            config_errors=tuple(errors),
+        )
+
+    @classmethod
+    def _empty(cls) -> "AdapterConfig":
+        """Return the well-formed empty adapter contract for the disabled off state."""
+        return cls(credential_secret_arn=None, provider_base_url=None, config_errors=())
+
+
+@dataclass(frozen=True)
+class SourceControlConfig:
+    """Composed connector configuration and the single fail-closed ``enabled`` decision.
+
+    Composes the three layer contracts (:class:`DomainConfig`, :class:`ConnectorConfig`,
+    :class:`AdapterConfig`) and resolves one ``enabled`` gate. ``enabled`` is ``True`` iff
+    the enablement flag is truthy AND all three contracts validate; any contract error
+    forces ``enabled=False`` (Req 1.6, 12.4).
+    """
+
+    enabled: bool
+    domain: DomainConfig
+    connector: ConnectorConfig
+    adapter: AdapterConfig
+
+    @property
+    def config_errors(self) -> tuple[str, ...]:
+        """Aggregate every contract's accumulated configuration errors, in layer order."""
+        return (
+            self.domain.config_errors
+            + self.connector.config_errors
+            + self.adapter.config_errors
+        )
+
+    @classmethod
+    def load(cls) -> "SourceControlConfig":
+        """Read ``GBAW_SCM_*`` config, build the three contracts, and resolve ``enabled``.
+
+        Reads exclusively from the ``GBAW_``-prefixed values on ``config.settings``
+        (Req 12.1). Never raises: every failure is accumulated into the owning contract's
+        ``config_errors`` and forces ``enabled=False``. When the enablement flag is truthy
+        but validation fails, a single configuration-error audit entry is emitted across all
+        accumulated errors (Req 1.6, 12.4).
+        """
+        raw_flag = (settings.SCM_CONNECTOR_ENABLED or "").strip().lower()
+        truthy = raw_flag in _TRUTHY_VALUES
+
+        # Not truthy is the normal off state: the connector is disabled with NO error and
+        # no audit entry (Req 1.1, 1.5). Short-circuit before validation so a default
+        # read-only deployment reports empty config_errors.
+        if not truthy:
+            return cls._disabled_off_state()
+
+        domain = DomainConfig.load()
+        connector = ConnectorConfig.load()
+        adapter = AdapterConfig.load()
+
+        # Enablement gate: the flag is truthy here (non-truthy short-circuited above), so
+        # enablement hinges solely on whether any contract accumulated errors (Req 1.4,
+        # 1.6). The operator asked for the connector but validation failed → emit a single
+        # configuration-error audit entry across all contracts (Req 1.6, 12.4).
+        all_errors = list(
+            domain.config_errors + connector.config_errors + adapter.config_errors
+        )
+        enabled = not all_errors
+        if all_errors:
+            _emit_config_error_audit(all_errors)
+
+        return cls(
+            enabled=enabled,
+            domain=domain,
+            connector=connector,
+            adapter=adapter,
+        )
+
+    @classmethod
+    def _disabled_off_state(cls) -> "SourceControlConfig":
+        """Return the disabled config for the normal off state (flag not truthy).
+
+        No validation is performed and no error/audit is produced (Req 1.1, 1.5); each
+        contract carries its documented defaults so the object is always well-formed.
+        """
+        return cls(
+            enabled=False,
+            domain=DomainConfig._empty(),
+            connector=ConnectorConfig._defaults(),
+            adapter=AdapterConfig._empty(),
         )
 
 

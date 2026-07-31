@@ -35,7 +35,8 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector import service
 from connector.service import propose_change
@@ -72,9 +73,9 @@ _AUTHORIZED_CONTEXT = {"user_id": "user-123", "groups": ["scm-writers"], "sessio
 _VALID_CFN = '{"Resources": {"Bucket": {"Type": "AWS::S3::Bucket"}}}'
 
 
-def _make_config() -> ConnectorConfig:
-    """Build an enabled ConnectorConfig backed by the fixed known allowlist."""
-    return ConnectorConfig(
+def _make_config() -> SourceControlConfig:
+    """Build an enabled SourceControlConfig backed by the fixed known allowlist."""
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",

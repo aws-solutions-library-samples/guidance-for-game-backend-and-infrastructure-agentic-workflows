@@ -22,7 +22,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, ConnectorConfig
+from connector.config import AllowlistEntry, SourceControlConfig
+from support.config_factory import make_source_control_config
 from connector.service import read_iac_files
 from support.fake_provider import FakeProvider
 
@@ -43,14 +44,14 @@ _paths = st.from_regex(r"[A-Za-z0-9._/-]{1,25}", fullmatch=True)
 _MUTATION_OPS = ("create_branch", "commit_files", "open_change_proposal")
 
 
-def _make_config(*, max_files: int, repo: str, branch: str) -> ConnectorConfig:
+def _make_config(*, max_files: int, repo: str, branch: str) -> SourceControlConfig:
     """Build a minimal enabled ConnectorConfig whose allowlist[0] is ``repo``+``branch``.
 
     Only the fields the read path reads (``max_files_per_request`` and ``allowlist``)
     matter here; the remaining fields carry valid placeholder values so the frozen
     dataclass is well-formed.
     """
-    return ConnectorConfig(
+    return make_source_control_config(
         enabled=True,
         provider="github",
         credential_secret_id="scm/credential",
@@ -131,8 +132,8 @@ def test_property12_within_limit_fetches_scoped_and_reports_missing(case):
     get_files_calls = fake.calls_for("get_files")
     assert len(get_files_calls) == 1
     call = get_files_calls[0]
-    assert call["repo"] == config.allowlist[0].repo
-    assert call["branch"] == config.allowlist[0].target_branches[0]
+    assert call["repo"] == config.domain.authorization_policy[0].repo
+    assert call["branch"] == config.domain.authorization_policy[0].target_branches[0]
     assert call["paths"] == list(paths)
 
     # Req 3.4: reading never creates a proposal.
