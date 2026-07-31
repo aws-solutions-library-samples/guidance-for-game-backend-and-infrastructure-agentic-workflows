@@ -138,6 +138,17 @@
   color: var(--ga-text) !important;
 }
 
+/* Code blocks render on CopilotKit's always-dark container (rgb(9 9 11)),
+   regardless of app theme. The blanket span rule above would paint their text
+   var(--ga-text), which on the light theme is near-black — black-on-black,
+   illegible (issue #252). Re-assert a fixed light color for code-block text so
+   it stays readable in both themes, matching the pre-#218 behavior. Higher
+   specificity (3 classes) + !important wins over the blanket span rule. */
+.copilotKitMarkdown .copilotKitCodeBlock span,
+.copilotKitMarkdown .copilotKitCodeBlock code {
+  color: #e4e4e7 !important;
+}
+
 .copilotKitMarkdown strong {
   color: var(--ga-accent) !important;
 }
