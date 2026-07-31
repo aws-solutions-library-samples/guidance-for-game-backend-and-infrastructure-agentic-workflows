@@ -106,25 +106,9 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
             title: "🎮 Game Agent",
             initial: `**Welcome to Game Agent!** 🎮
 
-I'm your AI-powered game server management assistant with **persistent memory**.
+Your AI assistant for game server management, with **persistent memory** across sessions. I can help with **GameLift** fleets, **EKS/Kubernetes** operations, **cost optimization**, health monitoring, and security.
 
-**🧠 Memory Features:**
-- I remember our conversations across sessions
-- I learn your infrastructure preferences
-- I build context about your AWS environment
-- I provide personalized recommendations
-
-**I can help you with:**
-- **GameLift Fleet Management** - Monitor, scale, and optimize your game servers
-- **EKS/Kubernetes Operations** - Manage clusters, pods, and deployments
-- **Cost Analysis & Optimization** - Track spending and find savings opportunities
-- **Health Monitoring** - Real-time system status and performance metrics
-- **Security & Compliance** - Best practices and vulnerability assessments
-
-I maintain context across all our interactions, so feel free to reference previous conversations!
-
-For instance, you can ask me:
-- What can you help me with?
+Try asking:
 - List my GameLift fleets
 - List my EKS clusters
 - How much am I spending on GameLift?
