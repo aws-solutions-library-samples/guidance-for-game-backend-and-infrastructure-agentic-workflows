@@ -13,12 +13,24 @@ pytestmark = pytest.mark.unit
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 MANAGE_SCRIPT = PROJECT_ROOT / "scripts/infrastructure/manage-inference-profile.sh"
 GET_SCRIPT = PROJECT_ROOT / "scripts/infrastructure/get-inference-profile-ids.sh"
+BASE_INFRASTRUCTURE_TEMPLATE = PROJECT_ROOT / "infrastructure/cloudformation/01-base-infrastructure.yaml"
 SCRIPTS = (MANAGE_SCRIPT, GET_SCRIPT)
 
 
 def _write_executable(path: pathlib.Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _cloudformation_resource(template: str, logical_id: str) -> str:
+    start = template.index(f"  {logical_id}:\n")
+    lines = template[start:].splitlines(keepends=True)
+    resource = [lines[0]]
+    for line in lines[1:]:
+        if line.startswith("  ") and not line.startswith("    ") and line.strip():
+            break
+        resource.append(line)
+    return "".join(resource)
 
 
 def _stub_environment(tmp_path: pathlib.Path, uv_exit_code: int = 0, aws_mode: str = "profiles") -> dict[str, str]:
@@ -83,6 +95,14 @@ def test_get_profile_ids_prefers_role_application_profiles(tmp_path):
 
     assert "GBAW_ORCHESTRATOR_MODEL_ID='orchestrator-profile-id'" in result.stdout
     assert "GBAW_SPECIALIST_MODEL_ID='specialist-profile-id'" in result.stdout
+
+
+def test_agentcore_role_can_invoke_preferred_application_profiles():
+    template = BASE_INFRASTRUCTURE_TEMPLATE.read_text(encoding="utf-8")
+    execution_role = _cloudformation_resource(template, "AgentCoreExecutionRole")
+
+    assert "bedrock:InvokeModel" in execution_role
+    assert "!Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*'" in execution_role
 
 
 def test_get_profile_ids_falls_back_to_canonical_system_profiles(tmp_path):
