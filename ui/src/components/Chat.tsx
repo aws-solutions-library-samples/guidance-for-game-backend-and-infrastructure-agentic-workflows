@@ -9,6 +9,7 @@ import React, { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { CopilotKit } from "@copilotkit/react-core";
 import { CopilotChat } from "@copilotkit/react-ui";
+import { NewChatButton } from "./NewChatButton";
 
 // Progress messages for rotating indicator
 const PROGRESS_MESSAGES = [
@@ -99,6 +100,9 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
         showDevConsole={false}
       >
         <div className="ga-chat-wrapper">
+          {/* Must live inside the CopilotKit provider: it consumes the chat
+              context to reset messages AND rotate the threadId (#253). */}
+          <NewChatButton />
           <CopilotChat
             className={`ga-chat ${className || ''}`}
             onInProgress={handleInProgress}

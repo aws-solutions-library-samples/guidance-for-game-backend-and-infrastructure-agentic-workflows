@@ -8,6 +8,9 @@ jest.mock('@copilotkit/react-core', () => ({
   CopilotKit: ({ children }: { children: React.ReactNode }) => <div data-testid="copilot-provider">{children}</div>,
   useCopilotAction: () => jest.fn(),
   useCopilotReadable: () => jest.fn(),
+  // Hooks consumed by NewChatButton (#253)
+  useCopilotChat: () => ({ reset: jest.fn() }),
+  useCopilotContext: () => ({ setThreadId: jest.fn() }),
 }))
 
 jest.mock('@copilotkit/react-ui', () => ({
