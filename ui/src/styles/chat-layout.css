@@ -169,6 +169,17 @@
   color: var(--ga-text) !important;
 }
 
+/* Code blocks render on CopilotKit's always-dark container (rgb(9 9 11)),
+   regardless of app theme. The blanket span rule above would paint their text
+   var(--ga-text), which on the light theme is near-black — black-on-black,
+   illegible (issue #252). Re-assert a fixed light color for code-block text so
+   it stays readable in both themes, matching the pre-#218 behavior. Higher
+   specificity (3 classes) + !important wins over the blanket span rule. */
+.copilotKitMarkdown .copilotKitCodeBlock span,
+.copilotKitMarkdown .copilotKitCodeBlock code {
+  color: #e4e4e7 !important;
+}
+
 .copilotKitMarkdown strong {
   color: var(--ga-accent) !important;
 }
@@ -235,6 +246,21 @@
   transition: all 0.3s ease !important;
   backdrop-filter: blur(20px) !important;
   min-height: 80px !important;       /* Ensure container accommodates larger textarea */
+}
+
+/* Short-viewport compaction (issue #251): the input area is ~170px of fixed
+   chrome. Trim its padding and min-height on short laptops so more of the
+   height goes to the conversation. Mirrors the height breakpoints in
+   command-center-layout.css. */
+@media (max-height: 1000px) {
+  .copilotKitInputContainer {
+    padding: 12px 24px !important;
+  }
+
+  .copilotKitInput {
+    min-height: 60px !important;
+    padding: 12px 16px !important;
+  }
 }
 
 .copilotKitInput:focus-within {
