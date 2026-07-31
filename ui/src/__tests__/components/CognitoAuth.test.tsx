@@ -60,7 +60,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
 
     renderAuth();
 
-    const emailInput = screen.getByPlaceholderText('your@email.com');
+    const emailInput = screen.getByPlaceholderText('you@example.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
 
     fireEvent.change(emailInput, { target: { value: 'test@example.com' } });
@@ -86,7 +86,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
 
     renderAuth();
 
-    const emailInput = screen.getByPlaceholderText('your@email.com');
+    const emailInput = screen.getByPlaceholderText('you@example.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
 
     fireEvent.change(emailInput, { target: { value: 'test@example.com' } });
@@ -117,7 +117,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
 
     renderAuth();
 
-    const emailInput = screen.getByPlaceholderText('your@email.com');
+    const emailInput = screen.getByPlaceholderText('you@example.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
 
     fireEvent.change(emailInput, { target: { value: 'test@example.com' } });
@@ -143,7 +143,7 @@ describe('CognitoAuth - handleSignIn error handling', () => {
 
     renderAuth();
 
-    const emailInput = screen.getByPlaceholderText('your@email.com');
+    const emailInput = screen.getByPlaceholderText('you@example.com');
     const passwordInput = screen.getByPlaceholderText('••••••••');
 
     fireEvent.change(emailInput, { target: { value: 'test@example.com' } });

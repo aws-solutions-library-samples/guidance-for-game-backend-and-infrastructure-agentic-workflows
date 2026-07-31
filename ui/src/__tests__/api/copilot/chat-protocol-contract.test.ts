@@ -35,7 +35,7 @@ describe('/api/copilot/chat - CopilotKit wire-protocol contract', () => {
     jest.clearAllMocks();
     process.env.NODE_ENV = 'development';
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
-    mockVerify.mockResolvedValue({ sub: 'u1', email: 'a@b.com', 'cognito:groups': ['users'] });
+    mockVerify.mockResolvedValue({ sub: 'u1', email: 'user@example.com', 'cognito:groups': ['users'] });
   });
   afterEach(() => {
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;

@@ -212,9 +212,8 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Least-privilege (#151): scope to gameagent*-named resources (the
-              # account is shared with other projects, e.g. echelon_*) and limit
-              # to the actions the REQUEST PATH actually needs. Memory/runtime
+              # Least-privilege (#151): scope to Game Agent resources and limit
+              # access to the actions the request path actually needs. Memory/runtime
               # LIFECYCLE (create/update/delete) belongs to deploy/teardown, not
               # the runtime role — removed here so a compromised/jailbroken
               # runtime can't delete its own or another project's memory.

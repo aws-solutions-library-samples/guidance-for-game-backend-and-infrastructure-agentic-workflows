@@ -57,3 +57,11 @@ repos:
         args: ["--maxkb=1000"]
       - id: check-merge-conflict
       - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: public-content
+        name: public content
+        entry: python3 scripts/check_public_content.py
+        language: system
+        types: [text]
