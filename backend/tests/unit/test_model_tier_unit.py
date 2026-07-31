@@ -47,3 +47,36 @@ class TestCreateModelHonorsModelId:
         with patch("models.cached_bedrock.BedrockModel") as mock_model:
             create_bedrock_model_with_overrides()
             assert mock_model.call_args.kwargs["model_id"] == ORCHESTRATOR_MODEL_ID
+
+
+class TestSpecialistRoleFallback:
+    """Unpinned specialists retain the specialist model role."""
+
+    def test_unmapped_specialist_uses_specialist_role_model(self):
+        # Local modules
+        from agents.base_specialist import create_specialist_agent
+
+        specialist_model = object()
+        with (
+            patch("agents.base_specialist.INFERENCE_CONFIG", {}),
+            patch(
+                "agents.base_specialist.create_specialist_bedrock_model",
+                return_value=specialist_model,
+            ) as create_specialist_model,
+            patch("agents.base_specialist.create_bedrock_model_with_overrides") as create_override_model,
+            patch("agents.base_specialist.Agent") as agent_class,
+        ):
+            agent_class.return_value.return_value = "specialist response"
+            future_agent = create_specialist_agent(
+                service_name="FutureService",
+                emoji="",
+                mcp_server_names=None,
+                kb_id=None,
+                prompt_fn=lambda: "system prompt",
+            )
+
+            assert future_agent("query") == "specialist response"
+
+        create_specialist_model.assert_called_once_with()
+        create_override_model.assert_not_called()
+        assert agent_class.call_args.kwargs["model"] is specialist_model

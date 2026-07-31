@@ -67,22 +67,30 @@ class TestRoleModelResolution:
         ) == ("orchestrator-custom", "specialist-custom")
 
     def test_legacy_aliases(self):
-        assert resolve_model_ids(
-            {
-                "GBAW_BEDROCK_MODEL_ID": "legacy-orchestrator",
-                "GBAW_BEDROCK_MODEL_ID_SECONDARY": "legacy-specialist",
-            }
-        ) == ("legacy-orchestrator", "legacy-specialist")
+        with patch("config.model_settings.logger.warning") as warning:
+            assert resolve_model_ids(
+                {
+                    "GBAW_BEDROCK_MODEL_ID": "legacy-orchestrator",
+                    "GBAW_BEDROCK_MODEL_ID_SECONDARY": "legacy-specialist",
+                }
+            ) == ("legacy-orchestrator", "legacy-specialist")
+
+        assert warning.call_count == 2
+        assert "GBAW_BEDROCK_MODEL_ID is deprecated" in warning.call_args_list[0].args[0]
+        assert "GBAW_BEDROCK_MODEL_ID_SECONDARY is deprecated" in warning.call_args_list[1].args[0]
 
     def test_canonical_variables_take_precedence_over_aliases(self):
-        assert resolve_model_ids(
-            {
-                "GBAW_ORCHESTRATOR_MODEL_ID": "canonical-orchestrator",
-                "GBAW_SPECIALIST_MODEL_ID": "canonical-specialist",
-                "GBAW_BEDROCK_MODEL_ID": "legacy-orchestrator",
-                "GBAW_BEDROCK_MODEL_ID_SECONDARY": "legacy-specialist",
-            }
-        ) == ("canonical-orchestrator", "canonical-specialist")
+        with patch("config.model_settings.logger.warning") as warning:
+            assert resolve_model_ids(
+                {
+                    "GBAW_ORCHESTRATOR_MODEL_ID": "canonical-orchestrator",
+                    "GBAW_SPECIALIST_MODEL_ID": "canonical-specialist",
+                    "GBAW_BEDROCK_MODEL_ID": "legacy-orchestrator",
+                    "GBAW_BEDROCK_MODEL_ID_SECONDARY": "legacy-specialist",
+                }
+            ) == ("canonical-orchestrator", "canonical-specialist")
+
+        warning.assert_not_called()
 
     def test_empty_values_are_unset(self):
         assert resolve_model_ids(

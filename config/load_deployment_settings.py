@@ -9,21 +9,26 @@ import pathlib
 import shlex
 import sys
 
+# Third-party packages
+from dotenv import load_dotenv
+
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "backend" / "src"))
 
 
 def load_env_file(env_file_path: pathlib.Path) -> None:
-    """Load simple dotenv entries without overriding the process environment."""
+    """Load dotenv entries without overriding the process environment.
+
+    Uses python-dotenv so deployment resolves the file exactly as the runtime
+    does in config.settings. A hand-rolled parser silently disagreed on
+    `export `-prefixed keys and trailing comments, which let the deployed model
+    differ from the locally configured one. override=False keeps process
+    environment values winning over the file.
+    """
     if not env_file_path.exists():
         return
 
-    with env_file_path.open(encoding="utf-8") as env_file:
-        for raw_line in env_file:
-            line = raw_line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key, value.strip().strip('"').strip("'"))
+    load_dotenv(env_file_path, override=False)
 
 
 def shell_exports(values: dict[str, str]) -> str:
