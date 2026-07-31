@@ -181,35 +181,14 @@ function Deploy-GameAgent {
         Write-Host "   Orchestrator model: $orchestratorModelId"
         Write-Host "   Specialist model:   $specialistModelId"
 
-        function Get-AgentCoreEnvArgs {
-            param(
-                [string]$GameLiftKbId = '',
-                [string]$EksKbId = '',
-                [string]$CostKbId = ''
-            )
-
-            $result = @(
-                '-env', "GBAW_ORCHESTRATOR_MODEL_ID=$orchestratorModelId",
-                '-env', "GBAW_SPECIALIST_MODEL_ID=$specialistModelId"
-            )
-            $optionalValues = [ordered]@{
-                GBAW_BEDROCK_GUARDRAIL_ID      = $guardrailId
-                GBAW_BEDROCK_GUARDRAIL_VERSION = if ($guardrailId) { 'DRAFT' } else { '' }
-                GBAW_ORCHESTRATOR_PROMPT_ARN   = $orchestratorPromptArn
-                GBAW_GAMELIFT_PROMPT_ARN       = $gameliftPromptArn
-                GBAW_EKS_PROMPT_ARN            = $eksPromptArn
-                GBAW_COST_PROMPT_ARN           = $costPromptArn
-                GBAW_GAMELIFT_KB_ID             = $GameLiftKbId
-                GBAW_EKS_KB_ID                  = $EksKbId
-                GBAW_COST_KB_ID                 = $CostKbId
-            }
-            foreach ($entry in $optionalValues.GetEnumerator()) {
-                if ($entry.Value) { $result += @('-env', "$($entry.Key)=$($entry.Value)") }
-            }
-            return $result
-        }
-
-        $agentCoreEnvArgs = Get-AgentCoreEnvArgs
+        $agentCoreEnvArgs = New-GameAgentAgentCoreEnvArgs `
+            -OrchestratorModelId $orchestratorModelId `
+            -SpecialistModelId $specialistModelId `
+            -GuardrailId $guardrailId `
+            -OrchestratorPromptArn $orchestratorPromptArn `
+            -GameLiftPromptArn $gameliftPromptArn `
+            -EksPromptArn $eksPromptArn `
+            -CostPromptArn $costPromptArn
 
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
         Write-Host "Using execution role: $executionRoleArn"
@@ -338,7 +317,14 @@ function Deploy-GameAgent {
 
         # Always pass the complete resolved environment so model-only updates
         # are applied and optional service settings are preserved together.
-        $agentCoreEnvArgs = Get-AgentCoreEnvArgs `
+        $agentCoreEnvArgs = New-GameAgentAgentCoreEnvArgs `
+            -OrchestratorModelId $orchestratorModelId `
+            -SpecialistModelId $specialistModelId `
+            -GuardrailId $guardrailId `
+            -OrchestratorPromptArn $orchestratorPromptArn `
+            -GameLiftPromptArn $gameliftPromptArn `
+            -EksPromptArn $eksPromptArn `
+            -CostPromptArn $costPromptArn `
             -GameLiftKbId $gameliftKbId `
             -EksKbId $eksKbId `
             -CostKbId $costKbId

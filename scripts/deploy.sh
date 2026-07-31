@@ -171,21 +171,39 @@ eval "$MODEL_EXPORTS"
 echo "   Orchestrator model: $GBAW_ORCHESTRATOR_MODEL_ID"
 echo "   Specialist model:   $GBAW_SPECIALIST_MODEL_ID"
 
+is_resolved_deployment_value() {
+  [ -n "${1:-}" ] && [ "$1" != "None" ]
+}
+
+append_agentcore_env_if_resolved() {
+  local name="$1"
+  local value="${2:-}"
+
+  if is_resolved_deployment_value "$value"; then
+    AGENTCORE_ENV_ARGS+=(-env "$name=$value")
+  fi
+  return 0
+}
+
 build_agentcore_env_args() {
   AGENTCORE_ENV_ARGS=(
     -env "GBAW_ORCHESTRATOR_MODEL_ID=$GBAW_ORCHESTRATOR_MODEL_ID"
     -env "GBAW_SPECIALIST_MODEL_ID=$GBAW_SPECIALIST_MODEL_ID"
   )
 
-  [ -n "${GUARDRAIL_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID")
-  [ -n "${GUARDRAIL_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT")
-  [ -n "${GBAW_ORCHESTRATOR_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN")
-  [ -n "${GBAW_GAMELIFT_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN")
-  [ -n "${GBAW_EKS_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN")
-  [ -n "${GBAW_COST_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN")
-  [ -n "${GAMELIFT_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID")
-  [ -n "${EKS_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_EKS_KB_ID=$EKS_KB_ID")
-  [ -n "${COST_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_COST_KB_ID=$COST_KB_ID")
+  if is_resolved_deployment_value "${GUARDRAIL_ID:-}"; then
+    AGENTCORE_ENV_ARGS+=(
+      -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"
+      -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT"
+    )
+  fi
+  append_agentcore_env_if_resolved "GBAW_ORCHESTRATOR_PROMPT_ARN" "${GBAW_ORCHESTRATOR_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_GAMELIFT_PROMPT_ARN" "${GBAW_GAMELIFT_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_EKS_PROMPT_ARN" "${GBAW_EKS_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_PROMPT_ARN" "${GBAW_COST_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_GAMELIFT_KB_ID" "${GAMELIFT_KB_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_EKS_KB_ID" "${EKS_KB_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_KB_ID" "${COST_KB_ID:-}"
   return 0
 }
 

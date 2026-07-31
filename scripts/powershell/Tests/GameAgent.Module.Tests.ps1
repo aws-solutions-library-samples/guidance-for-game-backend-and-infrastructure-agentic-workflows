@@ -43,6 +43,7 @@ Describe 'GameAgent Module' {
             'Invoke-GameAgentKBTeardown'
             'Invoke-GameAgentPromptDeploy'
             'Invoke-GameAgentPromptTeardown'
+            'New-GameAgentAgentCoreEnvArgs'
         )
         $exported = (Get-Module -Name GameAgent).ExportedCommands.Keys
         foreach ($fn in $privateFunctions) {
