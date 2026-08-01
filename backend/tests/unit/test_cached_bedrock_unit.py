@@ -34,6 +34,7 @@ class TestCachedBedrockModels:
         call_args = mock_bedrock_model.call_args.kwargs
         assert call_args["model_id"] == ORCHESTRATOR_MODEL_ID
         assert call_args["boto_client_config"] is MODEL_CLIENT_CONFIG
+        assert MODEL_CLIENT_CONFIG.read_timeout == 120
         assert call_args["region_name"] == AWS_REGION
         assert call_args["cache_prompt"] == "default"
         assert call_args["cache_tools"] == "default"

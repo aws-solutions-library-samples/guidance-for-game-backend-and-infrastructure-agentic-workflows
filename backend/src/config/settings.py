@@ -171,6 +171,8 @@ from botocore.config import Config as BotocoreConfig
 BOTO3_RETRY_MODE = cast(Literal["legacy", "standard", "adaptive"], os.getenv("GBAW_BOTO3_RETRY_MODE", "adaptive"))
 BOTO3_MAX_ATTEMPTS = int(os.getenv("GBAW_BOTO3_MAX_ATTEMPTS", "3"))
 BOTO3_CLIENT_CONFIG = BotocoreConfig(
+    # Supplying a config replaces Strands' 120-second Bedrock read timeout.
+    read_timeout=120,
     retries={"mode": BOTO3_RETRY_MODE, "max_attempts": BOTO3_MAX_ATTEMPTS},
 )
 
