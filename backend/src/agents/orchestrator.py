@@ -75,7 +75,7 @@ def run_orchestrator(query: str, context: dict = None):
         logger.info(f"📋 Prompt versions: {get_prompt_versions()}")
 
         # Per-agent inference parameters (WA GenAI Lens: Performance Efficiency 2)
-        inf = INFERENCE_CONFIG.get("orchestrator", {})
+        inf = INFERENCE_CONFIG.get("orchestrator")
         orch_model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
 
         # Extract memory parameters from context

@@ -272,10 +272,14 @@ if __name__ == "__main__":
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
-- `BEDROCK_MODEL_ID` - Claude model to use
+- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 4.5)
+- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 4.6)
+- `GBAW_BEDROCK_MODEL_ID` / `GBAW_BEDROCK_MODEL_ID_SECONDARY` - Legacy compatibility aliases
 - `MCP_TIMEOUT` - MCP server execution timeout (default: 30 seconds)
 - `MCP_RETRY_COUNT` - Number of retry attempts (default: 2)
 - `MCP_FALLBACK_ENABLED` - Enable AWS SDK fallback (default: true)
+
+Canonical role variables take precedence over legacy aliases, then repository defaults. Haiku handles orchestration while Sonnet handles all specialist requests. This assignment is independent from failure handling: both models receive the shared Botocore adaptive retry configuration, and the runtime never substitutes one role model for the other. After retries, specialist tools return their configured AWS SDK/CLI fallback or a generic retry response, while orchestrator errors reach the top-level request handler. Prompt caching, streaming, Guardrails, and client-side specialist tools remain enabled for both roles.
 
 ---
 
