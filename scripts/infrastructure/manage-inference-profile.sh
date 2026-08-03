@@ -1,31 +1,41 @@
 #!/bin/bash
-# Manage Bedrock Inference Profiles for Game Agent
+set -euo pipefail
 
-ACTION=$1
+# Manage role-based Bedrock application inference profiles for Game Agent.
+ACTION=${1:-}
 REGION=${2:-us-west-2}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# System profiles (source for copying)
-SYSTEM_SONNET_PROFILE="global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-SYSTEM_HAIKU_PROFILE="global.anthropic.claude-haiku-4-5-20251001-v1:0"
+# Profile creation always wraps the canonical system defaults. Runtime model
+# overrides are handled separately by the role environment variables.
+if ! MODEL_EXPORTS=$(uv run --directory "$PROJECT_ROOT/backend" python \
+    "$PROJECT_ROOT/config/load_deployment_settings.py" --default-models-only); then
+    echo "Unable to resolve canonical model defaults" >&2
+    exit 1
+fi
+eval "$MODEL_EXPORTS"
+SYSTEM_ORCHESTRATOR_PROFILE="$GBAW_ORCHESTRATOR_MODEL_ID"
+SYSTEM_SPECIALIST_PROFILE="$GBAW_SPECIALIST_MODEL_ID"
 
-# Custom GameAgent profiles
-GAMEAGENT_SONNET_NAME="GameAgent-Claude-Sonnet-4-5"
-GAMEAGENT_HAIKU_NAME="GameAgent-Claude-Haiku-4-5"
+ORCHESTRATOR_PROFILE_NAME="GameAgent-Orchestrator-Claude-Haiku-4-5"
+SPECIALIST_PROFILE_NAME="GameAgent-Specialist-Claude-Sonnet-4-6"
 
 get_system_profile_arn() {
-    aws bedrock list-inference-profiles --region $REGION \
+    aws bedrock list-inference-profiles --region "$REGION" \
         --query "inferenceProfileSummaries[?inferenceProfileId=='$1'].inferenceProfileArn" \
         --output text
 }
 
 get_app_profile_id() {
-    aws bedrock list-inference-profiles --region $REGION --type-equals APPLICATION \
+    aws bedrock list-inference-profiles --region "$REGION" --type-equals APPLICATION \
         --query "inferenceProfileSummaries[?inferenceProfileName=='$1'].inferenceProfileId" \
         --output text
 }
 
 check_profile_exists() {
-    local profile_id=$(get_app_profile_id "$1")
+    local profile_id
+    profile_id=$(get_app_profile_id "$1")
     [ -n "$profile_id" ]
 }
 
@@ -33,127 +43,85 @@ create_custom_profile() {
     local profile_name=$1
     local description=$2
     local source_profile_id=$3
+    local source_arn
 
-    echo "Creating custom profile: $profile_name"
-
-    SOURCE_ARN=$(get_system_profile_arn "$source_profile_id")
-    if [ -z "$SOURCE_ARN" ]; then
-        echo "❌ Source profile not found: $source_profile_id"
+    echo "Creating application profile: $profile_name"
+    source_arn=$(get_system_profile_arn "$source_profile_id")
+    if [ -z "$source_arn" ]; then
+        echo "Source profile not found: $source_profile_id" >&2
         return 1
     fi
 
     aws bedrock create-inference-profile \
-        --region $REGION \
+        --region "$REGION" \
         --inference-profile-name "$profile_name" \
         --description "$description" \
-        --model-source copyFrom="$SOURCE_ARN" \
-        --tags key=Project,value=GameAgent key=ManagedBy,value=CloudFormation
-
-    if [ $? -eq 0 ]; then
-        echo "✅ Created: $profile_name"
-    else
-        echo "❌ Failed to create: $profile_name"
-        return 1
-    fi
+        --model-source copyFrom="$source_arn" \
+        --tags key=Project,value=GameAgent key=ManagedBy,value=GameAgentScripts
 }
 
 delete_custom_profile() {
     local profile_name=$1
-    local profile_id=$(get_app_profile_id "$profile_name")
+    local profile_id
+    profile_id=$(get_app_profile_id "$profile_name")
 
     if [ -z "$profile_id" ]; then
-        echo "ℹ️  Profile not found: $profile_name"
+        echo "Profile not found: $profile_name"
         return 0
     fi
 
-    echo "Deleting custom profile: $profile_name"
+    echo "Deleting application profile: $profile_name"
     aws bedrock delete-inference-profile \
-        --region $REGION \
+        --region "$REGION" \
         --inference-profile-identifier "$profile_id"
-
-    if [ $? -eq 0 ]; then
-        echo "✅ Deleted: $profile_name"
-    else
-        echo "❌ Failed to delete: $profile_name"
-        return 1
-    fi
 }
 
-case $ACTION in
+case "$ACTION" in
   create)
-    echo "🔧 Creating GameAgent custom inference profiles..."
-    echo ""
-
-    if check_profile_exists "$GAMEAGENT_SONNET_NAME"; then
-        echo "✅ $GAMEAGENT_SONNET_NAME already exists"
+    if check_profile_exists "$ORCHESTRATOR_PROFILE_NAME"; then
+        echo "$ORCHESTRATOR_PROFILE_NAME already exists"
     else
         create_custom_profile \
-            "$GAMEAGENT_SONNET_NAME" \
-            "Game Agent application profile for Claude Sonnet 4.5" \
-            "$SYSTEM_SONNET_PROFILE"
+            "$ORCHESTRATOR_PROFILE_NAME" \
+            "Game Agent orchestrator profile for Claude Haiku 4.5" \
+            "$SYSTEM_ORCHESTRATOR_PROFILE"
     fi
 
-    echo ""
-
-    if check_profile_exists "$GAMEAGENT_HAIKU_NAME"; then
-        echo "✅ $GAMEAGENT_HAIKU_NAME already exists"
+    if check_profile_exists "$SPECIALIST_PROFILE_NAME"; then
+        echo "$SPECIALIST_PROFILE_NAME already exists"
     else
         create_custom_profile \
-            "$GAMEAGENT_HAIKU_NAME" \
-            "Game Agent application profile for Claude Haiku 4.5" \
-            "$SYSTEM_HAIKU_PROFILE"
+            "$SPECIALIST_PROFILE_NAME" \
+            "Game Agent specialist profile for Claude Sonnet 4.6" \
+            "$SYSTEM_SPECIALIST_PROFILE"
     fi
-
-    echo ""
-    echo "✅ GameAgent inference profiles ready"
     ;;
 
   delete)
-    echo "🗑️  Deleting GameAgent custom inference profiles..."
-    echo ""
-
-    delete_custom_profile "$GAMEAGENT_SONNET_NAME"
-    echo ""
-    delete_custom_profile "$GAMEAGENT_HAIKU_NAME"
-
-    echo ""
-    echo "✅ Cleanup complete"
+    # This command removes only the current role-named profiles. Older model-
+    # named profiles are intentionally left untouched for safe migration.
+    delete_custom_profile "$ORCHESTRATOR_PROFILE_NAME"
+    delete_custom_profile "$SPECIALIST_PROFILE_NAME"
     ;;
 
   check)
-    echo "🔍 Checking GameAgent inference profiles..."
-    echo ""
-
-    sonnet_exists=0
-    haiku_exists=0
-
-    if check_profile_exists "$GAMEAGENT_SONNET_NAME"; then
-        SONNET_ID=$(get_app_profile_id "$GAMEAGENT_SONNET_NAME")
-        echo "✅ $GAMEAGENT_SONNET_NAME exists (ID: $SONNET_ID)"
-        sonnet_exists=1
-    else
-        echo "❌ $GAMEAGENT_SONNET_NAME not found"
-    fi
-
-    echo ""
-
-    if check_profile_exists "$GAMEAGENT_HAIKU_NAME"; then
-        HAIKU_ID=$(get_app_profile_id "$GAMEAGENT_HAIKU_NAME")
-        echo "✅ $GAMEAGENT_HAIKU_NAME exists (ID: $HAIKU_ID)"
-        haiku_exists=1
-    else
-        echo "❌ $GAMEAGENT_HAIKU_NAME not found"
-    fi
-
-    [ $sonnet_exists -eq 1 ] && [ $haiku_exists -eq 1 ]
+    missing=0
+    for profile_name in "$ORCHESTRATOR_PROFILE_NAME" "$SPECIALIST_PROFILE_NAME"; do
+        if check_profile_exists "$profile_name"; then
+            profile_id=$(get_app_profile_id "$profile_name")
+            echo "$profile_name exists (ID: $profile_id)"
+        else
+            echo "$profile_name not found"
+            missing=1
+        fi
+    done
+    exit "$missing"
     ;;
 
   *)
-    echo "Usage: $0 {create|delete|check} [region]"
-    echo ""
-    echo "Manages GameAgent custom inference profiles:"
-    echo "  - $GAMEAGENT_SONNET_NAME (wraps $SYSTEM_SONNET_PROFILE)"
-    echo "  - $GAMEAGENT_HAIKU_NAME (wraps $SYSTEM_HAIKU_PROFILE)"
+    echo "Usage: $0 {create|delete|check} [region]" >&2
+    echo "  $ORCHESTRATOR_PROFILE_NAME wraps $SYSTEM_ORCHESTRATOR_PROFILE" >&2
+    echo "  $SPECIALIST_PROFILE_NAME wraps $SYSTEM_SPECIALIST_PROFILE" >&2
     exit 1
     ;;
 esac
