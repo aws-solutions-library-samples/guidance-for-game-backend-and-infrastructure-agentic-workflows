@@ -1,30 +1,34 @@
 #!/bin/bash
-# Get Game Agent custom inference profile IDs
+set -euo pipefail
 
+# Emit canonical role model exports, preferring Game Agent application profiles.
 REGION=${1:-us-west-2}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Default to system profiles
-SYSTEM_SONNET="global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-SYSTEM_HAIKU="global.anthropic.claude-haiku-4-5-20251001-v1:0"
+if ! MODEL_EXPORTS=$(uv run --directory "$PROJECT_ROOT/backend" python \
+    "$PROJECT_ROOT/config/load_deployment_settings.py" --models-only); then
+    echo "Unable to resolve canonical role models" >&2
+    exit 1
+fi
+eval "$MODEL_EXPORTS"
 
-# Try to get custom profile IDs
-SONNET_ID=$(aws bedrock list-inference-profiles --region $REGION --type-equals APPLICATION \
-    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Claude-Sonnet-4-5'].inferenceProfileId" \
+ORCHESTRATOR_ID=$(aws bedrock list-inference-profiles --region "$REGION" --type-equals APPLICATION \
+    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Orchestrator-Claude-Haiku-4-5'].inferenceProfileId" \
     --output text)
 
-HAIKU_ID=$(aws bedrock list-inference-profiles --region $REGION --type-equals APPLICATION \
-    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Claude-Haiku-4-5'].inferenceProfileId" \
+SPECIALIST_ID=$(aws bedrock list-inference-profiles --region "$REGION" --type-equals APPLICATION \
+    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Specialist-Claude-Sonnet-4-6'].inferenceProfileId" \
     --output text)
 
-# Export (fallback to system profiles if custom don't exist)
-if [ -n "$SONNET_ID" ]; then
-    echo "export BEDROCK_MODEL_ID='$SONNET_ID'"
+if [ -n "$ORCHESTRATOR_ID" ]; then
+    printf "export GBAW_ORCHESTRATOR_MODEL_ID='%s'\n" "$ORCHESTRATOR_ID"
 else
-    echo "export BEDROCK_MODEL_ID='$SYSTEM_SONNET'"
+    printf "export GBAW_ORCHESTRATOR_MODEL_ID='%s'\n" "$GBAW_ORCHESTRATOR_MODEL_ID"
 fi
 
-if [ -n "$HAIKU_ID" ]; then
-    echo "export BEDROCK_MODEL_ID_SECONDARY='$HAIKU_ID'"
+if [ -n "$SPECIALIST_ID" ]; then
+    printf "export GBAW_SPECIALIST_MODEL_ID='%s'\n" "$SPECIALIST_ID"
 else
-    echo "export BEDROCK_MODEL_ID_SECONDARY='$SYSTEM_HAIKU'"
+    printf "export GBAW_SPECIALIST_MODEL_ID='%s'\n" "$GBAW_SPECIALIST_MODEL_ID"
 fi

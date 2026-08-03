@@ -3,20 +3,19 @@
 
 Creates or updates 4 managed prompts (orchestrator, gamelift, eks, cost).
 Writes prompt ARNs to backend/.env.local for runtime consumption.
-Idempotent: re-runs detect existing prompts and only update if text changed.
+Idempotent: re-runs publish only when text, model, or inference settings change.
 """
 
 import argparse
-import hashlib
-import sys
 import os
+import sys
 
 # Add backend/src to path so we can import prompt definitions
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "backend", "src"))
 
 import boto3
 from agents.optimized_prompts import GAMELIFT_PROMPT, EKS_PROMPT, COST_PROMPT, ORCHESTRATOR_PROMPT
-from config.settings import BEDROCK_MODEL_ID, INFERENCE_CONFIG
+from config.settings import INFERENCE_CONFIG
 
 # Prompt definitions keyed by env-var name
 PROMPTS = {
@@ -33,29 +32,63 @@ def _prompt_resource_name(vp):
     return f"{PREFIX}-{vp.name}"
 
 
+def _list_prompt_summaries(client, **parameters):
+    """Yield prompt summaries using the API's explicit nextToken contract."""
+    next_token = None
+    while True:
+        request = dict(parameters)
+        if next_token:
+            request["nextToken"] = next_token
+        response = client.list_prompts(**request)
+        yield from response.get("promptSummaries", [])
+        next_token = response.get("nextToken")
+        if not next_token:
+            break
+
+
 def _find_existing(client, name):
     """Return prompt ID if a prompt with this name exists, else None."""
-    paginator = client.get_paginator("list_prompts")
-    for page in paginator.paginate():
-        for summary in page.get("promptSummaries", []):
-            if summary["name"] == name:
-                return summary["id"]
+    for summary in _list_prompt_summaries(client):
+        if summary["name"] == name:
+            return summary["id"]
     return None
 
 
-def _text_hash(text):
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+def _variant_signature(variant):
+    """Return deployment-relevant fields for idempotency comparisons."""
+    text_config = variant.get("templateConfiguration", {}).get("text", {})
+    inference_text = variant.get("inferenceConfiguration", {}).get("text", {})
+    return {
+        "name": variant.get("name"),
+        "modelId": variant.get("modelId"),
+        "templateType": variant.get("templateType"),
+        "temperature": inference_text.get("temperature"),
+        "text": text_config.get("text", ""),
+    }
+
+
+def _latest_published_version(client, prompt_id):
+    """Return the highest numeric published version summary, if one exists."""
+    published = []
+    for summary in _list_prompt_summaries(client, promptIdentifier=prompt_id):
+        version = summary.get("version")
+        if version and version != "DRAFT":
+            try:
+                published.append((int(version), summary))
+            except (TypeError, ValueError):
+                continue
+    return max(published, key=lambda item: item[0])[1] if published else None
 
 
 def deploy_prompt(client, env_key, vp):
     """Create or update a single managed prompt. Returns the version ARN."""
     name = _prompt_resource_name(vp)
     agent_key = vp.name.replace("_specialist", "")
-    inf = INFERENCE_CONFIG.get(agent_key, {"temperature": 0.1})
+    inf = INFERENCE_CONFIG[agent_key]
 
     variant = {
         "name": "default",
-        "modelId": BEDROCK_MODEL_ID,
+        "modelId": inf["model_id"],
         "templateType": "TEXT",
         "inferenceConfiguration": {"text": {"temperature": inf.get("temperature", 0.1)}},
         "templateConfiguration": {"text": {"text": vp.text}},
@@ -64,26 +97,21 @@ def deploy_prompt(client, env_key, vp):
     existing_id = _find_existing(client, name)
 
     if existing_id:
-        # Check if text changed
+        # Compare every field that affects the published prompt variant. Model-
+        # or inference-only changes must publish a new version too.
         current = client.get_prompt(promptIdentifier=existing_id)
-        current_text = ""
-        for v in current.get("variants", []):
-            tc = v.get("templateConfiguration", {}).get("text", {})
-            current_text = tc.get("text", "")
-            break
+        current_variant = next(iter(current.get("variants", [])), {})
 
-        if _text_hash(current_text) == _text_hash(vp.text):
-            # Unchanged — get latest version ARN
-            versions = client.list_prompts(promptIdentifier=existing_id)
-            for s in versions.get("promptSummaries", []):
-                if s.get("version") and s["version"] != "DRAFT":
-                    print(f"  ✅ {name} unchanged (version {s['version']})")
-                    return s["arn"]
+        if _variant_signature(current_variant) == _variant_signature(variant):
+            # Unchanged — return the latest published version across all pages.
+            latest_version = _latest_published_version(client, existing_id)
+            if latest_version:
+                print(f"  ✅ {name} unchanged (version {latest_version['version']})")
+                return latest_version["arn"]
             # No published version yet — create one
             print(f"  📌 {name} exists but no version, creating...")
         else:
-            # Text changed — update draft
-            print(f"  🔄 {name} text changed, updating...")
+            print(f"  🔄 {name} configuration changed, updating...")
             client.update_prompt(
                 promptIdentifier=existing_id,
                 name=name,

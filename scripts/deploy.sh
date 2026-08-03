@@ -160,6 +160,37 @@ cd "$PROJECT_ROOT/backend"
 echo "📦 Installing backend dependencies..."
 uv sync > /dev/null 2>&1
 
+# Resolve model roles through the same canonical Python configuration used by
+# local runtime. Process variables override ui/.env.local; canonical role names
+# override the legacy compatibility aliases.
+if ! MODEL_EXPORTS=$(uv run python "$PROJECT_ROOT/config/load_deployment_settings.py" --models-only); then
+  echo "❌ Unable to resolve canonical role models" >&2
+  exit 1
+fi
+eval "$MODEL_EXPORTS"
+echo "   Orchestrator model: $GBAW_ORCHESTRATOR_MODEL_ID"
+echo "   Specialist model:   $GBAW_SPECIALIST_MODEL_ID"
+
+build_agentcore_env_args() {
+  AGENTCORE_ENV_ARGS=(
+    -env "GBAW_ORCHESTRATOR_MODEL_ID=$GBAW_ORCHESTRATOR_MODEL_ID"
+    -env "GBAW_SPECIALIST_MODEL_ID=$GBAW_SPECIALIST_MODEL_ID"
+  )
+
+  [ -n "${GUARDRAIL_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID")
+  [ -n "${GUARDRAIL_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT")
+  [ -n "${GBAW_ORCHESTRATOR_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN")
+  [ -n "${GBAW_GAMELIFT_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN")
+  [ -n "${GBAW_EKS_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN")
+  [ -n "${GBAW_COST_PROMPT_ARN:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN")
+  [ -n "${GAMELIFT_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID")
+  [ -n "${EKS_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_EKS_KB_ID=$EKS_KB_ID")
+  [ -n "${COST_KB_ID:-}" ] && AGENTCORE_ENV_ARGS+=(-env "GBAW_COST_KB_ID=$COST_KB_ID")
+  return 0
+}
+
+build_agentcore_env_args
+
 # Get execution role from CloudFormation
 EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-infrastructure" \
@@ -219,7 +250,7 @@ if [ -n "$EXISTING_RUNTIME" ] && [ "$EXISTING_RUNTIME" != "null" ]; then
   RUNTIME_ARN="$EXISTING_RUNTIME"
 else
   echo "🚀 Launching new AgentCore Runtime (CodeBuild)..."
-  uv run agentcore launch --auto-update-on-conflict
+  uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 
   # Wait for runtime to be ready
   echo "⏳ Waiting for runtime to be ready..."
@@ -322,25 +353,17 @@ GAMELIFT_KB_ID=$(grep "^GBAW_GAMELIFT_KB_ID=" .env.local 2>/dev/null | cut -d'='
 EKS_KB_ID=$(grep "^GBAW_EKS_KB_ID=" .env.local 2>/dev/null | cut -d'=' -f2 || echo "")
 COST_KB_ID=$(grep "^GBAW_COST_KB_ID=" .env.local 2>/dev/null | cut -d'=' -f2 || echo "")
 
-if [ -n "$GAMELIFT_KB_ID" ] && [ -n "$EKS_KB_ID" ] && [ -n "$COST_KB_ID" ]; then
-  echo "   GameLift KB: $GAMELIFT_KB_ID"
-  echo "   EKS KB: $EKS_KB_ID"
-  echo "   Cost KB: $COST_KB_ID"
-  echo "🚀 Updating AgentCore Runtime with KB environment variables..."
-  uv run agentcore launch --auto-update-on-conflict \
-    -env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID" \
-    -env "GBAW_EKS_KB_ID=$EKS_KB_ID" \
-    -env "GBAW_COST_KB_ID=$COST_KB_ID" \
-    -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID" \
-    -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT" \
-    -env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN" \
-    -env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN" \
-    -env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN" \
-    -env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN"
-  echo "✅ AgentCore Runtime updated with KB IDs and Prompt ARNs"
-else
-  echo "⚠️  KB IDs not found in .env.local - skipping runtime update"
-fi
+if [ -n "$GAMELIFT_KB_ID" ]; then echo "   GameLift KB: $GAMELIFT_KB_ID"; fi
+if [ -n "$EKS_KB_ID" ]; then echo "   EKS KB:      $EKS_KB_ID"; fi
+if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
+
+# Always update the runtime with the complete set of currently resolved values.
+# This keeps role models synchronized even when one or more optional KBs are not
+# available and avoids dropping prompt or Guardrail settings on replacement.
+build_agentcore_env_args
+echo "🚀 Updating AgentCore Runtime environment..."
+uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
+echo "✅ AgentCore Runtime updated with role models and available service configuration"
 
 cd "$PROJECT_ROOT"
 echo ""

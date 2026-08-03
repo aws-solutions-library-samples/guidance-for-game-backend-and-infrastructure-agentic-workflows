@@ -67,15 +67,23 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 |-------|------------|
 | Frontend | Next.js, TypeScript, CopilotKit, AWS SDK v3 |
 | Backend | Python 3.13, Strands Agents, Bedrock AgentCore SDK |
-| AI Models | Amazon Bedrock (Claude Haiku 4.5 for orchestration, Claude Sonnet 4.5 for specialists) |
+| AI Models | Amazon Bedrock (Claude Haiku 4.5 for orchestration, Claude Sonnet 4.6 for specialists) |
 | MCP Servers | AWS Labs MCP servers (EKS, CCAPI, Cost Explorer) via stdio transport |
 | Authentication | Amazon Cognito with group-based authorization |
 | Infrastructure | AWS CloudFormation, ECS Express (Fargate + ALB), ECR |
 | Observability | Amazon CloudWatch, AWS X-Ray, OpenTelemetry |
 
+### Model strategy and overrides
+
+The orchestrator uses Claude Haiku 4.5 for low-latency routing. GameLift, EKS, and Cost specialists use Claude Sonnet 4.6 for deeper reasoning and client-side tool use. Both roles retain prompt caching, streaming behavior, and Bedrock Guardrails.
+
+Override the roles with `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID`. Existing deployments may continue using `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; a non-empty role-based variable takes precedence over its legacy alias, followed by the repository default. Process environment values take precedence over `ui/.env.local`. Foundation, system inference profile, and application inference profile IDs are accepted.
+
+The roles are not a failover order. Botocore adaptive retries apply to both configured models, but the runtime never substitutes one role model for the other. After retries are exhausted, orchestrator failures reach the top-level request handler; specialist failures follow the existing service behavior, returning an AWS SDK/CLI fallback when configured or a generic retry message.
+
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of June 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,129.23 per month** for processing approximately 10,000 agent queries per month.
+You are responsible for the cost of the AWS services used while running this Guidance. As of July 2026, the cost for running this Guidance with the default settings in the US East (N. Virginia) Region is approximately **$1,075.23 per month** for processing approximately 10,000 agent queries per month.
 
 We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
@@ -85,7 +93,7 @@ The following table provides a sample cost breakdown for deploying this Guidance
 
 | AWS service | Dimensions | Cost [USD] |
 | ----------- | ------------ | ------------ |
-| Amazon Bedrock (Claude Sonnet 4.5) | 80M input tokens @ $3.30/M + 20M output tokens @ $16.50/M (specialist agents) | $594.00 |
+| Amazon Bedrock (Claude Sonnet 4.6) | 80M input tokens @ $3.00/M + 20M output tokens @ $15.00/M (specialist agents, global profile) | $540.00 |
 | Amazon OpenSearch Serverless (Knowledge Bases) | 2 OCUs (indexing + search) @ $0.24/OCU-hour × 730 hours | $350.40 |
 | Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.10/M + 10M output tokens @ $5.50/M (orchestrator) | $99.00 |
 | Amazon CloudWatch + AWS X-Ray | Logs, metrics, and distributed traces for all components | $25.00 |
@@ -97,7 +105,7 @@ The following table provides a sample cost breakdown for deploying this Guidance
 | Amazon Inspector | Container image scanning (~10 images) | $1.30 |
 | Amazon ECR | Image storage (~2 GB) @ $0.10/GB-month | $0.20 |
 | Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00 |
-| **Total** | | **~$1,129.23/month** |
+| **Total** | | **~$1,075.23/month** |
 
 ## Prerequisites
 
@@ -115,7 +123,7 @@ Python 3.13 and the AgentCore CLI are automatically installed by `uv` during set
 
 ### AWS Account Requirements
 
-- **Bedrock Model Access**: Claude Sonnet 4.5 and Claude Haiku 4.5 enabled in your target region
+- **Bedrock Model Access**: Claude Sonnet 4.6 and Claude Haiku 4.5 enabled in your target region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
@@ -149,7 +157,7 @@ To enable Bedrock models:
 
 1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock/)
 2. Navigate to **Model access**
-3. Enable Anthropic Claude 4.5 Sonnet and Anthropic Claude 4.5 Haiku
+3. Enable Anthropic Claude Sonnet 4.6 and Anthropic Claude 4.5 Haiku
 4. Save changes
 
 ### Windows Users

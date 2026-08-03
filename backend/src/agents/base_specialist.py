@@ -13,7 +13,7 @@ from strands import Agent, tool
 
 # Local modules
 from config.settings import AGENT_MAX_TURNS_SPECIALIST, AGENT_TIMEOUT_SPECIALIST_SECONDS, AWS_REGION, INFERENCE_CONFIG
-from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
+from models.cached_bedrock import create_bedrock_model_with_overrides, create_specialist_bedrock_model
 from utils.kb_tools import create_kb_retrieve_tool
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
@@ -80,8 +80,17 @@ def create_specialist_agent(
                 try:
                     # Per-agent inference parameters (WA GenAI Lens: Performance Efficiency 2)
                     agent_key = service_name.lower()
-                    inf = INFERENCE_CONFIG.get(agent_key, {})
-                    model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
+                    inf = INFERENCE_CONFIG.get(agent_key)
+                    if inf:
+                        model = create_bedrock_model_with_overrides(**inf)
+                    else:
+                        # No pinned entry (new or renamed service_name). Fall back to the
+                        # specialist role model, never the orchestrator's fast routing model.
+                        logger.warning(
+                            f"No INFERENCE_CONFIG entry for '{agent_key}'; using the specialist role model. "
+                            f"Add a pinned entry for {service_name} to control its inference settings."
+                        )
+                        model = create_specialist_bedrock_model()
 
                     with time_operation(f"{agent_key}_agent_execution", {"query_length": len(query)}):
                         specialist = Agent(
