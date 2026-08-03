@@ -17,6 +17,17 @@ Game Agent uses a **simplified stdio-only MCP architecture** with specialized AI
 - **Cost Optimization**: Cost-effective stdio transport
 - **Improved Reliability**: Fewer network failure points and dependencies
 
+### Accepted Evolution: Optional Operations Control Plane
+
+The architecture above describes the currently deployed, read-only chat
+experience. The accepted design for a future optional operations control plane
+preserves that path and adds separate operations services and execution trust
+boundaries. These decisions do not deploy operations resources or grant
+provider write permissions.
+
+See the [architecture decision records](adr/README.md) for the accepted
+boundaries and compatibility constraints.
+
 ---
 
 ## Architecture Diagram
@@ -587,3 +598,4 @@ scripts/
 
 - [Deployment Guide](DEPLOYMENT_GUIDE.md) — Full deployment steps and environment variable reference
 - [Security](../SECURITY.md) — Encryption, access controls, and compliance
+- [Architecture Decision Records](adr/README.md) — Accepted boundaries for the optional operations control plane
