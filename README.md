@@ -75,25 +75,25 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of July 2026, the cost for running this Guidance with the default settings in the US West (Oregon) Region is approximately **~$815/month** for processing approximately 10,000 agent queries per month.
+You are responsible for the cost of the AWS services used while running this Guidance. As of July 2026, the cost for running this Guidance with the default settings in the US West (Oregon) Region is approximately **~$752/month** for processing approximately 10,000 agent queries per month.
 
 We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
 ### Sample Cost Table
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US West (Oregon) Region (`us-west-2`) for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context, ~8 model turns per query). Token costs shown are at standard (uncached) rates. Prompt caching is enabled by default but cost impact depends on hit rate — cache reads cost 0.1× standard input while cache writes cost 1.25× (5-min TTL); a net benefit requires sustained hit rates above 12%.
+The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US West (Oregon) Region (`us-west-2`) for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context, ~8 model turns per query). Token costs shown are at standard (uncached) rates using the default `global.*` cross-region inference model IDs. Prompt caching is enabled by default; cache reads cost 0.1× standard input while cache writes cost 1.25× (5-min TTL). Break-even requires a cache-read share above ~22% of total cached tokens (R/W ratio > 0.28). Both models require a minimum 4,096-token prefix per cache checkpoint.
 
 | AWS service | Dimensions | Cost [USD] |
 | ----------- | ------------ | ------------ |
-| Amazon Bedrock (Claude Sonnet 4.5) | 80M input tokens @ $3.30/M + 20M output tokens @ $16.50/M (specialist agents) | $594.00 |
-| Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.10/M + 10M output tokens @ $5.50/M (orchestrator) | $99.00 |
+| Amazon Bedrock (Claude Sonnet 4.5) | 80M input tokens @ $3.00/M + 20M output tokens @ $15.00/M (specialist agents, global cross-region endpoint) | $540.00 |
+| Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.00/M + 10M output tokens @ $5.00/M (orchestrator, global cross-region endpoint) | $90.00 |
 | Amazon ECS (Fargate) | 1 vCPU + 2 GB task. At MinTasks: 1 running 730 hrs/mo = $36.04. Autoscaling may average ~1.3 tasks under moderate load (~950 task-hrs/mo ≈ $47). [Pricing](https://aws.amazon.com/fargate/pricing/) | $36.04 |
-| Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hr × 730 hrs = $16.43 fixed. LCU cost depends on max of: new connections, active connections, processed bytes, and rule evaluations per hour. At ~100K HTTP requests/mo with small payloads, LCU usage is minimal. [Pricing](https://aws.amazon.com/elasticloadbalancing/pricing/) | ~$17.00 |
-| Amazon Bedrock Guardrails | ~40K input TU + ~40K output TU evaluated per safeguard. Content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) applied to both input and output. [Pricing](https://aws.amazon.com/bedrock/pricing/) | ~$32.00 |
+| Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hr × 730 hrs = $16.43 fixed. LCU variable: ~100K requests/mo, 1 new conn/req, 30s duration, 100 KB/req, ≤10 rules. Max LCU dimension is processed bytes (~10 LCU-hrs × $0.008 = $0.08). [Pricing](https://aws.amazon.com/elasticloadbalancing/pricing/) | $16.51 |
+| Amazon Bedrock Guardrails | 10K queries × 4 guarded calls/query × ≤1K input chars + ≤1K output chars = 40K input TU + 40K output TU. Each TU evaluated by: content filters ($0.15/1K) + denied topics ($0.15/1K) + PII ($0.10/1K). Total: (40+40) × ($0.15+$0.15+$0.10)/1K. [Pricing](https://aws.amazon.com/bedrock/pricing/) | $32.00 |
 | AWS WAF | 1 WebACL ($5) + 6 rules ($6) + ~100K requests @ [$0.60/M](https://aws.amazon.com/waf/pricing/) | $11.06 |
 | Amazon CloudWatch + AWS X-Ray | ~5 GB log ingestion @ $0.50/GB + metrics + X-Ray traces (1% indexing, ~10K spans) | ~$7.50 |
 | Amazon Bedrock AgentCore Runtime | 10K invocations, ~30s session each. CPU billed on active consumption only (~5s active CPU @ $0.0895/vCPU-hr); memory billed for full session duration (2 GB peak × 30s @ $0.00945/GB-hr) | ~$2.84 |
-| Amazon Bedrock AgentCore Memory | STM: ~30K new events/mo (~3 per query) @ $0.25/1K events = $7.50. LTM retrieval: 10K requests/mo @ $0.50/1K requests = $5.00 (retrieval is billed even when zero results are returned). Conditional LTM writes are negligible with default empty strategies. [Pricing](https://aws.amazon.com/bedrock/agentcore/pricing/) | $12.50 |
+| Amazon Bedrock AgentCore Memory | STM: ~30K new events/mo (~3 per query) @ $0.25/1K events = $7.50. LTM retrieval: 10K requests/mo @ $0.50/1K requests = $5.00 (billed even for empty results). LTM record storage: ~1K retained records (10% of queries store one user-fact record) @ $0.25/1K records/mo = $0.25. [Pricing](https://aws.amazon.com/bedrock/agentcore/pricing/) | $12.75 |
 | AWS CloudTrail | Management events (first trail free); associated S3 + CloudWatch Logs delivery | ~$1.00 |
 | AWS KMS | 1 customer-managed key ($1/mo) + API requests | ~$1.00 |
 | Amazon S3 (logs + docs + artifacts) | 5 buckets, ~5 GB standard storage + requests | ~$0.50 |
@@ -102,9 +102,9 @@ The following table provides a sample cost breakdown for deploying this Guidance
 | Amazon ECR | Image storage (~2 GB) @ $0.10/GB-month | $0.20 |
 | Amazon S3 Vectors (Knowledge Bases) | 3 indexes, ~50 vectors (1024-dim), 10K queries/mo @ [$2.50/M requests](https://aws.amazon.com/s3/pricing/) + data processed | ~$0.10 |
 | Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00 |
-| **Total** | | **~$815/month** |
+| **Total** | | **~$752/month** |
 
-> **Note:** The dominant cost driver is model token usage (Sonnet + Haiku = ~$693, or 85% of total). Infrastructure costs are minimal at this query volume. Token volumes above are estimates based on ~8 model turns per query; actual costs depend on conversation length and specialist complexity. HTTP request volume is estimated at ~100K/month (10K agent queries × ~10 HTTP requests each for auth, polling, streaming, and static assets); ALB and WAF rows use this shared assumption. Prompt caching economics depend on hit rate — monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch to verify net benefit.
+> **Note:** The dominant cost driver is model token usage (Sonnet + Haiku = $630, or 84% of total). Infrastructure costs are minimal at this query volume. Token volumes above are estimates based on ~8 model turns per query; actual costs depend on conversation length and specialist complexity. HTTP request volume is estimated at ~100K/month (10K agent queries × ~10 HTTP requests each for auth, polling, streaming, and static assets); ALB and WAF rows use this shared assumption. Prompt caching break-even requires a cache-read share above ~22% of cached tokens — monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch. Both Claude models require ≥4,096 tokens per cache checkpoint.
 
 ## Prerequisites
 

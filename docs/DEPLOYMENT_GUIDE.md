@@ -235,14 +235,14 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet + Haiku) | $20-700+ | Dominant cost; ~$3.30/M input, ~$16.50/M output (Sonnet). Token costs at standard (uncached) rates. Caching: reads 0.1× input, writes 1.25× (5-min TTL); net benefit requires >12% hit rate |
+| Bedrock (Claude Sonnet + Haiku) | $20-630+ | Dominant cost; uses `global.*` cross-region model IDs (~$3/M input, ~$15/M output for Sonnet; ~$1/M input, ~$5/M output for Haiku). Caching: reads 0.1×, writes 1.25× (5-min TTL); break-even requires cache-read share >22%; min 4,096 tokens per checkpoint |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
-| Bedrock Guardrails | $3-32 | Billed per input + output text unit per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
+| Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
-| Bedrock AgentCore Memory | $5-13 | STM: ~3 events per query @ $0.25/1K events + LTM retrieval: 1 request/query @ $0.50/1K requests (billed even for empty results) |
+| Bedrock AgentCore Memory | $5-13 | STM: ~3 events/query @ $0.25/1K + LTM retrieval: 1 request/query @ $0.50/1K (billed for empty results) + LTM storage: ~1K records/mo @ $0.25/1K |
 | WAF | $11 | $5 WebACL + $6 rules + $0.60/M requests (shared ~100K HTTP request assumption) |
 | CloudWatch + X-Ray | $5-10 | Log ingestion, metrics, traces |
-| ALB | $17-20 | $16.43 fixed hourly + LCU (based on max of: new connections, active connections, bytes, rule evaluations) |
+| ALB | ~$17 | $16.43 fixed + LCU variable (max of: new connections, active connections, processed bytes, rule evaluations). At 100K reqs/mo, 100KB/req, processed bytes dominates: ~$0.08 |
 | Knowledge Bases (S3 Vectors) | <$1 | S3 Vectors storage + $2.50/M query requests + Titan Embed V2 @ $0.02/M tokens |
 | CloudTrail + KMS | ~$2 | Management events (first trail free) + 1 CMK @ $1/mo |
 | S3 (docs + logs + artifacts) | $1-5 | Standard storage across 5 buckets |
@@ -253,7 +253,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 ### Cost Optimization Tips
 
-- Prompt caching is enabled by default. Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch — a read-to-write ratio >3:1 indicates net savings; below that, caching may cost more than uncached input
+- Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint size: 4,096 tokens. Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
 - Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage — near-zero cost at small scale
 - ECS Fargate scales between 1-4 tasks based on load (configurable via MinTasks/MaxTasks)
 - AgentCore Runtime only charges for active CPU time; memory is billed for full session duration regardless of I/O wait
