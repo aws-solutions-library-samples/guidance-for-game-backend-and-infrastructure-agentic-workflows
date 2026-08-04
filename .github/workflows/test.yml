@@ -39,6 +39,16 @@ jobs:
       with:
         python-version: '3.13'
 
+    - name: Verify deployment requirements match lockfile
+      working-directory: ./backend
+      shell: bash
+      run: |
+        uv export --frozen --format requirements-txt --no-dev --no-hashes \
+          --output-file /tmp/backend-requirements.txt > /dev/null
+        diff -u \
+          <(grep -v '^#' requirements.txt | grep -v '^$') \
+          <(grep -v '^#' /tmp/backend-requirements.txt | grep -v '^$')
+
     - name: Install dependencies
       working-directory: ./backend
       run: uv sync
