@@ -535,7 +535,7 @@ opentelemetry-semantic-conventions==0.65b0
     #   opentelemetry-instrumentation-wsgi
     #   opentelemetry-sdk
     #   opentelemetry-util-genai
-opentelemetry-util-genai==0.4b0
+opentelemetry-util-genai==1.0b0
     # via opentelemetry-instrumentation-openai-agents-v2
 opentelemetry-util-http==0.65b0
     # via
@@ -785,13 +785,13 @@ wcwidth==0.2.14
     # via prompt-toolkit
 websocket-client==1.9.0
     # via kubernetes
-websockets==15.0.1
+websockets==17.0.1
     # via
     #   bedrock-agentcore
     #   fastmcp-slim
 win32-setctime==1.2.0 ; sys_platform == 'win32'
     # via loguru
-wrapt==1.17.3
+wrapt==2.3.0
     # via
     #   opentelemetry-instrumentation
     #   opentelemetry-instrumentation-aio-pika
@@ -813,5 +813,6 @@ wrapt==1.17.3
     #   opentelemetry-instrumentation-threading
     #   opentelemetry-instrumentation-urllib3
     #   opentelemetry-processor-baggage
+    #   opentelemetry-util-genai
 yarl==1.22.0
     # via aiohttp
