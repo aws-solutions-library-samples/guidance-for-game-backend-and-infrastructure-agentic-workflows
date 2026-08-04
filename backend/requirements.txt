@@ -785,7 +785,7 @@ wcwidth==0.2.14
     # via prompt-toolkit
 websocket-client==1.9.0
     # via kubernetes
-websockets==15.0.1
+websockets==17.0.1
     # via
     #   bedrock-agentcore
     #   fastmcp-slim
