@@ -46,8 +46,8 @@ jobs:
         uv export --frozen --format requirements-txt --no-dev --no-hashes \
           --output-file /tmp/backend-requirements.txt > /dev/null
         diff -u \
-          <(grep -v '^#' requirements.txt | grep -v '^$') \
-          <(grep -v '^#' /tmp/backend-requirements.txt | grep -v '^$')
+          <(grep -Ev '^[[:space:]]*(#|$)' requirements.txt) \
+          <(grep -Ev '^[[:space:]]*(#|$)' /tmp/backend-requirements.txt)
 
     - name: Install dependencies
       working-directory: ./backend
