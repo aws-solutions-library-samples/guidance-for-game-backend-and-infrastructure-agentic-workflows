@@ -8,9 +8,12 @@ those tests keep passing the same *flat* keyword arguments while producing a cor
 composed :class:`SourceControlConfig`, so the split is a pure structural change with no
 behavioral drift in the tests.
 
-``credential_secret_id`` is accepted as an alias for ``credential_secret_arn`` because the
-single-ARN credential consolidation is a later v2 task; for now the value is simply re-homed
-onto ``AdapterConfig.credential_secret_arn`` exactly as the loader does.
+The underlying credential setting is now the single ARN-valued
+``AdapterConfig.credential_secret_arn`` (the v2 single-ARN consolidation). The legacy
+``credential_secret_id`` keyword is still accepted as an alias and mapped onto
+``credential_secret_arn`` so existing call sites keep working with minimal churn; the factory
+builds the config object directly and does not enforce ARN shape, so tests may pass any
+sentinel value.
 """
 
 # Standard library

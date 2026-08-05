@@ -29,11 +29,13 @@ What it validates (Req 2.1, 2.2, 2.6, 6.1):
    which deliberately has no close/merge operation): closes the PR and deletes the proposal
    branch, so the test is idempotent and leaves no residue.
 
-The connector fetches its SCM_Credential via ``get_secret(...,
-source="secretsmanager")``. To let this integration test run with just a GitHub token (no
-Secrets Manager provisioning), ``get_secret`` is patched inside the connector modules to
-return the test token. Every other connector code path — enablement gate, authorization,
-allowlist, rate limit, IaC validation, provider ops — runs unmodified.
+Under the v2 ProviderAuth model, credential acquisition is owned entirely by the
+Provider_Adapter: the GitHub adapter's ``GitHubTokenAuth`` fetches the SCM_Credential via
+``get_secret(..., source="secretsmanager")``. To let this integration test run with just a
+GitHub token (no Secrets Manager provisioning), ``get_secret`` is patched inside the adapter
+module (``connector.github_provider``) to return the test token. The connector core no longer
+calls ``get_secret`` at all. Every other connector code path — enablement gate,
+authorization, allowlist, rate limit, IaC validation, provider ops — runs unmodified.
 """
 
 # Standard library
@@ -170,13 +172,11 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
     pr_number: str | None = None
     head_branch: str | None = None
 
-    # Patch the credential fetch in BOTH connector modules that call get_secret so the real
-    # GitHub token is used for the provider auth and the service credential gate, while every
-    # other connector code path runs unmodified.
-    with (
-        patch("connector.service.get_secret", return_value=_TOKEN),
-        patch("connector.github_provider.get_secret", return_value=_TOKEN),
-    ):
+    # Patch the credential fetch in the adapter module (the only connector module that calls
+    # get_secret now that credential acquisition is adapter-owned behind ProviderAuth) so the
+    # real GitHub token is used for provider auth, while every other connector code path runs
+    # unmodified.
+    with patch("connector.github_provider.get_secret", return_value=_TOKEN):
         # Identity must come from the request context, never from tool/model input (Req 7.1).
         token = set_request_context(
             {

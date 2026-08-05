@@ -22,11 +22,13 @@ Hypothesis drives every enabled terminal outcome:
 - **rejected** — an authenticated user who is not in an authorized group (authorization gate),
   and a prompt-injection-flagged intent (injection gate),
 - **declined** — an empty file set, and a structurally invalid IaC file set,
-- **error**    — a failed credential retrieval, and a provider that reports unavailable.
+- **error**    — an adapter credential-acquisition failure (surfaced as a ProviderAuthError),
+  and a provider that reports unavailable.
 
 For each generated scenario the test patches ``connector.service._get_audit_sink`` to return a
 recording fake ``AuditSink`` (whose ``write`` captures each event and confirms the durable
-write) and ``connector.service.get_secret`` so no network/AWS call occurs, drives the outcome
+write); credential acquisition is adapter-owned so the connector core issues no ``get_secret``,
+drives the outcome
 via a ``FakeProvider`` (``provider=``) and an enabled ``ConnectorConfig`` (``config=``), then
 asserts the single audit event written to the sink for that terminal outcome contains the
 required fields populated.
@@ -55,7 +57,7 @@ from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector import service
 from connector.service import propose_change
-from connector.provider import ProviderUnavailableError
+from connector.provider import ProviderAuthError, ProviderUnavailableError
 from support.fake_provider import FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -151,8 +153,10 @@ _EXPECTATIONS = {
         "reason_required": True,
     },
     "error_credential": {
+        # Credential acquisition is now adapter-owned: a failure surfaces as a
+        # ProviderAuthError on the first provider op, audited as a provider error outcome.
         "status": "error",
-        "event": "scm_credential_error",
+        "event": "scm_proposal",
         "outcome": "error",
         "repo_applicable": True,
         "reason_required": True,
@@ -263,7 +267,6 @@ def _run_scenario(scenario: str, files, intent_words):
     description = f"Adjust the {intent_words[-1]} in the infrastructure template."
     groups = [_GROUP]
     proposed_files = files
-    secret_value = _FAKE_CREDENTIAL
 
     if scenario == "rejected_unauthorized":
         # Authenticated identity, but not a member of any authorized group.
@@ -276,8 +279,13 @@ def _run_scenario(scenario: str, files, intent_words):
     elif scenario == "declined_invalid_iac":
         proposed_files = _invalid_cfn_files()
     elif scenario == "error_credential":
-        # Credential retrieval fails -> fail-closed error outcome.
-        secret_value = None
+        # Credential acquisition is adapter-owned: a failure surfaces as a ProviderAuthError
+        # on the first provider op (fail-closed error outcome), replacing the removed
+        # service-level credential gate.
+        provider.fail(
+            "latest_commit_sha",
+            ProviderAuthError("credential acquisition failed"),
+        )
     elif scenario == "error_provider":
         # Provider reports unavailable on the first provider operation.
         provider.fail(
@@ -292,7 +300,6 @@ def _run_scenario(scenario: str, files, intent_words):
     )
     try:
         with (
-            mock.patch.object(service, "get_secret", return_value=secret_value),
             mock.patch.object(service, "_get_audit_sink", return_value=sink),
         ):
             result = propose_change(

@@ -93,16 +93,17 @@ def _propose_as(user_id: str, *, config: SourceControlConfig, provider: FakeProv
     """
     token = set_request_context({"user_id": user_id, "groups": [_GROUP]})
     try:
-        with patch("connector.service.get_secret", return_value="ghp_fake_token_value"):
-            return propose_change(
-                _INTENT,
-                [ProposedFile(path="template.yaml", content=_VALID_CFN, iac_format=_IAC_FORMAT)],
-                _IAC_FORMAT,
-                _TITLE,
-                _DESCRIPTION,
-                config=config,
-                provider=provider,
-            )
+        # Credential acquisition is adapter-owned behind ProviderAuth; the core issues no
+        # get_secret and the injected FakeProvider needs none, so no credential patch.
+        return propose_change(
+            _INTENT,
+            [ProposedFile(path="template.yaml", content=_VALID_CFN, iac_format=_IAC_FORMAT)],
+            _IAC_FORMAT,
+            _TITLE,
+            _DESCRIPTION,
+            config=config,
+            provider=provider,
+        )
     finally:
         reset_request_context(token)
 

@@ -184,16 +184,17 @@ def test_property6_authorization_gate(scenario):
 
     token = set_request_context(request_ctx)
     try:
-        with patch("connector.service.get_secret", return_value=_FAKE_CREDENTIAL):
-            result = propose_change(
-                _INTENT,
-                _proposed_files(),
-                iac_format="cloudformation",
-                title=_TITLE,
-                description=_DESCRIPTION,
-                config=config,
-                provider=fake,
-            )
+        # Credential acquisition is adapter-owned behind ProviderAuth; the core issues no
+        # get_secret, and the injected FakeProvider needs none — so no credential patch.
+        result = propose_change(
+            _INTENT,
+            _proposed_files(),
+            iac_format="cloudformation",
+            title=_TITLE,
+            description=_DESCRIPTION,
+            config=config,
+            provider=fake,
+        )
     finally:
         reset_request_context(token)
 

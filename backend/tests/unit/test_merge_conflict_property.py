@@ -183,7 +183,6 @@ def test_property19_merge_conflict_is_reported_without_destructive_resolution(
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-1"})
     try:
         with (
-            mock.patch.object(service, "get_secret", return_value="ghp_fake_token_value"),
             mock.patch.object(service, "logger") as mock_logger,
         ):
             result = propose_change(

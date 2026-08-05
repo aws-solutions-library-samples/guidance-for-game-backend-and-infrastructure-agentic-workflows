@@ -51,7 +51,7 @@ _SCM_ATTRS = (
     "SCM_CONNECTOR_ENABLED",
     "SCM_PROVIDER",
     "SCM_PROVIDER_BASE_URL",
-    "SCM_CREDENTIAL_SECRET_ID",
+    "SCM_CREDENTIAL_SECRET_ARN",
     "SCM_REPO_ALLOWLIST",
     "SCM_AUTHORIZED_GROUPS",
     "SCM_AUDIT_LOG_GROUP",
@@ -101,7 +101,7 @@ def _valid_base() -> dict:
         "SCM_CONNECTOR_ENABLED": "true",
         "SCM_PROVIDER": "github",
         "SCM_PROVIDER_BASE_URL": None,
-        "SCM_CREDENTIAL_SECRET_ID": "scm/github-token",
+        "SCM_CREDENTIAL_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf",
         "SCM_REPO_ALLOWLIST": "org/iac-repo=main",
         "SCM_AUTHORIZED_GROUPS": "iac-admins",
         "SCM_AUDIT_LOG_GROUP": "scm-audit-logs",
@@ -180,8 +180,8 @@ _connector_invalidations = st.one_of(
 # AdapterConfig: credential secret ARN + provider base URL.
 _adapter_invalidations = st.one_of(
     st.tuples(
-        st.just("SCM_CREDENTIAL_SECRET_ID"),
-        st.sampled_from([None, "", "   "]),
+        st.just("SCM_CREDENTIAL_SECRET_ARN"),
+        st.sampled_from([None, "", "   ", "scm/github-token", "not-an-arn"]),
         st.just("credential_secret_arn"),
     ),
     st.tuples(

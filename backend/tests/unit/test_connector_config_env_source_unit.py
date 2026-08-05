@@ -27,7 +27,7 @@ _SCM_KEYS = (
     "SCM_CONNECTOR_ENABLED",
     "SCM_PROVIDER",
     "SCM_PROVIDER_BASE_URL",
-    "SCM_CREDENTIAL_SECRET_ID",
+    "SCM_CREDENTIAL_SECRET_ARN",
     "SCM_REPO_ALLOWLIST",
     "SCM_AUTHORIZED_GROUPS",
     "SCM_AUDIT_LOG_GROUP",
@@ -43,7 +43,7 @@ _SCM_KEYS = (
 _BARE_CONFIG = {
     "SCM_CONNECTOR_ENABLED": "true",
     "SCM_PROVIDER": "github",
-    "SCM_CREDENTIAL_SECRET_ID": "gbaw/scm/github-token",
+    "SCM_CREDENTIAL_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf",
     "SCM_REPO_ALLOWLIST": "org/iac-repo=main",
     "SCM_AUTHORIZED_GROUPS": "sre",
     "SCM_RATE_LIMIT_MAX": "999",
@@ -109,7 +109,7 @@ def test_gbaw_prefixed_vars_are_the_only_honored_source(monkeypatch):
     prefixed = {
         "GBAW_SCM_CONNECTOR_ENABLED": "true",
         "GBAW_SCM_PROVIDER": "github",
-        "GBAW_SCM_CREDENTIAL_SECRET_ID": "gbaw/scm/github-token",
+        "GBAW_SCM_CREDENTIAL_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf",
         "GBAW_SCM_REPO_ALLOWLIST": "org/iac-repo=main",
         "GBAW_SCM_AUTHORIZED_GROUPS": "sre",
         "GBAW_SCM_AUDIT_LOG_GROUP": "scm-audit-logs",

@@ -30,7 +30,8 @@ before ``connector/models.py`` exists.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # Local modules
@@ -90,6 +91,50 @@ class UnsupportedProviderError(ProviderError):
     a provider that is not implemented (or none at all). Caught at config-load time so the
     Connector remains disabled and retains read-only behavior.
     """
+
+
+@dataclass
+class OutboundRequest:
+    """A provider-neutral, mutable description of an outbound request to a Provider.
+
+    A :class:`ProviderAuth` receives an ``OutboundRequest`` and attaches whatever
+    credential material the underlying credential model requires — a bearer token in a
+    header for a token-based Provider, or a set of SigV4 signature headers for an
+    IAM-native Provider — by mutating :attr:`headers` (and, for signing schemes,
+    reading :attr:`method`/:attr:`url`/:attr:`params`). The type references only Python
+    primitives so no provider-specific vocabulary enters the neutral auth contract
+    (Req 9.1, 11.1).
+    """
+
+    method: str = ""
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    params: dict[str, Any] | None = None
+
+
+class ProviderAuth(ABC):
+    """Provider-neutral credential-acquisition contract owned by each Provider_Adapter.
+
+    Credential acquisition is owned **entirely by the adapter** behind this neutral
+    interface, so the Connector_Core issues no credential retrieval of its own and a
+    token-based adapter and an IAM-native adapter satisfy the *same* contract (Req 11.1).
+
+    An implementation acquires its credential (e.g. a token from Secrets Manager, or the
+    runtime role for SigV4 signing) and attaches it to the outbound provider request. On
+    any acquisition failure it raises :class:`ProviderAuthError` so the operation fails
+    closed with no retry (the service maps ``ProviderAuthError`` to a safe, no-retry error
+    result). Implementations MUST never log or otherwise expose the credential value.
+    """
+
+    @abstractmethod
+    def apply(self, request: OutboundRequest) -> None:
+        """Acquire credentials and attach them to ``request`` (fail-closed).
+
+        Mutates ``request`` in place to carry the credential material. Raises
+        :class:`ProviderAuthError` if the credential cannot be acquired, so the calling
+        operation is aborted without retry (Req 11.1).
+        """
+        raise NotImplementedError
 
 
 class SourceControlProvider(ABC):

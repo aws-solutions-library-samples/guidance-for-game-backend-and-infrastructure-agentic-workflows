@@ -198,16 +198,17 @@ def test_property17_invalid_credentials_are_not_retried(failing_op, files, inten
 
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-1"})
     try:
-        with patch("connector.service.get_secret", return_value="ghp_fake_token_value"):
-            result = propose_change(
-                intent,
-                files,
-                _IAC_FORMAT,
-                title,
-                description,
-                config=config,
-                provider=provider,
-            )
+        # Credential acquisition is adapter-owned behind ProviderAuth; the core issues no
+        # get_secret and the injected FakeProvider needs none, so no credential patch.
+        result = propose_change(
+            intent,
+            files,
+            _IAC_FORMAT,
+            title,
+            description,
+            config=config,
+            provider=provider,
+        )
     finally:
         reset_request_context(token)
 

@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 """Property-based test that credential values never appear in the connector's output.
 
-Covers Correctness Property 8 from the source-control-connector design: the value of the
-source-control credential (``SCM_Credential``) is fetched only from Secrets Manager via
-``get_secret`` and must **never** surface anywhere the agent or an operator can observe it.
+The value of the source-control credential (``SCM_Credential``) must **never** surface
+anywhere the agent or an operator can observe it. Under the v2 ProviderAuth model,
+credential acquisition is owned entirely by the Provider_Adapter behind the neutral
+:class:`~connector.provider.ProviderAuth` contract (Req 11.1): the connector core
+(``connector.service``) does not import or call ``get_secret`` at all, and the adapter's
+:class:`~connector.github_provider.GitHubTokenAuth` fetches the credential per operation and
+places it only in an outbound ``Authorization`` header.
+
 Two observable surfaces exist for a ``connector.service.propose_change`` invocation:
 
   1. the returned :class:`ProposalResult` — its ``status``, ``message``,
      ``proposal_id`` and ``proposal_url``; and
   2. the audit log — every field of every ``connector.service.logger`` call.
 
-The property proven here is universal: for *any* credential value that ``get_secret``
-returns (generated as random, high-entropy, secret-looking strings), that exact value never
-appears in the returned result nor in any audit log call's args/kwargs — across **both** the
-success path (a proposal is created) and every failure path (input rejected, empty file set,
-invalid IaC, and each typed provider failure). This holds because the pipeline never places
-the credential in a result field or an audit field; the credential lives only long enough to
-authenticate the provider.
+The property proven here is universal: for *any* credential value the adapter's
+``ProviderAuth`` acquires (generated as random, high-entropy, secret-looking strings), that
+exact value never appears in the returned result nor in any audit log call — across **both**
+the success path (a proposal is created) and every failure path. This holds because the core
+never handles the credential and the adapter confines it to the outbound request header.
 
-The service is exercised with a ``FakeProvider`` injected via ``provider=`` and a
-purpose-built enabled :class:`ConnectorConfig` injected via ``config=``. An authorized user
-is supplied through the request contextvar, valid CloudFormation and an allowlist-matching
-repo/branch drive the success path, and ``connector.service.get_secret`` is mocked to return
-the generated credential. Audit output is captured by patching ``connector.service.logger``
-with a :class:`~unittest.mock.MagicMock` and asserting the credential string appears in no
-recorded call. Each example clears the shared rate-limit store and uses a unique ``user_id``
-so examples stay independent.
+The pipeline is exercised with an *authenticating* ``FakeProvider`` that, like a real
+adapter, acquires the credential through ``GitHubTokenAuth`` (backed by a patched
+``get_secret``) on every provider operation, then behaves like the in-memory fake. This
+genuinely brings the credential into the flow so the "never leaks" assertion is meaningful.
+Each example clears the shared rate-limit store and uses a unique ``user_id`` so examples
+stay independent.
 
-Validates: Requirements 4.7, 6.6
+Validates: Requirements 4.7, 6.6, 11.1
 """
 
 # Standard library
 import itertools
 import string
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 # Third-party packages
@@ -42,16 +44,20 @@ from hypothesis import strategies as st
 
 # Local modules
 import utils.security as security
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
+from connector import service
+from connector.config import AdapterConfig, AllowlistEntry, SourceControlConfig
+from connector.github_provider import GitHubTokenAuth
 from connector.models import ProposedFile
 from connector.provider import (
+    OutboundRequest,
+    ProviderAuth,
     ProviderAuthError,
     ProviderConflictError,
     ProviderTransientError,
     ProviderUnavailableError,
 )
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
@@ -63,6 +69,9 @@ pytestmark = pytest.mark.unit
 _REPO = "org/iac-repo"
 _BRANCH = "main"
 _GROUP = "scm-writers"
+
+# A valid Secrets Manager ARN — the single ARN-valued credential setting the adapter fetches.
+_ARN = "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf"
 
 # A benign, injection-free intent/title/description so the success/failure outcome is decided
 # by the scenario under test, not by the input-validation gate.
@@ -80,8 +89,58 @@ _INVALID_CFN = "NotResources:\n  junk: true\n"
 _user_ids = itertools.count(1)
 
 
+class _AuthenticatingFakeProvider(FakeProvider):
+    """A ``FakeProvider`` that acquires a credential via ``ProviderAuth`` on each op.
+
+    Mirrors a real Provider_Adapter: before delegating to the in-memory fake behavior, each
+    provider operation acquires the credential through the neutral ``ProviderAuth`` contract
+    (which fetches it from the patched ``get_secret`` and attaches it to a throwaway outbound
+    request). This confines the credential to the adapter layer exactly as production does,
+    so the "credential never in the core's output" property is exercised, not vacuous.
+    """
+
+    def __init__(self, auth: ProviderAuth) -> None:
+        super().__init__()
+        self._auth = auth
+
+    def _authenticate(self) -> None:
+        self._auth.apply(OutboundRequest(headers={}))
+
+    def latest_commit_sha(self, *args: Any, **kwargs: Any) -> str:
+        self._authenticate()
+        return super().latest_commit_sha(*args, **kwargs)
+
+    def branch_exists(self, *args: Any, **kwargs: Any) -> bool:
+        self._authenticate()
+        return super().branch_exists(*args, **kwargs)
+
+    def create_branch(self, *args: Any, **kwargs: Any) -> None:
+        self._authenticate()
+        return super().create_branch(*args, **kwargs)
+
+    def commit_files(self, *args: Any, **kwargs: Any) -> str:
+        self._authenticate()
+        return super().commit_files(*args, **kwargs)
+
+    def open_change_proposal(self, *args: Any, **kwargs: Any):
+        self._authenticate()
+        return super().open_change_proposal(*args, **kwargs)
+
+    def find_open_change_proposal(self, *args: Any, **kwargs: Any):
+        self._authenticate()
+        return super().find_open_change_proposal(*args, **kwargs)
+
+    def get_files(self, *args: Any, **kwargs: Any):
+        self._authenticate()
+        return super().get_files(*args, **kwargs)
+
+    def get_file(self, *args: Any, **kwargs: Any):
+        self._authenticate()
+        return super().get_file(*args, **kwargs)
+
+
 def _make_config() -> SourceControlConfig:
-    """Build an enabled ConnectorConfig for the propose path.
+    """Build an enabled SourceControlConfig for the propose path.
 
     ``rate_limit_max`` is high and the shared window store is cleared per example, so the
     rate-limit gate never masks the scenario under test. ``retry_max_attempts=1`` keeps the
@@ -91,7 +150,7 @@ def _make_config() -> SourceControlConfig:
     return make_source_control_config(
         enabled=True,
         provider="github",
-        credential_secret_id="scm/credential",
+        credential_secret_arn=_ARN,
         allowlist=(AllowlistEntry(repo=_REPO, target_branches=(_BRANCH,)),),
         authorized_groups=(_GROUP,),
         rate_limit_max=1000,
@@ -118,7 +177,7 @@ _secret_values = st.builds(
 )
 
 # The scenarios exercised. "success" drives the full create path; every other value drives a
-# distinct decline/failure/error path that still fetches the credential first.
+# distinct decline/failure/error path that still acquires the credential first.
 _scenarios = st.sampled_from(
     [
         "success",
@@ -132,14 +191,17 @@ _scenarios = st.sampled_from(
 )
 
 
-def _provider_for(scenario: str) -> FakeProvider:
-    """Return a FakeProvider programmed for ``scenario``.
+def _provider_for(scenario: str) -> _AuthenticatingFakeProvider:
+    """Return an authenticating FakeProvider programmed for ``scenario``.
 
     Provider-failure scenarios inject a typed exception on the first provider operation so
     the propose pipeline takes the corresponding error branch (all of which audit and return
     a secret-free result).
     """
-    fake = FakeProvider()
+    auth = GitHubTokenAuth(
+        AdapterConfig(credential_secret_arn=_ARN, provider_base_url=None, config_errors=())
+    )
+    fake = _AuthenticatingFakeProvider(auth)
     fake.set_head(_REPO, _BRANCH, "basesha0000000000000000000000000000000000")
     if scenario == "provider_auth":
         fake.fail("latest_commit_sha", ProviderAuthError("auth denied"))
@@ -175,20 +237,23 @@ def _logger_call_blob(mock_logger: MagicMock) -> str:
     return "\n".join(parts)
 
 
-# --- Property 8 ------------------------------------------------------------
+# --- Property V2 (credential neutrality) -----------------------------------
 
 
-# Feature: source-control-connector, Property 8: Credential values never appear in output
+# Feature: source-control-connector-v2, Property V2: credential acquisition is adapter-owned behind a neutral auth contract
 @settings(max_examples=100)
 @given(credential=_secret_values, scenario=_scenarios)
-def test_property8_credential_never_appears_in_output(credential, scenario):
+def test_credential_never_appears_in_output(credential, scenario):
     """The credential value never appears in the ProposalResult nor any audit log field.
 
-    For any credential returned by ``get_secret`` and across the success path and every
-    decline/failure path, the exact credential string is absent from ``result.status``,
-    ``result.message``, ``result.proposal_id``, ``result.proposal_url`` and from
-    every ``connector.service.logger`` call's args/kwargs (Req 4.7, 6.6).
+    For any credential the adapter's ``ProviderAuth`` acquires, and across the success path
+    and every decline/failure path, the exact credential string is absent from
+    ``result.status``, ``result.message``, ``result.proposal_id``, ``result.proposal_url``
+    and from every ``connector.service.logger`` call's args/kwargs (Req 4.7, 6.6, 11.1).
     """
+    # The connector core never handles the credential (it does not import get_secret).
+    assert not hasattr(service, "get_secret")
+
     # Isolate this example: fresh rate-limit window and a unique authorized user id.
     security._rate_limit_windows.clear()
     user_id = f"user-cred-{next(_user_ids)}"
@@ -200,7 +265,8 @@ def test_property8_credential_never_appears_in_output(credential, scenario):
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-8-6"})
     try:
         with (
-            patch("connector.service.get_secret", return_value=credential),
+            # The credential is acquired by the adapter's ProviderAuth, not the core.
+            patch("connector.github_provider.get_secret", return_value=credential),
             patch("connector.service.logger", new=MagicMock()) as mock_logger,
         ):
             result = propose_change(
@@ -218,7 +284,7 @@ def test_property8_credential_never_appears_in_output(credential, scenario):
         reset_request_context(token)
 
     # Sanity: the scenario actually exercised the intended terminal state so the assertions
-    # below are meaningful (the credential gate was passed and each path was reached).
+    # below are meaningful (each path was reached).
     if scenario == "success":
         assert result.status == "created", result.message
         assert result.proposal_id is not None

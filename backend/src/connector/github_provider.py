@@ -48,6 +48,8 @@ from connector.models import (
     ChangeProposalResult,
 )
 from connector.provider import (
+    OutboundRequest,
+    ProviderAuth,
     ProviderAuthError,
     ProviderConflictError,
     ProviderError,
@@ -59,9 +61,9 @@ from utils.secrets import get_secret
 
 if TYPE_CHECKING:
     # Local modules
-    from connector.config import SourceControlConfig
+    from connector.config import AdapterConfig, SourceControlConfig
 
-__all__ = ["GitHubProvider"]
+__all__ = ["GitHubProvider", "GitHubTokenAuth"]
 
 # Public GitHub REST API host. GitHub Enterprise deployments would override this with a
 # configured base URL; the connector defaults to the public host.
@@ -75,6 +77,40 @@ _API_VERSION = "2022-11-28"
 _BLOB_MODE = "100644"
 
 
+class GitHubTokenAuth(ProviderAuth):
+    """Token-based :class:`ProviderAuth` for the GitHub adapter (Req 11.1).
+
+    Implements the provider-neutral credential-acquisition contract for a token-based
+    Provider: it fetches the credential fresh from AWS Secrets Manager at the configured
+    ``credential_secret_arn`` and attaches it to the outbound request as an
+    ``Authorization: Bearer <token>`` header. The credential is **never** logged (Req 4.7,
+    6.6) and a missing/empty credential fails closed as a :class:`ProviderAuthError` so the
+    calling operation is aborted without retry (Req 10.2).
+
+    Credential acquisition is owned here, in the adapter, rather than in the connector core:
+    a future IAM-native adapter (e.g. CodeCommit/SigV4) satisfies the *same* contract by
+    signing the request with the runtime role and never calling ``get_secret``.
+    """
+
+    def __init__(self, config: AdapterConfig) -> None:
+        # The single ARN-valued credential setting (AdapterConfig.credential_secret_arn).
+        self._credential_secret_arn = config.credential_secret_arn
+
+    def apply(self, request: OutboundRequest) -> None:
+        """Fetch the credential and set the ``Authorization`` header on ``request``.
+
+        The credential is retrieved fresh per operation from Secrets Manager and placed in
+        the ``Authorization`` header; it is never logged (Req 4.7, 6.6). A missing/empty
+        credential fails closed as an authorization error (Req 10.2, 11.1).
+        """
+        token = get_secret(self._credential_secret_arn, source="secretsmanager")
+        if not token:
+            raise ProviderAuthError(
+                "Source-control credential could not be retrieved from Secrets Manager"
+            )
+        request.headers["Authorization"] = f"Bearer {token}"
+
+
 class GitHubProvider(SourceControlProvider):
     """`SourceControlProvider` implemented against the GitHub REST API.
 
@@ -84,10 +120,12 @@ class GitHubProvider(SourceControlProvider):
     """
 
     def __init__(self, config: SourceControlConfig) -> None:
-        # Credential + base URL are adapter-owned (AdapterConfig); the per-request timeout
-        # is neutral operational tuning (ConnectorConfig). The composed SourceControlConfig
-        # gives the adapter access to both after the v2 three-layer config split.
-        self._credential_secret_id = config.adapter.credential_secret_arn
+        # Credential acquisition is adapter-owned behind the neutral ProviderAuth contract:
+        # GitHubTokenAuth fetches the secret at AdapterConfig.credential_secret_arn and
+        # attaches the Authorization header per operation (Req 11.1). The per-request
+        # timeout is neutral operational tuning (ConnectorConfig); the base URL is
+        # adapter-owned (AdapterConfig).
+        self._auth: ProviderAuth = GitHubTokenAuth(config.adapter)
         self._timeout = float(config.connector.provider_timeout_seconds)
         # provider_base_url is a real, validated config field (absolute https or None). When
         # unset the adapter falls back to the public GitHub API host (Req 10.2, 10.3).
@@ -321,22 +359,22 @@ class GitHubProvider(SourceControlProvider):
     # -------------------------------------------------------------------- helpers
 
     def _auth_headers(self) -> dict[str, str]:
-        """Fetch the credential for this operation and build request headers.
+        """Build request headers, delegating credential acquisition to the ProviderAuth.
 
-        The credential is retrieved fresh per operation from Secrets Manager and placed in
-        the ``Authorization`` header; it is never logged (Req 4.7, 6.6). A missing/empty
-        credential fails closed as an authorization error (Req 10.2).
+        The neutral, provider-agnostic base headers (Accept + API version) are set here;
+        the credential is acquired and attached by the adapter-owned
+        :class:`GitHubTokenAuth` through the :class:`ProviderAuth` contract, which fetches
+        the secret fresh per operation and never logs it (Req 4.7, 6.6, 11.1). A missing/
+        empty credential fails closed as a :class:`ProviderAuthError` (Req 10.2).
         """
-        token = get_secret(self._credential_secret_id, source="secretsmanager")
-        if not token:
-            raise ProviderAuthError(
-                "Source-control credential could not be retrieved from Secrets Manager"
-            )
-        return {
-            "Authorization": f"Bearer {token}",
-            "Accept": _ACCEPT,
-            "X-GitHub-Api-Version": _API_VERSION,
-        }
+        request = OutboundRequest(
+            headers={
+                "Accept": _ACCEPT,
+                "X-GitHub-Api-Version": _API_VERSION,
+            }
+        )
+        self._auth.apply(request)
+        return request.headers
 
     def _request(
         self,

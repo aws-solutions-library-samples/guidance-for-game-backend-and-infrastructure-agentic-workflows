@@ -181,9 +181,7 @@ def _run(files, intent_words, *, confirmed: bool):
 
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-1"})
     try:
-        with patch("connector.service.get_secret", return_value="ghp_fake_token_value"), patch.object(
-            service, "_get_audit_sink", return_value=sink
-        ):
+        with patch.object(service, "_get_audit_sink", return_value=sink):
             result = propose_change(
                 intent,
                 files,

@@ -131,7 +131,6 @@ def _call_propose(intent: str, title: str, description: str, fake: FakeProvider)
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
     try:
         with (
-            mock.patch.object(service, "get_secret", return_value="ghs_faketoken1234567890abcd"),
             mock.patch.object(service, "check_rate_limit", return_value=None),
         ):
             return propose_change(

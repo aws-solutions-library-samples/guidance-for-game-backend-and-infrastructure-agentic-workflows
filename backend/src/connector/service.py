@@ -60,7 +60,6 @@ from connector.provider import (
 )
 from utils.logger import logger
 from utils.request_context import get_request_context
-from utils.secrets import get_secret
 from utils.security import (
     INJECTION_PATTERNS,
     InputValidationError,
@@ -268,11 +267,13 @@ def read_iac_files(
 #   4. allowlist           — exact, case-sensitive, full-string (repo, branch) match;
 #                            effective repo/branch come from the matched entry, never input
 #   5. rate limit          — per-user sliding window
-#   6. credential fetch    — get_secret; fail-closed on failure/timeout
-#   7. IaC validation      — decline empty file sets; validate parseable/structural IaC
-#   8. provider ops        — latest_commit_sha → unique branch → create_branch →
-#                            commit_files → open_change_proposal, transient-only retries
-#   9. success audit       — audit-write failure aborts atomically
+#   6. IaC validation      — decline empty file sets; validate parseable/structural IaC
+#   7. provider ops        — latest_commit_sha → unique branch → create_branch →
+#                            commit_files → open_change_proposal, transient-only retries.
+#                            Credential acquisition is adapter-owned behind ProviderAuth: a
+#                            ProviderAuthError here (fail-closed, no retry) preserves the
+#                            credential fail-closed behavior the removed Gate 6 provided.
+#   8. success audit       — audit-write failure aborts atomically
 #
 # Every terminal path returns a secret-free :class:`ProposalResult` and writes an
 # audit entry; a failed audit write turns any outcome into an audit-persistence error
@@ -689,36 +690,13 @@ def propose_change(
             reason="rate_limit_exceeded",
         )
 
-    # --- Gate 6: credential retrieval, fail-closed (Req 4.6) ----------------------------
-    # The credential is fetched (and cached) from Secrets Manager before any provider op so
-    # a retrieval failure aborts with no branch/PR. The value itself is NEVER placed in an
-    # audit field or the returned message (Req 4.7, 6.6).
-    try:
-        credential = get_secret(
-            resolved_config.adapter.credential_secret_arn, source="secretsmanager"
-        )
-    except Exception:  # noqa: BLE001 - any retrieval failure is fail-closed
-        credential = None
-    if not credential:
-        return _finalize(
-            ProposalResult(
-                status="error",
-                proposal_id=None,
-                proposal_url=None,
-                message="The source-control credential could not be retrieved; no proposal was created.",
-            ),
-            level="error",
-            message="Change proposal aborted: credential retrieval failed",
-            event="scm_credential_error",
-            action="create",
-            outcome="error",
-            requesting_user=user_id or "anonymous",
-            repository=repo,
-            target_branch=branch,
-            reason="credential_retrieval_failed",
-        )
-
-    # --- Gate 7: IaC validation; decline empty file sets (Req 2.7, 11.1, 11.2) ----------
+    # --- Gate 6: IaC validation; decline empty file sets (Req 2.7, 11.1, 11.2) ----------
+    # NOTE: credential acquisition is no longer a service gate. It is owned entirely by the
+    # Provider_Adapter behind the neutral ``ProviderAuth`` contract (Req 11.1): the adapter
+    # fetches the credential on its first provider operation and raises ``ProviderAuthError``
+    # if acquisition fails. That error is caught in Gate 7 below and mapped to a safe,
+    # no-retry error result, so fail-closed credential behavior is preserved without the core
+    # ever handling (or importing) ``get_secret``.
     proposed_files = list(files)
     if not proposed_files:
         return _finalize(
@@ -766,7 +744,7 @@ def propose_change(
             reason=f"iac_validation_failed:{exc.file}",
         )
 
-    # --- Gate 8: provider operations (transient-only retries) ---------------------------
+    # --- Gate 7: provider operations (transient-only retries) ---------------------------
     resolved_provider = _resolve_provider(resolved_config, provider)
     attempts = resolved_config.connector.retry_max_attempts
 
@@ -936,7 +914,7 @@ def propose_change(
             reason="provider_operation_failed",
         )
 
-    # --- Gate 9: success audit; audit-write failure aborts atomically (Req 6.3, 6.4) ----
+    # --- Gate 8: success audit; audit-write failure aborts atomically (Req 6.3, 6.4) ----
     return _finalize(
         ProposalResult(
             status="created",

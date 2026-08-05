@@ -119,7 +119,10 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_WINDOW_SECONDS", "60"
 # connector plus an audit entry rather than an import-time crash.
 SCM_CONNECTOR_ENABLED = os.getenv("GBAW_SCM_CONNECTOR_ENABLED", "false")  # truthy: true/1/yes
 SCM_PROVIDER = os.getenv("GBAW_SCM_PROVIDER")  # e.g. "github"
-SCM_CREDENTIAL_SECRET_ID = os.getenv("GBAW_SCM_CREDENTIAL_SECRET_ID")  # Secrets Manager id/ARN
+# The single ARN-valued credential setting used consistently for both runtime credential
+# acquisition (AdapterConfig.credential_secret_arn) and the scoped IAM grant
+# (ScmCredentialSecretArn), so runtime config and IAM scope cannot drift (Req 11.2 / MR5).
+SCM_CREDENTIAL_SECRET_ARN = os.getenv("GBAW_SCM_CREDENTIAL_SECRET_ARN")  # Secrets Manager ARN
 SCM_REPO_ALLOWLIST = os.getenv("GBAW_SCM_REPO_ALLOWLIST")  # "repo=branch,branch;repo=branch" grammar
 SCM_AUTHORIZED_GROUPS = os.getenv("GBAW_SCM_AUTHORIZED_GROUPS")  # comma-separated Cognito groups
 SCM_RATE_LIMIT_MAX = os.getenv("GBAW_SCM_RATE_LIMIT_MAX", "5")  # 1..1000, default 5

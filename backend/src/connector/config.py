@@ -33,9 +33,10 @@ the split is preserved exactly, only re-homed:
 - When the flag is truthy but a required value is missing/invalid, a single
   configuration-error audit entry is emitted via the existing ``logger`` with every field
   passed through ``sanitize_log_data`` so no raw credential can leak (Req 1.6, 12.3, 12.4).
-- The credential is referenced **only** by a Secrets Manager secret id/ARN; a value that
-  looks like a raw credential (token/PEM/AWS-key shape) is rejected and its value is
-  excluded from all audit output (Req 12.2, 12.3).
+- The credential is referenced **only** by a single Secrets Manager secret ARN
+  (``GBAW_SCM_CREDENTIAL_SECRET_ARN``); a value that is not ARN-shaped (a bare secret name,
+  or a raw credential accidentally supplied here) is rejected and its value is excluded from
+  all audit output (Req 11.2, 12.3).
 
 Per-contract validation rules (all failures accumulate on the owning contract):
 
@@ -45,8 +46,8 @@ Per-contract validation rules (all failures accumulate on the owning contract):
 - ``provider_base_url`` set but not an absolute https URL → error and disabled; unset →
   ``None`` so the adapter uses the provider's public endpoint (Req 10.2, 10.3, 10.4).
 - ``audit_log_group`` absent on the enabled path → error and disabled (Req 13.1).
-- ``credential_secret_arn`` unset → error; raw-credential-shaped value → error and the
-  value is omitted from audit output (Req 12.2, 12.3).
+- ``credential_secret_arn`` unset → error; value not ARN-shaped → error and the value is
+  omitted from audit output (Req 11.2, 12.3).
 - Allowlist unparsable or zero entries → error (Req 5.4).
 - ``authorized_groups`` empty → error (Req 7.5).
 - ``rate_limit_max`` outside 1..1000 or ``rate_limit_window_seconds`` outside 60..86400 →
@@ -89,18 +90,9 @@ _MAX_FILES_DEFAULT = 20
 
 # A Secrets Manager secret ARN, e.g.
 # arn:aws:secretsmanager:us-west-2:123456789012:secret:my/secret-AbCdEf
+# This is the single ARN-valued credential setting's required shape (Req 11.2 / MR5).
 _SECRET_ARN_RE = re.compile(
     r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$"
-)
-
-# Shapes that indicate a RAW credential was supplied in place of a secret id (Req 12.2,
-# 12.3). Matching any of these rejects the value; the value itself is never logged.
-_RAW_CREDENTIAL_PATTERNS = (
-    r"-----BEGIN",  # PEM private key / certificate block
-    r"github_pat_[A-Za-z0-9_]{20,}",  # GitHub fine-grained PAT
-    r"gh[pousr]_[A-Za-z0-9]{20,}",  # GitHub classic tokens (ghp_/gho_/ghu_/ghs_/ghr_)
-    r"xox[baprs]-",  # Slack-style tokens (defensive)
-    r"AKIA[0-9A-Z]{16}",  # AWS access key id
 )
 
 
@@ -295,10 +287,13 @@ class AdapterConfig:
     provider credentials and the optional ``provider_base_url`` for self-hosted/enterprise
     endpoints. ``config_errors`` accumulates this contract's validation failures.
 
-    This task keeps the credential *value* sourced from the existing
-    ``GBAW_SCM_CREDENTIAL_SECRET_ID`` setting (the single-ARN consolidation and the move of
-    credential acquisition into the adapter are later v2 tasks); it is simply re-homed onto
-    this contract as ``credential_secret_arn``.
+    The credential is the single ARN-valued setting sourced from
+    ``GBAW_SCM_CREDENTIAL_SECRET_ARN`` (the v2 single-ARN consolidation, MR5). The same ARN
+    is used for both runtime acquisition — the adapter's :class:`ProviderAuth` fetches the
+    secret at this ARN — and the scoped IAM grant, so runtime config and IAM scope cannot
+    drift. When the connector is enabled the value MUST be ARN-shaped; any other value
+    (including a raw credential accidentally supplied in its place) fails closed with a
+    config error and is never echoed into the error/audit output (Req 11.2, 12.3).
     """
 
     credential_secret_arn: str | None
@@ -310,19 +305,22 @@ class AdapterConfig:
         """Build the adapter contract from ``GBAW_SCM_*`` values, accumulating errors."""
         errors: list[str] = []
 
-        # --- Credential secret ARN: required, and must be a secret id/ARN, not a raw value.
-        raw_secret = (settings.SCM_CREDENTIAL_SECRET_ID or "").strip()
+        # --- Credential secret ARN: required, and must be a Secrets Manager ARN. A value
+        # that is not ARN-shaped (a bare secret name, or a raw credential accidentally
+        # supplied here) is rejected fail-closed; the value is NEVER echoed into the error
+        # or audit output in case it is a raw credential (Req 11.2, 12.3).
+        raw_secret = (settings.SCM_CREDENTIAL_SECRET_ARN or "").strip()
         credential_secret_arn: str | None = raw_secret or None
         if credential_secret_arn is None:
             errors.append(
-                "credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ID is required but was not set"
+                "credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ARN is required but was not set"
             )
-        elif _looks_like_raw_credential(credential_secret_arn):
-            # Req 12.3: reject and NEVER echo the raw value into the error/audit output.
+        elif not _SECRET_ARN_RE.match(credential_secret_arn):
+            # Reject and NEVER echo the value into the error/audit output.
             credential_secret_arn = None
             errors.append(
-                "credential_secret_arn: a raw credential value was supplied in place of an "
-                "AWS Secrets Manager secret id; value rejected and omitted"
+                "credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ARN must be a valid AWS "
+                "Secrets Manager secret ARN; value rejected and omitted"
             )
 
         # --- Provider base URL: optional. When set it MUST be an absolute HTTPS URL
@@ -428,28 +426,6 @@ class SourceControlConfig:
             connector=ConnectorConfig._defaults(),
             adapter=AdapterConfig._empty(),
         )
-
-
-def _looks_like_raw_credential(value: str) -> bool:
-    """Return ``True`` if ``value`` looks like a raw credential, not a secret id/ARN.
-
-    A valid Secrets Manager ARN is accepted outright. Otherwise the value is rejected if
-    it matches a known credential shape (PEM, GitHub/Slack token, AWS access key), if it
-    is a bare 40-char base64 string (AWS-secret-key shape), or if it contains whitespace
-    (never valid in a Secrets Manager id). This is a defensive heuristic (Req 12.2, 12.3).
-    """
-    if _SECRET_ARN_RE.match(value):
-        return False
-    if any(ch.isspace() for ch in value):
-        return True
-    for pattern in _RAW_CREDENTIAL_PATTERNS:
-        if re.search(pattern, value):
-            return True
-    # A bare AWS-secret-key-shaped string (exactly 40 base64 chars) is a raw credential,
-    # whereas a real secret *name* virtually always contains other characters/structure.
-    if re.fullmatch(r"[A-Za-z0-9/+=]{40}", value):
-        return True
-    return False
 
 
 def _is_absolute_https_url(value: str) -> bool:

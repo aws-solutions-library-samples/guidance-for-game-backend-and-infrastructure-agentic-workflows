@@ -201,7 +201,6 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-1"})
     try:
         with (
-            mock.patch.object(service, "get_secret", return_value="ghp_fake_token_value"),
             # Patch time.sleep so retry backoff does not actually wait (fast test).
             mock.patch("connector.service.time.sleep", return_value=None),
             mock.patch.object(service, "logger") as mock_logger,

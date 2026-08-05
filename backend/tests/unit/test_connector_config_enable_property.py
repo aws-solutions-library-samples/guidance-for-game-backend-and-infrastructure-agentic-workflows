@@ -55,18 +55,16 @@ def _truthy_flags(draw) -> str:
 _providers = st.just("github")
 
 
-# A valid Secrets Manager ARN, matching the module's _SECRET_ARN_RE.
+# A valid Secrets Manager ARN, matching the module's _SECRET_ARN_RE. After the v2 single-ARN
+# consolidation (MR5) this is the ONLY accepted shape for the credential setting: the
+# adapter validates ``GBAW_SCM_CREDENTIAL_SECRET_ARN`` is ARN-shaped when enabled, so a bare
+# secret name no longer produces a valid, enabled config.
 _secret_arns = st.from_regex(
-    r"arn:aws:secretsmanager:[a-z]{2}-[a-z]{4,9}-\d:\d{12}:secret:[A-Za-z0-9/_-]{1,20}",
+    r"arn:aws:secretsmanager:[a-z]{2}-[a-z]{4,9}-[0-9]:[0-9]{12}:secret:[A-Za-z0-9/_-]{1,20}",
     fullmatch=True,
 )
 
-# A plain Secrets Manager secret *name* that cannot be mistaken for a raw credential:
-# a "scm/"-prefixed, whitespace-free token of bounded length (never the 40-char base64
-# shape, never a PEM/token pattern).
-_secret_names = st.from_regex(r"scm/[a-z0-9][a-z0-9._-]{2,18}", fullmatch=True)
-
-_credential_secret_ids = st.one_of(_secret_arns, _secret_names)
+_credential_secret_arns = _secret_arns
 
 
 # Repository and branch identifiers that survive the allowlist grammar unchanged: no
@@ -127,7 +125,7 @@ def _valid_configs(draw) -> dict:
         "flag": draw(_truthy_flags()),
         "provider": draw(_providers),
         "provider_base_url": draw(_provider_base_urls),
-        "credential_secret_id": draw(_credential_secret_ids),
+        "credential_secret_arn": draw(_credential_secret_arns),
         "allowlist_encoded": allowlist_encoded,
         "expected_entries": expected_entries,
         "groups": groups,
@@ -151,7 +149,7 @@ def _patched_settings(cfg: dict):
         SCM_CONNECTOR_ENABLED=cfg["flag"],
         SCM_PROVIDER=cfg["provider"],
         SCM_PROVIDER_BASE_URL=cfg["provider_base_url"],
-        SCM_CREDENTIAL_SECRET_ID=cfg["credential_secret_id"],
+        SCM_CREDENTIAL_SECRET_ARN=cfg["credential_secret_arn"],
         SCM_REPO_ALLOWLIST=cfg["allowlist_encoded"],
         SCM_AUTHORIZED_GROUPS=",".join(cfg["groups"]),
         SCM_AUDIT_LOG_GROUP=cfg["audit_log_group"],
@@ -187,7 +185,7 @@ def test_property1_truthy_valid_config_enables_connector(cfg):
     assert config.connector.provider == cfg["provider"]
     assert config.adapter.provider_base_url == cfg["provider_base_url"]
     assert config.connector.audit_log_group == cfg["audit_log_group"]
-    assert config.adapter.credential_secret_arn == cfg["credential_secret_id"]
+    assert config.adapter.credential_secret_arn == cfg["credential_secret_arn"]
     assert config.domain.authorization_policy == cfg["expected_entries"]
     assert config.domain.authorized_groups == tuple(cfg["groups"])
     assert config.connector.rate_limit_max == cfg["rate_limit_max"]
