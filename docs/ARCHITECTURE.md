@@ -17,6 +17,17 @@ Game Agent uses a **simplified stdio-only MCP architecture** with specialized AI
 - **Cost Optimization**: Cost-effective stdio transport
 - **Improved Reliability**: Fewer network failure points and dependencies
 
+### Accepted Evolution: Optional Operations Control Plane
+
+The architecture above describes the currently deployed, read-only chat
+experience. The accepted design for a future optional operations control plane
+preserves that path and adds separate operations services and execution trust
+boundaries. These decisions do not deploy operations resources or grant
+provider write permissions.
+
+See the [architecture decision records](adr/README.md) for the accepted
+boundaries and compatibility constraints.
+
 ---
 
 ## Architecture Diagram
@@ -272,10 +283,14 @@ if __name__ == "__main__":
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
-- `BEDROCK_MODEL_ID` - Claude model to use
+- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 4.5)
+- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 4.6)
+- `GBAW_BEDROCK_MODEL_ID` / `GBAW_BEDROCK_MODEL_ID_SECONDARY` - Legacy compatibility aliases
 - `MCP_TIMEOUT` - MCP server execution timeout (default: 30 seconds)
 - `MCP_RETRY_COUNT` - Number of retry attempts (default: 2)
 - `MCP_FALLBACK_ENABLED` - Enable AWS SDK fallback (default: true)
+
+Canonical role variables take precedence over legacy aliases, then repository defaults. Haiku handles orchestration while Sonnet handles all specialist requests. This assignment is independent from failure handling: both models receive the shared Botocore adaptive retry configuration, and the runtime never substitutes one role model for the other. After retries, specialist tools return their configured AWS SDK/CLI fallback or a generic retry response, while orchestrator errors reach the top-level request handler. Prompt caching, streaming, Guardrails, and client-side specialist tools remain enabled for both roles.
 
 ---
 
@@ -583,3 +598,4 @@ scripts/
 
 - [Deployment Guide](DEPLOYMENT_GUIDE.md) — Full deployment steps and environment variable reference
 - [Security](../SECURITY.md) — Encryption, access controls, and compliance
+- [Architecture Decision Records](adr/README.md) — Accepted boundaries for the optional operations control plane

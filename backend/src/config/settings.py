@@ -8,10 +8,14 @@ and provides configuration settings for the backend.
 # Standard library
 import os
 import pathlib
+from typing import Literal, TypedDict, cast
 
 # Third-party packages
 from dotenv import load_dotenv
 from loguru import logger
+
+# Local modules
+from config.model_settings import resolve_model_ids
 
 # Get the project root directory
 PROJECT_ROOT = pathlib.Path(__file__).parent.parent.parent.parent
@@ -38,14 +42,15 @@ if AWS_PROFILE:
     os.environ["AWS_PROFILE"] = AWS_PROFILE
     logger.info(f"Using AWS Profile: {AWS_PROFILE}")
 
-# Bedrock settings - Using global foundation models with cross-region routing
-# Global profiles provide automatic failover and load balancing across regions
-# Primary: Claude Haiku 4.5 (fast, cost-effective, global routing, caching enabled)
-# Secondary: Claude Sonnet 4.5 (complex tasks, global routing, caching enabled)
-BEDROCK_MODEL_ID = os.getenv("GBAW_BEDROCK_MODEL_ID", "global.anthropic.claude-haiku-4-5-20251001-v1:0")
-BEDROCK_MODEL_ID_SECONDARY = os.getenv(
-    "GBAW_BEDROCK_MODEL_ID_SECONDARY", "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-)
+# Bedrock role settings - global profiles provide cross-region routing.
+# Canonical role variables override legacy compatibility aliases; see
+# config.model_settings.resolve_model_ids for deterministic precedence.
+ORCHESTRATOR_MODEL_ID, SPECIALIST_MODEL_ID = resolve_model_ids()
+
+# Python import compatibility for existing integrations. New code should use
+# the role-based names above; these aliases do not imply failover order.
+BEDROCK_MODEL_ID = ORCHESTRATOR_MODEL_ID
+BEDROCK_MODEL_ID_SECONDARY = SPECIALIST_MODEL_ID
 
 # Bedrock Guardrails - Production security
 BEDROCK_GUARDRAIL_ID = os.getenv("GBAW_BEDROCK_GUARDRAIL_ID")
@@ -163,25 +168,24 @@ EMBEDDING_DIMENSION = int(os.getenv("GBAW_EMBEDDING_DIMENSION", "1024"))
 BEDROCK_EXPECTED_RPM = int(os.getenv("GBAW_BEDROCK_EXPECTED_RPM", "20"))
 BEDROCK_QUOTA_RPM = int(os.getenv("GBAW_BEDROCK_QUOTA_RPM", "100"))
 
+
 # Per-agent inference parameters (Well-Architected GenAI Lens: Performance Efficiency 2)
-# Model tier (intentional): the orchestrator runs on the fast/cheap PRIMARY
-# (Haiku) for low-latency routing, while the domain specialists run on the more
-# capable SECONDARY (Sonnet) for deeper reasoning over tool output. Each entry
-# pins model_id explicitly — without it every agent silently inherited the
-# primary (Haiku), contradicting the documented design.
-# Orchestrator: deterministic routing, short responses
-# Cost: precise numbers, no creativity
-# GameLift/EKS: slight creativity for recommendations
-# Model tier (intentional): orchestrator on the fast/cheap PRIMARY (Haiku) for
-# low-latency routing; domain specialists on the more capable SECONDARY (Sonnet)
-# for deeper reasoning over tool output. Each entry pins model_id explicitly —
-# without it every agent silently inherited the primary (Haiku), contradicting
-# the documented design.
-INFERENCE_CONFIG = {
-    "orchestrator": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID},
-    "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
-    "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
-    "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": BEDROCK_MODEL_ID_SECONDARY},
+# Haiku handles deterministic, low-latency orchestration. Sonnet handles
+# deeper specialist reasoning over tool and Knowledge Base output. This role
+# assignment is independent from retry and failure behavior.
+class AgentInferenceConfig(TypedDict):
+    """Inference settings passed directly to the Strands model constructor."""
+
+    temperature: float
+    max_tokens: int
+    model_id: str
+
+
+INFERENCE_CONFIG: dict[str, AgentInferenceConfig] = {
+    "orchestrator": {"temperature": 0.0, "max_tokens": 4096, "model_id": ORCHESTRATOR_MODEL_ID},
+    "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
+    "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
+    "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
 }
 
 # Resilience settings (Well-Architected GenAI Lens: Reliability 2)
@@ -194,9 +198,11 @@ RETRY_BASE_DELAY = float(os.getenv("GBAW_RETRY_BASE_DELAY", "1.0"))
 # dynamically adjusting retry behavior based on error responses and throttling.
 from botocore.config import Config as BotocoreConfig
 
-BOTO3_RETRY_MODE = os.getenv("GBAW_BOTO3_RETRY_MODE", "adaptive")
+BOTO3_RETRY_MODE = cast(Literal["legacy", "standard", "adaptive"], os.getenv("GBAW_BOTO3_RETRY_MODE", "adaptive"))
 BOTO3_MAX_ATTEMPTS = int(os.getenv("GBAW_BOTO3_MAX_ATTEMPTS", "3"))
 BOTO3_CLIENT_CONFIG = BotocoreConfig(
+    # Supplying a config replaces Strands' 120-second Bedrock read timeout.
+    read_timeout=120,
     retries={"mode": BOTO3_RETRY_MODE, "max_attempts": BOTO3_MAX_ATTEMPTS},
 )
 
@@ -206,7 +212,8 @@ BOTO3_CLIENT_CONFIG = BotocoreConfig(
 
 # Log configuration
 logger.info(f"AWS Region: {AWS_REGION}")
-logger.info(f"Bedrock Model ID: {BEDROCK_MODEL_ID}")
+logger.info(f"Orchestrator model: {ORCHESTRATOR_MODEL_ID}")
+logger.info(f"Specialist model: {SPECIALIST_MODEL_ID}")
 
 # Log MCP configuration
 logger.info("MCP Configuration: All servers use stdio transport within AgentCore Runtime")

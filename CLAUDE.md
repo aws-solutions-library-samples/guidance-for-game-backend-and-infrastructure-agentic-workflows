@@ -58,15 +58,16 @@ uv run --directory backend pre-commit run --all-files  # Same, manual
 
 ### Agent Hierarchy
 - **Orchestrator** (`agents/orchestrator.py`) — Routes queries to specialists, uses Claude Haiku 4.5 for fast classification; optionally uses `AgentCoreMemorySessionManager` for session + long-term memory (controlled by `GBAW_USE_BEDROCK_SESSIONS`)
-- **Specialist agents** (`agents/{gamelift,eks,cost}_specialist.py`) — Domain experts using Claude Sonnet 4.5, created via `base_specialist.py` factory (`create_specialist_agent()`). Each agent's `model_id`/temperature is pinned per-agent in `settings.INFERENCE_CONFIG`; without explicit pinning every agent silently inherited the orchestrator's Haiku model
+- **Specialist agents** (`agents/{gamelift,eks,cost}_specialist.py`) — Domain experts using Claude Sonnet 4.6, created via `base_specialist.py` factory (`create_specialist_agent()`). Each agent's `model_id`/temperature is pinned per-agent in `settings.INFERENCE_CONFIG`; without explicit pinning every agent silently inherited the orchestrator's Haiku model
 - **MCP servers** — Each specialist declares its servers via `mcp_server_names`: EKS uses `aws-api-mcp-server` (account-wide resource discovery via `call_aws`) + `eks-mcp-server` (in-cluster ops); Cost uses `billing-cost-management-mcp-server`; GameLift uses boto3 directly (no MCP). Servers run as embedded stdio subprocesses; a module-level thread-safe cache in `utils/mcp_client_factory.py` reuses clients across calls, with automatic fallback to boto3 if MCP is unavailable
 
 ### Startup Pre-warming
 `agentcore_main.py` initializes Bedrock model singleton, all 3 MCP clients, and KB tools at module load time (not per-request). This cuts first-request latency by 2–4s. Failures are logged as debug and don't block startup.
 
 ### Key Backend Modules
-- `config/settings.py` — All configuration via env vars (prefixed `GBAW_`), loads from `ui/.env.local` locally; global boto3 config sets adaptive retry mode (max 3 attempts)
-- `models/cached_bedrock.py` — Bedrock model initialization with caching
+- `config/model_settings.py` — Canonical Haiku-orchestrator/Sonnet-specialist defaults and canonical-over-legacy environment precedence
+- `config/settings.py` — Runtime configuration, loads from `ui/.env.local` locally and maps resolved role models into `INFERENCE_CONFIG`; global boto3 config uses adaptive retries (max 3 attempts)
+- `models/cached_bedrock.py` — Bedrock initialization with prompt/tool caching and Guardrails; role models are not implicit fallbacks for one another
 - `utils/security.py` — Input validation, rate limiting, sanitization
 - `utils/kb_tools.py` — Bedrock Knowledge Base retrieval tools (GameLift, EKS, Cost KBs)
 - `utils/wall_clock_timeout_hook.py` — Strands hook enforcing `GBAW_AGENT_TIMEOUT_REQUEST_SECONDS`
@@ -84,8 +85,8 @@ uv run --directory backend pre-commit run --all-files  # Same, manual
 1. **solution-tracking** — Solution ID (SO9693) stack for deployment metrics
 2. **infrastructure** (base) — Cognito, IAM, ECR
 3. **guardrails** — Bedrock Guardrails (the returned `GuardrailId` is wired into the runtime)
-4. **Managed Prompts** — `scripts/infrastructure/deploy_prompts.py` publishes the four agent prompts to Bedrock Prompt Management; it is text-hash-idempotent (only re-publishes changed prompts) and writes prompt ARNs to `backend/.env.local`, which are read back and passed to the runtime as `GBAW_*_PROMPT_ARN` env vars
-5. **AgentCore Runtime** — direct-code deploy via CodeBuild (ARM64, no FastAPI wrapper); a re-launch step rewires KB IDs + prompt ARNs as env vars
+4. **Managed Prompts** — `scripts/infrastructure/deploy_prompts.py` publishes the four agent prompts to Bedrock Prompt Management; it compares text, role model, and inference settings before publishing a new version and writes prompt ARNs to `backend/.env.local`
+5. **AgentCore Runtime** — direct-code deploy via CodeBuild (ARM64, no FastAPI wrapper); initial launches and updates receive the resolved `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID` together with available KB, Guardrail, and prompt settings
 6. **observability** — account-wide CloudWatch/X-Ray trace delivery
 7. **Knowledge Bases** (GameLift, EKS, Cost) — deployed then seeded
 8. **frontend** — ECS Express (managed Fargate + ALB)
@@ -128,6 +129,8 @@ Notable vars not in the example file:
 
 | Var | Default | Notes |
 |-----|---------|-------|
+| `GBAW_ORCHESTRATOR_MODEL_ID` | Haiku 4.5 global profile | Canonical orchestrator role; overrides `GBAW_BEDROCK_MODEL_ID` |
+| `GBAW_SPECIALIST_MODEL_ID` | Sonnet 4.6 global profile | Canonical GameLift/EKS/Cost role; overrides `GBAW_BEDROCK_MODEL_ID_SECONDARY` |
 | `GBAW_USE_BEDROCK_SESSIONS` | `true` | Enables cross-session memory via AgentCore |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | `true` | Long-term user memory (30-day TTL) |
 | `GBAW_MEMORY_REQUIRED` | `false` | If `true`, hard-fails when memory unavailable |

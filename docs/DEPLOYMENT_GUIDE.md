@@ -23,7 +23,7 @@ Before you begin, ensure you have the following installed and configured:
 ### AWS Account Requirements
 
 Your AWS account needs the following:
-- **Bedrock Model Access**: Claude Sonnet 4.5 and Claude Haiku 4.5 enabled in your region
+- **Bedrock Model Access**: Claude Sonnet 4.6 and Claude Haiku 4.5 enabled in your region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
@@ -33,7 +33,7 @@ Your AWS account needs the following:
 2. Navigate to **Model access** in the left sidebar
 3. Click **Manage model access**
 4. Enable:
-   - Anthropic Claude 4.5 Sonnet
+   - Anthropic Claude Sonnet 4.6
    - Anthropic Claude 4.5 Haiku
 5. Click **Save changes**
 
@@ -107,7 +107,10 @@ cp ui/.env.local.example ui/.env.local
 
 Edit `ui/.env.local` if you need to customize:
 - `AWS_REGION`: Your deployment region
-- `BEDROCK_MODEL_ID`: AI model to use (default: Claude Sonnet 4.5)
+- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 4.5)
+- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 4.6)
+
+Process environment values take precedence over `ui/.env.local`. The canonical role variables above take precedence over the compatibility aliases `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; empty values are treated as unset. The deployment passes the resolved role IDs to AgentCore on both initial launch and updates.
 
 ### Step 4: Deploy
 
@@ -157,7 +160,7 @@ Log in with the admin credentials you created.
 | Frontend | ECS Express (Fargate + ALB) | Web UI with chat interface |
 | Backend | Bedrock AgentCore | AI agents and orchestration |
 | Auth | Cognito | User authentication |
-| AI Models | Bedrock | Claude 4.5 Sonnet/Haiku |
+| AI Models | Bedrock | Claude Haiku 4.5 orchestrator and Claude Sonnet 4.6 specialists |
 | Knowledge Bases | Bedrock | RAG for GameLift, EKS, Cost |
 | Guardrails | Bedrock | AI safety controls |
 | Observability | CloudWatch | Logging and monitoring |
@@ -181,9 +184,20 @@ This grants Game Agent read-only access to monitor pods, deployments, and servic
 # Check all stacks
 aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `game-agent`)]'
 
-# Run validation tests
+# Validate resources and cloud integration
+./validate-deployment.sh
 ./test-cloud.sh
+
+# Exercise Guardrail behavior and specialist routing/tool use
+./test-ai-evals.sh
+
+# Confirm startup logged both resolved model roles
+aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
+  --since 30m --region "$AWS_REGION" --profile <your-profile> \
+  --filter-pattern '"Orchestrator model" || "Specialist model"'
 ```
+
+For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 4.5 for the orchestrator and Sonnet 4.6 for specialists. Response text alone is not sufficient evidence of model or tool selection.
 
 ## Teardown
 
@@ -259,10 +273,13 @@ Approximate monthly costs at minimal usage (development/demo):
 |----------|----------|---------|-------------|
 | `AWS_REGION` | No | us-west-2 | AWS deployment region |
 | `AWS_PROFILE` | No | default | AWS credentials profile |
-| `BEDROCK_MODEL_ID` | No | claude-sonnet-4-5 | Primary AI model |
+| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Orchestrator model/profile |
+| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-4-6` | All specialist models/profiles |
+| `GBAW_BEDROCK_MODEL_ID` | No | unset | Legacy orchestrator alias |
+| `GBAW_BEDROCK_MODEL_ID_SECONDARY` | No | unset | Legacy specialist alias |
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
-| `MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
-| `BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety guardrails |
+| `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
+| `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
 
 ## Security Notes
 

@@ -5,8 +5,8 @@ description = "AI-powered game server management backend"
 requires-python = ">=3.13.9,<3.14"
 dependencies = [
     # Strands packages with OTEL support
-    "strands-agents[otel]>=1.45.0",
-    "strands-agents-tools>=0.8.2",
+    "strands-agents[otel]>=1.50.2",
+    "strands-agents-tools>=0.8.5",
 
     # MCP client. Previously pinned <1.19.0 due to an eks-mcp-server
     # incompatibility (awslabs/mcp#1577: mcp 1.19 added stricter type
@@ -28,7 +28,7 @@ dependencies = [
     "PyJWT[crypto]>=2.13.0",
 
     # AgentCore SDK with Strands integration
-    "bedrock-agentcore[strands-agents]>=1.18.1",
+    "bedrock-agentcore[strands-agents]>=1.19.0",
 
     # HTTP client with AWS SigV4 signing
     "httpx>=0.28.1",
@@ -44,8 +44,8 @@ dependencies = [
     "python-hcl2>=7.0.0",
 
     # OpenTelemetry / ADOT for AgentCore observability
-    "aws-opentelemetry-distro>=0.18.0",
-    "opentelemetry-instrumentation>=0.63b1",
+    "aws-opentelemetry-distro>=0.19.0",
+    "opentelemetry-instrumentation>=0.65b0",
 
     # Process monitoring
     "psutil>=7.2.2",
@@ -58,12 +58,12 @@ dependencies = [
     # (`aws eks list-clusters`). Its log/workdir are redirected to /tmp via env in
     # mcp_client_factory.create_mcp_client (it writes under $HOME otherwise).
     # Floor at 1.3.47: 1.3.46 is affected by GHSA-29w2-fq35-v728 (High).
-    "awslabs.aws-api-mcp-server>=1.3.47",
+    "awslabs.aws-api-mcp-server>=1.4.1",
     # Replaces the YANKED awslabs.cost-explorer-mcp-server (#105). Its SQLite
     # session DB path is hardcoded in the package dir (read-only on container);
     # mcp_client_factory relocates it to /tmp via a startup patch.
-    "awslabs.billing-cost-management-mcp-server>=0.0.26",
-    "awslabs.eks-mcp-server>=0.1.33",
+    "awslabs.billing-cost-management-mcp-server>=0.0.29",
+    "awslabs.eks-mcp-server>=0.1.35",
 
     # Documentation scraper dependencies
     "requests>=2.34.2",
@@ -76,8 +76,8 @@ dependencies = [
 dev = [
     # CLI/interactive tools (not needed in production)
     "strands-agents-builder>=0.1.10",
-    "bedrock-agentcore-starter-toolkit>=0.3.10",
-    "uv>=0.11.28",
+    "bedrock-agentcore-starter-toolkit>=0.3.11",
+    "uv>=0.12.0",
 
     # Testing
     "pytest>=9.1.1",
@@ -87,10 +87,10 @@ dev = [
     "hypothesis>=6.130.0",  # property-based tests (source-control connector)
 
     # Code quality tools
-    "pre-commit>=4.6.0",
+    "pre-commit>=4.6.1",
     "black>=26.5.1",
     "isort>=8.0.1",
-    "mypy>=2.2.0",
+    "mypy>=2.3.0",
 ]
 
 [tool.black]

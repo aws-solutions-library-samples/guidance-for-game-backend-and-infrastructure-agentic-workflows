@@ -158,7 +158,7 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="your@email.com"
+                  placeholder="you@example.com"
                   required
                 />
               </div>
@@ -206,7 +206,7 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="your@email.com"
+                  placeholder="you@example.com"
                   required
                 />
               </div>

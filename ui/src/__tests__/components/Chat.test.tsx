@@ -22,6 +22,9 @@ function cleanupPortalContainer(container: HTMLElement) {
 // Mock CopilotKit components
 jest.mock('@copilotkit/react-core', () => ({
   CopilotKit: ({ children }: { children: React.ReactNode }) => <div data-testid="copilotkit">{children}</div>,
+  // Hooks consumed by NewChatButton (#253)
+  useCopilotChat: () => ({ reset: jest.fn() }),
+  useCopilotContext: () => ({ setThreadId: jest.fn() }),
 }));
 
 // Import React at module level for mock

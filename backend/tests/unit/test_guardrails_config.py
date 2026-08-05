@@ -69,6 +69,59 @@ class TestGuardrailsConfiguration:
                 assert model is not None
                 mock_model.assert_called_once()
 
+    def test_guardrails_evaluate_only_latest_message(self):
+        """All guardrail-enabled models must set guardrail_latest_message=True.
+
+        Regression guard for issue #201: without this flag, strands attaches
+        guardrailConfig to the full Converse request, so input policies
+        (PROMPT_ATTACK at HIGH strength) evaluate the entire AgentCore-Memory
+        restored conversation. Replayed assistant turns then trigger LOW-
+        confidence false positives that block valid in-domain follow-ups.
+        """
+        reset_model_cache()
+        with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ID", "test-guardrail-id"):
+            with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_VERSION", "7"):
+                with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ENABLED", True):
+                    with patch("models.cached_bedrock.BedrockModel") as mock_model:
+                        # Local modules
+                        from models.cached_bedrock import create_cached_bedrock_model
+
+                        create_cached_bedrock_model()
+
+                        call_kwargs = mock_model.call_args[1]
+                        assert call_kwargs["guardrail_latest_message"] is True
+
+    def test_guardrails_latest_message_on_specialist_model(self):
+        """The specialist role must use the same Guardrail configuration."""
+        reset_model_cache()
+        with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ID", "test-guardrail-id"):
+            with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_VERSION", "7"):
+                with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ENABLED", True):
+                    with patch("models.cached_bedrock.BedrockModel") as mock_model:
+                        # Local modules
+                        from models.cached_bedrock import create_specialist_bedrock_model
+
+                        create_specialist_bedrock_model()
+
+                        call_kwargs = mock_model.call_args.kwargs
+                        assert call_kwargs["guardrail_latest_message"] is True
+                        assert call_kwargs["cache_prompt"] == "default"
+                        assert call_kwargs["cache_tools"] == "default"
+
+    def test_guardrails_latest_message_on_override_models(self):
+        """Per-agent override models must also set guardrail_latest_message=True (issue #201)."""
+        with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ID", "test-guardrail-id"):
+            with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_VERSION", "7"):
+                with patch("models.cached_bedrock.BEDROCK_GUARDRAIL_ENABLED", True):
+                    with patch("models.cached_bedrock.BedrockModel") as mock_model:
+                        # Local modules
+                        from models.cached_bedrock import create_bedrock_model_with_overrides
+
+                        create_bedrock_model_with_overrides(temperature=0.3, max_tokens=2048)
+
+                        call_kwargs = mock_model.call_args[1]
+                        assert call_kwargs["guardrail_latest_message"] is True
+
     def test_guardrails_disabled_via_flag(self):
         """Guardrails should be skipped when disabled via flag."""
         reset_model_cache()  # Ensure fresh cache for this test

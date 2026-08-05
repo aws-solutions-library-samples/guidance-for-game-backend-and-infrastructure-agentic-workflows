@@ -177,6 +177,55 @@ cd "$PROJECT_ROOT/backend"
 echo "📦 Installing backend dependencies..."
 uv sync > /dev/null 2>&1
 
+# Resolve model roles through the same canonical Python configuration used by
+# local runtime. Process variables override ui/.env.local; canonical role names
+# override the legacy compatibility aliases.
+if ! MODEL_EXPORTS=$(uv run python "$PROJECT_ROOT/config/load_deployment_settings.py" --models-only); then
+  echo "❌ Unable to resolve canonical role models" >&2
+  exit 1
+fi
+eval "$MODEL_EXPORTS"
+echo "   Orchestrator model: $GBAW_ORCHESTRATOR_MODEL_ID"
+echo "   Specialist model:   $GBAW_SPECIALIST_MODEL_ID"
+
+is_resolved_deployment_value() {
+  [ -n "${1:-}" ] && [ "$1" != "None" ]
+}
+
+append_agentcore_env_if_resolved() {
+  local name="$1"
+  local value="${2:-}"
+
+  if is_resolved_deployment_value "$value"; then
+    AGENTCORE_ENV_ARGS+=(-env "$name=$value")
+  fi
+  return 0
+}
+
+build_agentcore_env_args() {
+  AGENTCORE_ENV_ARGS=(
+    -env "GBAW_ORCHESTRATOR_MODEL_ID=$GBAW_ORCHESTRATOR_MODEL_ID"
+    -env "GBAW_SPECIALIST_MODEL_ID=$GBAW_SPECIALIST_MODEL_ID"
+  )
+
+  if is_resolved_deployment_value "${GUARDRAIL_ID:-}"; then
+    AGENTCORE_ENV_ARGS+=(
+      -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"
+      -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT"
+    )
+  fi
+  append_agentcore_env_if_resolved "GBAW_ORCHESTRATOR_PROMPT_ARN" "${GBAW_ORCHESTRATOR_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_GAMELIFT_PROMPT_ARN" "${GBAW_GAMELIFT_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_EKS_PROMPT_ARN" "${GBAW_EKS_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_PROMPT_ARN" "${GBAW_COST_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_GAMELIFT_KB_ID" "${GAMELIFT_KB_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_EKS_KB_ID" "${EKS_KB_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_KB_ID" "${COST_KB_ID:-}"
+  return 0
+}
+
+build_agentcore_env_args
+
 # Get execution role from CloudFormation
 EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-infrastructure" \
@@ -236,7 +285,7 @@ if [ -n "$EXISTING_RUNTIME" ] && [ "$EXISTING_RUNTIME" != "null" ]; then
   RUNTIME_ARN="$EXISTING_RUNTIME"
 else
   echo "🚀 Launching new AgentCore Runtime (CodeBuild)..."
-  uv run agentcore launch --auto-update-on-conflict
+  uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 
   # Wait for runtime to be ready
   echo "⏳ Waiting for runtime to be ready..."
@@ -339,6 +388,10 @@ GAMELIFT_KB_ID=$(grep "^GBAW_GAMELIFT_KB_ID=" .env.local 2>/dev/null | cut -d'='
 EKS_KB_ID=$(grep "^GBAW_EKS_KB_ID=" .env.local 2>/dev/null | cut -d'=' -f2 || echo "")
 COST_KB_ID=$(grep "^GBAW_COST_KB_ID=" .env.local 2>/dev/null | cut -d'=' -f2 || echo "")
 
+if [ -n "$GAMELIFT_KB_ID" ]; then echo "   GameLift KB: $GAMELIFT_KB_ID"; fi
+if [ -n "$EKS_KB_ID" ]; then echo "   EKS KB:      $EKS_KB_ID"; fi
+if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
+
 # Source Control Connector (disabled by default). Wire GBAW_SCM_* vars through the
 # same -env mechanism, including only the ones that are set so read-only deployments
 # that never configure the connector are unaffected. Only the Secrets Manager secret
@@ -367,40 +420,20 @@ if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
   echo "   Source Control Connector: wiring ${#SCM_ENV_ARGS[@]} GBAW_SCM_* env var(s)"
 fi
 
-# Build the launch env-arg list. KB IDs, guardrail, and prompt ARNs are wired only
-# when all three KB IDs are present (unchanged behavior). The Source Control Connector
-# env args (SCM_ENV_ARGS) are appended UNCONDITIONALLY so the GBAW_SCM_* vars are
-# delivered to the runtime regardless of whether the KB IDs exist (Req 8.1-8.3).
-LAUNCH_ENV_ARGS=()
-if [ -n "$GAMELIFT_KB_ID" ] && [ -n "$EKS_KB_ID" ] && [ -n "$COST_KB_ID" ]; then
-  echo "   GameLift KB: $GAMELIFT_KB_ID"
-  echo "   EKS KB: $EKS_KB_ID"
-  echo "   Cost KB: $COST_KB_ID"
-  LAUNCH_ENV_ARGS+=(
-    -env "GBAW_GAMELIFT_KB_ID=$GAMELIFT_KB_ID"
-    -env "GBAW_EKS_KB_ID=$EKS_KB_ID"
-    -env "GBAW_COST_KB_ID=$COST_KB_ID"
-    -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"
-    -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT"
-    -env "GBAW_ORCHESTRATOR_PROMPT_ARN=$GBAW_ORCHESTRATOR_PROMPT_ARN"
-    -env "GBAW_GAMELIFT_PROMPT_ARN=$GBAW_GAMELIFT_PROMPT_ARN"
-    -env "GBAW_EKS_PROMPT_ARN=$GBAW_EKS_PROMPT_ARN"
-    -env "GBAW_COST_PROMPT_ARN=$GBAW_COST_PROMPT_ARN"
-  )
-else
-  echo "⚠️  KB IDs not found in .env.local - skipping KB/prompt env wiring"
+# Always update the runtime with the complete set of currently resolved values.
+# This keeps role models synchronized even when one or more optional KBs are not
+# available and avoids dropping prompt or Guardrail settings on replacement.
+# Rebuild AGENTCORE_ENV_ARGS now that KB IDs have been resolved from .env.local,
+# then append the Source Control Connector env args UNCONDITIONALLY so the
+# GBAW_SCM_* vars are delivered regardless of whether the KB IDs exist (Req 8.1-8.3).
+build_agentcore_env_args
+LAUNCH_ENV_ARGS=("${AGENTCORE_ENV_ARGS[@]}")
+if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
+  LAUNCH_ENV_ARGS+=("${SCM_ENV_ARGS[@]}")
 fi
-
-# Always append the connector env args (decoupled from KB IDs — Req 8).
-LAUNCH_ENV_ARGS+=("${SCM_ENV_ARGS[@]}")
-
-if [ ${#LAUNCH_ENV_ARGS[@]} -gt 0 ]; then
-  echo "🚀 Updating AgentCore Runtime with environment variables..."
-  uv run agentcore launch --auto-update-on-conflict "${LAUNCH_ENV_ARGS[@]}"
-  echo "✅ AgentCore Runtime updated"
-else
-  echo "⚠️  No KB IDs or connector env vars found - skipping runtime update"
-fi
+echo "🚀 Updating AgentCore Runtime environment..."
+uv run agentcore launch --auto-update-on-conflict "${LAUNCH_ENV_ARGS[@]}"
+echo "✅ AgentCore Runtime updated with role models and available service configuration"
 
 cd "$PROJECT_ROOT"
 echo ""
@@ -425,9 +458,16 @@ echo "Frontend ECR Repository: $FRONTEND_ECR_REPO"
 aws ecr get-login-password --region $AWS_REGION | \
   docker login --username AWS --password-stdin $FRONTEND_ECR_REPO
 
-# Build and push
-docker build --platform linux/amd64 -t $FRONTEND_ECR_REPO:latest .
+# Build and push under BOTH :latest and a unique per-deploy tag. The unique tag
+# is passed to the frontend stack as ImageTag: with a constant tag the stack
+# parameters never change, CloudFormation no-ops, and ECS Express keeps running
+# the task it resolved at first deploy — new images land in ECR but are never
+# served (frontend fixes silently don't ship).
+FRONTEND_IMAGE_TAG="deploy-$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo manual)-$(date +%Y%m%d%H%M%S)"
+docker build --platform linux/amd64 -t $FRONTEND_ECR_REPO:latest -t $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG .
 docker push $FRONTEND_ECR_REPO:latest
+docker push $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG
+echo "   Frontend image tag: $FRONTEND_IMAGE_TAG"
 
 echo "✅ Frontend container pushed"
 
@@ -458,6 +498,7 @@ aws cloudformation deploy \
   --parameter-overrides \
     ProjectName="$PROJECT_NAME" \
     RuntimeId="$RUNTIME_ID" \
+    ImageTag="$FRONTEND_IMAGE_TAG" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 
@@ -489,6 +530,24 @@ FRONTEND_ALB_ARN=$(aws cloudformation describe-stacks \
   --output text)
 
 echo "   ALB ARN: $FRONTEND_ALB_ARN"
+
+# Raise the ALB idle timeout above the agent wall-clock budget. The ECS Express
+# service manages its own ALB (no CloudFormation handle we can set attributes on),
+# and the AWS default idle timeout is 60s — but a complex multi-specialist agent
+# run can take up to GBAW_AGENT_TIMEOUT_REQUEST_SECONDS (180s) and the proxy waits
+# 185s. At the 60s default the ALB severs the connection mid-run, returning a 504
+# while the backend keeps working and persists the answer to memory — the user
+# sees no answer and no error (issue #250). 190s sits just above the proxy budget.
+# Idempotent: re-running just re-asserts the same value.
+if [ -n "$FRONTEND_ALB_ARN" ] && [ "$FRONTEND_ALB_ARN" != "None" ]; then
+  echo "   Setting ALB idle timeout to 190s (default 60s severs long agent runs — #250)..."
+  aws elbv2 modify-load-balancer-attributes \
+    --load-balancer-arn "$FRONTEND_ALB_ARN" \
+    --attributes Key=idle_timeout.timeout_seconds,Value=190 \
+    --region $AWS_REGION \
+    --query 'Attributes[?Key==`idle_timeout.timeout_seconds`].Value' \
+    --output text
+fi
 
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/05-security-infrastructure.yaml" \

@@ -171,6 +171,25 @@ function Deploy-GameAgent {
         uv sync 2>$null
         if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
 
+        # Resolve both model roles through the canonical Python configuration.
+        $settingsLoader = Join-Path $repoRoot 'config/load_deployment_settings.py'
+        $modelSettingsJson = (uv run python $settingsLoader --format json --models-only) | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "model settings resolution failed (exit code $LASTEXITCODE)" }
+        $modelSettings = $modelSettingsJson | ConvertFrom-Json
+        $orchestratorModelId = $modelSettings.GBAW_ORCHESTRATOR_MODEL_ID
+        $specialistModelId = $modelSettings.GBAW_SPECIALIST_MODEL_ID
+        Write-Host "   Orchestrator model: $orchestratorModelId"
+        Write-Host "   Specialist model:   $specialistModelId"
+
+        $agentCoreEnvArgs = New-GameAgentAgentCoreEnvArgs `
+            -OrchestratorModelId $orchestratorModelId `
+            -SpecialistModelId $specialistModelId `
+            -GuardrailId $guardrailId `
+            -OrchestratorPromptArn $orchestratorPromptArn `
+            -GameLiftPromptArn $gameliftPromptArn `
+            -EksPromptArn $eksPromptArn `
+            -CostPromptArn $costPromptArn
+
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
         Write-Host "Using execution role: $executionRoleArn"
 
@@ -222,7 +241,7 @@ function Deploy-GameAgent {
         # Launch or skip
         if (-not $existingRuntime) {
             Write-GameAgentStatus 'Launching new AgentCore Runtime (CodeBuild)...' -Type Info
-            uv run agentcore launch --auto-update-on-conflict
+            uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
             if ($LASTEXITCODE -ne 0) { throw "agentcore launch failed (exit code $LASTEXITCODE)" }
             Start-Sleep -Seconds 10
         } else {
@@ -292,25 +311,26 @@ function Deploy-GameAgent {
         $eksKbId      = Read-EnvVar 'GBAW_EKS_KB_ID'
         $costKbId     = Read-EnvVar 'GBAW_COST_KB_ID'
 
-        if ($gameliftKbId -and $eksKbId -and $costKbId) {
-            Write-Host "   GameLift KB: $gameliftKbId"
-            Write-Host "   EKS KB:      $eksKbId"
-            Write-Host "   Cost KB:     $costKbId"
-            uv run agentcore launch --auto-update-on-conflict `
-                -env "GBAW_GAMELIFT_KB_ID=$gameliftKbId" `
-                -env "GBAW_EKS_KB_ID=$eksKbId" `
-                -env "GBAW_COST_KB_ID=$costKbId" `
-                -env "GBAW_BEDROCK_GUARDRAIL_ID=$guardrailId" `
-                -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT" `
-                -env "GBAW_ORCHESTRATOR_PROMPT_ARN=$orchestratorPromptArn" `
-                -env "GBAW_GAMELIFT_PROMPT_ARN=$gameliftPromptArn" `
-                -env "GBAW_EKS_PROMPT_ARN=$eksPromptArn" `
-                -env "GBAW_COST_PROMPT_ARN=$costPromptArn"
-            if ($LASTEXITCODE -ne 0) { throw "agentcore launch (wire KBs) failed (exit code $LASTEXITCODE)" }
-            Write-GameAgentStatus 'AgentCore Runtime updated with KB IDs and Prompt ARNs' -Type Success
-        } else {
-            Write-GameAgentStatus 'KB IDs not found in .env.local — skipping runtime update' -Type Warning
-        }
+        if ($gameliftKbId) { Write-Host "   GameLift KB: $gameliftKbId" }
+        if ($eksKbId) { Write-Host "   EKS KB:      $eksKbId" }
+        if ($costKbId) { Write-Host "   Cost KB:     $costKbId" }
+
+        # Always pass the complete resolved environment so model-only updates
+        # are applied and optional service settings are preserved together.
+        $agentCoreEnvArgs = New-GameAgentAgentCoreEnvArgs `
+            -OrchestratorModelId $orchestratorModelId `
+            -SpecialistModelId $specialistModelId `
+            -GuardrailId $guardrailId `
+            -OrchestratorPromptArn $orchestratorPromptArn `
+            -GameLiftPromptArn $gameliftPromptArn `
+            -EksPromptArn $eksPromptArn `
+            -CostPromptArn $costPromptArn `
+            -GameLiftKbId $gameliftKbId `
+            -EksKbId $eksKbId `
+            -CostKbId $costKbId
+        uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
+        if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
+        Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
     } finally { Pop-Location }
     Write-Host ''
 
