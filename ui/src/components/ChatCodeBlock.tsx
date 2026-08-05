@@ -1,24 +1,51 @@
 import React, { useState } from 'react';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 /**
  * Custom fenced-code renderer for the chat markdown.
  *
- * Replaces CopilotKit's bundled CodeBlock (via CopilotChat's `markdownTagRenderers`)
- * to fix two issues with the default:
- *   1. Contrast — the default relied on a highlight theme that rendered dark
- *      token text on the dark block background, making IaC/code unreadable.
- *      This block uses an explicit high-contrast dark surface (see chat-layout.css).
- *   2. Download filename — the default always suggested `file-<random>.file` for
- *      unrecognized languages (terraform/hcl/etc.), so the downloaded file never
- *      matched the filename shown in the UI. Here the download name is derived
- *      from the fence token: a token that already looks like a filename
- *      (e.g. ```main.tf) is used verbatim, otherwise a sensible extension is
- *      mapped from the language.
+ * Wired through CopilotChat's `markdownTagRenderers` to fix issues with the
+ * bundled CodeBlock while preserving its useful behavior:
+ *   1. Readability — the block renders on an explicit high-contrast dark
+ *      surface (see chat-layout.css) so IaC/code isn't dark-on-dark.
+ *   2. Syntax highlighting — preserved via react-syntax-highlighter (Prism +
+ *      vsc-dark-plus), matching CopilotKit's original highlighting.
+ *   3. Download filename — derived from the fence token: a filename-like token
+ *      (e.g. ```main.tf) is used verbatim so the download matches the label,
+ *      otherwise the language maps to an extension. CopilotKit's full
+ *      language->extension map is preserved so nothing regresses to `.txt`.
  */
 
-// Map a bare language token to a file extension. Keys must be lowercase.
-// Terraform/IaC languages are the important additions over the default map.
+// Language -> file extension. Every mapping from CopilotKit's bundled
+// programmingLanguages map is preserved (so cpp/php/kotlin/swift/etc. keep
+// their native extensions), plus Terraform/IaC and config additions.
 const LANGUAGE_EXTENSIONS: Record<string, string> = {
+  // Preserved from CopilotKit's programmingLanguages map:
+  javascript: '.js',
+  python: '.py',
+  java: '.java',
+  c: '.c',
+  cpp: '.cpp',
+  'c++': '.cpp',
+  'c#': '.cs',
+  ruby: '.rb',
+  php: '.php',
+  swift: '.swift',
+  'objective-c': '.m',
+  kotlin: '.kt',
+  typescript: '.ts',
+  go: '.go',
+  perl: '.pl',
+  rust: '.rs',
+  scala: '.scala',
+  haskell: '.hs',
+  lua: '.lua',
+  shell: '.sh',
+  sql: '.sql',
+  html: '.html',
+  css: '.css',
+  // Additions (Terraform/IaC, config, and common aliases):
   terraform: '.tf',
   hcl: '.tf',
   tf: '.tf',
@@ -26,22 +53,13 @@ const LANGUAGE_EXTENSIONS: Record<string, string> = {
   yml: '.yml',
   json: '.json',
   bash: '.sh',
-  shell: '.sh',
   sh: '.sh',
   dockerfile: 'Dockerfile',
-  python: '.py',
   py: '.py',
-  javascript: '.js',
   js: '.js',
-  typescript: '.ts',
   ts: '.ts',
-  go: '.go',
-  java: '.java',
-  ruby: '.rb',
-  rust: '.rs',
-  sql: '.sql',
-  html: '.html',
-  css: '.css',
+  rb: '.rb',
+  rs: '.rs',
   xml: '.xml',
   toml: '.toml',
   ini: '.ini',
@@ -53,6 +71,7 @@ const LANGUAGE_EXTENSIONS: Record<string, string> = {
  * Derive a download filename from the code fence token.
  * - "main.tf" (contains a dot) -> used verbatim, so the download matches the label
  * - "hcl" / "terraform"        -> "code.tf"
+ * - "cpp" / "swift" / "kotlin" -> "code.cpp" / "code.swift" / "code.kt"
  * - "dockerfile"               -> "Dockerfile"
  * - unknown / empty            -> "<token>.txt" or "code.txt"
  */
@@ -62,6 +81,30 @@ export function deriveFileName(token: string): string {
   const ext = LANGUAGE_EXTENSIONS[token.toLowerCase()];
   if (ext === 'Dockerfile') return 'Dockerfile';
   return ext ? `code${ext}` : `${token}.txt`;
+}
+
+// Map a fence token to a Prism language id for highlighting. Filename-like
+// tokens (main.tf) are reduced to a language by their extension.
+const TOKEN_TO_PRISM: Record<string, string> = {
+  tf: 'hcl',
+  terraform: 'hcl',
+  hcl: 'hcl',
+  py: 'python',
+  js: 'javascript',
+  ts: 'typescript',
+  rb: 'ruby',
+  yml: 'yaml',
+  sh: 'bash',
+  shell: 'bash',
+  md: 'markdown',
+  dockerfile: 'docker',
+};
+
+export function deriveHighlightLanguage(token: string): string {
+  if (!token) return 'text';
+  const t = token.toLowerCase();
+  const key = t.includes('.') ? t.split('.').pop() || '' : t;
+  return TOKEN_TO_PRISM[key] || key || 'text';
 }
 
 const DownloadIcon = (
@@ -96,14 +139,20 @@ export function ChatCodeBlock({ inline, className, children }: ChatCodeBlockProp
   const [copied, setCopied] = useState(false);
 
   const token = /language-([\w.+-]+)/.exec(className || '')?.[1] ?? '';
-  const code = String(children ?? '').replace(/\n$/, '');
+  // Classify from the ORIGINAL content, before trimming the trailing newline.
+  // react-markdown supplies one-line fenced blocks as e.g. "echo hello\n";
+  // trimming first would make an unlabeled one-liner look inline and lose its
+  // block styling, copy, and download controls.
+  const rawChildren = String(children ?? '');
+  const isBlock = !inline && (Boolean(token) || rawChildren.includes('\n'));
 
-  // Inline code (no language fence and no newlines): render a simple readable pill.
-  if (inline || (!token && !code.includes('\n'))) {
+  if (!isBlock) {
     return <code className="ga-inline-code">{children}</code>;
   }
 
+  const code = rawChildren.replace(/\n$/, '');
   const fileName = deriveFileName(token);
+  const highlightLanguage = deriveHighlightLanguage(token);
 
   const handleCopy = async () => {
     if (copied) return;
@@ -155,9 +204,24 @@ export function ChatCodeBlock({ inline, className, children }: ChatCodeBlockProp
           </button>
         </div>
       </div>
-      <pre className="ga-code-block__pre">
-        <code>{code}</code>
-      </pre>
+      <SyntaxHighlighter
+        language={highlightLanguage}
+        style={vscDarkPlus}
+        PreTag="div"
+        className="ga-code-block__pre"
+        customStyle={{
+          margin: 0,
+          padding: '14px 16px',
+          background: '#1e1e1e',
+          fontSize: '13px',
+          lineHeight: '1.55',
+        }}
+        codeTagProps={{
+          style: { fontFamily: 'Menlo, Monaco, Consolas, "Courier New", monospace' },
+        }}
+      >
+        {code}
+      </SyntaxHighlighter>
     </div>
   );
 }
