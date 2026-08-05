@@ -73,6 +73,10 @@ _GROUP = "scm-writers"
 # A valid Secrets Manager ARN — the single ARN-valued credential setting the adapter fetches.
 _ARN = "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf"
 
+# The seeded target-branch head; propose passes it as the Verified_Source_Snapshot so the
+# read-before-write check passes and the scenario under test decides the outcome.
+_BASE_SHA = "basesha0000000000000000000000000000000000"
+
 # A benign, injection-free intent/title/description so the success/failure outcome is decided
 # by the scenario under test, not by the input-validation gate.
 _INTENT = "update the storage bucket configuration in the service infrastructure template"
@@ -202,7 +206,7 @@ def _provider_for(scenario: str) -> _AuthenticatingFakeProvider:
         AdapterConfig(credential_secret_arn=_ARN, provider_base_url=None, config_errors=())
     )
     fake = _AuthenticatingFakeProvider(auth)
-    fake.set_head(_REPO, _BRANCH, "basesha0000000000000000000000000000000000")
+    fake.set_head(_REPO, _BRANCH, _BASE_SHA)
     if scenario == "provider_auth":
         fake.fail("latest_commit_sha", ProviderAuthError("auth denied"))
     elif scenario == "provider_unavailable":
@@ -275,6 +279,7 @@ def test_credential_never_appears_in_output(credential, scenario):
                 iac_format="cloudformation",
                 title=_TITLE,
                 description=_DESCRIPTION,
+                base_revision=_BASE_SHA,
                 config=config,
                 provider=provider,
             )

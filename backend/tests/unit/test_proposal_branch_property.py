@@ -92,8 +92,13 @@ def _proposed_files() -> list[ProposedFile]:
     return [ProposedFile(path="template.yaml", content=_VALID_CFN, iac_format="cloudformation")]
 
 
-def _call_propose(fake: FakeProvider):
-    """Invoke ``propose_change`` with an authorized user; credential + rate-limit neutralized."""
+def _call_propose(fake: FakeProvider, base_revision: str):
+    """Invoke ``propose_change`` with an authorized user; credential + rate-limit neutralized.
+
+    ``base_revision`` is the Verified_Source_Snapshot the caller "read"; the provider is
+    programmed to report the same SHA as the current target head, so the read-before-write
+    check passes and the branch-selection behavior under test is isolated.
+    """
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
     try:
         with (
@@ -105,6 +110,7 @@ def _call_propose(fake: FakeProvider):
                 iac_format="cloudformation",
                 title="Update bucket configuration",
                 description="Enable versioning on the storage bucket.",
+                base_revision=base_revision,
                 config=_make_config(),
                 provider=fake,
             )
@@ -131,7 +137,9 @@ def test_property11_branch_unique_and_based_on_latest_commit(latest_sha, collisi
     # existing, then a free name; the service must regenerate until it finds the free one.
     fake.program("branch_exists", side_effects=[True] * collisions + [False])
 
-    result = _call_propose(fake)
+    # The proposal must be anchored to the snapshot the caller read; the provider reports the
+    # same SHA as the current target head, so the read-before-write check passes.
+    result = _call_propose(fake, base_revision=latest_sha)
 
     # The pipeline reached and completed the provider stage: exactly one proposal created.
     assert result.status == "created", result.message

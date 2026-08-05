@@ -179,9 +179,17 @@ class SourceControlProvider(ABC):
 
     @abstractmethod
     def latest_commit_sha(self, repo: str, branch: str) -> str:
-        """Return the SHA of the latest commit on ``branch`` of ``repo``.
+        """Return the SHA of the current head commit on ``branch`` of ``repo``.
 
-        The Proposal_Branch is based on this SHA as of creation time (Req 3.3).
+        This is the provider-neutral **head-revision resolver**: it returns an opaque
+        revision string for the current head of ``branch``. The connector uses it for two
+        purposes (Req 3.3, 7.1):
+
+        - on a read, to capture the :class:`~connector.models.FileFetchResult.revision`
+          (the Verified_Source_Snapshot the caller actually read), and
+        - on a propose, to re-read the target head and verify the caller's ``base_revision``
+          still matches it (rejecting a stale snapshot) before basing the Proposal_Branch on
+          that verified revision.
         """
         raise NotImplementedError
 

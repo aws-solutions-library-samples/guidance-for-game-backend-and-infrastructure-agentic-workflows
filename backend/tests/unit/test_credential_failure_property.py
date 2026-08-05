@@ -57,6 +57,10 @@ _GROUP = "scm-writers"
 # A valid Secrets Manager ARN — the single ARN-valued credential setting the adapter fetches.
 _ARN = "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf"
 
+# The seeded target-branch head; propose passes it as the Verified_Source_Snapshot so the
+# read-before-write check passes and the credential-failure path under test is reached.
+_BASE_SHA = "basesha0000000000000000000000000000000000"
+
 # An authenticated user in an authorized group so the authorization gate passes. Identity is
 # derived strictly from the request context, never from tool/model input.
 _AUTHORIZED_CONTEXT = {"user_id": "user-9", "groups": [_GROUP], "session_id": "sess-9"}
@@ -157,7 +161,7 @@ def test_credential_acquisition_failure_is_fail_closed_no_retry(op, message):
     no ``get_secret`` of its own (Req 4.6, 11.1).
     """
     fake = FakeProvider()
-    fake.set_head(_REPO, _BRANCH, "basesha0000000000000000000000000000000000")
+    fake.set_head(_REPO, _BRANCH, _BASE_SHA)
     fake.fail(op, ProviderAuthError(message or "credential acquisition failed"))
 
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
@@ -169,6 +173,7 @@ def test_credential_acquisition_failure_is_fail_closed_no_retry(op, message):
                 iac_format="cloudformation",
                 title=_TITLE,
                 description=_DESCRIPTION,
+                base_revision=_BASE_SHA,
                 repository=_REPO,
                 target_branch=_BRANCH,
                 config=_make_config(),

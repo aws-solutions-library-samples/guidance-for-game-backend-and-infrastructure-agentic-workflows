@@ -53,7 +53,7 @@ from connector.provider import (
     ProviderUnavailableError,
 )
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
 
@@ -209,6 +209,7 @@ def test_property18_pr_failure_after_branch_never_reports_success(files, intent_
             _IAC_FORMAT,
             title,
             description,
+            base_revision=DEFAULT_HEAD_SHA,
             config=config,
             provider=provider,
         )

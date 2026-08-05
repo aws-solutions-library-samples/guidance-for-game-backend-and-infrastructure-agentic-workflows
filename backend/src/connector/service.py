@@ -293,7 +293,19 @@ def read_iac_files(
 
     # Req 3.1 / 3.4: fetch exactly the requested paths from the matched repo+branch.
     # The provider reports missing paths in the result; no proposal is created here.
-    result = resolved_provider.get_files(repo, branch, list(paths))
+    fetched = resolved_provider.get_files(repo, branch, list(paths))
+
+    # Req 7.1: capture the Verified_Source_Snapshot — the current head of the target branch
+    # at read time — and surface it on the result as an opaque revision token. The agent
+    # passes this back as ``base_revision`` when it proposes a change, so the connector can
+    # require a read-before-write and reject a stale/unverified proposal.
+    revision = resolved_provider.latest_commit_sha(repo, branch)
+    result = FileFetchResult(
+        files=fetched.files,
+        missing=fetched.missing,
+        limit_exceeded=fetched.limit_exceeded,
+        revision=revision,
+    )
 
     if result.missing:
         logger.info(
@@ -322,6 +334,9 @@ def read_iac_files(
 #   3. authorization       — identity/groups from the request contextvar only
 #   4. allowlist           — exact, case-sensitive, full-string (repo, branch) match;
 #                            effective repo/branch come from the matched entry, never input
+#   4b. snapshot present    — a Verified_Source_Snapshot (base_revision) must be supplied;
+#                            absent -> reject with no adapter op (Req 7.2). Its head match is
+#                            re-verified in step 7 before the first mutating op (Req 7.1).
 #   5. rate limit          — per-user sliding window
 #   6. IaC validation      — decline empty file sets; validate parseable/structural IaC
 #   7. provider ops        — latest_commit_sha → unique branch → create_branch →
@@ -553,6 +568,7 @@ def propose_change(
     title: str,
     description: str,
     *,
+    base_revision: str,
     repository: str | None = None,
     target_branch: str | None = None,
     config: SourceControlConfig | None = None,
@@ -564,6 +580,14 @@ def propose_change(
     the Connector performs no further source-control operation, leaves no partial proposal
     reported as success, records an audit entry, and returns a typed, secret-free
     :class:`ProposalResult`.
+
+    ``base_revision`` is the **required** Verified_Source_Snapshot: the opaque source
+    revision the agent obtained from a prior read (``FileFetchResult.revision``). After
+    authorization and before creating any branch/commit/proposal, the connector requires it
+    to be present and to still equal the current head of the target branch; an absent or
+    stale ``base_revision`` rejects the proposal without creating a branch, commit, or
+    Change_Proposal, and an accepted proposal is anchored to that verified revision
+    (Req 7.1, 7.2).
 
     ``repository``/``target_branch`` are the *requested* values (from the agent/tool layer);
     they are only used to select an allowlist entry by exact match — the effective repo and
@@ -701,6 +725,36 @@ def propose_change(
         )
     repo, branch = decision.repo, decision.branch
 
+    # --- Gate 4b: verified source snapshot present (Req 7.1, 7.2) -----------------------
+    # A read-before-write is required: the caller must supply the Verified_Source_Snapshot
+    # (``base_revision``) it read. An absent/empty snapshot rejects the proposal here, before
+    # any adapter op — no branch, commit, or Change_Proposal is created (Req 7.2). The head
+    # match itself is re-verified against the current target head in Gate 7, just before the
+    # first mutating op (Req 7.1). Identity/effective repo/branch are already resolved so the
+    # rejection audit is complete.
+    if not base_revision:
+        return _finalize(
+            ProposalResult(
+                status="rejected",
+                proposal_id=None,
+                proposal_url=None,
+                message=(
+                    "The change proposal requires a verified source snapshot: read the "
+                    "target files first and pass the returned revision as base_revision. "
+                    "No proposal was created."
+                ),
+            ),
+            level="warning",
+            message="Change proposal rejected: missing verified source snapshot",
+            event="scm_rejected",
+            action="decline",
+            outcome="rejected",
+            requesting_user=user_id or "anonymous",
+            repository=repo,
+            target_branch=branch,
+            reason="missing_snapshot",
+        )
+
     # --- Gate 5: per-user rate limit (Req 8.1, 8.2) -------------------------------------
     try:
         check_rate_limit(
@@ -801,11 +855,41 @@ def propose_change(
     branch_created = False
     proposal_branch = ""
     try:
-        # Base the proposal branch on the latest commit of the target branch (Req 3.3).
+        # Re-read the current head of the target branch. This single read serves two roles
+        # (Req 3.3, 7.1): it is the verification re-read for the Verified_Source_Snapshot AND
+        # the base the proposal branch is created from.
         base_sha = _retry_transient(
             lambda: resolved_provider.latest_commit_sha(repo, branch),
             max_attempts=attempts,
         )
+
+        # Req 7.1: verify the snapshot the caller read is still current. If the target head
+        # has advanced since the read, the snapshot is STALE — reject without creating any
+        # branch/commit/proposal (nothing has been mutated yet). Only on a verified match do
+        # we proceed, and the proposal branch is based on that verified revision (which
+        # equals ``base_sha``), never on "latest at some later creation time".
+        if base_sha != base_revision:
+            return _finalize(
+                ProposalResult(
+                    status="rejected",
+                    proposal_id=None,
+                    proposal_url=None,
+                    message=(
+                        "The change proposal is based on a stale source snapshot: the target "
+                        "branch has advanced since it was read. Re-read the files and retry "
+                        "with the current revision. No proposal was created."
+                    ),
+                ),
+                level="warning",
+                message="Change proposal rejected: stale verified source snapshot",
+                event="scm_rejected",
+                action="decline",
+                outcome="rejected",
+                requesting_user=user_id or "anonymous",
+                repository=repo,
+                target_branch=branch,
+                reason="stale_snapshot",
+            )
 
         # Generate a unique proposal-branch name, regenerating on collision (Req 2.8).
         for _ in range(_MAX_BRANCH_NAME_ATTEMPTS):

@@ -40,7 +40,7 @@ from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector import service
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.unit
@@ -127,6 +127,7 @@ def _call_propose(repository: str, target_branch: str, fake: FakeProvider):
                 iac_format="cloudformation",
                 title="Update bucket configuration",
                 description="Enable versioning on the storage bucket.",
+                base_revision=DEFAULT_HEAD_SHA,
                 repository=repository,
                 target_branch=target_branch,
                 config=_make_config(),

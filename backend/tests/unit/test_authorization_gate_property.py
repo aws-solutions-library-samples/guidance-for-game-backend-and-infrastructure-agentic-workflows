@@ -40,7 +40,7 @@ from connector.config import AllowlistEntry, SourceControlConfig
 from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.unit
@@ -192,6 +192,7 @@ def test_property6_authorization_gate(scenario):
             iac_format="cloudformation",
             title=_TITLE,
             description=_DESCRIPTION,
+            base_revision=DEFAULT_HEAD_SHA,
             config=config,
             provider=fake,
         )

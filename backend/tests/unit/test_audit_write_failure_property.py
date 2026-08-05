@@ -50,7 +50,7 @@ from connector.config import AllowlistEntry, SourceControlConfig
 from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
 
@@ -188,6 +188,7 @@ def _run(files, intent_words, *, confirmed: bool):
                 _IAC_FORMAT,
                 title,
                 description,
+                base_revision=DEFAULT_HEAD_SHA,
                 config=config,
                 provider=provider,
             )

@@ -40,7 +40,7 @@ from connector.config import AllowlistEntry, SourceControlConfig
 from support.config_factory import make_source_control_config
 from connector import service
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.unit
@@ -141,6 +141,7 @@ def test_property13_empty_files_declined_cleanly(intent, title, description):
                 iac_format="cloudformation",
                 title=title,
                 description=description,
+                base_revision=DEFAULT_HEAD_SHA,
                 config=_make_config(),
                 provider=fake,
             )

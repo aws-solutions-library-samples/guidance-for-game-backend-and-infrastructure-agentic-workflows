@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 # Sentinel indicating "nothing programmed for this operation".
 _UNSET: Any = object()
 
+# The default head SHA reported by ``latest_commit_sha`` for a repo/branch whose head has
+# not been explicitly seeded. Tests that drive the read-before-write path pass this value as
+# ``base_revision`` when they have not called :meth:`FakeProvider.set_head` (the connector
+# verifies ``base_revision`` against the current head before proposing).
+DEFAULT_HEAD_SHA: str = "0" * 40
+
 # The fixed operation set of the abstraction (used to validate programming keys and
 # to reset per-operation state).
 OPERATIONS: tuple[str, ...] = (
@@ -200,6 +206,24 @@ class FakeProvider(SourceControlProvider):
         self._branches.add((repo, branch))
         return self
 
+    def advance_head(self, repo: str, branch: str, sha: str | None = None) -> str:
+        """Advance ``branch``'s head to a new SHA, simulating a push between read and propose.
+
+        This is the read-before-write staleness hook: a test reads (capturing the head as a
+        Verified_Source_Snapshot), calls ``advance_head`` to move the head forward, then
+        proposes with the now-stale ``base_revision`` and asserts the connector rejects it.
+        When ``sha`` is omitted a fresh, distinct 40-char hex SHA is generated so the new
+        head is guaranteed to differ from the previous one. Returns the new head SHA.
+        """
+        if sha is None:
+            previous = self._head_shas.get((repo, branch), DEFAULT_HEAD_SHA)
+            sha = f"{next(self._commit_counter):040x}"
+            if sha == previous:
+                sha = f"{next(self._commit_counter):040x}"
+        self._head_shas[(repo, branch)] = sha
+        self._branches.add((repo, branch))
+        return sha
+
     # ---------------------------------------------------------- outcome resolution
 
     def _check_operation(self, operation: str) -> None:
@@ -278,7 +302,7 @@ class FakeProvider(SourceControlProvider):
         outcome = self._programmed_outcome("latest_commit_sha")
         if outcome is not _UNSET:
             return self._apply(outcome, repo=repo, branch=branch)
-        return self._head_shas.get((repo, branch), "0" * 40)
+        return self._head_shas.get((repo, branch), DEFAULT_HEAD_SHA)
 
     def create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
         self._record(

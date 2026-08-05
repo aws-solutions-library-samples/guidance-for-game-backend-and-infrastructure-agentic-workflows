@@ -226,6 +226,7 @@ def _invoke(operation: str, provider: _AuthProvider, config: SourceControlConfig
             iac_format="cloudformation",
             title=_TITLE,
             description=_DESCRIPTION,
+            base_revision=_BASE_SHA,
             repository=_REPO,
             target_branch=_BRANCH,
             config=config,

@@ -41,11 +41,20 @@ class FileFetchResult:
     ``missing`` lists paths that could not be found without creating any proposal
     (Req 3.4); ``limit_exceeded`` is ``True`` when the requested path count exceeded
     the configured maximum and no provider fetch was performed (Req 3.2).
+
+    ``revision`` is the **Verified_Source_Snapshot** captured at read time: the opaque
+    source revision (the target-branch head at the moment of the read) that the caller
+    actually read. The agent surfaces it back as the required ``base_revision`` when it
+    proposes a change, so the connector can require a read-before-write and reject a
+    proposal that is not anchored to a confirmed view of the source (Req 7.1, 7.2). It is
+    ``None`` when no fetch was performed (e.g. a limit-exceeded or rejected read); the
+    value is provider-neutral — an opaque string the provider produced.
     """
 
     files: tuple[FileContent, ...]
     missing: tuple[str, ...]
     limit_exceeded: bool
+    revision: str | None = None
 
 
 @dataclass(frozen=True)

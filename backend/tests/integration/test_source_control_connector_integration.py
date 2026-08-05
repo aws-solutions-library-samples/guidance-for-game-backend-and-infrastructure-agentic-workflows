@@ -196,6 +196,10 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
             )
             assert len(read_result.files) == 1
             assert read_result.files[0].path == _READ_FILE
+            # The read captured the Verified_Source_Snapshot (the target-branch head); it is
+            # the opaque revision the propose step must be anchored to (read-before-write).
+            assert read_result.revision, "expected the read to capture a source revision"
+            base_revision = read_result.revision
 
             # --- Step 2: open a REAL pull request via the propose pipeline -----------------
             from connector.models import ProposedFile
@@ -215,6 +219,7 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
                     "Automated integration-test proposal. Safe to close. Adds a single "
                     "disposable SSM parameter template."
                 ),
+                base_revision=base_revision,
                 config=config,
             )
 

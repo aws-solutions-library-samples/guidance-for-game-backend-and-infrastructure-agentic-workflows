@@ -67,11 +67,16 @@ def get_iac_file(
     Returns:
         A JSON-serialisable dict:
         ``{"files": [{"path": str, "content": str}], "missing": [str, ...],
-        "limit_exceeded": bool}``. ``missing`` lists any requested path that does not
-        exist (no proposal is created for a read). ``limit_exceeded`` is ``True`` when the
-        request asked for more files than allowed, in which case no read was performed. On
-        an unexpected failure the dict instead contains an ``"error"`` message with empty
-        ``files``/``missing``.
+        "limit_exceeded": bool, "revision": str | None}``. ``missing`` lists any requested
+        path that does not exist (no proposal is created for a read). ``limit_exceeded`` is
+        ``True`` when the request asked for more files than allowed, in which case no read
+        was performed. ``revision`` is an **opaque source-snapshot token** for the version
+        of the source you just read — you MUST pass it back unchanged as the
+        ``base_revision`` argument to ``propose_infrastructure_change`` so your proposal is
+        anchored to the source you reviewed; a proposal built on a stale revision is
+        rejected. Treat ``revision`` as opaque: do not parse, modify, or fabricate it. On an
+        unexpected failure the dict instead contains an ``"error"`` message with empty
+        ``files``/``missing`` and a ``None`` ``revision``.
     """
     try:
         result = read_iac_files(
@@ -81,6 +86,7 @@ def get_iac_file(
             "files": [{"path": f.path, "content": f.content} for f in result.files],
             "missing": list(result.missing),
             "limit_exceeded": result.limit_exceeded,
+            "revision": result.revision,
         }
     except Exception:  # noqa: BLE001 - tools must never raise to the model
         logger.exception("get_iac_file failed unexpectedly", event="scm_read", action="read")
@@ -88,6 +94,7 @@ def get_iac_file(
             "files": [],
             "missing": [],
             "limit_exceeded": False,
+            "revision": None,
             "error": "The IaC files could not be read due to an internal error.",
         }
 
@@ -99,6 +106,7 @@ def propose_infrastructure_change(
     iac_format: str,
     title: str,
     description: str,
+    base_revision: str,
     repository: str | None = None,
     target_branch: str | None = None,
 ) -> dict:
@@ -112,6 +120,13 @@ def propose_infrastructure_change(
     repository, branch, the path prefix and file extension of each proposed file, and your
     authorized group membership — before any source-control operation is performed.
 
+    **Read-before-write contract.** You MUST read the target file(s) with ``get_iac_file``
+    first and pass the ``revision`` it returned as ``base_revision`` here. The proposal is
+    anchored to that verified snapshot: if ``base_revision`` is missing, or if the target
+    branch has moved on since you read it (a stale revision), the proposal is rejected and
+    no branch, commit, or change proposal is created. Re-read and retry with the fresh
+    ``revision`` if that happens.
+
     Args:
         intent: A short natural-language description of the change being proposed.
         files: The complete set of modified IaC files, each a dict
@@ -121,6 +136,10 @@ def propose_infrastructure_change(
             ``{"cloudformation", "terraform"}``.
         title: A non-empty change proposal title.
         description: A description identifying the intended change and affected files.
+        base_revision: The opaque source-snapshot token returned as ``revision`` by the
+            ``get_iac_file`` read you performed first. Pass it back unchanged; it anchors
+            the proposal to the exact source you reviewed. A missing or stale value causes
+            the proposal to be rejected without creating anything.
         repository: Optionally selects which allowlisted repository the proposal targets.
             The value must exactly match a configured allowlist entry (case-sensitive,
             full-string); a value that is not on the allowlist is rejected and no proposal
@@ -154,6 +173,7 @@ def propose_infrastructure_change(
             iac_format=iac_format,
             title=title,
             description=description,
+            base_revision=base_revision,
             repository=repository,
             target_branch=target_branch,
         )

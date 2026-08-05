@@ -49,7 +49,7 @@ from connector.models import ProposedFile
 from connector import service
 from connector.service import propose_change
 from connector.provider import ProviderConflictError
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
 
@@ -191,6 +191,7 @@ def test_property19_merge_conflict_is_reported_without_destructive_resolution(
                 _IAC_FORMAT,
                 title,
                 description,
+                base_revision=DEFAULT_HEAD_SHA,
                 config=config,
                 provider=provider,
             )

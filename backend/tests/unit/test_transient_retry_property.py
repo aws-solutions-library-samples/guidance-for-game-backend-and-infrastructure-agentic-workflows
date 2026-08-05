@@ -57,7 +57,7 @@ from connector.models import ProposedFile
 from connector import service
 from connector.provider import ProviderTransientError
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
 
@@ -211,6 +211,7 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
                 _IAC_FORMAT,
                 title,
                 description,
+                base_revision=DEFAULT_HEAD_SHA,
                 config=config,
                 provider=provider,
             )

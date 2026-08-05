@@ -38,7 +38,7 @@ from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector import service
 from connector.service import propose_change
-from support.fake_provider import FakeProvider
+from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.unit
@@ -139,6 +139,7 @@ def _call_propose(intent: str, title: str, description: str, fake: FakeProvider)
                 iac_format="cloudformation",
                 title=title,
                 description=description,
+                base_revision=DEFAULT_HEAD_SHA,
                 repository=_REPO,
                 target_branch=_BRANCH,
                 config=_make_config(),
