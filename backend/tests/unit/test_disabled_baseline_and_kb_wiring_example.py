@@ -149,7 +149,7 @@ def _build_and_invoke_specialist(monkeypatch, kb_id):
 
     monkeypatch.setattr(base, "Agent", _CapturingAgent)
     monkeypatch.setattr(base, "create_kb_retrieve_tool", kb_factory)
-    monkeypatch.setattr(base, "create_cached_bedrock_model", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(base, "create_specialist_bedrock_model", lambda *a, **k: MagicMock())
     monkeypatch.setattr(base, "create_bedrock_model_with_overrides", lambda *a, **k: MagicMock())
 
     extra_tool = MagicMock(name="additional_tool")
