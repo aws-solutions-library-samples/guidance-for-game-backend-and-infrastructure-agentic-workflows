@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
 
 # Local modules
 from connector.audit import AuditSink
-from connector.config import SourceControlConfig
+from connector.config import AuthorizationPolicy, Decision, SourceControlConfig
 from connector.iac_validation import IaCValidationError, validate_iac
 from connector.registry import get_provider
 from connector.models import (
@@ -69,7 +69,6 @@ from utils.security import (
     get_rate_limit_key,
     sanitize_log_data,
     validate_prompt,
-    verify_request_authorization,
 )
 
 if TYPE_CHECKING:
@@ -166,6 +165,49 @@ def _default_repo_and_branch(config: SourceControlConfig) -> tuple[str, str]:
     return entry.repo, entry.target_branches[0]
 
 
+def _context_groups() -> list[str]:
+    """Return the requesting user's groups from the trusted request context (Req 5.1).
+
+    Groups are derived **only** from the request-scoped identity context, never from
+    model/tool input, so a prompt-injected model cannot influence authorization. Any
+    non-list value is normalized to a list (or an empty list) for the policy check.
+    """
+    ctx = get_request_context()
+    groups = ctx.get("groups") or []
+    if not isinstance(groups, list):
+        groups = list(groups) if isinstance(groups, (tuple, set)) else []
+    return groups
+
+
+def authorize_operation(
+    config: SourceControlConfig,
+    *,
+    req_repo: str,
+    req_branch: str,
+    paths: Sequence[str],
+    groups: Sequence[str],
+) -> Decision:
+    """Authorize an operation against all five dimensions before any adapter op (Req 6).
+
+    Wraps the domain contract's operator-approved allowlist in an
+    :class:`~connector.config.AuthorizationPolicy` and evaluates the requested
+    ``(repo, branch, paths)`` and requesting ``groups`` against
+    ``config.domain.authorized_groups``. The same helper is called at the top of **both**
+    :func:`read_iac_files` and :func:`propose_change`, so reads and writes enforce the
+    identical repository/branch/path/extension/group policy (Req 6.1, 6.2). The returned
+    :class:`Decision` carries the effective repo/branch from the matched entry on success,
+    or the failed dimension on denial (Req 6.3).
+    """
+    policy = AuthorizationPolicy(entries=config.domain.authorization_policy)
+    return policy.authorize(
+        repo=req_repo,
+        branch=req_branch,
+        paths=list(paths),
+        groups=list(groups),
+        authorized_groups=list(config.domain.authorized_groups),
+    )
+
+
 def read_iac_files(
     paths: list[str],
     *,
@@ -181,13 +223,16 @@ def read_iac_files(
     - If the number of requested ``paths`` exceeds ``config.max_files_per_request``, no
       provider fetch is performed and a :class:`FileFetchResult` with
       ``limit_exceeded=True`` (and empty ``files``/``missing``) is returned (Req 3.2).
-    - The requested ``repository``/``target_branch`` selectors are matched against the
-      **whole** allowlist by exact, case-sensitive, full-string comparison via
-      :func:`_match_allowlist`. When they are omitted, they default to the first allowlist
-      entry and its first branch, preserving prior single-entry behavior. On a selector
-      MISS (no exact allowlist entry) the read is rejected: no provider fetch is performed,
-      the rejection is logged, and an empty :class:`FileFetchResult` is returned (Req 11.5).
-    - On a match the configured provider fetches exactly the requested paths from the
+    - The requested ``repository``/``target_branch`` selectors, the requested ``paths``, and
+      the requesting user's groups are enforced against all five authorization dimensions
+      (repository, branch, path, extension, group) via :func:`authorize_operation`, exactly
+      as the propose path is (Req 6.1). When the selectors are omitted, they default to the
+      first allowlist entry and its first branch. On a violation of **any** dimension the
+      read is rejected: no provider fetch is performed, the rejection is logged naming the
+      failed dimension, and an empty :class:`FileFetchResult` is returned (Req 6.3). The
+      group dimension now runs on reads too — an unauthenticated caller (no intersecting
+      groups) is rejected.
+    - On authorization the configured provider fetches exactly the requested paths from the
       **matched allowlist entry's** repository/branch (never free-form input); the returned
       result carries the files that were found and names every path that does not exist in
       ``missing``, without creating any proposal (Req 3.1, 3.4, 11.4).
@@ -218,20 +263,31 @@ def read_iac_files(
     req_repo = repository if repository is not None else default_repo
     req_branch = target_branch if target_branch is not None else default_branch
 
-    matched = _match_allowlist(resolved_config, req_repo, req_branch)
-    if matched is None:
-        # Req 11.5: a read-path selector miss is rejected with NO provider fetch.
+    # Req 6.1/6.3: enforce all five authorization dimensions (repo · branch · path ·
+    # extension · group) BEFORE any provider fetch, identically to the propose path. The
+    # group dimension now runs on reads too; identity/groups come only from the request
+    # context, never from model/tool input.
+    decision = authorize_operation(
+        resolved_config,
+        req_repo=req_repo,
+        req_branch=req_branch,
+        paths=paths,
+        groups=_context_groups(),
+    )
+    if not decision.allowed:
+        # A violation of any dimension rejects with NO provider fetch, naming the dimension.
         logger.warning(
-            "IaC file read rejected: repository/branch not in allowlist",
+            "IaC file read rejected: authorization policy denied the request",
             event="scm_rejected",
             action="read",
             outcome="rejected",
             repository=req_repo,
             target_branch=req_branch,
-            reason="allowlist_miss",
+            reason=decision.failed_dimension,
+            failed_dimension=decision.failed_dimension,
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=False)
-    repo, branch = matched
+    repo, branch = decision.repo, decision.branch
 
     resolved_provider = _resolve_provider(resolved_config, provider)
 
@@ -455,27 +511,6 @@ def _looks_injected(*texts: str) -> bool:
     return False
 
 
-def _match_allowlist(
-    config: SourceControlConfig,
-    req_repo: str,
-    req_branch: str,
-) -> tuple[str, str] | None:
-    """Return the effective ``(repo, branch)`` for an exact allowlist match, else ``None``.
-
-    The match is **case-sensitive, full-string** on both the repository and the branch, with
-    no partial/prefix/substring/wildcard matching (Req 5.2). The returned values are taken
-    from the matched allowlist entry, so a source-control operation is only ever issued
-    against an operator-approved repository/branch regardless of model or user input
-    (Req 5.5, 11.5). The allowlist lives on the domain contract's ``authorization_policy``.
-    """
-    for entry in config.domain.authorization_policy:
-        if entry.repo == req_repo:
-            for branch in entry.target_branches:
-                if branch == req_branch:
-                    return entry.repo, branch
-    return None
-
-
 def _slug(text: str, *, max_length: int = 40) -> str:
     """Turn free-text ``intent`` into a branch-safe slug for the proposal branch name."""
     slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
@@ -601,15 +636,12 @@ def propose_change(
             reason="injection_pattern_detected",
         )
 
-    # --- Gate 3: authorization (Req 7.1-7.4) --------------------------------------------
-    authorized = verify_request_authorization(
-        user_id,
-        required_groups=list(resolved_config.domain.authorized_groups),
-        user_groups=user_groups,
-        require_authentication=True,
-    )
-    if not authorized:
-        reason = "unauthenticated" if not user_id else "not_in_authorized_group"
+    # --- Gate 3: authentication (Req 5.1, 5.2, 7.1) -------------------------------------
+    # An authenticated identity is a precondition for authorization. Identity comes only
+    # from the request context; an unauthenticated request is rejected before any
+    # five-dimension check (a caller could otherwise present intersecting groups without a
+    # verified identity). The group dimension itself is enforced by Gate 4 below.
+    if not user_id:
         return _finalize(
             ProposalResult(
                 status="rejected",
@@ -618,42 +650,56 @@ def propose_change(
                 message="You are not authorized to propose infrastructure changes.",
             ),
             level="warning",
-            message="Change proposal rejected by authorization gate",
+            message="Change proposal rejected: unauthenticated request",
             event="scm_rejected",
             action="decline",
             outcome="rejected",
-            requesting_user=user_id or "anonymous",
-            reason=reason,
+            requesting_user="anonymous",
+            reason="unauthenticated",
         )
 
-    # --- Gate 4: allowlist exact match (Req 5.2, 5.3, 11.5, 11.6) ------------------------
-    # Requested repo/branch default to the first allowlist entry when the caller omits them
-    # (production tools operate on the configured repo); when supplied they must match an
-    # entry exactly. The effective repo/branch always come from the matched entry.
+    # --- Gate 4: five-dimension authorization (Req 6.1, 6.2, 6.3) -----------------------
+    # Enforce repository · branch · path · extension · group against the operator-approved
+    # policy BEFORE any adapter op, identically to the read path. Requested repo/branch
+    # default to the first allowlist entry when the caller omits them; the proposed file
+    # paths supply the path/extension dimensions. On any dimension violation the request is
+    # rejected with no provider op and a rejection audit that NAMES the failed dimension.
+    # The effective repo/branch always come from the matched entry, never from input.
     default_entry: AllowlistEntry = resolved_config.domain.authorization_policy[0]
     req_repo = repository if repository is not None else default_entry.repo
     req_branch = target_branch if target_branch is not None else default_entry.target_branches[0]
+    proposed_paths = [f.path for f in files]
 
-    matched = _match_allowlist(resolved_config, req_repo, req_branch)
-    if matched is None:
+    decision = authorize_operation(
+        resolved_config,
+        req_repo=req_repo,
+        req_branch=req_branch,
+        paths=proposed_paths,
+        groups=user_groups,
+    )
+    if not decision.allowed:
         return _finalize(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
                 proposal_url=None,
-                message="The requested repository or branch is not in the allowlist; request rejected.",
+                message=(
+                    "The request was not permitted by the authorization policy "
+                    f"({decision.failed_dimension}); no proposal was created."
+                ),
             ),
             level="warning",
-            message="Change proposal rejected: repository/branch not in allowlist",
+            message="Change proposal rejected by authorization policy",
             event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user=user_id or "anonymous",
             repository=req_repo,
             target_branch=req_branch,
-            reason="allowlist_miss",
+            reason=decision.failed_dimension,
+            failed_dimension=decision.failed_dimension,
         )
-    repo, branch = matched
+    repo, branch = decision.repo, decision.branch
 
     # --- Gate 5: per-user rate limit (Req 8.1, 8.2) -------------------------------------
     try:

@@ -16,18 +16,44 @@ no secret retrieval and no provider-factory lookup, so no ``get_secret`` mock is
 Validates: Requirements 3.1, 3.2, 3.4
 """
 
+# Standard library
+from unittest import mock
+
 # Third-party packages
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
+from connector import service as service_module
 from connector.config import AllowlistEntry, SourceControlConfig
 from support.config_factory import make_source_control_config
 from connector.service import read_iac_files
 from support.fake_provider import FakeProvider
+from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.unit
+
+# The read path now enforces all five authorization dimensions (repository, branch, path,
+# extension, group) identically to the write path (Req 6.1). The group dimension requires an
+# authenticated caller whose groups intersect the configured authorized groups, so every read
+# under test runs inside this authorized request context. The fixed allowlist entries below
+# carry no path_prefixes/extensions (any path / any extension), so the path and extension
+# dimensions are permissive here and this test isolates the read scoping/limit behavior.
+_AUTHORIZED_CONTEXT = {"user_id": "reader-1", "groups": ["scm-writers"], "session_id": "s-read"}
+
+
+def _read_authorized(paths, *, config, provider):
+    """Invoke ``read_iac_files`` inside an authorized request context.
+
+    Identity/groups are derived only from the request context (never from tool input), so an
+    authorized user is set (and reset) per call to satisfy the read path's group dimension.
+    """
+    token = set_request_context(dict(_AUTHORIZED_CONTEXT))
+    try:
+        return read_iac_files(paths, config=config, provider=provider)
+    finally:
+        reset_request_context(token)
 
 
 # --- Hypothesis strategies -------------------------------------------------
@@ -115,7 +141,7 @@ def test_property12_within_limit_fetches_scoped_and_reports_missing(case):
     the configured repo+branch, and no proposal is created (Req 3.1, 3.4)."""
     config, fake, paths, present, missing = case
 
-    result = read_iac_files(paths, config=config, provider=fake)
+    result = _read_authorized(paths, config=config, provider=fake)
 
     # Not a limit rejection: a real fetch happened.
     assert result.limit_exceeded is False
@@ -169,7 +195,7 @@ def test_property12_over_limit_rejects_without_fetch(case):
     """Over the limit: limit-exceeded result, NO provider fetch, no proposal (Req 3.2)."""
     config, fake, paths = case
 
-    result = read_iac_files(paths, config=config, provider=fake)
+    result = _read_authorized(paths, config=config, provider=fake)
 
     # Req 3.2: a limit-exceeded result with no files and no missing list.
     assert result.limit_exceeded is True
@@ -182,3 +208,112 @@ def test_property12_over_limit_rejects_without_fetch(case):
 
     # And certainly no proposal.
     _assert_no_proposal(fake)
+
+
+# --- Five-dimension enforcement on reads (Req 6.1, 6.3) --------------------
+#
+# The v2 pass authorizes reads on the same five dimensions as writes. The tests below prove
+# the group dimension (previously write-only) and the path/extension dimensions now reject a
+# read with NO provider fetch and an audit entry naming the failed dimension.
+
+
+def _make_constrained_config(*, repo: str, branch: str) -> SourceControlConfig:
+    """An enabled config whose single allowlist entry constrains path prefix + extension."""
+    return make_source_control_config(
+        enabled=True,
+        provider="github",
+        credential_secret_id="scm/credential",
+        allowlist=(
+            AllowlistEntry(
+                repo=repo,
+                target_branches=(branch,),
+                path_prefixes=("infra/",),
+                extensions=(".yaml",),
+            ),
+        ),
+        authorized_groups=("scm-writers",),
+        rate_limit_max=5,
+        rate_limit_window_seconds=3600,
+        provider_timeout_seconds=30,
+        retry_max_attempts=3,
+        max_files_per_request=20,
+        provider_base_url=None,
+        audit_log_group="scm-audit",
+        config_errors=(),
+    )
+
+
+def test_read_rejected_when_group_dimension_not_satisfied():
+    """A read by a caller with no intersecting group is rejected with no provider fetch."""
+    repo, branch = "org/iac-repo", "main"
+    config = make_source_control_config(
+        enabled=True,
+        provider="github",
+        credential_secret_id="scm/credential",
+        allowlist=(AllowlistEntry(repo=repo, target_branches=(branch,)),),
+        authorized_groups=("scm-writers",),
+        audit_log_group="scm-audit",
+    )
+    fake = FakeProvider()
+    fake.add_file(repo, branch, "infra/vpc.yaml", "content")
+
+    # Authenticated but NOT in an authorized group → group dimension fails.
+    token = set_request_context({"user_id": "u", "groups": ["other-group"], "session_id": "s"})
+    try:
+        with mock.patch.object(service_module, "logger") as mock_logger:
+            result = read_iac_files(["infra/vpc.yaml"], config=config, provider=fake)
+    finally:
+        reset_request_context(token)
+
+    assert result.files == ()
+    assert result.missing == ()
+    assert result.limit_exceeded is False
+    # No provider fetch happened.
+    assert fake.calls == []
+    # A rejection audit entry names the failed dimension.
+    rejections = [
+        call
+        for call in mock_logger.warning.call_args_list
+        if call.kwargs.get("event") == "scm_rejected"
+        and call.kwargs.get("failed_dimension") == "group"
+    ]
+    assert rejections, "expected a scm_rejected read audit naming the group dimension"
+
+
+def test_read_rejected_when_path_prefix_not_allowed():
+    """A read of a path outside the entry's path_prefixes is rejected with no fetch."""
+    repo, branch = "org/iac-repo", "main"
+    config = _make_constrained_config(repo=repo, branch=branch)
+    fake = FakeProvider()
+    fake.add_file(repo, branch, "modules/vpc.yaml", "content")
+
+    result = _read_authorized(["modules/vpc.yaml"], config=config, provider=fake)
+
+    assert result.files == ()
+    assert fake.calls == []
+
+
+def test_read_rejected_when_extension_not_allowed():
+    """A read of a path with a disallowed extension is rejected with no fetch."""
+    repo, branch = "org/iac-repo", "main"
+    config = _make_constrained_config(repo=repo, branch=branch)
+    fake = FakeProvider()
+    fake.add_file(repo, branch, "infra/vpc.tf", "content")
+
+    result = _read_authorized(["infra/vpc.tf"], config=config, provider=fake)
+
+    assert result.files == ()
+    assert fake.calls == []
+
+
+def test_read_allowed_when_path_and_extension_satisfy_entry():
+    """A read under an allowed prefix with an allowed extension fetches normally."""
+    repo, branch = "org/iac-repo", "main"
+    config = _make_constrained_config(repo=repo, branch=branch)
+    fake = FakeProvider()
+    fake.add_file(repo, branch, "infra/vpc.yaml", "content")
+
+    result = _read_authorized(["infra/vpc.yaml"], config=config, provider=fake)
+
+    assert [fc.path for fc in result.files] == ["infra/vpc.yaml"]
+    assert len(fake.calls_for("get_files")) == 1

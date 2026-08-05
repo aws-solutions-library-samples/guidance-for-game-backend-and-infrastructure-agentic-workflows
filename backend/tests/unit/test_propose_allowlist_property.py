@@ -271,17 +271,21 @@ def test_property5_non_match_performs_no_operation_and_audits(pair):
     for op in _ALL_OPS:
         assert fake.calls_for(op) == [], f"non-match unexpectedly invoked {op}"
 
-    # A rejection audit entry was recorded with the required fields (Req 5.3).
+    # A rejection audit entry was recorded with the required fields (Req 6.3). Under the v2
+    # five-dimension policy a repository/branch mismatch is reported by NAMING the failed
+    # dimension: a repo that matches no entry fails the "repo" dimension; a listed repo with
+    # a non-listed branch fails the "branch" dimension.
     assert mock_logger.warning.called
     rejection_calls = [
         call
         for call in mock_logger.warning.call_args_list
         if call.kwargs.get("event") == "scm_rejected"
-        and call.kwargs.get("reason") == "allowlist_miss"
+        and call.kwargs.get("failed_dimension") in ("repo", "branch")
     ]
-    assert rejection_calls, "expected a scm_rejected/allowlist_miss audit entry"
+    assert rejection_calls, "expected a scm_rejected audit naming the repo/branch dimension"
     audit = rejection_calls[0].kwargs
     assert audit.get("requesting_user") == _AUTHORIZED_CONTEXT["user_id"]
     assert audit.get("repository") == requested_repo
     assert audit.get("target_branch") == requested_branch
     assert audit.get("outcome") == "rejected"
+    assert audit.get("reason") == audit.get("failed_dimension")

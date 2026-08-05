@@ -46,7 +46,10 @@ def get_iac_file(
 
     Use this before proposing a change so your proposal is consistent with the current
     source of truth. Reads are always scoped to an operator-approved allowlist entry; the
-    ``paths`` you pass select which files to read, not which repository.
+    ``paths`` you pass select which files to read, not which repository. Every read is
+    authorized against the full five-dimension policy — repository, branch, path prefix,
+    file extension, and your authorized group membership — before any file is fetched; a
+    request that violates any dimension returns no files.
 
     Args:
         paths: Repository-relative file paths to read (e.g. ``["infra/vpc.yaml"]``).
@@ -105,7 +108,9 @@ def propose_infrastructure_change(
     selected allowlisted target branch, commits the proposed files, and opens exactly one
     unmerged change proposal attributed to the agent on behalf of the requesting user. The
     change flows through review and the existing CI/CD pipeline after a human approves and
-    merges.
+    merges. Every proposal is authorized against the full five-dimension policy —
+    repository, branch, the path prefix and file extension of each proposed file, and your
+    authorized group membership — before any source-control operation is performed.
 
     Args:
         intent: A short natural-language description of the change being proposed.

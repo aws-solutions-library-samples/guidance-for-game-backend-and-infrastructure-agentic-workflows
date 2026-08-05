@@ -61,6 +61,7 @@ Per-contract validation rules (all failures accumulate on the owning contract):
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -72,6 +73,8 @@ from utils.security import sanitize_log_data
 
 __all__ = [
     "AllowlistEntry",
+    "Decision",
+    "AuthorizationPolicy",
     "DomainConfig",
     "ConnectorConfig",
     "AdapterConfig",
@@ -98,15 +101,124 @@ _SECRET_ARN_RE = re.compile(
 
 @dataclass(frozen=True)
 class AllowlistEntry:
-    """One repository paired with the branches the Connector may target (Req 5.1).
+    """One authorized repository with the branches, paths, and extensions it permits.
 
     ``repo`` is an exact repository identifier (e.g. ``"org/iac-repo"``) and
     ``target_branches`` is one or more exact branch names. Comparison at the tool
-    boundary is case-sensitive, full-string (Req 5.2).
+    boundary is case-sensitive, full-string (Req 5.2, 6.1, 6.2).
+
+    The v2 five-dimension authorization (Req 6) extends each entry with two optional,
+    repo-relative constraints:
+
+    - ``path_prefixes``: the repo-relative prefixes a requested/proposed file path must lie
+      under (e.g. ``"infra/"``). **An empty tuple means "any path"** — a backward-compatible
+      entry that lists only branches permits every path.
+    - ``extensions``: the file extensions a requested/proposed path must carry (e.g.
+      ``".yaml"``, ``".tf"``). **An empty tuple means "any extension"**.
+
+    Both default to the empty tuple so entries built or parsed without the path/extension
+    dimensions behave exactly as before the v2 pass (any path / any extension).
     """
 
     repo: str
     target_branches: tuple[str, ...]
+    path_prefixes: tuple[str, ...] = ()
+    extensions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Decision:
+    """Outcome of an :class:`AuthorizationPolicy` evaluation.
+
+    ``allowed`` is ``True`` only when all five dimensions pass. On a denial,
+    ``failed_dimension`` names the first dimension that failed — one of ``"repo"``,
+    ``"branch"``, ``"path"``, ``"extension"``, or ``"group"`` — so the Service_Layer can
+    record a rejection audit that names it (Req 6.3). On an allow, ``repo`` and ``branch``
+    carry the **effective** repository/branch taken from the matched allowlist entry, never
+    from free-form input (Req 6.1, 6.2); they are ``None`` on a denial.
+    """
+
+    allowed: bool
+    failed_dimension: str | None = None
+    repo: str | None = None
+    branch: str | None = None
+
+
+@dataclass(frozen=True)
+class AuthorizationPolicy:
+    """Five-dimension authorization over a tuple of :class:`AllowlistEntry` (Req 6).
+
+    Evaluates a requested operation against **repository, branch, path, extension, and
+    group** and is enforced identically on reads and writes by the Service_Layer. The policy
+    is a stateless evaluator over ``entries`` (the operator-approved allowlist owned by
+    :class:`DomainConfig`); the Service_Layer wraps the domain contract's entries in this
+    class to authorize both the read tool and the change-proposal tool before any adapter op.
+    """
+
+    entries: tuple[AllowlistEntry, ...]
+
+    def authorize(
+        self,
+        *,
+        repo: str,
+        branch: str,
+        paths: Sequence[str],
+        groups: Sequence[str],
+        authorized_groups: Sequence[str],
+    ) -> Decision:
+        """Permit the operation iff all five dimensions pass; else deny naming the dimension.
+
+        Evaluation order (the first failing dimension is reported):
+
+        1. **repo** — at least one entry's ``repo`` equals ``repo`` (exact, case-sensitive,
+           full-string).
+        2. **branch** — among the repo-matching entries, one lists ``branch`` in its
+           ``target_branches`` (exact, case-sensitive). That entry becomes the *matched*
+           entry and supplies the effective repo/branch and the path/extension constraints.
+        3. **path** — when the matched entry has ``path_prefixes``, **every** requested path
+           must lie under one of them (``str.startswith``). An empty ``path_prefixes`` means
+           any path.
+        4. **extension** — when the matched entry has ``extensions``, **every** requested
+           path must carry one of them (``str.endswith``). An empty ``extensions`` means any
+           extension.
+        5. **group** — the requesting ``groups`` must intersect ``authorized_groups``.
+
+        On success the returned :class:`Decision` carries the effective repo/branch from the
+        matched entry (Req 6.1, 6.2); on failure it carries the failed dimension and no
+        provider operation should be performed (Req 6.3).
+        """
+        # --- Dimension 1: repository ---------------------------------------------------
+        repo_entries = [entry for entry in self.entries if entry.repo == repo]
+        if not repo_entries:
+            return Decision(allowed=False, failed_dimension="repo")
+
+        # --- Dimension 2: branch (selects the matched entry) ---------------------------
+        matched: AllowlistEntry | None = None
+        for entry in repo_entries:
+            if branch in entry.target_branches:
+                matched = entry
+                break
+        if matched is None:
+            return Decision(allowed=False, failed_dimension="branch")
+
+        # --- Dimension 3: path prefixes (absent => any path) ---------------------------
+        if matched.path_prefixes:
+            for path in paths:
+                if not any(path.startswith(prefix) for prefix in matched.path_prefixes):
+                    return Decision(allowed=False, failed_dimension="path")
+
+        # --- Dimension 4: extensions (absent => any extension) -------------------------
+        if matched.extensions:
+            for path in paths:
+                if not any(path.endswith(ext) for ext in matched.extensions):
+                    return Decision(allowed=False, failed_dimension="extension")
+
+        # --- Dimension 5: group intersection -------------------------------------------
+        if not (set(groups) & set(authorized_groups)):
+            return Decision(allowed=False, failed_dimension="group")
+
+        # All dimensions pass: effective repo/branch come from the matched entry.
+        return Decision(allowed=True, repo=matched.repo, branch=branch)
 
 
 @dataclass(frozen=True)
@@ -114,10 +226,11 @@ class DomainConfig:
     """IaC_Change_Domain configuration: authorization policy + authorized groups.
 
     Owns the operator-approved repository ``authorization_policy`` (the allowlist) and the
-    ``authorized_groups`` a requesting user must belong to. This task keeps the policy
-    minimal — it holds the existing tuple of :class:`AllowlistEntry` (repo + branch) and the
-    authorized groups exactly as before the split; the path/extension dimensions are added
-    by a later v2 task. ``config_errors`` accumulates this contract's validation failures.
+    ``authorized_groups`` a requesting user must belong to. The allowlist is the tuple of
+    :class:`AllowlistEntry` that the Service_Layer wraps in an :class:`AuthorizationPolicy`
+    to enforce all five dimensions (repository, branch, path, extension, group) identically
+    on reads and writes (Req 6). ``config_errors`` accumulates this contract's validation
+    failures.
     """
 
     authorization_policy: tuple[AllowlistEntry, ...]
@@ -445,13 +558,30 @@ def _is_absolute_https_url(value: str) -> bool:
 def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[str]]:
     """Parse the ``GBAW_SCM_REPO_ALLOWLIST`` grammar into ``AllowlistEntry`` values.
 
-    Grammar (Req 5.1)::
+    Grammar (Req 5.1, 6.1, 6.2)::
 
         allowlist := entry ( ";" entry )*
-        entry     := repo "=" branch ( "," branch )*
+        entry     := repo "=" branches [ ":" paths [ ":" extensions ] ]
+        branches  := branch ( "," branch )*
+        paths     := prefix ( "," prefix )*
+        extensions:= ext    ( "," ext )*
 
-    Returns the parsed entries (order preserved) and a list of per-entry parse errors.
-    Empty ``;``-separated segments are ignored so a trailing separator is harmless.
+    The v2 five-dimension authorization extends the entry grammar **minimally and backward
+    compatibly** with two optional ``:``-separated segments after the branches:
+
+    - the second segment lists repo-relative path prefixes (e.g. ``infra/,modules/``);
+    - the third segment lists file extensions (e.g. ``.yaml,.tf``).
+
+    An entry with **no path segment** means "any path" and an entry with **no extension
+    segment** means "any extension", so existing repo+branch-only entries such as
+    ``org/iac=main,release`` parse exactly as before (empty ``path_prefixes`` / ``extensions``).
+    A fully-specified entry looks like ``org/iac=main,release:infra/,modules/:.yaml,.tf``.
+
+    Parsing is fail-closed: a segment with no ``=``, an empty repository, no branches, or
+    more than the three permitted ``:``-separated groups is reported as a per-entry error
+    (which the caller turns into a config error → connector disabled). Returns the parsed
+    entries (order preserved) and a list of per-entry parse errors. Empty ``;``-separated
+    segments are ignored so a trailing separator is harmless.
     """
     errors: list[str] = []
     if not raw or not raw.strip():
@@ -464,19 +594,43 @@ def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[
             continue
         if "=" not in segment:
             errors.append(
-                f"allowlist: entry '{segment}' is malformed (expected 'repo=branch[,branch...]')"
+                f"allowlist: entry '{segment}' is malformed (expected "
+                "'repo=branch[,branch...][:path[,path...][:ext[,ext...]]]')"
             )
             continue
-        repo_part, branches_part = segment.split("=", 1)
+        repo_part, spec_part = segment.split("=", 1)
         repo = repo_part.strip()
+
+        # The branch/path/extension groups are ':'-separated; at most three are permitted.
+        groups = spec_part.split(":")
+        if len(groups) > 3:
+            errors.append(
+                f"allowlist: entry '{segment}' is malformed (expected at most "
+                "'branches:paths:extensions')"
+            )
+            continue
+        branches_part = groups[0]
+        paths_part = groups[1] if len(groups) >= 2 else ""
+        extensions_part = groups[2] if len(groups) >= 3 else ""
+
         branches = tuple(b.strip() for b in branches_part.split(",") if b.strip())
+        path_prefixes = tuple(p.strip() for p in paths_part.split(",") if p.strip())
+        extensions = tuple(e.strip() for e in extensions_part.split(",") if e.strip())
+
         if not repo:
             errors.append(f"allowlist: entry '{segment}' has an empty repository identifier")
             continue
         if not branches:
             errors.append(f"allowlist: repository '{repo}' has no target branches")
             continue
-        entries.append(AllowlistEntry(repo=repo, target_branches=branches))
+        entries.append(
+            AllowlistEntry(
+                repo=repo,
+                target_branches=branches,
+                path_prefixes=path_prefixes,
+                extensions=extensions,
+            )
+        )
 
     return tuple(entries), errors
 

@@ -108,3 +108,62 @@ def test_property4_allowlist_round_trip_via_config_load(mapping):
         e.repo: list(e.target_branches) for e in config.domain.authorization_policy
     }
     assert reconstructed == mapping
+
+
+# --- v2 grammar extension: optional path/extension segments (Req 6.1, 6.2) -------------
+#
+# The entry grammar gains two optional ':'-separated segments after the branches:
+#   entry := repo "=" branches [ ":" paths [ ":" extensions ] ]
+# An absent path segment means "any path" and an absent extension segment means "any
+# extension", so existing repo+branch-only entries keep parsing exactly as before.
+
+
+def test_backward_compatible_entry_has_no_path_or_extension_constraints():
+    """A repo+branch-only entry parses with empty path_prefixes / extensions (any/any)."""
+    entries, errors = _parse_allowlist("org/iac=main,release")
+
+    assert errors == []
+    assert entries == (
+        AllowlistEntry(
+            repo="org/iac",
+            target_branches=("main", "release"),
+            path_prefixes=(),
+            extensions=(),
+        ),
+    )
+
+
+def test_entry_with_path_segment_only_parses_path_prefixes():
+    """An entry with a path segment but no extension segment parses path_prefixes only."""
+    entries, errors = _parse_allowlist("org/iac=main:infra/,modules/")
+
+    assert errors == []
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.repo == "org/iac"
+    assert entry.target_branches == ("main",)
+    assert entry.path_prefixes == ("infra/", "modules/")
+    assert entry.extensions == ()
+
+
+def test_fully_specified_entry_parses_all_five_dimensions_of_config():
+    """A fully-specified entry parses branches, path prefixes, and extensions."""
+    entries, errors = _parse_allowlist("org/iac=main,release:infra/,modules/:.yaml,.tf")
+
+    assert errors == []
+    assert entries == (
+        AllowlistEntry(
+            repo="org/iac",
+            target_branches=("main", "release"),
+            path_prefixes=("infra/", "modules/"),
+            extensions=(".yaml", ".tf"),
+        ),
+    )
+
+
+def test_entry_with_too_many_colon_segments_is_a_fail_closed_error():
+    """More than three ':'-separated groups is malformed → parse error (fail-closed)."""
+    entries, errors = _parse_allowlist("org/iac=main:infra/:.yaml:extra")
+
+    assert entries == ()
+    assert errors, "an over-segmented entry must produce a config error"
