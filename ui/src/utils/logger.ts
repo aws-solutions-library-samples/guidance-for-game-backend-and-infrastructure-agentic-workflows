@@ -29,7 +29,7 @@ export function logDebug(message: string): void {
  *
  * Keeps a short non-reversible prefix for correlation while not writing the full
  * email / user id / session id to logs (which land in CloudWatch). Returns a
- * fixed placeholder for empty values. Example: "jp.velasco@example.com" -> "jp…(redacted)".
+ * fixed placeholder for empty values. Example: "user@example.com" -> "us…(redacted)".
  */
 export function redact(value: string | undefined | null): string {
   if (!value) return '<none>';

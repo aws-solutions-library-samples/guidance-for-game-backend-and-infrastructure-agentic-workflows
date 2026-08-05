@@ -71,7 +71,7 @@ describe('/api/auth/user', () => {
   });
 
   it('should extract username from email and default isAdmin to false', async () => {
-    mockVerify.mockResolvedValue({ email: 'john.doe@company.com', sub: 'user-456' });
+    mockVerify.mockResolvedValue({ email: 'john.doe@example.org', sub: 'user-456' });
 
     const { req, res } = createMocks({
       method: 'GET',
@@ -83,7 +83,7 @@ describe('/api/auth/user', () => {
     expect(res._getStatusCode()).toBe(200);
     const data = JSON.parse(res._getData());
     expect(data.username).toBe('john.doe');
-    expect(data.email).toBe('john.doe@company.com');
+    expect(data.email).toBe('john.doe@example.org');
     expect(data.isAdmin).toBe(false);
   });
 
