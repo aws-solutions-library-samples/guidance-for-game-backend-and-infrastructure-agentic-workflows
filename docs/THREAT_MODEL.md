@@ -150,6 +150,46 @@ Game Agent is an AI-powered conversational assistant for managing AWS game serve
 | Token Exhaustion | Long prompts to waste tokens | Input length limits |
 | Output Manipulation | Forcing specific outputs | Output validation |
 
+## Source Control Connector
+
+The Source Control Connector is an **opt-in, disabled-by-default** capability. When disabled, none
+of the threats below apply because the specialist is never registered and no credential grant or
+outbound path exists. When enabled, it adds a controlled *proposal* path that reads approved IaC
+sources and creates **unmerged change proposals** for human review; it never mutates live AWS
+resources. This section covers the threats specific to that path. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md#source-control-connector-optional-write-path) for the
+architecture and [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md) for the deep-dive.
+
+### Additional Trust Boundary: Outbound Provider
+
+- **Entry/Exit Points**: Outbound HTTPS from the AgentCore Runtime to a third-party source-control
+  provider (for example `api.github.com` or a configured enterprise base URL).
+- **Trust Level**: External third party, outside the AWS control plane and IAM trust domain.
+- **Blast radius**: A compromise of the write credential is limited to **proposing unmerged
+  changes** on allowlisted repositories/branches. It **cannot merge, approve, or close** a
+  proposal and **cannot mutate live AWS resources**, because the connector exposes no such
+  operation and the runtime role stays read-only against live AWS.
+
+### Connector Threats
+
+| Threat ID | Threat | Component | Mitigation | Status |
+|-----------|--------|-----------|------------|--------|
+| SC1 | Write credential compromise or exposure | Provider Adapter | Single scoped Secrets Manager ARN; adapter-owned, fetched per request; never logged; IAM `GetSecretValue` scoped to that one ARN; credential never in env or tool output | Mitigated |
+| SC2 | Unauthorized repo/branch/path/extension write | Service Layer | Five-dimension authorization (repository · branch · path · extension · group) enforced identically on reads and writes; fail-closed; disabled by default | Mitigated |
+| SC3 | Prompt injection redirecting a write or forging identity | Service Layer / AI Backend | Identity and groups derived only from verified Cognito claims via the request context, never from model input; effective repo/branch taken from the matched allowlist entry; tool-boundary injection re-check | Mitigated |
+| SC4 | Duplicate or stale proposals from retries / ambiguous outcomes | Service Layer | Read-before-write `base_revision` snapshot (stale rejected); stable idempotency key + deterministic branch reconcile to the already-open proposal | Mitigated |
+| SC5 | Audit gaps or overclaimed atomicity | Audit Sink | Durable `scm_intent` (pre-mutation) and `scm_outcome` (post) events; reconciliation instead of a cross-system atomicity claim; unconfirmed intent aborts before any mutation; unconfirmed outcome is reconcilable, never a false success | Mitigated |
+| SC6 | Secrets or sensitive fields leaking into audit/logs | Audit Sink | No secrets recorded in intent/outcome events; sanitized fields (`sanitize_log_data`) as defense-in-depth | Mitigated |
+| SC7 | Escalation from proposal to merge / live mutation | Service Layer | No merge/approve/close/delete/force-push operation exposed; human-review gate is the containment boundary; runtime role read-only against live AWS | Mitigated |
+
+### Human-Review Gate
+
+The human-review gate is the connector's **containment boundary**. Because the connector can only
+create unmerged proposals and exposes no operation to merge, approve, or close them, every change
+is gated on a human reviewer and the existing CI/CD pipeline. Read-before-write staleness
+rejection and idempotent retries ensure a reviewer sees a proposal based on a confirmed source
+revision, without duplicates from retries.
+
 ## Risk Assessment
 
 ### High Risk Items
