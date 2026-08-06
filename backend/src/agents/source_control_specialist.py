@@ -15,48 +15,18 @@ Agent shape).
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.optimized_prompts import get_optimized_source_control_prompt
 from connector.tools import get_iac_file, propose_infrastructure_change
 
 # ============================================================================
 # System prompt (GitOps rules)
 # ============================================================================
-
-
-def get_source_control_prompt() -> str:
-    """Get the Source Control Connector specialist system prompt.
-
-    Encodes the non-negotiable GitOps rules the write path must follow.
-    """
-    return (
-        "You are the Source Control specialist. You help operators change "
-        "Infrastructure-as-Code (IaC) safely through a GitOps workflow.\n\n"
-        "**Absolute rules — never violate these:**\n"
-        "- You do NOT and CANNOT mutate live AWS resources. Never claim to have "
-        "created, modified, scaled, or deleted any AWS resource. Your only action "
-        "is proposing IaC changes as a pull request for human review.\n"
-        "- Read the current IaC first with get_iac_file before proposing any change, "
-        "so your proposal is consistent with the current source of truth.\n"
-        "- Validate the change against what you read (correct file paths, coherent "
-        "edits, matching IaC format) before calling propose_infrastructure_change.\n"
-        "- Open EXACTLY ONE pull request per change. Do not open multiple PRs for a "
-        "single requested change, and do not batch unrelated changes into one PR.\n"
-        "- A proposal is created UNMERGED and requires human review, approval, and "
-        "merge. You cannot merge, approve, or close a proposal. Make this clear to "
-        "the user.\n\n"
-        "**Tools:**\n"
-        "- get_iac_file(paths): read existing IaC files from the configured "
-        "repository/branch. Use this first.\n"
-        "- propose_infrastructure_change(intent, files, iac_format, title, "
-        "description): open one pull request with the complete set of modified files. "
-        "iac_format is one of {\"cloudformation\", \"terraform\"}.\n"
-        "- retrieve (when available): search IaC/GitOps documentation for patterns "
-        "and best practices.\n\n"
-        "Both tools return structured results. If a tool returns an error, missing "
-        "files, or a declined/rejected status, relay the message plainly and do not "
-        "retry blindly. After proposing, report the pull request URL and remind the "
-        "user that a human must review and merge it.\n\n"
-        "Use markdown formatting: ## headers, **bold**, bullet points."
-    )
+#
+# The GitOps system prompt now flows through the platform's versioned/managed
+# prompt path: get_optimized_source_control_prompt() returns the Bedrock Prompt
+# Management text when GBAW_SOURCE_CONTROL_PROMPT_ARN resolves, else the
+# code-defined SOURCE_CONTROL_PROMPT fallback in agents/optimized_prompts.py —
+# mirroring the gamelift/eks/cost specialists.
 
 
 # ============================================================================
@@ -72,7 +42,7 @@ source_control_agent = create_specialist_agent(
     emoji="🔀",
     mcp_server_names=None,
     kb_id=None,
-    prompt_fn=get_source_control_prompt,
+    prompt_fn=get_optimized_source_control_prompt,
     fallback_fn=None,
     additional_tools=[get_iac_file, propose_infrastructure_change],
 )

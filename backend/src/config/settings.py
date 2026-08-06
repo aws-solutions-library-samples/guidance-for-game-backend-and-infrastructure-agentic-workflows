@@ -189,6 +189,11 @@ INFERENCE_CONFIG: dict[str, AgentInferenceConfig] = {
     "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
+    # Source Control specialist proposes IaC changes as pull requests — a careful,
+    # deterministic write path, so it pins the lowest temperature. Keyed "sourcecontrol"
+    # because the specialist's service_name="SourceControl" lowercases to this lookup key
+    # in create_specialist_agent (INFERENCE_CONFIG.get(service_name.lower())).
+    "sourcecontrol": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
 }
 
 # Resilience settings (Well-Architected GenAI Lens: Reliability 2)
