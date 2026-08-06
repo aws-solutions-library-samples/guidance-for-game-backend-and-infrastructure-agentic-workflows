@@ -85,19 +85,26 @@ def _make_config(*, rate_limit_max: int) -> SourceControlConfig:
     )
 
 
-def _propose_as(user_id: str, *, config: SourceControlConfig, provider: FakeProvider):
+def _propose_as(
+    user_id: str, *, config: SourceControlConfig, provider: FakeProvider, variant: int = 0
+):
     """Run one ``propose_change`` as ``user_id`` (authorized) and return the result.
 
-    ``connector.service.get_secret`` is mocked so the credential fetch succeeds without any
-    AWS call; the returned value never influences the rate-limit behavior under test.
+    Credential acquisition is adapter-owned behind ``ProviderAuth`` (the core issues no
+    ``get_secret``), so no credential patch is needed. ``variant`` makes each proposal a
+    **distinct** logical change (a unique CloudFormation logical id → unique file content),
+    which is essential under the v2 deterministic-idempotency model: identical requests now
+    map to the SAME stable idempotency key and therefore reuse a single proposal branch/PR
+    rather than opening a new one. Distinct variants keep this rate-limit test isolated from
+    idempotency — each allowed proposal genuinely creates its own branch and Change_Proposal —
+    so the per-user allow/reject counts reflect the rate limiter alone.
     """
+    content = f"Resources:\n  MyBucket{variant}:\n    Type: AWS::S3::Bucket\n"
     token = set_request_context({"user_id": user_id, "groups": [_GROUP]})
     try:
-        # Credential acquisition is adapter-owned behind ProviderAuth; the core issues no
-        # get_secret and the injected FakeProvider needs none, so no credential patch.
         return propose_change(
             _INTENT,
-            [ProposedFile(path="template.yaml", content=_VALID_CFN, iac_format=_IAC_FORMAT)],
+            [ProposedFile(path="template.yaml", content=content, iac_format=_IAC_FORMAT)],
             _IAC_FORMAT,
             _TITLE,
             _DESCRIPTION,
@@ -135,7 +142,10 @@ def test_property7_per_user_proposal_rate_limit(rate_limit_max, extra_calls):
     user_a = f"user-a-{next(_user_ids)}"
     total_calls = rate_limit_max + extra_calls
 
-    results = [_propose_as(user_a, config=config, provider=provider) for _ in range(total_calls)]
+    results = [
+        _propose_as(user_a, config=config, provider=provider, variant=i)
+        for i in range(total_calls)
+    ]
 
     # The first N requests succeed (each opens exactly one pull request).
     allowed = results[:rate_limit_max]

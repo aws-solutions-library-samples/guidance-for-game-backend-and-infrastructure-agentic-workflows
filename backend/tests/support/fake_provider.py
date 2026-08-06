@@ -51,6 +51,22 @@ if TYPE_CHECKING:
 # Sentinel indicating "nothing programmed for this operation".
 _UNSET: Any = object()
 
+
+@dataclass
+class _ApplyThenRaise:
+    """Programmed outcome: apply the operation's normal effect, THEN raise ``exc``.
+
+    This models an **ambiguous** provider outcome for a mutating operation — the effect
+    (branch created, files committed, proposal opened) actually landed on the provider, but
+    the call then failed with a transient error so the caller cannot tell whether it
+    succeeded. It is the exact condition the connector's reconcile-before-retry logic must
+    handle without duplicating source-control state (Property V6): after the raise, the
+    fake's in-memory model reflects the applied effect, so a follow-up ``branch_exists`` /
+    ``latest_commit_sha`` / ``find_open_change_proposal`` reconcile query observes it.
+    """
+
+    exc: BaseException | type[BaseException]
+
 # The default head SHA reported by ``latest_commit_sha`` for a repo/branch whose head has
 # not been explicitly seeded. Tests that drive the read-before-write path pass this value as
 # ``base_revision`` when they have not called :meth:`FakeProvider.set_head` (the connector
@@ -181,6 +197,28 @@ class FakeProvider(SourceControlProvider):
         self._queues[operation].extend([exc] * max(0, times))
         return self
 
+    def apply_then_fail(
+        self,
+        operation: str,
+        exc: BaseException | type[BaseException],
+        times: int = 1,
+    ) -> FakeProvider:
+        """Make ``operation`` apply its normal effect and THEN raise ``exc`` for ``times`` calls.
+
+        Unlike :meth:`fail` / :meth:`fail_times` (which raise *instead* of doing anything),
+        this simulates an **ambiguous** outcome where the mutating effect landed on the
+        provider before the error surfaced: the fake mutates its in-memory model (creates the
+        branch, records the commit and advances the branch head, or opens the proposal) and
+        only then raises. After the raise the applied state is observable via
+        ``branch_exists`` / ``latest_commit_sha`` / ``find_open_change_proposal``, so a
+        reconcile-before-retry can detect it and avoid creating duplicate state (Property V6).
+        Once the ``times`` programmed failures are consumed the operation falls back to normal
+        behavior.
+        """
+        self._check_operation(operation)
+        self._queues[operation].extend([_ApplyThenRaise(exc)] * max(0, times))
+        return self
+
     def reset_calls(self) -> None:
         """Clear the recorded call log (leaves programming and state intact)."""
         self.calls.clear()
@@ -261,6 +299,11 @@ class FakeProvider(SourceControlProvider):
             return outcome(**kwargs)
         return outcome
 
+    @staticmethod
+    def _raise(exc: BaseException | type[BaseException]) -> None:
+        """Raise ``exc`` whether it was programmed as an instance or an exception class."""
+        raise exc if isinstance(exc, BaseException) else exc()
+
     # --------------------------------------------------------- provider operations
 
     def get_file(self, repo: str, branch: str, path: str) -> FileContent | None:
@@ -309,15 +352,23 @@ class FakeProvider(SourceControlProvider):
             "create_branch", repo=repo, new_branch=new_branch, from_sha=from_sha
         )
         outcome = self._programmed_outcome("create_branch")
+        if isinstance(outcome, _ApplyThenRaise):
+            # Ambiguous outcome: the branch actually gets created, then the call raises.
+            self._default_create_branch(repo, new_branch, from_sha)
+            self._raise(outcome.exc)
         if outcome is not _UNSET:
             self._apply(outcome, repo=repo, new_branch=new_branch, from_sha=from_sha)
             return None
+        self._default_create_branch(repo, new_branch, from_sha)
+        return None
+
+    def _default_create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
+        """Apply the default in-memory create-branch effect (records + head at ``from_sha``)."""
         self.created_branches.append(
             {"repo": repo, "new_branch": new_branch, "from_sha": from_sha}
         )
         self._branches.add((repo, new_branch))
         self._head_shas[(repo, new_branch)] = from_sha
-        return None
 
     def commit_files(
         self,
@@ -334,10 +385,25 @@ class FakeProvider(SourceControlProvider):
             message=message,
         )
         outcome = self._programmed_outcome("commit_files")
+        if isinstance(outcome, _ApplyThenRaise):
+            # Ambiguous outcome: the commit actually lands (advancing the branch head), then
+            # the call raises — so a content-addressed reconcile can detect the applied commit.
+            self._default_commit_files(repo, branch, list(files), message)
+            self._raise(outcome.exc)
         if outcome is not _UNSET:
             return self._apply(
                 outcome, repo=repo, branch=branch, files=list(files), message=message
             )
+        return self._default_commit_files(repo, branch, list(files), message)
+
+    def _default_commit_files(
+        self,
+        repo: str,
+        branch: str,
+        files: list[ProposedFile],
+        message: str,
+    ) -> str:
+        """Apply the default in-memory commit effect (stores files, advances head); returns SHA."""
         sha = f"commit{next(self._commit_counter)}"
         self.commits.append(
             {
@@ -370,10 +436,26 @@ class FakeProvider(SourceControlProvider):
             body=body,
         )
         outcome = self._programmed_outcome("open_change_proposal")
+        if isinstance(outcome, _ApplyThenRaise):
+            # Ambiguous outcome: the proposal actually opens (recorded so a follow-up
+            # find_open_change_proposal reconcile returns it), then the call raises.
+            self._default_open_change_proposal(repo, head, base, title, body)
+            self._raise(outcome.exc)
         if outcome is not _UNSET:
             return self._apply(
                 outcome, repo=repo, head=head, base=base, title=title, body=body
             )
+        return self._default_open_change_proposal(repo, head, base, title, body)
+
+    def _default_open_change_proposal(
+        self,
+        repo: str,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+    ) -> ChangeProposalResult:
+        """Apply the default in-memory open-proposal effect (records PR); returns the result."""
         pr_number = next(self._pr_counter)
         pr_id = str(pr_number)
         pr_url = f"https://fake.provider/{repo}/pull/{pr_number}"

@@ -71,15 +71,17 @@ _BRANCH = "main"
 _GROUP = "scm-writers"
 _IAC_FORMAT = "cloudformation"
 
-# The provider operations reached on the proposal path, each invoked exactly once on the
-# success path. Injecting a bounded number of transient failures at any one of them
-# exercises that op's retry loop; Hypothesis picks which op fails.
-# NOTE (hardening spec, task 6.1/6.3): the propose pipeline now uses reconcile-before-retry
-# for the MUTATING ops (create_branch, commit_files, open_change_proposal) so they are no
-# longer blindly repeated after an ambiguous transient failure. Their retry/idempotency
-# coverage moves to hardening Property H4 (test_reconcile_before_retry_property, task 6.2).
-# This baseline Property 20 test is scoped to the READ-ONLY ops, which keep simple transient
-# retry (safe to repeat) and whose attempt-count semantics are unchanged.
+# The read-only provider operations reached on the proposal path. Injecting a bounded number
+# of transient failures at one of them exercises that op's transient-retry loop; Hypothesis
+# picks which op fails.
+# NOTE (v2 spec, task 5.1): the propose pipeline now derives a DETERMINISTIC proposal branch
+# from a stable idempotency key and reconciles-before-running each MUTATING op (create_branch,
+# commit_files, open_change_proposal), so a mutating op is never blindly repeated after an
+# ambiguous transient failure and a retry never duplicates source-control state. That
+# mutating-op idempotency coverage lives in Property V6 (task 5.2). This test is scoped to the
+# READ-ONLY ops, which keep simple transient retry (safe to repeat); their attempt counts are
+# asserted per-op below (``latest_commit_sha`` is additionally consulted by the commit
+# reconcile on the success path).
 _PROVIDER_OPS = (
     "latest_commit_sha",
     "branch_exists",
@@ -221,9 +223,18 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
     attempts_made = len(provider.calls_for(failing_op))
 
     if transient_failures < retry_max_attempts:
-        # Facet (a): the op fails k times, then the (k+1)-th attempt succeeds. Because the op
-        # is reached exactly once on the success path, it is invoked exactly k + 1 times.
-        assert attempts_made == transient_failures + 1
+        # Facet (a): the op fails k times, then a later attempt succeeds. The op is consulted
+        # k + 1 times for that consultation. Under the v2 deterministic-branch idempotency
+        # model the propose path reconciles-before-running each mutating step, which consults
+        # ``latest_commit_sha`` a SECOND time (the content-addressed commit reconcile reads the
+        # proposal-branch head); that second consultation finds an empty failure queue and
+        # succeeds in one call. ``branch_exists`` is consulted exactly once (the create-branch
+        # reconcile). So the failing op is invoked k + 1 times, plus one extra call for
+        # ``latest_commit_sha``.
+        expected_attempts = transient_failures + (
+            2 if failing_op == "latest_commit_sha" else 1
+        )
+        assert attempts_made == expected_attempts
 
         # The proposal ultimately succeeds and a pull request is created (Req 10.5).
         assert result.status == "created", result.message

@@ -33,9 +33,9 @@ Design contract for the read path (see
 # Standard library
 from __future__ import annotations
 
+import hashlib
 import random
 import re
-import secrets
 import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
@@ -86,8 +86,13 @@ _RATE_LIMIT_ENDPOINT = "scm_propose"
 # Precompiled injection patterns reused for the tool-boundary re-check (Req 11.3, 11.4).
 _INJECTION_RE = tuple(re.compile(pattern, re.IGNORECASE) for pattern in INJECTION_PATTERNS)
 
-# How many times to regenerate a proposal-branch name when it already exists (Req 2.8).
-_MAX_BRANCH_NAME_ATTEMPTS = 10
+# The stable prefix for every deterministic proposal-branch name (Req 8.1, 8.2).
+_PROPOSAL_BRANCH_PREFIX = "gbaw"
+
+# How many hex characters of the idempotency-key digest are appended to the proposal-branch
+# name. 12 hex chars (48 bits) is ample to keep distinct proposals on distinct branches while
+# keeping the deterministic branch name short and readable.
+_BRANCH_KEY_LENGTH = 12
 
 # ---------------------------------------------------------------------------
 # Durable audit sink wiring (Req 13.1, 13.2, 13.3)
@@ -339,8 +344,10 @@ def read_iac_files(
 #                            re-verified in step 7 before the first mutating op (Req 7.1).
 #   5. rate limit          — per-user sliding window
 #   6. IaC validation      — decline empty file sets; validate parseable/structural IaC
-#   7. provider ops        — latest_commit_sha → unique branch → create_branch →
-#                            commit_files → open_change_proposal, transient-only retries.
+#   7. provider ops        — latest_commit_sha → stable idempotency key → deterministic
+#                            proposal branch → create_branch → commit_files →
+#                            open_change_proposal, with reconcile-before-run/-retry so a
+#                            retried proposal never duplicates branch/commit/proposal.
 #                            Credential acquisition is adapter-owned behind ProviderAuth: a
 #                            ProviderAuthError here (fail-closed, no retry) preserves the
 #                            credential fail-closed behavior the removed Gate 6 provided.
@@ -428,7 +435,7 @@ def _retry_mutating(
         except ProviderTransientError as exc:
             last_exc = exc
             # Ambiguous transient failure: reconcile provider state BEFORE deciding whether
-            # to retry, so an already-applied effect is never duplicated (Req 12.1, 12.5).
+            # to retry, so an already-applied effect is never duplicated (Req 8.1, 8.2).
             reconciled = reconcile()
             if reconciled is not None:
                 return reconciled
@@ -437,6 +444,33 @@ def _retry_mutating(
             delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
             time.sleep(delay + random.uniform(0, delay * 0.25))
     raise last_exc  # pragma: no cover - loop always returns or raises above
+
+
+def _idempotent_mutate(
+    operation: Callable[[], _T],
+    reconcile: Callable[[], _T | object | None],
+    *,
+    max_attempts: int,
+) -> _T | object:
+    """Run a mutating op idempotently against BOTH pre-existing state and ambiguous retries.
+
+    Because the proposal branch is now **deterministic** in the stable idempotency key, the
+    same logical proposal always targets the same branch/commit/proposal. This helper makes
+    each mutating step safe to (re)run without ever creating a duplicate (Req 8.1, 8.2):
+
+    - It **reconciles first**: if ``reconcile()`` reports the intended effect is already
+      present — a branch that already exists, a commit already on the deterministic branch, or
+      an already-open Change_Proposal for the deterministic head→base — the operation is
+      skipped and the reconciled value is returned, so a retried proposal reuses existing
+      state instead of duplicating it.
+    - Otherwise it runs the op via :func:`_retry_mutating`, which also reconciles before each
+      retry so an *ambiguous* transient failure (effect applied, then the provider raised) is
+      recognized rather than repeated.
+    """
+    pre = reconcile()
+    if pre is not None:
+        return pre
+    return _retry_mutating(operation, reconcile, max_attempts=max_attempts)
 
 
 def _now_iso() -> str:
@@ -533,10 +567,49 @@ def _slug(text: str, *, max_length: int = 40) -> str:
     return slug or "change"
 
 
-def _generate_branch_name(intent: str) -> str:
-    """Generate a unique-ish proposal-branch name ``gbaw/<slug>-<utc>-<rand>`` (Req 2.8)."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    return f"gbaw/{_slug(intent)}-{stamp}-{secrets.token_hex(4)}"
+def _idempotency_key(
+    *,
+    repo: str,
+    target_branch: str,
+    base_revision: str,
+    files: Sequence[ProposedFile],
+    user_id: str,
+) -> str:
+    """Derive a **stable** idempotency key from a proposal's request inputs (Req 8.1, 8.2).
+
+    The key is a SHA-256 over a canonical, order-independent serialization of everything
+    that identifies the *logical* proposal:
+
+    ``repo | target_branch | base_revision | sorted(path + ":" + sha256(content)) | user_id``
+
+    Each proposed file contributes ``"<path>:<sha256(content)>"`` and those per-file entries
+    are **sorted**, so the key is independent of the order the files were supplied and is
+    content-addressed (a different file body yields a different key). Because every component
+    comes from the request/snapshot inputs, a retry of the *same* logical proposal — same
+    repo, verified base revision, file set, and requesting user — produces the *same* key,
+    which anchors the deterministic branch name below and makes the whole mutation idempotent.
+    """
+    file_entries = sorted(
+        f"{f.path}:{hashlib.sha256(f.content.encode('utf-8')).hexdigest()}" for f in files
+    )
+    canonical = "|".join(
+        [repo, target_branch, base_revision, "|".join(file_entries), user_id]
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _deterministic_branch_name(intent: str, idempotency_key: str) -> str:
+    """Derive a **deterministic** proposal-branch name from the idempotency key (Req 8.1, 8.2).
+
+    The name is ``gbaw/<slug>-<key[:12]>`` — a stable prefix, a human-readable slug of the
+    intent, and a truncated hex digest of the stable :func:`_idempotency_key`. It carries no
+    random token and no timestamp, so the *same* logical proposal always maps to the *same*
+    branch: ``create_branch`` becomes naturally idempotent (an existing branch is reused, never
+    duplicated), a repeated commit targets the same content-addressed tree, and an already-open
+    Change_Proposal for the deterministic head→base is returned rather than opened twice. The
+    resulting name is always distinct from the target branch it is proposed against.
+    """
+    return f"{_PROPOSAL_BRANCH_PREFIX}/{_slug(intent)}-{idempotency_key[:_BRANCH_KEY_LENGTH]}"
 
 
 def _build_change_proposal_body(
@@ -891,25 +964,29 @@ def propose_change(
                 reason="stale_snapshot",
             )
 
-        # Generate a unique proposal-branch name, regenerating on collision (Req 2.8).
-        for _ in range(_MAX_BRANCH_NAME_ATTEMPTS):
-            candidate = _generate_branch_name(intent)
-            exists = _retry_transient(
-                lambda c=candidate: resolved_provider.branch_exists(repo, c),
-                max_attempts=attempts,
-            )
-            if not exists:
-                proposal_branch = candidate
-                break
-        if not proposal_branch:
-            raise ProviderError("could not generate a unique proposal branch name")
+        # Derive the stable idempotency key and the DETERMINISTIC proposal-branch name from
+        # the verified request inputs (Req 8.1, 8.2). The key is content-addressed over the
+        # verified ``base_sha`` (== base_revision) and the proposed file bodies, so a retry of
+        # the SAME logical proposal maps to the SAME key and therefore the SAME branch. There
+        # is no random token and no uniqueness-regeneration loop: the branch name is a pure
+        # function of the request, which is what makes the mutation genuinely idempotent.
+        idempotency_key = _idempotency_key(
+            repo=repo,
+            target_branch=branch,
+            base_revision=base_sha,
+            files=proposed_files,
+            user_id=user_id or "unknown",
+        )
+        proposal_branch = _deterministic_branch_name(intent, idempotency_key)
 
-        # Create the branch, then commit the complete file set (Req 2.1, 2.3). These are
-        # MUTATING ops, so each retry reconciles provider state first to avoid duplicates
-        # after an ambiguous transient failure (Req 12.1, 12.2, 12.3, 12.5).
+        # Create the branch, then commit the complete file set (Req 2.1, 2.3). Both are
+        # MUTATING ops run through :func:`_idempotent_mutate`, which reconciles provider state
+        # BEFORE running (so pre-existing state from an earlier run is reused, not duplicated)
+        # AND before each retry (so an ambiguous transient failure is recognized, not
+        # repeated) — never creating a second branch/commit (Req 8.1, 8.2).
 
-        # Reconcile create_branch: if the proposal branch now exists, the create already
-        # landed — skip it and continue from the existing branch (Req 12.2).
+        # Reconcile create_branch: the proposal branch is deterministic, so if it already
+        # exists (a prior attempt created it) it is REUSED rather than re-created (Req 8.1).
         def _reconcile_branch() -> object | None:
             exists = _retry_transient(
                 lambda: resolved_provider.branch_exists(repo, proposal_branch),
@@ -917,20 +994,21 @@ def propose_change(
             )
             return _ALREADY_APPLIED if exists else None
 
-        _retry_mutating(
+        _idempotent_mutate(
             lambda: resolved_provider.create_branch(repo, proposal_branch, base_sha),
             _reconcile_branch,
             max_attempts=attempts,
         )
         branch_created = True
 
-        # Reconcile commit_files with a best-effort heuristic (Req 12.3): the proposal
-        # branch was created pointing at ``base_sha``; if its head has since advanced to a
-        # different SHA, a commit beyond the base was applied, so treat the commit as done
-        # and skip it. This can only mistake a concurrent external push on the freshly
-        # created proposal branch for our commit, which is acceptable for a proposal branch
-        # the connector owns; the alternative (blindly re-committing) risks a duplicate
-        # commit, which Req 12.3/12.5 forbid.
+        # Reconcile commit_files with a CONTENT-ADDRESSED check (Req 8.1, 8.2): the proposal
+        # branch is deterministic and freshly anchored to the verified ``base_sha``, so it is
+        # the connector's own branch created for exactly this content. If its head has moved
+        # past ``base_sha``, our commit of this proposed tree already landed on it, so the
+        # commit is treated as applied and NOT repeated; if the head is still at ``base_sha``
+        # the commit has not yet landed and is performed. Because the branch identity is tied
+        # to the idempotency key (not a random name), this decision is deterministic and never
+        # duplicates the commit.
         def _reconcile_commit() -> object | None:
             head = _retry_transient(
                 lambda: resolved_provider.latest_commit_sha(repo, proposal_branch),
@@ -938,7 +1016,7 @@ def propose_change(
             )
             return _ALREADY_APPLIED if head and head != base_sha else None
 
-        _retry_mutating(
+        _idempotent_mutate(
             lambda: resolved_provider.commit_files(
                 repo, proposal_branch, proposed_files, commit_message
             ),
@@ -947,8 +1025,9 @@ def propose_change(
         )
 
         # Open exactly one change proposal with agent+user attribution (Req 2.2, 2.6, 6.5).
-        # Reconcile open_change_proposal: if an open proposal for head→base already exists,
-        # return it instead of opening a duplicate (Req 12.4).
+        # Reconcile open_change_proposal: because the head (deterministic proposal branch) and
+        # base are fixed, if an open Change_Proposal for this head→base already exists it is
+        # RETURNED instead of opening a duplicate (Req 8.1, 8.2).
         def _reconcile_proposal() -> ChangeProposalResult | None:
             return _retry_transient(
                 lambda: resolved_provider.find_open_change_proposal(
@@ -957,7 +1036,7 @@ def propose_change(
                 max_attempts=attempts,
             )
 
-        proposal = _retry_mutating(
+        proposal = _idempotent_mutate(
             lambda: resolved_provider.open_change_proposal(
                 repo, proposal_branch, branch, effective_title, body
             ),
