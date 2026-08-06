@@ -37,9 +37,9 @@ from hypothesis import strategies as st
 # Local modules
 import utils.security as security
 from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
@@ -113,18 +113,14 @@ def _auth_scenarios(draw):
     ``user_id``/``groups``, the scenario ``category`` and the expected ``authorized``
     outcome (True only for authenticated-with-overlap).
     """
-    authorized_groups = tuple(
-        draw(st.lists(st.sampled_from(_AUTHORIZED_POOL), min_size=1, unique=True))
-    )
+    authorized_groups = tuple(draw(st.lists(st.sampled_from(_AUTHORIZED_POOL), min_size=1, unique=True)))
     category = draw(st.sampled_from(["unauthenticated", "no_overlap", "overlap"]))
 
     if category == "unauthenticated":
         # No authenticated identity: user_id is missing/empty. Groups are irrelevant —
         # even if they would overlap, an unauthenticated request must be rejected.
         user_id = draw(st.sampled_from([None, ""]))
-        user_groups = draw(
-            st.lists(st.sampled_from(_AUTHORIZED_POOL + _OTHER_POOL), unique=True)
-        )
+        user_groups = draw(st.lists(st.sampled_from(_AUTHORIZED_POOL + _OTHER_POOL), unique=True))
         return {
             "authorized_groups": authorized_groups,
             "user_id": user_id,
@@ -203,8 +199,7 @@ def test_property6_authorization_gate(scenario):
         # (c) Authenticated + group overlap: the auth gate passes and, with every later
         # gate satisfied, exactly one proposal is created via the provider.
         assert result.status == "created", (
-            f"expected authorized request to create a proposal, got {result.status}: "
-            f"{result.message}"
+            f"expected authorized request to create a proposal, got {result.status}: " f"{result.message}"
         )
         assert result.proposal_id is not None
         assert len(fake.calls_for("open_change_proposal")) == 1
@@ -212,8 +207,7 @@ def test_property6_authorization_gate(scenario):
     else:
         # (a)/(b) Unauthenticated OR no group overlap: rejected before any provider op.
         assert result.status == "rejected", (
-            f"expected unauthorized request to be rejected, got {result.status}: "
-            f"{result.message}"
+            f"expected unauthorized request to be rejected, got {result.status}: " f"{result.message}"
         )
         assert result.proposal_id is None
         assert result.proposal_url is None

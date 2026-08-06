@@ -128,9 +128,7 @@ def test_intent_and_outcome_event_shapes_are_written_and_confirmed():
 
 def test_rejected_events_are_unconfirmed():
     client = _FakeLogsClient()
-    client.put_outcomes = [
-        {"nextSequenceToken": "1", "rejectedLogEventsInfo": {"tooOldLogEventEndIndex": 0}}
-    ]
+    client.put_outcomes = [{"nextSequenceToken": "1", "rejectedLogEventsInfo": {"tooOldLogEventEndIndex": 0}}]
     sink = AuditSink("audit-grp", client=client)
     assert sink.write(_EVENT) is False
 

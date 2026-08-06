@@ -118,8 +118,7 @@ def test_parameter_names_have_no_provider_specific_token(tool):
     for param_name in sig.parameters:
         offending = _contains_forbidden_token(param_name)
         assert offending == [], (
-            f"parameter {param_name!r} of {_tool_name(tool)!r} references "
-            f"provider-specific token(s): {offending}"
+            f"parameter {param_name!r} of {_tool_name(tool)!r} references " f"provider-specific token(s): {offending}"
         )
 
 
@@ -148,8 +147,7 @@ def test_resolved_annotations_are_only_agnostic_primitive_types(tool):
         resolved = _resolved_origin_types(annotation)
         disallowed = resolved - ALLOWED_TYPES
         assert disallowed == set(), (
-            f"{target!r} of {_tool_name(tool)!r} uses non-agnostic type(s): "
-            f"{sorted(str(t) for t in disallowed)}"
+            f"{target!r} of {_tool_name(tool)!r} uses non-agnostic type(s): " f"{sorted(str(t) for t in disallowed)}"
         )
 
 

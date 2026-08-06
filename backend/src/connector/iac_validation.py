@@ -118,6 +118,7 @@ def validate_terraform(path: str, content: str) -> None:
         raise IaCValidationError(path, "content is empty")
 
     try:
+        # Third-party packages
         import hcl2  # type: ignore[import-not-found]
     except ImportError as exc:
         raise IaCValidationError(

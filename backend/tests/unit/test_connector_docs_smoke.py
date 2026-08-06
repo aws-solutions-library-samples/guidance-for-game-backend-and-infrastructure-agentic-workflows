@@ -61,7 +61,7 @@ def _connector_section(text: str) -> str:
     assert match is not None, "no '## Source Control Connector' section heading found"
     start = match.start()
     # Find the next top-level heading after the connector heading line.
-    next_top = re.search(r"^##\s+(?!#)", text[match.end():], re.MULTILINE)
+    next_top = re.search(r"^##\s+(?!#)", text[match.end() :], re.MULTILINE)
     end = match.end() + next_top.start() if next_top else len(text)
     section = text[start:end]
     assert len(section) > 200, "connector section is unexpectedly short"
@@ -102,9 +102,7 @@ def _assert_trust_boundary(section: str, doc: str) -> None:
     """Outbound HTTPS to a third-party provider, framed as a trust boundary."""
     assert "outbound https" in section, f"{doc}: missing outbound-HTTPS description"
     assert "trust boundary" in section, f"{doc}: missing 'trust boundary' framing"
-    assert _has_any(section, r"third[\s-]party"), (
-        f"{doc}: connector section must call out a third-party provider"
-    )
+    assert _has_any(section, r"third[\s-]party"), f"{doc}: connector section must call out a third-party provider"
 
 
 def _assert_write_credential(section: str, doc: str) -> None:
@@ -119,18 +117,14 @@ def _assert_authorization_policy(section: str, doc: str) -> None:
     assert "five" in section, f"{doc}: authorization must be described as five-dimension"
     missing = [d for d in _FIVE_DIMENSIONS if d not in section]
     assert not missing, f"{doc}: authorization section missing dimension(s): {missing}"
-    assert _has_any(section, r"read", r"write"), (
-        f"{doc}: authorization must reference reads/writes"
-    )
+    assert _has_any(section, r"read", r"write"), f"{doc}: authorization must reference reads/writes"
 
 
 def _assert_audit_flow(section: str, doc: str) -> None:
     """Durable intent + outcome events reconciled (not atomic)."""
     assert "intent" in section, f"{doc}: audit flow must mention intent events"
     assert "outcome" in section, f"{doc}: audit flow must mention outcome events"
-    assert _has_any(section, r"reconcil"), (
-        f"{doc}: audit flow must describe reconciliation of ambiguous outcomes"
-    )
+    assert _has_any(section, r"reconcil"), f"{doc}: audit flow must describe reconciliation of ambiguous outcomes"
 
 
 def _assert_human_review_gate(section: str, doc: str) -> None:
@@ -162,12 +156,9 @@ def _assert_no_atomicity_claim(section: str, doc: str) -> None:
         r"\batomic\w*\b[^.]{0,60}\b(?:not\b|claim)",  # "atomicity ... claim" / "... not"
     )
     assert negated_atomicity, (
-        f"{doc}: connector section must explicitly disclaim cross-system atomicity, "
-        "not present it as a guarantee"
+        f"{doc}: connector section must explicitly disclaim cross-system atomicity, " "not present it as a guarantee"
     )
-    assert _has_any(section, r"reconcil"), (
-        f"{doc}: the no-atomicity framing must be paired with reconciliation"
-    )
+    assert _has_any(section, r"reconcil"), f"{doc}: the no-atomicity framing must be paired with reconciliation"
 
 
 # --- Tests: ARCHITECTURE.md ---------------------------------------------------------------

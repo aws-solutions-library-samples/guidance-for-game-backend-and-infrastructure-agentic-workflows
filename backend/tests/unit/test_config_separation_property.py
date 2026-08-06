@@ -117,9 +117,7 @@ def _valid_base() -> dict:
 
 # Flags that ARE truthy (case-insensitive, whitespace-trimmed) and flags that are NOT.
 _truthy_flags = st.sampled_from(["true", "1", "yes", "TRUE", "Yes", " yes ", "  1 ", "YES", "yEs"])
-_non_truthy_flags = st.sampled_from(
-    [None, "", "  ", "false", "no", "0", "off", "disabled", "FALSE", "2", "true-ish"]
-)
+_non_truthy_flags = st.sampled_from([None, "", "  ", "false", "no", "0", "off", "disabled", "FALSE", "2", "true-ish"])
 
 # Each invalidation is (settings_key, bad_value, expected_error_substring), scoped so it
 # breaks exactly one field of the named contract.

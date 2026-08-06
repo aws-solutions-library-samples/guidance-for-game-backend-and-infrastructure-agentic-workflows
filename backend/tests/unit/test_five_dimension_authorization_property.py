@@ -152,14 +152,10 @@ def _scenarios(draw):
         )
     )
 
-    authorized_groups = tuple(
-        draw(st.lists(st.sampled_from(_AUTH_GROUPS_POOL), min_size=1, unique=True))
-    )
+    authorized_groups = tuple(draw(st.lists(st.sampled_from(_AUTH_GROUPS_POOL), min_size=1, unique=True)))
 
     repo = draw(st.sampled_from(_REPOS))
-    branches = tuple(
-        draw(st.lists(st.sampled_from(_BRANCHES), min_size=1, max_size=3, unique=True))
-    )
+    branches = tuple(draw(st.lists(st.sampled_from(_BRANCHES), min_size=1, max_size=3, unique=True)))
     branch = draw(st.sampled_from(list(branches)))
 
     if category == "permit_unconstrained":
@@ -167,12 +163,8 @@ def _scenarios(draw):
         prefixes: tuple[str, ...] = ()
         extensions: tuple[str, ...] = ()
     else:
-        prefixes = tuple(
-            draw(st.lists(st.sampled_from(_PREFIXES), min_size=1, max_size=2, unique=True))
-        )
-        extensions = tuple(
-            draw(st.lists(st.sampled_from(_EXTS), min_size=1, max_size=2, unique=True))
-        )
+        prefixes = tuple(draw(st.lists(st.sampled_from(_PREFIXES), min_size=1, max_size=2, unique=True)))
+        extensions = tuple(draw(st.lists(st.sampled_from(_EXTS), min_size=1, max_size=2, unique=True)))
 
     primary = AllowlistEntry(
         repo=repo,
@@ -187,9 +179,7 @@ def _scenarios(draw):
     other_repos = [r for r in _REPOS if r != repo]
     if draw(st.booleans()) and other_repos:
         decoy_repo = draw(st.sampled_from(other_repos))
-        entries.append(
-            AllowlistEntry(repo=decoy_repo, target_branches=("main",))
-        )
+        entries.append(AllowlistEntry(repo=decoy_repo, target_branches=("main",)))
 
     def _good_path(name: str) -> str:
         pre = prefixes[0] if prefixes else "any/"
@@ -197,9 +187,7 @@ def _scenarios(draw):
         return f"{pre}{name}{ext}"
 
     def _good_groups():
-        overlap = draw(
-            st.lists(st.sampled_from(list(authorized_groups)), min_size=1, unique=True)
-        )
+        overlap = draw(st.lists(st.sampled_from(list(authorized_groups)), min_size=1, unique=True))
         extras = draw(st.lists(st.sampled_from(_OTHER_GROUPS_POOL), unique=True))
         return list(dict.fromkeys(overlap + extras))
 
@@ -264,10 +252,7 @@ def _make_config(scenario) -> SourceControlConfig:
 
 
 def _proposed_files(paths) -> list[ProposedFile]:
-    return [
-        ProposedFile(path=p, content=_VALID_CFN, iac_format="cloudformation")
-        for p in paths
-    ]
+    return [ProposedFile(path=p, content=_VALID_CFN, iac_format="cloudformation") for p in paths]
 
 
 def _rejection_dimensions(mock_logger) -> list[str]:
@@ -351,16 +336,13 @@ def test_property_v3_five_dimension_authorization(scenario):
         # (1)/(5) Both entry points permit the operation for the same policy + request.
         assert read_result.limit_exceeded is False
         read_calls = read_fake.calls_for("get_files")
-        assert len(read_calls) == 1, (
-            f"permitted read expected exactly one get_files, got {read_fake.call_operations}"
-        )
+        assert len(read_calls) == 1, f"permitted read expected exactly one get_files, got {read_fake.call_operations}"
         # (4) Effective repo/branch come from the matched allowlist entry.
         assert read_calls[0]["repo"] == eff_repo
         assert read_calls[0]["branch"] == eff_branch
 
         assert propose_result.status == "created", (
-            f"permitted propose expected 'created', got {propose_result.status}: "
-            f"{propose_result.message}"
+            f"permitted propose expected 'created', got {propose_result.status}: " f"{propose_result.message}"
         )
         assert propose_result.proposal_id is not None
         create_calls = propose_fake.calls_for("create_branch")
@@ -376,24 +358,19 @@ def test_property_v3_five_dimension_authorization(scenario):
         assert read_result.files == ()
         assert read_result.missing == ()
         assert read_result.limit_exceeded is False
-        assert read_fake.calls == [], (
-            f"rejected read unexpectedly called provider: {read_fake.call_operations}"
-        )
+        assert read_fake.calls == [], f"rejected read unexpectedly called provider: {read_fake.call_operations}"
 
         assert propose_result.status == "rejected", (
-            f"rejected propose expected 'rejected', got {propose_result.status}: "
-            f"{propose_result.message}"
+            f"rejected propose expected 'rejected', got {propose_result.status}: " f"{propose_result.message}"
         )
         assert propose_result.proposal_id is None
         assert propose_result.proposal_url is None
-        assert propose_fake.calls == [], (
-            f"rejected propose unexpectedly called provider: {propose_fake.call_operations}"
-        )
+        assert (
+            propose_fake.calls == []
+        ), f"rejected propose unexpectedly called provider: {propose_fake.call_operations}"
 
         # (3) The rejection audit NAMES the failed dimension, identically on read + write.
-        assert failed_dim in _rejection_dimensions(read_logger), (
-            f"read rejection did not name dimension {failed_dim!r}"
-        )
-        assert failed_dim in _rejection_dimensions(propose_logger), (
-            f"propose rejection did not name dimension {failed_dim!r}"
-        )
+        assert failed_dim in _rejection_dimensions(read_logger), f"read rejection did not name dimension {failed_dim!r}"
+        assert failed_dim in _rejection_dimensions(
+            propose_logger
+        ), f"propose rejection did not name dimension {failed_dim!r}"

@@ -58,12 +58,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
-from connector.models import ProposedFile
 from connector import service
-from connector.service import propose_change
+from connector.config import AllowlistEntry, SourceControlConfig
+from connector.models import ProposedFile
 from connector.provider import ProviderAuthError, ProviderUnavailableError
+from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -296,13 +296,9 @@ def _run_scenario(scenario: str, files, intent_words):
 
     sink = _RecordingAuditSink(confirmed=True)
 
-    token = set_request_context(
-        {"user_id": user_id, "groups": groups, "session_id": "s-1"}
-    )
+    token = set_request_context({"user_id": user_id, "groups": groups, "session_id": "s-1"})
     try:
-        with (
-            mock.patch.object(service, "_get_audit_sink", return_value=sink),
-        ):
+        with (mock.patch.object(service, "_get_audit_sink", return_value=sink),):
             result = propose_change(
                 intent,
                 proposed_files,
@@ -344,20 +340,16 @@ def test_audit_records_are_complete(scenario, files, intent_words):
     """
     expected = _EXPECTATIONS[scenario]
 
-    result, user_id, intent_events, outcome_events = _run_scenario(
-        scenario, files, intent_words
-    )
+    result, user_id, intent_events, outcome_events = _run_scenario(scenario, files, intent_words)
 
     # The scenario reached its intended terminal outcome.
     assert result.status == expected["status"], (
-        f"scenario {scenario!r} produced status {result.status!r} "
-        f"(message: {result.message})"
+        f"scenario {scenario!r} produced status {result.status!r} " f"(message: {result.message})"
     )
 
     # Exactly one terminal OUTCOME event was written for this outcome.
     assert len(outcome_events) == 1, (
-        f"scenario {scenario!r} expected exactly one scm_outcome event, "
-        f"got {len(outcome_events)}"
+        f"scenario {scenario!r} expected exactly one scm_outcome event, " f"got {len(outcome_events)}"
     )
     outcome = outcome_events[0]
 
@@ -378,9 +370,9 @@ def test_audit_records_are_complete(scenario, files, intent_words):
     # --- reason (required for every non-created outcome) ----------------------------------
     if expected["reason_required"]:
         reason = outcome.get("reason")
-        assert isinstance(reason, str) and reason, (
-            f"scenario {scenario!r} must record a reason for a non-created outcome"
-        )
+        assert (
+            isinstance(reason, str) and reason
+        ), f"scenario {scenario!r} must record a reason for a non-created outcome"
 
     # --- repository / target_branch (where an allowlist match was resolved) ---------------
     if expected["repo_applicable"]:
@@ -389,9 +381,7 @@ def test_audit_records_are_complete(scenario, files, intent_words):
 
     # --- INTENT event (only for the path that reaches the mutation stage) -----------------
     if expected["intent_expected"]:
-        assert len(intent_events) == 1, (
-            f"scenario {scenario!r} expected exactly one preceding scm_intent event"
-        )
+        assert len(intent_events) == 1, f"scenario {scenario!r} expected exactly one preceding scm_intent event"
         intent = intent_events[0]
         # The INTENT attributes the same user and carries the effective repo/branch, the base
         # revision, and the proposed paths (never file contents). The base revision is recorded
@@ -408,9 +398,7 @@ def test_audit_records_are_complete(scenario, files, intent_words):
         assert key and outcome.get("idempotency_key") == key
     else:
         # Paths that never reach the mutation stage record no intent.
-        assert intent_events == [], (
-            f"scenario {scenario!r} unexpectedly recorded a preceding intent event"
-        )
+        assert intent_events == [], f"scenario {scenario!r} unexpectedly recorded a preceding intent event"
 
     # --- created outcome additionally records the proposal branch + PR id -----------------
     if scenario == "created":

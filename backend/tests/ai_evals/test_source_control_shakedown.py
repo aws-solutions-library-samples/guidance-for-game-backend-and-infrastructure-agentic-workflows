@@ -126,14 +126,11 @@ def test_shakedown_read_then_propose_creates_unmerged_proposal(connector_config)
         )
         try:
             # --- Step 1: read through the specialist's read tool -----------------------
-            read_result = get_iac_file(
-                [_READ_FILE], repository=_REPO, target_branch=_BRANCH
-            )
+            read_result = get_iac_file([_READ_FILE], repository=_REPO, target_branch=_BRANCH)
             assert "error" not in read_result, f"Read failed: {read_result.get('error')}"
             assert read_result["limit_exceeded"] is False
             assert _READ_FILE not in read_result["missing"], (
-                f"Expected '{_READ_FILE}' to exist in {_REPO}@{_BRANCH}; "
-                f"set GBAW_SCM_IT_FILE to an existing path."
+                f"Expected '{_READ_FILE}' to exist in {_REPO}@{_BRANCH}; " f"set GBAW_SCM_IT_FILE to an existing path."
             )
             # Read-before-write: the read captures the Verified_Source_Snapshot (revision)
             # that the propose step MUST be anchored to (Req 7.1, 7.2).

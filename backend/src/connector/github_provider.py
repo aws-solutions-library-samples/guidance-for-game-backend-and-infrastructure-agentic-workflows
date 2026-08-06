@@ -30,11 +30,11 @@ Only provider-agnostic dataclasses from ``connector.models`` and Python primitiv
 the method boundary; no GitHub-specific type escapes this layer (Req 9.1).
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 import base64
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 # Third-party packages
 import httpx
@@ -42,10 +42,10 @@ import httpx
 # Local modules
 from connector import registry
 from connector.models import (
+    ChangeProposalResult,
     FileContent,
     FileFetchResult,
     ProposedFile,
-    ChangeProposalResult,
 )
 from connector.provider import (
     OutboundRequest,
@@ -105,9 +105,7 @@ class GitHubTokenAuth(ProviderAuth):
         """
         token = get_secret(self._credential_secret_arn, source="secretsmanager")
         if not token:
-            raise ProviderAuthError(
-                "Source-control credential could not be retrieved from Secrets Manager"
-            )
+            raise ProviderAuthError("Source-control credential could not be retrieved from Secrets Manager")
         request.headers["Authorization"] = f"Bearer {token}"
 
 
@@ -248,12 +246,8 @@ class GitHubProvider(SourceControlProvider):
         """
         headers = self._auth_headers()
 
-        head_sha = self._extract_ref_sha(
-            self._request("GET", f"/repos/{repo}/git/ref/heads/{branch}", headers).json()
-        )
-        base_commit = self._request(
-            "GET", f"/repos/{repo}/git/commits/{head_sha}", headers
-        ).json()
+        head_sha = self._extract_ref_sha(self._request("GET", f"/repos/{repo}/git/ref/heads/{branch}", headers).json())
+        base_commit = self._request("GET", f"/repos/{repo}/git/commits/{head_sha}", headers).json()
         base_tree_sha = base_commit["tree"]["sha"]
 
         tree_entries = [
@@ -282,7 +276,7 @@ class GitHubProvider(SourceControlProvider):
                 "parents": [head_sha],
             },
         ).json()
-        new_commit_sha = new_commit["sha"]
+        new_commit_sha = cast(str, new_commit["sha"])
 
         self._request(
             "PATCH",
@@ -395,9 +389,7 @@ class GitHubProvider(SourceControlProvider):
         url = f"{self._base_url}{path}"
         try:
             with httpx.Client(timeout=self._timeout) as client:
-                response = client.request(
-                    method, url, headers=headers, params=params, json=json
-                )
+                response = client.request(method, url, headers=headers, params=params, json=json)
         except httpx.ConnectTimeout as exc:
             raise ProviderUnavailableError(f"Provider connection timed out: {method} {path}") from exc
         except httpx.ConnectError as exc:
@@ -430,15 +422,11 @@ class GitHubProvider(SourceControlProvider):
         if status == 404 and allow_404:
             return
         if status in (401, 403):
-            raise ProviderAuthError(
-                f"Provider rejected the credential ({status}): {method} {path}"
-            )
+            raise ProviderAuthError(f"Provider rejected the credential ({status}): {method} {path}")
         if status == 409:
             raise ProviderConflictError(f"Provider reported a conflict (409): {method} {path}")
         if status == 429 or 500 <= status < 600:
-            raise ProviderTransientError(
-                f"Provider temporarily unavailable ({status}): {method} {path}"
-            )
+            raise ProviderTransientError(f"Provider temporarily unavailable ({status}): {method} {path}")
         raise ProviderError(f"Provider request failed ({status}): {method} {path}")
 
     @staticmethod
@@ -452,14 +440,12 @@ class GitHubProvider(SourceControlProvider):
         if payload.get("encoding") == "base64":
             raw = base64.b64decode(payload.get("content", ""))
             return raw.decode("utf-8")
-        raise ProviderError(
-            f"Unsupported content encoding for '{payload.get('path', '<unknown>')}'"
-        )
+        raise ProviderError(f"Unsupported content encoding for '{payload.get('path', '<unknown>')}'")
 
     @staticmethod
     def _extract_ref_sha(payload: dict[str, Any]) -> str:
         """Pull the commit SHA out of a Git Data ref response."""
-        return payload["object"]["sha"]
+        return cast(str, payload["object"]["sha"])
 
 
 # Self-register the bundled GitHub adapter with the provider-neutral registry so that

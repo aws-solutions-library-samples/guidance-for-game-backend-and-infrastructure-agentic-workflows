@@ -26,9 +26,9 @@ branches, and per-branch head SHAs) so it behaves like a plausible provider for
 read/branch/commit/PR flows.
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 import itertools
 from collections import deque
 from dataclasses import dataclass, field
@@ -36,10 +36,10 @@ from typing import TYPE_CHECKING, Any
 
 # Local modules
 from connector.models import (
+    ChangeProposalResult,
     FileContent,
     FileFetchResult,
     ProposedFile,
-    ChangeProposalResult,
 )
 from connector.provider import SourceControlProvider
 
@@ -66,6 +66,7 @@ class _ApplyThenRaise:
     """
 
     exc: BaseException | type[BaseException]
+
 
 # The default head SHA reported by ``latest_commit_sha`` for a repo/branch whose head has
 # not been explicitly seeded. Tests that drive the read-before-write path pass this value as
@@ -266,10 +267,7 @@ class FakeProvider(SourceControlProvider):
 
     def _check_operation(self, operation: str) -> None:
         if operation not in OPERATIONS:
-            raise ValueError(
-                f"Unknown provider operation {operation!r}; "
-                f"valid operations are {OPERATIONS}"
-            )
+            raise ValueError(f"Unknown provider operation {operation!r}; " f"valid operations are {OPERATIONS}")
 
     def _record(self, operation: str, **kwargs: Any) -> None:
         self.calls.append(RecordedCall(operation=operation, kwargs=kwargs))
@@ -287,9 +285,7 @@ class FakeProvider(SourceControlProvider):
 
     @staticmethod
     def _is_exception(outcome: Any) -> bool:
-        return isinstance(outcome, BaseException) or (
-            isinstance(outcome, type) and issubclass(outcome, BaseException)
-        )
+        return isinstance(outcome, BaseException) or (isinstance(outcome, type) and issubclass(outcome, BaseException))
 
     def _apply(self, outcome: Any, **kwargs: Any) -> Any:
         """Turn a programmed outcome into a value (raising it if it is an exception)."""
@@ -348,9 +344,7 @@ class FakeProvider(SourceControlProvider):
         return self._head_shas.get((repo, branch), DEFAULT_HEAD_SHA)
 
     def create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
-        self._record(
-            "create_branch", repo=repo, new_branch=new_branch, from_sha=from_sha
-        )
+        self._record("create_branch", repo=repo, new_branch=new_branch, from_sha=from_sha)
         outcome = self._programmed_outcome("create_branch")
         if isinstance(outcome, _ApplyThenRaise):
             # Ambiguous outcome: the branch actually gets created, then the call raises.
@@ -364,9 +358,7 @@ class FakeProvider(SourceControlProvider):
 
     def _default_create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
         """Apply the default in-memory create-branch effect (records + head at ``from_sha``)."""
-        self.created_branches.append(
-            {"repo": repo, "new_branch": new_branch, "from_sha": from_sha}
-        )
+        self.created_branches.append({"repo": repo, "new_branch": new_branch, "from_sha": from_sha})
         self._branches.add((repo, new_branch))
         self._head_shas[(repo, new_branch)] = from_sha
 
@@ -391,9 +383,7 @@ class FakeProvider(SourceControlProvider):
             self._default_commit_files(repo, branch, list(files), message)
             self._raise(outcome.exc)
         if outcome is not _UNSET:
-            return self._apply(
-                outcome, repo=repo, branch=branch, files=list(files), message=message
-            )
+            return self._apply(outcome, repo=repo, branch=branch, files=list(files), message=message)
         return self._default_commit_files(repo, branch, list(files), message)
 
     def _default_commit_files(
@@ -442,9 +432,7 @@ class FakeProvider(SourceControlProvider):
             self._default_open_change_proposal(repo, head, base, title, body)
             self._raise(outcome.exc)
         if outcome is not _UNSET:
-            return self._apply(
-                outcome, repo=repo, head=head, base=base, title=title, body=body
-            )
+            return self._apply(outcome, repo=repo, head=head, base=base, title=title, body=body)
         return self._default_open_change_proposal(repo, head, base, title, body)
 
     def _default_open_change_proposal(
@@ -487,17 +475,13 @@ class FakeProvider(SourceControlProvider):
         ``head``/``base`` match the query, or ``None`` when none has been opened — mirroring
         the base ABC default of "none found".
         """
-        self._record(
-            "find_open_change_proposal", repo=repo, head=head, base=base
-        )
+        self._record("find_open_change_proposal", repo=repo, head=head, base=base)
         outcome = self._programmed_outcome("find_open_change_proposal")
         if outcome is not _UNSET:
             return self._apply(outcome, repo=repo, head=head, base=base)
         for pr in reversed(self.pull_requests):
             if pr["repo"] == repo and pr["head"] == head and pr["base"] == base:
-                return ChangeProposalResult(
-                    proposal_id=pr["proposal_id"], proposal_url=pr["proposal_url"]
-                )
+                return ChangeProposalResult(proposal_id=pr["proposal_id"], proposal_url=pr["proposal_url"])
         return None
 
     # --------------------------------------------------------------- introspection

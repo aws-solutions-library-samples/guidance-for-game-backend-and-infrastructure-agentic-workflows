@@ -16,9 +16,9 @@ builds the config object directly and does not enforce ARN shape, so tests may p
 sentinel value.
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 from collections.abc import Sequence
 
 # Local modules

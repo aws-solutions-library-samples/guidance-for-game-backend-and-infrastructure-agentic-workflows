@@ -36,10 +36,10 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector import service
+from connector.config import AllowlistEntry, SourceControlConfig
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
@@ -95,9 +95,27 @@ def _make_config() -> SourceControlConfig:
 # non-injection invariant explicit and robust against any accidental phrasing.
 
 _WORDS = [
-    "update", "bucket", "stack", "resource", "memory", "configuration", "service",
-    "cluster", "policy", "template", "infrastructure", "enable", "versioning",
-    "scaling", "capacity", "instance", "network", "adjust", "the", "for", "and",
+    "update",
+    "bucket",
+    "stack",
+    "resource",
+    "memory",
+    "configuration",
+    "service",
+    "cluster",
+    "policy",
+    "template",
+    "infrastructure",
+    "enable",
+    "versioning",
+    "scaling",
+    "capacity",
+    "instance",
+    "network",
+    "adjust",
+    "the",
+    "for",
+    "and",
 ]
 
 
@@ -132,9 +150,7 @@ def test_property13_empty_files_declined_cleanly(intent, title, description):
 
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
     try:
-        with (
-            mock.patch.object(service, "check_rate_limit", return_value=None),
-        ):
+        with (mock.patch.object(service, "check_rate_limit", return_value=None),):
             result = propose_change(
                 intent=intent,
                 files=[],  # non-file-expressible: no IaC modifications

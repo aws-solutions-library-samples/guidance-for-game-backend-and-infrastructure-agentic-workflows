@@ -57,9 +57,7 @@ def test_connector_core_does_not_import_or_call_get_secret():
 
 def test_adapter_auth_fetches_credential_via_get_secret_and_reads_no_raw_env(monkeypatch):
     """GitHubTokenAuth sources the credential from get_secret(arn) only (Req 4.2, 11.2)."""
-    auth = GitHubTokenAuth(
-        AdapterConfig(credential_secret_arn=_SECRET_ARN, provider_base_url=None, config_errors=())
-    )
+    auth = GitHubTokenAuth(AdapterConfig(credential_secret_arn=_SECRET_ARN, provider_base_url=None, config_errors=()))
     request = OutboundRequest(headers={})
 
     # Plant a decoy raw credential in the environment. If the adapter read the credential

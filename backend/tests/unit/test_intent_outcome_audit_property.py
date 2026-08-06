@@ -242,12 +242,11 @@ def _run(
     title = f"Update {intent_words[0]} configuration"
     description = f"Adjust the {intent_words[-1]} in the infrastructure template."
 
-    token = set_request_context(
-        {"user_id": resolved_user, "groups": resolved_groups, "session_id": "s-1"}
-    )
+    token = set_request_context({"user_id": resolved_user, "groups": resolved_groups, "session_id": "s-1"})
     try:
-        with patch.object(service, "_get_audit_sink", return_value=sink), patch.object(
-            service.time, "sleep", lambda *_a, **_k: None
+        with (
+            patch.object(service, "_get_audit_sink", return_value=sink),
+            patch.object(service.time, "sleep", lambda *_a, **_k: None),
         ):
             result = propose_change(
                 intent,
@@ -302,9 +301,7 @@ def _outcomes(sink: _ProgrammableAuditSink) -> list[dict]:
     outcome_confirmed=st.booleans(),
     mutation_succeeds=st.booleans(),
 )
-def test_intent_outcome_audit_non_atomic(
-    files, intent_words, intent_confirmed, outcome_confirmed, mutation_succeeds
-):
+def test_intent_outcome_audit_non_atomic(files, intent_words, intent_confirmed, outcome_confirmed, mutation_succeeds):
     """Durable INTENT/OUTCOME with reconciliation and no cross-system atomicity (Req 9.1, 9.2).
 
     Crosses mutation ∈ {success, fail} × intent-write ∈ {ok, fail} × outcome-write ∈ {ok, fail}
@@ -344,9 +341,7 @@ def test_intent_outcome_audit_non_atomic(
     # INTENT confirmed: it is written, and it precedes the first provider mutation.
     assert len(intents) == 1
     mutation_indices = [i for i, (kind, _) in enumerate(timeline) if kind == "mutation"]
-    intent_indices = [
-        i for i, (kind, name) in enumerate(timeline) if kind == "audit" and name == "scm_intent"
-    ]
+    intent_indices = [i for i, (kind, name) in enumerate(timeline) if kind == "audit" and name == "scm_intent"]
     # Assertion 1 (ordering): if any mutation ran, an INTENT was written before the first one.
     if mutation_indices:
         assert intent_indices, "no scm_intent recorded on the timeline"

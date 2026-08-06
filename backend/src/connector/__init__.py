@@ -14,6 +14,7 @@ connector submodule therefore runs this bootstrap first, so registration always 
 before enablement is evaluated or ``get_provider`` is called.
 """
 
+# Local modules
 # Import bundled provider adapters for their self-registration side effect (each adapter
 # calls ``registry.register(...)`` at import time). This is the neutral bootstrap point:
 # the core modules import ``connector.registry`` only, never these adapter modules.

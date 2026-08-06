@@ -216,15 +216,13 @@ def test_property_v4_verified_snapshot_required(scenario):
 
         # The rejection audit names the expected reason for each category.
         expected_reason = "missing_snapshot" if category == "absent" else "stale_snapshot"
-        assert expected_reason in _rejection_reasons(mock_logger), (
-            f"{category} reject did not name reason {expected_reason!r}"
-        )
+        assert expected_reason in _rejection_reasons(
+            mock_logger
+        ), f"{category} reject did not name reason {expected_reason!r}"
 
         if category == "absent":
             # A missing snapshot is rejected BEFORE any adapter op at all (Gate 4b).
-            assert fake.calls == [], (
-                f"missing-snapshot reject touched the provider: {fake.call_operations}"
-            )
+            assert fake.calls == [], f"missing-snapshot reject touched the provider: {fake.call_operations}"
 
 
 # --- Read -> propose happy path + staleness (example coverage) -------------

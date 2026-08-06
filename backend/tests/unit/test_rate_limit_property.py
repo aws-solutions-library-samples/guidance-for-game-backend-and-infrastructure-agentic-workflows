@@ -35,9 +35,9 @@ from hypothesis import strategies as st
 
 # Local modules
 from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -85,9 +85,7 @@ def _make_config(*, rate_limit_max: int) -> SourceControlConfig:
     )
 
 
-def _propose_as(
-    user_id: str, *, config: SourceControlConfig, provider: FakeProvider, variant: int = 0
-):
+def _propose_as(user_id: str, *, config: SourceControlConfig, provider: FakeProvider, variant: int = 0):
     """Run one ``propose_change`` as ``user_id`` (authorized) and return the result.
 
     Credential acquisition is adapter-owned behind ``ProviderAuth`` (the core issues no
@@ -142,10 +140,7 @@ def test_property7_per_user_proposal_rate_limit(rate_limit_max, extra_calls):
     user_a = f"user-a-{next(_user_ids)}"
     total_calls = rate_limit_max + extra_calls
 
-    results = [
-        _propose_as(user_a, config=config, provider=provider, variant=i)
-        for i in range(total_calls)
-    ]
+    results = [_propose_as(user_a, config=config, provider=provider, variant=i) for i in range(total_calls)]
 
     # The first N requests succeed (each opens exactly one pull request).
     allowed = results[:rate_limit_max]

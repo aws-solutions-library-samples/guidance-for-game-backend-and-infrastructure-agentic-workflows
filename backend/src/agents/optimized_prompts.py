@@ -151,8 +151,7 @@ ORCHESTRATOR_PROMPT = VersionedPrompt(
 
 # Registry for programmatic access
 _ALL_PROMPTS: dict[str, VersionedPrompt] = {
-    p.name: p
-    for p in [GAMELIFT_PROMPT, EKS_PROMPT, COST_PROMPT, SOURCE_CONTROL_PROMPT, ORCHESTRATOR_PROMPT]
+    p.name: p for p in [GAMELIFT_PROMPT, EKS_PROMPT, COST_PROMPT, SOURCE_CONTROL_PROMPT, ORCHESTRATOR_PROMPT]
 }
 
 

@@ -48,10 +48,10 @@ from hypothesis import strategies as st
 
 # Local modules
 from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.provider import ProviderAuthError
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows

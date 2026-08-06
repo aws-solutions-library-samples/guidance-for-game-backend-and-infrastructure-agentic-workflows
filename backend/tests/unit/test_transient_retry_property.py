@@ -51,12 +51,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
-from connector.models import ProposedFile
 from connector import service
+from connector.config import AllowlistEntry, SourceControlConfig
+from connector.models import ProposedFile
 from connector.provider import ProviderTransientError
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -231,9 +231,7 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
         # succeeds in one call. ``branch_exists`` is consulted exactly once (the create-branch
         # reconcile). So the failing op is invoked k + 1 times, plus one extra call for
         # ``latest_commit_sha``.
-        expected_attempts = transient_failures + (
-            2 if failing_op == "latest_commit_sha" else 1
-        )
+        expected_attempts = transient_failures + (2 if failing_op == "latest_commit_sha" else 1)
         assert attempts_made == expected_attempts
 
         # The proposal ultimately succeeds and a pull request is created (Req 10.5).

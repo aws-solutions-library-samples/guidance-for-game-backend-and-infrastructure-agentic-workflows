@@ -43,10 +43,10 @@ from hypothesis import strategies as st
 
 # Local modules
 from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.provider import ProviderUnavailableError
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -162,9 +162,7 @@ def _valid_cfn_files(draw):
     files=_valid_cfn_files(),
     intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
 )
-def test_property16_provider_unavailable_is_safe_and_non_destructive(
-    failing_op, files, intent_words
-):
+def test_property16_provider_unavailable_is_safe_and_non_destructive(failing_op, files, intent_words):
     """Provider unavailability at any operation yields a safe, non-destructive error.
 
     For any authorized, valid request in which the provider reports unavailable/timed out at

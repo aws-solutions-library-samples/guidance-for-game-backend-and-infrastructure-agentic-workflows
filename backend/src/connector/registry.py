@@ -19,9 +19,9 @@ To stay provider-neutral this module references only the abstraction.
 :class:`~connector.provider.UnsupportedProviderError` that :func:`get_provider` raises.
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 from typing import TYPE_CHECKING, Callable
 
 # Local modules

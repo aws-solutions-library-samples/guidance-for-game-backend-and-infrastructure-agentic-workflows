@@ -111,12 +111,8 @@ def _non_comment_text(text: str) -> str:
 def test_arn_resolved_once_from_env_or_env_local(deploy_text: str):
     """(Req 11.2) The credential ARN is resolved once into ``$SCM_CREDENTIAL_SECRET_ARN``
     from the environment or backend/.env.local — a single source of truth."""
-    pattern = re.compile(
-        rf'^{_ARN_VAR}="\$\{{{_ARN_ENV_NAME}:-.*\}}"', re.MULTILINE
-    )
-    assert pattern.search(deploy_text), (
-        f"{_ARN_VAR} must be resolved once from ${_ARN_ENV_NAME} (env or .env.local)"
-    )
+    pattern = re.compile(rf'^{_ARN_VAR}="\$\{{{_ARN_ENV_NAME}:-.*\}}"', re.MULTILINE)
+    assert pattern.search(deploy_text), f"{_ARN_VAR} must be resolved once from ${_ARN_ENV_NAME} (env or .env.local)"
 
 
 def test_same_arn_source_drives_base_param_and_runtime_env(deploy_text: str):
@@ -126,13 +122,13 @@ def test_same_arn_source_drives_base_param_and_runtime_env(deploy_text: str):
     non_comment = _non_comment_text(deploy_text)
 
     # Base-stack parameter reads the shell variable.
-    assert re.search(rf'ScmCredentialSecretArn="\${_ARN_VAR}"', non_comment), (
-        "base-stack ScmCredentialSecretArn parameter must read $SCM_CREDENTIAL_SECRET_ARN"
-    )
+    assert re.search(
+        rf'ScmCredentialSecretArn="\${_ARN_VAR}"', non_comment
+    ), "base-stack ScmCredentialSecretArn parameter must read $SCM_CREDENTIAL_SECRET_ARN"
     # Runtime env var reads the SAME shell variable.
-    assert re.search(rf'{_ARN_ENV_NAME}=\${_ARN_VAR}\b', non_comment), (
-        "runtime GBAW_SCM_CREDENTIAL_SECRET_ARN must read the SAME $SCM_CREDENTIAL_SECRET_ARN"
-    )
+    assert re.search(
+        rf"{_ARN_ENV_NAME}=\${_ARN_VAR}\b", non_comment
+    ), "runtime GBAW_SCM_CREDENTIAL_SECRET_ARN must read the SAME $SCM_CREDENTIAL_SECRET_ARN"
 
 
 # --- Tests: KB-independent audit destination + env wiring ---------------------------------
@@ -141,17 +137,15 @@ def test_same_arn_source_drives_base_param_and_runtime_env(deploy_text: str):
 def test_audit_log_group_env_var_wired(deploy_text: str):
     """(Req 9.3, 9.4) The audit destination env var ``GBAW_SCM_AUDIT_LOG_GROUP`` is part of
     the wired ``GBAW_SCM_*`` runtime env set."""
-    assert "GBAW_SCM_AUDIT_LOG_GROUP" in _non_comment_text(deploy_text), (
-        "GBAW_SCM_AUDIT_LOG_GROUP must be wired through the runtime env args"
-    )
+    assert "GBAW_SCM_AUDIT_LOG_GROUP" in _non_comment_text(
+        deploy_text
+    ), "GBAW_SCM_AUDIT_LOG_GROUP must be wired through the runtime env args"
 
 
 def test_credential_env_append_guarded_by_arn_not_kb(deploy_lines: list):
     """(Req 9.3) The credential runtime env append is guarded by the ARN's own presence
     check, independent of any Knowledge Base ID."""
-    guard = _enclosing_guard(
-        deploy_lines, f'SCM_ENV_ARGS+=(-env "{_ARN_ENV_NAME}=${_ARN_VAR}'
-    )
+    guard = _enclosing_guard(deploy_lines, f'SCM_ENV_ARGS+=(-env "{_ARN_ENV_NAME}=${_ARN_VAR}')
     assert _ARN_VAR in guard, f"credential env append must guard on ${_ARN_VAR}: {guard!r}"
     for kb in _KB_ID_VARS:
         assert kb not in guard, f"credential env append must not be gated on {kb}: {guard!r}"
@@ -161,9 +155,7 @@ def test_launch_env_appends_scm_args_outside_kb_conditional(deploy_lines: list):
     """(Req 9.3, 9.4) ``LAUNCH_ENV_ARGS`` appends ``SCM_ENV_ARGS`` under its own count guard,
     not inside a Knowledge Base conditional — so GBAW_SCM_* args ship regardless of KB IDs."""
     guard = _enclosing_guard(deploy_lines, 'LAUNCH_ENV_ARGS+=("${SCM_ENV_ARGS[@]}")')
-    assert "SCM_ENV_ARGS" in guard, (
-        f"SCM_ENV_ARGS append must guard on the SCM_ENV_ARGS count: {guard!r}"
-    )
+    assert "SCM_ENV_ARGS" in guard, f"SCM_ENV_ARGS append must guard on the SCM_ENV_ARGS count: {guard!r}"
     for kb in _KB_ID_VARS:
         assert kb not in guard, f"SCM_ENV_ARGS append must not be gated on {kb}: {guard!r}"
 
@@ -174,9 +166,7 @@ def test_launch_env_appends_scm_args_outside_kb_conditional(deploy_lines: list):
 def test_removed_credential_secret_id_absent(deploy_text: str):
     """(Req 11.2) The removed legacy ``GBAW_SCM_CREDENTIAL_SECRET_ID`` setting does not
     reappear anywhere in deploy.sh — only the single ARN-valued setting is used."""
-    assert _REMOVED_ENV_NAME not in deploy_text, (
-        f"{_REMOVED_ENV_NAME} must be absent; only {_ARN_ENV_NAME} is used"
-    )
+    assert _REMOVED_ENV_NAME not in deploy_text, f"{_REMOVED_ENV_NAME} must be absent; only {_ARN_ENV_NAME} is used"
 
 
 def test_only_arn_variable_flows_never_a_literal_value(deploy_text: str):
@@ -187,6 +177,4 @@ def test_only_arn_variable_flows_never_a_literal_value(deploy_text: str):
     env_arg_values = re.findall(rf'-env "{_ARN_ENV_NAME}=([^"]*)"', non_comment)
     assert env_arg_values, f"expected a -env {_ARN_ENV_NAME}=... assignment"
     for value in env_arg_values:
-        assert value == f"${_ARN_VAR}", (
-            f"{_ARN_ENV_NAME} -env value must be exactly ${_ARN_VAR}, got: {value!r}"
-        )
+        assert value == f"${_ARN_VAR}", f"{_ARN_ENV_NAME} -env value must be exactly ${_ARN_VAR}, got: {value!r}"

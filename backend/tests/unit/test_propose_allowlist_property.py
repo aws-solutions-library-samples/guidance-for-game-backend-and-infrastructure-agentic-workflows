@@ -35,11 +35,11 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
-from connector.models import ProposedFile
 from connector import service
+from connector.config import AllowlistEntry, SourceControlConfig
+from connector.models import ProposedFile
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
@@ -118,9 +118,7 @@ def _call_propose(repository: str, target_branch: str, fake: FakeProvider):
     """
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
     try:
-        with (
-            mock.patch.object(service, "check_rate_limit", return_value=None),
-        ):
+        with (mock.patch.object(service, "check_rate_limit", return_value=None),):
             return propose_change(
                 intent="update the storage bucket configuration",
                 files=_proposed_files(),
@@ -180,9 +178,7 @@ def _non_matching_pairs(draw):
         candidate = (repo, branch[:-1])
     elif kind == "wrong_branch":
         # A branch that belongs to some entry but not to this repository's entry.
-        other_branches = [
-            b for r, b in _EXACT_PAIRS if not _is_exact_match(repo, b)
-        ]
+        other_branches = [b for r, b in _EXACT_PAIRS if not _is_exact_match(repo, b)]
         assume(other_branches)
         candidate = (repo, draw(st.sampled_from(other_branches)))
     elif kind == "absent_repo":
@@ -280,8 +276,7 @@ def test_property5_non_match_performs_no_operation_and_audits(pair):
     rejection_calls = [
         call
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_outcome"
-        and call.kwargs.get("failed_dimension") in ("repo", "branch")
+        if call.kwargs.get("event") == "scm_outcome" and call.kwargs.get("failed_dimension") in ("repo", "branch")
     ]
     assert rejection_calls, "expected a scm_outcome audit naming the repo/branch dimension"
     audit = rejection_calls[0].kwargs

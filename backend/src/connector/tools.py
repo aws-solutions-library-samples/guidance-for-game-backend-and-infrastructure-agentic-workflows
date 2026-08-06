@@ -24,7 +24,6 @@ caught and converted into a safe error dict so the agent can relay a clean messa
 than crashing the tool call.
 """
 
-# Standard library
 from __future__ import annotations
 
 # Third-party packages
@@ -79,9 +78,7 @@ def get_iac_file(
         ``files``/``missing`` and a ``None`` ``revision``.
     """
     try:
-        result = read_iac_files(
-            list(paths), repository=repository, target_branch=target_branch
-        )
+        result = read_iac_files(list(paths), repository=repository, target_branch=target_branch)
         return {
             "files": [{"path": f.path, "content": f.content} for f in result.files],
             "missing": list(result.missing),

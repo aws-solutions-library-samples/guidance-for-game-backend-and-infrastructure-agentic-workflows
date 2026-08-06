@@ -14,7 +14,7 @@ import inspect
 import pytest
 
 # Local modules
-from connector.models import FileContent, FileFetchResult, ProposedFile, ChangeProposalResult
+from connector.models import ChangeProposalResult, FileContent, FileFetchResult, ProposedFile
 from connector.provider import (
     ProviderAuthError,
     ProviderConflictError,

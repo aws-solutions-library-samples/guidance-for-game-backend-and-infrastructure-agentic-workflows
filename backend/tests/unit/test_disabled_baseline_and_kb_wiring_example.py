@@ -171,9 +171,7 @@ def _build_and_invoke_specialist(monkeypatch, kb_id):
 
 def test_configured_iac_kb_wires_retrieve_tool_into_specialist(monkeypatch):
     """Truthy kb_id => specialist is built WITH the KB retrieve tool (Req 3.5)."""
-    tools, kb_factory, kb_retrieve_sentinel, extra_tool = _build_and_invoke_specialist(
-        monkeypatch, kb_id="iac-kb-123"
-    )
+    tools, kb_factory, kb_retrieve_sentinel, extra_tool = _build_and_invoke_specialist(monkeypatch, kb_id="iac-kb-123")
 
     # The factory created the retrieve tool for the configured KB id ...
     kb_factory.assert_called_once()
@@ -185,9 +183,7 @@ def test_configured_iac_kb_wires_retrieve_tool_into_specialist(monkeypatch):
 
 def test_unset_iac_kb_builds_specialist_without_retrieve_tool(monkeypatch):
     """Falsy kb_id => no KB retrieve tool is created or wired (Req 3.5)."""
-    tools, kb_factory, kb_retrieve_sentinel, extra_tool = _build_and_invoke_specialist(
-        monkeypatch, kb_id=None
-    )
+    tools, kb_factory, kb_retrieve_sentinel, extra_tool = _build_and_invoke_specialist(monkeypatch, kb_id=None)
 
     kb_factory.assert_not_called()
     assert kb_retrieve_sentinel not in tools

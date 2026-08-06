@@ -57,9 +57,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
+from connector import service
 from connector.config import AllowlistEntry, SourceControlConfig
 from connector.models import ProposedFile
-from connector import service
 from connector.provider import ProviderTransientError
 from connector.service import (
     _deterministic_branch_name,
@@ -218,9 +218,7 @@ def _call_propose(fake: FakeProvider, *, intent, files, title, description, user
     pre_state=st.sampled_from(_PRE_STATES),
     base_revision=st.from_regex(r"[0-9a-f]{7,40}", fullmatch=True),
 )
-def test_propertyV6_ambiguous_outcomes_never_duplicate_state(
-    files, intent_words, failing_op, pre_state, base_revision
-):
+def test_propertyV6_ambiguous_outcomes_never_duplicate_state(files, intent_words, failing_op, pre_state, base_revision):
     """A mutating op whose effect landed then raised a transient error is reconciled, not
     repeated: the deterministic branch is reused, the commit is not duplicated, and an
     already-open proposal is returned — never a second branch/commit/proposal (Req 8.1, 8.2)."""
@@ -302,9 +300,7 @@ def test_propertyV6_ambiguous_outcomes_never_duplicate_state(
 
     # Exactly one open Change_Proposal exists for the deterministic head->base — the applied
     # or pre-existing proposal is returned, never duplicated.
-    prs_for_head = [
-        pr for pr in fake.pull_requests if pr["head"] == proposal_branch and pr["base"] == _BRANCH
-    ]
+    prs_for_head = [pr for pr in fake.pull_requests if pr["head"] == proposal_branch and pr["base"] == _BRANCH]
     assert len(prs_for_head) == 1
 
     # The connector targeted its deterministic branch (not a random name).

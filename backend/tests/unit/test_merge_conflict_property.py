@@ -43,12 +43,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
-from connector.models import ProposedFile
 from connector import service
-from connector.service import propose_change
+from connector.config import AllowlistEntry, SourceControlConfig
+from connector.models import ProposedFile
 from connector.provider import ProviderConflictError
+from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -157,9 +157,7 @@ def _valid_cfn_files(draw):
     intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
     failing_op=st.sampled_from(_PROPOSE_OPS),
 )
-def test_property19_merge_conflict_is_reported_without_destructive_resolution(
-    files, intent_words, failing_op
-):
+def test_property19_merge_conflict_is_reported_without_destructive_resolution(files, intent_words, failing_op):
     """A provider conflict is surfaced safely: error result, no PR, no destructive op, no retry.
 
     For any provider operation in the propose flow that raises ``ProviderConflictError``, the
@@ -182,9 +180,7 @@ def test_property19_merge_conflict_is_reported_without_destructive_resolution(
 
     token = set_request_context({"user_id": user_id, "groups": [_GROUP], "session_id": "s-1"})
     try:
-        with (
-            mock.patch.object(service, "logger") as mock_logger,
-        ):
+        with (mock.patch.object(service, "logger") as mock_logger,):
             result = propose_change(
                 intent,
                 files,
@@ -236,8 +232,7 @@ def test_property19_merge_conflict_is_reported_without_destructive_resolution(
     conflict_audits = [
         call
         for call in mock_logger.error.call_args_list
-        if call.kwargs.get("event") == "scm_outcome"
-        and call.kwargs.get("reason") == "provider_conflict"
+        if call.kwargs.get("event") == "scm_outcome" and call.kwargs.get("reason") == "provider_conflict"
     ]
     assert conflict_audits, "expected a provider_conflict audit entry"
     audit = conflict_audits[0].kwargs

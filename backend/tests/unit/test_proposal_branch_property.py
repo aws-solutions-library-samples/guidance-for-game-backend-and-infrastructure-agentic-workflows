@@ -44,11 +44,11 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
-from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
-from connector.models import ProposedFile
 from connector import service
+from connector.config import AllowlistEntry, SourceControlConfig
+from connector.models import ProposedFile
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
@@ -106,9 +106,7 @@ def _call_propose(fake: FakeProvider, base_revision: str):
     """
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
     try:
-        with (
-            mock.patch.object(service, "check_rate_limit", return_value=None),
-        ):
+        with (mock.patch.object(service, "check_rate_limit", return_value=None),):
             return propose_change(
                 intent=_INTENT,
                 files=_proposed_files(),
@@ -174,6 +172,6 @@ def test_proposal_branch_deterministic_and_based_on_verified_snapshot(latest_sha
     assert result2.status == "created", result2.message
     rerun_create = fake2.calls_for("create_branch")
     assert len(rerun_create) == 1
-    assert rerun_create[0]["new_branch"] == branch_name, (
-        "the same logical proposal must map to the same deterministic branch name"
-    )
+    assert (
+        rerun_create[0]["new_branch"] == branch_name
+    ), "the same logical proposal must map to the same deterministic branch name"

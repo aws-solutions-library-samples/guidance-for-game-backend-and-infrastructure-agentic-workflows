@@ -198,9 +198,7 @@ def _proposed_files() -> list[ProposedFile]:
 
 def _make_provider(auth_model: str, auth_outcome: str, credential: str) -> tuple[_AuthProvider, _FakeProviderAuth]:
     """Build an authenticating provider + its installed fake ProviderAuth for a scenario."""
-    auth = _FakeProviderAuth(
-        model=auth_model, credential=credential, fails=(auth_outcome == "fails")
-    )
+    auth = _FakeProviderAuth(model=auth_model, credential=credential, fails=(auth_outcome == "fails"))
     provider = _AuthProvider(auth)
     provider.set_head(_REPO, _BRANCH, _BASE_SHA)
     provider.add_file(_REPO, _BRANCH, "template.yaml", _VALID_CFN)

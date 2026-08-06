@@ -27,8 +27,8 @@ from hypothesis import strategies as st
 # Local modules
 from connector import service as service_module
 from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector.service import read_iac_files
+from support.config_factory import make_source_control_config
 from support.fake_provider import FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 
@@ -114,9 +114,7 @@ def _within_limit_requests(draw):
     branch = draw(_branches)
     max_files = draw(st.integers(min_value=1, max_value=25))
 
-    paths = draw(
-        st.lists(_paths, min_size=0, max_size=max_files, unique=True)
-    )
+    paths = draw(st.lists(_paths, min_size=0, max_size=max_files, unique=True))
     # Partition the requested paths into those present in the provider and those missing.
     present = set(draw(st.sets(st.sampled_from(paths), max_size=len(paths)))) if paths else set()
     missing = [p for p in paths if p not in present]
@@ -174,9 +172,7 @@ def _over_limit_requests(draw):
     max_files = draw(st.integers(min_value=1, max_value=15))
 
     # Strictly more than max_files distinct paths.
-    paths = draw(
-        st.lists(_paths, min_size=max_files + 1, max_size=max_files + 8, unique=True)
-    )
+    paths = draw(st.lists(_paths, min_size=max_files + 1, max_size=max_files + 8, unique=True))
 
     fake = FakeProvider()
     # Seed every requested path so that, if a fetch *were* wrongly issued, it would
@@ -274,8 +270,7 @@ def test_read_rejected_when_group_dimension_not_satisfied():
     rejections = [
         call
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_rejected"
-        and call.kwargs.get("failed_dimension") == "group"
+        if call.kwargs.get("event") == "scm_rejected" and call.kwargs.get("failed_dimension") == "group"
     ]
     assert rejections, "expected a scm_rejected read audit naming the group dimension"
 

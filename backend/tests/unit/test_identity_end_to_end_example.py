@@ -230,9 +230,9 @@ def test_authenticated_authorized_groups_creates_proposal():
 
     result = _propose_through_identity_chain(raw_claims, fake)
 
-    assert result.status == "created", (
-        f"authorized identity should create a proposal, got {result.status}: {result.message}"
-    )
+    assert (
+        result.status == "created"
+    ), f"authorized identity should create a proposal, got {result.status}: {result.message}"
     assert result.proposal_id is not None
     assert result.proposal_url is not None
     # Exactly one proposal was opened, scoped to the allowlisted repo/branch.
@@ -259,9 +259,10 @@ def test_unauthenticated_request_rejected_no_provider_op():
     # No verified UI Cognito claims reached the backend (unauthenticated / guest session).
     result = _propose_through_identity_chain(None, fake)
 
-    assert result.status in ("rejected", "declined"), (
-        f"unauthenticated request should be rejected, got {result.status}: {result.message}"
-    )
+    assert result.status in (
+        "rejected",
+        "declined",
+    ), f"unauthenticated request should be rejected, got {result.status}: {result.message}"
     assert result.proposal_id is None
     assert result.proposal_url is None
     _assert_no_provider_mutation(fake)
@@ -292,9 +293,10 @@ def test_authenticated_unauthorized_groups_rejected_no_provider_op():
 
     result = _propose_through_identity_chain(raw_claims, fake)
 
-    assert result.status in ("rejected", "declined"), (
-        f"unauthorized-groups request should be rejected, got {result.status}: {result.message}"
-    )
+    assert result.status in (
+        "rejected",
+        "declined",
+    ), f"unauthorized-groups request should be rejected, got {result.status}: {result.message}"
     assert result.proposal_id is None
     assert result.proposal_url is None
     _assert_no_provider_mutation(fake)

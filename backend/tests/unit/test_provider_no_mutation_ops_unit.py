@@ -62,11 +62,7 @@ FORBIDDEN_OPERATION_SUBSTRINGS = (
 
 def _public_operations(cls) -> set:
     """Return the public (non-dunder, non-underscore) method names declared on ``cls``."""
-    return {
-        name
-        for name, _ in inspect.getmembers(cls, predicate=inspect.isfunction)
-        if not name.startswith("_")
-    }
+    return {name for name, _ in inspect.getmembers(cls, predicate=inspect.isfunction) if not name.startswith("_")}
 
 
 def test_abstract_method_set_is_exactly_the_propose_read_set():
@@ -84,12 +80,7 @@ def test_public_operations_are_exactly_the_propose_read_set():
 def test_no_merge_approve_or_close_operation_is_defined():
     """No mutation/finalization operation (merge/approve/close/delete/...) is defined."""
     public_ops = _public_operations(SourceControlProvider)
-    offending = {
-        op
-        for op in public_ops
-        for bad in FORBIDDEN_OPERATION_SUBSTRINGS
-        if bad in op.lower()
-    }
+    offending = {op for op in public_ops for bad in FORBIDDEN_OPERATION_SUBSTRINGS if bad in op.lower()}
     assert offending == set(), f"forbidden mutation operation(s) present: {sorted(offending)}"
 
 

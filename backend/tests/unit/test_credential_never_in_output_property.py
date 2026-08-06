@@ -202,9 +202,7 @@ def _provider_for(scenario: str) -> _AuthenticatingFakeProvider:
     the propose pipeline takes the corresponding error branch (all of which audit and return
     a secret-free result).
     """
-    auth = GitHubTokenAuth(
-        AdapterConfig(credential_secret_arn=_ARN, provider_base_url=None, config_errors=())
-    )
+    auth = GitHubTokenAuth(AdapterConfig(credential_secret_arn=_ARN, provider_base_url=None, config_errors=()))
     fake = _AuthenticatingFakeProvider(auth)
     fake.set_head(_REPO, _BRANCH, _BASE_SHA)
     if scenario == "provider_auth":
@@ -304,11 +302,7 @@ def test_credential_never_appears_in_output(credential, scenario):
         result.proposal_url,
     ):
         if field_value is not None:
-            assert credential not in field_value, (
-                f"credential leaked into ProposalResult ({scenario}): {field_value!r}"
-            )
+            assert credential not in field_value, f"credential leaked into ProposalResult ({scenario}): {field_value!r}"
 
     # Req 6.6: the credential value appears in NO audit log field (args or kwargs).
-    assert credential not in audit_blob, (
-        f"credential leaked into an audit log entry ({scenario})"
-    )
+    assert credential not in audit_blob, f"credential leaked into an audit log entry ({scenario})"

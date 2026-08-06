@@ -47,9 +47,9 @@ from hypothesis import strategies as st
 # Local modules
 from connector import service
 from connector.config import AllowlistEntry, SourceControlConfig
-from support.config_factory import make_source_control_config
 from connector.models import ProposedFile
 from connector.service import propose_change
+from support.config_factory import make_source_control_config
 from support.fake_provider import DEFAULT_HEAD_SHA, FakeProvider
 from utils.request_context import reset_request_context, set_request_context
 from utils.security import _rate_limit_windows
@@ -176,9 +176,7 @@ def _run(files, intent_words, *, intent_confirmed: bool, outcome_confirmed: bool
 
     config = _make_config()
     provider = FakeProvider()
-    sink = _ProgrammableAuditSink(
-        intent_confirmed=intent_confirmed, outcome_confirmed=outcome_confirmed
-    )
+    sink = _ProgrammableAuditSink(intent_confirmed=intent_confirmed, outcome_confirmed=outcome_confirmed)
 
     user_id = f"user-{next(_user_ids)}"
     intent = " ".join(intent_words)
@@ -234,9 +232,7 @@ def test_unconfirmed_intent_aborts_before_any_mutation(files, intent_words):
     and never reports success. Because nothing was mutated, this abort is a safe fail-closed
     decline, not a cross-system atomicity claim (Req 9.2).
     """
-    result, provider, sink = _run(
-        files, intent_words, intent_confirmed=False, outcome_confirmed=True
-    )
+    result, provider, sink = _run(files, intent_words, intent_confirmed=False, outcome_confirmed=True)
 
     # No mutation occurred at all — the abort happened before the first mutating op.
     _assert_no_mutation(provider)
@@ -277,9 +273,7 @@ def test_unconfirmed_outcome_after_success_is_reconcilable_not_atomic(files, int
     ``status="reconcilable"`` handle (with the proposal id/url) reconcilable from the recorded
     intent + provider state. No cross-system atomicity is claimed (Req 9.1, 9.2).
     """
-    result, provider, sink = _run(
-        files, intent_words, intent_confirmed=True, outcome_confirmed=False
-    )
+    result, provider, sink = _run(files, intent_words, intent_confirmed=True, outcome_confirmed=False)
 
     # The mutation actually happened and was NOT rolled back: the proposal exists on provider.
     assert len(provider.pull_requests) == 1
@@ -323,9 +317,7 @@ def test_confirmed_intent_and_outcome_reports_created(files, intent_words):
     OUTCOME (after) let the connector report the proposal as ``created``. Two correlated events
     are recorded — INTENT then OUTCOME — sharing the idempotency key (Req 9.1).
     """
-    result, provider, sink = _run(
-        files, intent_words, intent_confirmed=True, outcome_confirmed=True
-    )
+    result, provider, sink = _run(files, intent_words, intent_confirmed=True, outcome_confirmed=True)
 
     assert result.status == "created", result.message
     assert result.proposal_id is not None

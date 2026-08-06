@@ -115,9 +115,7 @@ def _gh_headers() -> dict:
 def _get_pull_request(pr_number: str) -> dict:
     """Fetch a PR directly from GitHub to verify state and discover its head branch."""
     with httpx.Client(timeout=30.0) as client:
-        response = client.get(
-            f"{_GITHUB_API}/repos/{_REPO}/pulls/{pr_number}", headers=_gh_headers()
-        )
+        response = client.get(f"{_GITHUB_API}/repos/{_REPO}/pulls/{pr_number}", headers=_gh_headers())
         response.raise_for_status()
         return response.json()
 
@@ -191,8 +189,7 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
             assert read_result.limit_exceeded is False
             # The configured read file should exist in a properly prepared disposable repo.
             assert _READ_FILE not in read_result.missing, (
-                f"Expected '{_READ_FILE}' to exist in {_REPO}@{_BRANCH}; "
-                f"set GBAW_SCM_IT_FILE to an existing path."
+                f"Expected '{_READ_FILE}' to exist in {_REPO}@{_BRANCH}; " f"set GBAW_SCM_IT_FILE to an existing path."
             )
             assert len(read_result.files) == 1
             assert read_result.files[0].path == _READ_FILE
@@ -202,6 +199,7 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
             base_revision = read_result.revision
 
             # --- Step 2: open a REAL pull request via the propose pipeline -----------------
+            # Local modules
             from connector.models import ProposedFile
 
             proposal = propose_change(
@@ -235,9 +233,9 @@ def test_connector_round_trip_reads_file_and_opens_unmerged_pr():
             assert pr.get("merged") is False, "Change proposal must be unmerged (Req 6.1)"
             assert pr.get("base", {}).get("ref") == _BRANCH
             # The connector generates a gbaw/-prefixed proposal branch off the target head.
-            assert head_branch and head_branch.startswith("gbaw/"), (
-                f"Expected a gbaw/ proposal branch, got {head_branch!r}"
-            )
+            assert head_branch and head_branch.startswith(
+                "gbaw/"
+            ), f"Expected a gbaw/ proposal branch, got {head_branch!r}"
         finally:
             # --- Step 4: clean up out of band so the test is idempotent --------------------
             _cleanup_pull_request(pr_number, head_branch)

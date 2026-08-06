@@ -26,7 +26,6 @@ from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.gamelift_specialist import gamelift_agent
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
-from connector.config import SourceControlConfig
 from config.settings import (
     AGENT_MAX_TURNS_ORCHESTRATOR,
     AGENT_TIMEOUT_ORCHESTRATOR_SECONDS,
@@ -35,6 +34,7 @@ from config.settings import (
     INFERENCE_CONFIG,
     USE_BEDROCK_SESSIONS,
 )
+from connector.config import SourceControlConfig
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
@@ -99,8 +99,7 @@ def run_orchestrator(query: str, context: dict = None):
             # only when enabled so the base prompt (and its version) is untouched for
             # read-only deployments.
             orchestrator_prompt = (
-                orchestrator_prompt
-                + "\n\n- sourcecontrol_agent: infrastructure CHANGE PROPOSALS — "
+                orchestrator_prompt + "\n\n- sourcecontrol_agent: infrastructure CHANGE PROPOSALS — "
                 "open a pull request / modify or update an IaC template "
                 "(CloudFormation, Terraform). Never mutates live AWS."
             )

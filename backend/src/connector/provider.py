@@ -26,9 +26,9 @@ types are imported only under ``TYPE_CHECKING`` so this module imports cleanly e
 before ``connector/models.py`` exists.
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -36,10 +36,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Local modules
     from connector.models import (
+        ChangeProposalResult,
         FileContent,
         FileFetchResult,
         ProposedFile,
-        ChangeProposalResult,
     )
 
 

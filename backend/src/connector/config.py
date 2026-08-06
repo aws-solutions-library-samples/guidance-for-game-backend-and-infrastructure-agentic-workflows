@@ -57,9 +57,9 @@ Per-contract validation rules (all failures accumulate on the owning contract):
 - ``max_files_per_request`` not a positive integer → error; absent → 20 (Req 3.2).
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -94,9 +94,7 @@ _MAX_FILES_DEFAULT = 20
 # A Secrets Manager secret ARN, e.g.
 # arn:aws:secretsmanager:us-west-2:123456789012:secret:my/secret-AbCdEf
 # This is the single ARN-valued credential setting's required shape (Req 11.2 / MR5).
-_SECRET_ARN_RE = re.compile(
-    r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$"
-)
+_SECRET_ARN_RE = re.compile(r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$")
 
 
 @dataclass(frozen=True)
@@ -246,18 +244,13 @@ class DomainConfig:
         allowlist, allowlist_errors = _parse_allowlist(settings.SCM_REPO_ALLOWLIST)
         errors.extend(allowlist_errors)
         if not allowlist and not allowlist_errors:
-            errors.append(
-                "allowlist: GBAW_SCM_REPO_ALLOWLIST is required and must contain at least one entry"
-            )
+            errors.append("allowlist: GBAW_SCM_REPO_ALLOWLIST is required and must contain at least one entry")
 
         # --- Authorized groups: comma-separated, at least one non-empty (Req 7.5). ---
-        authorized_groups = tuple(
-            g.strip() for g in (settings.SCM_AUTHORIZED_GROUPS or "").split(",") if g.strip()
-        )
+        authorized_groups = tuple(g.strip() for g in (settings.SCM_AUTHORIZED_GROUPS or "").split(",") if g.strip())
         if not authorized_groups:
             errors.append(
-                "authorized_groups: GBAW_SCM_AUTHORIZED_GROUPS is required and must list at "
-                "least one Cognito group"
+                "authorized_groups: GBAW_SCM_AUTHORIZED_GROUPS is required and must list at " "least one Cognito group"
             )
 
         return cls(
@@ -315,8 +308,7 @@ class ConnectorConfig:
         audit_log_group = (settings.SCM_AUDIT_LOG_GROUP or "").strip() or None
         if audit_log_group is None:
             errors.append(
-                "audit_log_group: GBAW_SCM_AUDIT_LOG_GROUP is required when the connector is "
-                "enabled but was not set"
+                "audit_log_group: GBAW_SCM_AUDIT_LOG_GROUP is required when the connector is " "enabled but was not set"
             )
 
         # --- Numeric tuning values: parse + range-check, falling back to defaults. ---
@@ -425,9 +417,7 @@ class AdapterConfig:
         raw_secret = (settings.SCM_CREDENTIAL_SECRET_ARN or "").strip()
         credential_secret_arn: str | None = raw_secret or None
         if credential_secret_arn is None:
-            errors.append(
-                "credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ARN is required but was not set"
-            )
+            errors.append("credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ARN is required but was not set")
         elif not _SECRET_ARN_RE.match(credential_secret_arn):
             # Reject and NEVER echo the value into the error/audit output.
             credential_secret_arn = None
@@ -479,11 +469,7 @@ class SourceControlConfig:
     @property
     def config_errors(self) -> tuple[str, ...]:
         """Aggregate every contract's accumulated configuration errors, in layer order."""
-        return (
-            self.domain.config_errors
-            + self.connector.config_errors
-            + self.adapter.config_errors
-        )
+        return self.domain.config_errors + self.connector.config_errors + self.adapter.config_errors
 
     @classmethod
     def load(cls) -> "SourceControlConfig":
@@ -512,9 +498,7 @@ class SourceControlConfig:
         # enablement hinges solely on whether any contract accumulated errors (Req 1.4,
         # 1.6). The operator asked for the connector but validation failed → emit a single
         # configuration-error audit entry across all contracts (Req 1.6, 12.4).
-        all_errors = list(
-            domain.config_errors + connector.config_errors + adapter.config_errors
-        )
+        all_errors = list(domain.config_errors + connector.config_errors + adapter.config_errors)
         enabled = not all_errors
         if all_errors:
             _emit_config_error_audit(all_errors)
@@ -605,8 +589,7 @@ def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[
         groups = spec_part.split(":")
         if len(groups) > 3:
             errors.append(
-                f"allowlist: entry '{segment}' is malformed (expected at most "
-                "'branches:paths:extensions')"
+                f"allowlist: entry '{segment}' is malformed (expected at most " "'branches:paths:extensions')"
             )
             continue
         branches_part = groups[0]

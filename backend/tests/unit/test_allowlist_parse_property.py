@@ -48,10 +48,7 @@ def _repo_branch_mapping(draw) -> dict[str, list[str]]:
     property. Branches within a repo are unique so the comparison is unambiguous.
     """
     repos = draw(st.lists(_tokens, min_size=1, max_size=5, unique=True))
-    return {
-        repo: draw(st.lists(_tokens, min_size=1, max_size=4, unique=True))
-        for repo in repos
-    }
+    return {repo: draw(st.lists(_tokens, min_size=1, max_size=4, unique=True)) for repo in repos}
 
 
 def _serialize(mapping: dict[str, list[str]]) -> str:
@@ -104,9 +101,7 @@ def test_property4_allowlist_round_trip_via_config_load(mapping):
     ):
         config = SourceControlConfig.load()
 
-    reconstructed = {
-        e.repo: list(e.target_branches) for e in config.domain.authorization_policy
-    }
+    reconstructed = {e.repo: list(e.target_branches) for e in config.domain.authorization_policy}
     assert reconstructed == mapping
 
 

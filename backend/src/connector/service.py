@@ -30,21 +30,20 @@ Design contract for the read path (see
         # Req 3.4: missing files -> not-found result listing each, no proposal
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 import hashlib
 import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Callable, Sequence, TypeVar
+from typing import TYPE_CHECKING, Callable, Sequence, TypeVar, cast
 
 # Local modules
 from connector.audit import AuditSink
 from connector.config import AuthorizationPolicy, Decision, SourceControlConfig
 from connector.iac_validation import IaCValidationError, validate_iac
-from connector.registry import get_provider
 from connector.models import (
     ChangeProposalResult,
     FileFetchResult,
@@ -58,6 +57,7 @@ from connector.provider import (
     ProviderTransientError,
     ProviderUnavailableError,
 )
+from connector.registry import get_provider
 from utils.logger import logger
 from utils.request_context import get_request_context
 from utils.security import (
@@ -510,8 +510,7 @@ def _audit(level: str, message: str, /, **fields: object) -> bool:
     it never gates the action — only the confirmed sink write does.
     """
     safe_fields = {
-        key: (sanitize_log_data(value) if isinstance(value, str) else value)
-        for key, value in fields.items()
+        key: (sanitize_log_data(value) if isinstance(value, str) else value) for key, value in fields.items()
     }
     safe_fields.setdefault("timestamp", _now_iso())
 
@@ -630,6 +629,8 @@ def _finalize_outcome(
     repository: str | None = None,
     target_branch: str | None = None,
     proposal_branch: str | None = None,
+    proposal_id: str | None = None,
+    proposal_url: str | None = None,
     reason: str | None = None,
     **extra: object,
 ) -> ProposalResult:
@@ -653,6 +654,8 @@ def _finalize_outcome(
         repository=repository,
         target_branch=target_branch,
         proposal_branch=proposal_branch,
+        proposal_id=proposal_id,
+        proposal_url=proposal_url,
         reason=reason,
         **extra,
     )
@@ -743,12 +746,8 @@ def _idempotency_key(
     repo, verified base revision, file set, and requesting user — produces the *same* key,
     which anchors the deterministic branch name below and makes the whole mutation idempotent.
     """
-    file_entries = sorted(
-        f"{f.path}:{hashlib.sha256(f.content.encode('utf-8')).hexdigest()}" for f in files
-    )
-    canonical = "|".join(
-        [repo, target_branch, base_revision, "|".join(file_entries), user_id]
-    )
+    file_entries = sorted(f"{f.path}:{hashlib.sha256(f.content.encode('utf-8')).hexdigest()}" for f in files)
+    canonical = "|".join([repo, target_branch, base_revision, "|".join(file_entries), user_id])
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -987,8 +986,7 @@ def propose_change(
         )
     except RateLimitExceeded:
         reset_at = (
-            datetime.now(timezone.utc)
-            + timedelta(seconds=resolved_config.connector.rate_limit_window_seconds)
+            datetime.now(timezone.utc) + timedelta(seconds=resolved_config.connector.rate_limit_window_seconds)
         ).isoformat()
         return _finalize_outcome(
             ProposalResult(
@@ -1050,8 +1048,7 @@ def propose_change(
                 proposal_id=None,
                 proposal_url=None,
                 message=(
-                    f"The proposed IaC failed validation for '{exc.file}': {exc.reason}. "
-                    f"No proposal was created."
+                    f"The proposed IaC failed validation for '{exc.file}': {exc.reason}. " f"No proposal was created."
                 ),
             ),
             level="warning",
@@ -1187,9 +1184,7 @@ def propose_change(
             return _ALREADY_APPLIED if head and head != base_sha else None
 
         _idempotent_mutate(
-            lambda: resolved_provider.commit_files(
-                repo, proposal_branch, proposed_files, commit_message
-            ),
+            lambda: resolved_provider.commit_files(repo, proposal_branch, proposed_files, commit_message),
             _reconcile_commit,
             max_attempts=attempts,
         )
@@ -1200,18 +1195,21 @@ def propose_change(
         # RETURNED instead of opening a duplicate (Req 8.1, 8.2).
         def _reconcile_proposal() -> ChangeProposalResult | None:
             return _retry_transient(
-                lambda: resolved_provider.find_open_change_proposal(
-                    repo, proposal_branch, branch
-                ),
+                lambda: resolved_provider.find_open_change_proposal(repo, proposal_branch, branch),
                 max_attempts=attempts,
             )
 
-        proposal = _idempotent_mutate(
-            lambda: resolved_provider.open_change_proposal(
-                repo, proposal_branch, branch, effective_title, body
+        # Both the operation (``open_change_proposal``) and the reconcile
+        # (``_reconcile_proposal``) resolve to a ``ChangeProposalResult`` here — the
+        # ``_ALREADY_APPLIED`` sentinel is only used by the value-less branch/commit steps —
+        # so the widened ``_T | object`` return is narrowed back to the concrete proposal type.
+        proposal = cast(
+            ChangeProposalResult,
+            _idempotent_mutate(
+                lambda: resolved_provider.open_change_proposal(repo, proposal_branch, branch, effective_title, body),
+                _reconcile_proposal,
+                max_attempts=attempts,
             ),
-            _reconcile_proposal,
-            max_attempts=attempts,
         )
     except ProviderAuthError:
         # Invalid/unauthorized credential — never retried (Req 10.2).

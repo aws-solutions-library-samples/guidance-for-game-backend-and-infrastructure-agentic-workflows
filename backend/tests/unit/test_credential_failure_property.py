@@ -126,14 +126,10 @@ def test_adapter_auth_fails_closed_when_credential_unavailable(secret):
     adapter fails closed with a :class:`ProviderAuthError` and attaches no credential header
     (Req 11.1). The credential is fetched from the single ARN-valued setting.
     """
-    auth = GitHubTokenAuth(
-        AdapterConfig(credential_secret_arn=_ARN, provider_base_url=None, config_errors=())
-    )
+    auth = GitHubTokenAuth(AdapterConfig(credential_secret_arn=_ARN, provider_base_url=None, config_errors=()))
     request = OutboundRequest(headers={})
 
-    with mock.patch(
-        "connector.github_provider.get_secret", return_value=secret
-    ) as mock_get_secret:
+    with mock.patch("connector.github_provider.get_secret", return_value=secret) as mock_get_secret:
         with pytest.raises(ProviderAuthError):
             auth.apply(request)
 
@@ -203,9 +199,7 @@ def test_credential_acquisition_failure_is_fail_closed_no_retry(op, message):
     # A provider-auth error audit entry was recorded, attributing the requesting user.
     assert mock_logger.error.called
     auth_error_calls = [
-        call
-        for call in mock_logger.error.call_args_list
-        if call.kwargs.get("reason") == "provider_auth_error"
+        call for call in mock_logger.error.call_args_list if call.kwargs.get("reason") == "provider_auth_error"
     ]
     assert auth_error_calls, "expected a provider_auth_error audit entry"
     audit = auth_error_calls[0].kwargs

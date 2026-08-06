@@ -259,14 +259,12 @@ def test_scm_policy_only_action_is_scoped_get_secret_value(role_policies: list):
     assert statement.get("Effect") == "Allow"
 
     actions = _as_list(statement.get("Action"))
-    assert actions == ["secretsmanager:GetSecretValue"], (
-        "the only added action must be secretsmanager:GetSecretValue"
-    )
+    assert actions == ["secretsmanager:GetSecretValue"], "the only added action must be secretsmanager:GetSecretValue"
 
     resources = _as_list(statement.get("Resource"))
-    assert resources == [{"Ref": _SCM_PARAMETER_NAME}], (
-        "GetSecretValue must be scoped to the ScmCredentialSecretArn parameter ref"
-    )
+    assert resources == [
+        {"Ref": _SCM_PARAMETER_NAME}
+    ], "GetSecretValue must be scoped to the ScmCredentialSecretArn parameter ref"
 
 
 def test_scm_credential_resource_is_single_arn_not_wildcard(role_policies: list):
@@ -277,16 +275,16 @@ def test_scm_credential_resource_is_single_arn_not_wildcard(role_policies: list)
     _condition_name, policy = found
 
     resources = _as_list(policy.get("PolicyDocument", {}).get("Statement", [{}])[0].get("Resource"))
-    assert resources == [{"Ref": _SCM_PARAMETER_NAME}], (
-        "credential resource must be exactly the single ScmCredentialSecretArn ref"
-    )
+    assert resources == [
+        {"Ref": _SCM_PARAMETER_NAME}
+    ], "credential resource must be exactly the single ScmCredentialSecretArn ref"
     # The resource is a structured !Ref (a dict), not a raw ARN string, so it cannot be
     # "*" or a prefix wildcard. Guard explicitly against a regression to a string wildcard.
     for resource in resources:
         assert resource != "*", "credential grant must not be Resource: '*'"
-        assert not (isinstance(resource, str) and resource.endswith("*")), (
-            "credential grant must not use a prefix/suffix wildcard ARN"
-        )
+        assert not (
+            isinstance(resource, str) and resource.endswith("*")
+        ), "credential grant must not use a prefix/suffix wildcard ARN"
 
 
 # --- Tests: no new mutating live-infrastructure actions ------------------------------------
@@ -294,12 +292,10 @@ def test_scm_credential_resource_is_single_arn_not_wildcard(role_policies: list)
 
 def test_only_secretsmanager_action_is_get_secret_value(role_policies: list):
     """(Req 4.3) Across the entire role, the sole Secrets Manager action is GetSecretValue."""
-    secretsmanager_actions = sorted(
-        {a for a in _all_actions(role_policies) if a.startswith("secretsmanager:")}
-    )
-    assert secretsmanager_actions == ["secretsmanager:GetSecretValue"], (
-        f"unexpected secretsmanager actions: {secretsmanager_actions}"
-    )
+    secretsmanager_actions = sorted({a for a in _all_actions(role_policies) if a.startswith("secretsmanager:")})
+    assert secretsmanager_actions == [
+        "secretsmanager:GetSecretValue"
+    ], f"unexpected secretsmanager actions: {secretsmanager_actions}"
 
 
 def test_no_mutating_live_infrastructure_actions_present(role_policies: list):
@@ -324,12 +320,12 @@ def test_scm_audit_policy_is_conditional_on_audit_log_group_configured(role_poli
     found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
     assert found is not None, f"{_SCM_AUDIT_POLICY_NAME} policy is not present as an Fn::If entry"
     condition_name, _policy = found
-    assert condition_name == _SCM_AUDIT_CONDITION_NAME, (
-        "audit grant must gate on ScmAuditLogGroupConfigured, not a KB condition"
-    )
-    assert "KB" not in condition_name and "KnowledgeBase" not in condition_name, (
-        "audit grant condition must be independent of Knowledge Base configuration"
-    )
+    assert (
+        condition_name == _SCM_AUDIT_CONDITION_NAME
+    ), "audit grant must gate on ScmAuditLogGroupConfigured, not a KB condition"
+    assert (
+        "KB" not in condition_name and "KnowledgeBase" not in condition_name
+    ), "audit grant condition must be independent of Knowledge Base configuration"
 
 
 def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list):
@@ -347,34 +343,33 @@ def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list
     assert statement.get("Effect") == "Allow"
 
     actions = _as_list(statement.get("Action"))
-    assert sorted(actions) == ["logs:CreateLogStream", "logs:PutLogEvents"], (
-        "the only added audit actions must be logs:CreateLogStream + logs:PutLogEvents"
-    )
+    assert sorted(actions) == [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+    ], "the only added audit actions must be logs:CreateLogStream + logs:PutLogEvents"
 
     resources = _as_list(statement.get("Resource"))
     assert len(resources) == 2, "audit grant must scope to the log group ARN and its ':*' children"
     # Every resource must reference the dedicated ScmAuditLogGroup — the GetAtt Arn and the
     # Sub'd ':*' stream wildcard — and nothing may be Resource: '*' or reference a KB.
-    assert {"Fn::GetAtt": f"{_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}.Arn"} in resources, (
-        "audit grant must include the ScmAuditLogGroup ARN via GetAtt"
-    )
+    assert {
+        "Fn::GetAtt": f"{_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}.Arn"
+    } in resources, "audit grant must include the ScmAuditLogGroup ARN via GetAtt"
     stream_children = [
         r
         for r in resources
-        if isinstance(r, dict)
-        and isinstance(r.get("Fn::Sub"), str)
-        and r["Fn::Sub"].endswith(":*")
+        if isinstance(r, dict) and isinstance(r.get("Fn::Sub"), str) and r["Fn::Sub"].endswith(":*")
     ]
     assert len(stream_children) == 1, "audit grant must include the ':*' log-stream children"
     for resource in resources:
         assert resource != "*", "audit grant must not be Resource: '*'"
         rendered = str(resource)
-        assert _SCM_AUDIT_LOG_GROUP_LOGICAL_ID in rendered, (
-            f"audit resource must reference {_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}: {resource!r}"
-        )
-        assert "knowledge-base" not in rendered and "KnowledgeBase" not in rendered, (
-            "audit grant must be independent of any Knowledge Base resource"
-        )
+        assert (
+            _SCM_AUDIT_LOG_GROUP_LOGICAL_ID in rendered
+        ), f"audit resource must reference {_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}: {resource!r}"
+        assert (
+            "knowledge-base" not in rendered and "KnowledgeBase" not in rendered
+        ), "audit grant must be independent of any Knowledge Base resource"
 
 
 def test_scm_audit_log_group_is_dedicated_resource(template: dict):

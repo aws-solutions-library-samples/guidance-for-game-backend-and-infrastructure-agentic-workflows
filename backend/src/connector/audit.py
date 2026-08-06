@@ -56,13 +56,13 @@ is cached on the instance (keyed by stream name) so consecutive writes chain cor
 a describe call.
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 import json
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 # Third-party packages
 from botocore.exceptions import ClientError
@@ -71,6 +71,7 @@ from botocore.exceptions import ClientError
 from utils.security import sanitize_log_data
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    # Third-party packages
     from mypy_boto3_logs import CloudWatchLogsClient
 
 __all__ = ["AuditSink"]
@@ -82,9 +83,7 @@ _STREAM_PREFIX = "scm-audit"
 
 # CloudWatch Logs error codes we recover from by refreshing the expected sequence token and
 # retrying the put exactly once (optimistic-concurrency on the per-stream token).
-_SEQUENCE_RECOVERABLE = frozenset(
-    {"InvalidSequenceTokenException", "DataAlreadyAcceptedException"}
-)
+_SEQUENCE_RECOVERABLE = frozenset({"InvalidSequenceTokenException", "DataAlreadyAcceptedException"})
 
 
 class AuditSink:
@@ -177,10 +176,7 @@ class AuditSink:
             if isinstance(value, str):
                 safe[key] = sanitize_log_data(value)
             elif isinstance(value, (list, tuple)):
-                safe[key] = [
-                    sanitize_log_data(item) if isinstance(item, str) else item
-                    for item in value
-                ]
+                safe[key] = [sanitize_log_data(item) if isinstance(item, str) else item for item in value]
             else:
                 safe[key] = value
         return json.dumps(safe, default=str, sort_keys=True)
@@ -205,9 +201,7 @@ class AuditSink:
             token = self._describe_sequence_token(client, stream)
         self._sequence_tokens[stream] = token
 
-    def _describe_sequence_token(
-        self, client: "CloudWatchLogsClient", stream: str
-    ) -> str | None:
+    def _describe_sequence_token(self, client: "CloudWatchLogsClient", stream: str) -> str | None:
         """Look up the current upload sequence token for ``stream`` via describe."""
         try:
             response = client.describe_log_streams(
@@ -219,7 +213,7 @@ class AuditSink:
             return None
         for entry in response.get("logStreams", []):
             if entry.get("logStreamName") == stream:
-                return entry.get("uploadSequenceToken")
+                return cast("str | None", entry.get("uploadSequenceToken"))
         return None
 
     def _confirm(self, response: Any, stream: str) -> bool:

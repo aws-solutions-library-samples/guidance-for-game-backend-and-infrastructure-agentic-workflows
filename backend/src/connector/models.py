@@ -20,9 +20,9 @@ Contents:
   its ``message`` never contains secrets.
 """
 
-# Standard library
 from __future__ import annotations
 
+# Standard library
 from dataclasses import dataclass
 
 
