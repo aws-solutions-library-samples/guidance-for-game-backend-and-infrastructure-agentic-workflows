@@ -126,10 +126,19 @@ Resources:
   DataSource:
     Type: AWS::Bedrock::DataSource
     Properties:
-      Name: !Sub '${ProjectName}-eks-docs'
+      # Name suffix bumped (-v2) alongside the chunking change below. Bedrock
+      # treats chunking config as immutable, so changing it forces a data-source
+      # replacement; a fixed name would collide (AlreadyExists) because CFN
+      # creates the replacement before deleting the old one. Bump the suffix
+      # whenever the chunking config changes.
+      Name: !Sub '${ProjectName}-eks-docs-v2'
       Description: 'EKS documentation'
       KnowledgeBaseId: !Ref KnowledgeBase
-      DataDeletionPolicy: RETAIN
+      # DELETE so that when the data source is replaced (e.g. to change the
+      # immutable chunking config), Bedrock purges the old vectors from the
+      # index instead of orphaning them. Docs are ephemeral (re-scraped), so
+      # retaining vectors provides no value.
+      DataDeletionPolicy: DELETE
       DataSourceConfiguration:
         Type: S3
         S3Configuration:
@@ -138,7 +147,13 @@ Resources:
         ChunkingConfiguration:
           ChunkingStrategy: FIXED_SIZE
           FixedSizeChunkingConfiguration:
-            MaxTokens: 256
+            # Reduced from 256 to keep each chunk's text under the S3 Vectors
+            # 2048-byte filterable-metadata cap. Bedrock stores chunk text in the
+            # AMAZON_BEDROCK_TEXT metadata key, which S3 Vectors treats as
+            # filterable; dense docs at 256 tokens exceeded the limit and failed
+            # ingestion. This is a No-interruption update (KB/data-source IDs
+            # unchanged); re-run seed-kb-eks.sh after deploy to re-chunk.
+            MaxTokens: 120
             OverlapPercentage: 10
 
 Outputs:
