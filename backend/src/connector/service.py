@@ -102,7 +102,8 @@ _BRANCH_KEY_LENGTH = 12
 # (``connector.audit.AuditSink``) instead of the fire-and-forget ``logger``. The sink is
 # cached per audit-log-group name so repeated proposals reuse one boto3 client and its
 # chained sequence token. ``_active_config`` holds the config resolved by the current
-# ``propose_change`` call so the signature-stable ``_audit``/``_finalize`` helpers can reach
+# ``propose_change`` call so the signature-stable ``_audit``/``_record_intent``/
+# ``_record_outcome`` helpers can reach
 # ``config.audit_log_group`` without threading it through every terminal call site. Tests may
 # monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to inject a fake sink.
 _audit_sinks: dict[str, AuditSink] = {}
@@ -345,17 +346,24 @@ def read_iac_files(
 #   5. rate limit          — per-user sliding window
 #   6. IaC validation      — decline empty file sets; validate parseable/structural IaC
 #   7. provider ops        — latest_commit_sha → stable idempotency key → deterministic
-#                            proposal branch → create_branch → commit_files →
-#                            open_change_proposal, with reconcile-before-run/-retry so a
-#                            retried proposal never duplicates branch/commit/proposal.
-#                            Credential acquisition is adapter-owned behind ProviderAuth: a
-#                            ProviderAuthError here (fail-closed, no retry) preserves the
-#                            credential fail-closed behavior the removed Gate 6 provided.
-#   8. success audit       — audit-write failure aborts atomically
+#                            proposal branch → durable INTENT event → create_branch →
+#                            commit_files → open_change_proposal, with reconcile-before-run/
+#                            -retry so a retried proposal never duplicates branch/commit/
+#                            proposal. Credential acquisition is adapter-owned behind
+#                            ProviderAuth: a ProviderAuthError here (fail-closed, no retry)
+#                            preserves the credential fail-closed behavior the removed Gate 6
+#                            provided.
+#   8. outcome audit       — durable OUTCOME event after the provider ops resolve
 #
-# Every terminal path returns a secret-free :class:`ProposalResult` and writes an
-# audit entry; a failed audit write turns any outcome into an audit-persistence error
-# so success is never reported without a durable audit record (Req 6.4).
+# The audit path is a durable INTENT + OUTCOME model with reconciliation, NOT cross-system
+# atomicity (Req 9.1, 9.2). A durable INTENT is written before the first mutating op; if that
+# write is unconfirmed the action aborts before any mutation (safe — nothing happened yet).
+# After the provider ops resolve a durable OUTCOME event is written, correlated to the INTENT
+# by the idempotency key. If a mutation succeeded but the OUTCOME write is unconfirmed the
+# connector does NOT roll back and does NOT report false success: it returns a reconcilable
+# result and leaves the true outcome reconcilable from the INTENT + provider state.
+# Rejection/decline paths (which perform no mutation) emit a single OUTCOME event with no
+# preceding intent. Every terminal path returns a secret-free :class:`ProposalResult`.
 
 
 def _retry_transient(
@@ -486,8 +494,12 @@ def _audit(level: str, message: str, /, **fields: object) -> bool:
     (:func:`_get_audit_sink`). The returned ``bool`` is the sink's confirmed-write result:
     ``True`` only when CloudWatch Logs confirmed the write, ``False`` on any unconfirmed write
     or failure — including when no audit log group is configured (fail closed, Req 13.1,
-    13.2, 13.3). ``_finalize`` uses this to abort the action atomically rather than reporting
-    success without a durable audit record.
+    13.2, 13.3). The two-event audit model uses this: :func:`_record_intent` gates the start
+    of a mutation on a confirmed INTENT write (a safe pre-mutation abort — nothing has been
+    mutated yet, so this is *not* a cross-system atomicity claim), while
+    :func:`_record_outcome` writes the terminal OUTCOME after the provider ops resolve. If a
+    mutation has already succeeded but the OUTCOME write is unconfirmed, the connector does
+    **not** roll back or claim atomicity: it returns a reconcilable result (Req 9.2).
 
     Every string field is passed through ``sanitize_log_data`` as defense-in-depth so no
     secret can leak into the audit log (Req 6.6); the SCM_Credential is never placed in a
@@ -517,36 +529,178 @@ def _audit(level: str, message: str, /, **fields: object) -> bool:
     return sink.write(event)
 
 
-def _audit_persistence_error() -> ProposalResult:
-    """Return the audit-persistence error result used when an audit write fails (Req 6.4)."""
+def _record_intent(
+    idempotency_key: str,
+    *,
+    requesting_user: str,
+    repository: str,
+    target_branch: str,
+    base_revision: str,
+    paths: Sequence[str],
+) -> bool:
+    """Write the durable INTENT audit event before the first mutating adapter op (Req 9.1).
+
+    The INTENT records *what the connector is about to attempt* — keyed by the stable
+    idempotency key so it correlates with the later OUTCOME — before any branch/commit/
+    proposal is created. It carries the requesting user, the effective repo/branch, the
+    verified ``base_revision``, and the proposed file **paths** only: never file contents and
+    never secrets. Returns the sink's confirmed-write result.
+
+    A confirmed INTENT is a precondition for starting the mutation. If this write is
+    unconfirmed the caller aborts *before* any mutation — a genuinely safe fail-closed abort
+    (nothing has been mutated), **not** a cross-system atomicity claim: it only means "do not
+    start work we cannot audit" (Req 9.2). Together the recorded INTENT plus provider state
+    let a later run reconcile an ambiguous outcome via the deterministic proposal branch.
+    """
+    return _audit(
+        "info",
+        "Change proposal intent recorded",
+        event="scm_intent",
+        action="intent",
+        idempotency_key=idempotency_key,
+        requesting_user=requesting_user,
+        repository=repository,
+        target_branch=target_branch,
+        base_revision=base_revision,
+        paths=list(paths),
+    )
+
+
+def _record_outcome(
+    idempotency_key: str | None,
+    *,
+    level: str,
+    message: str,
+    action: str,
+    outcome: str,
+    requesting_user: str,
+    repository: str | None = None,
+    target_branch: str | None = None,
+    proposal_branch: str | None = None,
+    proposal_id: str | None = None,
+    proposal_url: str | None = None,
+    reason: str | None = None,
+    **extra: object,
+) -> bool:
+    """Write the durable OUTCOME audit event after the adapter result resolves (Req 9.1).
+
+    The OUTCOME records *what actually happened* — ``outcome`` is one of
+    ``created`` / ``declined`` / ``rejected`` / ``error`` / ``reconciled`` — and carries the
+    same ``idempotency_key`` as the INTENT so the two events correlate (the key is ``None``
+    for reject/decline paths that never reached the mutation stage and therefore have no
+    preceding intent). On a created outcome it records the proposal id/url; on a failure it
+    records a ``reason``. It never carries file contents or secrets. Returns the sink's
+    confirmed-write result so the success path can detect an unconfirmed OUTCOME.
+    """
+    fields: dict[str, object] = {
+        "event": "scm_outcome",
+        "action": action,
+        "outcome": outcome,
+        "requesting_user": requesting_user,
+    }
+    if idempotency_key is not None:
+        fields["idempotency_key"] = idempotency_key
+    if repository is not None:
+        fields["repository"] = repository
+    if target_branch is not None:
+        fields["target_branch"] = target_branch
+    if proposal_branch is not None:
+        fields["proposal_branch"] = proposal_branch
+    if proposal_id is not None:
+        fields["proposal_id"] = proposal_id
+    if proposal_url is not None:
+        fields["proposal_url"] = proposal_url
+    if reason is not None:
+        fields["reason"] = reason
+    # ``event`` is always ``scm_outcome`` for this helper; never let a caller override it.
+    extra.pop("event", None)
+    fields.update(extra)
+    return _audit(level, message, **fields)
+
+
+def _finalize_outcome(
+    result: ProposalResult,
+    *,
+    level: str,
+    message: str,
+    action: str,
+    outcome: str,
+    requesting_user: str,
+    idempotency_key: str | None = None,
+    repository: str | None = None,
+    target_branch: str | None = None,
+    proposal_branch: str | None = None,
+    reason: str | None = None,
+    **extra: object,
+) -> ProposalResult:
+    """Emit a single terminal OUTCOME audit event and return ``result`` unchanged.
+
+    Used by every rejection / decline / provider-error terminal path. These paths either
+    performed no mutation at all (so there is no preceding intent and no atomicity to claim)
+    or already failed with a non-success result; in both cases the returned result is itself
+    the safe, fail-closed outcome. The durable OUTCOME record is written best-effort and does
+    **not** gate the result — the connector makes no cross-system atomicity claim between the
+    audit store and the provider (Req 9.2). This is the deliberate reversal of the previous
+    "audit-write failure aborts atomically" behavior.
+    """
+    _record_outcome(
+        idempotency_key,
+        level=level,
+        message=message,
+        action=action,
+        outcome=outcome,
+        requesting_user=requesting_user,
+        repository=repository,
+        target_branch=target_branch,
+        proposal_branch=proposal_branch,
+        reason=reason,
+        **extra,
+    )
+    return result
+
+
+def _intent_abort_result() -> ProposalResult:
+    """Return the safe result used when the pre-mutation INTENT write is unconfirmed (Req 9.2).
+
+    This abort happens **before** any provider mutation, so nothing has been created — it is a
+    genuinely safe fail-closed decline, not a cross-system atomicity claim. The connector
+    simply refuses to start work it cannot durably audit.
+    """
     return ProposalResult(
         status="error",
         proposal_id=None,
         proposal_url=None,
         message=(
-            "The change proposal could not be completed because its audit record could not "
-            "be persisted. No proposal was reported as successful."
+            "The change proposal was not started because its intent could not be durably "
+            "recorded. No branch, commit, or change proposal was created."
         ),
     )
 
 
-def _finalize(
-    result: ProposalResult,
-    *,
-    level: str,
-    message: str,
-    **fields: object,
+def _reconcilable_result(
+    proposal: ChangeProposalResult,
+    repo: str,
+    branch: str,
 ) -> ProposalResult:
-    """Write the terminal audit entry and return ``result`` (or an audit-persistence error).
+    """Return the reconcilable result for a successful mutation with an unconfirmed OUTCOME.
 
-    Centralizes the audit-then-return contract for every terminal path so that an
-    audit-write failure uniformly aborts the action and returns an audit-persistence error
-    instead of the intended result — never reporting success without a durable record
-    (Req 6.4, Property 22).
+    A change proposal was created on the provider but the terminal OUTCOME audit write was
+    not confirmed. The connector does **not** report a false success and does **not** roll
+    back the mutation (no cross-system atomicity is claimed — Req 9.2). Instead it returns a
+    distinct ``status="reconcilable"`` result: the proposal may exist and is reconcilable from
+    the durably recorded INTENT plus provider state (the deterministic proposal branch +
+    :meth:`find_open_change_proposal`), and a retry will not create a duplicate.
     """
-    if not _audit(level, message, **fields):
-        return _audit_persistence_error()
-    return result
+    return ProposalResult(
+        status="reconcilable",
+        proposal_id=proposal.proposal_id,
+        proposal_url=proposal.proposal_url,
+        message=(
+            f"A change proposal was created against {repo}@{branch}, but its audit outcome "
+            f"could not be durably confirmed. The proposal may exist and is reconcilable from "
+            f"the recorded intent and provider state; a retry will not create a duplicate."
+        ),
+    )
 
 
 def _looks_injected(*texts: str) -> bool:
@@ -670,8 +824,9 @@ def propose_change(
     """
     global _active_config
     resolved_config = _resolve_config(config)
-    # Publish the resolved config so the signature-stable ``_audit``/``_finalize`` helpers can
-    # reach ``config.audit_log_group`` for the durable sink write (Req 13.1).
+    # Publish the resolved config so the signature-stable ``_audit``/``_record_intent``/
+    # ``_record_outcome`` helpers can reach ``config.audit_log_group`` for the durable sink
+    # write (Req 13.1).
     _active_config = resolved_config
 
     # --- Gate 1: enablement (Req 1.2) ---------------------------------------------------
@@ -700,7 +855,7 @@ def propose_change(
     try:
         validate_prompt(intent, strict_mode=True)
     except (InputValidationError, SecurityViolationError):
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
@@ -709,7 +864,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal rejected by input validation",
-            event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user=user_id or "anonymous",
@@ -717,7 +871,7 @@ def propose_change(
         )
 
     if _looks_injected(intent, title, description):
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
@@ -726,7 +880,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal rejected by prompt-injection detection",
-            event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user=user_id or "anonymous",
@@ -739,7 +892,7 @@ def propose_change(
     # five-dimension check (a caller could otherwise present intersecting groups without a
     # verified identity). The group dimension itself is enforced by Gate 4 below.
     if not user_id:
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
@@ -748,7 +901,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal rejected: unauthenticated request",
-            event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user="anonymous",
@@ -775,7 +927,7 @@ def propose_change(
         groups=user_groups,
     )
     if not decision.allowed:
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
@@ -787,7 +939,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal rejected by authorization policy",
-            event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user=user_id or "anonymous",
@@ -806,7 +957,7 @@ def propose_change(
     # first mutating op (Req 7.1). Identity/effective repo/branch are already resolved so the
     # rejection audit is complete.
     if not base_revision:
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
@@ -819,7 +970,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal rejected: missing verified source snapshot",
-            event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user=user_id or "anonymous",
@@ -840,7 +990,7 @@ def propose_change(
             datetime.now(timezone.utc)
             + timedelta(seconds=resolved_config.connector.rate_limit_window_seconds)
         ).isoformat()
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="rejected",
                 proposal_id=None,
@@ -854,7 +1004,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal rejected by rate limit",
-            event="scm_rejected",
             action="decline",
             outcome="rejected",
             requesting_user=user_id or "anonymous",
@@ -872,7 +1021,7 @@ def propose_change(
     # ever handling (or importing) ``get_secret``.
     proposed_files = list(files)
     if not proposed_files:
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="declined",
                 proposal_id=None,
@@ -884,7 +1033,6 @@ def propose_change(
             ),
             level="info",
             message="Change proposal declined: no IaC file modifications",
-            event="scm_proposal",
             action="decline",
             outcome="declined",
             requesting_user=user_id or "anonymous",
@@ -896,7 +1044,7 @@ def propose_change(
     try:
         validate_iac(proposed_files, iac_format)
     except IaCValidationError as exc:
-        return _finalize(
+        return _finalize_outcome(
             ProposalResult(
                 status="declined",
                 proposal_id=None,
@@ -908,7 +1056,6 @@ def propose_change(
             ),
             level="warning",
             message="Change proposal declined: IaC validation failed",
-            event="scm_proposal",
             action="decline",
             outcome="declined",
             requesting_user=user_id or "anonymous",
@@ -927,6 +1074,10 @@ def propose_change(
 
     branch_created = False
     proposal_branch = ""
+    # The stable idempotency key correlates the INTENT and OUTCOME audit events. It is derived
+    # only after the snapshot is verified (below), so it is ``None`` for any provider error
+    # raised by the pre-mutation verification read; those errors emit an OUTCOME with no key.
+    idempotency_key: str | None = None
     try:
         # Re-read the current head of the target branch. This single read serves two roles
         # (Req 3.3, 7.1): it is the verification re-read for the Verified_Source_Snapshot AND
@@ -942,7 +1093,8 @@ def propose_change(
         # we proceed, and the proposal branch is based on that verified revision (which
         # equals ``base_sha``), never on "latest at some later creation time".
         if base_sha != base_revision:
-            return _finalize(
+            # No mutation has occurred and no intent was recorded — a single OUTCOME event.
+            return _finalize_outcome(
                 ProposalResult(
                     status="rejected",
                     proposal_id=None,
@@ -955,7 +1107,6 @@ def propose_change(
                 ),
                 level="warning",
                 message="Change proposal rejected: stale verified source snapshot",
-                event="scm_rejected",
                 action="decline",
                 outcome="rejected",
                 requesting_user=user_id or "anonymous",
@@ -978,6 +1129,25 @@ def propose_change(
             user_id=user_id or "unknown",
         )
         proposal_branch = _deterministic_branch_name(intent, idempotency_key)
+
+        # --- Durable INTENT event (Req 9.1, 9.2) ------------------------------------------
+        # Record what the connector is about to attempt BEFORE the first mutating adapter op,
+        # keyed by the stable idempotency key so it correlates with the OUTCOME below. The
+        # INTENT carries the requesting user, effective repo/branch, verified base revision,
+        # and proposed file PATHS only (no file contents, no secrets). If this durable write
+        # is unconfirmed we abort here — before any branch/commit/proposal exists. That abort
+        # is genuinely safe (nothing has been mutated) and is NOT a cross-system atomicity
+        # claim: it only means "do not start work we cannot audit". The recorded INTENT plus
+        # provider state also make an ambiguous outcome reconcilable later.
+        if not _record_intent(
+            idempotency_key,
+            requesting_user=user_id or "anonymous",
+            repository=repo,
+            target_branch=branch,
+            base_revision=base_sha,
+            paths=proposed_paths,
+        ):
+            return _intent_abort_result()
 
         # Create the branch, then commit the complete file set (Req 2.1, 2.3). Both are
         # MUTATING ops run through :func:`_idempotent_mutate`, which reconciles provider state
@@ -1045,16 +1215,16 @@ def propose_change(
         )
     except ProviderAuthError:
         # Invalid/unauthorized credential — never retried (Req 10.2).
-        return _finalize(
+        return _finalize_outcome(
             _provider_error_result(
                 "The source-control provider rejected the credential; no proposal was completed.",
                 branch_created,
             ),
             level="error",
             message="Change proposal failed: provider rejected credential",
-            event="scm_proposal",
             action="create",
             outcome="error",
+            idempotency_key=idempotency_key,
             requesting_user=user_id or "anonymous",
             repository=repo,
             target_branch=branch,
@@ -1064,16 +1234,16 @@ def propose_change(
         )
     except ProviderUnavailableError:
         # Provider unreachable / timed out (Req 10.1) — safe, non-destructive.
-        return _finalize(
+        return _finalize_outcome(
             _provider_error_result(
                 "The source-control provider is unavailable; no proposal was completed.",
                 branch_created,
             ),
             level="error",
             message="Change proposal failed: provider unavailable",
-            event="scm_proposal",
             action="create",
             outcome="error",
+            idempotency_key=idempotency_key,
             requesting_user=user_id or "anonymous",
             repository=repo,
             target_branch=branch,
@@ -1083,7 +1253,7 @@ def propose_change(
         )
     except ProviderConflictError:
         # Conflict (Req 10.4) — existing target content preserved, no destructive resolution.
-        return _finalize(
+        return _finalize_outcome(
             _provider_error_result(
                 "The proposal could not be applied cleanly due to a conflict; existing content "
                 "was preserved and no proposal was completed.",
@@ -1091,9 +1261,9 @@ def propose_change(
             ),
             level="error",
             message="Change proposal failed: provider reported a conflict",
-            event="scm_proposal",
             action="create",
             outcome="error",
+            idempotency_key=idempotency_key,
             requesting_user=user_id or "anonymous",
             repository=repo,
             target_branch=branch,
@@ -1105,16 +1275,16 @@ def propose_change(
         # Transient retries exhausted (Req 10.5, 10.6) or another provider failure. If the
         # branch was already created but the change proposal was not, we report failure and
         # NEVER report success (Req 10.3).
-        return _finalize(
+        return _finalize_outcome(
             _provider_error_result(
                 "The source-control operation failed; no proposal was completed.",
                 branch_created,
             ),
             level="error",
             message="Change proposal failed: provider operation error",
-            event="scm_proposal",
             action="create",
             outcome="error",
+            idempotency_key=idempotency_key,
             requesting_user=user_id or "anonymous",
             repository=repo,
             target_branch=branch,
@@ -1123,20 +1293,18 @@ def propose_change(
             reason="provider_operation_failed",
         )
 
-    # --- Gate 8: success audit; audit-write failure aborts atomically (Req 6.3, 6.4) ----
-    return _finalize(
-        ProposalResult(
-            status="created",
-            proposal_id=proposal.proposal_id,
-            proposal_url=proposal.proposal_url,
-            message=(
-                f"Opened change proposal {proposal.proposal_id} against {repo}@{branch}. "
-                f"It is unmerged and awaiting human review."
-            ),
-        ),
+    # --- Gate 8: durable OUTCOME event; NOT cross-system atomicity (Req 9.1, 9.2) --------
+    # The mutation succeeded: a Change_Proposal was created on the provider. Write the durable
+    # OUTCOME event, correlated to the INTENT by the idempotency key. If this write is
+    # unconfirmed we do NOT roll back the mutation and do NOT report a false success — no
+    # atomicity is claimed across the audit store and the provider. Instead we return a
+    # reconcilable result: the proposal may exist and is reconcilable from the recorded INTENT
+    # plus provider state (the deterministic proposal branch + find_open_change_proposal), and
+    # a retry will not create a duplicate.
+    outcome_confirmed = _record_outcome(
+        idempotency_key,
         level="info",
         message="Change proposal created",
-        event="scm_proposal",
         action="create",
         outcome="created",
         requesting_user=user_id or "anonymous",
@@ -1144,6 +1312,19 @@ def propose_change(
         target_branch=branch,
         proposal_branch=proposal_branch,
         proposal_id=proposal.proposal_id,
+        proposal_url=proposal.proposal_url,
+    )
+    if not outcome_confirmed:
+        return _reconcilable_result(proposal, repo, branch)
+
+    return ProposalResult(
+        status="created",
+        proposal_id=proposal.proposal_id,
+        proposal_url=proposal.proposal_url,
+        message=(
+            f"Opened change proposal {proposal.proposal_id} against {repo}@{branch}. "
+            f"It is unmerged and awaiting human review."
+        ),
     )
 
 

@@ -257,7 +257,7 @@ def test_property20_transient_errors_are_retried_up_to_the_maximum(
         exhausted_audits = [
             call
             for call in mock_logger.error.call_args_list
-            if call.kwargs.get("event") == "scm_proposal"
+            if call.kwargs.get("event") == "scm_outcome"
             and call.kwargs.get("outcome") == "error"
             and call.kwargs.get("reason") == "provider_operation_failed"
         ]

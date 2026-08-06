@@ -1,44 +1,50 @@
 #!/usr/bin/env python3
-"""Property-based test that create/decline audit records are complete
+"""Property-based test that connector audit records are complete under the intent/outcome model
 (`connector.service.propose_change`).
 
-Covers Correctness Property 21 from the source-control-connector design: for *any* creation or
-decline of a Change_Proposal — and, more broadly, for *any* terminal outcome of the propose
-pipeline (created, declined, rejected, error) — the connector writes an audit record that
-contains, at minimum:
+For *any* terminal outcome of the propose pipeline (created, declined, rejected, error) the
+connector writes durable audit records that, at minimum:
 
-- the ``requesting_user`` identity (taken from the request contextvar, never model input),
-- an ``event`` / ``action`` / ``outcome`` describing what happened,
-- the target ``repository`` / ``target_branch`` **where applicable** (i.e. once the request has
-  been matched to an allowlist entry; the pre-allowlist authorization/injection rejections do not
-  carry a repository because none has been resolved yet),
-- a ``reason`` for every non-created (rejected / declined / error) outcome, and
-- a ``timestamp`` (UTC ISO-8601), always attached by the audit helper.
+- attribute the ``requesting_user`` identity (taken from the request contextvar, never model
+  input),
+- describe what happened via ``event`` / ``action`` / ``outcome``,
+- carry the target ``repository`` / ``target_branch`` **where applicable** (i.e. once the
+  request has been matched to an allowlist entry; the pre-allowlist authorization/injection
+  rejections do not carry a repository because none has been resolved yet),
+- record a ``reason`` for every non-created (rejected / declined / error) outcome, and
+- always carry a ``timestamp`` (UTC ISO-8601), attached by the audit helper.
 
-Hypothesis drives every enabled terminal outcome:
+Under the v2 durable intent/outcome model (issue #268, R9), a change-proposal action that
+reaches the mutation stage records **two** correlated events — a ``scm_intent`` written before
+the first mutating provider op and a ``scm_outcome`` written after — sharing one
+``idempotency_key`` and carrying no secrets. Paths that never reach the mutation stage
+(rejections, declines, and provider errors raised by the pre-mutation verification read) record
+a **single** ``scm_outcome`` event with no preceding intent. This test asserts exactly that
+shape for every enabled terminal outcome:
 
 - **created**  — an authorized, allowlist-matching request with a valid, non-empty
-  CloudFormation file set and a succeeding provider (FakeProvider) + credential fetch,
-- **rejected** — an authenticated user who is not in an authorized group (authorization gate),
-  and a prompt-injection-flagged intent (injection gate),
-- **declined** — an empty file set, and a structurally invalid IaC file set,
-- **error**    — an adapter credential-acquisition failure (surfaced as a ProviderAuthError),
-  and a provider that reports unavailable.
+  CloudFormation file set and a succeeding provider (FakeProvider): one ``scm_intent`` then one
+  ``scm_outcome`` (``outcome="created"``), correlated by key,
+- **rejected** — an unauthorized group (authorization gate) and a prompt-injection-flagged
+  intent (injection gate): a single ``scm_outcome`` (``outcome="rejected"``), no intent,
+- **declined** — an empty file set and a structurally invalid IaC file set: a single
+  ``scm_outcome`` (``outcome="declined"``), no intent,
+- **error**    — an adapter credential-acquisition failure (``ProviderAuthError``) and a
+  provider that reports unavailable, both raised on the pre-mutation read: a single
+  ``scm_outcome`` (``outcome="error"``), no intent.
 
 For each generated scenario the test patches ``connector.service._get_audit_sink`` to return a
 recording fake ``AuditSink`` (whose ``write`` captures each event and confirms the durable
-write); credential acquisition is adapter-owned so the connector core issues no ``get_secret``,
-drives the outcome
-via a ``FakeProvider`` (``provider=``) and an enabled ``ConnectorConfig`` (``config=``), then
-asserts the single audit event written to the sink for that terminal outcome contains the
-required fields populated.
+write), drives the outcome via a ``FakeProvider`` (``provider=``) and an enabled
+``SourceControlConfig`` (``config=``), then asserts the recorded events carry the required
+fields populated.
 
 To keep examples independent, the shared sliding-window rate-limit store is cleared before each
 example and a unique ``user_id`` is used per example, so the rate-limit gate never rejects a
 request under test. The enablement-disabled path is intentionally out of scope: a disabled
 connector is the normal off state and declines without auditing.
 
-Validates: Requirements 6.3
+Validates: Requirements 9.1, 9.2
 """
 
 # Standard library
@@ -73,13 +79,10 @@ _GROUP = "scm-writers"
 _IAC_FORMAT = "cloudformation"
 _FAKE_CREDENTIAL = "ghp_fake_token_value"
 
-# The known audit ``event`` labels emitted by the propose pipeline. Used to locate the single
-# terminal audit entry among the mocked logger's recorded calls.
-_AUDIT_EVENTS = {
-    "scm_proposal",
-    "scm_rejected",
-    "scm_credential_error",
-}
+# The two durable audit event labels emitted by the propose pipeline under the intent/outcome
+# model. ``scm_intent`` precedes the first mutation; ``scm_outcome`` is the terminal record.
+_INTENT_EVENT = "scm_intent"
+_OUTCOME_EVENT = "scm_outcome"
 
 # Benign, injection-free words used to build varying intents/titles so input validation and
 # prompt-injection detection pass on every non-injection scenario.
@@ -113,60 +116,61 @@ _SCENARIOS = [
     "error_provider",
 ]
 
-# Per-scenario expectations: the terminal result status, the audit ``event`` and ``outcome``,
-# whether a repository/target_branch is applicable (resolved via an allowlist match), and whether
-# a ``reason`` is required (every non-created outcome must carry one).
+# Per-scenario expectations: the terminal result status, the OUTCOME ``outcome`` value, whether
+# a repository/target_branch is applicable (resolved via an allowlist match), whether a
+# ``reason`` is required (every non-created outcome must carry one), and whether a preceding
+# ``scm_intent`` event is expected (only the created path reaches the mutation stage here).
 _EXPECTATIONS = {
     "created": {
         "status": "created",
-        "event": "scm_proposal",
         "outcome": "created",
         "repo_applicable": True,
         "reason_required": False,
+        "intent_expected": True,
     },
     "rejected_unauthorized": {
         "status": "rejected",
-        "event": "scm_rejected",
         "outcome": "rejected",
         "repo_applicable": False,
         "reason_required": True,
+        "intent_expected": False,
     },
     "rejected_injection": {
         "status": "rejected",
-        "event": "scm_rejected",
         "outcome": "rejected",
         "repo_applicable": False,
         "reason_required": True,
+        "intent_expected": False,
     },
     "declined_empty": {
         "status": "declined",
-        "event": "scm_proposal",
         "outcome": "declined",
         "repo_applicable": True,
         "reason_required": True,
+        "intent_expected": False,
     },
     "declined_invalid_iac": {
         "status": "declined",
-        "event": "scm_proposal",
         "outcome": "declined",
         "repo_applicable": True,
         "reason_required": True,
+        "intent_expected": False,
     },
     "error_credential": {
-        # Credential acquisition is now adapter-owned: a failure surfaces as a
-        # ProviderAuthError on the first provider op, audited as a provider error outcome.
+        # Credential acquisition is adapter-owned: a failure surfaces as a ProviderAuthError on
+        # the first provider op (the pre-mutation read), before any intent is recorded.
         "status": "error",
-        "event": "scm_proposal",
         "outcome": "error",
         "repo_applicable": True,
         "reason_required": True,
+        "intent_expected": False,
     },
     "error_provider": {
         "status": "error",
-        "event": "scm_proposal",
         "outcome": "error",
         "repo_applicable": True,
         "reason_required": True,
+        "intent_expected": False,
     },
 }
 
@@ -177,11 +181,10 @@ _user_ids = itertools.count(1)
 class _RecordingAuditSink:
     """A fake :class:`connector.audit.AuditSink` that records the events it is asked to write.
 
-    Each terminal audit entry now flows through the durable, confirmed sink rather than the
-    fire-and-forget ``logger``. This fake captures every ``write(event)`` payload so the test
-    can assert the audit record's fields, and returns a confirmed (``True``) result so the
-    otherwise-successful ``created`` scenario is reported as created (a confirmed durable
-    write). Failure-mode coverage lives in the audit-write-failure property test.
+    Captures every ``write(event)`` payload (in order) so the test can assert on the recorded
+    intent/outcome records, and returns a confirmed (``True``) result so the otherwise-
+    successful ``created`` scenario is reported as created. Failure-mode coverage (unconfirmed
+    intent / outcome) lives in the audit-write-failure property test.
     """
 
     def __init__(self, confirmed: bool = True):
@@ -251,8 +254,7 @@ def _invalid_cfn_files() -> list[ProposedFile]:
 
 def _run_scenario(scenario: str, files, intent_words):
     """Drive ``propose_change`` to the requested terminal ``scenario`` and return
-    ``(result, audit_kwargs)`` where ``audit_kwargs`` is the single terminal audit entry's
-    keyword arguments captured from the patched logger.
+    ``(result, user_id, intent_events, outcome_events)`` collected from the recording sink.
     """
     _rate_limit_windows.clear()
 
@@ -280,14 +282,13 @@ def _run_scenario(scenario: str, files, intent_words):
         proposed_files = _invalid_cfn_files()
     elif scenario == "error_credential":
         # Credential acquisition is adapter-owned: a failure surfaces as a ProviderAuthError
-        # on the first provider op (fail-closed error outcome), replacing the removed
-        # service-level credential gate.
+        # on the first provider op (the pre-mutation read), before any mutation or intent.
         provider.fail(
             "latest_commit_sha",
             ProviderAuthError("credential acquisition failed"),
         )
     elif scenario == "error_provider":
-        # Provider reports unavailable on the first provider operation.
+        # Provider reports unavailable on the first provider operation (pre-mutation read).
         provider.fail(
             "latest_commit_sha",
             ProviderUnavailableError("provider unreachable"),
@@ -315,36 +316,37 @@ def _run_scenario(scenario: str, files, intent_words):
     finally:
         reset_request_context(token)
 
-    # Collect the audit events the connector wrote to the durable sink and keep only the
-    # connector's terminal audit events.
-    audit_calls = [
-        event for event in sink.events if event.get("event") in _AUDIT_EVENTS
-    ]
+    intent_events = [e for e in sink.events if e.get("event") == _INTENT_EVENT]
+    outcome_events = [e for e in sink.events if e.get("event") == _OUTCOME_EVENT]
 
-    return result, user_id, audit_calls
+    return result, user_id, intent_events, outcome_events
 
 
-# --- Property 21 -----------------------------------------------------------
+# --- Audit completeness under the intent/outcome model ---------------------
 
 
-# Feature: source-control-connector, Property 21: Create/decline audit records are complete
+# Feature: source-control-connector-v2, intent/outcome audit: records are complete for every terminal outcome
 @settings(max_examples=100)
 @given(
     scenario=st.sampled_from(_SCENARIOS),
     files=_valid_cfn_files(),
     intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
 )
-def test_property21_audit_records_are_complete(scenario, files, intent_words):
-    """Every terminal outcome writes exactly one audit record with the required fields.
+def test_audit_records_are_complete(scenario, files, intent_words):
+    """Every terminal outcome writes complete, correctly-shaped intent/outcome audit records.
 
-    For any created / rejected / declined / error outcome of ``propose_change``, the connector
-    emits a single audit entry that identifies the requesting user, describes the outcome
-    (event/action/outcome), carries the target repository/branch where a match was resolved,
-    includes a reason for every non-created outcome, and always carries a timestamp (Req 6.3).
+    For any created / rejected / declined / error outcome of ``propose_change``: a single
+    terminal ``scm_outcome`` event identifies the requesting user, describes the outcome
+    (action/outcome), carries the target repository/branch where a match was resolved, includes
+    a reason for every non-created outcome, and always carries a timestamp (Req 9.1). A
+    created outcome is additionally preceded by exactly one ``scm_intent`` event, correlated by
+    the idempotency key; paths that never mutate carry no intent (Req 9.2).
     """
     expected = _EXPECTATIONS[scenario]
 
-    result, user_id, audit_calls = _run_scenario(scenario, files, intent_words)
+    result, user_id, intent_events, outcome_events = _run_scenario(
+        scenario, files, intent_words
+    )
 
     # The scenario reached its intended terminal outcome.
     assert result.status == expected["status"], (
@@ -352,44 +354,70 @@ def test_property21_audit_records_are_complete(scenario, files, intent_words):
         f"(message: {result.message})"
     )
 
-    # Exactly one terminal audit entry was written for this outcome.
-    assert len(audit_calls) == 1, (
-        f"scenario {scenario!r} expected exactly one audit entry, got {len(audit_calls)}: "
-        f"{[c.get('event') for c in audit_calls]}"
+    # Exactly one terminal OUTCOME event was written for this outcome.
+    assert len(outcome_events) == 1, (
+        f"scenario {scenario!r} expected exactly one scm_outcome event, "
+        f"got {len(outcome_events)}"
     )
-    audit = audit_calls[0]
+    outcome = outcome_events[0]
 
-    # --- Required fields common to every terminal outcome ---------------------------------
+    # --- Required fields on the terminal OUTCOME event ------------------------------------
 
     # requesting_user: attributed to the authenticated identity from the request contextvar.
-    assert audit.get("requesting_user") == user_id
+    assert outcome.get("requesting_user") == user_id
 
     # event / action / outcome: describe what happened.
-    assert audit.get("event") == expected["event"]
-    assert audit.get("outcome") == expected["outcome"]
-    assert isinstance(audit.get("action"), str) and audit["action"]
+    assert outcome.get("event") == _OUTCOME_EVENT
+    assert outcome.get("outcome") == expected["outcome"]
+    assert isinstance(outcome.get("action"), str) and outcome["action"]
 
     # timestamp: always attached by the audit helper as a non-empty string.
-    timestamp = audit.get("timestamp")
+    timestamp = outcome.get("timestamp")
     assert isinstance(timestamp, str) and timestamp
 
     # --- reason (required for every non-created outcome) ----------------------------------
     if expected["reason_required"]:
-        reason = audit.get("reason")
+        reason = outcome.get("reason")
         assert isinstance(reason, str) and reason, (
             f"scenario {scenario!r} must record a reason for a non-created outcome"
         )
 
     # --- repository / target_branch (where an allowlist match was resolved) ---------------
     if expected["repo_applicable"]:
-        assert audit.get("repository") == _REPO
-        assert audit.get("target_branch") == _BRANCH
+        assert outcome.get("repository") == _REPO
+        assert outcome.get("target_branch") == _BRANCH
+
+    # --- INTENT event (only for the path that reaches the mutation stage) -----------------
+    if expected["intent_expected"]:
+        assert len(intent_events) == 1, (
+            f"scenario {scenario!r} expected exactly one preceding scm_intent event"
+        )
+        intent = intent_events[0]
+        # The INTENT attributes the same user and carries the effective repo/branch, the base
+        # revision, and the proposed paths (never file contents). The base revision is recorded
+        # as a non-empty token; note the audit helper's defense-in-depth ``sanitize_log_data``
+        # may redact a SHA-shaped value, which is harmless — the field is still present.
+        assert intent.get("requesting_user") == user_id
+        assert intent.get("repository") == _REPO
+        assert intent.get("target_branch") == _BRANCH
+        assert isinstance(intent.get("base_revision"), str) and intent["base_revision"]
+        assert isinstance(intent.get("paths"), list) and intent["paths"]
+        assert isinstance(intent.get("timestamp"), str) and intent["timestamp"]
+        # INTENT and OUTCOME correlate by a shared, non-empty idempotency key.
+        key = intent.get("idempotency_key")
+        assert key and outcome.get("idempotency_key") == key
+    else:
+        # Paths that never reach the mutation stage record no intent.
+        assert intent_events == [], (
+            f"scenario {scenario!r} unexpectedly recorded a preceding intent event"
+        )
 
     # --- created outcome additionally records the proposal branch + PR id -----------------
     if scenario == "created":
-        assert audit.get("proposal_branch")
-        assert audit.get("proposal_id")
+        assert outcome.get("proposal_branch")
+        assert outcome.get("proposal_id")
 
-    # Defense-in-depth: the credential value never leaks into any audit field.
-    for value in audit.values():
-        assert _FAKE_CREDENTIAL not in str(value)
+    # Defense-in-depth: the credential value never leaks into any recorded audit field.
+    for event in intent_events + outcome_events:
+        for value in event.values():
+            assert _FAKE_CREDENTIAL not in str(value)

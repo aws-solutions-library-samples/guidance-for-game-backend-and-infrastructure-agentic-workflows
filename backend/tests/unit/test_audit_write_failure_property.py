@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""Property-based test for atomic abort on audit-write failure (`connector.service.propose_change`).
+"""Property-based tests for the durable intent/outcome audit model — NOT atomic
+(`connector.service.propose_change`).
 
-Covers Correctness Property 22 from the source-control-connector design: a change proposal
-is only ever reported as successful when a durable audit record has been written. If the
-audit sink fails while recording the success of an otherwise-complete proposal, the
-connector MUST NOT report success. Instead it aborts the action atomically and returns an
-audit-persistence error result (Req 6.4).
+This file replaces the shipped baseline Property 22 ("audit-write failure aborts the action
+atomically"). Issue #268 (R9.2) deliberately **reverses** that cross-system atomicity claim:
+the connector now records a durable **INTENT** event before the first mutating provider op and
+a durable **OUTCOME** event after, correlated by the stable idempotency key, and reconciles
+ambiguous outcomes instead of claiming atomicity between the audit store and the provider.
 
-The service is exercised with a scenario that would otherwise succeed:
+The two audit-write-failure behaviors this proves (the full success/fail × intent × outcome
+matrix is covered by the dedicated Property V5 test, task 6.2):
 
-- a ``FakeProvider`` injected via ``provider=`` whose default behavior makes every provider
-  operation succeed,
-- an enabled :class:`ConnectorConfig` injected via ``config=`` whose allowlist matches the
-  requested repository/branch,
-- ``connector.service.get_secret`` mocked so no AWS call occurs, and
-- an authorized ``user_id`` supplied through the request contextvar.
+- **Unconfirmed INTENT → abort before any mutation.** If the durable INTENT write is not
+  confirmed, the connector aborts *before* any branch/commit/proposal is created. This is a
+  genuinely safe fail-closed abort — nothing has been mutated yet — and is **not** an
+  atomicity claim: it only means "do not start work we cannot audit". The result is a safe
+  error and the provider performs no mutation.
+- **Unconfirmed OUTCOME after a successful mutation → reconcilable, not rolled back.** If the
+  mutation succeeds but the durable OUTCOME write is not confirmed, the connector does **not**
+  report a false success and does **not** roll back the mutation. It returns a distinct
+  ``status="reconcilable"`` result: the proposal exists on the provider and is reconcilable
+  from the recorded INTENT plus provider state. No cross-system atomicity is claimed.
 
-The audit trail now flows through the durable, confirmed CloudWatch Logs sink
-(``connector.audit.AuditSink``). This test drives that sink directly by patching
-``connector.service._get_audit_sink`` with a programmable fake whose ``write`` returns the
-confirmed/unconfirmed outcome under test:
+The complement (INTENT confirmed AND OUTCOME confirmed) reports the proposal as ``created``.
 
-- an **unconfirmed** write (``write`` returns ``False``) models a durable-audit-sink failure
-  at the exact point the success would be recorded; the connector's ``_audit`` helper
-  returns ``False`` and ``_finalize`` converts the intended ``status="created"`` result into
-  an audit-persistence error (``status="error"``). Success is NEVER reported.
-- a **confirmed** write (``write`` returns ``True``) records the success durably and the
-  proposal is reported as ``created`` — success requires a confirmed durable write.
+The service is exercised with a scenario that would otherwise succeed: a ``FakeProvider``
+injected via ``provider=`` whose default behavior makes every provider operation succeed, an
+enabled :class:`SourceControlConfig` whose allowlist matches the requested repository/branch,
+an authorized ``user_id`` supplied through the request contextvar, and a programmable audit
+sink patched over ``connector.service._get_audit_sink`` that returns a chosen confirmed/
+unconfirmed result **per event type** (``scm_intent`` vs ``scm_outcome``).
 
-Hypothesis varies the proposed file set, the (injection-free) intent/title/description text,
-and the confirmed/unconfirmed write outcome so the property holds across many inputs.
-
-Validates: Requirements 6.4, 13.2, 13.3
+Validates: Requirements 9.1, 9.2
 """
 
 # Standard library
@@ -63,9 +63,10 @@ _REPO = "org/iac-repo"
 _BRANCH = "main"
 _GROUP = "scm-writers"
 _IAC_FORMAT = "cloudformation"
+_FAKE_CREDENTIAL = "ghp_fake_token_value"
 
 # Benign words used to build varying, injection-free intents/titles so the input-validation
-# and prompt-injection gates always pass and every request reaches the success audit.
+# and prompt-injection gates always pass and every request reaches the mutation stage.
 _SAFE_WORDS = [
     "update",
     "storage",
@@ -95,21 +96,28 @@ _user_ids = itertools.count(1)
 
 
 class _ProgrammableAuditSink:
-    """A fake :class:`connector.audit.AuditSink` whose ``write`` returns a fixed outcome.
+    """A fake :class:`connector.audit.AuditSink` returning a chosen result per event type.
 
-    ``confirmed=False`` models a durable-audit-sink failure (an unconfirmed write): every
-    ``write`` returns ``False`` so the connector aborts the action and returns an
-    audit-persistence error. ``confirmed=True`` models a confirmed durable write so the
-    success can be reported. The events written are captured for optional inspection.
+    The intent/outcome model writes two distinct durable events: ``scm_intent`` (before the
+    first mutation) and ``scm_outcome`` (after the provider ops resolve). This sink lets a test
+    independently confirm/unconfirm each: ``intent_confirmed`` gates the ``scm_intent`` write
+    and ``outcome_confirmed`` gates the ``scm_outcome`` write. Every event written is captured
+    (in order) for correlation/ordering/secret assertions.
     """
 
-    def __init__(self, confirmed: bool):
+    def __init__(self, *, intent_confirmed: bool, outcome_confirmed: bool):
         self.events: list[dict] = []
-        self._confirmed = confirmed
+        self._intent_confirmed = intent_confirmed
+        self._outcome_confirmed = outcome_confirmed
 
     def write(self, event: dict) -> bool:
         self.events.append(dict(event))
-        return self._confirmed
+        kind = event.get("event")
+        if kind == "scm_intent":
+            return self._intent_confirmed
+        if kind == "scm_outcome":
+            return self._outcome_confirmed
+        return True
 
 
 def _make_config() -> SourceControlConfig:
@@ -133,12 +141,7 @@ def _make_config() -> SourceControlConfig:
 
 @st.composite
 def _valid_cfn_files(draw):
-    """Generate 1..N distinct, structurally valid CloudFormation ``ProposedFile``s.
-
-    Each file has a unique path (index-suffixed) and a JSON body (valid YAML too) with a
-    non-empty ``Resources`` mapping whose single resource declares a ``Type`` — exactly what
-    the IaC validation gate requires so the request reaches the success audit.
-    """
+    """Generate 1..N distinct, structurally valid CloudFormation ``ProposedFile``s."""
     specs = draw(
         st.lists(
             st.tuples(
@@ -162,17 +165,20 @@ def _valid_cfn_files(draw):
     return files
 
 
-# --- Property 22 -----------------------------------------------------------
+def _run(files, intent_words, *, intent_confirmed: bool, outcome_confirmed: bool):
+    """Drive an otherwise-successful ``propose_change`` with a programmable audit sink.
 
-
-def _run(files, intent_words, *, confirmed: bool):
-    """Drive an otherwise-successful ``propose_change`` with a sink of the given outcome."""
+    Returns ``(result, provider, sink)`` so callers can assert on the terminal result, the
+    provider's applied state (mutation or none), and the captured audit events.
+    """
     # Isolate this example: clear the shared sliding-window store and use a fresh user id.
     _rate_limit_windows.clear()
 
     config = _make_config()
     provider = FakeProvider()
-    sink = _ProgrammableAuditSink(confirmed=confirmed)
+    sink = _ProgrammableAuditSink(
+        intent_confirmed=intent_confirmed, outcome_confirmed=outcome_confirmed
+    )
 
     user_id = f"user-{next(_user_ids)}"
     intent = " ".join(intent_words)
@@ -194,56 +200,145 @@ def _run(files, intent_words, *, confirmed: bool):
             )
     finally:
         reset_request_context(token)
-    return result
+    return result, provider, sink
 
 
-# Feature: source-control-connector, Property 22: Audit-write failure aborts the action atomically
+def _assert_no_mutation(provider: FakeProvider) -> None:
+    """Assert the provider created no branch, commit, or change proposal."""
+    assert provider.created_branches == []
+    assert provider.commits == []
+    assert provider.pull_requests == []
+
+
+def _assert_no_secret(sink: _ProgrammableAuditSink) -> None:
+    """Assert no audit event (of any type) carries the credential value."""
+    for event in sink.events:
+        for value in event.values():
+            assert _FAKE_CREDENTIAL not in str(value)
+
+
+# --- Unconfirmed INTENT aborts before any mutation (Req 9.2) ---------------
+
+
+# Feature: source-control-connector-v2, intent/outcome audit: unconfirmed INTENT aborts before any mutation
 @settings(max_examples=100)
 @given(
     files=_valid_cfn_files(),
     intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
 )
-def test_property22_unconfirmed_audit_write_aborts_atomically(files, intent_words):
-    """When the durable audit write is unconfirmed, propose_change returns an error, not created.
+def test_unconfirmed_intent_aborts_before_any_mutation(files, intent_words):
+    """An unconfirmed INTENT write aborts before any provider mutation (safe, not atomic).
 
-    For a scenario that would otherwise succeed (enabled, authorized, allowlist-matching,
-    valid IaC, provider succeeds), an unconfirmed sink write (``write`` returns ``False``)
-    causes the connector to abort the action atomically: the returned result is an
-    audit-persistence error (``status="error"``) and is NEVER reported as ``created`` — a
-    proposal is never reported successful without a confirmed durable audit record
-    (Req 6.4, 13.2, 13.3).
+    For a scenario that would otherwise succeed, if the durable INTENT write is unconfirmed the
+    connector performs NO branch/commit/proposal, returns a safe (non-created) error result,
+    and never reports success. Because nothing was mutated, this abort is a safe fail-closed
+    decline, not a cross-system atomicity claim (Req 9.2).
     """
-    result = _run(files, intent_words, confirmed=False)
+    result, provider, sink = _run(
+        files, intent_words, intent_confirmed=False, outcome_confirmed=True
+    )
 
-    # Req 13.3: success is NEVER reported when the durable audit write is not confirmed.
+    # No mutation occurred at all — the abort happened before the first mutating op.
+    _assert_no_mutation(provider)
+
+    # Success is never reported; the result is a safe, non-created error with no proposal.
     assert result.status != "created", result.message
+    assert result.status != "reconcilable", result.message
     assert result.status == "error", result.message
-
-    # The result is specifically the audit-persistence error and carries no proposal handle.
-    assert "audit record could not be persisted" in result.message
     assert result.proposal_id is None
     assert result.proposal_url is None
 
-    # Defense-in-depth: the credential value never leaks into the agent-visible result.
-    assert "ghp_fake_token_value" not in result.message
+    # Exactly one INTENT event was attempted and NO OUTCOME event was written (we aborted).
+    intent_events = [e for e in sink.events if e.get("event") == "scm_intent"]
+    outcome_events = [e for e in sink.events if e.get("event") == "scm_outcome"]
+    assert len(intent_events) == 1
+    assert outcome_events == []
+
+    # Defense-in-depth: no secret leaks into the result or the audit events.
+    assert _FAKE_CREDENTIAL not in result.message
+    _assert_no_secret(sink)
 
 
-# Feature: source-control-connector, Property 22: Success requires a confirmed durable write
+# --- Unconfirmed OUTCOME after a successful mutation is reconcilable, not rolled back -------
+
+
+# Feature: source-control-connector-v2, intent/outcome audit: unconfirmed OUTCOME after success is reconcilable, not atomic
 @settings(max_examples=100)
 @given(
     files=_valid_cfn_files(),
     intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
 )
-def test_property22_confirmed_audit_write_reports_success(files, intent_words):
-    """When the durable audit write is confirmed, an otherwise-successful proposal is created.
+def test_unconfirmed_outcome_after_success_is_reconcilable_not_atomic(files, intent_words):
+    """A successful mutation with an unconfirmed OUTCOME yields a reconcilable result.
 
-    The complement of the abort property: with the same otherwise-successful scenario a
-    confirmed sink write (``write`` returns ``True``) lets the connector report the proposal
-    as ``created`` — demonstrating that success requires, and follows from, a confirmed
-    durable audit record (Req 13.2, 13.3).
+    When the INTENT is confirmed and the provider mutation succeeds but the durable OUTCOME
+    write is unconfirmed, the connector does NOT report a false success and does NOT roll back
+    the mutation: the change proposal remains on the provider and the result is a distinct
+    ``status="reconcilable"`` handle (with the proposal id/url) reconcilable from the recorded
+    intent + provider state. No cross-system atomicity is claimed (Req 9.1, 9.2).
     """
-    result = _run(files, intent_words, confirmed=True)
+    result, provider, sink = _run(
+        files, intent_words, intent_confirmed=True, outcome_confirmed=False
+    )
+
+    # The mutation actually happened and was NOT rolled back: the proposal exists on provider.
+    assert len(provider.pull_requests) == 1
+    assert provider.created_branches
+    assert provider.commits
+
+    # No false success: the result is the distinct reconcilable status, never "created".
+    assert result.status != "created", result.message
+    assert result.status == "reconcilable", result.message
+    # The reconcilable result still surfaces the proposal handle so it can be reconciled.
+    assert result.proposal_id is not None
+    assert result.proposal_url is not None
+    assert "reconcilable" in result.message.lower()
+
+    # INTENT preceded the mutation and correlates with the (attempted) OUTCOME by the key.
+    intent_events = [e for e in sink.events if e.get("event") == "scm_intent"]
+    outcome_events = [e for e in sink.events if e.get("event") == "scm_outcome"]
+    assert len(intent_events) == 1
+    assert len(outcome_events) == 1
+    assert sink.events[0].get("event") == "scm_intent"  # INTENT written first, before mutation
+    key = intent_events[0].get("idempotency_key")
+    assert key and outcome_events[0].get("idempotency_key") == key
+    # The INTENT carries proposed paths only (never file contents) — a positive no-secret check.
+    assert "paths" in intent_events[0]
+    _assert_no_secret(sink)
+
+
+# --- Both writes confirmed reports success (complement) --------------------
+
+
+# Feature: source-control-connector-v2, intent/outcome audit: confirmed intent + outcome reports created
+@settings(max_examples=100)
+@given(
+    files=_valid_cfn_files(),
+    intent_words=st.lists(st.sampled_from(_SAFE_WORDS), min_size=2, max_size=6),
+)
+def test_confirmed_intent_and_outcome_reports_created(files, intent_words):
+    """With both durable writes confirmed, an otherwise-successful proposal is created.
+
+    The complement of the failure paths: a confirmed INTENT (before mutation) and a confirmed
+    OUTCOME (after) let the connector report the proposal as ``created``. Two correlated events
+    are recorded — INTENT then OUTCOME — sharing the idempotency key (Req 9.1).
+    """
+    result, provider, sink = _run(
+        files, intent_words, intent_confirmed=True, outcome_confirmed=True
+    )
 
     assert result.status == "created", result.message
     assert result.proposal_id is not None
     assert result.proposal_url is not None
+    assert len(provider.pull_requests) == 1
+
+    intent_events = [e for e in sink.events if e.get("event") == "scm_intent"]
+    outcome_events = [e for e in sink.events if e.get("event") == "scm_outcome"]
+    assert len(intent_events) == 1
+    assert len(outcome_events) == 1
+    # INTENT is written before OUTCOME, and both correlate by the stable idempotency key.
+    assert sink.events.index(intent_events[0]) < sink.events.index(outcome_events[0])
+    key = intent_events[0].get("idempotency_key")
+    assert key and outcome_events[0].get("idempotency_key") == key
+    assert outcome_events[0].get("outcome") == "created"
+    _assert_no_secret(sink)

@@ -63,7 +63,27 @@ class _FakeLogsClient:
         }
 
 
-_EVENT = {"event": "scm_proposal", "message": "Change proposal created", "outcome": "created"}
+# The durable sink is neutral to the event shape: the connector now writes two first-class
+# event types through it — a ``scm_intent`` before the first mutation and a ``scm_outcome``
+# after — correlated by ``idempotency_key`` and carrying no secrets. Both are plain dicts the
+# sink serializes and confirms identically.
+_EVENT = {
+    "event": "scm_outcome",
+    "message": "Change proposal created",
+    "outcome": "created",
+    "idempotency_key": "abc123",
+}
+
+_INTENT_EVENT = {
+    "event": "scm_intent",
+    "message": "Change proposal intent recorded",
+    "idempotency_key": "abc123",
+    "requesting_user": "user-1",
+    "repository": "org/iac",
+    "target_branch": "main",
+    "base_revision": "0" * 40,
+    "paths": ["infra/vpc.yaml", "infra/sg.yaml"],
+}
 
 
 def test_confirmed_write_returns_true_and_ensures_stream():
@@ -78,6 +98,32 @@ def test_confirmed_write_returns_true_and_ensures_stream():
     log_event = client.put_calls[0]["logEvents"][0]
     assert isinstance(log_event["timestamp"], int)
     assert client.put_calls[0]["logGroupName"] == "audit-grp"
+
+
+def test_intent_and_outcome_event_shapes_are_written_and_confirmed():
+    """Both first-class event shapes (scm_intent / scm_outcome) serialize and confirm alike.
+
+    The sink is neutral to the event shape: an INTENT event (with its list-valued ``paths``
+    and ``idempotency_key``) and an OUTCOME event are each serialized to JSON and confirmed by
+    the same ``put_log_events`` contract, preserving their correlating fields in the payload.
+    """
+    client = _FakeLogsClient()
+    client.put_outcomes = [{"nextSequenceToken": "1"}, {"nextSequenceToken": "2"}]
+    sink = AuditSink("audit-grp", client=client)
+
+    assert sink.write(_INTENT_EVENT) is True
+    assert sink.write(_EVENT) is True
+    assert len(client.put_calls) == 2
+
+    intent_payload = json.loads(client.put_calls[0]["logEvents"][0]["message"])
+    outcome_payload = json.loads(client.put_calls[1]["logEvents"][0]["message"])
+
+    assert intent_payload["event"] == "scm_intent"
+    # The list-valued proposed paths survive serialization intact.
+    assert intent_payload["paths"] == ["infra/vpc.yaml", "infra/sg.yaml"]
+    assert outcome_payload["event"] == "scm_outcome"
+    # INTENT and OUTCOME correlate by the shared idempotency key.
+    assert intent_payload["idempotency_key"] == outcome_payload["idempotency_key"] == "abc123"
 
 
 def test_rejected_events_are_unconfirmed():

@@ -12,7 +12,7 @@ Concretely, for any injection-flagged input this proves the safety-critical gate
 - The result status is ``"rejected"`` and no pull-request id/url is returned.
 - **Zero** provider operations are issued (the injected ``FakeProvider`` records no calls),
   so the connector never reports success on an injected request.
-- A rejection audit entry (``event == "scm_rejected"``, ``outcome == "rejected"``) is
+- A rejection audit entry (``event == "scm_outcome"``, ``outcome == "rejected"``) is
   recorded, attributing the requesting user and naming an injection/validation reason.
 
 The service is exercised with an authorized request context, an allowlist-matching
@@ -217,10 +217,10 @@ def test_property15_injection_flagged_input_blocks_all_operations(inputs):
     rejection_calls = [
         call
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_rejected"
+        if call.kwargs.get("event") == "scm_outcome"
         and call.kwargs.get("reason") in _INJECTION_REASONS
     ]
-    assert rejection_calls, "expected a scm_rejected audit entry with an injection reason"
+    assert rejection_calls, "expected a scm_outcome audit entry with an injection reason"
     audit = rejection_calls[0].kwargs
     assert audit.get("outcome") == "rejected"
     assert audit.get("requesting_user") == _AUTHORIZED_CONTEXT["user_id"]

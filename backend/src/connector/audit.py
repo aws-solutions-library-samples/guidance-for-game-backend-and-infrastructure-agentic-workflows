@@ -1,10 +1,29 @@
 """Durable, confirmed audit sink for the Source Control Connector (Req 13.1, 13.2, 13.3).
 
 The baseline connector wrote its audit trail through the shared ``utils.logger.logger``
-(stdout → ADOT/CloudWatch), a fire-and-forget path: the "an audit-write failure aborts the
-action" guarantee could not actually be honored because a lost stdout line was never
+(stdout → ADOT/CloudWatch), a fire-and-forget path where a lost stdout line was never
 observed. This module replaces that with a **confirmed** durable write to a dedicated
 CloudWatch Logs log group.
+
+The connector records two first-class event shapes through this sink (Req 9.1, 9.2), both
+serialized and confirmed identically by :meth:`AuditSink.write`:
+
+- **INTENT** (``event="scm_intent"``) — written *before* the first mutating provider op. It
+  captures what the connector is about to attempt: the stable ``idempotency_key``, the
+  ``requesting_user``, the effective ``repository``/``target_branch``, the verified
+  ``base_revision``, and the proposed file ``paths``. It never carries file contents or
+  secrets.
+- **OUTCOME** (``event="scm_outcome"``) — written *after* the provider ops resolve (or after
+  reconciliation). It carries the same ``idempotency_key`` (so it correlates with the INTENT),
+  an ``outcome`` of ``created`` / ``declined`` / ``rejected`` / ``error`` / ``reconciled``,
+  the ``proposal_id``/``proposal_url`` on success or a ``reason`` on failure. Rejection and
+  decline paths — which perform no mutation — emit a single OUTCOME with no preceding INTENT.
+
+The sink itself is neutral to the event shape: it treats every event as an opaque dict to
+serialize and durably confirm. Crucially, the connector makes **no cross-system atomicity
+claim** between this durable audit store and the provider: a confirmed INTENT gates the *start*
+of a mutation (a safe pre-mutation abort if unconfirmed), while an unconfirmed OUTCOME after a
+successful mutation is surfaced as a reconcilable result rather than a rollback (Req 9.2).
 
 :class:`AuditSink` owns a boto3 ``logs`` client (built with the platform's
 ``BOTO3_CLIENT_CONFIG``/``AWS_REGION`` convention, matching ``utils.secrets`` and the other
@@ -25,8 +44,10 @@ modules) and exposes a single :meth:`AuditSink.write` operation:
   (from the exception payload, falling back to ``describe_log_streams``) and retrying the
   put exactly **once**.
 - :meth:`write` **never raises** — every boto3/``ClientError``/unexpected exception is caught
-  and reported as ``False`` so the caller (``connector.service._finalize``) can fail the
-  action closed and return the audit-persistence error result (Req 13.3).
+  and reported as ``False`` so the caller (``connector.service._record_intent`` /
+  ``_record_outcome``) observes an unconfirmed write: an unconfirmed INTENT aborts before any
+  mutation and an unconfirmed OUTCOME after a successful mutation yields a reconcilable result
+  (Req 13.3, 9.2).
 
 The log stream name is deterministic per process **per UTC date** (``scm-audit-<YYYYMMDD>``)
 so entries accumulate in a small, predictable set of streams and the daily rollover keeps any
@@ -256,8 +277,9 @@ class AuditSink:
         Serializes the event, ensures the log stream exists, and puts the log event with a
         millisecond timestamp. Returns ``True`` only when CloudWatch Logs confirms the write
         (see :meth:`_confirm`). Never raises: any failure — serialization, missing log group,
-        client construction, or a boto3 error — yields ``False`` so the caller aborts the
-        action and returns an audit-persistence error (Req 13.3).
+        client construction, or a boto3 error — yields ``False`` so the caller observes an
+        unconfirmed write (an unconfirmed INTENT aborts before any mutation; an unconfirmed
+        OUTCOME after a successful mutation yields a reconcilable result — Req 13.3, 9.2).
         """
         if not self._log_group:
             return False

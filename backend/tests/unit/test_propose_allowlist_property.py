@@ -280,10 +280,10 @@ def test_property5_non_match_performs_no_operation_and_audits(pair):
     rejection_calls = [
         call
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_rejected"
+        if call.kwargs.get("event") == "scm_outcome"
         and call.kwargs.get("failed_dimension") in ("repo", "branch")
     ]
-    assert rejection_calls, "expected a scm_rejected audit naming the repo/branch dimension"
+    assert rejection_calls, "expected a scm_outcome audit naming the repo/branch dimension"
     audit = rejection_calls[0].kwargs
     assert audit.get("requesting_user") == _AUTHORIZED_CONTEXT["user_id"]
     assert audit.get("repository") == requested_repo

@@ -271,11 +271,18 @@ def _proposed_files(paths) -> list[ProposedFile]:
 
 
 def _rejection_dimensions(mock_logger) -> list[str]:
-    """Collect the ``failed_dimension`` values from any scm_rejected warning audits."""
+    """Collect the ``failed_dimension`` values from any rejection warning audits.
+
+    The read path records a rejection as ``event="scm_rejected"`` while the propose path now
+    records it as a single ``event="scm_outcome"`` (the intent/outcome model — a rejected
+    proposal performs no mutation, so it emits one OUTCOME event with no preceding intent).
+    Both are collected so the five-dimension policy is asserted identically on reads and
+    writes.
+    """
     return [
         call.kwargs.get("failed_dimension")
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_rejected"
+        if call.kwargs.get("event") in ("scm_rejected", "scm_outcome")
     ]
 
 

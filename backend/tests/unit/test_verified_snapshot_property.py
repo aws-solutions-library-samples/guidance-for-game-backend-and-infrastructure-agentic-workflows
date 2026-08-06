@@ -126,11 +126,16 @@ def _call_propose(fake: FakeProvider, base_revision: str):
 
 
 def _rejection_reasons(mock_logger) -> list[str]:
-    """Collect the ``reason`` values from any scm_rejected warning audits."""
+    """Collect the ``reason`` values from any rejection warning audits.
+
+    A rejected proposal performs no mutation, so under the intent/outcome model it emits a
+    single ``event="scm_outcome"`` record (with no preceding intent) rather than the former
+    ``scm_rejected`` label.
+    """
     return [
         call.kwargs.get("reason")
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_rejected"
+        if call.kwargs.get("event") == "scm_outcome"
     ]
 
 

@@ -236,7 +236,7 @@ def test_property19_merge_conflict_is_reported_without_destructive_resolution(
     conflict_audits = [
         call
         for call in mock_logger.error.call_args_list
-        if call.kwargs.get("event") == "scm_proposal"
+        if call.kwargs.get("event") == "scm_outcome"
         and call.kwargs.get("reason") == "provider_conflict"
     ]
     assert conflict_audits, "expected a provider_conflict audit entry"
