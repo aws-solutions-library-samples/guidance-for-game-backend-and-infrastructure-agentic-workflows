@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Smoke test: ``scripts/deploy.sh`` wires the Source Control Connector correctly.
+
+These are fast text/structure assertions over ``scripts/deploy.sh`` (no AWS calls, no
+shelling out to the deploy). They pin the three v2 (issue #268) deploy invariants:
+
+* **Single source / no drift** — the SAME resolved value (``$SCM_CREDENTIAL_SECRET_ARN``)
+  drives BOTH the ``ScmCredentialSecretArn`` base-stack parameter (Step 1) AND the
+  ``GBAW_SCM_CREDENTIAL_SECRET_ARN`` runtime env var (Step 5b), so the runtime
+  credential-acquisition config and the scoped IAM grant cannot diverge (Req 11.2 / MR5).
+* **KB-independent audit destination** — the ``GBAW_SCM_*`` runtime env args (including
+  ``GBAW_SCM_AUDIT_LOG_GROUP``) are emitted under their own guards, never gated on the
+  Knowledge Base IDs, and ``LAUNCH_ENV_ARGS`` appends ``SCM_ENV_ARGS`` outside any KB
+  conditional (Req 9.3, 9.4).
+* **ARN-only, no raw credential value** — only the ARN variable/env-name flows through;
+  the removed ``GBAW_SCM_CREDENTIAL_SECRET_ID`` is absent (Req 11.2).
+
+The test mirrors ``test_iam_scm_credential_smoke.py`` in how it locates the repo-root file.
+
+Validates: Requirements 9.3, 9.4, 11.2
+"""
+
+# Standard library
+import re
+from pathlib import Path
+
+# Third-party packages
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+# --- Locate deploy.sh ---------------------------------------------------------------------
+
+# tests/unit/<this file> -> tests/unit -> tests -> backend -> <repo root>
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEPLOY_PATH = _REPO_ROOT / "scripts" / "deploy.sh"
+
+# The single resolved shell variable that both destinations must read from.
+_ARN_VAR = "SCM_CREDENTIAL_SECRET_ARN"
+_ARN_ENV_NAME = "GBAW_SCM_CREDENTIAL_SECRET_ARN"
+# The removed legacy (non-ARN) credential setting; must not reappear.
+_REMOVED_ENV_NAME = "GBAW_SCM_CREDENTIAL_SECRET_ID"
+# Shell variables holding Knowledge Base IDs — the SCM wiring must be independent of these.
+_KB_ID_VARS = ("GAMELIFT_KB_ID", "EKS_KB_ID", "COST_KB_ID")
+
+
+# --- Fixtures -----------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def deploy_text() -> str:
+    """Return the raw text of ``scripts/deploy.sh``."""
+    assert _DEPLOY_PATH.is_file(), f"deploy.sh not found at {_DEPLOY_PATH}"
+    return _DEPLOY_PATH.read_text()
+
+
+@pytest.fixture(scope="module")
+def deploy_lines(deploy_text: str) -> list:
+    """Return ``deploy.sh`` split into individual lines."""
+    return deploy_text.splitlines()
+
+
+# --- Helpers ------------------------------------------------------------------------------
+
+
+def _enclosing_guard(lines: list, target_substr: str) -> str:
+    """Return the nearest preceding ``if`` guard line for the line containing target_substr.
+
+    Walks backwards from the matched line to the closest line whose stripped form starts
+    with ``if `` — i.e. the immediate one-level shell guard the statement sits under.
+    """
+    index = next(
+        (i for i, line in enumerate(lines) if target_substr in line and not line.lstrip().startswith("#")),
+        None,
+    )
+    assert index is not None, f"could not find a non-comment line containing: {target_substr!r}"
+    for line in reversed(lines[:index]):
+        stripped = line.strip()
+        if stripped.startswith("if "):
+            return stripped
+    raise AssertionError(f"no enclosing 'if' guard found for: {target_substr!r}")
+
+
+def _non_comment_text(text: str) -> str:
+    """Return deploy.sh text with whole-line and trailing ``#`` comments stripped.
+
+    Used for assertions about what the script *does* (not what its comments mention), so a
+    reference to a name inside an explanatory comment never satisfies or breaks a test.
+    """
+    out = []
+    for line in text.splitlines():
+        # Drop a trailing comment while ignoring '#' inside single/double quotes.
+        in_single = in_double = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == "#" and not in_single and not in_double:
+                cut = i
+                break
+        out.append(line[:cut])
+    return "\n".join(out)
+
+
+# --- Tests: single source / no drift ------------------------------------------------------
+
+
+def test_arn_resolved_once_from_env_or_env_local(deploy_text: str):
+    """(Req 11.2) The credential ARN is resolved once into ``$SCM_CREDENTIAL_SECRET_ARN``
+    from the environment or backend/.env.local — a single source of truth."""
+    pattern = re.compile(
+        rf'^{_ARN_VAR}="\$\{{{_ARN_ENV_NAME}:-.*\}}"', re.MULTILINE
+    )
+    assert pattern.search(deploy_text), (
+        f"{_ARN_VAR} must be resolved once from ${_ARN_ENV_NAME} (env or .env.local)"
+    )
+
+
+def test_same_arn_source_drives_base_param_and_runtime_env(deploy_text: str):
+    """(Req 11.2 / MR5) The SAME ``$SCM_CREDENTIAL_SECRET_ARN`` value drives BOTH the
+    ``ScmCredentialSecretArn`` base-stack parameter AND the ``GBAW_SCM_CREDENTIAL_SECRET_ARN``
+    runtime env var — single source, no drift."""
+    non_comment = _non_comment_text(deploy_text)
+
+    # Base-stack parameter reads the shell variable.
+    assert re.search(rf'ScmCredentialSecretArn="\${_ARN_VAR}"', non_comment), (
+        "base-stack ScmCredentialSecretArn parameter must read $SCM_CREDENTIAL_SECRET_ARN"
+    )
+    # Runtime env var reads the SAME shell variable.
+    assert re.search(rf'{_ARN_ENV_NAME}=\${_ARN_VAR}\b', non_comment), (
+        "runtime GBAW_SCM_CREDENTIAL_SECRET_ARN must read the SAME $SCM_CREDENTIAL_SECRET_ARN"
+    )
+
+
+# --- Tests: KB-independent audit destination + env wiring ---------------------------------
+
+
+def test_audit_log_group_env_var_wired(deploy_text: str):
+    """(Req 9.3, 9.4) The audit destination env var ``GBAW_SCM_AUDIT_LOG_GROUP`` is part of
+    the wired ``GBAW_SCM_*`` runtime env set."""
+    assert "GBAW_SCM_AUDIT_LOG_GROUP" in _non_comment_text(deploy_text), (
+        "GBAW_SCM_AUDIT_LOG_GROUP must be wired through the runtime env args"
+    )
+
+
+def test_credential_env_append_guarded_by_arn_not_kb(deploy_lines: list):
+    """(Req 9.3) The credential runtime env append is guarded by the ARN's own presence
+    check, independent of any Knowledge Base ID."""
+    guard = _enclosing_guard(
+        deploy_lines, f'SCM_ENV_ARGS+=(-env "{_ARN_ENV_NAME}=${_ARN_VAR}'
+    )
+    assert _ARN_VAR in guard, f"credential env append must guard on ${_ARN_VAR}: {guard!r}"
+    for kb in _KB_ID_VARS:
+        assert kb not in guard, f"credential env append must not be gated on {kb}: {guard!r}"
+
+
+def test_launch_env_appends_scm_args_outside_kb_conditional(deploy_lines: list):
+    """(Req 9.3, 9.4) ``LAUNCH_ENV_ARGS`` appends ``SCM_ENV_ARGS`` under its own count guard,
+    not inside a Knowledge Base conditional — so GBAW_SCM_* args ship regardless of KB IDs."""
+    guard = _enclosing_guard(deploy_lines, 'LAUNCH_ENV_ARGS+=("${SCM_ENV_ARGS[@]}")')
+    assert "SCM_ENV_ARGS" in guard, (
+        f"SCM_ENV_ARGS append must guard on the SCM_ENV_ARGS count: {guard!r}"
+    )
+    for kb in _KB_ID_VARS:
+        assert kb not in guard, f"SCM_ENV_ARGS append must not be gated on {kb}: {guard!r}"
+
+
+# --- Tests: ARN-only, no raw credential value ---------------------------------------------
+
+
+def test_removed_credential_secret_id_absent(deploy_text: str):
+    """(Req 11.2) The removed legacy ``GBAW_SCM_CREDENTIAL_SECRET_ID`` setting does not
+    reappear anywhere in deploy.sh — only the single ARN-valued setting is used."""
+    assert _REMOVED_ENV_NAME not in deploy_text, (
+        f"{_REMOVED_ENV_NAME} must be absent; only {_ARN_ENV_NAME} is used"
+    )
+
+
+def test_only_arn_variable_flows_never_a_literal_value(deploy_text: str):
+    """(Req 11.2) The credential is delivered to the runtime as an ``-env`` arg whose value
+    is the shell variable ``$SCM_CREDENTIAL_SECRET_ARN`` (an ARN reference), never an inlined
+    literal credential value."""
+    non_comment = _non_comment_text(deploy_text)
+    env_arg_values = re.findall(rf'-env "{_ARN_ENV_NAME}=([^"]*)"', non_comment)
+    assert env_arg_values, f"expected a -env {_ARN_ENV_NAME}=... assignment"
+    for value in env_arg_values:
+        assert value == f"${_ARN_VAR}", (
+            f"{_ARN_ENV_NAME} -env value must be exactly ${_ARN_VAR}, got: {value!r}"
+        )

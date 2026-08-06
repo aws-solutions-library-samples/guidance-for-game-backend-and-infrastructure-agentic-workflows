@@ -394,14 +394,15 @@ if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
 
 # Source Control Connector (disabled by default). Wire GBAW_SCM_* vars through the
 # same -env mechanism, including only the ones that are set so read-only deployments
-# that never configure the connector are unaffected. Only the Secrets Manager secret
-# id (GBAW_SCM_CREDENTIAL_SECRET_ID) is passed — never a raw credential value (Req 12.2).
+# that never configure the connector are unaffected. The single ARN-valued credential
+# setting (GBAW_SCM_CREDENTIAL_SECRET_ARN) is delivered separately below from the SAME
+# source value used for the base stack's ScmCredentialSecretArn parameter — only the
+# ARN is ever passed, never a raw credential value (Req 11.2).
 SCM_ENV_ARGS=()
 for _scm_var in \
   GBAW_SCM_CONNECTOR_ENABLED \
   GBAW_SCM_PROVIDER \
   GBAW_SCM_PROVIDER_BASE_URL \
-  GBAW_SCM_CREDENTIAL_SECRET_ID \
   GBAW_SCM_REPO_ALLOWLIST \
   GBAW_SCM_AUTHORIZED_GROUPS \
   GBAW_SCM_AUDIT_LOG_GROUP \
@@ -416,6 +417,14 @@ for _scm_var in \
     SCM_ENV_ARGS+=(-env "${_scm_var}=${_scm_val}")
   fi
 done
+# Single-source the credential ARN (Req 11.2 / MR5): the SAME value resolved for the
+# base stack's ScmCredentialSecretArn parameter (Step 1, $SCM_CREDENTIAL_SECRET_ARN)
+# is delivered as the runtime env var GBAW_SCM_CREDENTIAL_SECRET_ARN, so the runtime
+# credential-acquisition config and the scoped IAM grant are driven by one value and
+# cannot drift. Only the ARN is passed — never a raw credential value.
+if [ -n "$SCM_CREDENTIAL_SECRET_ARN" ]; then
+  SCM_ENV_ARGS+=(-env "GBAW_SCM_CREDENTIAL_SECRET_ARN=$SCM_CREDENTIAL_SECRET_ARN")
+fi
 if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
   echo "   Source Control Connector: wiring ${#SCM_ENV_ARGS[@]} GBAW_SCM_* env var(s)"
 fi

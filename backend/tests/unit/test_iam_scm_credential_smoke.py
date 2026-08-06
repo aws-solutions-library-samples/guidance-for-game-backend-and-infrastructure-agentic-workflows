@@ -12,7 +12,13 @@ The template uses CloudFormation intrinsic short tags (``!Ref``, ``!Sub``, ``!If
 constructor (mirroring ``connector.iac_validation._CfnLoader``) tolerates them by turning
 each intrinsic into an ordinary Python mapping so the document parses into plain structures.
 
-Validates: Requirements 4.1, 4.3, 4.5
+The v2 pass (issue #268) additionally asserts that the credential grant is scoped to the
+single ARN (never ``*`` or a prefix wildcard) and that the durable audit sink grant
+(``ScmAuditLogAccess``) grants only ``logs:CreateLogStream`` + ``logs:PutLogEvents`` scoped
+to the dedicated connector audit log group (and its stream children), independent of any
+Knowledge Base resource.
+
+Validates: Requirements 4.1, 4.3, 4.5, 9.3, 9.4, 11.2
 """
 
 # Standard library
@@ -35,6 +41,11 @@ _ROLE_LOGICAL_ID = "AgentCoreExecutionRole"
 _SCM_POLICY_NAME = "ScmCredentialAccess"
 _SCM_CONDITION_NAME = "ScmCredentialConfigured"
 _SCM_PARAMETER_NAME = "ScmCredentialSecretArn"
+
+# The dedicated audit-sink grant (KB-independent, opt-in via ScmAuditLogGroupName).
+_SCM_AUDIT_POLICY_NAME = "ScmAuditLogAccess"
+_SCM_AUDIT_CONDITION_NAME = "ScmAuditLogGroupConfigured"
+_SCM_AUDIT_LOG_GROUP_LOGICAL_ID = "ScmAuditLogGroup"
 
 
 # --- CloudFormation-aware YAML loader -----------------------------------------------------
@@ -104,8 +115,8 @@ def _as_list(value) -> list:
     return list(value) if isinstance(value, list) else [value]
 
 
-def _find_scm_conditional_policy(policies: list):
-    """Return ``(condition_name, policy_dict)`` for the ``!If``-gated SCM policy, or None."""
+def _find_conditional_policy(policies: list, policy_name: str):
+    """Return ``(condition_name, policy_dict)`` for the named ``!If``-gated policy, or None."""
     for entry in policies:
         if not isinstance(entry, dict):
             continue
@@ -113,9 +124,14 @@ def _find_scm_conditional_policy(policies: list):
         if not isinstance(fn_if, list) or len(fn_if) != 3:
             continue
         condition_name, true_branch, _false_branch = fn_if
-        if isinstance(true_branch, dict) and true_branch.get("PolicyName") == _SCM_POLICY_NAME:
+        if isinstance(true_branch, dict) and true_branch.get("PolicyName") == policy_name:
             return condition_name, true_branch
     return None
+
+
+def _find_scm_conditional_policy(policies: list):
+    """Return ``(condition_name, policy_dict)`` for the ``!If``-gated SCM credential policy."""
+    return _find_conditional_policy(policies, _SCM_POLICY_NAME)
 
 
 def _iter_statements(policies: list):
@@ -253,6 +269,26 @@ def test_scm_policy_only_action_is_scoped_get_secret_value(role_policies: list):
     )
 
 
+def test_scm_credential_resource_is_single_arn_not_wildcard(role_policies: list):
+    """(Req 11.2) The credential grant is scoped to the single ARN parameter ref — never
+    ``*`` and never a prefix wildcard (no ``*`` anywhere in the scoped resource)."""
+    found = _find_scm_conditional_policy(role_policies)
+    assert found is not None
+    _condition_name, policy = found
+
+    resources = _as_list(policy.get("PolicyDocument", {}).get("Statement", [{}])[0].get("Resource"))
+    assert resources == [{"Ref": _SCM_PARAMETER_NAME}], (
+        "credential resource must be exactly the single ScmCredentialSecretArn ref"
+    )
+    # The resource is a structured !Ref (a dict), not a raw ARN string, so it cannot be
+    # "*" or a prefix wildcard. Guard explicitly against a regression to a string wildcard.
+    for resource in resources:
+        assert resource != "*", "credential grant must not be Resource: '*'"
+        assert not (isinstance(resource, str) and resource.endswith("*")), (
+            "credential grant must not use a prefix/suffix wildcard ARN"
+        )
+
+
 # --- Tests: no new mutating live-infrastructure actions ------------------------------------
 
 
@@ -277,3 +313,75 @@ def test_no_mutating_live_infrastructure_actions_present(role_policies: list):
         if any(verb.startswith(mutating) for mutating in _MUTATING_VERBS):
             offending.append(action)
     assert offending == [], f"mutating live-infrastructure actions present: {sorted(offending)}"
+
+
+# --- Tests: durable audit-sink grant is scoped, logs-only, and KB-independent -------------
+
+
+def test_scm_audit_policy_is_conditional_on_audit_log_group_configured(role_policies: list):
+    """(Req 9.3) The audit-sink grant is added only via the ``ScmAuditLogGroupConfigured``
+    condition — a non-empty ``ScmAuditLogGroupName``, independent of any Knowledge Base."""
+    found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
+    assert found is not None, f"{_SCM_AUDIT_POLICY_NAME} policy is not present as an Fn::If entry"
+    condition_name, _policy = found
+    assert condition_name == _SCM_AUDIT_CONDITION_NAME, (
+        "audit grant must gate on ScmAuditLogGroupConfigured, not a KB condition"
+    )
+    assert "KB" not in condition_name and "KnowledgeBase" not in condition_name, (
+        "audit grant condition must be independent of Knowledge Base configuration"
+    )
+
+
+def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list):
+    """(Req 9.3, 9.4) The audit statement grants ONLY logs:CreateLogStream +
+    logs:PutLogEvents scoped to the dedicated audit log group ARN (and its ``:*`` stream
+    children) — nothing else, and no live-infrastructure or KB resource."""
+    found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
+    assert found is not None
+    _condition_name, policy = found
+
+    statements = _as_list(policy.get("PolicyDocument", {}).get("Statement"))
+    assert len(statements) == 1, "audit policy must contain exactly one statement"
+    statement = statements[0]
+
+    assert statement.get("Effect") == "Allow"
+
+    actions = _as_list(statement.get("Action"))
+    assert sorted(actions) == ["logs:CreateLogStream", "logs:PutLogEvents"], (
+        "the only added audit actions must be logs:CreateLogStream + logs:PutLogEvents"
+    )
+
+    resources = _as_list(statement.get("Resource"))
+    assert len(resources) == 2, "audit grant must scope to the log group ARN and its ':*' children"
+    # Every resource must reference the dedicated ScmAuditLogGroup — the GetAtt Arn and the
+    # Sub'd ':*' stream wildcard — and nothing may be Resource: '*' or reference a KB.
+    assert {"Fn::GetAtt": f"{_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}.Arn"} in resources, (
+        "audit grant must include the ScmAuditLogGroup ARN via GetAtt"
+    )
+    stream_children = [
+        r
+        for r in resources
+        if isinstance(r, dict)
+        and isinstance(r.get("Fn::Sub"), str)
+        and r["Fn::Sub"].endswith(":*")
+    ]
+    assert len(stream_children) == 1, "audit grant must include the ':*' log-stream children"
+    for resource in resources:
+        assert resource != "*", "audit grant must not be Resource: '*'"
+        rendered = str(resource)
+        assert _SCM_AUDIT_LOG_GROUP_LOGICAL_ID in rendered, (
+            f"audit resource must reference {_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}: {resource!r}"
+        )
+        assert "knowledge-base" not in rendered and "KnowledgeBase" not in rendered, (
+            "audit grant must be independent of any Knowledge Base resource"
+        )
+
+
+def test_scm_audit_log_group_is_dedicated_resource(template: dict):
+    """(Req 9.3) The audit destination is a dedicated CloudWatch Logs log group provisioned
+    independently of Knowledge Base configuration (gated on ScmAuditLogGroupConfigured)."""
+    resources = template.get("Resources", {})
+    log_group = resources.get(_SCM_AUDIT_LOG_GROUP_LOGICAL_ID)
+    assert log_group is not None, f"missing {_SCM_AUDIT_LOG_GROUP_LOGICAL_ID} resource"
+    assert log_group.get("Type") == "AWS::Logs::LogGroup"
+    assert log_group.get("Condition") == _SCM_AUDIT_CONDITION_NAME
