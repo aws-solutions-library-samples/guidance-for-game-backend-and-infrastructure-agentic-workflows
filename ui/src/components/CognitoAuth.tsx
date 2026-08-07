@@ -6,6 +6,7 @@ import ThemeToggle from './ThemeToggle';
 interface CognitoAuthProps {
   userPoolId: string;
   clientId: string;
+  notice?: string;
   onAuthenticated: (user: CognitoUser, session: CognitoUserSession) => void;
 }
 
@@ -13,7 +14,7 @@ interface CognitoAuthProps {
 // users are provisioned via script. Only sign-in + password reset are exposed.
 type AuthMode = 'signin' | 'forgot' | 'reset';
 
-export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: CognitoAuthProps) {
+export default function CognitoAuth({ userPoolId, clientId, notice, onAuthenticated }: CognitoAuthProps) {
   const [mode, setMode] = useState<AuthMode>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -140,6 +141,8 @@ export default function CognitoAuth({ userPoolId, clientId, onAuthenticated }: C
           <h1>Game Agent</h1>
           <p>AI-Powered Game Server Management</p>
         </div>
+
+        {notice && <div className="auth-error" role="alert">{notice}</div>}
 
         {mode === 'signin' && (
           <>

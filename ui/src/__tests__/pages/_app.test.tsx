@@ -3,14 +3,30 @@
  */
 
 import React from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import MyApp from '../../pages/_app';
 
+const mockCognitoSignOut = jest.fn();
+
 // Mock CognitoAuth component
 jest.mock('../../components/CognitoAuth', () => {
-  return function MockCognitoAuth() {
-    return <div data-testid="cognito-auth">Login Screen</div>;
+  return function MockCognitoAuth({
+    notice,
+    onAuthenticated,
+  }: {
+    notice?: string;
+    onAuthenticated?: (user: { signOut: () => void }) => void;
+  }) {
+    return (
+      <div data-testid="cognito-auth">
+        Login Screen
+        {notice && <div role="alert">{notice}</div>}
+        <button onClick={() => onAuthenticated?.({ signOut: mockCognitoSignOut })}>
+          Complete sign in
+        </button>
+      </div>
+    );
   };
 });
 
@@ -33,6 +49,7 @@ describe('MyApp - Logout behavior', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    global.fetch = jest.fn();
     // Clear cookies
     Object.defineProperty(document, 'cookie', {
       writable: true,
@@ -150,7 +167,8 @@ describe('MyApp - Logout behavior', () => {
   });
 
   it('validates session on mount in production mode', async () => {
-    (global.fetch as jest.Mock).mockResolvedValue({
+    const fetchMock = global.fetch as jest.Mock;
+    fetchMock.mockResolvedValue({
       json: async () => ({
         cognito: {
           region: 'us-west-2',
@@ -177,6 +195,68 @@ describe('MyApp - Logout behavior', () => {
     });
 
     // fetchWithTimeout passes an AbortController signal in the options.
-    expect(global.fetch).toHaveBeenCalledWith('/api/config', expect.objectContaining({ signal: expect.anything() }));
+    expect(fetchMock).toHaveBeenCalledWith('/api/config', expect.objectContaining({ signal: expect.anything() }));
+  });
+
+  it('returns to sign-in and clears the session when an authenticated request receives 401', async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: {
+              region: 'us-west-2',
+              userPoolId: 'test-pool',
+              clientId: 'test-client',
+            },
+          }),
+        } as Response;
+      }
+      if (url === '/api/copilot/chat') {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ error: 'Unauthorized' }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true }),
+        } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>
+          Submit message
+        </button>
+      </div>
+    );
+
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Submit message' }));
+
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent('Your session expired. Sign in again.');
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/auth/logout',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(mockCognitoSignOut).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([input]) => input.toString() === '/api/copilot/chat')).toHaveLength(1);
   });
 });
