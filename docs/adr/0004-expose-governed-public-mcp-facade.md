@@ -67,6 +67,10 @@ tools must call the shared operations application services defined by
 [ADR 0002](0002-use-protocol-neutral-operations-services.md). They cannot
 approve an operation or perform a provider write.
 
+Preparing an operation does not approve it or grant execution authority. The
+public MCP facade and Gateway cannot invoke a prepared executor directly. An
+operation identifier is not a credential or authorization.
+
 All provider writes remain behind the prepared executors defined by
 [ADR 0003](0003-isolate-provider-writes.md). The MCP Runtime and Gateway receive
 no provider write credential or permission.
@@ -100,6 +104,8 @@ and request must produce the same authorization result through HTTP and MCP.
 - Trusting identity or workspace fields supplied in tool arguments.
 - Treating a desktop user's AWS identity as automatic downstream AWS
   authorization.
+- Treating an operation identifier as approval or executor authorization.
+- Exposing a prepared executor as a public MCP tool or Gateway target.
 - Letting an MCP tool approve or execute a provider write.
 - Allowing clients to invoke the MCP Runtime directly and bypass Gateway
   controls.
