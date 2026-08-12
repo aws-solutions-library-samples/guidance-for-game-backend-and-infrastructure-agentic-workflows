@@ -27,6 +27,16 @@ DOCS_CONFIG = {
             "url": "https://docs.aws.amazon.com/gamelift/latest/developerguide/gamelift-intro.html",
             "output": "developer-guide.md",
             "title": "GameLift Developer Guide"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/reduce-cost-by-up-to-90-with-amazon-gamelift-fleetiq-and-spot-instances/",
+            "output": "blog-fleetiq-spot-cost.md",
+            "title": "Reduce Cost by up to 90% with Amazon GameLift FleetIQ and Spot Instances"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/how-to-host-your-unreal-engine-game-for-under-1-per-player-with-amazon-gamelift/",
+            "output": "blog-unreal-under-1-dollar.md",
+            "title": "How to Host Your Unreal Engine Game for Under $1 per Player with Amazon GameLift"
         }
     ],
     "eks": [
@@ -39,6 +49,31 @@ DOCS_CONFIG = {
             "url": "https://aws.github.io/aws-eks-best-practices/",
             "output": "best-practices.md",
             "title": "EKS Best Practices"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/developers-guide-to-operate-game-servers-on-kubernetes-part-1/",
+            "output": "blog-game-servers-kubernetes.md",
+            "title": "Developer's Guide to Operate Game Servers on Kubernetes (Part 1)"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/optimize-game-servers-hosting-with-containers/",
+            "output": "blog-optimize-containers.md",
+            "title": "Optimize Game Servers Hosting with Containers"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/new-solution-guidance-for-building-scalable-cross-platform-game-backends-on-aws/",
+            "output": "blog-game-backend-framework.md",
+            "title": "Guidance for Building Scalable Cross-Platform Game Backends on AWS (Game Backend Framework)"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/modernize-game-backend-services-with-aws-global-accelerator/",
+            "output": "blog-modernize-aga.md",
+            "title": "Modernize Game Backend Services with AWS Global Accelerator"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/building-resilient-and-secure-game-backends-with-amazon-cloudfront/",
+            "output": "blog-resilient-cloudfront.md",
+            "title": "Building Resilient and Secure Game Backends with Amazon CloudFront"
         }
     ],
     "cost": [
@@ -46,6 +81,16 @@ DOCS_CONFIG = {
             "url": "https://docs.aws.amazon.com/cost-management/latest/userguide/what-is-costmanagement.html",
             "output": "cost-management.md",
             "title": "Cost Management Guide"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/choose-the-right-compute-strategy-for-your-global-game-servers/",
+            "output": "blog-global-compute-strategy.md",
+            "title": "Choose the Right Compute Strategy for Your Global Game Servers"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/cost-optimize-your-minecraft-java-ec2-server/",
+            "output": "blog-cost-optimize-minecraft-ec2.md",
+            "title": "Cost Optimize Your Minecraft Java EC2 Server"
         }
     ]
 }
@@ -125,6 +170,17 @@ class DocScraper:
 
     def _extract_content(self, html: str) -> Optional[str]:
         soup = BeautifulSoup(html, 'html.parser')
+
+        # Blog posts (aws.amazon.com/blogs/...) use a dedicated article body.
+        # Try these first so we get clean article text instead of page chrome.
+        blog_content = (
+            soup.find('section', {'class': 'blog-post-content'})
+            or soup.find('article')
+        )
+        if blog_content:
+            for tag in blog_content.find_all(['nav', 'footer', 'script', 'style']):
+                tag.decompose()
+            return str(blog_content)
 
         selectors = [
             {'id': 'main-content'},
