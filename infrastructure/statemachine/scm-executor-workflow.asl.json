@@ -1,0 +1,179 @@
+{
+  "Comment": "Source Control Connector Executor - Durable_Workflow (Step Functions Standard). Triggered by the Prepared_Operation_Store APPROVAL# transition via DynamoDB Streams dispatch, this workflow orchestrates the isolated executor Lambda over an opaque operation_id and records every lifecycle transition to the append-only Audit_Ledger. The authoritative gate sequence (load, hash/contract-version verification, expiry, re-validation, base-revision re-verification, reconcile-before-retry write) lives inside the executor; the workflow invokes it with ONLY operation_id (Req 3.1, 3.3) and durably records transitions (Req 3.3, 8.6). The ${ExecutorFunctionArn} and ${PreparedOperationTableName} tokens are resolved by the gated CloudFormation template (DefinitionSubstitutions).",
+  "StartAt": "LoadAndVerify",
+  "States": {
+    "LoadAndVerify": {
+      "Type": "Task",
+      "Comment": "Record the workflow-load lifecycle transition to the append-only ledger (insert-only). The authoritative load + Canonical_Hash + Operation_Contract_Version verification is performed inside the executor.",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${PreparedOperationTableName}",
+        "Item": {
+          "PK": {
+            "S.$": "States.Format('OP#{}', $.operation_id)"
+          },
+          "SK": {
+            "S.$": "States.Format('LEDGER#WF#{}#00-load', $$.Execution.Name)"
+          },
+          "event": {
+            "S": "workflow_load"
+          },
+          "operation_id": {
+            "S.$": "$.operation_id"
+          },
+          "execution_arn": {
+            "S.$": "$$.Execution.Id"
+          },
+          "recorded_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+      },
+      "ResultPath": null,
+      "Next": "Revalidate"
+    },
+    "Revalidate": {
+      "Type": "Task",
+      "Comment": "Record the revalidation lifecycle transition. The executor re-runs capability posture, request-time policy, policy version, enrollment, normalized paths/extensions, Target_Authorization, and base-revision re-verification before any write.",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${PreparedOperationTableName}",
+        "Item": {
+          "PK": {
+            "S.$": "States.Format('OP#{}', $.operation_id)"
+          },
+          "SK": {
+            "S.$": "States.Format('LEDGER#WF#{}#10-revalidate', $$.Execution.Name)"
+          },
+          "event": {
+            "S": "workflow_revalidate"
+          },
+          "operation_id": {
+            "S.$": "$.operation_id"
+          },
+          "recorded_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+      },
+      "ResultPath": null,
+      "Next": "Execute"
+    },
+    "Execute": {
+      "Type": "Task",
+      "Comment": "Invoke the isolated executor Lambda with ONLY the opaque operation_id (Req 3.3, 4.2, 4.3). No files, target, revision, or free-form instruction are ever passed. The executor is the sole holder of the write credential.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ExecutorFunctionArn}",
+        "Payload": {
+          "operation_id.$": "$.operation_id"
+        }
+      },
+      "ResultSelector": {
+        "status.$": "$.Payload.status",
+        "operation_id.$": "$.Payload.operation_id",
+        "reason.$": "$.Payload.reason",
+        "proposal_ref.$": "$.Payload.proposal_ref"
+      },
+      "ResultPath": "$.execution",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Rejected"
+        }
+      ],
+      "Next": "Reconcile"
+    },
+    "Reconcile": {
+      "Type": "Choice",
+      "Comment": "Route on the executor's terminal outcome. Ambiguous/transient outcomes are reconciled-before-retry INSIDE the executor; here we only branch a successful terminal write to Record and everything else to Rejected.",
+      "Choices": [
+        {
+          "Variable": "$.execution.status",
+          "StringEquals": "executed",
+          "Next": "Record"
+        },
+        {
+          "Variable": "$.execution.status",
+          "StringEquals": "reconciled",
+          "Next": "Record"
+        }
+      ],
+      "Default": "Rejected"
+    },
+    "Rejected": {
+      "Type": "Task",
+      "Comment": "Record a rejected/failed terminal transition to the ledger. No provider write occurred; the executor already appended its own rejection ledger entry.",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${PreparedOperationTableName}",
+        "Item": {
+          "PK": {
+            "S.$": "States.Format('OP#{}', $.operation_id)"
+          },
+          "SK": {
+            "S.$": "States.Format('LEDGER#WF#{}#90-rejected', $$.Execution.Name)"
+          },
+          "event": {
+            "S": "workflow_rejected"
+          },
+          "operation_id": {
+            "S.$": "$.operation_id"
+          },
+          "recorded_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+      },
+      "ResultPath": null,
+      "Next": "Record"
+    },
+    "Record": {
+      "Type": "Task",
+      "Comment": "Record the terminal workflow transition to the append-only ledger and end. The append-only records remain the ledger; the workflow only records transitions.",
+      "Resource": "arn:aws:states:::dynamodb:putItem",
+      "Parameters": {
+        "TableName": "${PreparedOperationTableName}",
+        "Item": {
+          "PK": {
+            "S.$": "States.Format('OP#{}', $.operation_id)"
+          },
+          "SK": {
+            "S.$": "States.Format('LEDGER#WF#{}#99-record', $$.Execution.Name)"
+          },
+          "event": {
+            "S": "workflow_record"
+          },
+          "operation_id": {
+            "S.$": "$.operation_id"
+          },
+          "recorded_at": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+      },
+      "ResultPath": null,
+      "End": true
+    }
+  }
+}

@@ -1,0 +1,583 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Game Agent - Source Control Connector Executor (write half). GATED, disabled-by-default
+  write path: the write-once Prepared_Operation_Store (+ Streams / Audit_Ledger), the isolated
+  executor Lambda, the Step Functions Standard Durable_Workflow, the DynamoDB Streams ->
+  workflow dispatch, and the IAM isolation topology. EVERY resource is behind the explicit
+  ScmWriteEnabled condition (EnableScmWritePath defaults to 'false'), so the DEFAULT deployment
+  creates NONE of them. This template attaches NO provider-write IAM: the executor role's
+  write-secret grant (secretsmanager:GetSecretValue) and the minimal provider-write action set
+  are DEFERRED to the gated task 9.3, which is blocked on the #280 security gate. Nothing here
+  grants the executor read of the write credential.
+
+# ---------------------------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: >-
+      Project name used for resource naming. Must match the base-infrastructure stack so the
+      IAM isolation statements can target the existing runtime role names
+      (${ProjectName}-agentcore-execution-role and ${ProjectName}-ecs-task-role).
+
+  EnableScmWritePath:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Master gate for the entire Source Control write path. Defaults to 'false' so the default
+      deployment creates NO executor, workflow, store, dispatch, or isolation resources. Set to
+      'true' only in a deployment that has opted into the write path.
+
+  ScmWriteCredentialSecretArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the Secrets Manager secret holding the Source Control write credential. Referenced
+      here ONLY as the deny target for the runtime-role isolation statements (runtime roles must
+      never read it). The executor role's GetSecretValue grant on this secret is DEFERRED to the
+      gated task 9.3 (blocked on the #280 security gate) and is intentionally NOT attached here.
+
+  ScmExecutorCodeS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 bucket holding the packaged executor Lambda deployment artifact
+      (connector.executor.handler.handler). Supplied by the deploy pipeline when the write path
+      is enabled.
+
+  ScmExecutorCodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 key of the packaged executor Lambda deployment artifact.
+
+# ---------------------------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------------------------
+Conditions:
+  # The single explicit gate. Every resource in this template carries Condition: ScmWriteEnabled,
+  # so a default deployment (EnableScmWritePath = 'false') creates none of them (Req 12.1-12.4).
+  ScmWriteEnabled: !Equals [!Ref EnableScmWritePath, 'true']
+
+# ---------------------------------------------------------------------------------------------
+# Resources (ALL gated on ScmWriteEnabled)
+# ---------------------------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------------------------
+  # Prepared_Operation_Store (+ Audit_Ledger) - write-once DynamoDB table with Streams.
+  # Single table: PK = OP#<operation_id>; SK discriminates record kind (OP#META insert-only,
+  # APPROVAL#<ts> conditional transition, LEDGER#<seq> append-only). Streams emit
+  # NEW_AND_OLD_IMAGES so the approval transition can drive the durable dispatch (Req 8.1, 8.8).
+  # -------------------------------------------------------------------------------------------
+  ScmPreparedOperationTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ScmWriteEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-scm-prepared-operations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: scm-prepared-operation-store
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------------------------
+  # Executor Lambda role - the isolated executor's role. WITHOUT the write-secret grant and
+  # WITHOUT any provider-write action (both DEFERRED to gated task 9.3 / #280). It gets only:
+  #   * CloudWatch Logs for its own log group
+  #   * scoped DynamoDB read + insert-only writes on the store (GetItem/Query/PutItem)
+  # It explicitly does NOT get UpdateItem/DeleteItem (write-once + append-only; see the
+  # ScmLedgerAppendOnlyPolicy deny) and does NOT get secretsmanager:GetSecretValue.
+  # -------------------------------------------------------------------------------------------
+  ScmExecutorRole:
+    Type: AWS::IAM::Role
+    Condition: ScmWriteEnabled
+    Properties:
+      RoleName: !Sub '${ProjectName}-scm-executor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ScmExecutorLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ExecutorLogWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-scm-executor*'
+        - PolicyName: ScmExecutorStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Insert-only writes + reads on the store/ledger. No UpdateItem/DeleteItem here;
+              # write-once + append-only are additionally enforced by the deny policy below.
+              - Sid: ExecutorStoreReadInsert
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt ScmPreparedOperationTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------------------------
+  # Isolated executor Lambda. Handler is connector.executor.handler.handler. Assumes the
+  # ScmExecutorRole (sole future holder of the write credential - grant deferred to 9.3).
+  # -------------------------------------------------------------------------------------------
+  ScmExecutorFunction:
+    Type: AWS::Lambda::Function
+    Condition: ScmWriteEnabled
+    Properties:
+      FunctionName: !Sub '${ProjectName}-scm-executor'
+      Description: >-
+        Isolated Source Control executor - the sole (future) holder of the write credential.
+        Accepts ONLY an opaque operation_id and runs the fail-closed gate sequence.
+      Runtime: python3.13
+      Handler: connector.executor.handler.handler
+      Role: !GetAtt ScmExecutorRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ScmExecutorCodeS3Bucket
+        S3Key: !Ref ScmExecutorCodeS3Key
+      Environment:
+        Variables:
+          SCM_PREPARED_OPERATION_TABLE: !Ref ScmPreparedOperationTable
+          # The workflow role is the ONLY permitted caller (gate 1 in-code mirror of the IAM grant).
+          SCM_WORKFLOW_ROLE_ARN: !GetAtt ScmWorkflowRole.Arn
+          # Passed for gate 6 wiring; the GetSecretValue grant itself is deferred to 9.3 / #280.
+          SCM_WRITE_CREDENTIAL_SECRET_ARN: !Ref ScmWriteCredentialSecretArn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------------------------
+  # Step Functions role - the ONLY principal granted lambda:InvokeFunction on the executor
+  # (Req 4.7). Also writes lifecycle-transition ledger entries (insert-only) and gets the
+  # managed logging/X-Ray permissions Standard workflows use.
+  # -------------------------------------------------------------------------------------------
+  ScmWorkflowRole:
+    Type: AWS::IAM::Role
+    Condition: ScmWriteEnabled
+    Properties:
+      RoleName: !Sub '${ProjectName}-scm-workflow-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ScmWorkflowInvokeExecutor
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Sole grant of lambda:InvokeFunction on the executor (Req 4.7).
+              - Sid: WorkflowInvokeExecutorOnly
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ScmExecutorFunction.Arn
+        - PolicyName: ScmWorkflowLedgerWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The workflow records lifecycle transitions to the ledger (insert-only).
+              - Sid: WorkflowLedgerInsert
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt ScmPreparedOperationTable.Arn
+        - PolicyName: ScmWorkflowLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Standard state machine logging to CloudWatch Logs (delivery uses these actions).
+              - Sid: WorkflowLogDelivery
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # CloudWatch Logs group for the Standard workflow execution history.
+  ScmWorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ScmWriteEnabled
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-scm-executor-workflow'
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------------------------
+  # Durable_Workflow (Step Functions Standard). Definition is the authored ASL
+  # (infrastructure/statemachine/scm-executor-workflow.asl.json) with its ${ExecutorFunctionArn}
+  # and ${PreparedOperationTableName} tokens resolved via DefinitionSubstitutions. It invokes the
+  # executor with ONLY operation_id (Req 3.1, 3.3).
+  # -------------------------------------------------------------------------------------------
+  ScmWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Condition: ScmWriteEnabled
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-scm-executor-workflow'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt ScmWorkflowRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ScmWorkflowLogGroup.Arn
+      DefinitionSubstitutions:
+        ExecutorFunctionArn: !GetAtt ScmExecutorFunction.Arn
+        PreparedOperationTableName: !Ref ScmPreparedOperationTable
+      DefinitionString: |
+        {
+          "Comment": "SCM Executor Durable_Workflow (Standard). Mirrors infrastructure/statemachine/scm-executor-workflow.asl.json. Invokes the executor with ONLY operation_id and records lifecycle transitions to the append-only ledger.",
+          "StartAt": "LoadAndVerify",
+          "States": {
+            "LoadAndVerify": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${PreparedOperationTableName}",
+                "Item": {
+                  "PK": {"S.$": "States.Format('OP#{}', $.operation_id)"},
+                  "SK": {"S.$": "States.Format('LEDGER#WF#{}#00-load', $$.Execution.Name)"},
+                  "event": {"S": "workflow_load"},
+                  "operation_id": {"S.$": "$.operation_id"},
+                  "execution_arn": {"S.$": "$$.Execution.Id"},
+                  "recorded_at": {"S.$": "$$.State.EnteredTime"}
+                },
+                "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+              },
+              "ResultPath": null,
+              "Next": "Revalidate"
+            },
+            "Revalidate": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${PreparedOperationTableName}",
+                "Item": {
+                  "PK": {"S.$": "States.Format('OP#{}', $.operation_id)"},
+                  "SK": {"S.$": "States.Format('LEDGER#WF#{}#10-revalidate', $$.Execution.Name)"},
+                  "event": {"S": "workflow_revalidate"},
+                  "operation_id": {"S.$": "$.operation_id"},
+                  "recorded_at": {"S.$": "$$.State.EnteredTime"}
+                },
+                "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+              },
+              "ResultPath": null,
+              "Next": "Execute"
+            },
+            "Execute": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ExecutorFunctionArn}",
+                "Payload": {
+                  "operation_id.$": "$.operation_id"
+                }
+              },
+              "ResultSelector": {
+                "status.$": "$.Payload.status",
+                "operation_id.$": "$.Payload.operation_id",
+                "reason.$": "$.Payload.reason",
+                "proposal_ref.$": "$.Payload.proposal_ref"
+              },
+              "ResultPath": "$.execution",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "Rejected"
+                }
+              ],
+              "Next": "Reconcile"
+            },
+            "Reconcile": {
+              "Type": "Choice",
+              "Choices": [
+                {"Variable": "$.execution.status", "StringEquals": "executed", "Next": "Record"},
+                {"Variable": "$.execution.status", "StringEquals": "reconciled", "Next": "Record"}
+              ],
+              "Default": "Rejected"
+            },
+            "Rejected": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${PreparedOperationTableName}",
+                "Item": {
+                  "PK": {"S.$": "States.Format('OP#{}', $.operation_id)"},
+                  "SK": {"S.$": "States.Format('LEDGER#WF#{}#90-rejected', $$.Execution.Name)"},
+                  "event": {"S": "workflow_rejected"},
+                  "operation_id": {"S.$": "$.operation_id"},
+                  "recorded_at": {"S.$": "$$.State.EnteredTime"}
+                },
+                "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+              },
+              "ResultPath": null,
+              "Next": "Record"
+            },
+            "Record": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${PreparedOperationTableName}",
+                "Item": {
+                  "PK": {"S.$": "States.Format('OP#{}', $.operation_id)"},
+                  "SK": {"S.$": "States.Format('LEDGER#WF#{}#99-record', $$.Execution.Name)"},
+                  "event": {"S": "workflow_record"},
+                  "operation_id": {"S.$": "$.operation_id"},
+                  "recorded_at": {"S.$": "$$.State.EnteredTime"}
+                },
+                "ConditionExpression": "attribute_not_exists(PK) AND attribute_not_exists(SK)"
+              },
+              "ResultPath": null,
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------------------------
+  # DynamoDB Streams -> workflow dispatch (task 8.2). An EventBridge Pipe reads the store's
+  # stream, filters to the APPROVAL# transition INSERT, and starts a workflow execution. The
+  # dispatch is a durable trigger ONLY - the append-only records remain the ledger (Req 3.2,
+  # 3.4, 8.8).
+  # -------------------------------------------------------------------------------------------
+  ScmDispatchPipeRole:
+    Type: AWS::IAM::Role
+    Condition: ScmWriteEnabled
+    Properties:
+      RoleName: !Sub '${ProjectName}-scm-dispatch-pipe-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pipes.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: ScmDispatchStreamRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadOperationStoreStream
+                Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:ListStreams
+                Resource:
+                  - !GetAtt ScmPreparedOperationTable.StreamArn
+        - PolicyName: ScmDispatchStartWorkflow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartDurableWorkflow
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref ScmWorkflow
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ScmApprovalDispatchPipe:
+    Type: AWS::Pipes::Pipe
+    Condition: ScmWriteEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-scm-approval-dispatch'
+      Description: >-
+        Durable dispatch from the Prepared_Operation_Store stream (APPROVAL# transition) to the
+        Step Functions Durable_Workflow. Trigger only; records remain the ledger.
+      RoleArn: !GetAtt ScmDispatchPipeRole.Arn
+      Source: !GetAtt ScmPreparedOperationTable.StreamArn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+          MaximumRetryAttempts: 3
+        FilterCriteria:
+          Filters:
+            # Only the APPROVAL# transition INSERT drives dispatch (Req 3.4, 8.8).
+            - Pattern: '{"eventName":["INSERT"],"dynamodb":{"Keys":{"SK":{"S":[{"prefix":"APPROVAL#"}]}}}}'
+      Target: !Ref ScmWorkflow
+      TargetParameters:
+        StepFunctionStateMachineParameters:
+          InvocationType: FIRE_AND_FORGET
+        # Map the stream record's operation-id attribute into the ONLY-operation_id workflow input.
+        InputTemplate: '{"operation_id": <$.dynamodb.NewImage.operation_id.S>}'
+
+  # -------------------------------------------------------------------------------------------
+  # IAM isolation topology (task 9.2). Attached to the EXISTING runtime roles by name (defined
+  # in the base-infrastructure stack): the chat runtime (AgentCoreExecutionRole) and the
+  # web/API/MCP runtime (ECSTaskRole). Explicit DENY of invoking the executor and reading the
+  # write credential (Req 9.1-9.4). These are the structural, CloudTrail-auditable guarantees
+  # that the untrusted model plane has no route to the executor or the write secret.
+  # -------------------------------------------------------------------------------------------
+  ScmRuntimeIsolationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: ScmWriteEnabled
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-scm-runtime-isolation'
+      Description: >-
+        Explicit deny attached to the chat and web/API/MCP runtime roles: they may neither
+        invoke the isolated executor nor read the write credential secret.
+      Roles:
+        - !Sub '${ProjectName}-agentcore-execution-role'
+        - !Sub '${ProjectName}-ecs-task-role'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInvokeScmExecutor
+            Effect: Deny
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt ScmExecutorFunction.Arn
+          - Sid: DenyReadScmWriteCredential
+            Effect: Deny
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Ref ScmWriteCredentialSecretArn
+
+  # Ledger append-only enforcement (Req 8.4). Attached to the in-stack write principals
+  # (executor + workflow roles): explicit deny of UpdateItem/DeleteItem so the write-once store
+  # and the LEDGER# append-only records can never be mutated or removed by the write path.
+  ScmLedgerAppendOnlyPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: ScmWriteEnabled
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-scm-ledger-append-only'
+      Description: >-
+        Explicit deny of dynamodb:UpdateItem / dynamodb:DeleteItem on the Prepared_Operation_Store
+        (covering the LEDGER# append-only prefix and the write-once records), attached to the
+        executor and workflow roles.
+      Roles:
+        - !Ref ScmExecutorRole
+        - !Ref ScmWorkflowRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyLedgerUpdateDelete
+            Effect: Deny
+            Action:
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+            Resource:
+              - !GetAtt ScmPreparedOperationTable.Arn
+
+# ---------------------------------------------------------------------------------------------
+# Outputs (all gated on ScmWriteEnabled)
+# ---------------------------------------------------------------------------------------------
+Outputs:
+  ScmPreparedOperationTableName:
+    Condition: ScmWriteEnabled
+    Description: Prepared_Operation_Store table name
+    Value: !Ref ScmPreparedOperationTable
+    Export:
+      Name: !Sub '${ProjectName}-ScmPreparedOperationTableName'
+
+  ScmExecutorFunctionArn:
+    Condition: ScmWriteEnabled
+    Description: Isolated executor Lambda ARN
+    Value: !GetAtt ScmExecutorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-ScmExecutorFunctionArn'
+
+  ScmWorkflowArn:
+    Condition: ScmWriteEnabled
+    Description: Durable_Workflow (Step Functions Standard) ARN
+    Value: !Ref ScmWorkflow
+    Export:
+      Name: !Sub '${ProjectName}-ScmWorkflowArn'
