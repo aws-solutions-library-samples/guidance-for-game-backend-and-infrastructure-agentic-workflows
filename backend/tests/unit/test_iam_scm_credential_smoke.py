@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Smoke test: the Source Control Connector IAM template change is minimal and scoped.
+"""Smoke test: the Source Control Connector IAM template is read-only and scoped.
 
-This parses ``infrastructure/cloudformation/01-base-infrastructure.yaml`` and asserts that
-the *only* thing the connector change added to the ``AgentCoreExecutionRole`` is a single,
-conditional ``secretsmanager:GetSecretValue`` grant scoped to the operator-provisioned
-connector secret ARN. It further asserts that no new *mutating live-infrastructure* action
-was introduced, so the runtime role stays read-only against live AWS resources.
+This parses ``infrastructure/cloudformation/01-base-infrastructure.yaml`` and asserts the
+**read-only split** posture of the connector's contribution to ``AgentCoreExecutionRole``
+(the chat-runtime read role):
+
+* **No write surface** (task 11.3) — the template defines NO ``ScmCredentialAccess`` policy
+  and NO ``ScmCredentialSecretArn`` parameter (the old write-credential wiring is gone), and
+  default synthesis grants no write-credential ``GetSecretValue`` to any chat role and
+  creates no source-control write resources.
+* **Scoped read grant** (task 11.4) — the template defines a ``ScmReadCredentialSecretArn``
+  parameter distinct from any write param, and the only ``secretsmanager:GetSecretValue``
+  grant targets the read ARN (``!Ref ScmReadCredentialSecretArn``) scoped to the
+  chat-runtime role.
+* **Minimal audit grant** (task 11.5) — ``ScmAuditLogAccess`` permits only
+  ``logs:CreateLogStream`` + ``logs:PutLogEvents``, is KB-independent, and remains the
+  read-audit target (the dedicated connector audit log group).
 
 The template uses CloudFormation intrinsic short tags (``!Ref``, ``!Sub``, ``!If``,
 ``!GetAtt``, ``!Not``, ``!Equals``). A dedicated ``SafeLoader`` subclass with a multi-tag
 constructor (mirroring ``connector.iac_validation._CfnLoader``) tolerates them by turning
 each intrinsic into an ordinary Python mapping so the document parses into plain structures.
 
-The v2 pass (issue #268) additionally asserts that the credential grant is scoped to the
-single ARN (never ``*`` or a prefix wildcard) and that the durable audit sink grant
-(``ScmAuditLogAccess``) grants only ``logs:CreateLogStream`` + ``logs:PutLogEvents`` scoped
-to the dedicated connector audit log group (and its stream children), independent of any
-Knowledge Base resource.
-
-Validates: Requirements 4.1, 4.3, 4.5, 9.3, 9.4, 11.2
+Validates: Requirements 3.1, 3.2, 3.4, 6.2, 6.3, 9.3, 9.5, 11.2, 11.3
 """
 
 # Standard library
@@ -38,9 +42,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TEMPLATE_PATH = _REPO_ROOT / "infrastructure" / "cloudformation" / "01-base-infrastructure.yaml"
 
 _ROLE_LOGICAL_ID = "AgentCoreExecutionRole"
-_SCM_POLICY_NAME = "ScmCredentialAccess"
-_SCM_CONDITION_NAME = "ScmCredentialConfigured"
-_SCM_PARAMETER_NAME = "ScmCredentialSecretArn"
+
+# Read-credential (kept, scoped) wiring.
+_SCM_READ_POLICY_NAME = "ScmReadCredentialAccess"
+_SCM_READ_CONDITION_NAME = "ScmReadCredentialConfigured"
+_SCM_READ_PARAMETER_NAME = "ScmReadCredentialSecretArn"
+
+# Removed write-credential wiring — these must NOT appear anywhere in the template.
+_REMOVED_WRITE_POLICY_NAME = "ScmCredentialAccess"
+_REMOVED_WRITE_CONDITION_NAME = "ScmCredentialConfigured"
+_REMOVED_WRITE_PARAMETER_NAME = "ScmCredentialSecretArn"
 
 # The dedicated audit-sink grant (KB-independent, opt-in via ScmAuditLogGroupName).
 _SCM_AUDIT_POLICY_NAME = "ScmAuditLogAccess"
@@ -129,9 +140,9 @@ def _find_conditional_policy(policies: list, policy_name: str):
     return None
 
 
-def _find_scm_conditional_policy(policies: list):
-    """Return ``(condition_name, policy_dict)`` for the ``!If``-gated SCM credential policy."""
-    return _find_conditional_policy(policies, _SCM_POLICY_NAME)
+def _find_scm_read_conditional_policy(policies: list):
+    """Return ``(condition_name, policy_dict)`` for the ``!If``-gated read-credential policy."""
+    return _find_conditional_policy(policies, _SCM_READ_POLICY_NAME)
 
 
 def _iter_statements(policies: list):
@@ -215,92 +226,136 @@ def _action_verb(action: str) -> str:
     return verb
 
 
-# --- Tests: parameter + condition ---------------------------------------------------------
+# --- Task 11.3: no write surface ----------------------------------------------------------
 
 
-def test_scm_credential_secret_arn_parameter_exists_with_empty_default(template: dict):
-    """(Req 4.5) A String parameter for the secret ARN exists and defaults to empty so
-    read-only deployments that never set it are unaffected."""
+def test_no_write_credential_parameter_present(template: dict):
+    """(Req 3.1, 3.2) The removed write-credential parameter ``ScmCredentialSecretArn`` does
+    not exist anywhere in the template's Parameters."""
     params = template.get("Parameters", {})
-    assert _SCM_PARAMETER_NAME in params, f"missing parameter {_SCM_PARAMETER_NAME}"
-    param = params[_SCM_PARAMETER_NAME]
+    assert _REMOVED_WRITE_PARAMETER_NAME not in params, (
+        f"{_REMOVED_WRITE_PARAMETER_NAME} write parameter must be removed"
+    )
+
+
+def test_no_write_credential_condition_present(template: dict):
+    """(Req 3.1) The removed write-credential condition ``ScmCredentialConfigured`` is gone."""
+    conditions = template.get("Conditions", {})
+    assert _REMOVED_WRITE_CONDITION_NAME not in conditions, (
+        f"{_REMOVED_WRITE_CONDITION_NAME} write condition must be removed"
+    )
+
+
+def test_no_write_credential_access_policy_present(role_policies: list):
+    """(Req 3.1, 3.4, 11.2, 11.3) The role defines NO ``ScmCredentialAccess`` write policy —
+    default synthesis grants no write-credential GetSecretValue to any chat role."""
+    assert _find_conditional_policy(role_policies, _REMOVED_WRITE_POLICY_NAME) is None, (
+        f"{_REMOVED_WRITE_POLICY_NAME} write-credential policy must be removed"
+    )
+    for entry in role_policies:
+        if isinstance(entry, dict):
+            assert entry.get("PolicyName") != _REMOVED_WRITE_POLICY_NAME, (
+                f"{_REMOVED_WRITE_POLICY_NAME} write-credential policy must be removed"
+            )
+
+
+def test_removed_write_names_absent_from_raw_template(template: dict):
+    """(Req 3.1, 11.2) None of the removed write-credential logical names appear anywhere in
+    the parsed template (parameters, conditions, or resources)."""
+    rendered = str(template)
+    for name in (_REMOVED_WRITE_PARAMETER_NAME, _REMOVED_WRITE_CONDITION_NAME, _REMOVED_WRITE_POLICY_NAME):
+        assert name not in rendered, f"removed write name {name!r} must not appear in the template"
+
+
+def test_no_source_control_write_resources_created(template: dict):
+    """(Req 3.4, 11.3) The template creates no source-control write resources — the only
+    connector-owned resource is the read-audit log group (a CloudWatch Logs group)."""
+    resources = template.get("Resources", {})
+    # The sole connector resource is the audit log group; it is a logs group, not a
+    # source-control write resource. No DynamoDB / Step Functions / Lambda write infra.
+    for logical_id, resource in resources.items():
+        rtype = resource.get("Type", "") if isinstance(resource, dict) else ""
+        assert rtype not in (
+            "AWS::DynamoDB::Table",
+            "AWS::StepFunctions::StateMachine",
+            "AWS::Lambda::Function",
+        ), f"unexpected write-infra resource {logical_id} of type {rtype}"
+
+
+# --- Task 11.4: scoped read grant ---------------------------------------------------------
+
+
+def test_scm_read_credential_secret_arn_parameter_exists_with_empty_default(template: dict):
+    """(Req 6.2) A String parameter for the READ secret ARN exists, is distinct from any
+    write param, and defaults to empty so deployments that never set it are unaffected."""
+    params = template.get("Parameters", {})
+    assert _SCM_READ_PARAMETER_NAME in params, f"missing parameter {_SCM_READ_PARAMETER_NAME}"
+    assert _SCM_READ_PARAMETER_NAME != _REMOVED_WRITE_PARAMETER_NAME
+    assert _REMOVED_WRITE_PARAMETER_NAME not in params, "read param must be distinct; no write param"
+    param = params[_SCM_READ_PARAMETER_NAME]
     assert param.get("Type") == "String"
     assert param.get("Default") == "", "parameter default must be empty string"
 
 
-def test_scm_credential_configured_condition_exists(template: dict):
-    """(Req 4.5) The condition gating the grant on a non-empty ARN exists."""
+def test_scm_read_credential_configured_condition_exists(template: dict):
+    """(Req 6.2) The condition gating the read grant on a non-empty ARN exists."""
     conditions = template.get("Conditions", {})
-    assert _SCM_CONDITION_NAME in conditions, f"missing condition {_SCM_CONDITION_NAME}"
+    assert _SCM_READ_CONDITION_NAME in conditions, f"missing condition {_SCM_READ_CONDITION_NAME}"
 
 
-# --- Tests: the added policy is exactly one scoped GetSecretValue grant --------------------
-
-
-def test_scm_policy_is_conditional_on_scm_credential_configured(role_policies: list):
-    """(Req 4.5) The SCM policy is added only via the ``ScmCredentialConfigured`` condition."""
-    found = _find_scm_conditional_policy(role_policies)
-    assert found is not None, f"{_SCM_POLICY_NAME} policy is not present as an Fn::If entry"
+def test_scm_read_policy_is_conditional_on_read_credential_configured(role_policies: list):
+    """(Req 6.2) The read grant is added only via the ``ScmReadCredentialConfigured`` cond."""
+    found = _find_scm_read_conditional_policy(role_policies)
+    assert found is not None, f"{_SCM_READ_POLICY_NAME} policy is not present as an Fn::If entry"
     condition_name, _policy = found
-    assert condition_name == _SCM_CONDITION_NAME
+    assert condition_name == _SCM_READ_CONDITION_NAME
 
 
-def test_scm_policy_only_action_is_scoped_get_secret_value(role_policies: list):
-    """(Req 4.1, 4.3) The added statement grants only ``secretsmanager:GetSecretValue``
-    scoped (Resource) to the connector secret ARN parameter — nothing else."""
-    found = _find_scm_conditional_policy(role_policies)
+def test_only_get_secret_value_grant_targets_the_read_arn(role_policies: list):
+    """(Req 6.2, 6.3) The single ``secretsmanager:GetSecretValue`` grant across the whole
+    chat-runtime role targets ONLY the read ARN (``!Ref ScmReadCredentialSecretArn``),
+    scoped (never ``*`` or a prefix wildcard)."""
+    found = _find_scm_read_conditional_policy(role_policies)
     assert found is not None
     _condition_name, policy = found
 
     statements = _as_list(policy.get("PolicyDocument", {}).get("Statement"))
-    assert len(statements) == 1, "SCM policy must contain exactly one statement"
+    assert len(statements) == 1, "read policy must contain exactly one statement"
     statement = statements[0]
-
     assert statement.get("Effect") == "Allow"
 
     actions = _as_list(statement.get("Action"))
-    assert actions == ["secretsmanager:GetSecretValue"], "the only added action must be secretsmanager:GetSecretValue"
+    assert actions == ["secretsmanager:GetSecretValue"], "the only added action must be GetSecretValue"
 
     resources = _as_list(statement.get("Resource"))
     assert resources == [
-        {"Ref": _SCM_PARAMETER_NAME}
-    ], "GetSecretValue must be scoped to the ScmCredentialSecretArn parameter ref"
-
-
-def test_scm_credential_resource_is_single_arn_not_wildcard(role_policies: list):
-    """(Req 11.2) The credential grant is scoped to the single ARN parameter ref — never
-    ``*`` and never a prefix wildcard (no ``*`` anywhere in the scoped resource)."""
-    found = _find_scm_conditional_policy(role_policies)
-    assert found is not None
-    _condition_name, policy = found
-
-    resources = _as_list(policy.get("PolicyDocument", {}).get("Statement", [{}])[0].get("Resource"))
-    assert resources == [
-        {"Ref": _SCM_PARAMETER_NAME}
-    ], "credential resource must be exactly the single ScmCredentialSecretArn ref"
-    # The resource is a structured !Ref (a dict), not a raw ARN string, so it cannot be
-    # "*" or a prefix wildcard. Guard explicitly against a regression to a string wildcard.
+        {"Ref": _SCM_READ_PARAMETER_NAME}
+    ], "GetSecretValue must be scoped to the ScmReadCredentialSecretArn parameter ref"
     for resource in resources:
-        assert resource != "*", "credential grant must not be Resource: '*'"
+        assert resource != "*", "read grant must not be Resource: '*'"
         assert not (
             isinstance(resource, str) and resource.endswith("*")
-        ), "credential grant must not use a prefix/suffix wildcard ARN"
+        ), "read grant must not use a prefix/suffix wildcard ARN"
 
-
-# --- Tests: no new mutating live-infrastructure actions ------------------------------------
-
-
-def test_only_secretsmanager_action_is_get_secret_value(role_policies: list):
-    """(Req 4.3) Across the entire role, the sole Secrets Manager action is GetSecretValue."""
+    # Across the ENTIRE role, GetSecretValue is the only Secrets Manager action, and it is
+    # only ever scoped to the read ARN ref (no other GetSecretValue grant exists).
     secretsmanager_actions = sorted({a for a in _all_actions(role_policies) if a.startswith("secretsmanager:")})
     assert secretsmanager_actions == [
         "secretsmanager:GetSecretValue"
     ], f"unexpected secretsmanager actions: {secretsmanager_actions}"
+    getsecret_resources = [
+        _as_list(s.get("Resource"))
+        for s in _iter_statements(role_policies)
+        if "secretsmanager:GetSecretValue" in _as_list(s.get("Action"))
+    ]
+    assert getsecret_resources == [
+        [{"Ref": _SCM_READ_PARAMETER_NAME}]
+    ], "the only GetSecretValue grant must target the read ARN ref"
 
 
 def test_no_mutating_live_infrastructure_actions_present(role_policies: list):
-    """(Req 4.3, 4.1) No action against a live-infrastructure service uses a mutating verb;
-    the runtime role remains read-only against live AWS resources."""
+    """(Req 3.4) No action against a live-infrastructure service uses a mutating verb; the
+    chat-runtime role remains read-only against live AWS resources."""
     offending = []
     for action in _all_actions(role_policies):
         if not any(action.startswith(prefix) for prefix in _LIVE_INFRA_SERVICE_PREFIXES):
@@ -311,11 +366,11 @@ def test_no_mutating_live_infrastructure_actions_present(role_policies: list):
     assert offending == [], f"mutating live-infrastructure actions present: {sorted(offending)}"
 
 
-# --- Tests: durable audit-sink grant is scoped, logs-only, and KB-independent -------------
+# --- Task 11.5: minimal, KB-independent audit grant ---------------------------------------
 
 
 def test_scm_audit_policy_is_conditional_on_audit_log_group_configured(role_policies: list):
-    """(Req 9.3) The audit-sink grant is added only via the ``ScmAuditLogGroupConfigured``
+    """(Req 9.3, 9.5) The audit-sink grant is added only via the ``ScmAuditLogGroupConfigured``
     condition — a non-empty ``ScmAuditLogGroupName``, independent of any Knowledge Base."""
     found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
     assert found is not None, f"{_SCM_AUDIT_POLICY_NAME} policy is not present as an Fn::If entry"
@@ -329,9 +384,9 @@ def test_scm_audit_policy_is_conditional_on_audit_log_group_configured(role_poli
 
 
 def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list):
-    """(Req 9.3, 9.4) The audit statement grants ONLY logs:CreateLogStream +
-    logs:PutLogEvents scoped to the dedicated audit log group ARN (and its ``:*`` stream
-    children) — nothing else, and no live-infrastructure or KB resource."""
+    """(Req 9.5) The audit statement grants ONLY logs:CreateLogStream + logs:PutLogEvents
+    scoped to the dedicated audit log group ARN (and its ``:*`` stream children) — nothing
+    else, and no live-infrastructure or KB resource. This is the read-audit target."""
     found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
     assert found is not None
     _condition_name, policy = found
@@ -339,7 +394,6 @@ def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list
     statements = _as_list(policy.get("PolicyDocument", {}).get("Statement"))
     assert len(statements) == 1, "audit policy must contain exactly one statement"
     statement = statements[0]
-
     assert statement.get("Effect") == "Allow"
 
     actions = _as_list(statement.get("Action"))
@@ -350,8 +404,6 @@ def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list
 
     resources = _as_list(statement.get("Resource"))
     assert len(resources) == 2, "audit grant must scope to the log group ARN and its ':*' children"
-    # Every resource must reference the dedicated ScmAuditLogGroup — the GetAtt Arn and the
-    # Sub'd ':*' stream wildcard — and nothing may be Resource: '*' or reference a KB.
     assert {
         "Fn::GetAtt": f"{_SCM_AUDIT_LOG_GROUP_LOGICAL_ID}.Arn"
     } in resources, "audit grant must include the ScmAuditLogGroup ARN via GetAtt"
@@ -373,8 +425,9 @@ def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list
 
 
 def test_scm_audit_log_group_is_dedicated_resource(template: dict):
-    """(Req 9.3) The audit destination is a dedicated CloudWatch Logs log group provisioned
-    independently of Knowledge Base configuration (gated on ScmAuditLogGroupConfigured)."""
+    """(Req 9.3, 9.5) The read-audit destination is a dedicated CloudWatch Logs log group
+    provisioned independently of Knowledge Base configuration (gated on
+    ScmAuditLogGroupConfigured)."""
     resources = template.get("Resources", {})
     log_group = resources.get(_SCM_AUDIT_LOG_GROUP_LOGICAL_ID)
     assert log_group is not None, f"missing {_SCM_AUDIT_LOG_GROUP_LOGICAL_ID} resource"

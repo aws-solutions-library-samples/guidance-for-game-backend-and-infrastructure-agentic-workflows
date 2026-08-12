@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Example test: agent-facing tool signatures reference only agnostic/primitive types.
 
-The Connector's public surface toward the Orchestrator/LLM is exactly the two ``@tool``
-functions in :mod:`connector.tools` (``get_iac_file`` and
-``propose_infrastructure_change``). Req 9.1 requires this surface to be **provider-
-agnostic**: no tool name, parameter name, parameter type annotation, or return type
+The Connector's public surface toward the Orchestrator/LLM is exactly the one read ``@tool``
+function in :mod:`connector.tools` (``get_iac_file``). Req 9.1 requires this surface to be
+**provider-agnostic**: no tool name, parameter name, parameter type annotation, or return type
 annotation may reference a provider-specific type (e.g. ``GitHubProvider``), a transport
 type (e.g. ``httpx.*``), or a provider name embedded in a name (``github``/``gitlab``/...).
 Only primitive / JSON-serialisable / provider-agnostic types are permitted
@@ -30,13 +29,13 @@ import pytest
 
 # Local modules
 from connector import tools as connector_tools
-from connector.tools import get_iac_file, propose_infrastructure_change
+from connector.tools import get_iac_file
 
 pytestmark = pytest.mark.unit
 
 
-# The complete set of agent-facing tools exposed by the connector (design.md).
-TOOLS = (get_iac_file, propose_infrastructure_change)
+# The complete set of agent-facing tools exposed by the connector (read-only surface).
+TOOLS = (get_iac_file,)
 
 # Provider / transport specific tokens that must never appear in a tool name, a parameter
 # name, or any annotation string. Kept lowercase; matched case-insensitively as substrings.
@@ -151,11 +150,11 @@ def test_resolved_annotations_are_only_agnostic_primitive_types(tool):
         )
 
 
-def test_module_exposes_exactly_the_two_agnostic_tools():
-    """The connector tool surface is exactly the two provider-agnostic tools (Req 9.1)."""
+def test_module_exposes_exactly_the_read_tool():
+    """The connector tool surface is exactly the one provider-agnostic read tool (Req 9.1)."""
     exported = {
         name
         for name in dir(connector_tools)
         if getattr(getattr(connector_tools, name), "tool_type", None) == "function"
     }
-    assert exported == {"get_iac_file", "propose_infrastructure_change"}
+    assert exported == {"get_iac_file"}

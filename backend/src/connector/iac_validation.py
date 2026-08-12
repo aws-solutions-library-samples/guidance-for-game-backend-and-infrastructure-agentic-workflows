@@ -1,8 +1,9 @@
 """In-memory validation of agent-proposed Infrastructure-as-Code (IaC) content.
 
-This module validates proposed IaC file contents *before* any branch, commit, or
-pull-request operation runs (Req 11.1). It operates purely on in-memory strings so
-it is friendly to a read-only filesystem: nothing is written to disk.
+This module is a reusable, read-side parsing utility for IaC content. It either parses the
+content or raises a validation error; it has **no** approval, execution, or write affordance
+and no coupling to any provider-write path. It operates purely on in-memory strings so it is
+friendly to a read-only filesystem: nothing is written to disk.
 
 Supported formats:
 

@@ -7,15 +7,17 @@ Parameters:
     Default: game-agent
     Description: Project name used for resource naming
 
-  ScmCredentialSecretArn:
+  ScmReadCredentialSecretArn:
     Type: String
     Default: ''
     Description: >-
       Optional. ARN of the Secrets Manager secret holding the Source Control
-      Connector write credential (SCM_Credential). Leave empty for read-only
-      deployments. When set, the AgentCore execution role is granted
+      Connector read credential (a provider-scoped, fine-grained read-only
+      token). Leave empty for deployments that never enable the connector. When
+      set, the AgentCore execution (chat-runtime read) role is granted
       secretsmanager:GetSecretValue scoped to this single secret ARN and no
-      additional (live-infrastructure) permissions.
+      additional (live-infrastructure) permissions. No provider-write credential
+      is ever referenced.
 
   ScmAuditLogGroupName:
     Type: String
@@ -29,9 +31,9 @@ Parameters:
       group ONLY, with no live-infrastructure write permissions.
 
 Conditions:
-  # Gate the Source Control Connector credential-read grant on a non-empty ARN.
-  # Read-only deployments that never set ScmCredentialSecretArn are unaffected.
-  ScmCredentialConfigured: !Not [!Equals [!Ref ScmCredentialSecretArn, '']]
+  # Gate the Source Control Connector read-credential grant on a non-empty ARN.
+  # Deployments that never set ScmReadCredentialSecretArn are unaffected.
+  ScmReadCredentialConfigured: !Not [!Equals [!Ref ScmReadCredentialSecretArn, '']]
 
   # Gate the dedicated audit log group + its scoped logs grant on a non-empty name.
   # Read-only deployments that never set ScmAuditLogGroupName are unaffected.
@@ -454,21 +456,23 @@ Resources:
                   - xray:PutTraceSegments
                   - xray:PutTelemetryRecords
                 Resource: '*'
-        # Security: Source Control Connector credential read (opt-in, #SCM).
+        # Security: Source Control Connector read-credential read (opt-in, #SCM).
         # Grants ONLY secretsmanager:GetSecretValue scoped to the single
-        # operator-provisioned connector secret. Added only when
-        # ScmCredentialSecretArn is set; adds NO live-infrastructure write
-        # actions. The runtime role stays read-only against live AWS.
+        # operator-provisioned connector READ secret (a provider-scoped,
+        # fine-grained read-only token). Added only when
+        # ScmReadCredentialSecretArn is set; adds NO live-infrastructure write
+        # actions and no provider-write credential. The chat-runtime (read) role
+        # stays read-only against live AWS.
         - !If
-          - ScmCredentialConfigured
-          - PolicyName: ScmCredentialAccess
+          - ScmReadCredentialConfigured
+          - PolicyName: ScmReadCredentialAccess
             PolicyDocument:
               Version: '2012-10-17'
               Statement:
-                - Sid: ScmCredentialRead
+                - Sid: ScmReadCredentialRead
                   Effect: Allow
                   Action: secretsmanager:GetSecretValue
-                  Resource: !Ref ScmCredentialSecretArn
+                  Resource: !Ref ScmReadCredentialSecretArn
           - !Ref 'AWS::NoValue'
         # Security: Source Control Connector durable audit sink (opt-in, #SCM).
         # Grants ONLY logs:CreateLogStream + logs:PutLogEvents scoped to the

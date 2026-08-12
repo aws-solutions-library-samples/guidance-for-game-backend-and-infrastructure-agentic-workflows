@@ -119,10 +119,11 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_WINDOW_SECONDS", "60"
 # connector plus an audit entry rather than an import-time crash.
 SCM_CONNECTOR_ENABLED = os.getenv("GBAW_SCM_CONNECTOR_ENABLED", "false")  # truthy: true/1/yes
 SCM_PROVIDER = os.getenv("GBAW_SCM_PROVIDER")  # e.g. "github"
-# The single ARN-valued credential setting used consistently for both runtime credential
-# acquisition (AdapterConfig.credential_secret_arn) and the scoped IAM grant
-# (ScmCredentialSecretArn), so runtime config and IAM scope cannot drift (Req 11.2 / MR5).
-SCM_CREDENTIAL_SECRET_ARN = os.getenv("GBAW_SCM_CREDENTIAL_SECRET_ARN")  # Secrets Manager ARN
+# The single ARN-valued READ-credential setting used consistently for both runtime
+# credential acquisition (AdapterConfig.read_credential_secret_arn) and the scoped IAM
+# grant (ScmReadCredentialSecretArn), so runtime config and IAM scope cannot drift. The
+# provider-WRITE credential was removed with the write path (issue #314).
+SCM_READ_CREDENTIAL_SECRET_ARN = os.getenv("GBAW_SCM_READ_CREDENTIAL_SECRET_ARN")  # Secrets Manager ARN (read-only)
 SCM_REPO_ALLOWLIST = os.getenv("GBAW_SCM_REPO_ALLOWLIST")  # "repo=branch,branch;repo=branch" grammar
 SCM_AUTHORIZED_GROUPS = os.getenv("GBAW_SCM_AUTHORIZED_GROUPS")  # comma-separated Cognito groups
 SCM_RATE_LIMIT_MAX = os.getenv("GBAW_SCM_RATE_LIMIT_MAX", "5")  # 1..1000, default 5
@@ -130,6 +131,9 @@ SCM_RATE_LIMIT_WINDOW_SECONDS = os.getenv("GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS", 
 SCM_PROVIDER_TIMEOUT_SECONDS = os.getenv("GBAW_SCM_PROVIDER_TIMEOUT_SECONDS", "30")  # 1..300, default 30
 SCM_RETRY_MAX_ATTEMPTS = os.getenv("GBAW_SCM_RETRY_MAX_ATTEMPTS", "3")  # 1..10, default 3
 SCM_MAX_FILES_PER_REQUEST = os.getenv("GBAW_SCM_MAX_FILES_PER_REQUEST", "20")  # max files per read request
+# Maximum total byte size of the content returned by a single read; a result exceeding this
+# is rejected with no files served. Default 1 MiB.
+SCM_MAX_CONTENT_BYTES = os.getenv("GBAW_SCM_MAX_CONTENT_BYTES", "1048576")  # 1..N bytes, default 1 MiB
 # Optional Provider API base URL for self-hosted/enterprise endpoints. When set it must be
 # an absolute HTTPS URL (validated in ConnectorConfig.load); when unset the adapter defaults
 # to the provider's public API endpoint (Req 10.1, 10.2, 10.3).

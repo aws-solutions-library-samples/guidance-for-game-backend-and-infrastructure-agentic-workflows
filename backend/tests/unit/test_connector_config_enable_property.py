@@ -149,7 +149,7 @@ def _patched_settings(cfg: dict):
         SCM_CONNECTOR_ENABLED=cfg["flag"],
         SCM_PROVIDER=cfg["provider"],
         SCM_PROVIDER_BASE_URL=cfg["provider_base_url"],
-        SCM_CREDENTIAL_SECRET_ARN=cfg["credential_secret_arn"],
+        SCM_READ_CREDENTIAL_SECRET_ARN=cfg["credential_secret_arn"],
         SCM_REPO_ALLOWLIST=cfg["allowlist_encoded"],
         SCM_AUTHORIZED_GROUPS=",".join(cfg["groups"]),
         SCM_AUDIT_LOG_GROUP=cfg["audit_log_group"],
@@ -185,7 +185,7 @@ def test_property1_truthy_valid_config_enables_connector(cfg):
     assert config.connector.provider == cfg["provider"]
     assert config.adapter.provider_base_url == cfg["provider_base_url"]
     assert config.connector.audit_log_group == cfg["audit_log_group"]
-    assert config.adapter.credential_secret_arn == cfg["credential_secret_arn"]
+    assert config.adapter.read_credential_secret_arn == cfg["credential_secret_arn"]
     assert config.domain.authorization_policy == cfg["expected_entries"]
     assert config.domain.authorized_groups == tuple(cfg["groups"])
     assert config.connector.rate_limit_max == cfg["rate_limit_max"]

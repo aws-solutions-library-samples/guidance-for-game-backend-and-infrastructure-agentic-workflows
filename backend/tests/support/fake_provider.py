@@ -1,99 +1,56 @@
-"""In-memory ``SourceControlProvider`` test double.
+"""In-memory ``SourceControlReader`` test double (read-only).
 
-``FakeProvider`` implements every operation of the
-:class:`connector.provider.SourceControlProvider` abstraction so unit and
-property-based tests can exercise the connector service layer without any network
-or AWS calls (see the design's Testing Strategy: "a ``FakeProvider`` implementing
-``SourceControlProvider`` with programmable responses/failures"). It offers three
-capabilities tests rely on:
+``FakeProvider`` implements every operation of the read-only
+:class:`connector.provider.SourceControlReader` abstraction so unit and property-based
+tests can exercise the connector read service without any network or AWS calls (see the
+design's Testing Strategy: "a ``FakeReader`` implementing ``SourceControlReader`` with
+programmable responses/failures"). It offers three capabilities tests rely on:
 
-1. **Programmable responses** — per operation, callers can pin a fixed return value,
-   or queue an ordered sequence of outcomes (values and/or exceptions) that are
-   consumed one per call. This drives retry scenarios (e.g. "two transient failures
-   then success") and exact-value assertions.
+1. **Programmable responses** — per read operation, callers can pin a fixed return value,
+   or queue an ordered sequence of outcomes (values and/or exceptions) that are consumed
+   one per call. This drives exact-value assertions and failure scenarios.
 2. **Recorded calls** — every invocation is appended to :attr:`calls` as a
    :class:`RecordedCall` capturing the operation name and all arguments (repo, branch,
-   paths, files, message, etc.), so tests can assert *which* provider operations ran,
-   in what order, and that no operation ran on a rejected/declined path.
-3. **Injectable typed failures** — callers can make any operation raise one of the
+   paths), so tests can assert *which* provider operations ran, in what order, and that no
+   provider read ran on a rejected path.
+3. **Injectable typed failures** — callers can make any read operation raise one of the
    abstraction's typed exceptions (``ProviderUnavailableError``, ``ProviderAuthError``,
-   ``ProviderConflictError``, ``ProviderTransientError``) either on every call or for a
-   bounded number of calls.
+   ``ProviderTransientError``) either on every call or for a bounded number of calls.
 
 When no response is programmed for an operation, the fake falls back to a small,
-deterministic in-memory model of a repository (a file store, a set of existing
-branches, and per-branch head SHAs) so it behaves like a plausible provider for
-read/branch/commit/PR flows.
+deterministic in-memory model of a repository (a file store) so it behaves like a plausible
+read provider. The provider-write path has been removed from the connector; this double is
+read-only and defines no mutation operation.
 """
 
 from __future__ import annotations
 
 # Standard library
-import itertools
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # Local modules
-from connector.models import (
-    ChangeProposalResult,
-    FileContent,
-    FileFetchResult,
-    ProposedFile,
-)
-from connector.provider import SourceControlProvider
-
-if TYPE_CHECKING:
-    # Standard library
-    from collections.abc import Callable
-
+from connector.models import FileContent, FileFetchResult
+from connector.provider import SourceControlReader
 
 # Sentinel indicating "nothing programmed for this operation".
 _UNSET: Any = object()
 
-
-@dataclass
-class _ApplyThenRaise:
-    """Programmed outcome: apply the operation's normal effect, THEN raise ``exc``.
-
-    This models an **ambiguous** provider outcome for a mutating operation — the effect
-    (branch created, files committed, proposal opened) actually landed on the provider, but
-    the call then failed with a transient error so the caller cannot tell whether it
-    succeeded. It is the exact condition the connector's reconcile-before-retry logic must
-    handle without duplicating source-control state (Property V6): after the raise, the
-    fake's in-memory model reflects the applied effect, so a follow-up ``branch_exists`` /
-    ``latest_commit_sha`` / ``find_open_change_proposal`` reconcile query observes it.
-    """
-
-    exc: BaseException | type[BaseException]
-
-
-# The default head SHA reported by ``latest_commit_sha`` for a repo/branch whose head has
-# not been explicitly seeded. Tests that drive the read-before-write path pass this value as
-# ``base_revision`` when they have not called :meth:`FakeProvider.set_head` (the connector
-# verifies ``base_revision`` against the current head before proposing).
-DEFAULT_HEAD_SHA: str = "0" * 40
-
-# The fixed operation set of the abstraction (used to validate programming keys and
+# The fixed read operation set of the abstraction (used to validate programming keys and
 # to reset per-operation state).
 OPERATIONS: tuple[str, ...] = (
     "get_file",
     "get_files",
-    "branch_exists",
-    "latest_commit_sha",
-    "create_branch",
-    "commit_files",
-    "open_change_proposal",
-    "find_open_change_proposal",
 )
 
 
 @dataclass
 class RecordedCall:
-    """A single recorded invocation of a provider operation.
+    """A single recorded invocation of a read operation.
 
     ``operation`` is the method name; ``kwargs`` holds every argument by name so tests
-    can assert on repo/branch/paths/args regardless of positional vs keyword calling.
+    can assert on repo/branch/paths regardless of positional vs keyword calling.
     """
 
     operation: str
@@ -103,8 +60,8 @@ class RecordedCall:
         return self.kwargs[key]
 
 
-class FakeProvider(SourceControlProvider):
-    """Programmable, call-recording in-memory ``SourceControlProvider``.
+class FakeProvider(SourceControlReader):
+    """Programmable, call-recording in-memory ``SourceControlReader`` (read-only).
 
     Example
     -------
@@ -112,7 +69,6 @@ class FakeProvider(SourceControlProvider):
     >>> fake.add_file("org/iac", "main", "a.yaml", "Resources: {}")
     >>> fake.get_file("org/iac", "main", "a.yaml").content
     'Resources: {}'
-    >>> fake.fail("open_change_proposal", ProviderConflictError("boom"))
     >>> [c.operation for c in fake.calls]
     ['get_file']
     """
@@ -129,17 +85,6 @@ class FakeProvider(SourceControlProvider):
 
         # Deterministic in-memory repository model used as the default behavior.
         self._files: dict[tuple[str, str, str], str] = {}
-        self._branches: set[tuple[str, str]] = set()
-        self._head_shas: dict[tuple[str, str], str] = {}
-
-        # Capture structures for created artifacts (in addition to ``calls``).
-        self.created_branches: list[dict[str, Any]] = []
-        self.commits: list[dict[str, Any]] = []
-        self.pull_requests: list[dict[str, Any]] = []
-
-        # Monotonic counters for deterministic generated identifiers.
-        self._pr_counter = itertools.count(1)
-        self._commit_counter = itertools.count(1)
 
     # ------------------------------------------------------------------ programming
 
@@ -151,7 +96,7 @@ class FakeProvider(SourceControlProvider):
         raises: BaseException | type[BaseException] | None = None,
         side_effects: list[Any] | None = None,
     ) -> FakeProvider:
-        """Program the outcome(s) of ``operation``.
+        """Program the outcome(s) of a read ``operation``.
 
         - ``returns``: a fixed value returned on every call (until a queued side effect
           takes precedence). If callable, it is invoked with the call kwargs.
@@ -191,33 +136,9 @@ class FakeProvider(SourceControlProvider):
     ) -> FakeProvider:
         """Make ``operation`` raise ``exc`` for the next ``times`` calls, then fall
         back to any persistent programming or the default behavior.
-
-        Useful for transient-error retry scenarios (raise N times, then succeed).
         """
         self._check_operation(operation)
         self._queues[operation].extend([exc] * max(0, times))
-        return self
-
-    def apply_then_fail(
-        self,
-        operation: str,
-        exc: BaseException | type[BaseException],
-        times: int = 1,
-    ) -> FakeProvider:
-        """Make ``operation`` apply its normal effect and THEN raise ``exc`` for ``times`` calls.
-
-        Unlike :meth:`fail` / :meth:`fail_times` (which raise *instead* of doing anything),
-        this simulates an **ambiguous** outcome where the mutating effect landed on the
-        provider before the error surfaced: the fake mutates its in-memory model (creates the
-        branch, records the commit and advances the branch head, or opens the proposal) and
-        only then raises. After the raise the applied state is observable via
-        ``branch_exists`` / ``latest_commit_sha`` / ``find_open_change_proposal``, so a
-        reconcile-before-retry can detect it and avoid creating duplicate state (Property V6).
-        Once the ``times`` programmed failures are consumed the operation falls back to normal
-        behavior.
-        """
-        self._check_operation(operation)
-        self._queues[operation].extend([_ApplyThenRaise(exc)] * max(0, times))
         return self
 
     def reset_calls(self) -> None:
@@ -229,55 +150,19 @@ class FakeProvider(SourceControlProvider):
     def add_file(self, repo: str, branch: str, path: str, content: str) -> FakeProvider:
         """Seed the in-memory file store so reads find ``path`` on ``branch``."""
         self._files[(repo, branch, path)] = content
-        self._branches.add((repo, branch))
         return self
-
-    def add_branch(self, repo: str, branch: str, head_sha: str = "") -> FakeProvider:
-        """Mark ``branch`` as already existing in ``repo`` (optionally with a head SHA)."""
-        self._branches.add((repo, branch))
-        if head_sha:
-            self._head_shas[(repo, branch)] = head_sha
-        return self
-
-    def set_head(self, repo: str, branch: str, sha: str) -> FakeProvider:
-        """Set the latest commit SHA reported for ``branch``."""
-        self._head_shas[(repo, branch)] = sha
-        self._branches.add((repo, branch))
-        return self
-
-    def advance_head(self, repo: str, branch: str, sha: str | None = None) -> str:
-        """Advance ``branch``'s head to a new SHA, simulating a push between read and propose.
-
-        This is the read-before-write staleness hook: a test reads (capturing the head as a
-        Verified_Source_Snapshot), calls ``advance_head`` to move the head forward, then
-        proposes with the now-stale ``base_revision`` and asserts the connector rejects it.
-        When ``sha`` is omitted a fresh, distinct 40-char hex SHA is generated so the new
-        head is guaranteed to differ from the previous one. Returns the new head SHA.
-        """
-        if sha is None:
-            previous = self._head_shas.get((repo, branch), DEFAULT_HEAD_SHA)
-            sha = f"{next(self._commit_counter):040x}"
-            if sha == previous:
-                sha = f"{next(self._commit_counter):040x}"
-        self._head_shas[(repo, branch)] = sha
-        self._branches.add((repo, branch))
-        return sha
 
     # ---------------------------------------------------------- outcome resolution
 
     def _check_operation(self, operation: str) -> None:
         if operation not in OPERATIONS:
-            raise ValueError(f"Unknown provider operation {operation!r}; " f"valid operations are {OPERATIONS}")
+            raise ValueError(f"Unknown read operation {operation!r}; valid operations are {OPERATIONS}")
 
     def _record(self, operation: str, **kwargs: Any) -> None:
         self.calls.append(RecordedCall(operation=operation, kwargs=kwargs))
 
     def _programmed_outcome(self, operation: str) -> Any:
-        """Return the next programmed outcome for ``operation`` or ``_UNSET``.
-
-        The queued ``side_effects`` are consumed first; when empty the persistent
-        programmed value/exception (if any) is used.
-        """
+        """Return the next programmed outcome for ``operation`` or ``_UNSET``."""
         queue = self._queues[operation]
         if queue:
             return queue.popleft()
@@ -294,11 +179,6 @@ class FakeProvider(SourceControlProvider):
         if callable(outcome):
             return outcome(**kwargs)
         return outcome
-
-    @staticmethod
-    def _raise(exc: BaseException | type[BaseException]) -> None:
-        """Raise ``exc`` whether it was programmed as an instance or an exception class."""
-        raise exc if isinstance(exc, BaseException) else exc()
 
     # --------------------------------------------------------- provider operations
 
@@ -328,161 +208,6 @@ class FakeProvider(SourceControlProvider):
             missing=tuple(missing),
             limit_exceeded=False,
         )
-
-    def branch_exists(self, repo: str, branch: str) -> bool:
-        self._record("branch_exists", repo=repo, branch=branch)
-        outcome = self._programmed_outcome("branch_exists")
-        if outcome is not _UNSET:
-            return self._apply(outcome, repo=repo, branch=branch)
-        return (repo, branch) in self._branches
-
-    def latest_commit_sha(self, repo: str, branch: str) -> str:
-        self._record("latest_commit_sha", repo=repo, branch=branch)
-        outcome = self._programmed_outcome("latest_commit_sha")
-        if outcome is not _UNSET:
-            return self._apply(outcome, repo=repo, branch=branch)
-        return self._head_shas.get((repo, branch), DEFAULT_HEAD_SHA)
-
-    def create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
-        self._record("create_branch", repo=repo, new_branch=new_branch, from_sha=from_sha)
-        outcome = self._programmed_outcome("create_branch")
-        if isinstance(outcome, _ApplyThenRaise):
-            # Ambiguous outcome: the branch actually gets created, then the call raises.
-            self._default_create_branch(repo, new_branch, from_sha)
-            self._raise(outcome.exc)
-        if outcome is not _UNSET:
-            self._apply(outcome, repo=repo, new_branch=new_branch, from_sha=from_sha)
-            return None
-        self._default_create_branch(repo, new_branch, from_sha)
-        return None
-
-    def _default_create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
-        """Apply the default in-memory create-branch effect (records + head at ``from_sha``)."""
-        self.created_branches.append({"repo": repo, "new_branch": new_branch, "from_sha": from_sha})
-        self._branches.add((repo, new_branch))
-        self._head_shas[(repo, new_branch)] = from_sha
-
-    def commit_files(
-        self,
-        repo: str,
-        branch: str,
-        files: list[ProposedFile],
-        message: str,
-    ) -> str:
-        self._record(
-            "commit_files",
-            repo=repo,
-            branch=branch,
-            files=list(files),
-            message=message,
-        )
-        outcome = self._programmed_outcome("commit_files")
-        if isinstance(outcome, _ApplyThenRaise):
-            # Ambiguous outcome: the commit actually lands (advancing the branch head), then
-            # the call raises — so a content-addressed reconcile can detect the applied commit.
-            self._default_commit_files(repo, branch, list(files), message)
-            self._raise(outcome.exc)
-        if outcome is not _UNSET:
-            return self._apply(outcome, repo=repo, branch=branch, files=list(files), message=message)
-        return self._default_commit_files(repo, branch, list(files), message)
-
-    def _default_commit_files(
-        self,
-        repo: str,
-        branch: str,
-        files: list[ProposedFile],
-        message: str,
-    ) -> str:
-        """Apply the default in-memory commit effect (stores files, advances head); returns SHA."""
-        sha = f"commit{next(self._commit_counter)}"
-        self.commits.append(
-            {
-                "repo": repo,
-                "branch": branch,
-                "files": list(files),
-                "message": message,
-                "sha": sha,
-            }
-        )
-        for proposed in files:
-            self._files[(repo, branch, proposed.path)] = proposed.content
-        self._head_shas[(repo, branch)] = sha
-        return sha
-
-    def open_change_proposal(
-        self,
-        repo: str,
-        head: str,
-        base: str,
-        title: str,
-        body: str,
-    ) -> ChangeProposalResult:
-        self._record(
-            "open_change_proposal",
-            repo=repo,
-            head=head,
-            base=base,
-            title=title,
-            body=body,
-        )
-        outcome = self._programmed_outcome("open_change_proposal")
-        if isinstance(outcome, _ApplyThenRaise):
-            # Ambiguous outcome: the proposal actually opens (recorded so a follow-up
-            # find_open_change_proposal reconcile returns it), then the call raises.
-            self._default_open_change_proposal(repo, head, base, title, body)
-            self._raise(outcome.exc)
-        if outcome is not _UNSET:
-            return self._apply(outcome, repo=repo, head=head, base=base, title=title, body=body)
-        return self._default_open_change_proposal(repo, head, base, title, body)
-
-    def _default_open_change_proposal(
-        self,
-        repo: str,
-        head: str,
-        base: str,
-        title: str,
-        body: str,
-    ) -> ChangeProposalResult:
-        """Apply the default in-memory open-proposal effect (records PR); returns the result."""
-        pr_number = next(self._pr_counter)
-        pr_id = str(pr_number)
-        pr_url = f"https://fake.provider/{repo}/pull/{pr_number}"
-        self.pull_requests.append(
-            {
-                "repo": repo,
-                "head": head,
-                "base": base,
-                "title": title,
-                "body": body,
-                "proposal_id": pr_id,
-                "proposal_url": pr_url,
-            }
-        )
-        return ChangeProposalResult(proposal_id=pr_id, proposal_url=pr_url)
-
-    def find_open_change_proposal(
-        self,
-        repo: str,
-        head: str,
-        base: str,
-    ) -> ChangeProposalResult | None:
-        """Reconciliation query used by reconcile-before-retry (Req 12.4).
-
-        Records the call and honors programmed outcomes exactly like the other operations
-        (a pinned ``returns`` value, a queued ``side_effects`` sequence, or an injected
-        typed failure). When nothing is programmed it falls back to the deterministic
-        in-memory model: it returns the most recent recorded open proposal whose
-        ``head``/``base`` match the query, or ``None`` when none has been opened — mirroring
-        the base ABC default of "none found".
-        """
-        self._record("find_open_change_proposal", repo=repo, head=head, base=base)
-        outcome = self._programmed_outcome("find_open_change_proposal")
-        if outcome is not _UNSET:
-            return self._apply(outcome, repo=repo, head=head, base=base)
-        for pr in reversed(self.pull_requests):
-            if pr["repo"] == repo and pr["head"] == head and pr["base"] == base:
-                return ChangeProposalResult(proposal_id=pr["proposal_id"], proposal_url=pr["proposal_url"])
-        return None
 
     # --------------------------------------------------------------- introspection
 

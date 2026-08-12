@@ -223,11 +223,11 @@ def test_real_source_control_specialist_built_without_iac_kb_tool():
 
         # No IaC KB is wired: the specialist is built with kb_id=None (Req 9.2).
         assert captured.get("kb_id") is None
-        # The write-path tools are still wired.
+        # The read-only tool is wired; the removed write tool must NOT be present.
         additional = captured.get("additional_tools") or []
         names = {getattr(t, "tool_name", getattr(t, "__name__", "")) for t in additional}
         assert "get_iac_file" in names
-        assert "propose_infrastructure_change" in names
+        assert "propose_infrastructure_change" not in names
     finally:
         # Restore the real factory, then rebuild the real specialist object so subsequent
         # tests (and the orchestrator's local import) see the genuine agent.

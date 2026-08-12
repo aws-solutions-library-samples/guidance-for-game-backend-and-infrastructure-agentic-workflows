@@ -14,8 +14,8 @@ and the Data Models "field move" table). The v2 pass splits the previously monol
 - :class:`ConnectorConfig` (Connector_Core, provider-neutral) owns operational tuning:
   ``provider``, rate limiting, provider timeout, retry attempts, max files per request, and
   the audit destination log group.
-- :class:`AdapterConfig` (Provider_Adapter) owns the credential secret ARN and the optional
-  provider base URL.
+- :class:`AdapterConfig` (Provider_Adapter) owns the read-credential secret ARN and the
+  optional provider base URL.
 
 Composition happens in :meth:`SourceControlConfig.load`, which builds all three contracts
 from the ``GBAW_SCM_*`` values and resolves a single ``enabled`` gate that is truthy **iff
@@ -33,10 +33,11 @@ the split is preserved exactly, only re-homed:
 - When the flag is truthy but a required value is missing/invalid, a single
   configuration-error audit entry is emitted via the existing ``logger`` with every field
   passed through ``sanitize_log_data`` so no raw credential can leak (Req 1.6, 12.3, 12.4).
-- The credential is referenced **only** by a single Secrets Manager secret ARN
-  (``GBAW_SCM_CREDENTIAL_SECRET_ARN``); a value that is not ARN-shaped (a bare secret name,
-  or a raw credential accidentally supplied here) is rejected and its value is excluded from
-  all audit output (Req 11.2, 12.3).
+- The read credential is referenced **only** by a single Secrets Manager secret ARN
+  (``GBAW_SCM_READ_CREDENTIAL_SECRET_ARN``); a value that is not ARN-shaped (a bare secret
+  name, or a raw credential accidentally supplied here) is rejected and its value is
+  excluded from all audit output (Req 3.2, 6.5). No provider-write credential is referenced
+  anywhere in the read-only connector.
 
 Per-contract validation rules (all failures accumulate on the owning contract):
 
@@ -46,8 +47,8 @@ Per-contract validation rules (all failures accumulate on the owning contract):
 - ``provider_base_url`` set but not an absolute https URL → error and disabled; unset →
   ``None`` so the adapter uses the provider's public endpoint (Req 10.2, 10.3, 10.4).
 - ``audit_log_group`` absent on the enabled path → error and disabled (Req 13.1).
-- ``credential_secret_arn`` unset → error; value not ARN-shaped → error and the value is
-  omitted from audit output (Req 11.2, 12.3).
+- ``read_credential_secret_arn`` unset → error; value not ARN-shaped → error and the value
+  is omitted from audit output (Req 3.2, 6.5).
 - Allowlist unparsable or zero entries → error (Req 5.4).
 - ``authorized_groups`` empty → error (Req 7.5).
 - ``rate_limit_max`` outside 1..1000 or ``rate_limit_window_seconds`` outside 60..86400 →
@@ -55,6 +56,7 @@ Per-contract validation rules (all failures accumulate on the owning contract):
 - ``provider_timeout_seconds`` outside 1..300 → error; absent → 30 (Req 10.1).
 - ``retry_max_attempts`` outside 1..10 → error; absent → 3 (Req 10.5).
 - ``max_files_per_request`` not a positive integer → error; absent → 20 (Req 3.2).
+- ``max_content_bytes`` not a positive integer → error; absent → 1048576 (1 MiB).
 """
 
 from __future__ import annotations
@@ -90,10 +92,11 @@ _RATE_WINDOW_MIN, _RATE_WINDOW_MAX, _RATE_WINDOW_DEFAULT = 60, 86400, 3600
 _TIMEOUT_MIN, _TIMEOUT_MAX, _TIMEOUT_DEFAULT = 1, 300, 30
 _RETRY_MIN, _RETRY_MAX, _RETRY_DEFAULT = 1, 10, 3
 _MAX_FILES_DEFAULT = 20
+_MAX_CONTENT_BYTES_DEFAULT = 1048576  # 1 MiB
 
 # A Secrets Manager secret ARN, e.g.
 # arn:aws:secretsmanager:us-west-2:123456789012:secret:my/secret-AbCdEf
-# This is the single ARN-valued credential setting's required shape (Req 11.2 / MR5).
+# This is the single ARN-valued read-credential setting's required shape.
 _SECRET_ARN_RE = re.compile(r"^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$")
 
 
@@ -105,35 +108,40 @@ class AllowlistEntry:
     ``target_branches`` is one or more exact branch names. Comparison at the tool
     boundary is case-sensitive, full-string (Req 5.2, 6.1, 6.2).
 
-    The v2 five-dimension authorization (Req 6) extends each entry with two optional,
-    repo-relative constraints:
+    The seven-dimension authorization extends each entry with four optional constraints:
 
-    - ``path_prefixes``: the repo-relative prefixes a requested/proposed file path must lie
-      under (e.g. ``"infra/"``). **An empty tuple means "any path"** — a backward-compatible
-      entry that lists only branches permits every path.
-    - ``extensions``: the file extensions a requested/proposed path must carry (e.g.
-      ``".yaml"``, ``".tf"``). **An empty tuple means "any extension"**.
+    - ``path_prefixes``: the repo-relative prefixes a requested file path must lie under
+      (e.g. ``"infra/"``). **An empty tuple means "any path"** — a backward-compatible entry
+      that lists only branches permits every path.
+    - ``extensions``: the file extensions a requested path must carry (e.g. ``".yaml"``,
+      ``".tf"``). **An empty tuple means "any extension"**.
+    - ``tenants``: the tenants this entry is scoped to. **An empty tuple means "any
+      tenant"**.
+    - ``workspaces``: the workspaces this entry is scoped to. **An empty tuple means "any
+      workspace"**.
 
-    Both default to the empty tuple so entries built or parsed without the path/extension
-    dimensions behave exactly as before the v2 pass (any path / any extension).
+    All four default to the empty tuple so entries built or parsed without those dimensions
+    behave exactly as before (any path / any extension / any tenant / any workspace).
     """
 
     repo: str
     target_branches: tuple[str, ...]
     path_prefixes: tuple[str, ...] = ()
     extensions: tuple[str, ...] = ()
+    tenants: tuple[str, ...] = ()
+    workspaces: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Decision:
     """Outcome of an :class:`AuthorizationPolicy` evaluation.
 
-    ``allowed`` is ``True`` only when all five dimensions pass. On a denial,
-    ``failed_dimension`` names the first dimension that failed — one of ``"repo"``,
-    ``"branch"``, ``"path"``, ``"extension"``, or ``"group"`` — so the Service_Layer can
-    record a rejection audit that names it (Req 6.3). On an allow, ``repo`` and ``branch``
-    carry the **effective** repository/branch taken from the matched allowlist entry, never
-    from free-form input (Req 6.1, 6.2); they are ``None`` on a denial.
+    ``allowed`` is ``True`` only when all seven dimensions pass. On a denial,
+    ``failed_dimension`` names the first dimension that failed — one of ``"tenant"``,
+    ``"workspace"``, ``"repo"``, ``"branch"``, ``"path"``, ``"extension"``, or ``"group"`` —
+    so the Service_Layer can record a rejection audit that names it. On an allow, ``repo``
+    and ``branch`` carry the **effective** repository/branch taken from the matched
+    allowlist entry, never from free-form input; they are ``None`` on a denial.
     """
 
     allowed: bool
@@ -144,13 +152,13 @@ class Decision:
 
 @dataclass(frozen=True)
 class AuthorizationPolicy:
-    """Five-dimension authorization over a tuple of :class:`AllowlistEntry` (Req 6).
+    """Seven-dimension authorization over a tuple of :class:`AllowlistEntry`.
 
-    Evaluates a requested operation against **repository, branch, path, extension, and
-    group** and is enforced identically on reads and writes by the Service_Layer. The policy
-    is a stateless evaluator over ``entries`` (the operator-approved allowlist owned by
-    :class:`DomainConfig`); the Service_Layer wraps the domain contract's entries in this
-    class to authorize both the read tool and the change-proposal tool before any adapter op.
+    Evaluates a requested read against **tenant, workspace, repository, branch, path,
+    extension, and group** and is enforced by the Service_Layer before any provider read.
+    The policy is a stateless evaluator over ``entries`` (the operator-approved allowlist
+    owned by :class:`DomainConfig`); the Service_Layer wraps the domain contract's entries
+    in this class to authorize the read tool before any adapter op.
     """
 
     entries: tuple[AllowlistEntry, ...]
@@ -158,39 +166,58 @@ class AuthorizationPolicy:
     def authorize(
         self,
         *,
+        tenant: str,
+        workspace: str,
         repo: str,
         branch: str,
         paths: Sequence[str],
         groups: Sequence[str],
         authorized_groups: Sequence[str],
     ) -> Decision:
-        """Permit the operation iff all five dimensions pass; else deny naming the dimension.
+        """Permit the read iff all seven dimensions pass; else deny naming the dimension.
 
         Evaluation order (the first failing dimension is reported):
 
-        1. **repo** — at least one entry's ``repo`` equals ``repo`` (exact, case-sensitive,
-           full-string).
-        2. **branch** — among the repo-matching entries, one lists ``branch`` in its
-           ``target_branches`` (exact, case-sensitive). That entry becomes the *matched*
+        1. **tenant** — among the entries, those whose ``tenants`` is empty (any tenant) or
+           lists ``tenant`` are eligible; if none are eligible the tenant dimension fails.
+        2. **workspace** — among the tenant-eligible entries, those whose ``workspaces`` is
+           empty (any workspace) or lists ``workspace`` remain eligible; if none remain the
+           workspace dimension fails.
+        3. **repo** — at least one eligible entry's ``repo`` equals ``repo`` (exact,
+           case-sensitive, full-string).
+        4. **branch** — among the repo-matching eligible entries, one lists ``branch`` in
+           its ``target_branches`` (exact, case-sensitive). That entry becomes the *matched*
            entry and supplies the effective repo/branch and the path/extension constraints.
-        3. **path** — when the matched entry has ``path_prefixes``, **every** requested path
+        5. **path** — when the matched entry has ``path_prefixes``, **every** requested path
            must lie under one of them (``str.startswith``). An empty ``path_prefixes`` means
            any path.
-        4. **extension** — when the matched entry has ``extensions``, **every** requested
+        6. **extension** — when the matched entry has ``extensions``, **every** requested
            path must carry one of them (``str.endswith``). An empty ``extensions`` means any
            extension.
-        5. **group** — the requesting ``groups`` must intersect ``authorized_groups``.
+        7. **group** — the requesting ``groups`` must intersect ``authorized_groups``.
 
         On success the returned :class:`Decision` carries the effective repo/branch from the
-        matched entry (Req 6.1, 6.2); on failure it carries the failed dimension and no
-        provider operation should be performed (Req 6.3).
+        matched entry; on failure it carries the failed dimension and no provider read should
+        be performed.
         """
-        # --- Dimension 1: repository ---------------------------------------------------
-        repo_entries = [entry for entry in self.entries if entry.repo == repo]
+        # --- Dimension 1: tenant (absent on entry => any tenant) -----------------------
+        tenant_entries = [entry for entry in self.entries if not entry.tenants or tenant in entry.tenants]
+        if not tenant_entries:
+            return Decision(allowed=False, failed_dimension="tenant")
+
+        # --- Dimension 2: workspace (absent on entry => any workspace) -----------------
+        workspace_entries = [
+            entry for entry in tenant_entries if not entry.workspaces or workspace in entry.workspaces
+        ]
+        if not workspace_entries:
+            return Decision(allowed=False, failed_dimension="workspace")
+
+        # --- Dimension 3: repository ---------------------------------------------------
+        repo_entries = [entry for entry in workspace_entries if entry.repo == repo]
         if not repo_entries:
             return Decision(allowed=False, failed_dimension="repo")
 
-        # --- Dimension 2: branch (selects the matched entry) ---------------------------
+        # --- Dimension 4: branch (selects the matched entry) ---------------------------
         matched: AllowlistEntry | None = None
         for entry in repo_entries:
             if branch in entry.target_branches:
@@ -199,19 +226,19 @@ class AuthorizationPolicy:
         if matched is None:
             return Decision(allowed=False, failed_dimension="branch")
 
-        # --- Dimension 3: path prefixes (absent => any path) ---------------------------
+        # --- Dimension 5: path prefixes (absent => any path) ---------------------------
         if matched.path_prefixes:
             for path in paths:
                 if not any(path.startswith(prefix) for prefix in matched.path_prefixes):
                     return Decision(allowed=False, failed_dimension="path")
 
-        # --- Dimension 4: extensions (absent => any extension) -------------------------
+        # --- Dimension 6: extensions (absent => any extension) -------------------------
         if matched.extensions:
             for path in paths:
                 if not any(path.endswith(ext) for ext in matched.extensions):
                     return Decision(allowed=False, failed_dimension="extension")
 
-        # --- Dimension 5: group intersection -------------------------------------------
+        # --- Dimension 7: group intersection -------------------------------------------
         if not (set(groups) & set(authorized_groups)):
             return Decision(allowed=False, failed_dimension="group")
 
@@ -226,9 +253,8 @@ class DomainConfig:
     Owns the operator-approved repository ``authorization_policy`` (the allowlist) and the
     ``authorized_groups`` a requesting user must belong to. The allowlist is the tuple of
     :class:`AllowlistEntry` that the Service_Layer wraps in an :class:`AuthorizationPolicy`
-    to enforce all five dimensions (repository, branch, path, extension, group) identically
-    on reads and writes (Req 6). ``config_errors`` accumulates this contract's validation
-    failures.
+    to enforce all seven dimensions (tenant, workspace, repository, branch, path, extension,
+    group) on reads. ``config_errors`` accumulates this contract's validation failures.
     """
 
     authorization_policy: tuple[AllowlistEntry, ...]
@@ -282,6 +308,7 @@ class ConnectorConfig:
     provider_timeout_seconds: int
     retry_max_attempts: int
     max_files_per_request: int
+    max_content_bytes: int
     audit_log_group: str | None
     config_errors: tuple[str, ...]
 
@@ -357,6 +384,15 @@ class ConnectorConfig:
             default=_MAX_FILES_DEFAULT,
             errors=errors,
         )
+        max_content_bytes = _parse_ranged_int(
+            settings.SCM_MAX_CONTENT_BYTES,
+            name="max_content_bytes",
+            env="GBAW_SCM_MAX_CONTENT_BYTES",
+            minimum=1,
+            maximum=None,
+            default=_MAX_CONTENT_BYTES_DEFAULT,
+            errors=errors,
+        )
 
         return cls(
             provider=provider,
@@ -365,6 +401,7 @@ class ConnectorConfig:
             provider_timeout_seconds=provider_timeout_seconds,
             retry_max_attempts=retry_max_attempts,
             max_files_per_request=max_files_per_request,
+            max_content_bytes=max_content_bytes,
             audit_log_group=audit_log_group,
             config_errors=tuple(errors),
         )
@@ -379,6 +416,7 @@ class ConnectorConfig:
             provider_timeout_seconds=_TIMEOUT_DEFAULT,
             retry_max_attempts=_RETRY_DEFAULT,
             max_files_per_request=_MAX_FILES_DEFAULT,
+            max_content_bytes=_MAX_CONTENT_BYTES_DEFAULT,
             audit_log_group=None,
             config_errors=(),
         )
@@ -386,22 +424,24 @@ class ConnectorConfig:
 
 @dataclass(frozen=True)
 class AdapterConfig:
-    """Provider_Adapter configuration: credential secret ARN + provider base URL.
+    """Provider_Adapter configuration: read-credential secret ARN + provider base URL.
 
-    Owns the credential reference (``credential_secret_arn``) the adapter uses to acquire
-    provider credentials and the optional ``provider_base_url`` for self-hosted/enterprise
-    endpoints. ``config_errors`` accumulates this contract's validation failures.
+    Owns the read-credential reference (``read_credential_secret_arn``) the adapter uses to
+    acquire the provider **read** credential and the optional ``provider_base_url`` for
+    self-hosted/enterprise endpoints. ``config_errors`` accumulates this contract's
+    validation failures.
 
-    The credential is the single ARN-valued setting sourced from
-    ``GBAW_SCM_CREDENTIAL_SECRET_ARN`` (the v2 single-ARN consolidation, MR5). The same ARN
-    is used for both runtime acquisition — the adapter's :class:`ProviderAuth` fetches the
-    secret at this ARN — and the scoped IAM grant, so runtime config and IAM scope cannot
-    drift. When the connector is enabled the value MUST be ARN-shaped; any other value
-    (including a raw credential accidentally supplied in its place) fails closed with a
-    config error and is never echoed into the error/audit output (Req 11.2, 12.3).
+    The read credential is the single ARN-valued setting sourced from
+    ``GBAW_SCM_READ_CREDENTIAL_SECRET_ARN``. The same ARN is used for both runtime
+    acquisition — the adapter's :class:`ProviderAuth` fetches the secret at this ARN — and
+    the scoped IAM grant, so runtime config and IAM scope cannot drift. It is a
+    provider-scoped, fine-grained read-only token. When the connector is enabled the value
+    MUST be ARN-shaped; any other value (including a raw credential accidentally supplied in
+    its place) fails closed with a config error and is never echoed into the error/audit
+    output. No provider-write credential is referenced anywhere.
     """
 
-    credential_secret_arn: str | None
+    read_credential_secret_arn: str | None
     provider_base_url: str | None
     config_errors: tuple[str, ...]
 
@@ -410,19 +450,21 @@ class AdapterConfig:
         """Build the adapter contract from ``GBAW_SCM_*`` values, accumulating errors."""
         errors: list[str] = []
 
-        # --- Credential secret ARN: required, and must be a Secrets Manager ARN. A value
-        # that is not ARN-shaped (a bare secret name, or a raw credential accidentally
+        # --- Read-credential secret ARN: required, and must be a Secrets Manager ARN. A
+        # value that is not ARN-shaped (a bare secret name, or a raw credential accidentally
         # supplied here) is rejected fail-closed; the value is NEVER echoed into the error
-        # or audit output in case it is a raw credential (Req 11.2, 12.3).
-        raw_secret = (settings.SCM_CREDENTIAL_SECRET_ARN or "").strip()
-        credential_secret_arn: str | None = raw_secret or None
-        if credential_secret_arn is None:
-            errors.append("credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ARN is required but was not set")
-        elif not _SECRET_ARN_RE.match(credential_secret_arn):
-            # Reject and NEVER echo the value into the error/audit output.
-            credential_secret_arn = None
+        # or audit output in case it is a raw credential.
+        raw_secret = (settings.SCM_READ_CREDENTIAL_SECRET_ARN or "").strip()
+        read_credential_secret_arn: str | None = raw_secret or None
+        if read_credential_secret_arn is None:
             errors.append(
-                "credential_secret_arn: GBAW_SCM_CREDENTIAL_SECRET_ARN must be a valid AWS "
+                "read_credential_secret_arn: GBAW_SCM_READ_CREDENTIAL_SECRET_ARN is required but was not set"
+            )
+        elif not _SECRET_ARN_RE.match(read_credential_secret_arn):
+            # Reject and NEVER echo the value into the error/audit output.
+            read_credential_secret_arn = None
+            errors.append(
+                "read_credential_secret_arn: GBAW_SCM_READ_CREDENTIAL_SECRET_ARN must be a valid AWS "
                 "Secrets Manager secret ARN; value rejected and omitted"
             )
 
@@ -440,7 +482,7 @@ class AdapterConfig:
             provider_base_url = None
 
         return cls(
-            credential_secret_arn=credential_secret_arn,
+            read_credential_secret_arn=read_credential_secret_arn,
             provider_base_url=provider_base_url,
             config_errors=tuple(errors),
         )
@@ -448,7 +490,7 @@ class AdapterConfig:
     @classmethod
     def _empty(cls) -> "AdapterConfig":
         """Return the well-formed empty adapter contract for the disabled off state."""
-        return cls(credential_secret_arn=None, provider_base_url=None, config_errors=())
+        return cls(read_credential_secret_arn=None, provider_base_url=None, config_errors=())
 
 
 @dataclass(frozen=True)
@@ -542,27 +584,32 @@ def _is_absolute_https_url(value: str) -> bool:
 def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[str]]:
     """Parse the ``GBAW_SCM_REPO_ALLOWLIST`` grammar into ``AllowlistEntry`` values.
 
-    Grammar (Req 5.1, 6.1, 6.2)::
+    Grammar::
 
         allowlist := entry ( ";" entry )*
-        entry     := repo "=" branches [ ":" paths [ ":" extensions ] ]
+        entry     := repo "=" branches [ ":" paths [ ":" extensions
+                                          [ ":" tenants [ ":" workspaces ] ] ] ]
         branches  := branch ( "," branch )*
         paths     := prefix ( "," prefix )*
         extensions:= ext    ( "," ext )*
+        tenants   := tenant ( "," tenant )*
+        workspaces:= ws     ( "," ws )*
 
-    The v2 five-dimension authorization extends the entry grammar **minimally and backward
-    compatibly** with two optional ``:``-separated segments after the branches:
+    The seven-dimension authorization extends the entry grammar **minimally and backward
+    compatibly** with optional ``:``-separated segments after the branches:
 
     - the second segment lists repo-relative path prefixes (e.g. ``infra/,modules/``);
-    - the third segment lists file extensions (e.g. ``.yaml,.tf``).
+    - the third segment lists file extensions (e.g. ``.yaml,.tf``);
+    - the fourth segment lists tenants (e.g. ``acme,globex``);
+    - the fifth segment lists workspaces (e.g. ``prod,staging``).
 
-    An entry with **no path segment** means "any path" and an entry with **no extension
-    segment** means "any extension", so existing repo+branch-only entries such as
-    ``org/iac=main,release`` parse exactly as before (empty ``path_prefixes`` / ``extensions``).
-    A fully-specified entry looks like ``org/iac=main,release:infra/,modules/:.yaml,.tf``.
+    A missing segment means "any" for that dimension, so existing repo+branch-only entries
+    such as ``org/iac=main,release`` parse exactly as before (empty ``path_prefixes`` /
+    ``extensions`` / ``tenants`` / ``workspaces``). A fully-specified entry looks like
+    ``org/iac=main,release:infra/,modules/:.yaml,.tf:acme:prod,staging``.
 
     Parsing is fail-closed: a segment with no ``=``, an empty repository, no branches, or
-    more than the three permitted ``:``-separated groups is reported as a per-entry error
+    more than the five permitted ``:``-separated groups is reported as a per-entry error
     (which the caller turns into a config error → connector disabled). Returns the parsed
     entries (order preserved) and a list of per-entry parse errors. Empty ``;``-separated
     segments are ignored so a trailing separator is harmless.
@@ -579,26 +626,32 @@ def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[
         if "=" not in segment:
             errors.append(
                 f"allowlist: entry '{segment}' is malformed (expected "
-                "'repo=branch[,branch...][:path[,path...][:ext[,ext...]]]')"
+                "'repo=branch[,branch...][:path[,path...][:ext[,ext...][:tenant[,...][:ws[,...]]]]]')"
             )
             continue
         repo_part, spec_part = segment.split("=", 1)
         repo = repo_part.strip()
 
-        # The branch/path/extension groups are ':'-separated; at most three are permitted.
+        # The branch/path/extension/tenant/workspace groups are ':'-separated; at most five
+        # are permitted (backward compatible: existing entries have <= 3 groups).
         groups = spec_part.split(":")
-        if len(groups) > 3:
+        if len(groups) > 5:
             errors.append(
-                f"allowlist: entry '{segment}' is malformed (expected at most " "'branches:paths:extensions')"
+                f"allowlist: entry '{segment}' is malformed (expected at most "
+                "'branches:paths:extensions:tenants:workspaces')"
             )
             continue
         branches_part = groups[0]
         paths_part = groups[1] if len(groups) >= 2 else ""
         extensions_part = groups[2] if len(groups) >= 3 else ""
+        tenants_part = groups[3] if len(groups) >= 4 else ""
+        workspaces_part = groups[4] if len(groups) >= 5 else ""
 
         branches = tuple(b.strip() for b in branches_part.split(",") if b.strip())
         path_prefixes = tuple(p.strip() for p in paths_part.split(",") if p.strip())
         extensions = tuple(e.strip() for e in extensions_part.split(",") if e.strip())
+        tenants = tuple(t.strip() for t in tenants_part.split(",") if t.strip())
+        workspaces = tuple(w.strip() for w in workspaces_part.split(",") if w.strip())
 
         if not repo:
             errors.append(f"allowlist: entry '{segment}' has an empty repository identifier")
@@ -612,6 +665,8 @@ def _parse_allowlist(raw: str | None) -> tuple[tuple[AllowlistEntry, ...], list[
                 target_branches=branches,
                 path_prefixes=path_prefixes,
                 extensions=extensions,
+                tenants=tenants,
+                workspaces=workspaces,
             )
         )
 

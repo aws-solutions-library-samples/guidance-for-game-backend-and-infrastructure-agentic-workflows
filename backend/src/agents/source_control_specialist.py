@@ -1,22 +1,22 @@
 """
-Source Control Connector specialist agent.
+Source Control Connector specialist agent (read-only).
 
-The single mutation path on the platform: instead of changing live AWS resources,
-this specialist reads Infrastructure-as-Code (IaC) from the operator-configured
-repository and proposes changes as pull requests for human review (GitOps).
+A read-only IaC-context capability: this specialist reads Infrastructure-as-Code (IaC)
+from the operator-configured repository so it can answer questions about the current
+infrastructure source of truth. It cannot and does not mutate any provider — the
+provider-write path has moved to a separate operations control plane / isolated executor
+(#314).
 
 Built with the shared ``create_specialist_agent`` factory and registered on the
-Orchestrator only when the Connector is enabled and validly configured. Its system
-prompt encodes the GitOps safety rules (read first, validate, never claim to mutate
-live AWS, exactly one PR per change, unmerged proposals require human review), keeping
-write intent isolated from the read-only GameLift/EKS/Cost specialists (design.md →
-Agent shape).
+Orchestrator only when the Connector is enabled and validly configured. Its system prompt
+encodes the read-only rules (review IaC, never claim to mutate live AWS or open pull
+requests), consistent with the read-only GameLift/EKS/Cost specialists.
 """
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
 from agents.optimized_prompts import get_optimized_source_control_prompt
-from connector.tools import get_iac_file, propose_infrastructure_change
+from connector.tools import get_iac_file
 
 # ============================================================================
 # System prompt (GitOps rules)
@@ -44,5 +44,5 @@ source_control_agent = create_specialist_agent(
     kb_id=None,
     prompt_fn=get_optimized_source_control_prompt,
     fallback_fn=None,
-    additional_tools=[get_iac_file, propose_infrastructure_change],
+    additional_tools=[get_iac_file],
 )

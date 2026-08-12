@@ -25,6 +25,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 # Local modules
+import utils.security as security
 from connector import service as service_module
 from connector.config import AllowlistEntry, SourceControlConfig
 from connector.service import read_iac_files
@@ -43,15 +44,18 @@ pytestmark = pytest.mark.unit
 _AUTHORIZED_CONTEXT = {"user_id": "reader-1", "groups": ["scm-writers"], "session_id": "s-read"}
 
 
-def _read_authorized(paths, *, config, provider):
+def _read_authorized(paths, *, config, reader):
     """Invoke ``read_iac_files`` inside an authorized request context.
 
     Identity/groups are derived only from the request context (never from tool input), so an
     authorized user is set (and reset) per call to satisfy the read path's group dimension.
+    The read path is now per-requester rate limited, so the shared sliding-window store is
+    cleared before each call to keep property examples independent.
     """
+    security._rate_limit_windows.clear()
     token = set_request_context(dict(_AUTHORIZED_CONTEXT))
     try:
-        return read_iac_files(paths, config=config, provider=provider)
+        return read_iac_files(paths, config=config, reader=reader)
     finally:
         reset_request_context(token)
 
@@ -63,11 +67,16 @@ def _read_authorized(paths, *, config, provider):
 _repos = st.from_regex(r"[A-Za-z0-9._-]{1,15}/[A-Za-z0-9._-]{1,15}", fullmatch=True)
 _branches = st.from_regex(r"[A-Za-z0-9._/-]{1,15}", fullmatch=True)
 
-# File paths within the repository (whitespace-free, distinct per request).
-_paths = st.from_regex(r"[A-Za-z0-9._/-]{1,25}", fullmatch=True)
+# File paths within the repository. Constrained to already-normalized, repo-relative POSIX
+# paths (single-slash-separated segments, no ".", "..", leading/trailing "/" or "//") so
+# path normalization is the identity and this test isolates read scoping/limit behavior from
+# the normalization property (which has its own dedicated test).
+_paths = st.from_regex(r"[A-Za-z0-9_-]{1,8}(/[A-Za-z0-9_-]{1,8}){0,3}", fullmatch=True)
 
-# The mutation operations that the read path must NEVER invoke (no proposal is created).
-_MUTATION_OPS = ("create_branch", "commit_files", "open_change_proposal")
+# The only provider operations the read-only reader exposes. The read path must never invoke
+# anything outside this read-only set (there is no provider-write operation in the shipped
+# package).
+_READ_OPS = ("get_file", "get_files")
 
 
 def _make_config(*, max_files: int, repo: str, branch: str) -> SourceControlConfig:
@@ -95,9 +104,8 @@ def _make_config(*, max_files: int, repo: str, branch: str) -> SourceControlConf
 
 
 def _assert_no_proposal(fake: FakeProvider) -> None:
-    """Assert the read path created no proposal (no branch/commit/PR provider calls)."""
-    for op in _MUTATION_OPS:
-        assert fake.calls_for(op) == [], f"read path unexpectedly invoked {op}"
+    """Assert the read path invoked only read operations (the reader exposes no write op)."""
+    assert set(fake.call_operations) <= set(_READ_OPS), f"read path invoked a non-read op: {fake.call_operations}"
 
 
 # --- Property 12 ------------------------------------------------------------
@@ -139,7 +147,7 @@ def test_property12_within_limit_fetches_scoped_and_reports_missing(case):
     the configured repo+branch, and no proposal is created (Req 3.1, 3.4)."""
     config, fake, paths, present, missing = case
 
-    result = _read_authorized(paths, config=config, provider=fake)
+    result = _read_authorized(paths, config=config, reader=fake)
 
     # Not a limit rejection: a real fetch happened.
     assert result.limit_exceeded is False
@@ -191,7 +199,7 @@ def test_property12_over_limit_rejects_without_fetch(case):
     """Over the limit: limit-exceeded result, NO provider fetch, no proposal (Req 3.2)."""
     config, fake, paths = case
 
-    result = _read_authorized(paths, config=config, provider=fake)
+    result = _read_authorized(paths, config=config, reader=fake)
 
     # Req 3.2: a limit-exceeded result with no files and no missing list.
     assert result.limit_exceeded is True
@@ -257,7 +265,7 @@ def test_read_rejected_when_group_dimension_not_satisfied():
     token = set_request_context({"user_id": "u", "groups": ["other-group"], "session_id": "s"})
     try:
         with mock.patch.object(service_module, "logger") as mock_logger:
-            result = read_iac_files(["infra/vpc.yaml"], config=config, provider=fake)
+            result = read_iac_files(["infra/vpc.yaml"], config=config, reader=fake)
     finally:
         reset_request_context(token)
 
@@ -270,9 +278,11 @@ def test_read_rejected_when_group_dimension_not_satisfied():
     rejections = [
         call
         for call in mock_logger.warning.call_args_list
-        if call.kwargs.get("event") == "scm_rejected" and call.kwargs.get("failed_dimension") == "group"
+        if call.kwargs.get("event") == "scm_read"
+        and call.kwargs.get("outcome") == "rejected"
+        and call.kwargs.get("failed_dimension") == "group"
     ]
-    assert rejections, "expected a scm_rejected read audit naming the group dimension"
+    assert rejections, "expected a scm_read rejection audit naming the group dimension"
 
 
 def test_read_rejected_when_path_prefix_not_allowed():
@@ -282,7 +292,7 @@ def test_read_rejected_when_path_prefix_not_allowed():
     fake = FakeProvider()
     fake.add_file(repo, branch, "modules/vpc.yaml", "content")
 
-    result = _read_authorized(["modules/vpc.yaml"], config=config, provider=fake)
+    result = _read_authorized(["modules/vpc.yaml"], config=config, reader=fake)
 
     assert result.files == ()
     assert fake.calls == []
@@ -295,7 +305,7 @@ def test_read_rejected_when_extension_not_allowed():
     fake = FakeProvider()
     fake.add_file(repo, branch, "infra/vpc.tf", "content")
 
-    result = _read_authorized(["infra/vpc.tf"], config=config, provider=fake)
+    result = _read_authorized(["infra/vpc.tf"], config=config, reader=fake)
 
     assert result.files == ()
     assert fake.calls == []
@@ -308,7 +318,7 @@ def test_read_allowed_when_path_and_extension_satisfy_entry():
     fake = FakeProvider()
     fake.add_file(repo, branch, "infra/vpc.yaml", "content")
 
-    result = _read_authorized(["infra/vpc.yaml"], config=config, provider=fake)
+    result = _read_authorized(["infra/vpc.yaml"], config=config, reader=fake)
 
     assert [fc.path for fc in result.files] == ["infra/vpc.yaml"]
     assert len(fake.calls_for("get_files")) == 1

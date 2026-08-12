@@ -51,7 +51,7 @@ _SCM_ATTRS = (
     "SCM_CONNECTOR_ENABLED",
     "SCM_PROVIDER",
     "SCM_PROVIDER_BASE_URL",
-    "SCM_CREDENTIAL_SECRET_ARN",
+    "SCM_READ_CREDENTIAL_SECRET_ARN",
     "SCM_REPO_ALLOWLIST",
     "SCM_AUTHORIZED_GROUPS",
     "SCM_AUDIT_LOG_GROUP",
@@ -74,10 +74,11 @@ _CONNECTOR_FIELDS = {
     "provider_timeout_seconds",
     "retry_max_attempts",
     "max_files_per_request",
+    "max_content_bytes",
     "audit_log_group",
     "config_errors",
 }
-_ADAPTER_FIELDS = {"credential_secret_arn", "provider_base_url", "config_errors"}
+_ADAPTER_FIELDS = {"read_credential_secret_arn", "provider_base_url", "config_errors"}
 
 
 @contextlib.contextmanager
@@ -101,7 +102,7 @@ def _valid_base() -> dict:
         "SCM_CONNECTOR_ENABLED": "true",
         "SCM_PROVIDER": "github",
         "SCM_PROVIDER_BASE_URL": None,
-        "SCM_CREDENTIAL_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf",
+        "SCM_READ_CREDENTIAL_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:123456789012:secret:scm/github-token-AbCdEf",
         "SCM_REPO_ALLOWLIST": "org/iac-repo=main",
         "SCM_AUTHORIZED_GROUPS": "iac-admins",
         "SCM_AUDIT_LOG_GROUP": "scm-audit-logs",
@@ -175,12 +176,12 @@ _connector_invalidations = st.one_of(
     ),
 )
 
-# AdapterConfig: credential secret ARN + provider base URL.
+# AdapterConfig: read-credential secret ARN + provider base URL.
 _adapter_invalidations = st.one_of(
     st.tuples(
-        st.just("SCM_CREDENTIAL_SECRET_ARN"),
+        st.just("SCM_READ_CREDENTIAL_SECRET_ARN"),
         st.sampled_from([None, "", "   ", "scm/github-token", "not-an-arn"]),
-        st.just("credential_secret_arn"),
+        st.just("read_credential_secret_arn"),
     ),
     st.tuples(
         st.just("SCM_PROVIDER_BASE_URL"),

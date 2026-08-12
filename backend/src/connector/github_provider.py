@@ -1,61 +1,56 @@
-"""GitHub provider adapter for the Source Control Connector.
+"""GitHub provider adapter for the Source Control Connector (read-only).
 
-This module implements the provider-agnostic :class:`SourceControlProvider` contract
-against the GitHub REST API (Req 9.3). Provider *selection* no longer lives here: the
-adapter self-registers with the provider-neutral registry at import time
+This module implements the provider-agnostic :class:`SourceControlReader` contract
+against the GitHub REST API. Provider *selection* no longer lives here: the adapter
+self-registers with the provider-neutral registry at import time
 (``registry.register("github", GitHubProvider)``) and the registry owns resolution via
-``connector.registry.get_provider`` (Req 4.1, 6.1, 6.3). Importing this module is what
-makes ``"github"`` a supported provider.
+``connector.registry.get_provider``. Importing this module is what makes ``"github"`` a
+supported provider.
 
 Design guarantees encoded here (see
-``.kiro/specs/source-control-connector/design.md`` → GitHub adapter):
+``.kiro/specs/source-control-connector-readonly-split/design.md`` → GitHub adapter):
 
 - **No local clone.** The container filesystem is read-only, so every operation is a
-  direct call to the GitHub *Git Data* / *Contents* REST endpoints (get contents, get
-  ref, create ref, create tree/commit, open pull request). Nothing is written to disk.
+  direct call to the GitHub *Contents* REST endpoint. Nothing is written to disk.
+- **Read-only.** The adapter exposes only ``get_file``/``get_files``; it holds no write
+  method and attaches its credential only to read requests.
 - **Per-request timeout.** Every HTTP call is bounded by
   ``config.connector.provider_timeout_seconds`` (sourced from
   ``GBAW_SCM_PROVIDER_TIMEOUT_SECONDS``).
-- **Per-operation credential fetch.** The SCM_Credential is fetched fresh for each public
-  operation via ``get_secret(config.adapter.credential_secret_arn, source="secretsmanager")``
-  and placed in the ``Authorization`` header. It is **never** logged (Req 4.7, 6.6).
-- **Typed error mapping** (Req 10.1, 10.2, 10.4, 10.5):
+- **Per-operation read-credential fetch.** The read credential is fetched fresh for each
+  operation via ``get_secret(config.adapter.read_credential_secret_arn,
+  source="secretsmanager")`` and placed in the ``Authorization`` header. It is **never**
+  logged.
+- **Typed error mapping**:
     - connection error / connect-timeout → :class:`ProviderUnavailableError`
     - read/write/pool timeout or other transport failure → :class:`ProviderTransientError`
     - HTTP 401 / 403 → :class:`ProviderAuthError` (never retried)
-    - HTTP 409 → :class:`ProviderConflictError` (no destructive resolution)
     - HTTP 5xx / 429 → :class:`ProviderTransientError` (retryable)
 
 Only provider-agnostic dataclasses from ``connector.models`` and Python primitives cross
-the method boundary; no GitHub-specific type escapes this layer (Req 9.1).
+the method boundary; no GitHub-specific type escapes this layer.
 """
 
 from __future__ import annotations
 
 # Standard library
 import base64
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 # Third-party packages
 import httpx
 
 # Local modules
 from connector import registry
-from connector.models import (
-    ChangeProposalResult,
-    FileContent,
-    FileFetchResult,
-    ProposedFile,
-)
+from connector.models import FileContent, FileFetchResult
 from connector.provider import (
     OutboundRequest,
     ProviderAuth,
     ProviderAuthError,
-    ProviderConflictError,
     ProviderError,
     ProviderTransientError,
     ProviderUnavailableError,
-    SourceControlProvider,
+    SourceControlReader,
 )
 from utils.secrets import get_secret
 
@@ -63,7 +58,7 @@ if TYPE_CHECKING:
     # Local modules
     from connector.config import AdapterConfig, SourceControlConfig
 
-__all__ = ["GitHubProvider", "GitHubTokenAuth"]
+__all__ = ["GitHubProvider", "GitHubReadTokenAuth"]
 
 # Public GitHub REST API host. GitHub Enterprise deployments would override this with a
 # configured base URL; the connector defaults to the public host.
@@ -73,60 +68,59 @@ _DEFAULT_API_BASE_URL = "https://api.github.com"
 _ACCEPT = "application/vnd.github+json"
 _API_VERSION = "2022-11-28"
 
-# Standard git file mode for a non-executable blob in a tree.
-_BLOB_MODE = "100644"
 
-
-class GitHubTokenAuth(ProviderAuth):
-    """Token-based :class:`ProviderAuth` for the GitHub adapter (Req 11.1).
+class GitHubReadTokenAuth(ProviderAuth):
+    """Token-based **read** :class:`ProviderAuth` for the GitHub adapter.
 
     Implements the provider-neutral credential-acquisition contract for a token-based
-    Provider: it fetches the credential fresh from AWS Secrets Manager at the configured
-    ``credential_secret_arn`` and attaches it to the outbound request as an
-    ``Authorization: Bearer <token>`` header. The credential is **never** logged (Req 4.7,
-    6.6) and a missing/empty credential fails closed as a :class:`ProviderAuthError` so the
-    calling operation is aborted without retry (Req 10.2).
+    Provider: it fetches the read credential fresh from AWS Secrets Manager at the
+    configured ``read_credential_secret_arn`` and attaches it to the outbound read request
+    as an ``Authorization: Bearer <token>`` header. The credential is **never** logged and
+    a missing/empty credential fails closed as a :class:`ProviderAuthError` so the calling
+    read is aborted without retry.
 
-    Credential acquisition is owned here, in the adapter, rather than in the connector core:
-    a future IAM-native adapter (e.g. CodeCommit/SigV4) satisfies the *same* contract by
-    signing the request with the runtime role and never calling ``get_secret``.
+    Credential acquisition is owned here, in the adapter, rather than in the connector
+    core: a future IAM-native adapter (e.g. CodeCommit/SigV4) satisfies the *same* contract
+    by signing the request with the runtime role and never calling ``get_secret``. The
+    credential is a provider-scoped, fine-grained read-only token and is attached only to
+    read requests (there is no write request in the shipped package).
     """
 
     def __init__(self, config: AdapterConfig) -> None:
-        # The single ARN-valued credential setting (AdapterConfig.credential_secret_arn).
-        self._credential_secret_arn = config.credential_secret_arn
+        # The single ARN-valued read-credential setting (AdapterConfig.read_credential_secret_arn).
+        self._read_credential_secret_arn = config.read_credential_secret_arn
 
     def apply(self, request: OutboundRequest) -> None:
-        """Fetch the credential and set the ``Authorization`` header on ``request``.
+        """Fetch the read credential and set the ``Authorization`` header on ``request``.
 
         The credential is retrieved fresh per operation from Secrets Manager and placed in
-        the ``Authorization`` header; it is never logged (Req 4.7, 6.6). A missing/empty
-        credential fails closed as an authorization error (Req 10.2, 11.1).
+        the ``Authorization`` header; it is never logged. A missing/empty credential fails
+        closed as an authorization error.
         """
-        token = get_secret(self._credential_secret_arn, source="secretsmanager")
+        token = get_secret(self._read_credential_secret_arn, source="secretsmanager")
         if not token:
-            raise ProviderAuthError("Source-control credential could not be retrieved from Secrets Manager")
+            raise ProviderAuthError("Source-control read credential could not be retrieved from Secrets Manager")
         request.headers["Authorization"] = f"Bearer {token}"
 
 
-class GitHubProvider(SourceControlProvider):
-    """`SourceControlProvider` implemented against the GitHub REST API.
+class GitHubProvider(SourceControlReader):
+    """`SourceControlReader` implemented against the GitHub REST API.
 
     The adapter holds only immutable configuration (timeout, base URL, and the secret id
-    used to fetch the credential per-operation). It stores no credential in memory beyond
-    the lifetime of a single HTTP request.
+    used to fetch the read credential per-operation). It stores no credential in memory
+    beyond the lifetime of a single HTTP request.
     """
 
     def __init__(self, config: SourceControlConfig) -> None:
         # Credential acquisition is adapter-owned behind the neutral ProviderAuth contract:
-        # GitHubTokenAuth fetches the secret at AdapterConfig.credential_secret_arn and
-        # attaches the Authorization header per operation (Req 11.1). The per-request
-        # timeout is neutral operational tuning (ConnectorConfig); the base URL is
-        # adapter-owned (AdapterConfig).
-        self._auth: ProviderAuth = GitHubTokenAuth(config.adapter)
+        # GitHubReadTokenAuth fetches the secret at AdapterConfig.read_credential_secret_arn
+        # and attaches the Authorization header per read operation. The per-request timeout
+        # is neutral operational tuning (ConnectorConfig); the base URL is adapter-owned
+        # (AdapterConfig).
+        self._auth: ProviderAuth = GitHubReadTokenAuth(config.adapter)
         self._timeout = float(config.connector.provider_timeout_seconds)
         # provider_base_url is a real, validated config field (absolute https or None). When
-        # unset the adapter falls back to the public GitHub API host (Req 10.2, 10.3).
+        # unset the adapter falls back to the public GitHub API host.
         self._base_url = config.adapter.provider_base_url or _DEFAULT_API_BASE_URL
 
     # ------------------------------------------------------------------ read path
@@ -135,7 +129,7 @@ class GitHubProvider(SourceControlProvider):
         """Return the file at ``path`` on ``branch`` of ``repo`` or ``None`` if absent.
 
         Uses the Contents endpoint; a 404 means the file does not exist and yields
-        ``None`` without raising (Req 3.1).
+        ``None`` without raising.
         """
         headers = self._auth_headers()
         response = self._request(
@@ -157,7 +151,7 @@ class GitHubProvider(SourceControlProvider):
         return FileContent(path=path, content=content)
 
     def get_files(self, repo: str, branch: str, paths: list[str]) -> FileFetchResult:
-        """Fetch multiple files, recording any missing paths without proposing (Req 3.4).
+        """Fetch multiple files, recording any missing paths.
 
         The credential is fetched once per operation and reused across the per-file
         requests. ``limit_exceeded`` is always ``False`` here; request-count limiting is
@@ -189,177 +183,16 @@ class GitHubProvider(SourceControlProvider):
             limit_exceeded=False,
         )
 
-    def branch_exists(self, repo: str, branch: str) -> bool:
-        """Return ``True`` if ``branch`` exists in ``repo`` (Req 2.8).
-
-        Uses the Git Data get-ref endpoint; a 404 means the ref is absent.
-        """
-        headers = self._auth_headers()
-        response = self._request(
-            "GET",
-            f"/repos/{repo}/git/ref/heads/{branch}",
-            headers,
-            allow_404=True,
-        )
-        return response.status_code != 404
-
-    def latest_commit_sha(self, repo: str, branch: str) -> str:
-        """Return the SHA the ``branch`` ref currently points at (Req 3.3)."""
-        headers = self._auth_headers()
-        response = self._request(
-            "GET",
-            f"/repos/{repo}/git/ref/heads/{branch}",
-            headers,
-        )
-        payload = response.json()
-        return self._extract_ref_sha(payload)
-
-    # --------------------------------------------------------------- propose path
-
-    def create_branch(self, repo: str, new_branch: str, from_sha: str) -> None:
-        """Create ``new_branch`` at ``from_sha`` (Req 2.1).
-
-        GitHub returns 422 for an already-existing ref; the service guarantees a unique
-        Proposal_Branch name via ``branch_exists`` beforehand (Req 2.8), so this only
-        creates a fresh ref.
-        """
-        headers = self._auth_headers()
-        self._request(
-            "POST",
-            f"/repos/{repo}/git/refs",
-            headers,
-            json={"ref": f"refs/heads/{new_branch}", "sha": from_sha},
-        )
-
-    def commit_files(
-        self,
-        repo: str,
-        branch: str,
-        files: list[ProposedFile],
-        message: str,
-    ) -> str:
-        """Commit ``files`` to ``branch`` as a single commit; return the commit SHA.
-
-        Uses the Git Data API so the complete set of modified files lands in one atomic
-        commit (Req 2.3): read the branch head, build a tree on top of the head's tree,
-        create a commit with the head as parent, then fast-forward the ref.
-        """
-        headers = self._auth_headers()
-
-        head_sha = self._extract_ref_sha(self._request("GET", f"/repos/{repo}/git/ref/heads/{branch}", headers).json())
-        base_commit = self._request("GET", f"/repos/{repo}/git/commits/{head_sha}", headers).json()
-        base_tree_sha = base_commit["tree"]["sha"]
-
-        tree_entries = [
-            {
-                "path": proposed.path,
-                "mode": _BLOB_MODE,
-                "type": "blob",
-                "content": proposed.content,
-            }
-            for proposed in files
-        ]
-        new_tree = self._request(
-            "POST",
-            f"/repos/{repo}/git/trees",
-            headers,
-            json={"base_tree": base_tree_sha, "tree": tree_entries},
-        ).json()
-
-        new_commit = self._request(
-            "POST",
-            f"/repos/{repo}/git/commits",
-            headers,
-            json={
-                "message": message,
-                "tree": new_tree["sha"],
-                "parents": [head_sha],
-            },
-        ).json()
-        new_commit_sha = cast(str, new_commit["sha"])
-
-        self._request(
-            "PATCH",
-            f"/repos/{repo}/git/refs/heads/{branch}",
-            headers,
-            json={"sha": new_commit_sha, "force": False},
-        )
-        return new_commit_sha
-
-    def open_change_proposal(
-        self,
-        repo: str,
-        head: str,
-        base: str,
-        title: str,
-        body: str,
-    ) -> ChangeProposalResult:
-        """Open exactly one pull request from ``head`` into ``base`` (Req 2.2, 2.6).
-
-        The proposal is created unmerged and requires human review; the adapter exposes no
-        merge/approve/close operation (Req 6.1).
-        """
-        headers = self._auth_headers()
-        payload = self._request(
-            "POST",
-            f"/repos/{repo}/pulls",
-            headers,
-            json={"title": title, "head": head, "base": base, "body": body},
-        ).json()
-        return ChangeProposalResult(
-            proposal_id=str(payload.get("number", "")),
-            proposal_url=payload.get("html_url", ""),
-        )
-
-    def find_open_change_proposal(
-        self,
-        repo: str,
-        head: str,
-        base: str,
-    ) -> ChangeProposalResult | None:
-        """Return the first OPEN pull request for ``head`` → ``base``, or ``None`` (Req 12.4).
-
-        Used by the service layer's reconcile-before-retry logic: after an ambiguous
-        transient failure while opening a change proposal, this read-only query discovers a
-        pull request the provider may already have created for the same head→base pair so a
-        duplicate is not opened.
-
-        Queries ``GET /repos/{repo}/pulls?state=open&head={owner}:{head}&base={base}``. The
-        GitHub ``head`` filter is namespaced by owner, so the owner is parsed from ``repo``
-        (``"owner/name"`` → ``"owner"``) and prefixed to ``head``. The first element of the
-        returned list is mapped to a provider-neutral :class:`ChangeProposalResult`
-        (``number`` → ``proposal_id`` as a string, ``html_url`` → ``proposal_url``); an
-        empty list yields ``None``. Wire failures map through the same typed-exception
-        handling used by every other GET (see :meth:`_request`); the credential is never
-        logged.
-        """
-        owner = repo.split("/", 1)[0]
-        headers = self._auth_headers()
-        response = self._request(
-            "GET",
-            f"/repos/{repo}/pulls",
-            headers,
-            params={"state": "open", "head": f"{owner}:{head}", "base": base},
-        )
-        payload = response.json()
-        if not isinstance(payload, list) or not payload:
-            return None
-        first = payload[0]
-        return ChangeProposalResult(
-            proposal_id=str(first.get("number", "")),
-            proposal_url=first.get("html_url", ""),
-        )
-
     # -------------------------------------------------------------------- helpers
 
     def _auth_headers(self) -> dict[str, str]:
         """Build request headers, delegating credential acquisition to the ProviderAuth.
 
         The neutral, provider-agnostic base headers (Accept + API version) are set here;
-        the credential is acquired and attached by the adapter-owned
-        :class:`GitHubTokenAuth` through the :class:`ProviderAuth` contract, which fetches
-        the secret fresh per operation and never logs it (Req 4.7, 6.6, 11.1). A missing/
-        empty credential fails closed as a :class:`ProviderAuthError` (Req 10.2).
+        the read credential is acquired and attached by the adapter-owned
+        :class:`GitHubReadTokenAuth` through the :class:`ProviderAuth` contract, which
+        fetches the secret fresh per operation and never logs it. A missing/empty
+        credential fails closed as a :class:`ProviderAuthError`.
         """
         request = OutboundRequest(
             headers={
@@ -384,7 +217,7 @@ class GitHubProvider(SourceControlProvider):
 
         ``allow_404`` lets read callers treat a 404 as "absent" and inspect the returned
         response instead of raising. All other error classes map to the connector's typed
-        exceptions so the service layer can react uniformly (Req 10.1, 10.2, 10.4, 10.5).
+        exceptions so the service layer can react uniformly.
         """
         url = f"{self._base_url}{path}"
         try:
@@ -412,9 +245,9 @@ class GitHubProvider(SourceControlProvider):
     ) -> None:
         """Map an HTTP status code to a typed provider exception.
 
-        Success (2xx) and an allowed 404 return normally. Auth (401/403) and conflict
-        (409) are non-retryable; 429 and 5xx are transient/retryable. Any other 4xx is a
-        non-retryable provider error. Response bodies are not logged so no secret leaks.
+        Success (2xx) and an allowed 404 return normally. Auth (401/403) is non-retryable;
+        429 and 5xx are transient/retryable. Any other 4xx is a non-retryable provider
+        error. Response bodies are not logged so no secret leaks.
         """
         status = response.status_code
         if 200 <= status < 300:
@@ -423,8 +256,6 @@ class GitHubProvider(SourceControlProvider):
             return
         if status in (401, 403):
             raise ProviderAuthError(f"Provider rejected the credential ({status}): {method} {path}")
-        if status == 409:
-            raise ProviderConflictError(f"Provider reported a conflict (409): {method} {path}")
         if status == 429 or 500 <= status < 600:
             raise ProviderTransientError(f"Provider temporarily unavailable ({status}): {method} {path}")
         raise ProviderError(f"Provider request failed ({status}): {method} {path}")
@@ -442,14 +273,9 @@ class GitHubProvider(SourceControlProvider):
             return raw.decode("utf-8")
         raise ProviderError(f"Unsupported content encoding for '{payload.get('path', '<unknown>')}'")
 
-    @staticmethod
-    def _extract_ref_sha(payload: dict[str, Any]) -> str:
-        """Pull the commit SHA out of a Git Data ref response."""
-        return cast(str, payload["object"]["sha"])
-
 
 # Self-register the bundled GitHub adapter with the provider-neutral registry so that
-# importing this module makes "github" a supported provider (Req 6.1, 7.1). The registry
-# owns provider selection now; there is no module-level get_provider factory here, and the
-# provider-neutral core (service/config) never imports this module directly (Req 4.1).
+# importing this module makes "github" a supported provider. The registry owns provider
+# selection now; there is no module-level get_provider factory here, and the
+# provider-neutral core (service/config) never imports this module directly.
 registry.register("github", GitHubProvider)

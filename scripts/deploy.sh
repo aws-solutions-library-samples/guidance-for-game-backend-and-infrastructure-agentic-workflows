@@ -102,15 +102,16 @@ echo ""
 # Step 1: Deploy base infrastructure
 echo "📦 Step 1: Deploying base infrastructure..."
 
-# Source Control Connector: source the credential secret ARN and (optional) audit
-# log-group name from the environment or backend/.env.local so the base stack can
-# apply the scoped credential-read grant (and, once available, provision the audit
-# log group). Only the secret ARN is passed to the stack — never the raw credential
-# value (Req 3.4). Both default to empty for read-only deployments (Req 3.3).
-SCM_CREDENTIAL_SECRET_ARN="${GBAW_SCM_CREDENTIAL_SECRET_ARN:-$(grep "^GBAW_SCM_CREDENTIAL_SECRET_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+# Source Control Connector: source the READ-credential secret ARN and (optional)
+# audit log-group name from the environment or backend/.env.local so the base
+# stack can apply the scoped read-credential grant (and, once available, provision
+# the audit log group). Only the secret ARN is passed to the stack — never the raw
+# credential value (Req 3.4). Both default to empty for deployments that never
+# enable the connector (Req 3.3).
+SCM_READ_CREDENTIAL_SECRET_ARN="${GBAW_SCM_READ_CREDENTIAL_SECRET_ARN:-$(grep "^GBAW_SCM_READ_CREDENTIAL_SECRET_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
 SCM_AUDIT_LOG_GROUP="${GBAW_SCM_AUDIT_LOG_GROUP:-$(grep "^GBAW_SCM_AUDIT_LOG_GROUP=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
 
-BASE_STACK_PARAMS=(ProjectName="$PROJECT_NAME" ScmCredentialSecretArn="$SCM_CREDENTIAL_SECRET_ARN")
+BASE_STACK_PARAMS=(ProjectName="$PROJECT_NAME" ScmReadCredentialSecretArn="$SCM_READ_CREDENTIAL_SECRET_ARN")
 # The audit log-group parameter is added to the base template by task 7.2. Pass it
 # only when configured so deployments against the current template (which does not
 # yet define the parameter) are not broken when it is unset.
@@ -393,11 +394,11 @@ if [ -n "$EKS_KB_ID" ]; then echo "   EKS KB:      $EKS_KB_ID"; fi
 if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
 
 # Source Control Connector (disabled by default). Wire GBAW_SCM_* vars through the
-# same -env mechanism, including only the ones that are set so read-only deployments
-# that never configure the connector are unaffected. The single ARN-valued credential
-# setting (GBAW_SCM_CREDENTIAL_SECRET_ARN) is delivered separately below from the SAME
-# source value used for the base stack's ScmCredentialSecretArn parameter — only the
-# ARN is ever passed, never a raw credential value (Req 11.2).
+# same -env mechanism, including only the ones that are set so deployments that never
+# configure the connector are unaffected. The single ARN-valued read-credential
+# setting (GBAW_SCM_READ_CREDENTIAL_SECRET_ARN) is delivered separately below from the
+# SAME source value used for the base stack's ScmReadCredentialSecretArn parameter —
+# only the ARN is ever passed, never a raw credential value (Req 11.2).
 SCM_ENV_ARGS=()
 for _scm_var in \
   GBAW_SCM_CONNECTOR_ENABLED \
@@ -417,13 +418,14 @@ for _scm_var in \
     SCM_ENV_ARGS+=(-env "${_scm_var}=${_scm_val}")
   fi
 done
-# Single-source the credential ARN (Req 11.2 / MR5): the SAME value resolved for the
-# base stack's ScmCredentialSecretArn parameter (Step 1, $SCM_CREDENTIAL_SECRET_ARN)
-# is delivered as the runtime env var GBAW_SCM_CREDENTIAL_SECRET_ARN, so the runtime
-# credential-acquisition config and the scoped IAM grant are driven by one value and
-# cannot drift. Only the ARN is passed — never a raw credential value.
-if [ -n "$SCM_CREDENTIAL_SECRET_ARN" ]; then
-  SCM_ENV_ARGS+=(-env "GBAW_SCM_CREDENTIAL_SECRET_ARN=$SCM_CREDENTIAL_SECRET_ARN")
+# Single-source the read-credential ARN (Req 11.2 / MR5): the SAME value resolved for
+# the base stack's ScmReadCredentialSecretArn parameter (Step 1,
+# $SCM_READ_CREDENTIAL_SECRET_ARN) is delivered as the runtime env var
+# GBAW_SCM_READ_CREDENTIAL_SECRET_ARN, so the runtime credential-acquisition config and
+# the scoped IAM grant are driven by one value and cannot drift. Only the ARN is
+# passed — never a raw credential value.
+if [ -n "$SCM_READ_CREDENTIAL_SECRET_ARN" ]; then
+  SCM_ENV_ARGS+=(-env "GBAW_SCM_READ_CREDENTIAL_SECRET_ARN=$SCM_READ_CREDENTIAL_SECRET_ARN")
 fi
 if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
   echo "   Source Control Connector: wiring ${#SCM_ENV_ARGS[@]} GBAW_SCM_* env var(s)"

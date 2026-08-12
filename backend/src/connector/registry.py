@@ -1,20 +1,20 @@
 """Provider-neutral registry for the Source Control Connector.
 
 Owns the mapping from a configured provider *name* to the adapter factory that builds the
-concrete :class:`~connector.provider.SourceControlProvider` for it. This module is the
+concrete :class:`~connector.provider.SourceControlReader` for it. This module is the
 dependency-inversion seam that lets the provider-neutral core (``connector.service`` and
 ``connector.config``) select an adapter WITHOUT importing any concrete adapter module
 (Req 4.1, 6.1, 6.2, 6.3):
 
 - Adapters depend on the registry — each adapter self-registers at import time (for
   example ``registry.register("github", GitHubProvider)``) — never the reverse.
-- The core depends only on this registry plus the :class:`SourceControlProvider`
+- The core depends only on this registry plus the :class:`SourceControlReader`
   abstraction. It never names ``connector.github_provider`` (or any other adapter).
 - ``ConnectorConfig.load()`` consults :func:`is_supported` so enablement fails closed when
   the configured provider has no registered adapter (Req 7.1, 7.2).
 
-To stay provider-neutral this module references only the abstraction.
-``SourceControlConfig`` and ``SourceControlProvider`` are imported solely for typing under
+To stay provider-neutral this module references only the read abstraction.
+``SourceControlConfig`` and ``SourceControlReader`` are imported solely for typing under
 ``TYPE_CHECKING`` to avoid import cycles; the only runtime import is the typed
 :class:`~connector.provider.UnsupportedProviderError` that :func:`get_provider` raises.
 """
@@ -30,13 +30,13 @@ from connector.provider import UnsupportedProviderError
 if TYPE_CHECKING:
     # Local modules
     from connector.config import SourceControlConfig
-    from connector.provider import SourceControlProvider
+    from connector.provider import SourceControlReader
 
 __all__ = ["ProviderFactory", "register", "is_supported", "get_provider"]
 
-# An adapter factory builds a concrete provider from the composed, validated config. The
+# An adapter factory builds a concrete reader from the composed, validated config. The
 # type references only the abstraction/composed config (both TYPE_CHECKING-only).
-ProviderFactory = Callable[["SourceControlConfig"], "SourceControlProvider"]
+ProviderFactory = Callable[["SourceControlConfig"], "SourceControlReader"]
 
 # Module-level registry mapping provider name -> adapter factory. Populated by adapters
 # self-registering at import time and resolved by is_supported/get_provider.
@@ -63,10 +63,11 @@ def is_supported(provider_name: str | None) -> bool:
     return provider_name in _REGISTRY
 
 
-def get_provider(config: "SourceControlConfig") -> "SourceControlProvider":
-    """Resolve and build the adapter for ``config.connector.provider`` via the registry (Req 6.3).
+def get_provider(config: "SourceControlConfig") -> "SourceControlReader":
+    """Resolve and build the read adapter for ``config.connector.provider`` via the registry.
 
-    Raises :class:`~connector.provider.UnsupportedProviderError` when no adapter factory is
+    Returns a :class:`~connector.provider.SourceControlReader`. Raises
+    :class:`~connector.provider.UnsupportedProviderError` when no adapter factory is
     registered for the configured provider, so a misconfigured provider fails closed rather
     than reaching a concrete adapter (Req 7.2). The composed :class:`SourceControlConfig` is
     passed to the factory so the adapter can read both its own :class:`AdapterConfig` fields

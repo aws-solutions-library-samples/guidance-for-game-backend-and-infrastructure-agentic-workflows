@@ -79,29 +79,27 @@ def run_orchestrator(query: str, context: dict = None):
         inf = INFERENCE_CONFIG.get("orchestrator")
         orch_model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
 
-        # Conditionally register the Source Control Connector specialist. The write
-        # path (proposing IaC changes as pull requests) is the platform's only mutation
-        # capability, so the specialist is added to the orchestrator tool set ONLY when
-        # the Connector is enabled and validly configured (Req 1.2). When disabled, the
-        # baseline read-only specialist set is unchanged, so the platform behaves exactly
-        # as it does today (Req 1.3). Built once and reused in both Agent constructions
-        # below to avoid divergence between the memory and fallback paths.
+        # Conditionally register the Source Control Connector specialist. It is a read-only
+        # IaC-context capability, so the specialist is added to the orchestrator tool set
+        # ONLY when the Connector is enabled and validly configured. When disabled, the
+        # baseline specialist set is unchanged, so the platform behaves exactly as it does
+        # today. Built once and reused in both Agent constructions below to avoid divergence
+        # between the memory and fallback paths.
         specialist_tools = [gamelift_agent, eks_agent, cost_agent]
         orchestrator_prompt = get_optimized_orchestrator_prompt()
         if SourceControlConfig.load().enabled:
-            # Local import: keeps the connector out of the import graph for read-only
-            # deployments and avoids a hard dependency when the Connector is disabled.
+            # Local import: keeps the connector out of the import graph for deployments where
+            # the Connector is disabled and avoids a hard dependency then.
             # Local modules
             from agents.source_control_specialist import source_control_agent
 
             specialist_tools.append(source_control_agent)
-            # Add the single routing rule for infrastructure-change proposals. Appended
-            # only when enabled so the base prompt (and its version) is untouched for
-            # read-only deployments.
+            # Register the specialist for read-only IaC-context questions. Appended only when
+            # enabled so the base prompt (and its version) is untouched when disabled.
             orchestrator_prompt = (
-                orchestrator_prompt + "\n\n- sourcecontrol_agent: infrastructure CHANGE PROPOSALS — "
-                "open a pull request / modify or update an IaC template "
-                "(CloudFormation, Terraform). Never mutates live AWS."
+                orchestrator_prompt + "\n\n- sourcecontrol_agent: read-only IaC context — "
+                "read and explain existing Infrastructure-as-Code (CloudFormation, Terraform). "
+                "Never mutates live AWS and never opens pull requests."
             )
 
         # Extract memory parameters from context

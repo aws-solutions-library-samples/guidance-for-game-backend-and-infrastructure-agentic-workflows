@@ -156,9 +156,26 @@ def test_fully_specified_entry_parses_all_five_dimensions_of_config():
     )
 
 
+def test_entry_with_path_extension_tenant_workspace_segments_parses_all_dimensions():
+    """A fully-specified entry parses branches, path prefixes, extensions, tenants, workspaces."""
+    entries, errors = _parse_allowlist("org/iac=main,release:infra/:.yaml:acme,globex:prod,staging")
+
+    assert errors == []
+    assert entries == (
+        AllowlistEntry(
+            repo="org/iac",
+            target_branches=("main", "release"),
+            path_prefixes=("infra/",),
+            extensions=(".yaml",),
+            tenants=("acme", "globex"),
+            workspaces=("prod", "staging"),
+        ),
+    )
+
+
 def test_entry_with_too_many_colon_segments_is_a_fail_closed_error():
-    """More than three ':'-separated groups is malformed → parse error (fail-closed)."""
-    entries, errors = _parse_allowlist("org/iac=main:infra/:.yaml:extra")
+    """More than five ':'-separated groups is malformed → parse error (fail-closed)."""
+    entries, errors = _parse_allowlist("org/iac=main:infra/:.yaml:tenant:ws:extra")
 
     assert entries == ()
     assert errors, "an over-segmented entry must produce a config error"

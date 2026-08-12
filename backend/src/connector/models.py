@@ -1,23 +1,22 @@
-"""Provider-agnostic data models for the Source Control Connector.
+"""Provider-agnostic data models for the Source Control Connector (read-only).
 
 These frozen dataclasses form the common vocabulary shared by every layer of the
-Connector — the agent-facing tools, the connector service, the provider abstraction,
-and each concrete provider adapter. They reference only Python primitives so that no
-provider-specific type ever leaks across the abstraction boundary (Req 9.1).
+read-only Connector — the agent-facing tools, the connector service, the provider
+abstraction, and each concrete provider adapter. They reference only Python primitives so
+that no provider-specific type ever leaks across the abstraction boundary.
 
-Immutability (``frozen=True``) makes each value safe to pass through the safety
-pipeline without a caller mutating it after a gate has inspected it, and lets the
-provider layer return results the service can trust unchanged.
+Immutability (``frozen=True``) makes each value safe to pass through the read pipeline
+without a caller mutating it after a gate has inspected it, and lets the provider layer
+return results the service can trust unchanged.
 
 Contents:
 
 - :class:`FileContent` / :class:`FileFetchResult` — the read path: a single file and a
-  batch fetch result carrying missing paths and a limit-exceeded flag (Req 3.2, 3.4).
-- :class:`ProposedFile` — one agent-proposed IaC file plus its declared format.
-- :class:`ChangeProposalResult` — the identifier and URL of an opened Change_Proposal
-  (Req 2.6).
-- :class:`ProposalResult` — the safe, agent-visible outcome of a propose operation;
-  its ``message`` never contains secrets.
+  batch fetch result carrying missing paths and a limit-exceeded flag.
+
+The write-path models (``ProposedFile``, ``ChangeProposalResult``, ``ProposalResult``)
+have been removed with the provider-write path (preserved in branch history for the #314
+executor).
 """
 
 from __future__ import annotations
@@ -38,50 +37,18 @@ class FileContent:
 class FileFetchResult:
     """Result of fetching one or more files from the repository/branch.
 
-    ``missing`` lists paths that could not be found without creating any proposal
-    (Req 3.4); ``limit_exceeded`` is ``True`` when the requested path count exceeded
-    the configured maximum and no provider fetch was performed (Req 3.2).
+    ``missing`` lists paths that could not be found; ``limit_exceeded`` is ``True`` when
+    the requested path count exceeded the configured maximum and no provider fetch was
+    performed.
 
-    ``revision`` is the **Verified_Source_Snapshot** captured at read time: the opaque
-    source revision (the target-branch head at the moment of the read) that the caller
-    actually read. The agent surfaces it back as the required ``base_revision`` when it
-    proposes a change, so the connector can require a read-before-write and reject a
-    proposal that is not anchored to a confirmed view of the source (Req 7.1, 7.2). It is
-    ``None`` when no fetch was performed (e.g. a limit-exceeded or rejected read); the
-    value is provider-neutral — an opaque string the provider produced.
+    Note (advisory-only contract): this result deliberately carries **no** write-usable
+    ``revision``/base-revision field. Head-revision resolution was a read-before-write
+    affordance for the removed write path. Should a future read consumer need a freshness
+    or audit hint, it may be added as an optional ``observed_revision`` that is advisory
+    only and is never accepted by any base-revision/write contract (there is none in
+    scope).
     """
 
     files: tuple[FileContent, ...]
     missing: tuple[str, ...]
     limit_exceeded: bool
-    revision: str | None = None
-
-
-@dataclass(frozen=True)
-class ProposedFile:
-    """A single agent-proposed IaC file destined for a Change_Proposal."""
-
-    path: str
-    content: str
-    iac_format: str  # "cloudformation" | "terraform"
-
-
-@dataclass(frozen=True)
-class ChangeProposalResult:
-    """Identifier and URL of an opened Change_Proposal (Req 2.6)."""
-
-    proposal_id: str
-    proposal_url: str
-
-
-@dataclass(frozen=True)
-class ProposalResult:
-    """Safe, agent-visible outcome of a propose operation.
-
-    ``message`` is safe for the agent to relay and never contains secrets.
-    """
-
-    status: str  # "created" | "declined" | "rejected" | "error"
-    proposal_id: str | None
-    proposal_url: str | None
-    message: str
