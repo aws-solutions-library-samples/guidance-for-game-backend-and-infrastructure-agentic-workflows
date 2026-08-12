@@ -40,6 +40,7 @@ function MyApp({ Component, pageProps }: AppProps) {
   const [config, setConfig] = useState<Config | null>(null);
   const [user, setUser] = useState<CognitoUser | null>(null);
   const [authNotice, setAuthNotice] = useState('');
+  const [sessionCleanupPending, setSessionCleanupPending] = useState(false);
   const sessionExpirationInProgress = useRef(false);
 
   const handleSessionExpired = useCallback(() => {
@@ -48,6 +49,7 @@ function MyApp({ Component, pageProps }: AppProps) {
     }
 
     sessionExpirationInProgress.current = true;
+    setSessionCleanupPending(true);
     try {
       user.signOut();
     } catch {
@@ -64,6 +66,7 @@ function MyApp({ Component, pageProps }: AppProps) {
       })
       .finally(() => {
         sessionExpirationInProgress.current = false;
+        setSessionCleanupPending(false);
       });
   }, [authMode, user]);
 
@@ -109,7 +112,7 @@ function MyApp({ Component, pageProps }: AppProps) {
 
   // Render the appropriate view for the current auth state.
   let content;
-  if (authMode === 'loading') {
+  if (authMode === 'loading' || sessionCleanupPending) {
     content = (
       <div style={{
         display: 'flex',
@@ -121,7 +124,9 @@ function MyApp({ Component, pageProps }: AppProps) {
       }}>
         <div style={{ textAlign: 'center' }}>
           <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🛡️</div>
-          <div style={{ color: 'var(--ga-text)' }}>Loading Game Agent...</div>
+          <div style={{ color: 'var(--ga-text)' }}>
+            {sessionCleanupPending ? 'Ending expired session...' : 'Loading Game Agent...'}
+          </div>
         </div>
       </div>
     );

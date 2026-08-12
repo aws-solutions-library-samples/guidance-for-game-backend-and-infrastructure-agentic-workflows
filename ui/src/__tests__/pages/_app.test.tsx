@@ -8,6 +8,7 @@ import '@testing-library/jest-dom';
 import MyApp from '../../pages/_app';
 
 const mockCognitoSignOut = jest.fn();
+const mockEstablishSession = jest.fn();
 
 // Mock CognitoAuth component
 jest.mock('../../components/CognitoAuth', () => {
@@ -22,7 +23,10 @@ jest.mock('../../components/CognitoAuth', () => {
       <div data-testid="cognito-auth">
         Login Screen
         {notice && <div role="alert">{notice}</div>}
-        <button onClick={() => onAuthenticated?.({ signOut: mockCognitoSignOut })}>
+        <button onClick={() => {
+          mockEstablishSession();
+          onAuthenticated?.({ signOut: mockCognitoSignOut });
+        }}>
           Complete sign in
         </button>
       </div>
@@ -49,6 +53,7 @@ describe('MyApp - Logout behavior', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockEstablishSession.mockReset();
     global.fetch = jest.fn();
     // Clear cookies
     Object.defineProperty(document, 'cookie', {
@@ -198,7 +203,7 @@ describe('MyApp - Logout behavior', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/config', expect.objectContaining({ signal: expect.anything() }));
   });
 
-  it('returns to sign-in and clears the session when an authenticated request receives 401', async () => {
+  it('returns to sign-in and sends one logout when concurrent authenticated requests receive 401', async () => {
     const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
       const url = input.toString();
       if (url === '/api/config') {
@@ -236,7 +241,10 @@ describe('MyApp - Logout behavior', () => {
 
     const AuthenticatedPage = () => (
       <div data-testid="app-content">
-        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>
+        <button onClick={() => void Promise.all([
+          fetch('/api/copilot/chat', { method: 'POST' }),
+          fetch('/api/copilot/chat', { method: 'POST' }),
+        ])}>
           Submit message
         </button>
       </div>
@@ -257,6 +265,153 @@ describe('MyApp - Logout behavior', () => {
       expect.objectContaining({ method: 'POST' }),
     );
     expect(mockCognitoSignOut).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls.filter(([input]) => input.toString() === '/api/copilot/chat')).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([input]) => input.toString() === '/api/copilot/chat')).toHaveLength(2);
+  });
+
+  it('does not let stale expiration cleanup clear a newly established session', async () => {
+    let releaseLogout!: () => void;
+    let serverSession: 'none' | 'fresh' = 'none';
+    const pendingLogout = new Promise<Response>((resolve) => {
+      releaseLogout = () => {
+        serverSession = 'none';
+        resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true }),
+        } as Response);
+      };
+    });
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: {
+              region: 'us-west-2',
+              userPoolId: 'test-pool',
+              clientId: 'test-client',
+            },
+          }),
+        } as Response;
+      }
+      if (url === '/api/copilot/chat') {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ error: 'Unauthorized' }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return pendingLogout;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock;
+    mockEstablishSession.mockImplementation(() => {
+      serverSession = 'fresh';
+    });
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>
+          Submit message
+        </button>
+      </div>
+    );
+
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Submit message' }));
+    await waitFor(() => expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/auth/logout',
+    )).toHaveLength(1));
+
+    const immediateSignIn = screen.queryByRole('button', { name: 'Complete sign in' });
+    if (immediateSignIn) {
+      fireEvent.click(immediateSignIn);
+      await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+    }
+
+    releaseLogout();
+
+    if (!immediateSignIn) {
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Complete sign in' })).toBeInTheDocument());
+      fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    }
+
+    await waitFor(() => expect(serverSession).toBe('fresh'));
+    expect(immediateSignIn).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/auth/logout',
+    )).toHaveLength(1);
+  });
+
+  it('allows sign-in after expiration cleanup fails', async () => {
+    let rejectLogout!: (error: Error) => void;
+    const pendingLogout = new Promise<Response>((_resolve, reject) => {
+      rejectLogout = reject;
+    });
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: {
+              region: 'us-west-2',
+              userPoolId: 'test-pool',
+              clientId: 'test-client',
+            },
+          }),
+        } as Response;
+      }
+      if (url === '/api/copilot/chat') {
+        return {
+          ok: false,
+          status: 401,
+          json: async () => ({ error: 'Unauthorized' }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return pendingLogout;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>
+          Submit message
+        </button>
+      </div>
+    );
+
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Submit message' }));
+
+    await waitFor(() => expect(screen.getByText('Ending expired session...')).toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: 'Complete sign in' })).not.toBeInTheDocument();
+
+    rejectLogout(new Error('Logout unavailable'));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Complete sign in' })).toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent('Your session expired. Sign in again.');
   });
 });
