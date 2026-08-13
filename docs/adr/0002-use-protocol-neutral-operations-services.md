@@ -63,8 +63,8 @@ by these services.
   through every adapter.
 - Contract and adapter-parity tests become release gates.
 - Protocol-specific authentication and error mapping stay at the edge.
-- Versioned contracts and exact principal fields are defined by later E0
-  issues without changing this boundary.
+- Versioned contracts and exact principal fields are defined by the foundation
+  phase (E0) without changing this boundary.
 
 ## Rejected Alternatives
 
