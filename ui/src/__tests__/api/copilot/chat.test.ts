@@ -46,6 +46,10 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
   afterEach(() => {
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    delete process.env.AGENTCORE_RUNTIME_ID;
+    delete process.env.COGNITO_CLIENT_ID;
+    delete process.env.GBAW_TENANT_ID;
+    delete process.env.GBAW_WORKSPACE_ID;
   });
 
   // An ID token that fails cryptographic verification (bad signature, wrong
@@ -104,13 +108,24 @@ describe('/api/copilot/chat - JWT decoding', () => {
   });
 
   it('returns 403 when user not approved', async () => {
-    // Verified ID token, but no approved group.
-    mockVerify.mockResolvedValue({ sub: 'user123', email: 'test@example.com', 'cognito:groups': [] });
+    process.env.NODE_ENV = 'production';
+    process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    // Verified access token, but no approved group.
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      'cognito:groups': [],
+    });
 
     const { req, res } = createMocks({
       method: 'POST',
       headers: {
-        cookie: 'cognito_id_token=header.payload.signature'
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token'
       },
       body: {
         operationName: 'generateCopilotResponse',
@@ -129,6 +144,7 @@ describe('/api/copilot/chat - JWT decoding', () => {
     expect(res._getStatusCode()).toBe(403);
     const data = JSON.parse(res._getData());
     expect(data.error).toBe('Account pending approval');
+
   });
 
   it('handles loadAgentState with 200 + empty state (not a 400)', async () => {

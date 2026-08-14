@@ -181,6 +181,14 @@ function Deploy-GameAgent {
         Write-Host "   Orchestrator model: $orchestratorModelId"
         Write-Host "   Specialist model:   $specialistModelId"
 
+        $identitySettingsJson = (uv run python $settingsLoader --format json --identity-only) | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "identity settings resolution failed (exit code $LASTEXITCODE)" }
+        $identitySettings = $identitySettingsJson | ConvertFrom-Json
+        $tenantId = $identitySettings.GBAW_TENANT_ID
+        $workspaceId = $identitySettings.GBAW_WORKSPACE_ID
+        Write-Host "   Tenant binding:      $tenantId"
+        Write-Host "   Workspace binding:   $workspaceId"
+
         $agentCoreEnvArgs = New-GameAgentAgentCoreEnvArgs `
             -OrchestratorModelId $orchestratorModelId `
             -SpecialistModelId $specialistModelId `
@@ -366,7 +374,12 @@ function Deploy-GameAgent {
         Write-GameAgentStatus 'Step 7: Deploying frontend...' -Type Info
         Deploy-Stack -StackName "$ProjectName-frontend" `
             -TemplateFile (Join-Path $infraPath '02-frontend-ecs-express.yaml') `
-            -Params @("ProjectName=$ProjectName", "RuntimeId=$runtimeId")
+            -Params @(
+                "ProjectName=$ProjectName",
+                "RuntimeId=$runtimeId",
+                "TenantId=$tenantId",
+                "WorkspaceId=$workspaceId"
+            )
 
         $frontendUrl = Get-StackOutput "$ProjectName-frontend" 'ServiceUrl'
         Write-GameAgentStatus "Frontend deployed: https://$frontendUrl" -Type Success
