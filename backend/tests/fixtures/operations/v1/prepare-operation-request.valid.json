@@ -1,0 +1,16 @@
+{
+  "request_contract_version": "1.0",
+  "capability_id": "source-control.change-proposal",
+  "proposal": {
+    "provider": "github",
+    "repository_id": "github:repository:123456",
+    "target_branch": "main",
+    "files": [
+      {
+        "path": "infrastructure/game.yaml",
+        "content_encoding": "utf-8",
+        "content": "AWSTemplateFormatVersion: '2010-09-09'\nResources: {}\n"
+      }
+    ]
+  }
+}

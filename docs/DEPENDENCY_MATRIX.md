@@ -4,7 +4,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 ## Overview
 
-- **Last Updated**: 2026-01-12
+- **Last Updated**: 2026-08-13
 - **Python Version**: >=3.13.9
 - **Node.js Version**: 18+
 
@@ -60,6 +60,8 @@ This document provides a comprehensive overview of major dependencies, their ver
 | PyYAML | >=6.0.1 | YAML parsing | MIT | Use safe_load only |
 | httpx | >=0.28.1 | HTTP client | BSD-3-Clause | - |
 | psutil | >=6.1.0 | Process monitoring | BSD-3-Clause | - |
+| jsonschema | >=4.26.0 | Operations contract validation | MIT | Draft 2020-12 schemas fail closed |
+| rfc8785 | >=0.1.4 | JSON Canonicalization Scheme | Apache-2.0 | Deterministic approval and contract hashes |
 
 ### Documentation Tools
 
@@ -167,6 +169,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 | Date | Changes |
 |------|---------|
+| 2026-08-13 | Added JSON Schema and RFC 8785 support for versioned operations contracts |
 | 2026-01-12 | Initial security audit, updated Next.js to fix CVE |
 
 ---

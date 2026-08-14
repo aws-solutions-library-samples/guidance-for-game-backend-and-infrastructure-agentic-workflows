@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:common",
+  "title": "Game Agent Operations Contract Common Types 1.0",
+  "$defs": {
+    "contract_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^op_[a-z0-9]{26}$"
+    },
+    "idempotency_token": {
+      "type": "string",
+      "minLength": 25,
+      "maxLength": 133,
+      "pattern": "^idem_[A-Za-z0-9_-]{20,128}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "authority": {
+      "type": "string",
+      "enum": [
+        "disabled",
+        "observe",
+        "advise",
+        "remediate",
+        "operate"
+      ]
+    },
+    "correlation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "correlation_id",
+        "request_id"
+      ],
+      "properties": {
+        "correlation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "request_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "principal_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subject_id",
+        "client_id"
+      ],
+      "properties": {
+        "subject_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "client_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "trusted_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "subject_id",
+        "client_id",
+        "tenant_id",
+        "workspace_id"
+      ],
+      "properties": {
+        "subject_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "client_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "playbook_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "playbook_id",
+        "playbook_version",
+        "playbook_hash"
+      ],
+      "properties": {
+        "playbook_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "playbook_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+\\.[0-9]+$"
+        },
+        "playbook_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "recommendation_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_type",
+        "source_id"
+      ],
+      "properties": {
+        "source_type": {
+          "type": "string",
+          "enum": [
+            "human",
+            "model",
+            "automation"
+          ]
+        },
+        "source_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "executor_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "executor_id",
+        "executor_binding_version"
+      ],
+      "properties": {
+        "executor_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "executor_binding_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+$"
+        }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_attempts",
+        "base_delay_seconds",
+        "max_delay_seconds",
+        "reconcile_before_retry"
+      ],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "base_delay_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 300
+        },
+        "max_delay_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "reconcile_before_retry": {
+          "type": "boolean"
+        }
+      }
+    },
+    "resource_enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enrollment_id",
+        "enrollment_version"
+      ],
+      "properties": {
+        "enrollment_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "enrollment_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "policy_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "policy_version"
+      ],
+      "properties": {
+        "policy_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "policy_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "calculated_risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "level",
+        "score",
+        "factors"
+      ],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "low",
+            "moderate",
+            "high",
+            "critical"
+          ]
+        },
+        "score": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "factors": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        }
+      }
+    },
+    "capability_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability_id",
+        "capability_version"
+      ],
+      "properties": {
+        "capability_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "capability_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+$"
+        }
+      }
+    },
+    "schema_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_id",
+        "schema_hash"
+      ],
+      "properties": {
+        "schema_id": {
+          "type": "string",
+          "format": "uri"
+        },
+        "schema_hash": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actor_type",
+        "actor_id"
+      ],
+      "properties": {
+        "actor_type": {
+          "type": "string",
+          "enum": [
+            "principal",
+            "workflow",
+            "executor",
+            "system"
+          ]
+        },
+        "actor_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "client_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "operation_state": {
+      "type": "string",
+      "enum": [
+        "prepared",
+        "pending_approval",
+        "approved",
+        "dispatched",
+        "executing",
+        "retry_pending",
+        "succeeded",
+        "failed",
+        "rejected",
+        "cancelled",
+        "expired"
+      ]
+    }
+  }
+}
