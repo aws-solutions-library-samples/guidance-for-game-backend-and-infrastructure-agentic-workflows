@@ -1,0 +1,172 @@
+{
+  "vector_version": "1.0",
+  "playbook_fixture": "source-control-playbook.valid.json",
+  "prepared_operation_fixture": "source-control-prepared-operation.valid.json",
+  "expected": {
+    "playbook_hash": "sha256:4128b928026df7387278901c4e7b7e4e111f5f846841c03795cb42411c75070e",
+    "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "prepared_operation_hash": "sha256:aed919c38939443654381eb251d9a3bed0112432970d689fbc4683882205e564",
+    "idempotency_token": "idem_AAAAAAAAAAAAAAAAAAAA",
+    "operation_contract_version": "1.0",
+    "duplicate_content_hash": "sha256:9157a5c313643625d18bc578b2dadb9380ba1f495e4a85d7b9d349421363700e",
+    "proposal_branch": "gba-op-c2dae6982929dfa9d5aa"
+  },
+  "hash_invalidation_cases": [
+    {
+      "name": "changed base revision",
+      "path": [
+        "target",
+        "base_revision"
+      ],
+      "replacement": "2222222222222222222222222222222222222222"
+    },
+    {
+      "name": "changed normalized path",
+      "path": [
+        "parameters",
+        "files",
+        0,
+        "path"
+      ],
+      "replacement": "infrastructure/game-v2.yaml"
+    },
+    {
+      "name": "changed file content",
+      "path": [
+        "parameters",
+        "files",
+        0,
+        "content"
+      ],
+      "replacement": "AWSTemplateFormatVersion: '2010-09-09'\nResources:\n  Queue: {}\n"
+    },
+    {
+      "name": "changed policy version",
+      "path": [
+        "policy",
+        "policy_version"
+      ],
+      "replacement": "13"
+    },
+    {
+      "name": "changed enrollment version",
+      "path": [
+        "resource_enrollment",
+        "enrollment_version"
+      ],
+      "replacement": "8"
+    },
+    {
+      "name": "changed calculated risk",
+      "path": [
+        "calculated_risk",
+        "score"
+      ],
+      "replacement": 41
+    },
+    {
+      "name": "changed operation contract version",
+      "path": [
+        "operation_contract_version"
+      ],
+      "replacement": "2.0"
+    },
+    {
+      "name": "changed executor binding",
+      "path": [
+        "executor_binding",
+        "executor_binding_version"
+      ],
+      "replacement": "2.0"
+    }
+  ],
+  "invalid_contract_cases": [
+    {
+      "name": "request body identity injection",
+      "fixture": "prepare-operation-request.valid.json",
+      "schema": "prepare-operation-request",
+      "path": [
+        "requester"
+      ],
+      "replacement": {
+        "subject_id": "subject:untrusted",
+        "client_id": "client:untrusted",
+        "tenant_id": "tenant:untrusted",
+        "workspace_id": "workspace:untrusted"
+      }
+    },
+    {
+      "name": "request body base revision injection",
+      "fixture": "prepare-operation-request.valid.json",
+      "schema": "prepare-operation-request",
+      "path": [
+        "proposal",
+        "base_revision"
+      ],
+      "replacement": "unverified-revision"
+    },
+    {
+      "name": "path traversal",
+      "fixture": "prepare-operation-request.valid.json",
+      "schema": "prepare-operation-request",
+      "path": [
+        "proposal",
+        "files",
+        0,
+        "path"
+      ],
+      "replacement": "../outside.yaml"
+    },
+    {
+      "name": "stored path traversal",
+      "fixture": "source-control-prepared-operation.valid.json",
+      "schema": "source-control-prepared-operation",
+      "path": [
+        "parameters",
+        "files",
+        0,
+        "path"
+      ],
+      "replacement": "../outside.yaml"
+    },
+    {
+      "name": "provider credential",
+      "fixture": "source-control-prepared-operation.valid.json",
+      "schema": "source-control-prepared-operation",
+      "path": [
+        "provider_token"
+      ],
+      "replacement": "not-a-real-token"
+    },
+    {
+      "name": "unfiltered provider response",
+      "fixture": "ledger-event.valid.json",
+      "schema": "ledger-event",
+      "path": [
+        "payload",
+        "provider_response"
+      ],
+      "replacement": {
+        "status": 201
+      }
+    },
+    {
+      "name": "unsupported operation contract version",
+      "fixture": "source-control-prepared-operation.valid.json",
+      "schema": "source-control-prepared-operation",
+      "path": [
+        "operation_contract_version"
+      ],
+      "replacement": "2.0"
+    },
+    {
+      "name": "invalid lifecycle transition",
+      "fixture": "operation-state-change.valid.json",
+      "schema": "operation-state-change",
+      "path": [
+        "new_state"
+      ],
+      "replacement": "succeeded"
+    }
+  ]
+}

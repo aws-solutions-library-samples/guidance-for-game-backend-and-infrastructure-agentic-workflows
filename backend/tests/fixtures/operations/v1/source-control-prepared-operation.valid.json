@@ -1,0 +1,81 @@
+{
+  "operation_contract_version": "1.0",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idempotency_token": "idem_AAAAAAAAAAAAAAAAAAAA",
+  "created_at": "2026-08-13T20:00:00Z",
+  "expires_at": "2026-08-13T21:00:00Z",
+  "playbook": {
+    "playbook_id": "source-control.change-proposal",
+    "playbook_version": "1.0.0",
+    "playbook_hash": "sha256:4128b928026df7387278901c4e7b7e4e111f5f846841c03795cb42411c75070e"
+  },
+  "profile": "source-control.change-proposal/1.0",
+  "action": "source-control.create-change-proposal",
+  "requester": {
+    "subject_id": "subject:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "client_id": "client:operations-web",
+    "tenant_id": "tenant:example",
+    "workspace_id": "workspace:game-platform"
+  },
+  "correlation": {
+    "correlation_id": "correlation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "request_id": "request:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "causation_id": "recommendation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E"
+  },
+  "recommendation": {
+    "source_type": "model",
+    "source_id": "recommendation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E"
+  },
+  "target": {
+    "provider": "github",
+    "repository_id": "github:repository:123456",
+    "target_branch": "main",
+    "base_revision": "1111111111111111111111111111111111111111",
+    "proposal_branch": "gba-op-c2dae6982929dfa9d5aa"
+  },
+  "parameters": {
+    "files": [
+      {
+        "path": "infrastructure/game.yaml",
+        "content_encoding": "utf-8",
+        "content": "AWSTemplateFormatVersion: '2010-09-09'\nResources: {}\n",
+        "content_hash": "sha256:5563154aebbb6f614eb7af725f3f92f34ac5899b808fbcb2ed66fc1fc058ea57"
+      }
+    ],
+    "diff": {
+      "rendered_diff": "diff --git a/infrastructure/game.yaml b/infrastructure/game.yaml\nnew file mode 100644\n--- /dev/null\n+++ b/infrastructure/game.yaml\n@@ -0,0 +1,2 @@\n+AWSTemplateFormatVersion: '2010-09-09'\n+Resources: {}\n",
+      "diff_hash": "sha256:0e2147c9518048c03ec5ceb5e98e49f72afddfdf3596dc58c9c0f09f83881b95"
+    }
+  },
+  "resource_enrollment": {
+    "enrollment_id": "enrollment:game-service-iac",
+    "enrollment_version": "7"
+  },
+  "policy": {
+    "policy_id": "policy:source-control",
+    "policy_version": "12"
+  },
+  "calculated_risk": {
+    "level": "moderate",
+    "score": 40,
+    "factors": [
+      "creates-ci-capable-proposal",
+      "infrastructure-as-code"
+    ]
+  },
+  "capability": {
+    "capability_id": "source-control.change-proposal",
+    "capability_version": "1.0"
+  },
+  "retry_policy": {
+    "max_attempts": 3,
+    "base_delay_seconds": 2,
+    "max_delay_seconds": 30,
+    "reconcile_before_retry": true
+  },
+  "executor_binding": {
+    "executor_id": "source-control.change-proposal",
+    "executor_binding_version": "1.0"
+  },
+  "duplicate_content_hash": "sha256:9157a5c313643625d18bc578b2dadb9380ba1f495e4a85d7b9d349421363700e"
+}
