@@ -150,6 +150,53 @@ Game Agent is an AI-powered conversational assistant for managing AWS game serve
 | Token Exhaustion | Long prompts to waste tokens | Input length limits |
 | Output Manipulation | Forcing specific outputs | Output validation |
 
+## Source Control Connector
+
+The Source Control Connector is an **opt-in, disabled-by-default** capability. When disabled, none
+of the threats below apply because the specialist is never registered and no credential grant or
+outbound path exists. When enabled, it adds a controlled **read-only** IaC-context path that reads
+approved IaC sources so the agent can review the current source of truth; it never mutates live
+AWS resources and, per **Architecture Update v1.3**, the chat runtime holds **no write path or
+write credential at all** — the provider-write path (branch/commit/unmerged change proposal) has
+**moved to the isolated #314 executor**. This section covers the threats specific to the read
+path. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md#source-control-connector-read-only-iac-context-path) for the
+architecture and [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md) for the deep-dive.
+
+### Additional Trust Boundary: Outbound Provider
+
+- **Entry/Exit Points**: Outbound HTTPS from the AgentCore Runtime to a third-party source-control
+  provider (for example `api.github.com` or a configured enterprise base URL).
+- **Trust Level**: External third party, outside the AWS control plane and IAM trust domain.
+- **Blast radius**: A compromise of the read credential is limited to **reading allowlisted
+  files** on allowlisted tenants/workspaces/repositories/branches. It **cannot write, propose,
+  merge, approve, or close** anything and **cannot mutate live AWS resources**, because the
+  connector exposes no such operation, holds no write credential, and the runtime role stays
+  read-only against live AWS. The write path lives in the separate #314 executor, outside this
+  trust boundary.
+
+### Connector Threats
+
+| Threat ID | Threat | Component | Mitigation | Status |
+|-----------|--------|-----------|------------|--------|
+| SC1 | Read credential compromise or exposure | Provider Adapter | Single scoped Secrets Manager ARN; adapter-owned, fetched per request; never logged; IAM `GetSecretValue` scoped to that one ARN; credential never in env or tool output; **no write credential present in the runtime** | Mitigated |
+| SC2 | Unauthorized tenant/workspace/repo/branch/path/extension read | Service Layer | Seven-dimension authorization (tenant · workspace · repository · branch · path · extension · group) enforced on reads; fail-closed; disabled by default | Mitigated |
+| SC3 | Prompt injection redirecting a read or forging identity | Service Layer / AI Backend | Identity, tenant, workspace, and groups derived only from verified Cognito claims via the request context, never from model input; effective repo/branch taken from the matched allowlist entry; tool-boundary injection re-check | Mitigated |
+| SC4 | Duplicate or ambiguous read audit from retries / ambiguous outcomes | Service Layer | Read-before-review `base_revision` snapshot; stable idempotency key reconciles a retried or ambiguous read to a single audited outcome | Mitigated |
+| SC5 | Audit gaps or overclaimed atomicity | Audit Sink | Durable intent (pre-read) and outcome (post) `scm_read` events; reconciliation instead of a cross-system atomicity claim; unconfirmed intent aborts before any outbound read; unconfirmed outcome is reconcilable, never a false success | Mitigated |
+| SC6 | Secrets or sensitive fields leaking into audit/logs | Audit Sink | No secrets recorded in intent/outcome events; sanitized fields (`sanitize_log_data`) as defense-in-depth | Mitigated |
+| SC7 | Escalation from read to write / live mutation | Service Layer | No create/commit/propose/merge/approve/close/delete/force-push operation exposed and no write credential held; the write path is isolated in the #314 executor; runtime role read-only against live AWS | Mitigated |
+
+### No Write Path in the Runtime
+
+The runtime's **containment boundary** is that it **cannot write at all**: the connector can only
+read approved files and exposes no operation to create, commit, propose, merge, approve, or close a
+change, and it holds no write credential. Any real change is still gated on a human reviewer and
+the existing CI/CD pipeline, but that write-and-review path now lives entirely in the isolated
+#314 executor rather than in this runtime. Read-before-review `base_revision` snapshots and
+idempotent retries ensure downstream review reasons about a confirmed source revision, without
+duplicate audit outcomes from retries.
+
 ## Risk Assessment
 
 ### High Risk Items

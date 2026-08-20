@@ -40,6 +40,9 @@ dependencies = [
     "PyYAML>=6.0.1",
     "cachetools>=6.2.4",  # bounded TTL caches (rate-limit, KB, memory dedup)
 
+    # Terraform HCL parsing for source-control connector IaC validation
+    "python-hcl2>=7.0.0",
+
     # OpenTelemetry / ADOT for AgentCore observability
     "aws-opentelemetry-distro>=0.19.0",
     "opentelemetry-instrumentation>=0.65b0",
@@ -81,6 +84,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.3.1",
+    "hypothesis>=6.130.0",  # property-based tests (source-control connector)
 
     # Code quality tools
     "pre-commit>=4.6.1",

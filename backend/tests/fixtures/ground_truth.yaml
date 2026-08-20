@@ -81,6 +81,47 @@ routing:
     expected_keywords: [cost, bill, forecast, spending]
     not_expected: []
 
+  # --- IaC-change proposals → source-control specialist (Req 12.3 / MR4) ---
+  # Only meaningful when the Source Control Connector is enabled in the target
+  # stack; the orchestrator appends the sourcecontrol_agent routing rule only
+  # when enabled. When disabled the specialist is not registered.
+  - query: "Update the VPC CloudFormation template"
+    expected_agent: sourcecontrol_agent
+    description: "IaC edit request must route to the source-control change specialist"
+    expected_keywords: [proposal, pull request, change, template]
+    not_expected: []
+
+  - query: "Open a PR to change the fleet config"
+    expected_agent: sourcecontrol_agent
+    description: "Explicit PR/change-proposal request routes to source control, not GameLift"
+    expected_keywords: [proposal, pull request, change]
+    not_expected: []
+
+  - query: "Propose an edit to the Terraform networking module and open a pull request"
+    expected_agent: sourcecontrol_agent
+    description: "Propose + open PR against IaC = source-control change specialist"
+    expected_keywords: [proposal, pull request, change, terraform]
+    not_expected: []
+
+  - query: "Modify the CloudFormation template to add a new subnet"
+    expected_agent: sourcecontrol_agent
+    description: "Modify an IaC template = change proposal, never a live mutation"
+    expected_keywords: [proposal, pull request, change, template]
+    not_expected: []
+
+  # --- Read-only infra discrimination — must NOT misroute to source control ---
+  - query: "List my EKS clusters and their current status"
+    expected_agent: eks
+    description: "Read-only EKS listing must not be misrouted to source control"
+    expected_keywords: [eks, cluster, kubernetes]
+    not_expected: [pull request, proposal, "open a pr"]
+
+  - query: "Show fleet utilization for my GameLift fleets"
+    expected_agent: gamelift
+    description: "Read-only GameLift utilization must not be misrouted to source control"
+    expected_keywords: [fleet, gamelift, util]
+    not_expected: [pull request, proposal, "open a pr"]
+
 # =============================================================================
 # KB_QUERIES — Per-KB retrieval relevance + latency benchmarks
 # =============================================================================

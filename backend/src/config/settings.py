@@ -105,6 +105,47 @@ AGENT_TIMEOUT_SPECIALIST_SECONDS = int(
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("GBAW_RATE_LIMIT_MAX_REQUESTS", "10"))  # requests per window
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_WINDOW_SECONDS", "60"))  # window in seconds
 
+# =============================================================================
+# SOURCE CONTROL CONNECTOR (opt-in read-only IaC-context path, disabled by default)
+# =============================================================================
+# Raw parsing of the connector's GBAW_SCM_* configuration, following the same
+# GBAW_-prefixed os.getenv() convention as RATE_LIMIT_* above.
+#
+# Per Architecture Update v1.3 the provider-WRITE path was removed from the chat
+# runtime (it now lives in the isolated executor, issue #314); only the
+# authorized, audited read path ships here.
+#
+# Per Requirement 12.1, connector configuration is read EXCLUSIVELY from these
+# GBAW_-prefixed environment variables; no other configuration source is
+# consulted. Values are intentionally kept as raw strings here — validation,
+# range checks, and the enabled/disabled decision live in
+# ConnectorConfig.load() so that misconfiguration results in a disabled
+# connector plus an audit entry rather than an import-time crash.
+SCM_CONNECTOR_ENABLED = os.getenv("GBAW_SCM_CONNECTOR_ENABLED", "false")  # truthy: true/1/yes
+SCM_PROVIDER = os.getenv("GBAW_SCM_PROVIDER")  # e.g. "github"
+# The single ARN-valued READ-credential setting used consistently for both runtime
+# credential acquisition (AdapterConfig.read_credential_secret_arn) and the scoped IAM
+# grant (ScmReadCredentialSecretArn), so runtime config and IAM scope cannot drift. The
+# provider-WRITE credential was removed with the write path (issue #314).
+SCM_READ_CREDENTIAL_SECRET_ARN = os.getenv("GBAW_SCM_READ_CREDENTIAL_SECRET_ARN")  # Secrets Manager ARN (read-only)
+SCM_REPO_ALLOWLIST = os.getenv("GBAW_SCM_REPO_ALLOWLIST")  # "repo=branch,branch;repo=branch" grammar
+SCM_AUTHORIZED_GROUPS = os.getenv("GBAW_SCM_AUTHORIZED_GROUPS")  # comma-separated Cognito groups
+SCM_RATE_LIMIT_MAX = os.getenv("GBAW_SCM_RATE_LIMIT_MAX", "5")  # 1..1000, default 5
+SCM_RATE_LIMIT_WINDOW_SECONDS = os.getenv("GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS", "3600")  # 60..86400, default 3600
+SCM_PROVIDER_TIMEOUT_SECONDS = os.getenv("GBAW_SCM_PROVIDER_TIMEOUT_SECONDS", "30")  # 1..300, default 30
+SCM_RETRY_MAX_ATTEMPTS = os.getenv("GBAW_SCM_RETRY_MAX_ATTEMPTS", "3")  # 1..10, default 3
+SCM_MAX_FILES_PER_REQUEST = os.getenv("GBAW_SCM_MAX_FILES_PER_REQUEST", "20")  # max files per read request
+# Maximum total byte size of the content returned by a single read; a result exceeding this
+# is rejected with no files served. Default 1 MiB.
+SCM_MAX_CONTENT_BYTES = os.getenv("GBAW_SCM_MAX_CONTENT_BYTES", "1048576")  # 1..N bytes, default 1 MiB
+# Optional Provider API base URL for self-hosted/enterprise endpoints. When set it must be
+# an absolute HTTPS URL (validated in ConnectorConfig.load); when unset the adapter defaults
+# to the provider's public API endpoint (Req 10.1, 10.2, 10.3).
+SCM_PROVIDER_BASE_URL = os.getenv("GBAW_SCM_PROVIDER_BASE_URL")
+# Dedicated CloudWatch Logs log group backing the durable audit sink. Required when the
+# connector is enabled (Req 13.1).
+SCM_AUDIT_LOG_GROUP = os.getenv("GBAW_SCM_AUDIT_LOG_GROUP")
+
 # Vector store embedding configuration (Well-Architected GenAI Lens: Cost 3.4, Performance Efficiency)
 # Titan Embed v2 supports 256, 512, 1024 dimensions.
 # Lower dimensions = cheaper storage/queries, faster retrieval, slightly lower quality.
@@ -156,6 +197,11 @@ INFERENCE_CONFIG: dict[str, AgentInferenceConfig] = {
     "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
+    # Source Control specialist reviews existing IaC as read-only context — a careful,
+    # deterministic read path, so it pins the lowest temperature. Keyed "sourcecontrol"
+    # because the specialist's service_name="SourceControl" lowercases to this lookup key
+    # in create_specialist_agent (INFERENCE_CONFIG.get(service_name.lower())).
+    "sourcecontrol": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
 }
 
 # Resilience settings (Well-Architected GenAI Lens: Reliability 2)

@@ -101,10 +101,28 @@ echo ""
 
 # Step 1: Deploy base infrastructure
 echo "📦 Step 1: Deploying base infrastructure..."
+
+# Source Control Connector: source the READ-credential secret ARN and (optional)
+# audit log-group name from the environment or backend/.env.local so the base
+# stack can apply the scoped read-credential grant (and, once available, provision
+# the audit log group). Only the secret ARN is passed to the stack — never the raw
+# credential value (Req 3.4). Both default to empty for deployments that never
+# enable the connector (Req 3.3).
+SCM_READ_CREDENTIAL_SECRET_ARN="${GBAW_SCM_READ_CREDENTIAL_SECRET_ARN:-$(grep "^GBAW_SCM_READ_CREDENTIAL_SECRET_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+SCM_AUDIT_LOG_GROUP="${GBAW_SCM_AUDIT_LOG_GROUP:-$(grep "^GBAW_SCM_AUDIT_LOG_GROUP=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+
+BASE_STACK_PARAMS=(ProjectName="$PROJECT_NAME" ScmReadCredentialSecretArn="$SCM_READ_CREDENTIAL_SECRET_ARN")
+# The audit log-group parameter is added to the base template by task 7.2. Pass it
+# only when configured so deployments against the current template (which does not
+# yet define the parameter) are not broken when it is unset.
+if [ -n "$SCM_AUDIT_LOG_GROUP" ]; then
+  BASE_STACK_PARAMS+=(ScmAuditLogGroupName="$SCM_AUDIT_LOG_GROUP")
+fi
+
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/01-base-infrastructure.yaml" \
   --stack-name "${PROJECT_NAME}-infrastructure" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides "${BASE_STACK_PARAMS[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 
@@ -375,12 +393,57 @@ if [ -n "$GAMELIFT_KB_ID" ]; then echo "   GameLift KB: $GAMELIFT_KB_ID"; fi
 if [ -n "$EKS_KB_ID" ]; then echo "   EKS KB:      $EKS_KB_ID"; fi
 if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
 
+# Source Control Connector (disabled by default). Wire GBAW_SCM_* vars through the
+# same -env mechanism, including only the ones that are set so deployments that never
+# configure the connector are unaffected. The single ARN-valued read-credential
+# setting (GBAW_SCM_READ_CREDENTIAL_SECRET_ARN) is delivered separately below from the
+# SAME source value used for the base stack's ScmReadCredentialSecretArn parameter —
+# only the ARN is ever passed, never a raw credential value (Req 11.2).
+SCM_ENV_ARGS=()
+for _scm_var in \
+  GBAW_SCM_CONNECTOR_ENABLED \
+  GBAW_SCM_PROVIDER \
+  GBAW_SCM_PROVIDER_BASE_URL \
+  GBAW_SCM_REPO_ALLOWLIST \
+  GBAW_SCM_AUTHORIZED_GROUPS \
+  GBAW_SCM_AUDIT_LOG_GROUP \
+  GBAW_SCM_RATE_LIMIT_MAX \
+  GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS \
+  GBAW_SCM_PROVIDER_TIMEOUT_SECONDS \
+  GBAW_SCM_RETRY_MAX_ATTEMPTS \
+  GBAW_SCM_MAX_FILES_PER_REQUEST; do
+  # Prefer the value already exported in the environment; fall back to .env.local
+  _scm_val="${!_scm_var:-$(grep "^${_scm_var}=" .env.local 2>/dev/null | cut -d'=' -f2- || echo "")}"
+  if [ -n "$_scm_val" ]; then
+    SCM_ENV_ARGS+=(-env "${_scm_var}=${_scm_val}")
+  fi
+done
+# Single-source the read-credential ARN (Req 11.2 / MR5): the SAME value resolved for
+# the base stack's ScmReadCredentialSecretArn parameter (Step 1,
+# $SCM_READ_CREDENTIAL_SECRET_ARN) is delivered as the runtime env var
+# GBAW_SCM_READ_CREDENTIAL_SECRET_ARN, so the runtime credential-acquisition config and
+# the scoped IAM grant are driven by one value and cannot drift. Only the ARN is
+# passed — never a raw credential value.
+if [ -n "$SCM_READ_CREDENTIAL_SECRET_ARN" ]; then
+  SCM_ENV_ARGS+=(-env "GBAW_SCM_READ_CREDENTIAL_SECRET_ARN=$SCM_READ_CREDENTIAL_SECRET_ARN")
+fi
+if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
+  echo "   Source Control Connector: wiring ${#SCM_ENV_ARGS[@]} GBAW_SCM_* env var(s)"
+fi
+
 # Always update the runtime with the complete set of currently resolved values.
 # This keeps role models synchronized even when one or more optional KBs are not
 # available and avoids dropping prompt or Guardrail settings on replacement.
+# Rebuild AGENTCORE_ENV_ARGS now that KB IDs have been resolved from .env.local,
+# then append the Source Control Connector env args UNCONDITIONALLY so the
+# GBAW_SCM_* vars are delivered regardless of whether the KB IDs exist (Req 8.1-8.3).
 build_agentcore_env_args
+LAUNCH_ENV_ARGS=("${AGENTCORE_ENV_ARGS[@]}")
+if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then
+  LAUNCH_ENV_ARGS+=("${SCM_ENV_ARGS[@]}")
+fi
 echo "🚀 Updating AgentCore Runtime environment..."
-uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
+uv run agentcore launch --auto-update-on-conflict "${LAUNCH_ENV_ARGS[@]}"
 echo "✅ AgentCore Runtime updated with role models and available service configuration"
 
 cd "$PROJECT_ROOT"

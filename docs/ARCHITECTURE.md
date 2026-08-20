@@ -349,6 +349,115 @@ See [`SECURITY.md`](../SECURITY.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md) for
 
 ---
 
+## Source Control Connector (Read-Only IaC Context Path)
+
+The Source Control Connector is an **opt-in** capability that adds a controlled *read-only*
+Infrastructure-as-Code (IaC) context path to the otherwise read-only platform. It never mutates
+live AWS resources and, per **Architecture Update v1.3**, it cannot write to the source-control
+provider either: the IaC Change Specialist only **reads approved IaC sources** so the agent can
+review the current source of truth. The provider-**write** path (branch/commit/unmerged change
+proposal) has **moved out of the chat runtime into the isolated #314 executor** and is no longer
+part of this connector. The connector is **disabled by default**; when disabled the platform
+behaves exactly as described above, and the specialist is never registered.
+
+For the full connector deep-dive (component layering, request flow, configuration reference, and
+source layout) see [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md). This section
+records how the connector fits the platform architecture and the trust boundaries it introduces.
+
+### External Provider Trust Boundary
+
+The read-only specialists (GameLift, EKS, Cost) reach AWS services through the AWS control plane
+using the runtime's IAM role. The Source Control Connector introduces a **distinct trust boundary
+crossing**: it makes **outbound HTTPS calls to a third-party source-control provider** (for
+example `api.github.com` or a configured enterprise base URL) that sits outside the AWS control
+plane and outside the platform's IAM trust domain.
+
+The connector core is **provider-neutral**: a `SourceControlReader` contract plus an adapter
+registry. GitHub is the **first adapter**, not a core dependency; GitLab, Bitbucket, CodeCommit,
+or an equivalent provider can be added later without changing the neutral contracts. Provider-
+specific types never escape the adapter layer.
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                AWS Bedrock AgentCore Runtime                  │
+│  Orchestrator ──► IaC Change Specialist                       │
+│                     │                                         │
+│                     ▼                                         │
+│           Connector Service Layer (policy enforcement)        │
+│                     │                                         │
+│      provider-neutral SourceControlReader contract            │
+│                     │                                         │
+│           GitHub adapter  (first adapter; ProviderAuth)       │
+└─────────────────────┬─────────────────────────────────────────┘
+                      │ Outbound HTTPS  ── PROVIDER TRUST BOUNDARY ──►
+                      ▼
+┌───────────────────────────────────────────────────────────────┐
+│         Third-party source-control provider (e.g. GitHub)     │
+│         Read existing IaC files at repository / branch        │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Read Credential
+
+The provider **read credential** is held in a **single AWS Secrets Manager secret**, referenced by
+one ARN-valued setting (`GBAW_SCM_READ_CREDENTIAL_SECRET_ARN`) used consistently for both runtime
+configuration and the scoped IAM grant. The credential is **adapter-owned**: it is acquired
+behind the neutral `ProviderAuth` contract, fetched **per request** at the moment an outbound
+read is made, and attached to the provider request by the adapter. The connector core issues no
+`get_secret` call of its own — credential handling lives entirely in the adapter.
+
+This isolates the read credential from the **read-only runtime role**. The only IAM addition is
+a single `secretsmanager:GetSecretValue` grant scoped to that one ARN; no live-infrastructure
+write actions and **no write-usable provider credential** are granted. There is no write
+credential in the chat runtime at all — the write path's credential lives with the #314 executor.
+A token-based adapter and a future IAM-native adapter (SigV4) implement the identical
+`ProviderAuth` contract, so the credential model stays provider-neutral.
+
+### Authorization Policy (Seven Dimensions)
+
+Every **read** is authorized against a **seven-dimension policy — tenant, workspace, repository,
+branch, path, extension, and group — enforced on reads**, before any provider operation runs. A
+violation of any dimension rejects the request with no provider call and an audit entry naming the
+failed dimension. The effective tenant, workspace, repository, and branch always come from the
+matched allowlist entry and trusted request context, never from model input.
+
+Requesting-user identity, tenant, workspace, and authorization groups are derived **exclusively
+from verified Cognito claims** carried on the request-scoped identity context (a `contextvars`
+value set per invocation). They are **never** taken from agent or model-supplied input, so a
+prompt-injected model cannot influence who is authorized or which source it reads.
+
+### Audit Flow (Intent / Outcome, Not Atomic)
+
+The connector records **durable intent and outcome events** for every read (`scm_read`),
+provisioned independently of any Knowledge Base configuration:
+
+- An intent event is written **before** the outbound provider read (idempotency key, requesting
+  user, effective repo/branch, requested paths, timestamp — no secrets).
+- An outcome event is written **after** (same key; outcome ∈ read / declined / rejected / error /
+  reconciled).
+
+The connector **does not claim cross-system atomicity** between the audit store and the provider.
+Instead it reconciles: if the intent write is unconfirmed, the read aborts **before** any outbound
+call (nothing happened). If a read succeeds but the outcome write is unconfirmed, the result is
+reported as reconcilable/unconfirmed — **never a false success** — and the durable intent plus
+provider state let a later run determine the true outcome.
+
+### No Write Path in the Runtime
+
+The connector is structurally limited to **reading approved files**. It exposes **no create,
+commit, propose, merge, approve, close, delete, or force-push operation** and holds **no write
+credential**, so the chat runtime **cannot write at all**. The former write path — creating an
+**unmerged change proposal** for human review — has **moved to the isolated #314 executor** and is
+preserved only in branch history; a human review and merge still gate any real change, but that
+gate now lives entirely outside this runtime. Two controls keep reads well-formed:
+
+- **Read-before-review snapshot.** A read returns an opaque `base_revision` the reviewing tooling
+  can pin to, so downstream review reasons about a confirmed source revision.
+- **Genuine idempotency.** A stable idempotency key means a retried or ambiguous read reconciles
+  to a single audited outcome instead of double-counting.
+
+---
+
 ## Deployment Architecture
 
 ### Development Environment
