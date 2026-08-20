@@ -46,6 +46,10 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
   afterEach(() => {
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    delete process.env.AGENTCORE_RUNTIME_ID;
+    delete process.env.COGNITO_CLIENT_ID;
+    delete process.env.GBAW_TENANT_ID;
+    delete process.env.GBAW_WORKSPACE_ID;
   });
 
   // An ID token that fails cryptographic verification (bad signature, wrong
@@ -104,13 +108,24 @@ describe('/api/copilot/chat - JWT decoding', () => {
   });
 
   it('returns 403 when user not approved', async () => {
-    // Verified ID token, but no approved group.
-    mockVerify.mockResolvedValue({ sub: 'user123', email: 'test@example.com', 'cognito:groups': [] });
+    process.env.NODE_ENV = 'production';
+    process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    // Verified access token, but no approved group.
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      'cognito:groups': [],
+    });
 
     const { req, res } = createMocks({
       method: 'POST',
       headers: {
-        cookie: 'cognito_id_token=header.payload.signature'
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token'
       },
       body: {
         operationName: 'generateCopilotResponse',
@@ -129,6 +144,35 @@ describe('/api/copilot/chat - JWT decoding', () => {
     expect(res._getStatusCode()).toBe(403);
     const data = JSON.parse(res._getData());
     expect(data.error).toBe('Account pending approval');
+
+  });
+
+  it('fails closed with 401 when auth is real but no trusted principal is built', async () => {
+    // Regression guard for the #320 approval-gate finding: the admin/users gate must not be
+    // silently skipped when the access token verifies "ok" but yields no payload/principal
+    // outside the local-dev bypass. Simulate a non-prod HOSTED env (no SKIP_AUTH) where the
+    // verifier resolves to a null-ish payload — the request must be rejected, not proceed.
+    process.env.NODE_ENV = 'production';
+    process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    // Access token verifies but carries no usable identity claims → buildTrustedPrincipal is
+    // never reached because accessPayload is null; the fail-closed guard must catch it.
+    mockVerify.mockResolvedValue(null);
+
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: { cookie: 'cognito_access_token=access-token' },
+      body: {
+        operationName: 'generateCopilotResponse',
+        variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } }
+      }
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(401);
+    expect(JSON.parse(res._getData()).error).toBe('Unauthorized');
   });
 
   it('handles loadAgentState with 200 + empty state (not a 400)', async () => {

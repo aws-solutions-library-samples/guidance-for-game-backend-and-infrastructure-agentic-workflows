@@ -11,6 +11,18 @@ Parameters:
     Type: String
     Description: AgentCore Runtime ID
 
+  TenantId:
+    Type: String
+    Default: default-tenant
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+    Description: Trusted tenant binding for requests from this deployment
+
+  WorkspaceId:
+    Type: String
+    Default: default-workspace
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$'
+    Description: Trusted workspace binding for requests from this deployment
+
   ImageTag:
     Type: String
     Default: latest
@@ -71,6 +83,13 @@ Resources:
           - Name: COGNITO_CLIENT_ID
             Value:
               Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
+          - Name: GBAW_COGNITO_AUDIENCE
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
+          - Name: GBAW_TENANT_ID
+            Value: !Ref TenantId
+          - Name: GBAW_WORKSPACE_ID
+            Value: !Ref WorkspaceId
           - Name: NEXT_PUBLIC_SKIP_AUTH
             Value: 'false'
           - Name: NEXT_PUBLIC_COGNITO_USER_POOL_ID

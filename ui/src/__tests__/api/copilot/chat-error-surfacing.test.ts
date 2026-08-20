@@ -74,6 +74,9 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
   afterEach(() => {
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
     delete process.env.AGENTCORE_RUNTIME_ID;
+    delete process.env.COGNITO_CLIENT_ID;
+    delete process.env.GBAW_TENANT_ID;
+    delete process.env.GBAW_WORKSPACE_ID;
   });
 
   it('returns an invocation failure as a visible assistant message, not a bare 500', async () => {
@@ -122,7 +125,17 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
   it('surfaces production AccessDenied failures as a visible assistant message', async () => {
     process.env.NODE_ENV = 'production';
     process.env.AGENTCORE_RUNTIME_ID = 'runtime-errtest';
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      email: 'test@example.com',
+      'cognito:groups': ['users'],
+    });
     const accessDenied = new Error('not authorized to invoke runtime');
     accessDenied.name = 'AccessDeniedException';
     mockAgentCoreSend.mockRejectedValue(accessDenied);
