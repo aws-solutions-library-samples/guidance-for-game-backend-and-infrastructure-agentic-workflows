@@ -270,6 +270,19 @@
   tab-size: 2;
 }
 
+/* Prism wraps unclassified code fragments (e.g. Python parameter names) in
+   classless <span>s. Those match the blanket
+   `.copilotKitMarkdown span:not([class*="token"])` rule (0,2,1) and inherit
+   var(--ga-text) — near-black on the always-dark #1e1e1e code surface in the
+   light theme, rendering them near-invisible (issue #252 follow-up). Re-assert
+   the light code color for classless spans inside a fenced block. Specificity
+   (0,3,0) exceeds the blanket rule (0,2,1); scoping to .ga-code-block__pre keeps
+   it from touching Prism's own classed token spans, which carry their own
+   syntax colors. */
+.copilotKitMarkdown .ga-code-block__pre span:not([class*="token"]) {
+  color: #e6edf3 !important;
+}
+
 /* Message controls positioning */
 .copilotKitMessageControls {
   position: absolute !important;

@@ -103,6 +103,29 @@ describe('ChatCodeBlock', () => {
     expect(container.querySelector('span[class*="token"]')).not.toBeNull();
   });
 
+  it('emits classless (non-token) spans inside the pre that the light-mode contrast rule targets', () => {
+    // Regression guard for the #252 follow-up: Prism wraps unclassified code
+    // fragments (e.g. Python parameter names) in classless <span>s. The CSS rule
+    // `.copilotKitMarkdown .ga-code-block__pre span:not([class*="token"])` must
+    // re-color those to a light value, or they inherit the near-black
+    // var(--ga-text) and vanish on the dark code surface in light mode.
+    // jsdom does not apply stylesheet cascade/specificity, so we cannot assert
+    // computed color here; instead we lock in the DOM structure the rule keys
+    // off — a classless span living under .ga-code-block__pre. If highlighting
+    // ever stops producing these, this test flags that the CSS scope needs a
+    // second look.
+    const { container } = render(
+      <ChatCodeBlock className="language-python">{'def handler(event, context):\n    return event\n'}</ChatCodeBlock>
+    );
+    const pre = container.querySelector('.ga-code-block__pre');
+    expect(pre).not.toBeNull();
+    const spans = Array.from(pre!.querySelectorAll('span'));
+    const classlessSpans = spans.filter(
+      (s) => !Array.from(s.classList).some((c) => c.includes('token'))
+    );
+    expect(classlessSpans.length).toBeGreaterThan(0);
+  });
+
   it('downloads using the derived filename from the fence token', () => {
     const createUrl = jest.fn(() => 'blob:mock');
     const revokeUrl = jest.fn();
