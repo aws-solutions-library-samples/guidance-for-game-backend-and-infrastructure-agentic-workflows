@@ -254,6 +254,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
     }
 
+    // Fail closed: outside the explicit local-dev bypass, a trusted principal MUST have been
+    // built from the verified access token before the request proceeds. Without this, the
+    // approval gate above is only reached when `accessPayload` happens to be truthy — so any
+    // future path that returns ok-but-null (e.g. a misconfigured hosted env) would silently
+    // skip the admin/users check and let an unapproved caller through. The dev bypass
+    // (NODE_ENV !== 'production' && NEXT_PUBLIC_SKIP_AUTH === 'true') is the ONLY case allowed
+    // to run without a trusted principal; identity there comes from STS, not Cognito.
+    const isDevAuthBypass =
+      process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
+    if (!trustedPrincipal && !isDevAuthBypass) {
+      logError(`[${requestId}] ❌ No trusted principal — refusing to proceed without verified identity`);
+      return res.status(401).json({ error: 'Unauthorized', requestId });
+    }
+
     // The ID token is separately verified and bound to the access-token subject.
     // Its email claim is presentation data only; it does not grant authority.
     const cookies = parse(req.headers.cookie || '');
