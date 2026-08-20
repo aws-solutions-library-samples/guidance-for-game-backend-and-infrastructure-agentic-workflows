@@ -1,8 +1,11 @@
 """Source Control Connector package.
 
-Provides the opt-in, fail-closed GitOps write path that lets the agent propose
-Infrastructure-as-Code (IaC) changes as change proposals instead of mutating live AWS
-resources. See ``.kiro/specs/source-control-connector`` for the design.
+Provides the opt-in, fail-closed **read-only** Infrastructure-as-Code (IaC) context path
+that lets the agent fetch existing IaC sources from an allowlisted repository/branch so it
+can review the current source of truth. Per Architecture Update v1.3 the provider-WRITE path
+has been removed from the chat runtime (it now lives in the isolated operations executor,
+issue #314); this package ships ``read_iac_files`` only — no write credential, no
+propose/merge tools, no mutation. See ``.kiro/specs/source-control-connector`` for the design.
 
 Registration bootstrap: the provider-neutral core (``connector.service`` /
 ``connector.config``) selects an adapter only through ``connector.registry`` and never

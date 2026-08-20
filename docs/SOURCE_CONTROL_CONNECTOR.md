@@ -4,13 +4,16 @@
 > platform guidance (overview, cost, deployment of the whole stack, MCP integration, testing,
 > and more), see the [root README](../README.md).
 
-The Source Control Connector (the "Connector") adds a safe, **opt-in write path** to the Game
-Backend & Infrastructure Agentic Workflows (GBAW) platform, which is otherwise read-only against
-live AWS infrastructure. Instead of mutating live resources, the agent proposes
-Infrastructure-as-Code (IaC) changes as **change proposals** against an IaC source repository.
-A change proposal is a Provider-neutral concept; each Provider_Adapter maps it to the provider's
-native review artifact (a GitHub pull request, a GitLab merge request, and so on). A human reviews
-the proposal; the existing CI/CD pipeline applies it after merge.
+The Source Control Connector (the "Connector") adds a safe, **opt-in read-only** IaC-context path
+to the Game Backend & Infrastructure Agentic Workflows (GBAW) platform, which is otherwise
+read-only against live AWS infrastructure. Rather than mutating live resources — or writing to the
+source-control provider — the agent **reads existing Infrastructure-as-Code (IaC) sources** from
+an allowlisted repository/branch so it can review the current source of truth. A file read is a
+Provider-neutral concept; each Provider_Adapter maps it to the provider's native read API (the
+GitHub contents API, the GitLab files API, and so on). Per **Architecture Update v1.3** the
+provider-**write** path (creating an unmerged change proposal for human review, then merge via the
+existing CI/CD pipeline) has **moved out of the chat runtime into the isolated #314 executor**; the
+Connector documented here holds no write credential and exposes no propose/merge operation.
 
 ## Table of Contents
 
