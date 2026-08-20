@@ -106,10 +106,14 @@ RATE_LIMIT_MAX_REQUESTS = int(os.getenv("GBAW_RATE_LIMIT_MAX_REQUESTS", "10"))  
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_WINDOW_SECONDS", "60"))  # window in seconds
 
 # =============================================================================
-# SOURCE CONTROL CONNECTOR (opt-in GitOps write path, disabled by default)
+# SOURCE CONTROL CONNECTOR (opt-in read-only IaC-context path, disabled by default)
 # =============================================================================
 # Raw parsing of the connector's GBAW_SCM_* configuration, following the same
 # GBAW_-prefixed os.getenv() convention as RATE_LIMIT_* above.
+#
+# Per Architecture Update v1.3 the provider-WRITE path was removed from the chat
+# runtime (it now lives in the isolated executor, issue #314); only the
+# authorized, audited read path ships here.
 #
 # Per Requirement 12.1, connector configuration is read EXCLUSIVELY from these
 # GBAW_-prefixed environment variables; no other configuration source is
@@ -193,8 +197,8 @@ INFERENCE_CONFIG: dict[str, AgentInferenceConfig] = {
     "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
-    # Source Control specialist proposes IaC changes as pull requests — a careful,
-    # deterministic write path, so it pins the lowest temperature. Keyed "sourcecontrol"
+    # Source Control specialist reviews existing IaC as read-only context — a careful,
+    # deterministic read path, so it pins the lowest temperature. Keyed "sourcecontrol"
     # because the specialist's service_name="SourceControl" lowercases to this lookup key
     # in create_specialist_agent (INFERENCE_CONFIG.get(service_name.lower())).
     "sourcecontrol": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},

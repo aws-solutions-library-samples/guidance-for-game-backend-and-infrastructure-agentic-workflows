@@ -10,6 +10,15 @@ Parameters:
   ScmReadCredentialSecretArn:
     Type: String
     Default: ''
+    # Empty (unset) OR a fully-qualified Secrets Manager secret ARN. The '*' and '?' wildcard
+    # characters are disallowed so a broad ARN (e.g. secret:*) cannot widen the scoped
+    # GetSecretValue grant below to multiple secrets. Anchored to arn:aws[...]:secretsmanager
+    # in a specific region/account with a non-empty secret name.
+    AllowedPattern: >-
+      ^$|^arn:aws[a-zA-Z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[^*?\s]+$
+    ConstraintDescription: >-
+      Must be empty or a fully-qualified Secrets Manager secret ARN with no wildcard
+      characters (no '*' or '?').
     Description: >-
       Optional. ARN of the Secrets Manager secret holding the Source Control
       Connector read credential (a provider-scoped, fine-grained read-only

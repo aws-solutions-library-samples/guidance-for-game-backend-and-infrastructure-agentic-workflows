@@ -51,6 +51,20 @@ __all__ = ["read_iac_files"]
 # The rate-limit endpoint label for per-requester READ limiting.
 _RATE_LIMIT_ENDPOINT = "scm_read"
 
+
+class PathTraversalError(ValueError):
+    """A requested path is unsafe (absolute, escaping, or contains an illegal character).
+
+    Raised by :func:`_normalize_path` and converted by :func:`read_iac_files` into a
+    fail-closed empty result with a ``path_invalid`` audit, so a prompt-injected request
+    cannot read outside the repository root.
+    """
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.requested_path = path
+        self.reason = reason
+        super().__init__(f"unsafe path rejected ({reason})")
+
 # ---------------------------------------------------------------------------
 # Durable audit sink wiring (repurposed for scm_read events)
 # ---------------------------------------------------------------------------
@@ -149,13 +163,32 @@ def _normalize_path(path: str) -> str:
     Collapses ``.``/``..`` segments and duplicate slashes and strips leading slashes so
     authorization prefix checks and the subsequent provider read operate on the same
     canonical form. An empty/whitespace path normalizes to an empty string.
+
+    Rejects — rather than silently rewrites — any path that attempts to escape the repository
+    root via ``..``, or that contains a NUL or backslash. A leading ``/`` is treated as
+    repo-relative (stripped), matching the pre-existing contract; it is not itself an escape and
+    the seven-dimension authorization still constrains where the read may land. Because the
+    requested paths originate from model/tool output, silently accepting ``../../secrets`` would
+    let a prompt-injected request read outside the intended tree; failing closed with
+    :class:`PathTraversalError` keeps the read confined to the repo. Callers convert this into a
+    fail-closed empty result with an audit.
     """
     if not path or not path.strip():
         return ""
+    if "\x00" in path or "\\" in path:
+        raise PathTraversalError(path, "path contains an illegal character")
+    # A leading "/" is treated as repo-relative (the pre-existing contract strips it), so an
+    # absolute-looking path is not itself an escape — it is normalized to repo-relative and the
+    # seven-dimension authorization still constrains it. What must be rejected is a path that
+    # escapes the repository root via "..".
     normalized = posixpath.normpath(path)
     if normalized == ".":
         return ""
-    return normalized.lstrip("/")
+    stripped = normalized.lstrip("/")
+    # After normalization + lstrip, a path that still begins with ".." points above the root.
+    if stripped == ".." or stripped.startswith("../"):
+        raise PathTraversalError(path, "path escapes the repository root")
+    return stripped
 
 
 def _now_iso() -> str:
@@ -274,8 +307,22 @@ def read_iac_files(
     _active_config = resolved_config
 
     # Normalize each requested path BEFORE the count check, authorization, and any read so
-    # every downstream stage operates on the canonical form.
-    normalized_paths = [_normalize_path(p) for p in paths]
+    # every downstream stage operates on the canonical form. A path that attempts to escape
+    # the repository root (absolute, ``..`` escape, or illegal character) is rejected here and
+    # the whole request fails closed with no provider read — never silently rewritten.
+    try:
+        normalized_paths = [_normalize_path(p) for p in paths]
+    except PathTraversalError as exc:
+        _audit(
+            "warning",
+            "IaC file read rejected: unsafe path",
+            event="scm_read",
+            action="read",
+            outcome="rejected",
+            reason="path_invalid",
+            detail=exc.reason,
+        )
+        return FileFetchResult(files=(), missing=(), limit_exceeded=False)
 
     # Reject an over-limit request BEFORE contacting the provider.
     if len(normalized_paths) > resolved_config.connector.max_files_per_request:
