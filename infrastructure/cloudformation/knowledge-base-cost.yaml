@@ -31,6 +31,16 @@ Resources:
       Dimension: !Ref EmbeddingDimension
       DataType: float32
       DistanceMetric: cosine
+      # Bedrock stores chunk text in AMAZON_BEDROCK_TEXT and chunk metadata in
+      # AMAZON_BEDROCK_METADATA. S3 Vectors treats metadata as filterable by
+      # default, and filterable metadata is capped at 2048 bytes/vector — dense
+      # chunks exceed it and fail ingestion. Mark these Bedrock-managed keys
+      # non-filterable so chunk text is retrievable-but-not-filterable and the
+      # cap no longer applies. (Issue #313.)
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_METADATA
+          - AMAZON_BEDROCK_TEXT
 
   DocumentBucket:
     Type: AWS::S3::Bucket
