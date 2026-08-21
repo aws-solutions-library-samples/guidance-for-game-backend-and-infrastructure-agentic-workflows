@@ -165,7 +165,7 @@
 .copilotKitMarkdown h5,
 .copilotKitMarkdown h6,
 .copilotKitMarkdown li,
-.copilotKitMarkdown span {
+.copilotKitMarkdown span:not([class*="token"]) {
   color: var(--ga-text) !important;
 }
 
@@ -184,11 +184,103 @@
   color: var(--ga-accent) !important;
 }
 
-.copilotKitMarkdown code {
+/* Inline code only. Scoped with :not(pre) so it never leaks into fenced code
+   blocks (rendered by ChatCodeBlock inside a <pre>), which caused dark-on-dark
+   unreadable text. */
+.copilotKitMarkdown :not(pre) > code,
+.ga-inline-code {
   background: var(--ga-code-bg) !important;
   color: var(--ga-cyan) !important;
   padding: 2px 6px !important;
   border-radius: 4px !important;
+}
+
+/* Fenced code blocks (ChatCodeBlock) — explicit high-contrast dark surface so
+   IaC/code is readable regardless of theme. */
+.ga-code-block {
+  margin: 12px 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #1e1e1e;
+}
+
+.ga-code-block__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: #2d2d2d;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Selector specificity (0,3,0) must exceed the blanket
+   `.copilotKitMarkdown span:not([class*="token"])` rule (0,2,1); otherwise the
+   label inherits var(--ga-text), which is near-black on the dark toolbar in
+   light theme (illegible). */
+.copilotKitMarkdown .ga-code-block__toolbar .ga-code-block__lang {
+  font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+  font-size: 12px;
+  color: #c8c8c8 !important;
+  letter-spacing: 0.02em;
+}
+
+.ga-code-block__actions {
+  display: flex;
+  gap: 4px;
+}
+
+.ga-code-block__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #c8c8c8;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.ga-code-block__btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+}
+
+.ga-code-block__pre {
+  margin: 0 !important;
+  padding: 14px 16px !important;
+  overflow-x: auto;
+  background: #1e1e1e !important;
+}
+
+.ga-code-block__pre code {
+  display: block;
+  background: transparent !important;
+  color: #e6edf3 !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 2;
+}
+
+/* Prism wraps unclassified code fragments (e.g. Python parameter names) in
+   classless <span>s. Those match the blanket
+   `.copilotKitMarkdown span:not([class*="token"])` rule (0,2,1) and inherit
+   var(--ga-text) — near-black on the always-dark #1e1e1e code surface in the
+   light theme, rendering them near-invisible (issue #252 follow-up). Re-assert
+   the light code color for classless spans inside a fenced block. Specificity
+   (0,3,0) exceeds the blanket rule (0,2,1); scoping to .ga-code-block__pre keeps
+   it from touching Prism's own classed token spans, which carry their own
+   syntax colors. */
+.copilotKitMarkdown .ga-code-block__pre span:not([class*="token"]) {
+  color: #e6edf3 !important;
 }
 
 /* Message controls positioning */
