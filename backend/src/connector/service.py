@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Sequence
 from connector.audit import AuditSink
 from connector.config import AuthorizationPolicy, Decision, SourceControlConfig
 from connector.models import FileFetchResult
+from connector.provider import ProviderTransientError
 from connector.registry import get_provider
 from utils.logger import logger
 from utils.request_context import get_request_context
@@ -262,6 +263,44 @@ def _content_size(result: FileFetchResult) -> int:
     return sum(len(f.content.encode("utf-8")) for f in result.files)
 
 
+def _fetch_files_with_retry(
+    reader: "SourceControlReader",
+    repo: str,
+    branch: str,
+    paths: list[str],
+    *,
+    max_attempts: int,
+) -> FileFetchResult:
+    """Fetch ``paths`` via ``reader.get_files``, retrying only transient failures.
+
+    A :class:`~connector.provider.ProviderTransientError` (provider rate limits, temporary
+    5xx/unavailability, read timeouts) is safe to repeat for a read, so it is retried up to
+    ``max_attempts`` total calls before the final failure propagates. Every other exception —
+    including :class:`~connector.provider.ProviderAuthError` (credential rejected; retrying
+    cannot help) and any permanent validation failure — propagates on the first raise with no
+    retry, so the read still fails closed. ``max_attempts`` is the connector's configured
+    ``retry_max_attempts`` (always >= 1); a value below 1 is treated as a single attempt.
+    """
+    attempts = max(1, max_attempts)
+    last_exc: ProviderTransientError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return reader.get_files(repo, branch, list(paths))
+        except ProviderTransientError as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "IaC file read: transient provider failure, retrying",
+                event="scm_read",
+                action="read",
+                attempt=attempt,
+                max_attempts=attempts,
+            )
+    # Unreachable: the loop either returns, or re-raises on the final attempt.
+    raise last_exc  # type: ignore[misc]  # pragma: no cover
+
+
 def read_iac_files(
     paths: list[str],
     *,
@@ -324,22 +363,30 @@ def read_iac_files(
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=False)
 
-    # Reject an over-limit request BEFORE contacting the provider.
+    # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
+    # context, never from model/tool input. Resolved before the file-count check so the
+    # rejection audit can name the requester/tenant/workspace.
+    user_id, groups, tenant, workspace = _read_path_context()
+    requester = user_id or "anonymous"
+
+    # Reject an over-limit request BEFORE contacting the provider. This is a policy
+    # rejection, so it is written to the durable audit sink (requester/tenant/workspace/
+    # result/reason) — never credentials or file contents — not merely a local warning.
     if len(normalized_paths) > resolved_config.connector.max_files_per_request:
-        logger.warning(
+        _audit(
+            "warning",
             "IaC file read rejected: request exceeds the configured per-request maximum",
             event="scm_read",
             action="read",
-            outcome="limit_exceeded",
+            outcome="rejected",
+            requester=requester,
+            tenant=tenant,
+            workspace=workspace,
+            reason="limit_exceeded",
             requested_count=len(normalized_paths),
             max_files_per_request=resolved_config.connector.max_files_per_request,
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=True)
-
-    # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
-    # context, never from model/tool input.
-    user_id, groups, tenant, workspace = _read_path_context()
-    requester = user_id or "anonymous"
 
     # Per-requester read rate limit: an over-limit request is rejected with no provider read.
     try:
@@ -405,9 +452,17 @@ def read_iac_files(
 
     resolved_reader = _resolve_reader(resolved_config, reader)
 
-    # Fetch exactly the normalized paths from the matched repo+branch. The reader reports
+    # Fetch exactly the normalized paths from the matched repo+branch. A transient provider
+    # failure (rate limit / temporary 5xx / read timeout) is retried up to the configured
+    # ``retry_max_attempts``; an auth or permanent failure is not retried. The reader reports
     # missing paths in the result; no write-usable revision is captured.
-    result = resolved_reader.get_files(repo, branch, list(normalized_paths))
+    result = _fetch_files_with_retry(
+        resolved_reader,
+        repo,
+        branch,
+        list(normalized_paths),
+        max_attempts=resolved_config.connector.retry_max_attempts,
+    )
 
     # Reject a read whose total content exceeds the configured maximum size, with no files
     # served.

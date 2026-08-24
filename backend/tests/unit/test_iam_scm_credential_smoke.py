@@ -45,7 +45,14 @@ _ROLE_LOGICAL_ID = "AgentCoreExecutionRole"
 
 # Read-credential (kept, scoped) wiring.
 _SCM_READ_POLICY_NAME = "ScmReadCredentialAccess"
-_SCM_READ_CONDITION_NAME = "ScmReadCredentialConfigured"
+# The read grant is now gated on the connector being ENABLED *and* an ARN configured, so a
+# disabled deployment carries no connector secret permission (PR #319 finding 3). The gating
+# condition on the policy is the combined ScmReadCredentialActive; the ARN-presence condition
+# ScmReadCredentialConfigured still exists and feeds it.
+_SCM_READ_CONDITION_NAME = "ScmReadCredentialActive"
+_SCM_READ_CONFIGURED_CONDITION_NAME = "ScmReadCredentialConfigured"
+_SCM_CONNECTOR_ENABLED_CONDITION_NAME = "ScmConnectorIsEnabled"
+_SCM_CONNECTOR_ENABLED_PARAMETER_NAME = "ScmConnectorEnabled"
 _SCM_READ_PARAMETER_NAME = "ScmReadCredentialSecretArn"
 
 # Removed write-credential wiring — these must NOT appear anywhere in the template.
@@ -298,13 +305,56 @@ def test_scm_read_credential_secret_arn_parameter_exists_with_empty_default(temp
 
 
 def test_scm_read_credential_configured_condition_exists(template: dict):
-    """(Req 6.2) The condition gating the read grant on a non-empty ARN exists."""
+    """(Req 6.2) The conditions gating the read grant exist: the ARN-presence condition, the
+    connector-enabled condition, and the combined active condition on the policy."""
     conditions = template.get("Conditions", {})
+    assert _SCM_READ_CONFIGURED_CONDITION_NAME in conditions, (
+        f"missing condition {_SCM_READ_CONFIGURED_CONDITION_NAME}"
+    )
+    assert _SCM_CONNECTOR_ENABLED_CONDITION_NAME in conditions, (
+        f"missing condition {_SCM_CONNECTOR_ENABLED_CONDITION_NAME}"
+    )
     assert _SCM_READ_CONDITION_NAME in conditions, f"missing condition {_SCM_READ_CONDITION_NAME}"
 
 
-def test_scm_read_policy_is_conditional_on_read_credential_configured(role_policies: list):
-    """(Req 6.2) The read grant is added only via the ``ScmReadCredentialConfigured`` cond."""
+def test_scm_read_grant_gated_on_enabled_and_configured(template: dict):
+    """(PR #319 finding 3) The read grant's condition requires BOTH the connector enabled AND
+    a read-credential ARN configured, so a DISABLED deployment carries no connector secret
+    permission even if an ARN is present.
+
+    ``ScmReadCredentialActive`` must be ``Fn::And`` of the connector-enabled condition and the
+    ARN-configured condition, and a ``ScmConnectorEnabled`` parameter must gate it.
+    """
+    # A parameter controls enablement, defaulting to disabled (fail-closed for the grant).
+    params = template.get("Parameters", {})
+    assert _SCM_CONNECTOR_ENABLED_PARAMETER_NAME in params, (
+        f"missing parameter {_SCM_CONNECTOR_ENABLED_PARAMETER_NAME}"
+    )
+    assert params[_SCM_CONNECTOR_ENABLED_PARAMETER_NAME].get("Default") == "false", (
+        "ScmConnectorEnabled must default to 'false' so a disabled deployment grants no secret access"
+    )
+
+    conditions = template.get("Conditions", {})
+    active = conditions[_SCM_READ_CONDITION_NAME]
+    and_terms = active.get("Fn::And")
+    assert isinstance(and_terms, list) and len(and_terms) == 2, (
+        "ScmReadCredentialActive must be an Fn::And of two conditions"
+    )
+    referenced = {term.get("Condition") for term in and_terms if isinstance(term, dict)}
+    assert referenced == {_SCM_CONNECTOR_ENABLED_CONDITION_NAME, _SCM_READ_CONFIGURED_CONDITION_NAME}, (
+        "the read grant must require BOTH connector-enabled and ARN-configured"
+    )
+
+    # The connector-enabled condition is a true/'true' comparison on the parameter.
+    enabled_cond = conditions[_SCM_CONNECTOR_ENABLED_CONDITION_NAME]
+    equals = enabled_cond.get("Fn::Equals")
+    assert isinstance(equals, list) and {"Ref": _SCM_CONNECTOR_ENABLED_PARAMETER_NAME} in equals
+    assert "true" in equals
+
+
+def test_scm_read_policy_is_conditional_on_read_credential_active(role_policies: list):
+    """(PR #319 finding 3) The read grant is added only via the combined ``ScmReadCredentialActive``
+    condition (enabled AND ARN configured)."""
     found = _find_scm_read_conditional_policy(role_policies)
     assert found is not None, f"{_SCM_READ_POLICY_NAME} policy is not present as an Fn::If entry"
     condition_name, _policy = found

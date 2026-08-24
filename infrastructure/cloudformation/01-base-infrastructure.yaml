@@ -39,10 +39,35 @@ Parameters:
       execution role logs:CreateLogStream + logs:PutLogEvents scoped to that log
       group ONLY, with no live-infrastructure write permissions.
 
+  ScmConnectorEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Whether the Source Control Connector is enabled for this deployment.
+      Defaults to 'false' so a disabled deployment grants NO connector secret
+      permission even if a read-credential ARN is otherwise present. The scoped
+      secretsmanager:GetSecretValue grant is added ONLY when this is 'true' AND a
+      read-credential ARN is configured, so a disabled deployment carries no
+      connector secret IAM permission. deploy.sh passes 'true' only when
+      GBAW_SCM_CONNECTOR_ENABLED is truthy.
+
 Conditions:
   # Gate the Source Control Connector read-credential grant on a non-empty ARN.
   # Deployments that never set ScmReadCredentialSecretArn are unaffected.
   ScmReadCredentialConfigured: !Not [!Equals [!Ref ScmReadCredentialSecretArn, '']]
+
+  # The connector is enabled for this deployment.
+  ScmConnectorIsEnabled: !Equals [!Ref ScmConnectorEnabled, 'true']
+
+  # The scoped read-credential GetSecretValue grant is applied ONLY when the connector is
+  # enabled AND a read-credential ARN is configured. A disabled deployment therefore carries
+  # NO connector secret IAM permission even if an ARN is otherwise present.
+  ScmReadCredentialActive: !And
+    - !Condition ScmConnectorIsEnabled
+    - !Condition ScmReadCredentialConfigured
 
   # Gate the dedicated audit log group + its scoped logs grant on a non-empty name.
   # Read-only deployments that never set ScmAuditLogGroupName are unaffected.
@@ -468,12 +493,13 @@ Resources:
         # Security: Source Control Connector read-credential read (opt-in, #SCM).
         # Grants ONLY secretsmanager:GetSecretValue scoped to the single
         # operator-provisioned connector READ secret (a provider-scoped,
-        # fine-grained read-only token). Added only when
-        # ScmReadCredentialSecretArn is set; adds NO live-infrastructure write
-        # actions and no provider-write credential. The chat-runtime (read) role
-        # stays read-only against live AWS.
+        # fine-grained read-only token). Added only when the connector is ENABLED
+        # AND ScmReadCredentialSecretArn is set (ScmReadCredentialActive); a
+        # disabled deployment carries no connector secret permission. Adds NO
+        # live-infrastructure write actions and no provider-write credential. The
+        # chat-runtime (read) role stays read-only against live AWS.
         - !If
-          - ScmReadCredentialConfigured
+          - ScmReadCredentialActive
           - PolicyName: ScmReadCredentialAccess
             PolicyDocument:
               Version: '2012-10-17'

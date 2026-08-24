@@ -233,3 +233,50 @@ def test_real_source_control_specialist_built_without_iac_kb_tool():
         # tests (and the orchestrator's local import) see the genuine agent.
         base.create_specialist_agent = original_factory
         importlib.reload(scs)
+
+
+# ---------------------------------------------------------------------------
+# Behavior 3 (PR #319 finding 3): a DISABLED deployment has no connector secret
+# env var and no connector secret IAM permission.
+# ---------------------------------------------------------------------------
+#
+# The disabled baseline is not only about which orchestrator tools are exposed — it must also
+# leave NO connector credential surface in the deployment. deploy.sh gates both the
+# runtime ``GBAW_SCM_READ_CREDENTIAL_SECRET_ARN`` env var AND the base-stack
+# ``ScmReadCredentialSecretArn`` parameter on ``$SCM_CONNECTOR_ENABLED``, and the CFN read
+# grant is gated on ``ScmReadCredentialActive`` (connector enabled AND ARN configured), whose
+# ``ScmConnectorEnabled`` parameter defaults to disabled. So a disabled deployment grants no
+# ``secretsmanager:GetSecretValue`` and injects no connector secret env var.
+
+# Standard library
+from pathlib import Path  # noqa: E402
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEPLOY_PATH = _REPO_ROOT / "scripts" / "deploy.sh"
+_TEMPLATE_PATH = _REPO_ROOT / "infrastructure" / "cloudformation" / "01-base-infrastructure.yaml"
+
+
+def test_disabled_deployment_gates_connector_secret_env_and_param_on_enabled():
+    """(PR #319 finding 3) deploy.sh delivers the connector read-credential ONLY when the
+    connector is enabled — both the runtime env var and the base-stack parameter are gated on
+    ``$SCM_CONNECTOR_ENABLED``, so a disabled deployment carries neither."""
+    text = _DEPLOY_PATH.read_text()
+    # The runtime read-credential env var append is gated on the enablement flag.
+    assert '"$SCM_CONNECTOR_ENABLED" = "true"' in text, (
+        "deploy.sh must gate the connector read-credential on $SCM_CONNECTOR_ENABLED"
+    )
+    # The base-stack ARN is the empty string unless enabled (SCM_BASE_READ_ARN intermediate).
+    assert "SCM_BASE_READ_ARN" in text, "deploy.sh must gate the base-stack ARN via SCM_BASE_READ_ARN"
+    assert "ScmConnectorEnabled=" in text, "deploy.sh must pass the enablement flag to the base stack"
+
+
+def test_disabled_deployment_grants_no_connector_secret_permission():
+    """(PR #319 finding 3) The CFN read grant is gated on connector-enabled AND ARN-configured;
+    the ``ScmConnectorEnabled`` parameter defaults to disabled, so the default synthesis of a
+    deployment that does not opt in grants no connector secret access."""
+    template_text = _TEMPLATE_PATH.read_text()
+    # The combined active condition (enabled AND configured) gates the grant.
+    assert "ScmReadCredentialActive" in template_text, "CFN must gate the read grant on the enabled+configured condition"
+    assert "ScmConnectorEnabled" in template_text, "CFN must define the ScmConnectorEnabled parameter"
+    # Default is disabled ('false') so the grant is absent unless the operator opts in.
+    assert "Default: 'false'" in template_text, "ScmConnectorEnabled must default to disabled"

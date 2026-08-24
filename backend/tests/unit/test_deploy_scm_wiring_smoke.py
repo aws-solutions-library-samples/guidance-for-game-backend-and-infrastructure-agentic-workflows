@@ -160,17 +160,46 @@ def test_read_arn_resolved_once_from_env_or_env_local(deploy_text: str):
 
 
 def test_same_read_arn_source_drives_base_param_and_runtime_env(deploy_text: str):
-    """(Req 3.3) The SAME ``$SCM_READ_CREDENTIAL_SECRET_ARN`` value drives BOTH the
-    ``ScmReadCredentialSecretArn`` base-stack parameter AND the
-    ``GBAW_SCM_READ_CREDENTIAL_SECRET_ARN`` runtime env var — single source, no drift."""
+    """(Req 3.3 + PR #319 finding 3) The read-credential ARN is single-sourced from
+    ``$SCM_READ_CREDENTIAL_SECRET_ARN``, then gated on the connector being ENABLED before it
+    reaches BOTH the ``ScmReadCredentialSecretArn`` base-stack parameter AND the
+    ``GBAW_SCM_READ_CREDENTIAL_SECRET_ARN`` runtime env var — single source, no drift, and no
+    secret wiring on a disabled deployment."""
     non_comment = _non_comment_text(deploy_text)
 
+    # The enablement-gated intermediate is derived from the single resolved read ARN.
     assert re.search(
-        rf'{_BASE_PARAM_NAME}="\${_ARN_VAR}"', non_comment
-    ), "base-stack ScmReadCredentialSecretArn parameter must read $SCM_READ_CREDENTIAL_SECRET_ARN"
+        rf'SCM_BASE_READ_ARN="\${_ARN_VAR}"', non_comment
+    ), "the base-stack ARN must be gated via $SCM_BASE_READ_ARN derived from $SCM_READ_CREDENTIAL_SECRET_ARN"
+    # The base-stack parameter reads the gated intermediate (empty when disabled).
+    assert re.search(
+        rf'{_BASE_PARAM_NAME}="\$SCM_BASE_READ_ARN"', non_comment
+    ), "base-stack ScmReadCredentialSecretArn parameter must read $SCM_BASE_READ_ARN"
+    # The runtime env var reads the SAME single-sourced read ARN.
     assert re.search(
         rf"{_ARN_ENV_NAME}=\${_ARN_VAR}\b", non_comment
     ), "runtime GBAW_SCM_READ_CREDENTIAL_SECRET_ARN must read the SAME $SCM_READ_CREDENTIAL_SECRET_ARN"
+    # The base stack is also told the enablement flag.
+    assert re.search(
+        r'ScmConnectorEnabled="\$SCM_CONNECTOR_ENABLED"', non_comment
+    ), "the base stack must receive ScmConnectorEnabled=$SCM_CONNECTOR_ENABLED"
+
+
+def test_read_credential_env_and_base_param_gated_on_enabled(deploy_text: str):
+    """(PR #319 finding 3) Both the runtime read-credential env var and the base-stack ARN are
+    gated on ``$SCM_CONNECTOR_ENABLED`` being 'true', so a disabled deployment carries no
+    connector secret env var and no connector secret grant."""
+    non_comment = _non_comment_text(deploy_text)
+    # The runtime env append requires the connector to be enabled.
+    assert re.search(
+        r'if\s+\[\s+"\$SCM_CONNECTOR_ENABLED"\s+=\s+"true"\s+\]\s+&&\s+\[\s+-n\s+"\$SCM_READ_CREDENTIAL_SECRET_ARN"',
+        non_comment,
+    ), "runtime read-credential env append must be gated on $SCM_CONNECTOR_ENABLED=true"
+    # The base-stack ARN intermediate is empty unless enabled.
+    assert re.search(
+        r'if\s+\[\s+"\$SCM_CONNECTOR_ENABLED"\s+=\s+"true"\s+\];\s+then\s+SCM_BASE_READ_ARN="\$SCM_READ_CREDENTIAL_SECRET_ARN"',
+        non_comment,
+    ), "SCM_BASE_READ_ARN must be the ARN only when enabled, else empty"
 
 
 # --- Tests: KB-independent audit destination + env wiring ---------------------------------
@@ -182,6 +211,31 @@ def test_audit_log_group_env_var_wired(deploy_text: str):
     assert "GBAW_SCM_AUDIT_LOG_GROUP" in _non_comment_text(
         deploy_text
     ), "GBAW_SCM_AUDIT_LOG_GROUP must be wired through the runtime env args"
+
+
+def test_max_content_bytes_env_var_wired(deploy_lines: list):
+    """(PR #319 finding 6) The content-size limit env var ``GBAW_SCM_MAX_CONTENT_BYTES`` is
+    part of the ``GBAW_SCM_*`` names iterated by the runtime env loop, so a configured value
+    reaches the runtime and replaces the default.
+
+    The loop iterates line-continued (``\\``) bare env-var NAMES; assert the name appears as
+    its own iterated token (a loop line), not merely somewhere in the file text."""
+    loop_tokens = set()
+    for line in deploy_lines:
+        token = line.strip().rstrip("\\").strip()
+        # The final env-var name on the `for` list line ends with `; do`; strip it so the
+        # bare name is captured.
+        if token.endswith("; do"):
+            token = token[: -len("; do")].strip()
+        if token.startswith("GBAW_SCM_"):
+            loop_tokens.add(token)
+    assert "GBAW_SCM_MAX_CONTENT_BYTES" in loop_tokens, (
+        "GBAW_SCM_MAX_CONTENT_BYTES must be iterated by the runtime env loop so the configured "
+        f"content-size limit reaches the runtime; loop tokens seen: {sorted(loop_tokens)}"
+    )
+    # The existing content-cap default lives in connector.config; the deploy loop only needs
+    # to forward the env var when set (same guard as every other GBAW_SCM_* value).
+    assert "GBAW_SCM_MAX_FILES_PER_REQUEST" in loop_tokens, "sibling GBAW_SCM_* names must remain wired"
 
 
 def test_read_credential_env_append_guarded_by_arn_not_kb(deploy_lines: list):

@@ -111,7 +111,29 @@ echo "📦 Step 1: Deploying base infrastructure..."
 SCM_READ_CREDENTIAL_SECRET_ARN="${GBAW_SCM_READ_CREDENTIAL_SECRET_ARN:-$(grep "^GBAW_SCM_READ_CREDENTIAL_SECRET_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
 SCM_AUDIT_LOG_GROUP="${GBAW_SCM_AUDIT_LOG_GROUP:-$(grep "^GBAW_SCM_AUDIT_LOG_GROUP=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
 
-BASE_STACK_PARAMS=(ProjectName="$PROJECT_NAME" ScmReadCredentialSecretArn="$SCM_READ_CREDENTIAL_SECRET_ARN")
+# Resolve the connector enablement flag (env or backend/.env.local) and normalize it to a
+# canonical 'true'/'false'. The connector is enabled ONLY when the flag is one of the
+# truthy values accepted by connector.config ({true,1,yes}, case-insensitive). A disabled
+# deployment must carry NO connector secret env var and NO connector secret IAM permission,
+# so both the read-credential base-stack parameter and the runtime credential env var are
+# gated on this below.
+SCM_CONNECTOR_ENABLED_RAW="${GBAW_SCM_CONNECTOR_ENABLED:-$(grep "^GBAW_SCM_CONNECTOR_ENABLED=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+case "$(printf '%s' "$SCM_CONNECTOR_ENABLED_RAW" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+  true|1|yes) SCM_CONNECTOR_ENABLED="true" ;;
+  *) SCM_CONNECTOR_ENABLED="false" ;;
+esac
+
+# The read-credential ARN is only delivered to the base stack (for the scoped
+# GetSecretValue grant) when the connector is enabled. When disabled, the parameter is
+# passed empty so the ScmReadCredentialActive condition is false and NO secret permission
+# is granted.
+if [ "$SCM_CONNECTOR_ENABLED" = "true" ]; then
+  SCM_BASE_READ_ARN="$SCM_READ_CREDENTIAL_SECRET_ARN"
+else
+  SCM_BASE_READ_ARN=""
+fi
+
+BASE_STACK_PARAMS=(ProjectName="$PROJECT_NAME" ScmReadCredentialSecretArn="$SCM_BASE_READ_ARN" ScmConnectorEnabled="$SCM_CONNECTOR_ENABLED")
 # The audit log-group parameter is added to the base template by task 7.2. Pass it
 # only when configured so deployments against the current template (which does not
 # yet define the parameter) are not broken when it is unset.
@@ -411,7 +433,8 @@ for _scm_var in \
   GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS \
   GBAW_SCM_PROVIDER_TIMEOUT_SECONDS \
   GBAW_SCM_RETRY_MAX_ATTEMPTS \
-  GBAW_SCM_MAX_FILES_PER_REQUEST; do
+  GBAW_SCM_MAX_FILES_PER_REQUEST \
+  GBAW_SCM_MAX_CONTENT_BYTES; do
   # Prefer the value already exported in the environment; fall back to .env.local
   _scm_val="${!_scm_var:-$(grep "^${_scm_var}=" .env.local 2>/dev/null | cut -d'=' -f2- || echo "")}"
   if [ -n "$_scm_val" ]; then
@@ -423,8 +446,10 @@ done
 # $SCM_READ_CREDENTIAL_SECRET_ARN) is delivered as the runtime env var
 # GBAW_SCM_READ_CREDENTIAL_SECRET_ARN, so the runtime credential-acquisition config and
 # the scoped IAM grant are driven by one value and cannot drift. Only the ARN is
-# passed — never a raw credential value.
-if [ -n "$SCM_READ_CREDENTIAL_SECRET_ARN" ]; then
+# passed — never a raw credential value. It is delivered ONLY when the connector is
+# ENABLED, so a disabled deployment carries no connector secret env var (matching the
+# gated IAM grant).
+if [ "$SCM_CONNECTOR_ENABLED" = "true" ] && [ -n "$SCM_READ_CREDENTIAL_SECRET_ARN" ]; then
   SCM_ENV_ARGS+=(-env "GBAW_SCM_READ_CREDENTIAL_SECRET_ARN=$SCM_READ_CREDENTIAL_SECRET_ARN")
 fi
 if [ ${#SCM_ENV_ARGS[@]} -gt 0 ]; then

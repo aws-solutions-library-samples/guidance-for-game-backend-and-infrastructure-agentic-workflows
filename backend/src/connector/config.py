@@ -185,15 +185,19 @@ class AuthorizationPolicy:
            workspace dimension fails.
         3. **repo** — at least one eligible entry's ``repo`` equals ``repo`` (exact,
            case-sensitive, full-string).
-        4. **branch** — among the repo-matching eligible entries, one lists ``branch`` in
-           its ``target_branches`` (exact, case-sensitive). That entry becomes the *matched*
-           entry and supplies the effective repo/branch and the path/extension constraints.
-        5. **path** — when the matched entry has ``path_prefixes``, **every** requested path
-           must lie under one of them (``str.startswith``). An empty ``path_prefixes`` means
-           any path.
-        6. **extension** — when the matched entry has ``extensions``, **every** requested
-           path must carry one of them (``str.endswith``). An empty ``extensions`` means any
-           extension.
+        4. **branch** — among the repo-matching eligible entries, collect **every** entry
+           that lists ``branch`` in its ``target_branches`` (exact, case-sensitive). If none
+           match, the branch dimension fails.
+        5. **path** — the request passes when **at least one** of the branch-matching
+           entries permits every requested path: an entry with ``path_prefixes`` requires
+           each path to lie under one of them (``str.startswith``); an empty ``path_prefixes``
+           permits any path.
+        6. **extension** — among the entries that passed the path check, the request passes
+           when at least one also permits every requested extension (``str.endswith``); an
+           empty ``extensions`` permits any extension. The first entry passing both path and
+           extension becomes the *matched* entry and supplies the effective repo/branch. If
+           some entry passed the path check but none passed the extension check the failed
+           dimension is ``"extension"``; otherwise it is ``"path"``.
         7. **group** — the requesting ``groups`` must intersect ``authorized_groups``.
 
         On success the returned :class:`Decision` carries the effective repo/branch from the
@@ -217,26 +221,42 @@ class AuthorizationPolicy:
         if not repo_entries:
             return Decision(allowed=False, failed_dimension="repo")
 
-        # --- Dimension 4: branch (selects the matched entry) ---------------------------
+        # --- Dimension 4: branch (collects EVERY matching entry) -----------------------
+        # An operator may list several entries for the same repository+branch that each
+        # scope a different set of path prefixes / extensions (e.g. one entry for
+        # ``infra/`` *.yaml and another for ``modules/`` *.tf). Selecting only the FIRST
+        # branch match and then checking its path/extension constraints would wrongly deny
+        # a request the SECOND entry permits. So collect every repo+branch match and let the
+        # path/extension check below succeed if ANY of them permits all requested
+        # paths+extensions.
+        branch_entries = [entry for entry in repo_entries if branch in entry.target_branches]
+        if not branch_entries:
+            return Decision(allowed=False, failed_dimension="branch")
+
+        # --- Dimensions 5 & 6: path prefixes + extensions across ALL matching entries --
+        # The request is permitted iff at least one matching entry permits ALL requested
+        # paths (path-prefix dimension) AND all requested extensions (extension dimension).
+        # ``failed_dimension`` reports the dimension that the closest-matching entry failed
+        # on: "extension" only if some entry passed the path check but none passed the
+        # extension check, otherwise "path".
         matched: AllowlistEntry | None = None
-        for entry in repo_entries:
-            if branch in entry.target_branches:
+        any_entry_passed_paths = False
+        for entry in branch_entries:
+            paths_ok = not entry.path_prefixes or all(
+                any(path.startswith(prefix) for prefix in entry.path_prefixes) for path in paths
+            )
+            if not paths_ok:
+                continue
+            any_entry_passed_paths = True
+            extensions_ok = not entry.extensions or all(
+                any(path.endswith(ext) for ext in entry.extensions) for path in paths
+            )
+            if extensions_ok:
                 matched = entry
                 break
         if matched is None:
-            return Decision(allowed=False, failed_dimension="branch")
-
-        # --- Dimension 5: path prefixes (absent => any path) ---------------------------
-        if matched.path_prefixes:
-            for path in paths:
-                if not any(path.startswith(prefix) for prefix in matched.path_prefixes):
-                    return Decision(allowed=False, failed_dimension="path")
-
-        # --- Dimension 6: extensions (absent => any extension) -------------------------
-        if matched.extensions:
-            for path in paths:
-                if not any(path.endswith(ext) for ext in matched.extensions):
-                    return Decision(allowed=False, failed_dimension="extension")
+            failed = "extension" if any_entry_passed_paths else "path"
+            return Decision(allowed=False, failed_dimension=failed)
 
         # --- Dimension 7: group intersection -------------------------------------------
         if not (set(groups) & set(authorized_groups)):
