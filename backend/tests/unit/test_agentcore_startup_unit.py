@@ -171,7 +171,19 @@ class TestInvokeAgent:
 
         # Pass user_id in the prompt dict
         result = invoke_agent(
-            {"prompt": "test prompt", "user_context": {"user_id": "test-user-123", "session_id": "test-session-456"}},
+            {
+                "prompt": "test prompt",
+                "user_context": {
+                    "user_id": "test-user-123",
+                    "client_id": "web-client",
+                    "audience": "web-client",
+                    "groups": ["users", "source-readers"],
+                    "scopes": ["openid", "profile"],
+                    "tenant": "tenant-a",
+                    "workspace": "workspace-a",
+                    "session_id": "test-session-456",
+                },
+            },
             context=mock_context,
         )
 
@@ -182,3 +194,9 @@ class TestInvokeAgent:
         assert agent_context["session_id"] == "test-session-456"
         # actor_id should be from context.user_id
         assert agent_context["actor_id"] == "test-user"
+        assert agent_context["client_id"] == "web-client"
+        assert agent_context["audience"] == "web-client"
+        assert agent_context["groups"] == ["users", "source-readers"]
+        assert agent_context["scopes"] == ["openid", "profile"]
+        assert agent_context["tenant"] == "tenant-a"
+        assert agent_context["workspace"] == "workspace-a"

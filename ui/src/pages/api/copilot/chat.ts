@@ -5,6 +5,12 @@ import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import { parse } from '@/utils/cookieCompat';
+import {
+  buildTrustedPrincipal,
+  TrustedPrincipalClaimsError,
+  TrustedPrincipalConfigError,
+  type TrustedPrincipal,
+} from '@/utils/trustedPrincipal';
 
 // Server-side proxy fetch timeouts. Plain fetch() has no default timeout, so a
 // hung backend would tie up the Node serverless function until the platform
@@ -69,8 +75,8 @@ async function verifyAccessToken(req: NextApiRequest): Promise<{ ok: boolean; pa
   try {
     const payload = await getAccessVerifier().verify(token);
     return { ok: true, payload };
-  } catch (error) {
-    logError('Access token validation failed:', error instanceof Error ? error : new Error(String(error)));
+  } catch {
+    logError('Access token validation failed');
     return { ok: false, payload: null };
   }
 }
@@ -211,14 +217,61 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(401).json({ error: 'Unauthorized', requestId });
     }
 
-    // Extract user context from the ID token. The ID token is CRYPTOGRAPHICALLY
-    // VERIFIED (signature + token_use + expiry) — not raw-decoded — because its
-    // claims (cognito:groups, sub) drive the approval gate and the isAdmin flag.
-    // It is also bound to the verified access token (matching sub) so a valid
-    // access token can't be paired with a forged/other id token. (#117)
+    // Authorization context comes only from the verified access token plus
+    // server-side deployment bindings. Browser request data and model output
+    // never participate in principal construction.
+    let trustedPrincipal: TrustedPrincipal | null = null;
+    if (accessPayload) {
+      try {
+        trustedPrincipal = buildTrustedPrincipal(accessPayload, {
+          clientId: process.env.COGNITO_CLIENT_ID,
+          audience: process.env.GBAW_COGNITO_AUDIENCE,
+          tenant: process.env.GBAW_TENANT_ID,
+          workspace: process.env.GBAW_WORKSPACE_ID,
+        });
+      } catch (error) {
+        if (error instanceof TrustedPrincipalConfigError) {
+          logError(`[${requestId}] ❌ Trusted identity configuration is incomplete`);
+          return res.status(503).json({ error: 'Identity configuration unavailable', requestId });
+        }
+        if (error instanceof TrustedPrincipalClaimsError) {
+          logError(`[${requestId}] ❌ Verified access token has invalid identity claims`);
+          return res.status(401).json({ error: 'Invalid token', requestId });
+        }
+        throw error;
+      }
+
+      if (
+        !trustedPrincipal.groups.includes('admin') &&
+        !trustedPrincipal.groups.includes('users')
+      ) {
+        logError(`[${requestId}] ❌ User not approved`);
+        return res.status(403).json({
+          error: 'Account pending approval',
+          message: 'Your account is awaiting admin approval. Please contact an administrator.',
+          requestId
+        });
+      }
+    }
+
+    // Fail closed: outside the explicit local-dev bypass, a trusted principal MUST have been
+    // built from the verified access token before the request proceeds. Without this, the
+    // approval gate above is only reached when `accessPayload` happens to be truthy — so any
+    // future path that returns ok-but-null (e.g. a misconfigured hosted env) would silently
+    // skip the admin/users check and let an unapproved caller through. The dev bypass
+    // (NODE_ENV !== 'production' && NEXT_PUBLIC_SKIP_AUTH === 'true') is the ONLY case allowed
+    // to run without a trusted principal; identity there comes from STS, not Cognito.
+    const isDevAuthBypass =
+      process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
+    if (!trustedPrincipal && !isDevAuthBypass) {
+      logError(`[${requestId}] ❌ No trusted principal — refusing to proceed without verified identity`);
+      return res.status(401).json({ error: 'Unauthorized', requestId });
+    }
+
+    // The ID token is separately verified and bound to the access-token subject.
+    // Its email claim is presentation data only; it does not grant authority.
     const cookies = parse(req.headers.cookie || '');
     const idToken = cookies.cognito_id_token;
-    let userContext = {};
     // Verified ID-token claims, reused later for the memory-identity block so the
     // token is verified exactly once (no second raw decode).
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -230,8 +283,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       try {
         decoded = await getIdVerifier().verify(idToken);
         verifiedIdClaims = decoded;
-      } catch (error) {
-        logError(`[${requestId}] ❌ ID token verification failed`, error instanceof Error ? error : new Error(String(error)));
+      } catch {
+        logError(`[${requestId}] ❌ ID token verification failed`);
         return res.status(401).json({ error: 'Invalid token', requestId });
       }
 
@@ -242,27 +295,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         return res.status(401).json({ error: 'Token mismatch', requestId });
       }
 
-      const groups = (decoded['cognito:groups'] as string[]) || [];
-
-      // Check if user is confirmed and approved
-      if (!groups.includes('admin') && !groups.includes('users')) {
-        logError(`[${requestId}] ❌ User not approved`);
-        return res.status(403).json({
-          error: 'Account pending approval',
-          message: 'Your account is awaiting admin approval. Please contact an administrator.',
-          requestId
-        });
-      }
-
-      userContext = {
-        userId: decoded.sub,
-        email: decoded.email,
-        isAdmin: groups.includes('admin'),
-        groups: groups
-      };
-
-      logInfo(`[${requestId}] 👤 User: ${redact(decoded.email as string)}, Admin: ${groups.includes('admin')}`);
+      logInfo(
+        `[${requestId}] 👤 User: ${redact(decoded.email as string)}, ` +
+          `Admin: ${trustedPrincipal?.groups.includes('admin') || false}`,
+      );
     }
+
+    const authorizationContext = trustedPrincipal
+      ? {
+          ...trustedPrincipal,
+          is_admin: trustedPrincipal.groups.includes('admin'),
+        }
+      : {};
 
     // Handle different HTTP methods appropriately
     if (req.method === 'GET' || req.method === 'HEAD') {
@@ -380,14 +424,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     logInfo(`[${requestId}] 📦 Conversation history: ${conversationHistory.length} messages`);
     logInfo(`[${requestId}] 📦 Found ${userMessages.length} user messages`);
-    // User prompt content is PII-bearing — log only its length at info level;
-    // the content itself is dev-only (logDebug).
+    // User prompt content is PII-bearing, so logs record only its length.
     logInfo(`[${requestId}] 📥 Last user message: ${message.length} chars`);
-    logDebug(`[${requestId}] 📥 Last user message content: ${message.substring(0, 100)}...`);
 
     if (!message) {
       logError(`[${requestId}] ❌ No user message found in messages array`);
-      logDebug(`[${requestId}] 📦 Messages: ${JSON.stringify(messages).substring(0, 500)}`);
       return res.status(400).json({ error: 'No message provided', requestId });
     }
 
@@ -421,7 +462,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         });
       }
       userIdentity = {
-        userId: decoded.sub,           // Persistent Cognito user ID
+        userId: trustedPrincipal?.user_id || decoded.sub, // Access-token subject is authoritative
         email: decoded.email,
         username: decoded.email || decoded.sub,
         displayName: decoded.email,
@@ -447,8 +488,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}]   Type: ${userIdentity?.authType}`);
     logInfo(`[${requestId}]   User ID: ${redact(userIdentity?.userId)}`);
     logInfo(`[${requestId}]   Username: ${redact(userIdentity?.username)}`);
-    logDebug(`[${requestId}]   Display: ${userIdentity?.displayName}`);
-    logDebug(`[${requestId}]   Email: ${userIdentity?.email}`);
+    logDebug(`[${requestId}]   Display: ${redact(userIdentity?.displayName)}`);
+    logDebug(`[${requestId}]   Email: ${redact(userIdentity?.email)}`);
 
     // Environment-specific session isolation
     // Dev and prod use different session ID prefixes to prevent memory collision
@@ -469,7 +510,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       // Production: Use AWS SDK to invoke AgentCore Runtime
       logInfo(`[${requestId}] 🚀 Calling AgentCore Runtime via AWS SDK`);
       logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
-      logDebug(`[${requestId}] 📤 Prompt content: ${message.substring(0, 100)}...`);
 
       const runtimeId = process.env.AGENTCORE_RUNTIME_ID;
       if (!runtimeId) {
@@ -492,24 +532,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         prompt: message,
         thread_id: isolatedThreadId,     // Environment-isolated session ID
         user_context: {
-          user_id: userIdentity?.userId,   // Persistent user ID
+          user_id: userIdentity?.userId,   // Overridden by trusted principal in production
           session_id: isolatedThreadId,    // Environment-isolated session ID
-          email: userIdentity?.email,
-          username: userIdentity?.username,
-          display_name: userIdentity?.displayName,
           auth_type: userIdentity?.authType,
-          account_id: userIdentity?.accountId,
-          arn: userIdentity?.arn,
-          ...userContext
+          ...authorizationContext
         }
       };
 
       logInfo(`[${requestId}] 📦 Payload to AgentCore:`);
-      logInfo(`[${requestId}]   prompt: ${message.substring(0, 50)}...`);
+      logInfo(`[${requestId}]   prompt: ${message.length} chars`);
       logInfo(`[${requestId}]   thread_id: ${isolatedThreadId}`);
       logInfo(`[${requestId}]   user_context.user_id: ${redact(payload.user_context.user_id)}`);
       logInfo(`[${requestId}]   user_context.session_id: ${redact(payload.user_context.session_id)}`);
-      logDebug(`[${requestId}]   user_context.display_name: ${payload.user_context.display_name}`);
 
       const payloadString = JSON.stringify(payload);
       const payloadBytes = new TextEncoder().encode(payloadString);
@@ -558,7 +592,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
         logInfo(`[${requestId}] 📦 STAGE 1 - RAW SDK STREAM`);
         logInfo(`[${requestId}] Type: ${typeof responseContent}`);
-        logDebug(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
         logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
         logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
 
@@ -593,7 +626,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 🚀 Calling local AgentCore at ${backendUrl}/invocations`);
       logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
-      logDebug(`[${requestId}] 📤 Prompt content: ${message.substring(0, 100)}...`);
 
       const response = await fetchWithTimeout(`${backendUrl}/invocations`, {
         method: 'POST',
@@ -607,13 +639,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           user_context: {
             user_id: userIdentity?.userId,   // Persistent user ID
             session_id: threadId,           // Session ID
-            email: userIdentity?.email,
-            username: userIdentity?.username,
-            display_name: userIdentity?.displayName,
+            ...(trustedPrincipal
+              ? {}
+              : {
+                  email: userIdentity?.email,
+                  username: userIdentity?.username,
+                  display_name: userIdentity?.displayName,
+                }),
             auth_type: userIdentity?.authType,
             account_id: userIdentity?.accountId,
             arn: userIdentity?.arn,
-            ...userContext
+            ...authorizationContext
           }
         }),
       }, INVOCATION_TIMEOUT_MS);
@@ -624,7 +660,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 STAGE 1 - RAW BACKEND RESPONSE`);
       logInfo(`[${requestId}] Type: ${typeof backendData}`);
-      logDebug(`[${requestId}] Value: ${JSON.stringify(backendData).substring(0, 200)}`);
 
       // Ensure we always get a string
       if (typeof backendData === 'string') {
@@ -641,7 +676,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 STAGE 2 - AFTER EXTRACTION`);
       logInfo(`[${requestId}] Type: ${typeof responseContent}`);
-      logDebug(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
       logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
       logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
     }
@@ -649,7 +683,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] 📦 STAGE 3 - BEFORE COPILOTKIT FORMATTING`);
     logInfo(`[${requestId}] Type: ${typeof responseContent}`);
     logInfo(`[${requestId}] Length: ${responseContent.length}`);
-    logDebug(`[${requestId}] First 200 chars: ${responseContent.substring(0, 200)}`);
     logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
     logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
 
@@ -690,7 +723,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] 📦 STAGE 4 - COPILOTKIT RESPONSE`);
     logInfo(`[${requestId}] Content array length: ${copilotResponse.data.generateCopilotResponse.messages[0].content.length}`);
     logInfo(`[${requestId}] Content[0] type: ${typeof copilotResponse.data.generateCopilotResponse.messages[0].content[0]}`);
-    logDebug(`[${requestId}] Content[0] first 200 chars: ${copilotResponse.data.generateCopilotResponse.messages[0].content[0].substring(0, 200)}`);
 
     logInfo(`[${requestId}] 📤 Sending CopilotKit formatted response`);
     logInfo(`[${requestId}] ========================================`);
