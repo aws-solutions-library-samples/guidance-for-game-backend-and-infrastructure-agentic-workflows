@@ -279,7 +279,7 @@ def invoke_agent(prompt, context=None):
                 logger.info(f"🔄 Using actor_id from headers: {header_actor_id}")
                 actor_id = header_actor_id
 
-        logger.info(f"👤 User: {display_name} ({username}) [{auth_type}]")
+        logger.info(f"👤 Authenticated user context [{auth_type}]")
         logger.info(f"🆔 Actor ID: {actor_id}")
         logger.info(f"📍 Session ID: {session_id} (environment-isolated)")
         logger.info(f"🔑 Persistent User ID: {persistent_user_id}")
@@ -288,6 +288,12 @@ def invoke_agent(prompt, context=None):
         # Note: AgentCore Memory automatically loads conversation history via runtimeSessionId
         agent_context = {
             "user_id": persistent_user_id,
+            "client_id": user_context.get("client_id"),
+            "audience": user_context.get("audience"),
+            "groups": user_context.get("groups", []),
+            "scopes": user_context.get("scopes", []),
+            "tenant": user_context.get("tenant"),
+            "workspace": user_context.get("workspace"),
             "session_id": session_id,
             "thread_id": thread_id,
             "username": username,
