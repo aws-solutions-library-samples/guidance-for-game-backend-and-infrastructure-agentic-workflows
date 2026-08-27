@@ -314,9 +314,26 @@ Canonical role variables take precedence over legacy aliases, then repository de
    - Command: `awslabs.aws-api-mcp-server` (pre-installed package)
    - Tools: `call_aws` (runs AWS CLI commands, e.g., `aws eks list-clusters` for EKS cluster discovery)
 
-3. **Cost Explorer MCP Server** - Cost analysis and billing operations
-   - Command: `awslabs.cost-explorer-mcp-server` (pre-installed package)
-   - Tools: `get_today_date`, `get_cost_and_usage`, `get_cost_forecast`
+3. **Billing and Cost Management MCP Server** - Forecasting and optimization analysis
+   - Command: `awslabs.billing-cost-management-mcp-server` (pre-installed package)
+   - Tools include Cost Explorer forecasts and cost optimization operations
+
+### Deterministic Cost Reports
+
+Actual cost totals and service rankings use the owned `get_cost_report` boto3
+tool. It converts the inclusive user end date to Cost Explorer's exclusive
+`End`, aggregates every page of one grouped query, performs all arithmetic with
+`Decimal`, validates the result, and emits a fixed financial section. Report
+snapshots are cached by random report ID so follow-up calculations can reuse the
+same data without silently mixing Cost Explorer query times.
+The cost specialist rejects the Billing MCP server's historical
+`getCostAndUsage` operations so they cannot bypass this path; forecast and
+optimization operations remain available.
+
+Snapshot correctness and billing finality are separate. A validated report is
+internally consistent with Cost Explorer at its `queriedAt` timestamp, while an
+open billing period marked `estimated` can still change when AWS backfills or
+finalizes usage.
 
 ### MCP Client Factory Pattern
 
