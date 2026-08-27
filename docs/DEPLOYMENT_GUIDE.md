@@ -109,8 +109,15 @@ Edit `ui/.env.local` if you need to customize:
 - `AWS_REGION`: Your deployment region
 - `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 4.5)
 - `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 4.6)
+- `GBAW_TENANT_ID`: Trusted tenant binding for this deployment (default: `default-tenant`)
+- `GBAW_WORKSPACE_ID`: Trusted workspace binding for this deployment (default: `default-workspace`)
 
 Process environment values take precedence over `ui/.env.local`. The canonical role variables above take precedence over the compatibility aliases `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; empty values are treated as unset. The deployment passes the resolved role IDs to AgentCore on both initial launch and updates.
+
+Tenant and workspace are server-side identity bindings. The deployment passes
+them to the frontend container without a `NEXT_PUBLIC_` prefix; browser request
+data cannot override them. See
+[Identity and Authorization](IDENTITY_AND_AUTHORIZATION.md).
 
 ### Step 4: Deploy
 
@@ -283,6 +290,8 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-4-6` | All specialist models/profiles |
 | `GBAW_BEDROCK_MODEL_ID` | No | unset | Legacy orchestrator alias |
 | `GBAW_BEDROCK_MODEL_ID_SECONDARY` | No | unset | Legacy specialist alias |
+| `GBAW_TENANT_ID` | No | `default-tenant` | Server-side trusted tenant binding |
+| `GBAW_WORKSPACE_ID` | No | `default-workspace` | Server-side trusted workspace binding |
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
@@ -290,6 +299,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 ## Security Notes
 
 - **Authentication**: Cognito enforces admin-only user creation
+- **Identity propagation**: Authorization uses verified access-token claims plus server-bound tenant/workspace; ID-token presentation data does not grant backend authority
 - **AI Safety**: Bedrock Guardrails filter harmful content
 - **IAM**: Least-privilege roles for all components
 - **EKS Access**: Read-only permissions, secrets excluded
