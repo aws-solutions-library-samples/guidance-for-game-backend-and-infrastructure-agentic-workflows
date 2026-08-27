@@ -40,7 +40,7 @@ Key capabilities:
 | **Orchestrator** | Query routing and multi-turn reasoning | Delegates to specialists |
 | **GameLift Specialist** | Fleet management, scaling, optimization | boto3 tools + Knowledge Base |
 | **EKS Specialist** | Kubernetes cluster operations | EKS MCP Server + Knowledge Base |
-| **Cost Specialist** | Spending analysis and forecasting | Cost Explorer MCP Server + Knowledge Base |
+| **Cost Specialist** | Deterministic spending reports, analysis, and forecasting | Owned Cost Explorer report tool + Billing MCP Server + Knowledge Base |
 
 ## Architecture
 
@@ -57,7 +57,7 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 5. Amazon Bedrock Guardrails filter input for prompt injection, off-topic content, and PII
 6. Orchestrator classifies the query and delegates to the appropriate specialist agent
 7. Specialist queries its Bedrock Knowledge Base for domain-specific context (RAG)
-8. Specialist invokes MCP servers (EKS, Cost Explorer) or boto3 tools (GameLift) for live AWS data
+8. Specialist invokes MCP servers or owned boto3 tools for live AWS data
 9. Read-only API calls execute against target AWS services with least-privilege IAM policies
 10. Response flows back through the chain to the user
 
@@ -302,9 +302,18 @@ All three MCP servers use stdio transport exclusively. They run as embedded subp
 |------------|---------|------------|
 | `awslabs.eks-mcp-server` | Kubernetes cluster management | EKS Specialist |
 | `awslabs.aws-api-mcp-server` | AWS CLI bridge for resource discovery (e.g. `aws eks list-clusters`) | EKS Specialist |
-| `awslabs.cost-explorer-mcp-server` | Cost analysis and forecasting | Cost Specialist |
+| `awslabs.billing-cost-management-mcp-server` | Cost forecasting and optimization analysis | Cost Specialist |
 
 MCP clients are created through a thread-safe factory (`utils/mcp_client_factory.py`) with automatic retry and fallback to boto3 when MCP servers are unavailable.
+
+Actual cost totals and service breakdowns use the owned `get_cost_report` tool
+instead of the general MCP query tool. One logical, grouped Cost Explorer query
+is aggregated with `Decimal`, validated, rendered deterministically, and cached
+by report ID for follow-up calculations. The report guarantees consistency with
+the stated Cost Explorer snapshot; an `estimated` report can still be revised by
+AWS as open-period billing data is finalized. Historical cost-and-usage
+operations from the general Billing MCP tool are blocked from bypassing the
+validated report path; forecast and optimization operations remain available.
 
 ### Enrolling EKS Clusters
 

@@ -6,7 +6,7 @@ reducing code duplication and ensuring uniform behavior across all specialists.
 """
 
 # Standard library
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 # Third-party packages
 from strands import Agent, tool
@@ -30,6 +30,8 @@ def create_specialist_agent(
     prompt_fn: Callable[[], str],
     fallback_fn: Optional[Callable[[str], str]] = None,
     additional_tools: Optional[List] = None,
+    additional_tools_factory: Optional[Callable[[], tuple[List, Callable[[str], str]]]] = None,
+    mcp_client_transform: Optional[Callable[[str, Any], Any]] = None,
 ):
     """
     Factory function to create specialist agents with consistent patterns.
@@ -42,6 +44,9 @@ def create_specialist_agent(
         prompt_fn: Function that returns system prompt
         fallback_fn: Fallback function when MCP unavailable (optional)
         additional_tools: Extra tools to add (e.g., boto3 tools)
+        additional_tools_factory: Per-request tools plus a response finalizer. Use
+            this when tools need request-local state or deterministic rendering.
+        mcp_client_transform: Optional wrapper applied to each available MCP client.
 
     Returns:
         Agent tool function decorated with @tool
@@ -55,6 +60,10 @@ def create_specialist_agent(
 
                 # Build tools list
                 tools = list(additional_tools) if additional_tools else []
+                response_finalizer = None
+                if additional_tools_factory:
+                    request_tools, response_finalizer = additional_tools_factory()
+                    tools.extend(request_tools)
 
                 # Add MCP clients if specified (uses caching for performance)
                 mcp_clients_created = 0
@@ -62,11 +71,13 @@ def create_specialist_agent(
                     for server_name in mcp_server_names:
                         mcp_client = create_mcp_client(server_name)
                         if mcp_client:
+                            if mcp_client_transform:
+                                mcp_client = mcp_client_transform(server_name, mcp_client)
                             tools.append(mcp_client)
                             mcp_clients_created += 1
 
                     # If no MCP clients created and fallback exists, use it
-                    if mcp_clients_created == 0 and fallback_fn:
+                    if mcp_clients_created == 0 and fallback_fn and not tools:
                         logger.warning(f"⚠️ {service_name} MCP unavailable, using fallback")
                         return fallback_fn(AWS_REGION)
 
@@ -104,6 +115,8 @@ def create_specialist_agent(
                         )
 
                         result = str(specialist(query))
+                        if response_finalizer:
+                            result = response_finalizer(result)
                         logger.debug(f"{emoji} {service_name} complete ({len(result)} chars)")
 
                     return result
