@@ -26,7 +26,9 @@ Resources:
   VectorIndex:
     Type: AWS::S3Vectors::Index
     Properties:
-      IndexName: !Sub '${ProjectName}-eks-index'
+      # MetadataConfiguration requires replacement. The v2 name lets
+      # CloudFormation create this index alongside the original named index.
+      IndexName: !Sub '${ProjectName}-eks-index-v2'
       VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
       Dimension: !Ref EmbeddingDimension
       DataType: float32
@@ -132,7 +134,7 @@ Resources:
         Type: S3_VECTORS
         S3VectorsConfiguration:
           VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
-          IndexName: !Sub '${ProjectName}-eks-index'
+          IndexName: !Sub '${ProjectName}-eks-index-v2'
 
   DataSource:
     Type: AWS::Bedrock::DataSource
