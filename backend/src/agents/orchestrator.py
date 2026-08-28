@@ -18,10 +18,14 @@ Uses native AWS AgentCore Memory integration via AgentCoreMemorySessionManager.
 Memory is automatically handled when session_manager is provided.
 """
 
+# Standard library
+from typing import Any
+
 # Third-party packages
 from strands import Agent
 
 # Local modules
+from agents.cost_report import begin_cost_report_capture, finish_cost_report_capture
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.gamelift_specialist import gamelift_agent
@@ -156,7 +160,22 @@ def run_orchestrator(query: str, context: dict = None):
 
         # Run the agent
         logger.debug("🚀 Running agent...")
-        response = agent(query)
+        cost_report_capture = begin_cost_report_capture()
+        try:
+            response: Any = agent(query)
+        except Exception:
+            authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
+            if authoritative_cost_response is None:
+                raise
+            logger.warning("Orchestrator failed after a validated cost report; returning the deterministic rendering")
+            response = authoritative_cost_response
+        else:
+            authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
+            if authoritative_cost_response is not None:
+                # A cost-report tool has already produced the complete financial
+                # section. Bypass both specialist and orchestrator prose so no
+                # model can replace or independently calculate those values.
+                response = authoritative_cost_response
 
         # Extract and save semantic memories for LTM (non-blocking)
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:

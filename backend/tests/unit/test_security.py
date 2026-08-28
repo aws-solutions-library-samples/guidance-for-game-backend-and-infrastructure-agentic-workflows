@@ -203,6 +203,12 @@ class TestUserContextValidation:
         context = {
             "user_id": "user123",
             "session_id": "session456",
+            "client_id": "web-client",
+            "audience": "web-client",
+            "groups": ["users", "source-readers"],
+            "scopes": ["openid", "profile"],
+            "tenant": "tenant-a",
+            "workspace": "workspace-a",
             "malicious_key": "should be removed",
             "email": "user@example.com",
         }
@@ -213,6 +219,12 @@ class TestUserContextValidation:
         assert "session_id" in result
         assert "email" in result
         assert "malicious_key" not in result
+        assert result["client_id"] == "web-client"
+        assert result["audience"] == "web-client"
+        assert result["groups"] == ["users", "source-readers"]
+        assert result["scopes"] == ["openid", "profile"]
+        assert result["tenant"] == "tenant-a"
+        assert result["workspace"] == "workspace-a"
 
     def test_validate_truncates_long_strings(self):
         """Long string values should be truncated."""
