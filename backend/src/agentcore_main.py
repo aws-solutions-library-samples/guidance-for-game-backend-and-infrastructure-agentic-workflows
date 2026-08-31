@@ -234,6 +234,16 @@ def invoke_agent(prompt, context=None):
             logger.info(f"📦 Prompt type: {type(prompt)}")
 
         # Security: Validate and sanitize input
+        #
+        # TRUST BOUNDARY (PR #319 finding F2 / PR #320): the requester, tenant, workspace,
+        # and groups in `user_context` are the VERIFIED frontend identity forwarded to this
+        # AgentCore runtime entry. `validate_user_context` only allow-lists the permitted
+        # keys and sanitizes their values (length/type) — it does NOT itself re-verify the
+        # origin or authenticity of that identity. The validated values are what get placed
+        # into the request context below (`set_request_context`) and are the ONLY identity
+        # the downstream Source Control Connector authorization gate trusts. Therefore this
+        # runtime endpoint must remain reachable only via that verified boundary; a caller
+        # that could invoke it directly would be trusted as the forwarded principal.
         logger.info("🔒 Security: Validating input...")
         try:
             user_prompt = validate_prompt(user_prompt, strict_mode=False)

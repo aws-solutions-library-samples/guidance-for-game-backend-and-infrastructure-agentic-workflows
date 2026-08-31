@@ -215,6 +215,7 @@ function Deploy-GameAgent {
     $gameliftPromptArn     = Read-EnvVar 'GBAW_GAMELIFT_PROMPT_ARN'
     $eksPromptArn          = Read-EnvVar 'GBAW_EKS_PROMPT_ARN'
     $costPromptArn         = Read-EnvVar 'GBAW_COST_PROMPT_ARN'
+    $sourceControlPromptArn = Read-EnvVar 'GBAW_SOURCE_CONTROL_PROMPT_ARN'
     Write-GameAgentStatus 'Managed Prompts deployed' -Type Success
     Write-Host ''
 
@@ -257,6 +258,7 @@ function Deploy-GameAgent {
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
             -CostPromptArn $costPromptArn `
+            -SourceControlPromptArn $sourceControlPromptArn `
             -ScmEnv $scmRuntimeEnv
 
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
@@ -394,6 +396,7 @@ function Deploy-GameAgent {
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
             -CostPromptArn $costPromptArn `
+            -SourceControlPromptArn $sourceControlPromptArn `
             -GameLiftKbId $gameliftKbId `
             -EksKbId $eksKbId `
             -CostKbId $costKbId `

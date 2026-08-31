@@ -10,6 +10,7 @@ function New-GameAgentAgentCoreEnvArgs {
         [string]$GameLiftPromptArn = '',
         [string]$EksPromptArn = '',
         [string]$CostPromptArn = '',
+        [string]$SourceControlPromptArn = '',
         [string]$GameLiftKbId = '',
         [string]$EksKbId = '',
         [string]$CostKbId = '',
@@ -33,6 +34,7 @@ function New-GameAgentAgentCoreEnvArgs {
         GBAW_GAMELIFT_PROMPT_ARN       = $GameLiftPromptArn
         GBAW_EKS_PROMPT_ARN            = $EksPromptArn
         GBAW_COST_PROMPT_ARN           = $CostPromptArn
+        GBAW_SOURCE_CONTROL_PROMPT_ARN = $SourceControlPromptArn
         GBAW_GAMELIFT_KB_ID             = $GameLiftKbId
         GBAW_EKS_KB_ID                  = $EksKbId
         GBAW_COST_KB_ID                 = $CostKbId

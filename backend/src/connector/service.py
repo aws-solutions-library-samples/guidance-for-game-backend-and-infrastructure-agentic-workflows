@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Sequence
 from connector.audit import AuditSink
 from connector.config import AuthorizationPolicy, Decision, SourceControlConfig
 from connector.models import FileFetchResult
-from connector.provider import ProviderTransientError
+from connector.provider import ProviderError, ProviderTransientError
 from connector.registry import get_provider
 from utils.logger import logger
 from utils.request_context import get_request_context
@@ -65,6 +65,7 @@ class PathTraversalError(ValueError):
         self.requested_path = path
         self.reason = reason
         super().__init__(f"unsafe path rejected ({reason})")
+
 
 # ---------------------------------------------------------------------------
 # Durable audit sink wiring (repurposed for scm_read events)
@@ -159,37 +160,46 @@ def _read_path_context() -> tuple[str | None, list[str], str, str]:
 
 
 def _normalize_path(path: str) -> str:
-    """Normalize a requested path to a canonical repo-relative POSIX path.
+    """Normalize a requested path to a canonical repo-relative POSIX path, or REJECT it.
 
-    Collapses ``.``/``..`` segments and duplicate slashes and strips leading slashes so
-    authorization prefix checks and the subsequent provider read operate on the same
-    canonical form. An empty/whitespace path normalizes to an empty string.
+    An empty/whitespace path normalizes to an empty string. Otherwise only *safe*
+    canonicalization is applied — collapsing ``.`` segments and duplicate slashes via
+    :func:`posixpath.normpath` — and the result is a single canonical repo-relative POSIX
+    path used identically by the seven-dimension authorization and the subsequent provider
+    read.
 
-    Rejects — rather than silently rewrites — any path that attempts to escape the repository
-    root via ``..``, or that contains a NUL or backslash. A leading ``/`` is treated as
-    repo-relative (stripped), matching the pre-existing contract; it is not itself an escape and
-    the seven-dimension authorization still constrains where the read may land. Because the
-    requested paths originate from model/tool output, silently accepting ``../../secrets`` would
-    let a prompt-injected request read outside the intended tree; failing closed with
-    :class:`PathTraversalError` keeps the read confined to the repo. Callers convert this into a
-    fail-closed empty result with an audit.
+    Because the requested paths originate from model/tool output, this **rejects rather than
+    silently rewrites** any path that could escape the repository root. A
+    :class:`PathTraversalError` is raised (and converted by the caller into a fail-closed
+    empty result with a ``path_invalid`` audit and no provider read) when the path:
+
+    - is **absolute** (has a leading ``/``) — it is rejected outright, not stripped to
+      repo-relative; or
+    - contains **any** ``..`` path segment — the presence of a ``..`` component is rejected
+      before normalization, so an escaping segment is never collapsed away and accepted; or
+    - contains a **NUL byte or a backslash** (illegal characters).
+
+    Silently accepting ``/etc/passwd`` or ``../../secrets`` would let a prompt-injected
+    request read outside the intended tree; failing closed keeps every read confined to the
+    repository root.
     """
     if not path or not path.strip():
         return ""
     if "\x00" in path or "\\" in path:
         raise PathTraversalError(path, "path contains an illegal character")
-    # A leading "/" is treated as repo-relative (the pre-existing contract strips it), so an
-    # absolute-looking path is not itself an escape — it is normalized to repo-relative and the
-    # seven-dimension authorization still constrains it. What must be rejected is a path that
-    # escapes the repository root via "..".
+    # Reject an absolute path outright — do NOT strip the leading "/" to repo-relative.
+    if path.startswith("/"):
+        raise PathTraversalError(path, "path is absolute")
+    # Reject on the PRESENCE of any ".." component (checked before normalization) so an
+    # escaping segment is never collapsed away and silently accepted.
+    if any(segment == ".." for segment in path.split("/")):
+        raise PathTraversalError(path, "path escapes the repository root")
+    # Safe to canonicalize: only "." segments and duplicate slashes are collapsed. With no
+    # ".." component and no leading "/", the result stays a repo-relative path.
     normalized = posixpath.normpath(path)
     if normalized == ".":
         return ""
-    stripped = normalized.lstrip("/")
-    # After normalization + lstrip, a path that still begins with ".." points above the root.
-    if stripped == ".." or stripped.startswith("../"):
-        raise PathTraversalError(path, "path escapes the repository root")
-    return stripped
+    return normalized
 
 
 def _now_iso() -> str:
@@ -299,6 +309,17 @@ def _fetch_files_with_retry(
             )
     # Unreachable: the loop either returns, or re-raises on the final attempt.
     raise last_exc  # type: ignore[misc]  # pragma: no cover
+
+
+def _provider_failure_reason(exc: ProviderError) -> str:
+    """Return a stable, secret-free category for a terminal provider failure.
+
+    Only the exception's class name (a fixed category such as ``ProviderAuthError`` or
+    ``ProviderTransientError``) is recorded — never the exception message or any provider
+    response body — so no credential, token, or file content can leak into the durable
+    audit reason.
+    """
+    return type(exc).__name__
 
 
 def read_iac_files(
@@ -456,13 +477,38 @@ def read_iac_files(
     # failure (rate limit / temporary 5xx / read timeout) is retried up to the configured
     # ``retry_max_attempts``; an auth or permanent failure is not retried. The reader reports
     # missing paths in the result; no write-usable revision is captured.
-    result = _fetch_files_with_retry(
-        resolved_reader,
-        repo,
-        branch,
-        list(normalized_paths),
-        max_attempts=resolved_config.connector.retry_max_attempts,
-    )
+    #
+    # A terminal provider failure — an exhausted ``ProviderTransientError`` or a non-retried
+    # ``ProviderAuthError``/permanent ``ProviderError`` — must not escape before the read is
+    # durably audited. Record a sanitized ``scm_read`` error outcome (requester/tenant/
+    # workspace/result/reason; the reason is the exception category only, never a credential,
+    # token, or provider payload) and then re-raise so the tool wrapper still returns its safe
+    # error dict. Retry policy is unchanged: the retry/no-retry decision happens inside
+    # ``_fetch_files_with_retry`` before any exception reaches here.
+    try:
+        result = _fetch_files_with_retry(
+            resolved_reader,
+            repo,
+            branch,
+            list(normalized_paths),
+            max_attempts=resolved_config.connector.retry_max_attempts,
+        )
+    except ProviderError as exc:
+        _audit(
+            "error",
+            "IaC file read failed: terminal provider error",
+            event="scm_read",
+            action="read",
+            outcome="error",
+            requester=requester,
+            tenant=tenant,
+            workspace=workspace,
+            repository=repo,
+            target_branch=branch,
+            normalized_paths=list(normalized_paths),
+            reason=_provider_failure_reason(exc),
+        )
+        raise
 
     # Reject a read whose total content exceeds the configured maximum size, with no files
     # served.

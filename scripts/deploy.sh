@@ -178,6 +178,7 @@ GBAW_ORCHESTRATOR_PROMPT_ARN=$(grep "^GBAW_ORCHESTRATOR_PROMPT_ARN=" "$PROJECT_R
 GBAW_GAMELIFT_PROMPT_ARN=$(grep "^GBAW_GAMELIFT_PROMPT_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 GBAW_EKS_PROMPT_ARN=$(grep "^GBAW_EKS_PROMPT_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 GBAW_COST_PROMPT_ARN=$(grep "^GBAW_COST_PROMPT_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
+GBAW_SOURCE_CONTROL_PROMPT_ARN=$(grep "^GBAW_SOURCE_CONTROL_PROMPT_ARN=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 
 echo "✅ Managed Prompts deployed"
 echo ""
@@ -249,6 +250,7 @@ build_agentcore_env_args() {
   append_agentcore_env_if_resolved "GBAW_GAMELIFT_PROMPT_ARN" "${GBAW_GAMELIFT_PROMPT_ARN:-}"
   append_agentcore_env_if_resolved "GBAW_EKS_PROMPT_ARN" "${GBAW_EKS_PROMPT_ARN:-}"
   append_agentcore_env_if_resolved "GBAW_COST_PROMPT_ARN" "${GBAW_COST_PROMPT_ARN:-}"
+  append_agentcore_env_if_resolved "GBAW_SOURCE_CONTROL_PROMPT_ARN" "${GBAW_SOURCE_CONTROL_PROMPT_ARN:-}"
   append_agentcore_env_if_resolved "GBAW_GAMELIFT_KB_ID" "${GAMELIFT_KB_ID:-}"
   append_agentcore_env_if_resolved "GBAW_EKS_KB_ID" "${EKS_KB_ID:-}"
   append_agentcore_env_if_resolved "GBAW_COST_KB_ID" "${COST_KB_ID:-}"

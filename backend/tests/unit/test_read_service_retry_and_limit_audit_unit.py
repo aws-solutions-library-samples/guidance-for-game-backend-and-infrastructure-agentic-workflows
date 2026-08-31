@@ -126,6 +126,66 @@ def test_auth_error_is_not_retried(captured_audit):
     assert len(reader.calls_for("get_files")) == 1, "auth failures must never be retried"
 
 
+# --- Finding #3: durable audit on a terminal provider failure -----------------------------
+
+
+def _terminal_failure_audit_events(captured: _FakeAuditSink) -> list[dict[str, Any]]:
+    """Return the durable ``scm_read`` error-outcome events captured on a terminal failure."""
+    return [e for e in captured.events if e.get("event") == "scm_read" and e.get("outcome") == "error"]
+
+
+def _assert_secret_free(event: dict[str, Any]) -> None:
+    """Assert a terminal-failure audit event leaks no credential or file content."""
+    assert "content" not in event
+    assert "token" not in event
+    assert not any("secret" in str(k).lower() for k in event), "audit must not carry a secret field"
+    # The reason is a sanitized exception category, never a raw provider payload/message.
+    for value in event.values():
+        assert "Bearer" not in str(value), "audit must not echo a credential"
+
+
+def test_exhausted_transient_failure_writes_durable_audit(captured_audit):
+    """An exhausted-transient terminal failure is durably audited before it propagates."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderTransientError("still throttled"))
+
+    with pytest.raises(ProviderTransientError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    # Retry policy preserved: exactly retry_max_attempts calls before the terminal failure.
+    assert len(reader.calls_for("get_files")) == 3
+
+    events = _terminal_failure_audit_events(captured_audit)
+    assert len(events) == 1, "a terminal transient failure must be durably audited exactly once"
+    event = events[0]
+    assert event["reason"] == "ProviderTransientError"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    _assert_secret_free(event)
+
+
+def test_auth_error_writes_durable_audit(captured_audit):
+    """A non-retried ProviderAuthError is durably audited before it propagates."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderAuthError("credential rejected"))
+
+    with pytest.raises(ProviderAuthError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    # Auth failures are never retried.
+    assert len(reader.calls_for("get_files")) == 1
+
+    events = _terminal_failure_audit_events(captured_audit)
+    assert len(events) == 1, "a terminal auth failure must be durably audited exactly once"
+    event = events[0]
+    assert event["reason"] == "ProviderAuthError"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    _assert_secret_free(event)
+
+
 # --- Finding #8: durable audit of a file-count rejection ----------------------------------
 
 

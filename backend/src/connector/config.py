@@ -210,9 +210,7 @@ class AuthorizationPolicy:
             return Decision(allowed=False, failed_dimension="tenant")
 
         # --- Dimension 2: workspace (absent on entry => any workspace) -----------------
-        workspace_entries = [
-            entry for entry in tenant_entries if not entry.workspaces or workspace in entry.workspaces
-        ]
+        workspace_entries = [entry for entry in tenant_entries if not entry.workspaces or workspace in entry.workspaces]
         if not workspace_entries:
             return Decision(allowed=False, failed_dimension="workspace")
 
@@ -477,9 +475,7 @@ class AdapterConfig:
         raw_secret = (settings.SCM_READ_CREDENTIAL_SECRET_ARN or "").strip()
         read_credential_secret_arn: str | None = raw_secret or None
         if read_credential_secret_arn is None:
-            errors.append(
-                "read_credential_secret_arn: GBAW_SCM_READ_CREDENTIAL_SECRET_ARN is required but was not set"
-            )
+            errors.append("read_credential_secret_arn: GBAW_SCM_READ_CREDENTIAL_SECRET_ARN is required but was not set")
         elif not _SECRET_ARN_RE.match(read_credential_secret_arn):
             # Reject and NEVER echo the value into the error/audit output.
             read_credential_secret_arn = None

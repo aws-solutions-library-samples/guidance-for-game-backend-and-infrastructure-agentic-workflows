@@ -38,6 +38,7 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -GameLiftPromptArn 'gamelift-prompt' `
             -EksPromptArn 'eks-prompt' `
             -CostPromptArn 'cost-prompt' `
+            -SourceControlPromptArn 'source-control-prompt' `
             -GameLiftKbId 'gamelift-kb' `
             -EksKbId 'eks-kb' `
             -CostKbId 'cost-kb'
@@ -59,6 +60,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             'GBAW_EKS_PROMPT_ARN=eks-prompt'
             '-env'
             'GBAW_COST_PROMPT_ARN=cost-prompt'
+            '-env'
+            'GBAW_SOURCE_CONTROL_PROMPT_ARN=source-control-prompt'
             '-env'
             'GBAW_GAMELIFT_KB_ID=gamelift-kb'
             '-env'

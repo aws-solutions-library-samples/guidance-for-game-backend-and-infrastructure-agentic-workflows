@@ -132,6 +132,14 @@ def _oracle(case) -> AllowlistEntry | None:
     Mirrors the seven-dimension contract (tenant -> workspace -> repo -> branch -> path ->
     extension -> group) so the test asserts the service behaviour against an explicit
     specification rather than the implementation itself.
+
+    Path and extension are evaluated across **all** repo+branch-matching entries, exactly as
+    :meth:`AuthorizationPolicy.authorize` does: the request is permitted iff *any* matching
+    entry permits every requested path (path-prefix dimension) AND every requested extension
+    (extension dimension). The first entry that passes both becomes the matched entry. An
+    operator may list several entries for the same repo+branch that each scope different path
+    prefixes / extensions, so selecting only the first branch match would wrongly deny a
+    request that a later entry permits.
     """
     entries = case["entries"]
     tenant, workspace = case["tenant"], case["workspace"]
@@ -148,12 +156,19 @@ def _oracle(case) -> AllowlistEntry | None:
     repo_entries = [e for e in workspace_entries if e.repo == repo]
     if not repo_entries:
         return None
-    matched = next((e for e in repo_entries if branch in e.target_branches), None)
+    branch_entries = [e for e in repo_entries if branch in e.target_branches]
+    if not branch_entries:
+        return None
+    matched = None
+    for e in branch_entries:
+        paths_ok = not e.path_prefixes or all(any(p.startswith(pre) for pre in e.path_prefixes) for p in paths)
+        if not paths_ok:
+            continue
+        extensions_ok = not e.extensions or all(any(p.endswith(ext) for ext in e.extensions) for p in paths)
+        if extensions_ok:
+            matched = e
+            break
     if matched is None:
-        return None
-    if matched.path_prefixes and not all(any(p.startswith(pre) for pre in matched.path_prefixes) for p in paths):
-        return None
-    if matched.extensions and not all(any(p.endswith(ext) for ext in matched.extensions) for p in paths):
         return None
     if not (set(groups) & set(authorized_groups)):
         return None
