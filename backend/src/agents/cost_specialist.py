@@ -1,12 +1,14 @@
 """
 AWS Cost Explorer specialist agent.
 
-Provides comprehensive cost analysis, optimization recommendations,
-and spending insights using AWS Cost Explorer MCP server.
+Provides deterministic Cost Explorer reports plus MCP-backed forecasting and
+optimization recommendations.
 """
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.cost_mcp_guard import guard_cost_mcp_client
+from agents.cost_report import create_cost_report_tool_bundle
 from agents.optimized_prompts import get_optimized_cost_prompt
 from config.settings import COST_KB_ID
 
@@ -53,4 +55,6 @@ cost_agent = create_specialist_agent(
     prompt_fn=get_optimized_cost_prompt,
     fallback_fn=_get_cost_aws_cli_fallback,
     additional_tools=None,
+    additional_tools_factory=create_cost_report_tool_bundle,
+    mcp_client_transform=guard_cost_mcp_client,
 )

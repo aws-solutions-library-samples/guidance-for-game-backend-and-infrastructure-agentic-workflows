@@ -28,6 +28,9 @@ provider write permissions.
 See the [architecture decision records](adr/README.md) for the accepted
 boundaries and compatibility constraints.
 
+See [Identity and Authorization](IDENTITY_AND_AUTHORIZATION.md) for the trusted
+principal, read-path, approval, remote-client, and executor identity contracts.
+
 ---
 
 ## Architecture Diagram
@@ -46,7 +49,7 @@ The architecture follows these 12 steps:
 |:----:|-------------|
 | **1** | User authenticates with **Amazon Cognito** User Pool. The frontend validates JWT tokens and stores them in HttpOnly cookies. Password policies enforce strong credentials, and admin approval is required for new users. |
 | **2** | User sends a natural language query (e.g., "What's the status of my EKS clusters?") through the **Next.js frontend** hosted on **Amazon ECS Express** (Fargate + ALB). The frontend provides a conversational chat interface powered by CopilotKit. |
-| **3** | The frontend invokes **Bedrock AgentCore Runtime** using the AWS SDK with SigV4 authentication. The request includes the user prompt, session ID for conversation continuity, and user context for memory personalization. |
+| **3** | The frontend constructs trusted principal context from the verified Cognito access token and deployment-bound tenant/workspace, then invokes **Bedrock AgentCore Runtime** using the AWS SDK with SigV4 authentication. Browser and model input cannot supply principal fields. |
 | **4** | AgentCore routes the request to the **Orchestrator** agent, which analyzes the query intent and determines the appropriate specialist to handle the request. The orchestrator maintains conversation context across turns. |
 | **5** | **Bedrock Guardrails** filter both input and output. Inbound filtering detects prompt injection attempts, blocks off-topic requests, and warns about sensitive data. Outbound filtering anonymizes PII and blocks credential exposure. |
 | **6** | The Orchestrator delegates to the appropriate **Specialist Agent** based on query classification: GameLift Specialist for fleet management, EKS Specialist for Kubernetes clusters, or Cost Specialist for billing analysis. |
@@ -161,6 +164,7 @@ The architecture follows these 12 steps:
 ### Authentication & Frontend
 - **Amazon Cognito**: User authentication with group-based authorization
 - **Amazon ECS Express**: Managed container hosting for Next.js frontend (Fargate + ALB), automatic HTTPS
+- **Trusted principal adapter**: Access-token subject, client, audience, groups/scopes, and server-bound tenant/workspace propagation
 
 ### AI Runtime
 - **Bedrock AgentCore**: Managed runtime for AI agents with built-in memory and session management
@@ -286,6 +290,8 @@ if __name__ == "__main__":
 - `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 4.5)
 - `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 4.6)
 - `GBAW_BEDROCK_MODEL_ID` / `GBAW_BEDROCK_MODEL_ID_SECONDARY` - Legacy compatibility aliases
+- `GBAW_TENANT_ID` - Server-side tenant binding (default: `default-tenant`)
+- `GBAW_WORKSPACE_ID` - Server-side workspace binding (default: `default-workspace`)
 - `MCP_TIMEOUT` - MCP server execution timeout (default: 30 seconds)
 - `MCP_RETRY_COUNT` - Number of retry attempts (default: 2)
 - `MCP_FALLBACK_ENABLED` - Enable AWS SDK fallback (default: true)
@@ -308,9 +314,26 @@ Canonical role variables take precedence over legacy aliases, then repository de
    - Command: `awslabs.aws-api-mcp-server` (pre-installed package)
    - Tools: `call_aws` (runs AWS CLI commands, e.g., `aws eks list-clusters` for EKS cluster discovery)
 
-3. **Cost Explorer MCP Server** - Cost analysis and billing operations
-   - Command: `awslabs.cost-explorer-mcp-server` (pre-installed package)
-   - Tools: `get_today_date`, `get_cost_and_usage`, `get_cost_forecast`
+3. **Billing and Cost Management MCP Server** - Forecasting and optimization analysis
+   - Command: `awslabs.billing-cost-management-mcp-server` (pre-installed package)
+   - Tools include Cost Explorer forecasts and cost optimization operations
+
+### Deterministic Cost Reports
+
+Actual cost totals and service rankings use the owned `get_cost_report` boto3
+tool. It converts the inclusive user end date to Cost Explorer's exclusive
+`End`, aggregates every page of one grouped query, performs all arithmetic with
+`Decimal`, validates the result, and emits a fixed financial section. Report
+snapshots are cached by random report ID so follow-up calculations can reuse the
+same data without silently mixing Cost Explorer query times.
+The cost specialist rejects the Billing MCP server's historical
+`getCostAndUsage` operations so they cannot bypass this path; forecast and
+optimization operations remain available.
+
+Snapshot correctness and billing finality are separate. A validated report is
+internally consistent with Cost Explorer at its `queriedAt` timestamp, while an
+open billing period marked `estimated` can still change when AWS backfills or
+finalizes usage.
 
 ### MCP Client Factory Pattern
 

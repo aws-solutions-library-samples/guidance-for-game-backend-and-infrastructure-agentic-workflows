@@ -211,6 +211,14 @@ eval "$MODEL_EXPORTS"
 echo "   Orchestrator model: $GBAW_ORCHESTRATOR_MODEL_ID"
 echo "   Specialist model:   $GBAW_SPECIALIST_MODEL_ID"
 
+if ! IDENTITY_EXPORTS=$(uv run python "$PROJECT_ROOT/config/load_deployment_settings.py" --identity-only); then
+  echo "❌ Unable to resolve trusted tenant and workspace bindings" >&2
+  exit 1
+fi
+eval "$IDENTITY_EXPORTS"
+echo "   Tenant binding:      $GBAW_TENANT_ID"
+echo "   Workspace binding:   $GBAW_WORKSPACE_ID"
+
 is_resolved_deployment_value() {
   [ -n "${1:-}" ] && [ "$1" != "None" ]
 }
@@ -535,6 +543,8 @@ aws cloudformation deploy \
     ProjectName="$PROJECT_NAME" \
     RuntimeId="$RUNTIME_ID" \
     ImageTag="$FRONTEND_IMAGE_TAG" \
+    TenantId="$GBAW_TENANT_ID" \
+    WorkspaceId="$GBAW_WORKSPACE_ID" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 

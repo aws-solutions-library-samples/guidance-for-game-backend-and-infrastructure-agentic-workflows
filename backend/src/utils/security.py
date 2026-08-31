@@ -143,7 +143,7 @@ def validate_user_context(context: dict | None) -> dict:
         _get_logger().warning("Invalid user context type, using empty context")
         return {}
 
-    validated = {}
+    validated: dict[str, Any] = {}
 
     # Whitelist of allowed context keys
     allowed_keys = {
@@ -155,7 +155,12 @@ def validate_user_context(context: dict | None) -> dict:
         "email",
         "auth_type",
         "actor_id",
+        "client_id",
+        "audience",
         "groups",
+        "scopes",
+        "tenant",
+        "workspace",
         "is_admin",
     }
 
