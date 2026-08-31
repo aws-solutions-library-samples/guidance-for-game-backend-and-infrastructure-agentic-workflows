@@ -38,6 +38,7 @@ from config.settings import (
     INFERENCE_CONFIG,
     USE_BEDROCK_SESSIONS,
 )
+from connector.config import SourceControlConfig
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
@@ -81,6 +82,29 @@ def run_orchestrator(query: str, context: dict = None):
         # Per-agent inference parameters (WA GenAI Lens: Performance Efficiency 2)
         inf = INFERENCE_CONFIG.get("orchestrator")
         orch_model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
+
+        # Conditionally register the Source Control Connector specialist. It is a read-only
+        # IaC-context capability, so the specialist is added to the orchestrator tool set
+        # ONLY when the Connector is enabled and validly configured. When disabled, the
+        # baseline specialist set is unchanged, so the platform behaves exactly as it does
+        # today. Built once and reused in both Agent constructions below to avoid divergence
+        # between the memory and fallback paths.
+        specialist_tools = [gamelift_agent, eks_agent, cost_agent]
+        orchestrator_prompt = get_optimized_orchestrator_prompt()
+        if SourceControlConfig.load().enabled:
+            # Local import: keeps the connector out of the import graph for deployments where
+            # the Connector is disabled and avoids a hard dependency then.
+            # Local modules
+            from agents.source_control_specialist import source_control_agent
+
+            specialist_tools.append(source_control_agent)
+            # Register the specialist for read-only IaC-context questions. Appended only when
+            # enabled so the base prompt (and its version) is untouched when disabled.
+            orchestrator_prompt = (
+                orchestrator_prompt + "\n\n- sourcecontrol_agent: read-only IaC context — "
+                "read and explain existing Infrastructure-as-Code (CloudFormation, Terraform). "
+                "Never mutates live AWS and never opens pull requests."
+            )
 
         # Extract memory parameters from context
         actor_id = None
@@ -128,8 +152,8 @@ def run_orchestrator(query: str, context: dict = None):
                 # Create session manager and agent with memory
                 session_manager = AgentCoreMemorySessionManager(agentcore_memory_config=config, region_name=AWS_REGION)
                 agent = Agent(
-                    system_prompt=get_optimized_orchestrator_prompt(),
-                    tools=[gamelift_agent, eks_agent, cost_agent],
+                    system_prompt=orchestrator_prompt,
+                    tools=specialist_tools,
                     model=orch_model,
                     session_manager=session_manager,
                     hooks=[
@@ -149,8 +173,8 @@ def run_orchestrator(query: str, context: dict = None):
         # Fallback: Create agent without memory
         if agent is None:
             agent = Agent(
-                system_prompt=get_optimized_orchestrator_prompt(),
-                tools=[gamelift_agent, eks_agent, cost_agent],
+                system_prompt=orchestrator_prompt,
+                tools=specialist_tools,
                 model=orch_model,
                 hooks=[
                     MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),

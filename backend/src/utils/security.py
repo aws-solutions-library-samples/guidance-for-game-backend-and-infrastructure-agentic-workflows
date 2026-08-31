@@ -366,7 +366,16 @@ _rate_limit_lock = threading.Lock()
 # a hard backstop. An evicted key simply starts a fresh window (correct, fail-open
 # only after inactivity). Sized generously for concurrent active callers.
 _RATE_LIMIT_MAX_KEYS = int(os.getenv("GBAW_RATE_LIMIT_MAX_KEYS", "10000"))
-_RATE_LIMIT_KEY_TTL_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_KEY_TTL_SECONDS", "3600"))
+# The connector permits a rate-limit window up to 86,400s (24h). A key must survive at least
+# one full window: if its sliding-window deque were evicted before the window elapsed, the
+# next request would start a fresh window and the caller would get MORE than the configured
+# quota per window. So the key TTL defaults to the longest permitted window (86,400s) rather
+# than 1h, keeping rate-limit data for the complete window. Fixing the cache lifetime here
+# (rather than reducing the permitted max window in connector.config) is the least-invasive
+# correct fix: it preserves the existing configurable-window contract (windows up to 24h stay
+# valid) and touches only the in-memory store's retention. The env override still allows a
+# larger TTL for any future window bound.
+_RATE_LIMIT_KEY_TTL_SECONDS = int(os.getenv("GBAW_RATE_LIMIT_KEY_TTL_SECONDS", "86400"))
 _rate_limit_windows: "TTLCache[str, collections.deque]" = TTLCache(
     maxsize=_RATE_LIMIT_MAX_KEYS, ttl=_RATE_LIMIT_KEY_TTL_SECONDS
 )

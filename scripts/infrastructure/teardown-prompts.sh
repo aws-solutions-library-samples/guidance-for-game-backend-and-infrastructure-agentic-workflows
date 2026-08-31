@@ -45,6 +45,7 @@ if [ -f "$ENV_FILE" ]; then
   sed -i '' '/^GBAW_GAMELIFT_PROMPT_ARN=/d' "$ENV_FILE" 2>/dev/null || true
   sed -i '' '/^GBAW_EKS_PROMPT_ARN=/d' "$ENV_FILE" 2>/dev/null || true
   sed -i '' '/^GBAW_COST_PROMPT_ARN=/d' "$ENV_FILE" 2>/dev/null || true
+  sed -i '' '/^GBAW_SOURCE_CONTROL_PROMPT_ARN=/d' "$ENV_FILE" 2>/dev/null || true
   echo "   ✅ Cleaned"
 fi
 

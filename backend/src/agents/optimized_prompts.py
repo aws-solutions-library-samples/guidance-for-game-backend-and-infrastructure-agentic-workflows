@@ -98,6 +98,32 @@ COST_PROMPT = VersionedPrompt(
     ),
 )
 
+SOURCE_CONTROL_PROMPT = VersionedPrompt(
+    name="source_control_specialist",
+    version="2.0.0",
+    text=(
+        "You are the Source Control specialist. You help operators understand their "
+        "Infrastructure-as-Code (IaC) by reading it from the operator-configured "
+        "repository. You are a read-only, IaC-context capability.\n\n"
+        "**Absolute rules — never violate these:**\n"
+        "- You do NOT and CANNOT mutate live AWS resources or the source repository. "
+        "Never claim to have created, modified, scaled, or deleted any AWS resource, "
+        "and never claim to have opened, changed, merged, or approved anything in the "
+        "repository.\n"
+        "- Your only action is reading existing IaC files to answer questions about the "
+        "current source of truth.\n\n"
+        "**Tools:**\n"
+        "- get_iac_file(paths): read existing IaC files from the configured "
+        "allowlisted repository/branch.\n"
+        "- retrieve (when available): search IaC documentation for patterns and best "
+        "practices.\n\n"
+        "The read tool returns a structured result. If it returns an error, missing "
+        "files, or no files, relay the message plainly and do not retry blindly. Base "
+        "your answers only on what you actually read.\n\n"
+        "Use markdown formatting: ## headers, **bold**, bullet points."
+    ),
+)
+
 ORCHESTRATOR_PROMPT = VersionedPrompt(
     name="orchestrator",
     version="2.0.0",
@@ -116,7 +142,7 @@ ORCHESTRATOR_PROMPT = VersionedPrompt(
 
 # Registry for programmatic access
 _ALL_PROMPTS: dict[str, VersionedPrompt] = {
-    p.name: p for p in [GAMELIFT_PROMPT, EKS_PROMPT, COST_PROMPT, ORCHESTRATOR_PROMPT]
+    p.name: p for p in [GAMELIFT_PROMPT, EKS_PROMPT, COST_PROMPT, SOURCE_CONTROL_PROMPT, ORCHESTRATOR_PROMPT]
 }
 
 
@@ -139,6 +165,7 @@ def _load_from_bedrock_pm():
         "gamelift_specialist": os.getenv("GBAW_GAMELIFT_PROMPT_ARN"),
         "eks_specialist": os.getenv("GBAW_EKS_PROMPT_ARN"),
         "cost_specialist": os.getenv("GBAW_COST_PROMPT_ARN"),
+        "source_control_specialist": os.getenv("GBAW_SOURCE_CONTROL_PROMPT_ARN"),
     }
 
     # Skip if no ARNs configured
@@ -219,6 +246,11 @@ def get_optimized_eks_prompt() -> str:
 def get_optimized_cost_prompt() -> str:
     """Get the optimized cost specialist system prompt."""
     return _get_prompt("cost_specialist", COST_PROMPT)
+
+
+def get_optimized_source_control_prompt() -> str:
+    """Get the optimized Source Control specialist system prompt."""
+    return _get_prompt("source_control_specialist", SOURCE_CONTROL_PROMPT)
 
 
 def get_optimized_orchestrator_prompt() -> str:

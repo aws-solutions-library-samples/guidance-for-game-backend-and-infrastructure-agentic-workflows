@@ -126,9 +126,69 @@ function Deploy-GameAgent {
 
     # ── Step 1: Base infrastructure ──
     Write-GameAgentStatus 'Step 1: Deploying base infrastructure...' -Type Info
+
+    # Source Control Connector: resolve the connector settings from the environment or
+    # backend/.env.local so this PowerShell deployment produces the SAME connector config +
+    # IAM state as scripts/deploy.sh. A local reader is used because the module's
+    # Read-EnvVar helper is not defined until Step 1.6 (after this base-stack deploy).
+    $scmEnvFile = Join-Path $backendPath '.env.local'
+    $scmEnvContent = if (Test-Path $scmEnvFile) { Get-Content $scmEnvFile -Raw } else { '' }
+    function Read-ScmSetting {
+        param([string]$Name)
+        # Prefer a process env var; fall back to backend/.env.local (matches bash).
+        $envValue = [Environment]::GetEnvironmentVariable($Name)
+        if ($envValue) { return $envValue.Trim() }
+        if ($scmEnvContent -match "(?m)^$Name=(.+)$") { return $Matches[1].Trim() }
+        return ''
+    }
+    $scmReadCredentialSecretArn = Read-ScmSetting 'GBAW_SCM_READ_CREDENTIAL_SECRET_ARN'
+    $scmAuditLogGroup           = Read-ScmSetting 'GBAW_SCM_AUDIT_LOG_GROUP'
+
+    # Normalize the enablement flag to a canonical 'true'/'false' using the same truthy set
+    # as connector.config ({true,1,yes}, case-insensitive). A disabled deployment must carry
+    # NO connector secret env var and NO connector secret IAM permission.
+    $scmEnabledRaw = (Read-ScmSetting 'GBAW_SCM_CONNECTOR_ENABLED').ToLowerInvariant()
+    $scmConnectorEnabled = if (@('true', '1', 'yes') -contains $scmEnabledRaw) { 'true' } else { 'false' }
+
+    # The read-credential ARN is only delivered to the base stack (for the scoped
+    # GetSecretValue grant) when the connector is enabled; disabled => empty so the
+    # ScmReadCredentialActive condition is false and no secret permission is granted.
+    $scmBaseReadArn = if ($scmConnectorEnabled -eq 'true') { $scmReadCredentialSecretArn } else { '' }
+
+    $baseParams = @(
+        "ProjectName=$ProjectName",
+        "ScmReadCredentialSecretArn=$scmBaseReadArn",
+        "ScmConnectorEnabled=$scmConnectorEnabled"
+    )
+    # Pass the audit log-group name only when configured, mirroring the bash guard.
+    if ($scmAuditLogGroup) { $baseParams += "ScmAuditLogGroupName=$scmAuditLogGroup" }
+
+    # Build the connector runtime env hashtable once (reused at both agentcore launch call
+    # sites). Every GBAW_SCM_* tuning value is read the same way the bash loop reads them;
+    # only non-empty values are emitted by New-GameAgentAgentCoreEnvArgs. The read-credential
+    # ARN is included ONLY when the connector is enabled, so a disabled deployment carries no
+    # connector secret env var (parity with the gated IAM grant).
+    $scmRuntimeEnv = @{
+        GBAW_SCM_CONNECTOR_ENABLED         = Read-ScmSetting 'GBAW_SCM_CONNECTOR_ENABLED'
+        GBAW_SCM_PROVIDER                  = Read-ScmSetting 'GBAW_SCM_PROVIDER'
+        GBAW_SCM_PROVIDER_BASE_URL         = Read-ScmSetting 'GBAW_SCM_PROVIDER_BASE_URL'
+        GBAW_SCM_REPO_ALLOWLIST            = Read-ScmSetting 'GBAW_SCM_REPO_ALLOWLIST'
+        GBAW_SCM_AUTHORIZED_GROUPS         = Read-ScmSetting 'GBAW_SCM_AUTHORIZED_GROUPS'
+        GBAW_SCM_AUDIT_LOG_GROUP           = $scmAuditLogGroup
+        GBAW_SCM_RATE_LIMIT_MAX            = Read-ScmSetting 'GBAW_SCM_RATE_LIMIT_MAX'
+        GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS = Read-ScmSetting 'GBAW_SCM_RATE_LIMIT_WINDOW_SECONDS'
+        GBAW_SCM_PROVIDER_TIMEOUT_SECONDS  = Read-ScmSetting 'GBAW_SCM_PROVIDER_TIMEOUT_SECONDS'
+        GBAW_SCM_RETRY_MAX_ATTEMPTS        = Read-ScmSetting 'GBAW_SCM_RETRY_MAX_ATTEMPTS'
+        GBAW_SCM_MAX_FILES_PER_REQUEST     = Read-ScmSetting 'GBAW_SCM_MAX_FILES_PER_REQUEST'
+        GBAW_SCM_MAX_CONTENT_BYTES         = Read-ScmSetting 'GBAW_SCM_MAX_CONTENT_BYTES'
+    }
+    if ($scmConnectorEnabled -eq 'true' -and $scmReadCredentialSecretArn) {
+        $scmRuntimeEnv['GBAW_SCM_READ_CREDENTIAL_SECRET_ARN'] = $scmReadCredentialSecretArn
+    }
+
     Deploy-Stack -StackName "$ProjectName-infrastructure" `
         -TemplateFile (Join-Path $infraPath '01-base-infrastructure.yaml') `
-        -Params @("ProjectName=$ProjectName")
+        -Params $baseParams
     Write-Host ''
 
     # ── Step 1.5: Guardrails ──
@@ -155,6 +215,7 @@ function Deploy-GameAgent {
     $gameliftPromptArn     = Read-EnvVar 'GBAW_GAMELIFT_PROMPT_ARN'
     $eksPromptArn          = Read-EnvVar 'GBAW_EKS_PROMPT_ARN'
     $costPromptArn         = Read-EnvVar 'GBAW_COST_PROMPT_ARN'
+    $sourceControlPromptArn = Read-EnvVar 'GBAW_SOURCE_CONTROL_PROMPT_ARN'
     Write-GameAgentStatus 'Managed Prompts deployed' -Type Success
     Write-Host ''
 
@@ -196,7 +257,9 @@ function Deploy-GameAgent {
             -OrchestratorPromptArn $orchestratorPromptArn `
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
-            -CostPromptArn $costPromptArn
+            -CostPromptArn $costPromptArn `
+            -SourceControlPromptArn $sourceControlPromptArn `
+            -ScmEnv $scmRuntimeEnv
 
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
         Write-Host "Using execution role: $executionRoleArn"
@@ -333,9 +396,11 @@ function Deploy-GameAgent {
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
             -CostPromptArn $costPromptArn `
+            -SourceControlPromptArn $sourceControlPromptArn `
             -GameLiftKbId $gameliftKbId `
             -EksKbId $eksKbId `
-            -CostKbId $costKbId
+            -CostKbId $costKbId `
+            -ScmEnv $scmRuntimeEnv
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
