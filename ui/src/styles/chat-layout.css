@@ -184,11 +184,9 @@
   color: var(--ga-accent) !important;
 }
 
-/* Inline code only. Scoped with :not(pre) so it never leaks into fenced code
-   blocks (rendered by ChatCodeBlock inside a <pre>), which caused dark-on-dark
-   unreadable text. */
-.copilotKitMarkdown :not(pre) > code,
-.ga-inline-code {
+/* ChatCodeBlock assigns this class only to inline code. Targeting the class
+   avoids leaking these styles into SyntaxHighlighter's div > code structure. */
+.copilotKitMarkdown .ga-inline-code {
   background: var(--ga-code-bg) !important;
   color: var(--ga-cyan) !important;
   padding: 2px 6px !important;
@@ -222,7 +220,7 @@
   font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
   font-size: 12px;
   color: #c8c8c8 !important;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
 }
 
 .ga-code-block__actions {

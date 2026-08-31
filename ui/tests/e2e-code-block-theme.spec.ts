@@ -52,4 +52,45 @@ test.describe('#252 - code block legibility on light theme', { tag: ['@e2e', '@v
     // light text; require a real luminance gap.
     expect(Math.abs(luminance(text) - luminance(bg))).toBeGreaterThan(0.4);
   });
+
+  test('custom fenced blocks do not inherit inline-code surface styles', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForSelector('.ga-chat-container', { timeout: 10000 });
+
+    const styles = await page.evaluate(() => {
+      const markdown = document.createElement('div');
+      markdown.className = 'copilotKitMarkdown';
+      markdown.innerHTML =
+        '<code class="ga-inline-code">fleetId</code>' +
+        '<div class="ga-code-block">' +
+        '<div class="ga-code-block__pre">' +
+        '<code class="language-python"><span>event</span></code>' +
+        '</div></div>';
+      document.querySelector('.copilotKitMessages')!.appendChild(markdown);
+
+      const inlineCode = markdown.querySelector('.ga-inline-code')!;
+      const fencedCode = markdown.querySelector('.ga-code-block__pre code')!;
+      const inlineStyles = getComputedStyle(inlineCode);
+      const fencedStyles = getComputedStyle(fencedCode);
+      return {
+        inline: {
+          backgroundColor: inlineStyles.backgroundColor,
+          padding: inlineStyles.padding,
+        },
+        fenced: {
+          backgroundColor: fencedStyles.backgroundColor,
+          color: fencedStyles.color,
+          padding: fencedStyles.padding,
+        },
+      };
+    });
+
+    expect(styles.fenced).toEqual({
+      backgroundColor: 'rgba(0, 0, 0, 0)',
+      color: 'rgb(230, 237, 243)',
+      padding: '0px',
+    });
+    expect(styles.inline.padding).toBe('2px 6px');
+    expect(styles.inline.backgroundColor).not.toBe('rgba(0, 0, 0, 0)');
+  });
 });
