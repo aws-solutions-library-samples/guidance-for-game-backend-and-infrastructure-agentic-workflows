@@ -26,11 +26,23 @@ Resources:
   VectorIndex:
     Type: AWS::S3Vectors::Index
     Properties:
-      IndexName: !Sub '${ProjectName}-gamelift-index'
+      # MetadataConfiguration requires replacement. The v2 name lets
+      # CloudFormation create this index alongside the original named index.
+      IndexName: !Sub '${ProjectName}-gamelift-index-v2'
       VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
       Dimension: !Ref EmbeddingDimension
       DataType: float32
       DistanceMetric: cosine
+      # Bedrock stores chunk text in AMAZON_BEDROCK_TEXT and chunk metadata in
+      # AMAZON_BEDROCK_METADATA. S3 Vectors treats metadata as filterable by
+      # default, and filterable metadata is capped at 2048 bytes/vector — dense
+      # chunks exceed it and fail ingestion. Mark these Bedrock-managed keys
+      # non-filterable so chunk text is retrievable-but-not-filterable and the
+      # cap no longer applies. (Issue #313.)
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_METADATA
+          - AMAZON_BEDROCK_TEXT
 
   DocumentBucket:
     Type: AWS::S3::Bucket
@@ -110,7 +122,12 @@ Resources:
     Type: AWS::Bedrock::KnowledgeBase
     DependsOn: VectorIndex
     Properties:
-      Name: !Sub '${ProjectName}-gamelift-kb'
+      # StorageConfiguration is create-only, so pointing at the v2 index
+      # replaces this KnowledgeBase. Bedrock KB names are account-unique and
+      # CloudFormation creates the replacement before deleting the original,
+      # so the name must be versioned too or the update fails with 409
+      # AlreadyExists. (Same replacement-safety rationale as the index above.)
+      Name: !Sub '${ProjectName}-gamelift-kb-v2'
       Description: 'GameLift documentation knowledge base'
       RoleArn: !GetAtt KnowledgeBaseRole.Arn
       KnowledgeBaseConfiguration:
@@ -121,7 +138,7 @@ Resources:
         Type: S3_VECTORS
         S3VectorsConfiguration:
           VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
-          IndexName: !Sub '${ProjectName}-gamelift-index'
+          IndexName: !Sub '${ProjectName}-gamelift-index-v2'
 
   DataSource:
     Type: AWS::Bedrock::DataSource
