@@ -300,10 +300,10 @@ if ! CLUSTER_INFO_OUTPUT=$(kubectl cluster-info 2>&1); then
     echo "$CLUSTER_INFO_OUTPUT" >&2
     fail "Cannot connect to the cluster. Use --kube-role-arn with a role that can remove cluster RBAC."
 fi
-if ! CAN_DELETE_ROLE=$(checked_can_i delete clusterroles.rbac.authorization.k8s.io); then
+if ! CAN_DELETE_ROLE=$(checked_can_i delete clusterroles.rbac.authorization.k8s.io --all-namespaces); then
     fail "Failed to verify ClusterRole cleanup permission."
 fi
-if ! CAN_DELETE_BINDING=$(checked_can_i delete clusterrolebindings.rbac.authorization.k8s.io); then
+if ! CAN_DELETE_BINDING=$(checked_can_i delete clusterrolebindings.rbac.authorization.k8s.io --all-namespaces); then
     fail "Failed to verify ClusterRoleBinding cleanup permission."
 fi
 if [ "$CAN_DELETE_ROLE" != "yes" ] || [ "$CAN_DELETE_BINDING" != "yes" ]; then

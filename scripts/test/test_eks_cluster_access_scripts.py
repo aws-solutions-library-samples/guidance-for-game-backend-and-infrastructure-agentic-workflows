@@ -876,6 +876,22 @@ class EksClusterAccessScriptTests(unittest.TestCase):
         self.assertIsNone(state["access_entry"])
         self.assertTrue(state["role_exists"])
         self.assertIn(MONITORING_BINDING, state["bindings"])
+        self.assertTrue(
+            any(
+                call.startswith(
+                    "auth can-i delete clusterroles.rbac.authorization.k8s.io --all-namespaces"
+                )
+                for call in state["kubectl_calls"]
+            )
+        )
+        self.assertTrue(
+            any(
+                call.startswith(
+                    "auth can-i delete clusterrolebindings.rbac.authorization.k8s.io --all-namespaces"
+                )
+                for call in state["kubectl_calls"]
+            )
+        )
         self.assertNotIn("delete -f", "\n".join(state["kubectl_calls"]))
         self.assertIn("Legacy shared ClusterRoleBinding: Preserved", result.stdout)
         self.assertIn("Namespaces and workloads: Preserved", result.stdout)
