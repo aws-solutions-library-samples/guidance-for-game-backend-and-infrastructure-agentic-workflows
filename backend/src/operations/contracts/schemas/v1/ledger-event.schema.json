@@ -1,0 +1,378 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:ledger-event",
+  "title": "Append-Only Operations Ledger Event 1.0",
+  "$defs": {
+    "operation_prepared_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_type",
+        "playbook_hash",
+        "profile"
+      ],
+      "properties": {
+        "payload_type": {
+          "const": "operation_prepared"
+        },
+        "playbook_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        },
+        "profile": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128
+        }
+      }
+    },
+    "authorization_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_type",
+        "decision_id",
+        "decision",
+        "policy_version"
+      ],
+      "properties": {
+        "payload_type": {
+          "const": "authorization_decided"
+        },
+        "decision_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "authorized",
+            "approval_required",
+            "denied"
+          ]
+        },
+        "policy_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "approval_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_type",
+        "approval_id",
+        "decision"
+      ],
+      "properties": {
+        "payload_type": {
+          "const": "approval_recorded"
+        },
+        "approval_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "granted",
+            "denied"
+          ]
+        }
+      }
+    },
+    "state_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_type",
+        "state_change_id",
+        "previous_state",
+        "new_state"
+      ],
+      "properties": {
+        "payload_type": {
+          "const": "state_changed"
+        },
+        "state_change_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "previous_state": {
+          "oneOf": [
+            {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "new_state": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+        }
+      }
+    },
+    "verification_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_type",
+        "verification_type",
+        "outcome"
+      ],
+      "properties": {
+        "payload_type": {
+          "const": "verification_recorded"
+        },
+        "verification_type": {
+          "type": "string",
+          "enum": [
+            "caller",
+            "approval",
+            "operation_hash",
+            "executor_binding",
+            "policy",
+            "enrollment",
+            "base_revision",
+            "paths"
+          ]
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed"
+          ]
+        },
+        "expected_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "observed_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "provider_result_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_type",
+        "provider",
+        "repository_id",
+        "result"
+      ],
+      "properties": {
+        "payload_type": {
+          "const": "provider_result_recorded"
+        },
+        "provider": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "repository_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "created",
+            "reconciled",
+            "failed"
+          ]
+        },
+        "branch_name": {
+          "type": "string",
+          "pattern": "^gba-op-[0-9a-f]{20}$"
+        },
+        "commit_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "change_proposal_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "error_code": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[A-Z][A-Z0-9_]*$"
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ledger_contract_version",
+    "event_id",
+    "event_type",
+    "operation_id",
+    "prepared_operation_hash",
+    "sequence",
+    "occurred_at",
+    "actor",
+    "correlation",
+    "payload"
+  ],
+  "properties": {
+    "ledger_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "event_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "operation.prepared",
+        "authorization.decided",
+        "approval.recorded",
+        "operation.state-changed",
+        "execution.verification-recorded",
+        "provider.result-recorded"
+      ]
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "prepared_operation_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "occurred_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "actor": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/actor"
+    },
+    "correlation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    },
+    "payload": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/operation_prepared_payload"
+        },
+        {
+          "$ref": "#/$defs/authorization_payload"
+        },
+        {
+          "$ref": "#/$defs/approval_payload"
+        },
+        {
+          "$ref": "#/$defs/state_payload"
+        },
+        {
+          "$ref": "#/$defs/verification_payload"
+        },
+        {
+          "$ref": "#/$defs/provider_result_payload"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "operation.prepared"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/operation_prepared_payload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "authorization.decided"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/authorization_payload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "approval.recorded"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/approval_payload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "operation.state-changed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/state_payload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "execution.verification-recorded"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/verification_payload"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "provider.result-recorded"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/provider_result_payload"
+          }
+        }
+      }
+    }
+  ]
+}

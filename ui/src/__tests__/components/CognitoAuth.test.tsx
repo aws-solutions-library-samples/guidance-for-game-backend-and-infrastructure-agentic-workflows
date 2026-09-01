@@ -34,11 +34,12 @@ describe('CognitoAuth - handleSignIn error handling', () => {
     getRefreshToken: mockGetRefreshToken,
   };
 
-  const renderAuth = () => render(
+  const renderAuth = (notice?: string) => render(
     <ThemeProvider>
       <CognitoAuth
         userPoolId="test-pool"
         clientId="test-client"
+        notice={notice}
         onAuthenticated={mockOnAuthenticated}
       />
     </ThemeProvider>,
@@ -49,6 +50,12 @@ describe('CognitoAuth - handleSignIn error handling', () => {
     mockGetAccessToken.mockReturnValue({ getJwtToken: () => 'access-token' });
     mockGetIdToken.mockReturnValue({ getJwtToken: () => 'id-token' });
     mockGetRefreshToken.mockReturnValue({ getToken: () => 'refresh-token' });
+  });
+
+  it('shows a session expiration notice on the sign-in view', () => {
+    renderAuth('Your session expired. Sign in again.');
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Your session expired. Sign in again.');
   });
 
   it('handles network error when storing tokens', async () => {

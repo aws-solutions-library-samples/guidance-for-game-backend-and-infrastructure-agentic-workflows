@@ -43,6 +43,10 @@ dependencies = [
     # Terraform HCL parsing for source-control connector IaC validation
     "python-hcl2>=7.0.0",
 
+    # Versioned operations contracts
+    "jsonschema>=4.26.0",
+    "rfc8785>=0.1.4",
+
     # OpenTelemetry / ADOT for AgentCore observability
     "aws-opentelemetry-distro>=0.19.0",
     "opentelemetry-instrumentation>=0.65b0",

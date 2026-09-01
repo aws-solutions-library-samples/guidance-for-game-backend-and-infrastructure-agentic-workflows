@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:prepared-operation",
+  "title": "Prepared Operation Core 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operation_contract_version",
+    "operation_id",
+    "idempotency_token",
+    "created_at",
+    "expires_at",
+    "playbook",
+    "profile",
+    "action",
+    "requester",
+    "correlation",
+    "recommendation",
+    "target",
+    "parameters",
+    "resource_enrollment",
+    "policy",
+    "calculated_risk",
+    "capability",
+    "retry_policy",
+    "executor_binding",
+    "duplicate_content_hash"
+  ],
+  "properties": {
+    "operation_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "idempotency_token": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/idempotency_token"
+    },
+    "created_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "playbook": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/playbook_ref"
+    },
+    "profile": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "action": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "requester": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/trusted_identity"
+    },
+    "correlation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    },
+    "recommendation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/recommendation_source"
+    },
+    "target": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "parameters": {
+      "type": "object",
+      "minProperties": 1
+    },
+    "resource_enrollment": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/resource_enrollment"
+    },
+    "policy": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/policy_binding"
+    },
+    "calculated_risk": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/calculated_risk"
+    },
+    "capability": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/capability_binding"
+    },
+    "retry_policy": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/retry_policy"
+    },
+    "executor_binding": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/executor_binding"
+    },
+    "duplicate_content_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    }
+  }
+}

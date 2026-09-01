@@ -19,6 +19,7 @@ Memory is automatically handled when session_manager is provided.
 """
 
 # Standard library
+import re
 from typing import Any
 
 # Third-party packages
@@ -64,6 +65,20 @@ except ImportError:
     SEMANTIC_MEMORY_AVAILABLE = False
 
 
+_COST_REPORT_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])cost-[0-9a-f]{32}(?![A-Za-z0-9_-])", re.IGNORECASE)
+_COST_REPORT_FOLLOWUP_FAILURE = (
+    "## Cost Report Unavailable\n\n"
+    "The report follow-up did not complete through the validated snapshot path. "
+    "Retry with the report ID and exact service names.\n\n"
+    "No unverified financial report was produced."
+)
+
+
+def _is_cost_report_followup(query: str) -> bool:
+    """Return whether a query references a production-format cost report ID."""
+    return _COST_REPORT_ID_PATTERN.search(query) is not None
+
+
 def run_orchestrator(query: str, context: dict = None):
     """
     Orchestrator with native AgentCore Memory integration.
@@ -79,6 +94,11 @@ def run_orchestrator(query: str, context: dict = None):
         logger.info(f"🎮 Orchestrator processing query ({len(query)} chars)")
         logger.info(f"📋 Prompt versions: {get_prompt_versions()}")
 
+        cost_report_followup = _is_cost_report_followup(query)
+        agent_tools = [cost_agent] if cost_report_followup else [gamelift_agent, eks_agent, cost_agent]
+        if cost_report_followup:
+            logger.info("Routing cost report ID follow-up exclusively through the cost specialist")
+
         # Per-agent inference parameters (WA GenAI Lens: Performance Efficiency 2)
         inf = INFERENCE_CONFIG.get("orchestrator")
         orch_model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
@@ -89,9 +109,13 @@ def run_orchestrator(query: str, context: dict = None):
         # baseline specialist set is unchanged, so the platform behaves exactly as it does
         # today. Built once and reused in both Agent constructions below to avoid divergence
         # between the memory and fallback paths.
-        specialist_tools = [gamelift_agent, eks_agent, cost_agent]
+        #
+        # Derives from agent_tools so the cost-report-ID follow-up routing is preserved: on
+        # a follow-up the tool set is exclusively the cost specialist, and the source-control
+        # specialist is NOT appended (never dilute the deterministic cost-report path).
+        specialist_tools = list(agent_tools)
         orchestrator_prompt = get_optimized_orchestrator_prompt()
-        if SourceControlConfig.load().enabled:
+        if not cost_report_followup and SourceControlConfig.load().enabled:
             # Local import: keeps the connector out of the import graph for deployments where
             # the Connector is disabled and avoids a hard dependency then.
             # Local modules
@@ -190,9 +214,18 @@ def run_orchestrator(query: str, context: dict = None):
         except Exception:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             if authoritative_cost_response is None:
-                raise
-            logger.warning("Orchestrator failed after a validated cost report; returning the deterministic rendering")
-            response = authoritative_cost_response
+                if not cost_report_followup:
+                    raise
+                logger.error(
+                    "Cost report ID follow-up failed before producing a deterministic rendering",
+                    exc_info=True,
+                )
+                response = _COST_REPORT_FOLLOWUP_FAILURE
+            else:
+                logger.warning(
+                    "Orchestrator failed after a validated cost report; returning the deterministic rendering"
+                )
+                response = authoritative_cost_response
         else:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             if authoritative_cost_response is not None:
@@ -200,6 +233,9 @@ def run_orchestrator(query: str, context: dict = None):
                 # section. Bypass both specialist and orchestrator prose so no
                 # model can replace or independently calculate those values.
                 response = authoritative_cost_response
+            elif cost_report_followup:
+                logger.error("Cost report ID follow-up returned without invoking the deterministic reuse path")
+                response = _COST_REPORT_FOLLOWUP_FAILURE
 
         # Extract and save semantic memories for LTM (non-blocking)
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:

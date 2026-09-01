@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:application-error",
+  "title": "Operations Application Error 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "error_contract_version",
+    "error_code",
+    "safe_message",
+    "retryable",
+    "correlation_id"
+  ],
+  "properties": {
+    "error_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "error_code": {
+      "type": "string",
+      "enum": [
+        "CONTRACT_INVALID",
+        "CONTRACT_VERSION_UNSUPPORTED",
+        "IDENTITY_CONTEXT_INVALID",
+        "AUTHORIZATION_DENIED",
+        "APPROVAL_REQUIRED",
+        "APPROVAL_INVALID",
+        "APPROVAL_EXPIRED",
+        "OPERATION_NOT_FOUND",
+        "OPERATION_HASH_MISMATCH",
+        "IDEMPOTENCY_CONFLICT",
+        "STATE_CONFLICT",
+        "PRECONDITION_FAILED",
+        "TARGET_STALE",
+        "POLICY_STALE",
+        "ENROLLMENT_STALE",
+        "EXECUTOR_BINDING_MISMATCH",
+        "PROVIDER_AUTHORIZATION_FAILED",
+        "PROVIDER_CONFLICT",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_UNAVAILABLE",
+        "EXECUTION_FAILED",
+        "LEDGER_WRITE_FAILED"
+      ]
+    },
+    "safe_message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "correlation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "field_paths": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "current_state": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+    }
+  }
+}

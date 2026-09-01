@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:playbook",
+  "title": "Operations Playbook 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "playbook_contract_version",
+    "playbook_id",
+    "playbook_version",
+    "profile",
+    "schemas",
+    "provider_action_allowlist",
+    "authority",
+    "retry_policy",
+    "hard_limits",
+    "executor_binding"
+  ],
+  "properties": {
+    "playbook_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "playbook_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "playbook_version": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*\\.[0-9]+\\.[0-9]+$"
+    },
+    "profile": {
+      "const": "source-control.change-proposal/1.0"
+    },
+    "schemas": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 16,
+      "items": {
+        "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/schema_binding"
+      }
+    },
+    "provider_action_allowlist": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "create_branch",
+          "commit_files",
+          "open_change_proposal"
+        ]
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "minimum_mode",
+        "maximum_mode",
+        "approval_requirement"
+      ],
+      "properties": {
+        "minimum_mode": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "maximum_mode": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "approval_requirement": {
+          "const": "required"
+        }
+      }
+    },
+    "retry_policy": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/retry_policy"
+    },
+    "hard_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_files",
+        "max_file_bytes",
+        "max_total_bytes",
+        "allowed_extensions"
+      ],
+      "properties": {
+        "max_files": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "max_file_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "max_total_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5000000
+        },
+        "allowed_extensions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^\\.[a-z0-9]+$"
+          }
+        }
+      }
+    },
+    "executor_binding": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/executor_binding"
+    }
+  }
+}

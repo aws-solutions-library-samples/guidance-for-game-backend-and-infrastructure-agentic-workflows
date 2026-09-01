@@ -1,0 +1,12 @@
+{
+  "error_contract_version": "1.0",
+  "error_code": "TARGET_STALE",
+  "safe_message": "The target changed after this operation was prepared.",
+  "retryable": false,
+  "correlation_id": "correlation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "field_paths": [
+    "target.base_revision"
+  ],
+  "current_state": "approved"
+}

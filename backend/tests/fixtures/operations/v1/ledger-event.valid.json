@@ -1,0 +1,23 @@
+{
+  "ledger_contract_version": "1.0",
+  "event_id": "event:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+  "event_type": "operation.prepared",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "prepared_operation_hash": "sha256:aed919c38939443654381eb251d9a3bed0112432970d689fbc4683882205e564",
+  "sequence": 1,
+  "occurred_at": "2026-08-13T20:00:02Z",
+  "actor": {
+    "actor_type": "system",
+    "actor_id": "service:operations-control-plane"
+  },
+  "correlation": {
+    "correlation_id": "correlation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "request_id": "request:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "causation_id": "recommendation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E"
+  },
+  "payload": {
+    "payload_type": "operation_prepared",
+    "playbook_hash": "sha256:4128b928026df7387278901c4e7b7e4e111f5f846841c03795cb42411c75070e",
+    "profile": "source-control.change-proposal/1.0"
+  }
+}

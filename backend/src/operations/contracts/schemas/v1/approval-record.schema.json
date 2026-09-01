@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:approval-record",
+  "title": "Approval Record 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "approval_contract_version",
+    "approval_id",
+    "operation_id",
+    "prepared_operation_hash",
+    "approver",
+    "decision",
+    "policy_version",
+    "decided_at",
+    "expires_at",
+    "correlation"
+  ],
+  "properties": {
+    "approval_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "approval_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "prepared_operation_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    },
+    "approver": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/trusted_identity"
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "granted",
+        "denied"
+      ]
+    },
+    "policy_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "decided_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "correlation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    }
+  }
+}

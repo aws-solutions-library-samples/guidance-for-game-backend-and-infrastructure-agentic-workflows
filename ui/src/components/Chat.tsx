@@ -10,6 +10,12 @@ import { createPortal } from "react-dom";
 import { CopilotKit } from "@copilotkit/react-core";
 import { CopilotChat } from "@copilotkit/react-ui";
 import { NewChatButton } from "./NewChatButton";
+import { ChatCodeBlock } from "@/components/ChatCodeBlock";
+
+// Override the markdown `code` renderer so fenced code blocks (e.g. IaC) are
+// readable on the dark surface and download with a filename derived from the
+// fence token, instead of CopilotKit's default `file-<random>.file`.
+const markdownTagRenderers = { code: ChatCodeBlock };
 
 // Progress messages for rotating indicator
 const PROGRESS_MESSAGES = [
@@ -106,6 +112,7 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
           <CopilotChat
             className={`ga-chat ${className || ''}`}
             onInProgress={handleInProgress}
+            markdownTagRenderers={markdownTagRenderers}
             labels={{
             title: "🎮 Game Agent",
             initial: `**Welcome to Game Agent!** 🎮

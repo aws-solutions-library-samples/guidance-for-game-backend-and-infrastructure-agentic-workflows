@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operation-state-change",
+  "title": "Operation State Change 1.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state_contract_version",
+    "state_change_id",
+    "operation_id",
+    "prepared_operation_hash",
+    "previous_state",
+    "new_state",
+    "attempt",
+    "reason_code",
+    "changed_at",
+    "actor",
+    "correlation"
+  ],
+  "properties": {
+    "state_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "state_change_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "prepared_operation_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    },
+    "previous_state": {
+      "oneOf": [
+        {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "new_state": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "OPERATION_PREPARED",
+        "APPROVAL_REQUESTED",
+        "APPROVAL_GRANTED",
+        "APPROVAL_DENIED",
+        "DISPATCHED",
+        "EXECUTION_STARTED",
+        "RETRY_SCHEDULED",
+        "EXECUTION_SUCCEEDED",
+        "EXECUTION_FAILED",
+        "CANCELLED",
+        "EXPIRED"
+      ]
+    },
+    "changed_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "actor": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/actor"
+    },
+    "correlation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    }
+  }
+}

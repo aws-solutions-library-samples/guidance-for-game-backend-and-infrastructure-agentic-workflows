@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:source-control-prepared-operation",
+  "title": "Source Control Prepared Operation Profile 1.0",
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "repository_id",
+        "target_branch",
+        "base_revision",
+        "proposal_branch"
+      ],
+      "properties": {
+        "provider": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "repository_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "target_branch": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "base_revision": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "proposal_branch": {
+          "type": "string",
+          "pattern": "^gba-op-[0-9a-f]{20}$"
+        }
+      }
+    },
+    "inline_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "content_encoding",
+        "content",
+        "content_hash"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "content_encoding": {
+          "const": "utf-8"
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 1000000
+        },
+        "content_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        }
+      }
+    },
+    "referenced_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "content_ref",
+        "content_hash"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "content_ref": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "content_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        }
+      }
+    },
+    "inline_diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rendered_diff",
+        "diff_hash"
+      ],
+      "properties": {
+        "rendered_diff": {
+          "type": "string",
+          "maxLength": 5000000
+        },
+        "diff_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        }
+      }
+    },
+    "referenced_diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diff_ref",
+        "diff_hash"
+      ],
+      "properties": {
+        "diff_ref": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "diff_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        }
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files",
+        "diff"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/inline_file"
+              },
+              {
+                "$ref": "#/$defs/referenced_file"
+              }
+            ]
+          }
+        },
+        "diff": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/inline_diff"
+            },
+            {
+              "$ref": "#/$defs/referenced_diff"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$ref": "urn:game-agent:operations:contracts:v1:prepared-operation"
+    },
+    {
+      "properties": {
+        "profile": {
+          "const": "source-control.change-proposal/1.0"
+        },
+        "action": {
+          "const": "source-control.create-change-proposal"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "parameters": {
+          "$ref": "#/$defs/parameters"
+        }
+      }
+    }
+  ]
+}

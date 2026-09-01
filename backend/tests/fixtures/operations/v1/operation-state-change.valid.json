@@ -1,0 +1,20 @@
+{
+  "state_contract_version": "1.0",
+  "state_change_id": "state-change:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "prepared_operation_hash": "sha256:aed919c38939443654381eb251d9a3bed0112432970d689fbc4683882205e564",
+  "previous_state": null,
+  "new_state": "prepared",
+  "attempt": 0,
+  "reason_code": "OPERATION_PREPARED",
+  "changed_at": "2026-08-13T20:00:02Z",
+  "actor": {
+    "actor_type": "system",
+    "actor_id": "service:operations-control-plane"
+  },
+  "correlation": {
+    "correlation_id": "correlation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "request_id": "request:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "causation_id": "recommendation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E"
+  }
+}

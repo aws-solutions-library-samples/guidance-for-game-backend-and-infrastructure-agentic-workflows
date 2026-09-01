@@ -1,0 +1,33 @@
+{
+  "authorization_contract_version": "1.0",
+  "decision_id": "decision:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "prepared_operation_hash": "sha256:aed919c38939443654381eb251d9a3bed0112432970d689fbc4683882205e564",
+  "principal": {
+    "subject_id": "subject:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "client_id": "client:operations-web",
+    "tenant_id": "tenant:example",
+    "workspace_id": "workspace:game-platform"
+  },
+  "authority_inputs": {
+    "deployment_mode": "operate",
+    "tenant_policy": "remediate",
+    "workspace_policy": "operate",
+    "principal_authority": "remediate",
+    "capability_maximum": "remediate",
+    "operation_risk_policy": "remediate"
+  },
+  "effective_authority": "remediate",
+  "decision": "approval_required",
+  "reason_codes": [
+    "APPROVAL_REQUIRED"
+  ],
+  "policy_version": "12",
+  "evaluated_at": "2026-08-13T20:00:01Z",
+  "expires_at": "2026-08-13T20:15:01Z",
+  "correlation": {
+    "correlation_id": "correlation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "request_id": "request:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "causation_id": "recommendation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E"
+  }
+}

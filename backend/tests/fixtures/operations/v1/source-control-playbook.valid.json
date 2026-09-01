@@ -1,0 +1,75 @@
+{
+  "playbook_contract_version": "1.0",
+  "playbook_id": "source-control.change-proposal",
+  "playbook_version": "1.0.0",
+  "profile": "source-control.change-proposal/1.0",
+  "schemas": [
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:application-error",
+      "schema_hash": "sha256:4e88c264da1e8e454328d2c7ea1d52a37e1843ee0e03ab95258afe08c1b3c286"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:approval-record",
+      "schema_hash": "sha256:7ce50b49a7e3c6d0dc9b07c3e9c134bfbf0d939a47a4afca9805a870b518fe23"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:authorization-decision",
+      "schema_hash": "sha256:c03d39f43273e8be2cadfc6a2350e09728bc7469f7a0834cb55c9796d8d73ffe"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:common",
+      "schema_hash": "sha256:74735df2b8ddcc1d1cd243cbf8131420757238a7adc2bb72e13aeaf36fb7ddb1"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:ledger-event",
+      "schema_hash": "sha256:aa52e8260eab9867a82cc8493706ceafb133672eb2d38d630d23c064e25533b3"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operation-state-change",
+      "schema_hash": "sha256:e5a4cbc4194daff9153dcb125656d6fe9eaef26a9b5116e150d35fc80206afd6"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:prepare-operation-request",
+      "schema_hash": "sha256:4b9fe6dc72917dc8cf517793b1b10a4a826aa13a495cbff784c58c5dd2eca1c0"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:prepared-operation",
+      "schema_hash": "sha256:3b5e9ffc7fef93f7f87c950807899d5e2ecb9fad314a1f42bde1383e51afb6a3"
+    },
+    {
+      "schema_id": "urn:game-agent:operations:contracts:v1:source-control-prepared-operation",
+      "schema_hash": "sha256:c95512e5870acb63b48673328c82a1853ec82f0304e6962e1e15f7fe84608649"
+    }
+  ],
+  "provider_action_allowlist": [
+    "create_branch",
+    "commit_files",
+    "open_change_proposal"
+  ],
+  "authority": {
+    "minimum_mode": "remediate",
+    "maximum_mode": "remediate",
+    "approval_requirement": "required"
+  },
+  "retry_policy": {
+    "max_attempts": 3,
+    "base_delay_seconds": 2,
+    "max_delay_seconds": 30,
+    "reconcile_before_retry": true
+  },
+  "hard_limits": {
+    "max_files": 25,
+    "max_file_bytes": 250000,
+    "max_total_bytes": 1000000,
+    "allowed_extensions": [
+      ".json",
+      ".tf",
+      ".yaml",
+      ".yml"
+    ]
+  },
+  "executor_binding": {
+    "executor_id": "source-control.change-proposal",
+    "executor_binding_version": "1.0"
+  }
+}
