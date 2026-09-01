@@ -195,6 +195,10 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 ./validate-deployment.sh
 ./test-cloud.sh
 
+# Verify all three Knowledge Bases (GameLift, EKS, Cost) return retrieval
+# results; exits non-zero if any stack, KB, or retrieval is broken
+./scripts/infrastructure/test-kb.sh
+
 # Exercise Guardrail behavior and specialist routing/tool use
 ./test-ai-evals.sh
 
