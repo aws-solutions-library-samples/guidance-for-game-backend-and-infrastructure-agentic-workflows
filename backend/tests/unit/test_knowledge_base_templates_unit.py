@@ -51,6 +51,17 @@ def test_vector_index_replacement_uses_versioned_name_and_nonfilterable_metadata
     assert storage["S3VectorsConfiguration"]["IndexName"] == expected_index_name
 
 
+@pytest.mark.parametrize("knowledge_base", KNOWLEDGE_BASES)
+def test_knowledge_base_replacement_uses_versioned_name(knowledge_base):
+    """The v2 index forces KB replacement (StorageConfiguration is create-only),
+    so the account-unique KB name must be versioned too or create-before-delete
+    fails with 409 AlreadyExists against the original KB."""
+    template = _load_template(knowledge_base)
+
+    kb_name = template["Resources"]["KnowledgeBase"]["Properties"]["Name"]
+    assert kb_name == f"${{ProjectName}}-{knowledge_base}-kb-v2"
+
+
 def test_eks_chunk_size_is_restored_after_metadata_fix():
     template = _load_template("eks")
     ingestion = template["Resources"]["DataSource"]["Properties"]["VectorIngestionConfiguration"]

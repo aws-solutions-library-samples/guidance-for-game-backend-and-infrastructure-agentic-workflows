@@ -123,7 +123,12 @@ Resources:
     Type: AWS::Bedrock::KnowledgeBase
     DependsOn: VectorIndex
     Properties:
-      Name: !Sub '${ProjectName}-eks-kb'
+      # StorageConfiguration is create-only, so pointing at the v2 index
+      # replaces this KnowledgeBase. Bedrock KB names are account-unique and
+      # CloudFormation creates the replacement before deleting the original,
+      # so the name must be versioned too or the update fails with 409
+      # AlreadyExists. (Same replacement-safety rationale as the index above.)
+      Name: !Sub '${ProjectName}-eks-kb-v2'
       Description: 'EKS documentation knowledge base'
       RoleArn: !GetAtt KnowledgeBaseRole.Arn
       KnowledgeBaseConfiguration:
