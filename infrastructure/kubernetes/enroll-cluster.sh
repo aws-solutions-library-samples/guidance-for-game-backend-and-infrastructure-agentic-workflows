@@ -675,11 +675,11 @@ if ! kubectl get clusterrole "$CLUSTER_ROLE_NAME" > /dev/null 2>&1 || \
     fail "Monitoring RBAC objects were not found after apply."
 fi
 
-if ! CAN_LIST_PODS=$(checked_can_i list pods --as="$EFFECTIVE_USERNAME" --as-group="$K8S_GROUP"); then
+if ! CAN_LIST_PODS=$(checked_can_i list pods --all-namespaces --as="$EFFECTIVE_USERNAME" --as-group="$K8S_GROUP"); then
     rollback_after_failure
     fail "Failed to verify pod read access for the monitoring identity."
 fi
-if ! CAN_LIST_NODES=$(checked_can_i list nodes --as="$EFFECTIVE_USERNAME" --as-group="$K8S_GROUP"); then
+if ! CAN_LIST_NODES=$(checked_can_i list nodes --all-namespaces --as="$EFFECTIVE_USERNAME" --as-group="$K8S_GROUP"); then
     rollback_after_failure
     fail "Failed to verify node read access for the monitoring identity."
 fi

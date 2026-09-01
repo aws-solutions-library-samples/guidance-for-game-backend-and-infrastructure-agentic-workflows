@@ -564,6 +564,12 @@ class EksClusterAccessScriptTests(unittest.TestCase):
             if event.startswith("aws eks create-access-entry")
         )
         self.assertLess(binding_apply_index, access_entry_create_index)
+        self.assertTrue(
+            any(call.startswith("auth can-i list pods --all-namespaces") for call in state["kubectl_calls"])
+        )
+        self.assertTrue(
+            any(call.startswith("auth can-i list nodes --all-namespaces") for call in state["kubectl_calls"])
+        )
         self.assertIn("Enrollment complete", result.stdout)
 
     def test_api_enrollment_is_idempotent(self) -> None:
