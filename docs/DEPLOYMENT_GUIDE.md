@@ -183,7 +183,7 @@ cd infrastructure/kubernetes
 ./enroll-cluster.sh your-cluster-name us-west-2
 ```
 
-This grants Game Agent read-only access to monitor pods, deployments, and services.
+This grants Game Agent read-only access to monitor pods, nodes, deployments, and services. The script uses EKS access entries for `API` and `API_AND_CONFIG_MAP` clusters and `aws-auth` for legacy `CONFIG_MAP` clusters. If the active identity cannot apply Kubernetes RBAC, pass `--kube-role-arn` with an administrator role.
 
 ### Verify Deployment Health
 

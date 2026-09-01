@@ -108,6 +108,8 @@ htmlcov/
 # Infrastructure generated files
 infrastructure/generated/
 infrastructure/scripts/
+infrastructure/kubernetes/access-entry-backup-*.json
+infrastructure/kubernetes/aws-auth-backup-*.yaml
 
 # Keep infrastructure directory
 !infrastructure/
