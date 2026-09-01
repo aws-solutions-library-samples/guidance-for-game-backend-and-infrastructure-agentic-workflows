@@ -139,9 +139,16 @@ The executor loads the stored operation, approval, and playbook and verifies
 all bindings before the first provider write. The identifier is neither a
 credential nor authorization.
 
-`operations.contracts.validate_playbook_binding` and
-`validate_approval_binding` implement the content checks. Identity and expiry
-enforcement belong to the trusted services defined by later operations issues.
+`operations.contracts.validate_playbook_binding` validates the named profile,
+immutable playbook binding, executor and retry settings, and every playbook
+hard limit. Referenced file or diff content MUST be supplied through its
+`content_resolver`; unresolved content fails closed because its hash and byte
+limits cannot be verified. `validate_authorization_binding` binds a decision to
+the exact operation, requester, policy, authority requirement, and mandatory
+approval mode. `validate_approval_binding` requires one granted approval under
+the operation's exact policy and binds it to exact stored content. Identity
+lifecycle and expiry enforcement belong to the trusted services defined by
+later operations issues.
 
 ## Source-Control Profile
 
@@ -161,8 +168,11 @@ The source-control prepared operation binds:
 - recommendation source and correlation identifiers.
 
 Semantic validation rejects absolute paths, empty segments, `.` and `..`
-segments, backslashes, duplicate paths, mismatched inline hashes, an incorrect
-derived branch, or an incorrect duplicate-content hash.
+segments, backslashes, duplicate paths, mismatched inline or resolved hashes,
+an incorrect derived branch, or an incorrect duplicate-content hash. Playbook
+binding additionally enforces allowed extensions, per-file UTF-8 byte limits,
+total file byte limits, the maximum file count, and a 5,000,000-byte rendered
+diff limit.
 
 The executable document carries no provider credential, token, email address,
 display name, provider SDK object, generic provider command, or unfiltered
@@ -172,8 +182,12 @@ provider response. Its provider vocabulary is limited to stable domain values.
 
 An authorization decision records all six authority ceilings from ADR 0001:
 deployment, tenant, workspace, principal, capability, and risk policy.
-`effective_authority` MUST be their deterministic minimum. A reason code and
-the exact policy version make the result reproducible.
+`effective_authority` MUST be their deterministic minimum. Positive decisions
+require authority within the playbook's inclusive minimum and maximum range in
+contract `1.0`; a disabled deployment always denies. A playbook's minimum
+authority cannot exceed its maximum. The decision and reason codes MUST agree, and a playbook that requires approval
+cannot produce an `authorized` decision. The exact policy version makes the
+result reproducible.
 
 State changes are immutable records. Contract `1.0` publishes these
 transitions:
@@ -181,7 +195,7 @@ transitions:
 | From | Allowed next states |
 |---|---|
 | No state | `prepared` |
-| `prepared` | `pending_approval`, `approved`, `dispatched`, `rejected`, `cancelled`, `expired` |
+| `prepared` | `pending_approval`, `rejected`, `cancelled`, `expired` |
 | `pending_approval` | `approved`, `rejected`, `cancelled`, `expired` |
 | `approved` | `dispatched`, `cancelled`, `expired` |
 | `dispatched` | `executing`, `retry_pending`, `failed` |
@@ -189,8 +203,11 @@ transitions:
 | `retry_pending` | `dispatched`, `failed`, `expired` |
 | Terminal states | No transitions |
 
-The terminal states are `succeeded`, `failed`, `rejected`, `cancelled`, and
-`expired`. Retry attempts occur before a terminal `failed` transition.
+The required-approval v1 workflow cannot reach `approved` or `dispatched`
+directly from `prepared`. Each transition has exactly one matching reason code;
+unrelated audit reasons fail validation. The terminal states are `succeeded`,
+`failed`, `rejected`, `cancelled`, and `expired`. Retry attempts occur before a
+terminal `failed` transition.
 
 ## Ledger and Errors
 

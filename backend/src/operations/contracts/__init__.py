@@ -1,20 +1,13 @@
 """Versioned contracts shared by every operations adapter and executor."""
 
 # Local modules
-from operations.contracts.canonical import (
-    CanonicalizationError,
-    canonical_sha256,
-    canonicalize,
-    load_json,
-)
-from operations.contracts.source_control import (
-    source_control_branch_name,
-    source_control_content_hash,
-)
+from operations.contracts.canonical import CanonicalizationError, canonical_sha256, canonicalize, load_json
+from operations.contracts.source_control import source_control_branch_name, source_control_content_hash
 from operations.contracts.validation import (
     ContractValidationError,
     load_schema,
     validate_approval_binding,
+    validate_authorization_binding,
     validate_contract,
     validate_playbook_binding,
 )
@@ -40,6 +33,7 @@ __all__ = [
     "source_control_branch_name",
     "source_control_content_hash",
     "validate_approval_binding",
+    "validate_authorization_binding",
     "validate_contract",
     "validate_playbook_binding",
     "validate_state_transition",

@@ -20,8 +20,11 @@ class CanonicalizationError(ValueError):
 def canonicalize(document: Any) -> bytes:
     """Return the RFC 8785 JSON Canonicalization Scheme representation."""
     try:
-        return rfc8785.dumps(document)
-    except (rfc8785.CanonicalizationError, TypeError) as exc:
+        result = rfc8785.dumps(document)
+        if not isinstance(result, bytes):
+            raise TypeError("RFC 8785 canonicalization did not return bytes")
+        return result
+    except (rfc8785.CanonicalizationError, RecursionError, TypeError, UnicodeError) as exc:
         raise CanonicalizationError(str(exc)) from exc
 
 
@@ -44,7 +47,7 @@ def _reject_non_finite(value: str) -> None:
 
 
 def load_json(source: str | bytes | Path | TextIO) -> Any:
-    """Load JSON while rejecting duplicate keys and non-I-JSON numeric values."""
+    """Load one I-JSON document and reject values outside the canonical domain."""
     try:
         raw: str | bytes
         if isinstance(source, Path):
@@ -55,10 +58,12 @@ def load_json(source: str | bytes | Path | TextIO) -> Any:
             raw = source.read()
 
         text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        return json.loads(
+        document = json.loads(
             text,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_non_finite,
         )
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        canonicalize(document)
+        return document
+    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError) as exc:
         raise CanonicalizationError(str(exc)) from exc
