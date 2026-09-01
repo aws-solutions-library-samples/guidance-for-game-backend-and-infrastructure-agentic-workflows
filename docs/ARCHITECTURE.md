@@ -26,7 +26,10 @@ boundaries. These decisions do not deploy operations resources or grant
 provider write permissions.
 
 See the [architecture decision records](adr/README.md) for the accepted
-boundaries and compatibility constraints.
+boundaries and compatibility constraints. The
+[operations contracts](OPERATIONS_CONTRACTS.md) define the versioned,
+protocol-neutral records and deterministic approval binding used by future
+operations services.
 
 See [Identity and Authorization](IDENTITY_AND_AUTHORIZATION.md) for the trusted
 principal, read-path, approval, remote-client, and executor identity contracts.
@@ -622,3 +625,4 @@ scripts/
 - [Deployment Guide](DEPLOYMENT_GUIDE.md) — Full deployment steps and environment variable reference
 - [Security](../SECURITY.md) — Encryption, access controls, and compliance
 - [Architecture Decision Records](adr/README.md) — Accepted boundaries for the optional operations control plane
+- [Operations Contracts](OPERATIONS_CONTRACTS.md) — Versioned schemas, canonical hashes, lifecycle, and source-control profile

@@ -1,0 +1,21 @@
+{
+  "approval_contract_version": "1.0",
+  "approval_id": "approval:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "prepared_operation_hash": "sha256:aed919c38939443654381eb251d9a3bed0112432970d689fbc4683882205e564",
+  "approver": {
+    "subject_id": "subject:01HZY3N6VQ7X8Y9Z0A1B2C3D4F",
+    "client_id": "client:operations-web",
+    "tenant_id": "tenant:example",
+    "workspace_id": "workspace:game-platform"
+  },
+  "decision": "granted",
+  "policy_version": "12",
+  "decided_at": "2026-08-13T20:05:00Z",
+  "expires_at": "2026-08-13T20:35:00Z",
+  "correlation": {
+    "correlation_id": "correlation:01HZY3N6VQ7X8Y9Z0A1B2C3D4E",
+    "request_id": "request:01HZY3N6VQ7X8Y9Z0A1B2C3D4F",
+    "causation_id": "decision:01HZY3N6VQ7X8Y9Z0A1B2C3D4E"
+  }
+}
