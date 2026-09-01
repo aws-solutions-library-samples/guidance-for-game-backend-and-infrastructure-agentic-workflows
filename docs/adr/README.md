@@ -19,3 +19,6 @@ existing Game Agent chat path remains the current product behavior.
 Later architecture issues define versioned contracts, trusted principal
 context, persistence, workflow recovery, and incremental cost. Those details
 must not weaken the boundaries accepted here.
+
+The published versioned records, hash rules, lifecycle, and source-control
+profile are documented in [Operations Contracts](../OPERATIONS_CONTRACTS.md).
