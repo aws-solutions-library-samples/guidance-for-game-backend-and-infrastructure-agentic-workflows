@@ -10,9 +10,12 @@ Addresses Well-Architected GenAI Lens findings:
   - Reliability 5.3        (remediation for loops, retries, failures)
 """
 
+# Standard library
+from typing import Any
+
 # Third-party packages
 from strands.hooks.events import BeforeToolCallEvent
-from strands.hooks.registry import HookProvider
+from strands.hooks.registry import HookProvider, HookRegistry
 
 # Local modules
 from utils.logger import logger
@@ -25,11 +28,11 @@ class MaxTurnsHook(HookProvider):
         self.max_turns = max_turns
         self._cycle_count = 0
 
-    def register_hooks(self, hooks):
-        hooks.add_callback(BeforeToolCallEvent, self._check_limit)
+    def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
+        registry.add_callback(BeforeToolCallEvent, self._check_limit)
 
     # ------------------------------------------------------------------
-    def _check_limit(self, event: BeforeToolCallEvent, **kwargs):
+    def _check_limit(self, event: BeforeToolCallEvent, **kwargs: Any) -> None:
         self._cycle_count += 1
         if self._cycle_count > self.max_turns:
             logger.warning(

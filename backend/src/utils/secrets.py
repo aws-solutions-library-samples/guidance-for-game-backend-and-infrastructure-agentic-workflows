@@ -134,7 +134,11 @@ def _get_from_secrets_manager(secret_name: str) -> str | None:
 
         # Handle both string and binary secrets
         if "SecretString" in response:
-            return response["SecretString"]
+            # boto3 runtime stubs aren't installed, so the client resolves to Any
+            # under ignore_missing_imports; pin the known str type explicitly to
+            # satisfy warn_return_any without a blanket ignore.
+            secret_string: str = response["SecretString"]
+            return secret_string
         elif "SecretBinary" in response:
             # Standard library
             import base64
@@ -206,16 +210,28 @@ def create_secret(
     try:
         client = _get_secrets_client()
 
-        create_params = {
-            "Name": secret_name,
-            "SecretString": secret_value,
-            "Description": description or f"Game Agent secret: {secret_name}",
-        }
+        description_value = description or f"Game Agent secret: {secret_name}"
 
+        # Call create_secret with explicit keyword arguments rather than
+        # unpacking a broadly-typed union dict. The union dict
+        # (dict[str, str | list[dict[str, str]]]) satisfied mypy but accepted
+        # invalid combinations — a list for Name, a str for Tags, or arbitrary
+        # misspelled keys. Splitting into tagged/untagged branches with literal
+        # kwargs keeps each key bound to its correct value type. Behaviorally
+        # identical: Tags is included only when tags are provided.
         if tags:
-            create_params["Tags"] = [{"Key": k, "Value": v} for k, v in tags.items()]
-
-        client.create_secret(**create_params)
+            client.create_secret(
+                Name=secret_name,
+                SecretString=secret_value,
+                Description=description_value,
+                Tags=[{"Key": k, "Value": v} for k, v in tags.items()],
+            )
+        else:
+            client.create_secret(
+                Name=secret_name,
+                SecretString=secret_value,
+                Description=description_value,
+            )
         logger.info(f"Secret '{secret_name}' created successfully")
         return True
 
