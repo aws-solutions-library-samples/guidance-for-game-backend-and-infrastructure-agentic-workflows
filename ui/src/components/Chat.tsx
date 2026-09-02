@@ -10,12 +10,14 @@ import { createPortal } from "react-dom";
 import { CopilotKit } from "@copilotkit/react-core";
 import { CopilotChat } from "@copilotkit/react-ui";
 import { NewChatButton } from "./NewChatButton";
-import { ChatCodeBlock } from "@/components/ChatCodeBlock";
+import { MarkdownCodeRenderer } from "@/components/MarkdownCodeRenderer";
 
-// Override the markdown `code` renderer so fenced code blocks (e.g. IaC) are
-// readable on the dark surface and download with a filename derived from the
-// fence token, instead of CopilotKit's default `file-<random>.file`.
-const markdownTagRenderers = { code: ChatCodeBlock };
+// Override the markdown `code` renderer. It (1) renders fenced code blocks
+// (e.g. IaC) readably on the dark surface with a filename derived from the
+// fence token instead of CopilotKit's default `file-<random>.file`, and
+// (2) renders a ```chart fenced block as an inline SVG chart (#255), falling
+// back to the code block for any malformed/partial payload.
+const markdownTagRenderers = { code: MarkdownCodeRenderer };
 
 // Progress messages for rotating indicator
 const PROGRESS_MESSAGES = [
@@ -142,7 +144,11 @@ You have access to conversation history and can reference previous messages. Alw
 - Professional analysis with clear next steps
 - Context-aware responses that build on previous discussions
 
-Be concise, informative, and maintain conversation context throughout our discussion.`}
+Be concise, informative, and maintain conversation context throughout our discussion.
+
+CHARTS: When the answer is quantitative — change over time or a comparison across items — render a chart inline in addition to (never instead of) a one-line text reading of what it shows. Emit a fenced code block tagged \`chart\` whose body is a single JSON object:
+{"type":"line|bar|area","title":"...","summary":"one-line reading","unit":"USD|%|...","x":{"label":"Month","values":["Jun","Jul","Aug"]},"series":[{"name":"GameLift","values":[1204,1521,1880]}]}
+Use "line" for trends over time, "bar" for comparison across fleets/items (multiple series render as grouped bars), and "area" for stacked composition over time. Every series' "values" array MUST have the same length as x.values. Keep the prose summary in the message too, so it survives copy-paste and is available to screen readers.`}
           makeSystemMessage={(instructions) =>
             instructions + "\n\nIMPORTANT: You have access to full conversation history. Reference previous messages and maintain context across the entire conversation."
           }

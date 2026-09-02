@@ -58,6 +58,17 @@
   --ga-warning: #ffa500;
   --ga-warning-bg: rgba(255, 165, 0, 0.16);
   --ga-warning-border: rgba(255, 165, 0, 0.3);
+  /* Inline chart series palette (#255). Eight distinct hues tuned for the dark
+     theme; the light theme overrides them below. Charts reference these so
+     they follow the app theme instead of shipping their own colours. */
+  --ga-chart-1: #8b45ff;
+  --ga-chart-2: #00bcd4;
+  --ga-chart-3: #00ff88;
+  --ga-chart-4: #ffa500;
+  --ga-chart-5: #ff6b6b;
+  --ga-chart-6: #3d5afe;
+  --ga-chart-7: #ff5cf0;
+  --ga-chart-8: #ffd54a;
 }
 
 :root[data-theme='light'] {
@@ -111,6 +122,16 @@
   --ga-warning: #b45309;
   --ga-warning-bg: rgba(180, 83, 9, 0.1);
   --ga-warning-border: rgba(180, 83, 9, 0.22);
+  /* Inline chart series palette (#255) — darker, higher-contrast hues for the
+     light theme so series stay legible on the light surface. */
+  --ga-chart-1: #5b35d8;
+  --ga-chart-2: #007c91;
+  --ga-chart-3: #047857;
+  --ga-chart-4: #b45309;
+  --ga-chart-5: #c73636;
+  --ga-chart-6: #2937c7;
+  --ga-chart-7: #b3208f;
+  --ga-chart-8: #8a6d00;
 }
 
 /* Reset and base styles */

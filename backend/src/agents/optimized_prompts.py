@@ -21,6 +21,9 @@ provides the code-level foundation for traceability.
 import os
 from dataclasses import dataclass
 
+# Local modules
+from agents.chart_directive import CHART_DIRECTIVE, with_chart_directive
+
 
 @dataclass(frozen=True)
 class VersionedPrompt:
@@ -209,30 +212,32 @@ def _get_prompt(name: str, fallback: VersionedPrompt) -> str:
 
 def get_optimized_gamelift_prompt() -> str:
     """Get the optimized GameLift specialist system prompt."""
-    return _get_prompt("gamelift_specialist", GAMELIFT_PROMPT)
+    return with_chart_directive(_get_prompt("gamelift_specialist", GAMELIFT_PROMPT))
 
 
 def get_optimized_eks_prompt() -> str:
     """Get the optimized EKS specialist system prompt."""
-    return _get_prompt("eks_specialist", EKS_PROMPT)
+    return with_chart_directive(_get_prompt("eks_specialist", EKS_PROMPT))
 
 
 def get_optimized_cost_prompt() -> str:
     """Get the optimized cost specialist system prompt."""
-    return _get_prompt("cost_specialist", COST_PROMPT)
+    return with_chart_directive(_get_prompt("cost_specialist", COST_PROMPT))
 
 
 def get_optimized_orchestrator_prompt() -> str:
     """Get the optimized orchestrator system prompt."""
-    return _get_prompt("orchestrator", ORCHESTRATOR_PROMPT)
+    return with_chart_directive(_get_prompt("orchestrator", ORCHESTRATOR_PROMPT))
 
 
 def get_prompt_versions() -> dict[str, str]:
     """Return a mapping of prompt name → version and source for logging/tracing."""
     versions = {p.name: p.version for p in _ALL_PROMPTS.values()}
+    # The chart contract directive (issue #255) is composed into every prompt
+    # above, so track its version alongside the authored prompts for traceability.
+    versions[CHART_DIRECTIVE.name] = CHART_DIRECTIVE.version
     versions["_source"] = _prompt_source
     return versions
-    return {p.name: p.version for p in _ALL_PROMPTS.values()}
 
 
 # ---------------------------------------------------------------------------
