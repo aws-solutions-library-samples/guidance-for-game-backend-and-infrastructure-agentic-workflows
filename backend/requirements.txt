@@ -616,7 +616,7 @@ pyjwt==2.13.0
     #   game-agent-backend
     #   mcp
     #   strands-agents-tools
-pypdf==6.15.0
+pypdf==6.16.1
     # via game-agent-backend
 pyperclip==1.11.0
     # via fastmcp-slim
