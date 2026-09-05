@@ -70,7 +70,7 @@
     "babel-jest": "^30.4.1",
     "eslint": "9.39.4",
     "eslint-config-next": "16.3.3",
-    "jest": "^30.4.2",
+    "jest": "^30.5.1",
     "jest-environment-jsdom": "^30.4.1",
     "node-mocks-http": "^1.17.2",
     "prismjs": "^1.30.0",
