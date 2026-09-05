@@ -261,9 +261,6 @@ Resources:
                   - ce:GetAnomalies
                   - ce:GetUsageReport
                 Resource: '*'
-                Condition:
-                  StringEquals:
-                    aws:RequestedRegion: !Ref AWS::Region
               - Sid: CloudControlReadAccess
                 Effect: Allow
                 Action:
@@ -365,6 +362,8 @@ Resources:
                 Action:
                   - s3:GetStorageLensConfiguration
                   - freetier:GetFreeTierUsage
+                  - pricing:DescribeServices
+                  - pricing:GetAttributeValues
                   - pricing:GetProducts
                 Resource: '*'
         # Security: Scoped logging access
