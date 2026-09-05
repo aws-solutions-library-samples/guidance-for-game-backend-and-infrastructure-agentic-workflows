@@ -55,7 +55,7 @@
     "next": "^16.2.12",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
-    "react-syntax-highlighter": "^15.6.6"
+    "react-syntax-highlighter": "^16.1.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
@@ -128,7 +128,7 @@
       ]
     },
     "transformIgnorePatterns": [
-      "/node_modules/(?!(@copilotkit|cookie|@aws-sdk|@smithy)/)"
+      "/node_modules/(?!(@copilotkit|cookie|@aws-sdk|@smithy|refractor|hastscript|hast-util-parse-selector|property-information|space-separated-tokens|comma-separated-tokens|parse-entities|character-entities-legacy|character-reference-invalid|decode-named-character-reference|is-alphabetical|is-alphanumerical|is-decimal|is-hexadecimal)/)"
     ]
   }
 }
