@@ -40,14 +40,20 @@ class TestCostAgentPerformance:
             assert len(result) > 0
 
     def test_cost_agent_prompt_is_concise(self):
-        """Cost agent system prompt should be concise to reduce token usage."""
+        """Cost agent's authored system prompt should be concise to reduce token usage."""
         # Local modules
-        from agents.optimized_prompts import get_optimized_cost_prompt
+        from agents.optimized_prompts import COST_PROMPT, get_optimized_cost_prompt
 
-        prompt = get_optimized_cost_prompt()
-
-        # Prompt should be under 500 characters for efficiency
-        assert len(prompt) < 500, f"Prompt is {len(prompt)} chars, should be <500 for efficiency"
+        # The authored specialist prompt itself must stay lean. The deployed
+        # prompt additionally composes the shared, versioned chart directive
+        # (issue #255), which is intentionally shared across specialists and is
+        # asserted separately in the chart directive tests.
+        assert (
+            len(COST_PROMPT.text) < 500
+        ), f"Authored cost prompt is {len(COST_PROMPT.text)} chars, should be <500 for efficiency"
+        # The composed prompt must still carry the chart contract so the
+        # capability actually reaches the model.
+        assert "`chart`" in get_optimized_cost_prompt()
 
 
 if __name__ == "__main__":

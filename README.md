@@ -289,6 +289,10 @@ Once the application is running (locally or deployed), interact with the AI assi
 "Show me cost optimization opportunities"
 ```
 
+### Inline Charts
+
+When the answer is quantitative — a change over time or a comparison across fleets/regions — the agent renders a chart inline in the chat (line, grouped bar, or stacked area) alongside a one-line text reading of what it shows. Charts follow the app's light/dark theme and include an accessible data-table fallback. This is a rendering capability only; no new IAM permissions are required. See [docs/CHART_CONTRACT.md](docs/CHART_CONTRACT.md) for the response contract and examples.
+
 ### Authentication
 
 - **Development mode** (`NEXT_PUBLIC_SKIP_AUTH=true`): No authentication required (default in `.env.local`)

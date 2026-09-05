@@ -1,0 +1,142 @@
+{
+  "$comment": "Shared parity corpus for the inline-chart contract (issue #255). Consumed by BOTH the Python validator test (backend/tests/unit/test_chart_directive_unit.py) and the TypeScript validator test (ui/src/__tests__/components/charts/chartContract.test.ts). It pins that the backend (build_chart_spec) and frontend (validateChartSpec) validators agree on the exact same decision for every case: optional nulls, the Unicode length metric, out-of-range and huge integer values, and the raw payload size boundary. A string value may be given literally or via a {\"$str\":{\"char\":\"X\",\"count\":N}} directive that both loaders expand to `char` repeated `count` times. This keeps astral (non-BMP) characters and exact boundary lengths compact and unambiguous: `char` is one Unicode code point but two UTF-16 code units, so these cases prove both sides measure length in code points, not UTF-16 units.",
+  "lengthMetric": "unicode-code-points",
+  "bounds": {
+    "MAX_POINTS": 366,
+    "MAX_SERIES": 8,
+    "MAX_LABEL_LENGTH": 120,
+    "MAX_TEXT_LENGTH": 280,
+    "MAX_ABS_VALUE": 1000000000000,
+    "MAX_RAW_PAYLOAD_CHARS": 24000
+  },
+  "astralChar": "𝔘",
+  "specCases": [
+    {
+      "name": "valid-line-baseline",
+      "accept": true,
+      "spec": {
+        "type": "line", "version": "1.0", "title": "GameLift spend", "summary": "Up.", "unit": "USD",
+        "x": { "label": "Month", "values": ["Jun", "Jul", "Aug"] },
+        "y": { "label": "USD" },
+        "series": [{ "name": "GameLift", "values": [1204, 1521, 1880] }]
+      }
+    },
+    {
+      "name": "omitted-optionals-accepted",
+      "accept": true,
+      "spec": { "type": "bar", "x": { "values": ["a", "b"] }, "series": [{ "name": "s", "values": [1, 2] }] }
+    },
+    {
+      "name": "empty-y-object-accepted",
+      "accept": true,
+      "spec": { "type": "bar", "x": { "values": ["a"] }, "y": {}, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-title-rejected",
+      "accept": false,
+      "spec": { "type": "line", "title": null, "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-summary-rejected",
+      "accept": false,
+      "spec": { "type": "line", "summary": null, "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-unit-rejected",
+      "accept": false,
+      "spec": { "type": "line", "unit": null, "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-version-rejected",
+      "accept": false,
+      "spec": { "type": "line", "version": null, "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-x-label-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "label": null, "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-y-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "y": null, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "null-y-label-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "y": { "label": null }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "astral-label-at-max-accepted",
+      "accept": true,
+      "spec": { "type": "line", "x": { "values": [{ "$str": { "char": "𝔘", "count": 120 } }] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "astral-label-over-max-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": [{ "$str": { "char": "𝔘", "count": 121 } }] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "astral-title-at-max-accepted",
+      "accept": true,
+      "spec": { "type": "line", "title": { "$str": { "char": "𝔘", "count": 280 } }, "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "astral-title-over-max-rejected",
+      "accept": false,
+      "spec": { "type": "line", "title": { "$str": { "char": "𝔘", "count": 281 } }, "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    },
+    {
+      "name": "astral-series-name-at-max-accepted",
+      "accept": true,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "series": [{ "name": { "$str": { "char": "𝔘", "count": 120 } }, "values": [1] }] }
+    },
+    {
+      "name": "value-at-max-abs-accepted",
+      "accept": true,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1000000000000] }] }
+    },
+    {
+      "name": "value-one-over-max-abs-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1000000000001] }] }
+    },
+    {
+      "name": "huge-positive-int-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1000000000000000000000000000000] }] }
+    },
+    {
+      "name": "huge-negative-int-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [-1000000000000000000000000000000] }] }
+    },
+    {
+      "name": "negative-area-rejected",
+      "accept": false,
+      "spec": { "type": "area", "x": { "values": ["a", "b"] }, "series": [{ "name": "s", "values": [10, -5] }] }
+    },
+    {
+      "name": "negative-bar-accepted",
+      "accept": true,
+      "spec": { "type": "bar", "x": { "values": ["a", "b"] }, "series": [{ "name": "s", "values": [10, -5] }] }
+    },
+    {
+      "name": "unknown-top-key-rejected",
+      "accept": false,
+      "spec": { "type": "line", "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }], "evil": 1 }
+    },
+    {
+      "name": "incompatible-major-version-rejected",
+      "accept": false,
+      "spec": { "type": "line", "version": "2.0", "x": { "values": ["a"] }, "series": [{ "name": "s", "values": [1] }] }
+    }
+  ],
+  "rawCases": [
+    { "name": "ascii-well-within-cap", "char": "a", "count": 100, "withinCap": true },
+    { "name": "ascii-exactly-at-cap", "char": "a", "count": 24000, "withinCap": true },
+    { "name": "ascii-one-over-cap", "char": "a", "count": 24001, "withinCap": false },
+    { "name": "astral-exactly-at-cap", "char": "𝔘", "count": 24000, "withinCap": true },
+    { "name": "astral-one-over-cap", "char": "𝔘", "count": 24001, "withinCap": false }
+  ]
+}
