@@ -61,4 +61,17 @@ describe('NewChatButton (#253)', () => {
     const second = mockSetThreadId.mock.calls[1][0];
     expect(first).not.toBe(second);
   });
+
+  it('resets the message scroll position for the fresh conversation', async () => {
+    const messages = document.createElement('div');
+    messages.className = 'copilotKitMessages';
+    messages.scrollTop = 500;
+    document.body.appendChild(messages);
+
+    render(<NewChatButton />);
+    await userEvent.click(screen.getByRole('button', { name: /new chat/i }));
+
+    expect(messages.scrollTop).toBe(0);
+    messages.remove();
+  });
 });
