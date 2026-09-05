@@ -12,10 +12,11 @@ Addresses Guardian Security Design Evaluation finding:
 
 # Standard library
 import time
+from typing import Any
 
 # Third-party packages
 from strands.hooks.events import BeforeToolCallEvent
-from strands.hooks.registry import HookProvider
+from strands.hooks.registry import HookProvider, HookRegistry
 
 # Local modules
 from utils.logger import logger
@@ -28,10 +29,10 @@ class WallClockTimeoutHook(HookProvider):
         self.timeout_seconds = timeout_seconds
         self._start_time = time.monotonic()
 
-    def register_hooks(self, hooks):
-        hooks.add_callback(BeforeToolCallEvent, self._check_timeout)
+    def register_hooks(self, registry: HookRegistry, **kwargs: Any) -> None:
+        registry.add_callback(BeforeToolCallEvent, self._check_timeout)
 
-    def _check_timeout(self, event: BeforeToolCallEvent, **kwargs):
+    def _check_timeout(self, event: BeforeToolCallEvent, **kwargs: Any) -> None:
         elapsed = time.monotonic() - self._start_time
         if elapsed > self.timeout_seconds:
             tool_name = event.tool_use.get("name", "unknown")
