@@ -37,7 +37,7 @@ def _client(existing_id=None):
     ],
 )
 def test_new_prompt_uses_agent_role_model(monkeypatch, prompt_name, expected_model):
-    # Local modules
+    # Third-party packages
     from scripts.infrastructure import deploy_prompts
 
     vp = SimpleNamespace(name=prompt_name, text="prompt text", version="1")
@@ -52,7 +52,7 @@ def test_new_prompt_uses_agent_role_model(monkeypatch, prompt_name, expected_mod
 
 
 def test_model_only_change_updates_and_publishes(monkeypatch):
-    # Local modules
+    # Third-party packages
     from scripts.infrastructure import deploy_prompts
 
     vp = SimpleNamespace(name="eks_specialist", text="same text", version="2")
@@ -78,7 +78,7 @@ def test_model_only_change_updates_and_publishes(monkeypatch):
 
 
 def test_complete_variant_match_is_unchanged(monkeypatch):
-    # Local modules
+    # Third-party packages
     from scripts.infrastructure import deploy_prompts
 
     vp = SimpleNamespace(name="orchestrator", text="same text", version="2")
