@@ -10,6 +10,7 @@ from operations.contracts.validation import (
     validate_authorization_binding,
     validate_contract,
     validate_playbook_binding,
+    validate_prepared_operation,
 )
 from operations.contracts.versions import (
     CONTRACT_VERSION,
@@ -36,5 +37,6 @@ __all__ = [
     "validate_authorization_binding",
     "validate_contract",
     "validate_playbook_binding",
+    "validate_prepared_operation",
     "validate_state_transition",
 ]

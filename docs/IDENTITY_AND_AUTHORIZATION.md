@@ -60,20 +60,39 @@ workspace model or accept identity through tool input.
 
 ## Approval Identity
 
-The future Operations HTTP API must treat these as separate fields:
+The protocol-neutral approval boundary in `operations.identity` and
+`operations.approval` now enforces these separate values:
 
-- `requester_id`: copied from the trusted principal when the operation is
-  prepared;
-- `approver_id`: copied from the trusted principal for the direct approval
-  action; and
-- `operation_hash`: loaded from the stored prepared operation and recorded with
-  the approval.
+- `requester`: copied from a fresh verified principal when the immutable
+  operation is prepared;
+- `approver`: copied from the fresh verified principal supplied separately for
+  the direct approval action; and
+- `prepared_operation_hash`: freshly calculated from the validated stored
+  operation and recorded with the approval.
 
-An approval action is a direct authenticated UI or API action outside the chat
-and model tool path. The API receives an operation identifier, loads the stored
-operation and canonical hash, verifies policy and state, and records the
-verified approver against that one hash. Chat text and model output can request
-preparation but cannot invoke or synthesize approval.
+An approval action remains a direct authenticated UI or API action outside the
+chat and model tool path. Its complete untrusted payload contains only an
+operation identifier. `ApprovalService` loads the stored document and hash,
+checks its contract, `pending_approval` state, expiry, policy version, and
+requester boundary, then constructs the approval record from verified context.
+Chat text and model output can request preparation but cannot invoke or
+synthesize approval.
+
+`VerifiedPrincipal` may be constructed only by verifier-owned adapter code
+after cryptographic access-token verification. It is a trusted capability, not
+a JSON data-transfer object, and must never be registered for generic request
+deserialization. The application boundary checks credential freshness and
+trusted audience, client, tenant, and workspace configuration; it never
+accepts a token or principal mapping from the approval payload.
+
+The service rechecks credential and operation expiry immediately before commit.
+The approval store receives expected state and hash plus an exclusive
+`commit_not_after` deadline equal to the earliest credential, operation, or
+approval-record expiry, and returns a typed recorded, precondition-failed, or
+deadline-expired outcome. Only exact outcome enum members are accepted; raw
+string values fail closed. Its durable implementation must enforce all three
+conditions in the same atomic transaction that records the approval and state
+transition.
 
 The default policy denies self-approval. A tenant/workspace policy may
 explicitly allow the same principal to approve an eligible low-risk operation.

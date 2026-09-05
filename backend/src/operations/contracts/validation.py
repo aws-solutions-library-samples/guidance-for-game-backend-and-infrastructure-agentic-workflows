@@ -171,7 +171,8 @@ def validate_contract(schema_name: str, document: object) -> None:
         raise ContractValidationError(schema_name, errors)
 
 
-def _validate_prepared_operation_profile(prepared_operation: dict[str, Any]) -> None:
+def validate_prepared_operation(prepared_operation: dict[str, Any]) -> None:
+    """Validate the core and exact named profile of a prepared operation."""
     validate_contract("prepared-operation", prepared_operation)
     profile = prepared_operation["profile"]
     profile_schema = _PROFILE_SCHEMAS.get(profile)
@@ -189,7 +190,7 @@ def validate_playbook_binding(
     content_resolver: ContentResolver | None = None,
 ) -> None:
     """Verify that a prepared operation satisfies and binds one exact playbook."""
-    _validate_prepared_operation_profile(prepared_operation)
+    validate_prepared_operation(prepared_operation)
     validate_contract("playbook", playbook)
 
     reference = prepared_operation["playbook"]
@@ -250,7 +251,7 @@ def validate_authorization_binding(
 def validate_approval_binding(approval: dict[str, Any], prepared_operation: dict[str, Any]) -> None:
     """Verify that one granted approval authorizes one exact stored operation."""
     validate_contract("approval-record", approval)
-    _validate_prepared_operation_profile(prepared_operation)
+    validate_prepared_operation(prepared_operation)
 
     errors = []
     if approval["decision"] != "granted":
