@@ -42,12 +42,49 @@ class TestCostAgentPerformance:
     def test_cost_agent_prompt_is_concise(self):
         """Cost agent system prompt should be concise to reduce token usage."""
         # Local modules
-        from agents.optimized_prompts import get_optimized_cost_prompt
+        from agents.optimized_prompts import COST_PROMPT, get_optimized_cost_prompt
 
+        # The managed/base template must stay lean (<500 chars) for token efficiency.
+        assert (
+            len(COST_PROMPT.text) < 500
+        ), f"Base cost prompt is {len(COST_PROMPT.text)} chars, should be <500 for efficiency"
+
+        # The runtime accessor appends a short current-UTC-date directive (~125
+        # chars) so relative ranges are derived from real time. Allow bounded
+        # headroom above the base cap for exactly that directive.
         prompt = get_optimized_cost_prompt()
+        assert len(prompt) < 650, f"Cost prompt with date directive is {len(prompt)} chars, should be <650"
 
-        # Prompt should be under 500 characters for efficiency
-        assert len(prompt) < 500, f"Prompt is {len(prompt)} chars, should be <500 for efficiency"
+    def test_cost_prompt_includes_runtime_utc_date(self):
+        """Cost prompt must state the current UTC date so relative ranges use real time."""
+        # Standard library
+        from datetime import datetime, timezone
+
+        # Local modules
+        import agents.optimized_prompts as op
+
+        with patch.object(op, "_utc_now", return_value=datetime(2027, 3, 9, 15, 30, tzinfo=timezone.utc)):
+            prompt = op.get_optimized_cost_prompt()
+
+        assert "Today (UTC) is 2027-03-09" in prompt
+        assert "current month" in prompt
+        # Base template guidance is still present.
+        assert "get_cost_report" in prompt
+
+    def test_cost_prompt_date_is_normalized_to_utc(self):
+        """A non-UTC injected time is normalized to its UTC calendar date."""
+        # Standard library
+        from datetime import datetime, timedelta, timezone
+
+        # Local modules
+        import agents.optimized_prompts as op
+
+        # 2027-03-09 23:00 at UTC-5 is 2027-03-10 04:00 UTC -> date rolls forward.
+        local_late = datetime(2027, 3, 9, 23, 0, tzinfo=timezone(timedelta(hours=-5)))
+        with patch.object(op, "_utc_now", return_value=local_late):
+            prompt = op.get_optimized_cost_prompt()
+
+        assert "Today (UTC) is 2027-03-10" in prompt
 
 
 if __name__ == "__main__":
