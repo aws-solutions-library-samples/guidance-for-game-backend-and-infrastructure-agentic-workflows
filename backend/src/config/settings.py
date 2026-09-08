@@ -78,6 +78,67 @@ COST_KB_ID = os.getenv("GBAW_COST_KB_ID")
 # Legacy support: KNOWLEDGE_BASE_ID falls back to GAMELIFT_KB_ID
 KNOWLEDGE_BASE_ID = os.getenv("GBAW_KNOWLEDGE_BASE_ID") or GAMELIFT_KB_ID
 
+# Cost report shared snapshot store (#365)
+# Validated cost report snapshots are persisted so a report ID created by one
+# AgentCore worker resolves from any worker for the configured TTL. When the
+# DynamoDB table name is set (wired by deploy.sh from CloudFormation), the shared
+# encrypted store is used; otherwise the runtime falls back to an in-memory TTL
+# cache — but only when the shared store is not required (see below).
+COST_SNAPSHOT_TABLE_NAME = os.getenv("GBAW_COST_SNAPSHOT_TABLE_NAME") or None
+
+# Explicit shared-store-required switch. Hosted deployments set this to "true"
+# (wired by deploy.sh / Deploy-GameAgent) so a missing table name fails closed
+# instead of silently degrading to a process-local in-memory cache that cannot
+# satisfy cross-worker reuse. Local development and tests leave it false, which
+# permits the in-memory fallback.
+COST_SNAPSHOT_STORE_REQUIRED = os.getenv("GBAW_COST_SNAPSHOT_REQUIRED", "false").lower() == "true"
+
+
+def _coerce_ttl_seconds(raw: str | None, *, default: int, minimum: int, maximum: int) -> int:
+    """Return a bounded, positive TTL in seconds.
+
+    A non-integer, non-positive, or out-of-range value falls back to ``default``
+    with a warning rather than crashing the runtime, so a malformed deployment
+    variable cannot take the whole service down. Deploy-time validation
+    (deploy.sh / Deploy-GameAgent) rejects bad values earlier; this is the
+    defensive runtime floor/ceiling.
+    """
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid GBAW_COST_SNAPSHOT_TTL_SECONDS={raw!r}; using default {default}")
+        return default
+    if value < minimum or value > maximum:
+        logger.warning(
+            f"GBAW_COST_SNAPSHOT_TTL_SECONDS={value} out of bounds [{minimum}, {maximum}]; using default {default}"
+        )
+        return default
+    return value
+
+
+# Bounded positive TTL. Minimum keeps a follow-up window usable; maximum caps how
+# long a validated snapshot may be reused before a fresh Cost Explorer query is
+# required (open-period billing data can be revised by AWS).
+COST_SNAPSHOT_TTL_MIN_SECONDS = 60
+COST_SNAPSHOT_TTL_MAX_SECONDS = 86_400
+COST_SNAPSHOT_TTL_SECONDS = _coerce_ttl_seconds(
+    os.getenv("GBAW_COST_SNAPSHOT_TTL_SECONDS"),
+    default=1800,
+    minimum=COST_SNAPSHOT_TTL_MIN_SECONDS,
+    maximum=COST_SNAPSHOT_TTL_MAX_SECONDS,
+)
+
+# Trusted deployment identity binding (#365)
+# Report reuse is scoped to the trusted deployment tenant/workspace plus the
+# request actor so a report ID cannot cross an authorization boundary. These
+# values are resolved at deploy time (config/load_deployment_settings.py) and
+# passed into the runtime environment; they default to the same deployment
+# defaults used elsewhere so local runs remain deterministic.
+DEPLOYMENT_TENANT_ID = os.getenv("GBAW_TENANT_ID", "").strip() or "default-tenant"
+DEPLOYMENT_WORKSPACE_ID = os.getenv("GBAW_WORKSPACE_ID", "").strip() or "default-workspace"
+
 # Memory layer configuration
 MEMORY_SESSION_TTL_HOURS = int(os.getenv("GBAW_MEMORY_SESSION_TTL_HOURS", "24"))  # Conversation memory
 MEMORY_USER_TTL_DAYS = int(os.getenv("GBAW_MEMORY_USER_TTL_DAYS", "30"))  # User memory
