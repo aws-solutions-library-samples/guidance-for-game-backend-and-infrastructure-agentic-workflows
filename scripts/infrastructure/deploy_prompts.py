@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Deploy prompts to Bedrock Prompt Management.
 
-Creates or updates 4 managed prompts (orchestrator, gamelift, eks, cost).
+Creates or updates 5 managed prompts (orchestrator, gamelift, eks, cost, source_control).
 Writes prompt ARNs to backend/.env.local for runtime consumption.
 Idempotent: re-runs publish only when text, model, or inference settings change.
 """
 
+# Standard library
 import argparse
 import os
 import sys
@@ -13,8 +14,17 @@ import sys
 # Add backend/src to path so we can import prompt definitions
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "backend", "src"))
 
+# Third-party packages
 import boto3
-from agents.optimized_prompts import GAMELIFT_PROMPT, EKS_PROMPT, COST_PROMPT, ORCHESTRATOR_PROMPT
+
+# Local modules
+from agents.optimized_prompts import (
+    COST_PROMPT,
+    EKS_PROMPT,
+    GAMELIFT_PROMPT,
+    ORCHESTRATOR_PROMPT,
+    SOURCE_CONTROL_PROMPT,
+)
 from config.settings import INFERENCE_CONFIG
 
 # Prompt definitions keyed by env-var name
@@ -23,6 +33,7 @@ PROMPTS = {
     "GBAW_GAMELIFT_PROMPT_ARN": GAMELIFT_PROMPT,
     "GBAW_EKS_PROMPT_ARN": EKS_PROMPT,
     "GBAW_COST_PROMPT_ARN": COST_PROMPT,
+    "GBAW_SOURCE_CONTROL_PROMPT_ARN": SOURCE_CONTROL_PROMPT,
 }
 
 PREFIX = "game-agent"
@@ -83,7 +94,13 @@ def _latest_published_version(client, prompt_id):
 def deploy_prompt(client, env_key, vp):
     """Create or update a single managed prompt. Returns the version ARN."""
     name = _prompt_resource_name(vp)
-    agent_key = vp.name.replace("_specialist", "")
+    # Derive the INFERENCE_CONFIG lookup key from the prompt name. Strip the
+    # "_specialist" suffix and then ALL underscores: the source-control specialist's
+    # inference key is underscore-less ("sourcecontrol") to match the runtime's
+    # create_specialist_agent lookup on service_name.lower() ("SourceControl" ->
+    # "sourcecontrol"). This is a no-op for the existing prompts (cost, gamelift, eks,
+    # orchestrator contain no underscores after removing "_specialist").
+    agent_key = vp.name.replace("_specialist", "").replace("_", "")
     inf = INFERENCE_CONFIG[agent_key]
 
     variant = {

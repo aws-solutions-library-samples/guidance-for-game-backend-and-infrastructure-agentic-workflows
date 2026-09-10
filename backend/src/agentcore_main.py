@@ -39,6 +39,7 @@ from config.settings import (
     USE_BEDROCK_SESSIONS,
 )
 from utils.logger import logger
+from utils.request_context import reset_request_context, set_request_context
 from utils.response_parser import ResponseParser
 from utils.security import (
     InputValidationError,
@@ -233,6 +234,16 @@ def invoke_agent(prompt, context=None):
             logger.info(f"📦 Prompt type: {type(prompt)}")
 
         # Security: Validate and sanitize input
+        #
+        # TRUST BOUNDARY (PR #319 finding F2 / PR #320): the requester, tenant, workspace,
+        # and groups in `user_context` are the VERIFIED frontend identity forwarded to this
+        # AgentCore runtime entry. `validate_user_context` only allow-lists the permitted
+        # keys and sanitizes their values (length/type) — it does NOT itself re-verify the
+        # origin or authenticity of that identity. The validated values are what get placed
+        # into the request context below (`set_request_context`) and are the ONLY identity
+        # the downstream Source Control Connector authorization gate trusts. Therefore this
+        # runtime endpoint must remain reachable only via that verified boundary; a caller
+        # that could invoke it directly would be trusted as the forwarded principal.
         logger.info("🔒 Security: Validating input...")
         try:
             user_prompt = validate_prompt(user_prompt, strict_mode=False)
@@ -290,6 +301,13 @@ def invoke_agent(prompt, context=None):
             "user_id": persistent_user_id,
             "client_id": user_context.get("client_id"),
             "audience": user_context.get("audience"),
+            # Top-level groups carry the VALIDATED Cognito groups claim into the
+            # request contextvar so downstream components (e.g. the Source Control
+            # Connector authorization gate, which reads ctx.get("groups")) resolve
+            # real group membership. Sourced solely from the validated user_context
+            # (never from spoofable agent/model input); validate_user_context
+            # allow-lists and sanitizes "groups". Empty list when absent so the
+            # gate fails closed rather than KeyError-ing.
             "groups": user_context.get("groups", []),
             "scopes": user_context.get("scopes", []),
             "tenant": user_context.get("tenant"),
@@ -318,7 +336,16 @@ def invoke_agent(prompt, context=None):
         # permanently poisoning the session (#155 / #125). The in-loop hooks fire
         # before the old 180s outer budget would have, so no coverage is lost.
         logger.info("🎯 Calling run_orchestrator (in-loop wall-clock hooks enforce timeout)...")
-        response = run_orchestrator(query=user_prompt, context=agent_context)
+        # Set the request-scoped identity context immediately before running the
+        # orchestrator so downstream components (e.g. the Source Control Connector
+        # service) can read the validated user_id/groups/session_id without relying
+        # on spoofable model/tool arguments. The token is reset in a finally block so
+        # identity is isolated per invocation and never leaks across requests.
+        _context_token = set_request_context(agent_context)
+        try:
+            response = run_orchestrator(query=user_prompt, context=agent_context)
+        finally:
+            reset_request_context(_context_token)
 
         logger.info(f"✅ Orchestrator returned response")
         logger.info(f"   Response type: {type(response)}")
