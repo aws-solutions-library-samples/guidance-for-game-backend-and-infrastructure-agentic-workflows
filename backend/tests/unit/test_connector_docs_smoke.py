@@ -11,17 +11,18 @@ BOTH docs must describe the Source Control Connector's five reviewer-facing conc
 * the **read credential** (a single Secrets Manager ARN, adapter-owned),
 * the **authorization policy** (seven dimensions — tenant, workspace, repository, branch, path,
   extension, group — enforced on reads),
-* the **audit flow** (durable intent/outcome events with reconciliation, and NO cross-system
-  atomicity claim), and
+* the **audit flow** (durable **best-effort** ``scm_read`` events, the read **not gated** on
+  audit-write success, NO cross-system atomicity claim, and — on the read path — NO pre-read
+  intent event, idempotency key, or reconciliation of ambiguous outcomes), and
 * the **no-write-path invariant** (the runtime holds no write path or write credential; the
-  write path moved to the isolated #314 executor).
+  write path is FUTURE work tracked by the isolated #314 executor, not a shipped component).
 
 Each check runs against the connector *section* of each doc (not the whole file) using
 case-insensitive substring/regex probes for the key concepts, so the assertions are robust to
 wording and punctuation. A dedicated **negative** assertion guards the deliberate Task 6
 reversal: neither connector section may present cross-system atomicity as a guarantee — instead
 each must carry the explicit no-atomicity framing (a negated ``atomic`` phrase) alongside the
-reconciliation story. This proves the reversal is *documented*, not contradicted.
+best-effort read-audit framing. This proves the reversal is *documented*, not contradicted.
 
 The test mirrors ``test_iam_scm_credential_smoke.py`` / ``test_deploy_scm_wiring_smoke.py`` in
 how it locates the repo-root files.
@@ -123,10 +124,27 @@ def _assert_authorization_policy(section: str, doc: str) -> None:
 
 
 def _assert_audit_flow(section: str, doc: str) -> None:
-    """Durable intent + outcome events reconciled (not atomic)."""
-    assert "intent" in section, f"{doc}: audit flow must mention intent events"
-    assert "outcome" in section, f"{doc}: audit flow must mention outcome events"
-    assert _has_any(section, r"reconcil"), f"{doc}: audit flow must describe reconciliation of ambiguous outcomes"
+    """Best-effort ``scm_read`` events; read not gated on audit-write; no revision.
+
+    The shipped read path emits durable **best-effort** ``scm_read`` events and does NOT
+    provide pre-read intent events, intent/outcome correlation, idempotency keys, or
+    reconciliation of ambiguous outcomes (those are future #314-executor concerns). This
+    check enforces the accurate read-path posture and requires the section to explicitly
+    disclaim the unshipped intent/reconciliation behavior for reads.
+    """
+    assert "scm_read" in section, f"{doc}: audit flow must name the scm_read event"
+    assert "best-effort" in section, f"{doc}: read audit must be described as best-effort"
+    # The read is not gated on audit-write success (tolerate markdown emphasis between words).
+    assert _has_any(section, r"not\b[^.]{0,12}gated"), f"{doc}: must state the read is not gated on audit-write success"
+    # The read returns no write-usable / base revision.
+    assert _has_any(
+        section, r"no\b[^.]{0,24}revision", r"no\b[^.]{0,24}base_revision"
+    ), f"{doc}: must state the read returns no write-usable revision"
+    # The unshipped read-path behaviors must be explicitly disclaimed, not asserted.
+    assert _has_any(section, r"no\b[^.]{0,40}intent"), f"{doc}: must disclaim pre-read intent events on the read path"
+    assert _has_any(
+        section, r"no\b[^.]{0,80}reconcil"
+    ), f"{doc}: must disclaim reconciliation of ambiguous outcomes on the read path"
 
 
 def _assert_no_write_path(section: str, doc: str) -> None:
@@ -145,13 +163,20 @@ def _assert_no_write_path(section: str, doc: str) -> None:
         r"no\s+write\s+path",
         r"(?:not|no|never|cannot)\b[^.]{0,80}\b(?:write|merge|propose|commit)",
     ), f"{doc}: must state the runtime exposes no write/merge/propose operation"
-    # The write path moved to the isolated #314 executor (not merely deleted).
+    # The write path is FUTURE work tracked by the isolated #314 executor (removed from the
+    # runtime, not a shipped/present destination on this branch).
     assert _has_any(
         section,
         r"#314 executor",
-        r"moved\b[^.]{0,80}#314",
         r"#314\b[^.]{0,80}executor",
-    ), f"{doc}: must frame the write path as MOVED to the #314 executor"
+        r"executor\b[^.]{0,80}#314",
+    ), f"{doc}: must reference the isolated #314 executor for the write path"
+    assert _has_any(
+        section,
+        r"future work",
+        r"removed from the chat runtime",
+        r"still open",
+    ), f"{doc}: must frame the write path as FUTURE #314 work (not a shipped/present component)"
 
 
 def _assert_no_atomicity_claim(section: str, doc: str) -> None:
@@ -160,8 +185,9 @@ def _assert_no_atomicity_claim(section: str, doc: str) -> None:
     The connector section must NOT present cross-system atomicity as a guarantee. Because the
     docs legitimately use the word "atomic" (in the phrase that *denies* atomicity), we do not
     fail on the substring alone; instead we require the explicit no-atomicity framing — a
-    negated ``atomic`` phrase (e.g. "does not claim ... atomicity", "instead of ... atomicity",
-    "overclaimed atomicity") — together with the reconciliation story that replaces it.
+    negated ``atomic`` phrase (e.g. "no cross-system atomicity claim", "does not claim ...
+    atomicity", "overclaimed atomicity") — together with the best-effort read-audit framing
+    that replaces it on the read path.
     """
     assert "atomic" in section, f"{doc}: expected the (denied) atomicity framing to be present"
     negated_atomicity = _has_any(
@@ -172,7 +198,9 @@ def _assert_no_atomicity_claim(section: str, doc: str) -> None:
     assert negated_atomicity, (
         f"{doc}: connector section must explicitly disclaim cross-system atomicity, " "not present it as a guarantee"
     )
-    assert _has_any(section, r"reconcil"), f"{doc}: the no-atomicity framing must be paired with reconciliation"
+    assert _has_any(
+        section, r"best-effort"
+    ), f"{doc}: the no-atomicity framing must be paired with the best-effort read-audit posture"
 
 
 # --- Tests: ARCHITECTURE.md ---------------------------------------------------------------

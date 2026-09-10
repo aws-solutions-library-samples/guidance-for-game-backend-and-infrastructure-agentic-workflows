@@ -177,7 +177,14 @@ def _normalize_path(path: str) -> str:
       repo-relative; or
     - contains **any** ``..`` path segment — the presence of a ``..`` component is rejected
       before normalization, so an escaping segment is never collapsed away and accepted; or
-    - contains a **NUL byte or a backslash** (illegal characters).
+    - contains a **NUL byte or a backslash** (illegal characters); or
+    - contains a character that can alter how the path resolves once placed in a provider
+      URL: ``#`` (fragment), ``?`` (query), ``%`` (percent-encoding), or any ASCII control
+      character. These are rejected here, *before* authorization, so the exact canonical
+      path that the seven-dimension authorization checks is byte-for-byte the path requested
+      from the provider. Without this an authorized path such as ``infra/a#hidden.tf`` (which
+      passes a ``.tf`` extension policy) would be truncated to ``infra/a`` when the provider
+      resolves the URL fragment — an extension-policy bypass.
 
     Silently accepting ``/etc/passwd`` or ``../../secrets`` would let a prompt-injected
     request read outside the intended tree; failing closed keeps every read confined to the
@@ -187,6 +194,14 @@ def _normalize_path(path: str) -> str:
         return ""
     if "\x00" in path or "\\" in path:
         raise PathTraversalError(path, "path contains an illegal character")
+    # Reject characters that can change how the path resolves once interpolated into a
+    # provider URL (fragment/query/percent-encoding) or that are non-printable. Rejecting
+    # them before authorization keeps the authorized canonical path identical to the path
+    # requested from the provider (no URL-resolution divergence, no extension-policy bypass).
+    if any(ch in path for ch in ("#", "?", "%")):
+        raise PathTraversalError(path, "path contains a URL-reserved character")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in path):
+        raise PathTraversalError(path, "path contains a control character")
     # Reject an absolute path outright — do NOT strip the leading "/" to repo-relative.
     if path.startswith("/"):
         raise PathTraversalError(path, "path is absolute")

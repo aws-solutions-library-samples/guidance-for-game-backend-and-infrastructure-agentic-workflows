@@ -36,6 +36,7 @@ from __future__ import annotations
 # Standard library
 import base64
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 # Third-party packages
 import httpx
@@ -134,7 +135,7 @@ class GitHubProvider(SourceControlReader):
         headers = self._auth_headers()
         response = self._request(
             "GET",
-            f"/repos/{repo}/contents/{path}",
+            self._contents_path(repo, path),
             headers,
             params={"ref": branch},
             allow_404=True,
@@ -163,7 +164,7 @@ class GitHubProvider(SourceControlReader):
         for path in paths:
             response = self._request(
                 "GET",
-                f"/repos/{repo}/contents/{path}",
+                self._contents_path(repo, path),
                 headers,
                 params={"ref": branch},
                 allow_404=True,
@@ -184,6 +185,30 @@ class GitHubProvider(SourceControlReader):
         )
 
     # -------------------------------------------------------------------- helpers
+
+    @staticmethod
+    def _encode_segments(value: str) -> str:
+        """Percent-encode each ``/``-separated segment of ``value``, preserving separators.
+
+        Each segment is encoded with ``urllib.parse.quote(segment, safe="")`` so any
+        URL-reserved character *inside* a segment (e.g. ``#``, ``?``, ``%``, space) is
+        percent-encoded, while the ``/`` separators between segments are kept literal. This
+        is defense in depth: the service layer already rejects URL-resolution-altering
+        characters before authorization, so for any path that reaches the adapter the
+        byte-for-byte authorized canonical path is exactly what is requested from the
+        provider — a reserved character can never make the provider resolve a different
+        path than authorization checked.
+        """
+        return "/".join(quote(segment, safe="") for segment in value.split("/"))
+
+    def _contents_path(self, repo: str, path: str) -> str:
+        """Build the Contents endpoint path for ``repo``/``path`` with encoded segments.
+
+        Both ``repo`` (``owner/name``) and the repo-relative ``path`` are segment-encoded so
+        the outgoing URL cannot diverge from the authorized path. The read semantics are
+        unchanged (a 404 from the built URL still means "missing").
+        """
+        return f"/repos/{self._encode_segments(repo)}/contents/{self._encode_segments(path)}"
 
     def _auth_headers(self) -> dict[str, str]:
         """Build request headers, delegating credential acquisition to the ProviderAuth.

@@ -12,9 +12,9 @@ an allowlisted repository/branch so it can review the current source of truth. A
 provider-neutral concept; each provider adapter maps it to the provider's native read API (the
 GitHub contents API, and so on). Per **Architecture Update v1.3** the provider-**write** path
 (creating an unmerged change proposal for human review, then merging via the existing CI/CD
-pipeline) has **moved out of the chat runtime into the isolated #314 executor**; the read-only
-Connector documented here holds **no write credential** and exposes **no** propose/merge/commit
-operation. The read-only posture is a property of the type graph — the shipped package has no
+pipeline) has been **removed from the chat runtime** and is **future work tracked by the isolated
+executor (#314, still open)**, preserved only in branch history; the read-only Connector documented
+here holds **no write credential** and exposes **no** propose/merge/commit operation. The read-only posture is a property of the type graph — the shipped package has no
 `SourceControlWriter` interface and no importable, callable, or attribute-reachable provider-write
 operation — not merely a runtime guard.
 
@@ -77,8 +77,8 @@ The design preserves the platform's core safety guarantees:
   does today, and the `source_control_agent` is never registered on the Orchestrator.
 - **The abstraction defines only read operations.** There is deliberately **no** write, merge,
   approve, commit, or close operation and no `SourceControlWriter` interface, so it is
-  structurally impossible for the chat runtime to mutate a provider. The provider-write path lives
-  in the isolated #314 executor, not here.
+  structurally impossible for the chat runtime to mutate a provider. The provider-write path is
+  future work tracked by the isolated #314 executor (still open), not a present component here.
 
 ## Component Layering
 
@@ -483,8 +483,7 @@ backend/src/
 │   ├── registry.py          # provider-neutral registry + get_provider(SourceControlConfig)
 │   ├── github_provider.py   # GitHub read adapter (self-registers with the registry)
 │   ├── service.py           # read_iac_files read pipeline
-│   ├── tools.py             # get_iac_file (@tool)
-│   └── executor/            # isolated #314 write-path executor (out of the chat runtime)
+│   └── tools.py             # get_iac_file (@tool)
 ├── agents/
 │   ├── source_control_specialist.py   # source_control_agent (get_iac_file tool)
 │   ├── optimized_prompts.py           # SOURCE_CONTROL_PROMPT + managed-prompt resolution
@@ -498,3 +497,7 @@ scripts/deploy.sh                                           # GBAW_SCM_* env wir
 
 > Note: `connector/iac_validation.py` exists in the package but is **not** part of the read path —
 > `service.py` performs no IaC parse/validation on reads (reads only fetch existing content).
+
+> Note: there is **no** `connector/executor/` directory in the shipped package on this branch. The
+> isolated write-path executor is **future work tracked by #314 (still open)** and lives only in
+> branch history — it is not a present component of the read-only connector.

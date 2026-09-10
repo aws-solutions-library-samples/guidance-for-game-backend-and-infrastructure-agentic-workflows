@@ -20,6 +20,7 @@ import pytest
 # Local modules
 import utils.security as security
 from connector import service as service_module
+from connector.config import AllowlistEntry
 from connector.service import PathTraversalError, _normalize_path, read_iac_files
 from support.config_factory import make_source_control_config
 from support.fake_provider import FakeProvider
@@ -63,10 +64,20 @@ def test_normalize_path_accepts_and_canonicalizes_safe_paths(safe_input, expecte
         # Illegal characters (pre-existing rejections, preserved).
         "a\\b.tf",  # backslash
         "a\x00b.tf",  # NUL
+        # URL-resolution-altering characters (new): fragment / query / percent-encoding.
+        # These must be rejected BEFORE authorization so the authorized canonical path is
+        # byte-for-byte the path requested from the provider (no URL-resolution divergence).
+        "infra/a#hidden.tf",  # "#" fragment — would truncate to "infra/a" in a URL
+        "infra/a?ref=evil.tf",  # "?" query separator
+        "infra/x%23y.tf",  # "%" percent-encoding (here an encoded "#")
+        "%2e%2e/secrets.tf",  # percent-encoded ".." escape
+        "infra/app%2f..%2fsecret.tf",  # percent-encoded "/" + traversal
+        "infra/a\x1fb.tf",  # ASCII control character (unit separator)
+        "infra/a\x7fb.tf",  # DEL control character
     ],
 )
 def test_normalize_path_rejects_absolute_traversal_or_illegal_paths(unsafe_input):
-    """Absolute paths, any ".." segment, and illegal characters are REJECTED, not rewritten."""
+    """Absolute, any ".." segment, illegal, and URL-altering characters are REJECTED."""
     with pytest.raises(PathTraversalError):
         _normalize_path(unsafe_input)
 
@@ -105,6 +116,11 @@ def _read_authorized(paths, *, config, reader):
         "../../etc/passwd",  # plain ../ escape
         "a/../../b",  # nested parent traversal
         "/etc/passwd",  # absolute path
+        # URL-resolution-altering characters must also fail closed with no provider read.
+        "infra/a#hidden.tf",  # "#" fragment
+        "infra/a?ref=evil.tf",  # "?" query separator
+        "infra/x%23y.tf",  # "%" percent-encoding
+        "%2e%2e/secrets.tf",  # percent-encoded ".." escape
     ],
 )
 def test_read_iac_files_rejects_unsafe_path_fails_closed_with_audit(unsafe_path, captured_audit):
@@ -130,6 +146,42 @@ def test_read_iac_files_rejects_unsafe_path_fails_closed_with_audit(unsafe_path,
     # Defense-in-depth: the audit carries no credential or file-content field.
     assert "content" not in event
     assert not any("secret" in str(k).lower() for k in event), "audit must not carry a secret field"
+
+
+def test_read_iac_files_rejects_extension_policy_bypass_via_fragment(captured_audit):
+    """Regression: a ``#`` fragment must not bypass a ``.tf``-only extension policy.
+
+    ``infra/a#hidden.tf`` ends with ``.tf`` and would pass a ``.tf`` extension policy, but a
+    provider resolving it as a URL would drop the ``#hidden.tf`` fragment and read
+    ``infra/a`` instead — a different path than authorization checked. Layer 1 rejects the
+    path before authorization, so the read fails closed with a ``path_invalid`` audit and the
+    provider is never contacted (it must NOT reach the provider as ``infra/a``).
+    """
+    config = make_source_control_config(
+        allowlist=(
+            AllowlistEntry(
+                repo="org/iac",
+                target_branches=("main",),
+                path_prefixes=("infra/",),
+                extensions=(".tf",),
+            ),
+        ),
+        authorized_groups=("scm-writers",),
+    )
+    reader = FakeProvider()
+
+    result = _read_authorized(["infra/a#hidden.tf"], config=config, reader=reader)
+
+    # Fail-closed empty result and NO provider read (not even as the truncated "infra/a").
+    assert result.files == ()
+    assert result.missing == ()
+    assert result.limit_exceeded is False
+    assert reader.calls == []
+
+    # Rejected before authorization with the path_invalid reason (not an extension denial).
+    invalid_events = [e for e in captured_audit.events if e.get("reason") == "path_invalid"]
+    assert len(invalid_events) == 1
+    assert invalid_events[0]["outcome"] == "rejected"
 
 
 def test_read_iac_files_fails_closed_on_unsafe_path_without_provider_read():

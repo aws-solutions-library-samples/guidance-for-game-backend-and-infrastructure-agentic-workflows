@@ -240,30 +240,30 @@ def test_no_write_credential_parameter_present(template: dict):
     """(Req 3.1, 3.2) The removed write-credential parameter ``ScmCredentialSecretArn`` does
     not exist anywhere in the template's Parameters."""
     params = template.get("Parameters", {})
-    assert _REMOVED_WRITE_PARAMETER_NAME not in params, (
-        f"{_REMOVED_WRITE_PARAMETER_NAME} write parameter must be removed"
-    )
+    assert (
+        _REMOVED_WRITE_PARAMETER_NAME not in params
+    ), f"{_REMOVED_WRITE_PARAMETER_NAME} write parameter must be removed"
 
 
 def test_no_write_credential_condition_present(template: dict):
     """(Req 3.1) The removed write-credential condition ``ScmCredentialConfigured`` is gone."""
     conditions = template.get("Conditions", {})
-    assert _REMOVED_WRITE_CONDITION_NAME not in conditions, (
-        f"{_REMOVED_WRITE_CONDITION_NAME} write condition must be removed"
-    )
+    assert (
+        _REMOVED_WRITE_CONDITION_NAME not in conditions
+    ), f"{_REMOVED_WRITE_CONDITION_NAME} write condition must be removed"
 
 
 def test_no_write_credential_access_policy_present(role_policies: list):
     """(Req 3.1, 3.4, 11.2, 11.3) The role defines NO ``ScmCredentialAccess`` write policy —
     default synthesis grants no write-credential GetSecretValue to any chat role."""
-    assert _find_conditional_policy(role_policies, _REMOVED_WRITE_POLICY_NAME) is None, (
-        f"{_REMOVED_WRITE_POLICY_NAME} write-credential policy must be removed"
-    )
+    assert (
+        _find_conditional_policy(role_policies, _REMOVED_WRITE_POLICY_NAME) is None
+    ), f"{_REMOVED_WRITE_POLICY_NAME} write-credential policy must be removed"
     for entry in role_policies:
         if isinstance(entry, dict):
-            assert entry.get("PolicyName") != _REMOVED_WRITE_POLICY_NAME, (
-                f"{_REMOVED_WRITE_POLICY_NAME} write-credential policy must be removed"
-            )
+            assert (
+                entry.get("PolicyName") != _REMOVED_WRITE_POLICY_NAME
+            ), f"{_REMOVED_WRITE_POLICY_NAME} write-credential policy must be removed"
 
 
 def test_removed_write_names_absent_from_raw_template(template: dict):
@@ -308,12 +308,10 @@ def test_scm_read_credential_configured_condition_exists(template: dict):
     """(Req 6.2) The conditions gating the read grant exist: the ARN-presence condition, the
     connector-enabled condition, and the combined active condition on the policy."""
     conditions = template.get("Conditions", {})
-    assert _SCM_READ_CONFIGURED_CONDITION_NAME in conditions, (
-        f"missing condition {_SCM_READ_CONFIGURED_CONDITION_NAME}"
-    )
-    assert _SCM_CONNECTOR_ENABLED_CONDITION_NAME in conditions, (
-        f"missing condition {_SCM_CONNECTOR_ENABLED_CONDITION_NAME}"
-    )
+    assert _SCM_READ_CONFIGURED_CONDITION_NAME in conditions, f"missing condition {_SCM_READ_CONFIGURED_CONDITION_NAME}"
+    assert (
+        _SCM_CONNECTOR_ENABLED_CONDITION_NAME in conditions
+    ), f"missing condition {_SCM_CONNECTOR_ENABLED_CONDITION_NAME}"
     assert _SCM_READ_CONDITION_NAME in conditions, f"missing condition {_SCM_READ_CONDITION_NAME}"
 
 
@@ -327,23 +325,22 @@ def test_scm_read_grant_gated_on_enabled_and_configured(template: dict):
     """
     # A parameter controls enablement, defaulting to disabled (fail-closed for the grant).
     params = template.get("Parameters", {})
-    assert _SCM_CONNECTOR_ENABLED_PARAMETER_NAME in params, (
-        f"missing parameter {_SCM_CONNECTOR_ENABLED_PARAMETER_NAME}"
-    )
-    assert params[_SCM_CONNECTOR_ENABLED_PARAMETER_NAME].get("Default") == "false", (
-        "ScmConnectorEnabled must default to 'false' so a disabled deployment grants no secret access"
-    )
+    assert _SCM_CONNECTOR_ENABLED_PARAMETER_NAME in params, f"missing parameter {_SCM_CONNECTOR_ENABLED_PARAMETER_NAME}"
+    assert (
+        params[_SCM_CONNECTOR_ENABLED_PARAMETER_NAME].get("Default") == "false"
+    ), "ScmConnectorEnabled must default to 'false' so a disabled deployment grants no secret access"
 
     conditions = template.get("Conditions", {})
     active = conditions[_SCM_READ_CONDITION_NAME]
     and_terms = active.get("Fn::And")
-    assert isinstance(and_terms, list) and len(and_terms) == 2, (
-        "ScmReadCredentialActive must be an Fn::And of two conditions"
-    )
+    assert (
+        isinstance(and_terms, list) and len(and_terms) == 2
+    ), "ScmReadCredentialActive must be an Fn::And of two conditions"
     referenced = {term.get("Condition") for term in and_terms if isinstance(term, dict)}
-    assert referenced == {_SCM_CONNECTOR_ENABLED_CONDITION_NAME, _SCM_READ_CONFIGURED_CONDITION_NAME}, (
-        "the read grant must require BOTH connector-enabled and ARN-configured"
-    )
+    assert referenced == {
+        _SCM_CONNECTOR_ENABLED_CONDITION_NAME,
+        _SCM_READ_CONFIGURED_CONDITION_NAME,
+    }, "the read grant must require BOTH connector-enabled and ARN-configured"
 
     # The connector-enabled condition is a true/'true' comparison on the parameter.
     enabled_cond = conditions[_SCM_CONNECTOR_ENABLED_CONDITION_NAME]

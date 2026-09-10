@@ -126,25 +126,23 @@ def test_removed_write_credential_shell_var_absent(deploy_text: str):
     """(Req 3.3) The removed write-credential shell variable ``$SCM_CREDENTIAL_SECRET_ARN`` is
     gone. Guarded with word boundaries so the read variable (a superstring) is not matched."""
     non_comment = _non_comment_text(deploy_text)
-    assert not re.search(rf"\b{_REMOVED_ARN_VAR}\b", non_comment), (
-        f"{_REMOVED_ARN_VAR} write shell variable must be removed"
-    )
+    assert not re.search(
+        rf"\b{_REMOVED_ARN_VAR}\b", non_comment
+    ), f"{_REMOVED_ARN_VAR} write shell variable must be removed"
 
 
 def test_removed_write_base_stack_param_absent(deploy_text: str):
     """(Req 3.3) The removed ``ScmCredentialSecretArn=`` base-stack parameter is gone. Word
     boundary avoids matching the read param ``ScmReadCredentialSecretArn``."""
     non_comment = _non_comment_text(deploy_text)
-    assert not re.search(rf"(?<!Read){_REMOVED_BASE_PARAM_NAME}=", non_comment), (
-        f"{_REMOVED_BASE_PARAM_NAME}= write base-stack param must be removed"
-    )
+    assert not re.search(
+        rf"(?<!Read){_REMOVED_BASE_PARAM_NAME}=", non_comment
+    ), f"{_REMOVED_BASE_PARAM_NAME}= write base-stack param must be removed"
 
 
 def test_removed_legacy_secret_id_absent(deploy_text: str):
     """(Req 3.3) The removed legacy ``GBAW_SCM_CREDENTIAL_SECRET_ID`` setting is absent."""
-    assert _REMOVED_SECRET_ID_ENV_NAME not in deploy_text, (
-        f"{_REMOVED_SECRET_ID_ENV_NAME} must be absent"
-    )
+    assert _REMOVED_SECRET_ID_ENV_NAME not in deploy_text, f"{_REMOVED_SECRET_ID_ENV_NAME} must be absent"
 
 
 # --- Tests: single source / no drift (read credential) ------------------------------------
@@ -154,9 +152,7 @@ def test_read_arn_resolved_once_from_env_or_env_local(deploy_text: str):
     """(Req 3.3) The read-credential ARN is resolved once into ``$SCM_READ_CREDENTIAL_SECRET_ARN``
     from the environment or backend/.env.local — a single source of truth."""
     pattern = re.compile(rf'^{_ARN_VAR}="\$\{{{_ARN_ENV_NAME}:-.*\}}"', re.MULTILINE)
-    assert pattern.search(deploy_text), (
-        f"{_ARN_VAR} must be resolved once from ${_ARN_ENV_NAME} (env or .env.local)"
-    )
+    assert pattern.search(deploy_text), f"{_ARN_VAR} must be resolved once from ${_ARN_ENV_NAME} (env or .env.local)"
 
 
 def test_same_read_arn_source_drives_base_param_and_runtime_env(deploy_text: str):

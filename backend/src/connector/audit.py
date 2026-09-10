@@ -1,29 +1,30 @@
-"""Durable, confirmed audit sink for the Source Control Connector (Req 13.1, 13.2, 13.3).
+"""Durable audit sink for the read-only Source Control Connector (Req 13.1, 13.2, 13.3).
 
 The baseline connector wrote its audit trail through the shared ``utils.logger.logger``
 (stdout → ADOT/CloudWatch), a fire-and-forget path where a lost stdout line was never
-observed. This module replaces that with a **confirmed** durable write to a dedicated
-CloudWatch Logs log group.
+observed. This module replaces that with a durable write to a dedicated CloudWatch Logs log
+group.
 
-The connector records two first-class event shapes through this sink (Req 9.1, 9.2), both
-serialized and confirmed identically by :meth:`AuditSink.write`:
+Per Architecture Update v1.3 the provider-write path was removed from the chat runtime, so
+this sink now serves the **read path only**. The connector emits a single first-class event
+shape through it:
 
-- **INTENT** (``event="scm_intent"``) — written *before* the first mutating provider op. It
-  captures what the connector is about to attempt: the stable ``idempotency_key``, the
-  ``requesting_user``, the effective ``repository``/``target_branch``, the verified
-  ``base_revision``, and the proposed file ``paths``. It never carries file contents or
-  secrets.
-- **OUTCOME** (``event="scm_outcome"``) — written *after* the provider ops resolve (or after
-  reconciliation). It carries the same ``idempotency_key`` (so it correlates with the INTENT),
-  an ``outcome`` of ``created`` / ``declined`` / ``rejected`` / ``error`` / ``reconciled``,
-  the ``proposal_id``/``proposal_url`` on success or a ``reason`` on failure. Rejection and
-  decline paths — which perform no mutation — emit a single OUTCOME with no preceding INTENT.
+- **``scm_read``** — one event per read attempt, written by
+  :func:`connector.service._audit`. It records the read ``outcome``
+  (``served`` / ``not_found`` / ``error`` / ``rejected``), the requesting user, the effective
+  ``repository``/``target_branch``, the normalized ``paths``, and a ``timestamp``. On a
+  rejection it also carries the ``reason`` (``path_invalid`` / ``limit_exceeded`` /
+  ``rate_limited`` / the failed authorization dimension / ``size_exceeded``); on a terminal
+  provider failure it carries the exception **class name** as the reason. It never carries
+  file contents or secrets.
 
-The sink itself is neutral to the event shape: it treats every event as an opaque dict to
-serialize and durably confirm. Crucially, the connector makes **no cross-system atomicity
-claim** between this durable audit store and the provider: a confirmed INTENT gates the *start*
-of a mutation (a safe pre-mutation abort if unconfirmed), while an unconfirmed OUTCOME after a
-successful mutation is surfaced as a reconcilable result rather than a rollback (Req 9.2).
+The sink is neutral to the event shape: it treats every event as an opaque dict to serialize
+and durably write. It implements **no** intent/outcome correlation, **no** idempotency key,
+**no** audit-confirmation gating, and **no** reconciliation of ambiguous outcomes — those are
+future concerns of the isolated executor (#314, still open), not behavior of this read-only
+sink. Because a read is non-mutating, the connector makes **no cross-system atomicity claim**
+between this audit store and the provider; the read path treats the durable-audit write as
+**best-effort** and does not gate the read on it (see :func:`connector.service._audit`).
 
 :class:`AuditSink` owns a boto3 ``logs`` client (built with the platform's
 ``BOTO3_CLIENT_CONFIG``/``AWS_REGION`` convention, matching ``utils.secrets`` and the other
@@ -35,19 +36,18 @@ modules) and exposes a single :meth:`AuditSink.write` operation:
 - It ensures the log stream exists (``create_log_stream``, tolerating
   ``ResourceAlreadyExistsException``), then calls ``put_log_events`` with a millisecond
   timestamp and the serialized message.
-- A write is treated as **confirmed** (returns ``True``) only when ``put_log_events`` returns
+- A write is reported as **confirmed** (returns ``True``) only when ``put_log_events`` returns
   a response dict that carries a ``nextSequenceToken`` and does not report
   ``rejectedLogEventsInfo`` — the real success shape of the API (Req 13.2). Any other
-  response is unconfirmed and yields ``False``.
+  response is unconfirmed and yields ``False``. This boolean is a write-confirmation signal
+  only; on the read path the caller does not act on it (the read is best-effort audited).
 - CloudWatch's optimistic-concurrency ``InvalidSequenceTokenException`` /
   ``DataAlreadyAcceptedException`` are handled by refreshing the expected sequence token
   (from the exception payload, falling back to ``describe_log_streams``) and retrying the
   put exactly **once**.
 - :meth:`write` **never raises** — every boto3/``ClientError``/unexpected exception is caught
-  and reported as ``False`` so the caller (``connector.service._record_intent`` /
-  ``_record_outcome``) observes an unconfirmed write: an unconfirmed INTENT aborts before any
-  mutation and an unconfirmed OUTCOME after a successful mutation yields a reconcilable result
-  (Req 13.3, 9.2).
+  and reported as ``False`` so the read path's best-effort audit can never disrupt the read
+  (Req 13.3).
 
 The log stream name is deterministic per process **per UTC date** (``scm-audit-<YYYYMMDD>``)
 so entries accumulate in a small, predictable set of streams and the daily rollover keeps any
@@ -87,13 +87,14 @@ _SEQUENCE_RECOVERABLE = frozenset({"InvalidSequenceTokenException", "DataAlready
 
 
 class AuditSink:
-    """Writes connector audit entries to a dedicated CloudWatch Logs group (Req 13.1, 13.2).
+    """Writes read-path (`scm_read`) audit entries to a dedicated CloudWatch Logs group (Req 13.1, 13.2).
 
-    A write is confirmed only when ``put_log_events`` returns a response carrying a
+    A write is reported confirmed only when ``put_log_events`` returns a response carrying a
     ``nextSequenceToken`` with no ``rejectedLogEventsInfo``; any exception or unconfirmed
-    response makes :meth:`write` return ``False`` so the caller can abort the action
-    (Req 13.3). The instance lazily builds a boto3 ``logs`` client unless one is injected
-    (for tests).
+    response makes :meth:`write` return ``False`` (Req 13.3). On the read path this boolean is
+    a confirmation signal only — the read is best-effort audited and is never gated on it. The
+    sink implements no intent/outcome correlation, idempotency, or reconciliation. The instance
+    lazily builds a boto3 ``logs`` client unless one is injected (for tests).
     """
 
     def __init__(
@@ -271,9 +272,9 @@ class AuditSink:
         Serializes the event, ensures the log stream exists, and puts the log event with a
         millisecond timestamp. Returns ``True`` only when CloudWatch Logs confirms the write
         (see :meth:`_confirm`). Never raises: any failure — serialization, missing log group,
-        client construction, or a boto3 error — yields ``False`` so the caller observes an
-        unconfirmed write (an unconfirmed INTENT aborts before any mutation; an unconfirmed
-        OUTCOME after a successful mutation yields a reconcilable result — Req 13.3, 9.2).
+        client construction, or a boto3 error — yields ``False`` (Req 13.3). On the read path
+        the caller records this best-effort and does not gate the read on the result, so a
+        ``False`` return never disrupts a non-mutating read.
         """
         if not self._log_group:
             return False

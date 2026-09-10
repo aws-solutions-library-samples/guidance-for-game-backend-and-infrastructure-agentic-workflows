@@ -158,8 +158,8 @@ outbound path exists. When enabled, it adds a controlled **read-only** IaC-conte
 approved IaC sources so the agent can review the current source of truth; it never mutates live
 AWS resources and, per **Architecture Update v1.3**, the chat runtime holds **no write path or
 write credential at all** — the provider-write path (branch/commit/unmerged change proposal) has
-**moved to the isolated #314 executor**. This section covers the threats specific to the read
-path. See
+been **removed from the chat runtime** and is **future work tracked by the isolated executor (#314,
+still open)**. This section covers the threats specific to the read path. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#source-control-connector-read-only-iac-context-path) for the
 architecture and [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md) for the deep-dive.
 
@@ -172,8 +172,8 @@ architecture and [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md) fo
   files** on allowlisted tenants/workspaces/repositories/branches. It **cannot write, propose,
   merge, approve, or close** anything and **cannot mutate live AWS resources**, because the
   connector exposes no such operation, holds no write credential, and the runtime role stays
-  read-only against live AWS. The write path lives in the separate #314 executor, outside this
-  trust boundary.
+  read-only against live AWS. The write path is **future work tracked by the isolated #314 executor
+  (still open)**, outside this runtime and trust boundary.
 
 ### Connector Threats
 
@@ -182,20 +182,22 @@ architecture and [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md) fo
 | SC1 | Read credential compromise or exposure | Provider Adapter | Single scoped Secrets Manager ARN; adapter-owned, fetched per request; never logged; IAM `GetSecretValue` scoped to that one ARN; credential never in env or tool output; **no write credential present in the runtime** | Mitigated |
 | SC2 | Unauthorized tenant/workspace/repo/branch/path/extension read | Service Layer | Seven-dimension authorization (tenant · workspace · repository · branch · path · extension · group) enforced on reads; fail-closed; disabled by default | Mitigated |
 | SC3 | Prompt injection redirecting a read or forging identity | Service Layer / AI Backend | Identity, tenant, workspace, and groups derived only from verified Cognito claims via the request context, never from model input; effective repo/branch taken from the matched allowlist entry; tool-boundary injection re-check | Mitigated |
-| SC4 | Duplicate or ambiguous read audit from retries / ambiguous outcomes | Service Layer | Read-before-review `base_revision` snapshot; stable idempotency key reconciles a retried or ambiguous read to a single audited outcome | Mitigated |
-| SC5 | Audit gaps or overclaimed atomicity | Audit Sink | Durable intent (pre-read) and outcome (post) `scm_read` events; reconciliation instead of a cross-system atomicity claim; unconfirmed intent aborts before any outbound read; unconfirmed outcome is reconcilable, never a false success | Mitigated |
-| SC6 | Secrets or sensitive fields leaking into audit/logs | Audit Sink | No secrets recorded in intent/outcome events; sanitized fields (`sanitize_log_data`) as defense-in-depth | Mitigated |
-| SC7 | Escalation from read to write / live mutation | Service Layer | No create/commit/propose/merge/approve/close/delete/force-push operation exposed and no write credential held; the write path is isolated in the #314 executor; runtime role read-only against live AWS | Mitigated |
+| SC4 | Duplicate or ambiguous read audit from retries | Service Layer | A read is **non-mutating**, so a retried read is safe to repeat and duplicate `scm_read` events are benign — no double-counted mutation is possible. Only transient provider errors are retried, bounded by `retry_max_attempts`. The read carries **no** `base_revision` snapshot, **no** idempotency key, and performs **no** reconciliation (those are future #314-executor concerns, not shipped). | Accepted (benign for reads) |
+| SC5 | Audit gaps or overclaimed atomicity | Audit Sink | Durable **best-effort** `scm_read` events (`served` / `not_found` / `error` / `rejected`); **no cross-system atomicity claim** and the read is **not gated** on audit-write success, so a served read is never aborted for an unconfirmed audit write; terminal provider failures still record a sanitized `error` event before re-raising. There is **no** pre-read intent event, idempotency key, or reconciliation on the read path. | Mitigated |
+| SC6 | Secrets or sensitive fields leaking into audit/logs | Audit Sink | No secrets recorded in `scm_read` events (the read credential is never placed in a field); sanitized fields (`sanitize_log_data`) as defense-in-depth | Mitigated |
+| SC7 | Escalation from read to write / live mutation | Service Layer | No create/commit/propose/merge/approve/close/delete/force-push operation exposed, no `SourceControlWriter` interface, and no write credential held; the write path is future work tracked by the isolated #314 executor (still open); runtime role read-only against live AWS | Mitigated |
 
 ### No Write Path in the Runtime
 
 The runtime's **containment boundary** is that it **cannot write at all**: the connector can only
 read approved files and exposes no operation to create, commit, propose, merge, approve, or close a
-change, and it holds no write credential. Any real change is still gated on a human reviewer and
-the existing CI/CD pipeline, but that write-and-review path now lives entirely in the isolated
-#314 executor rather than in this runtime. Read-before-review `base_revision` snapshots and
-idempotent retries ensure downstream review reasons about a confirmed source revision, without
-duplicate audit outcomes from retries.
+change, has no `SourceControlWriter` interface, and holds no write credential. Any real change would
+still be gated on a human reviewer and the existing CI/CD pipeline, but that write-and-review path
+is **future work tracked by the isolated executor (#314, still open)** rather than a shipped part of
+this runtime. The read path itself carries **no** `base_revision` snapshot, idempotency key, or
+reconciliation — a read is non-mutating, so a retried read is safe to repeat and its best-effort
+`scm_read` audit events (`served` / `not_found` / `error` / `rejected`) carry no mutation-oriented
+guarantees.
 
 ## Risk Assessment
 

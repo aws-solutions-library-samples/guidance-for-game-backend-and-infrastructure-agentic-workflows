@@ -262,9 +262,9 @@ def test_disabled_deployment_gates_connector_secret_env_and_param_on_enabled():
     ``$SCM_CONNECTOR_ENABLED``, so a disabled deployment carries neither."""
     text = _DEPLOY_PATH.read_text()
     # The runtime read-credential env var append is gated on the enablement flag.
-    assert '"$SCM_CONNECTOR_ENABLED" = "true"' in text, (
-        "deploy.sh must gate the connector read-credential on $SCM_CONNECTOR_ENABLED"
-    )
+    assert (
+        '"$SCM_CONNECTOR_ENABLED" = "true"' in text
+    ), "deploy.sh must gate the connector read-credential on $SCM_CONNECTOR_ENABLED"
     # The base-stack ARN is the empty string unless enabled (SCM_BASE_READ_ARN intermediate).
     assert "SCM_BASE_READ_ARN" in text, "deploy.sh must gate the base-stack ARN via SCM_BASE_READ_ARN"
     assert "ScmConnectorEnabled=" in text, "deploy.sh must pass the enablement flag to the base stack"
@@ -276,7 +276,9 @@ def test_disabled_deployment_grants_no_connector_secret_permission():
     deployment that does not opt in grants no connector secret access."""
     template_text = _TEMPLATE_PATH.read_text()
     # The combined active condition (enabled AND configured) gates the grant.
-    assert "ScmReadCredentialActive" in template_text, "CFN must gate the read grant on the enabled+configured condition"
+    assert (
+        "ScmReadCredentialActive" in template_text
+    ), "CFN must gate the read grant on the enabled+configured condition"
     assert "ScmConnectorEnabled" in template_text, "CFN must define the ScmConnectorEnabled parameter"
     # Default is disabled ('false') so the grant is absent unless the operator opts in.
     assert "Default: 'false'" in template_text, "ScmConnectorEnabled must default to disabled"
