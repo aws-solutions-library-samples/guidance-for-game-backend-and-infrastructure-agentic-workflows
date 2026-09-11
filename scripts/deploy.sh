@@ -179,6 +179,36 @@ eval "$IDENTITY_EXPORTS"
 echo "   Tenant binding:      $GBAW_TENANT_ID"
 echo "   Workspace binding:   $GBAW_WORKSPACE_ID"
 
+# Resolve the shared cost report snapshot table (#365) from the base stack so the
+# runtime can reuse report IDs across workers. The base stack (deployed above)
+# always exports this output, so a missing value means a broken or stale stack —
+# fail closed rather than silently degrading to a process-local in-memory cache
+# that cannot satisfy cross-worker reuse.
+COST_SNAPSHOT_TABLE_NAME=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT_NAME}-infrastructure" \
+  --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`CostReportSnapshotTableName`].OutputValue' \
+  --output text 2>/dev/null || echo "")
+if [ -z "$COST_SNAPSHOT_TABLE_NAME" ] || [ "$COST_SNAPSHOT_TABLE_NAME" = "None" ]; then
+  echo "❌ Base stack did not export CostReportSnapshotTableName." >&2
+  echo "   The shared cost report snapshot store is required for a hosted deployment;" >&2
+  echo "   redeploy the base infrastructure stack so the table and output exist." >&2
+  exit 1
+fi
+# Hosted deployments require the shared store: never fall back to memory.
+COST_SNAPSHOT_REQUIRED=true
+
+# Validate a bounded, positive TTL (seconds) before passing it to the runtime.
+COST_SNAPSHOT_TTL_SECONDS="${GBAW_COST_SNAPSHOT_TTL_SECONDS:-1800}"
+if ! [[ "$COST_SNAPSHOT_TTL_SECONDS" =~ ^[0-9]+$ ]] \
+    || [ "$COST_SNAPSHOT_TTL_SECONDS" -lt 60 ] \
+    || [ "$COST_SNAPSHOT_TTL_SECONDS" -gt 86400 ]; then
+  echo "❌ GBAW_COST_SNAPSHOT_TTL_SECONDS='$COST_SNAPSHOT_TTL_SECONDS' must be an integer in [60, 86400]." >&2
+  exit 1
+fi
+echo "   Cost snapshot table: ${COST_SNAPSHOT_TABLE_NAME}"
+echo "   Cost snapshot TTL:   ${COST_SNAPSHOT_TTL_SECONDS}s (required=${COST_SNAPSHOT_REQUIRED})"
+
 is_resolved_deployment_value() {
   [ -n "${1:-}" ] && [ "$1" != "None" ]
 }
@@ -212,6 +242,12 @@ build_agentcore_env_args() {
   append_agentcore_env_if_resolved "GBAW_GAMELIFT_KB_ID" "${GAMELIFT_KB_ID:-}"
   append_agentcore_env_if_resolved "GBAW_EKS_KB_ID" "${EKS_KB_ID:-}"
   append_agentcore_env_if_resolved "GBAW_COST_KB_ID" "${COST_KB_ID:-}"
+  # Trusted deployment identity + shared cost report snapshot store (#365)
+  append_agentcore_env_if_resolved "GBAW_TENANT_ID" "${GBAW_TENANT_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_WORKSPACE_ID" "${GBAW_WORKSPACE_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TABLE_NAME" "${COST_SNAPSHOT_TABLE_NAME:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_REQUIRED" "${COST_SNAPSHOT_REQUIRED:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TTL_SECONDS" "${COST_SNAPSHOT_TTL_SECONDS:-}"
   return 0
 }
 

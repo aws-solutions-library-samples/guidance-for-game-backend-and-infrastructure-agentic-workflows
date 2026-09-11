@@ -30,10 +30,21 @@ sys.path.insert(0, os.path.dirname(__file__))
 from bedrock_agentcore.runtime import BedrockAgentCoreApp  # type: ignore[import-untyped]
 
 # Local modules
+from agents.cost_report_scope import (
+    ScopeAuthorizationError,
+    build_request_scope,
+    reset_request_scope,
+    resolve_scope_actor,
+    set_request_scope,
+)
 from agents.orchestrator import run_orchestrator
 from config.settings import (
     AWS_REGION,
     BOTO3_CLIENT_CONFIG,
+    COST_SNAPSHOT_STORE_REQUIRED,
+    COST_SNAPSHOT_TABLE_NAME,
+    DEPLOYMENT_TENANT_ID,
+    DEPLOYMENT_WORKSPACE_ID,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
     USE_BEDROCK_SESSIONS,
@@ -53,6 +64,66 @@ from utils.security import (
     validate_user_context,
     verify_request_authorization,
 )
+
+# Transport identity header established by the AgentCore platform for SIGV4
+# inbound auth (the SDK ``runtimeUserId``). This is the ONLY transport value
+# trusted to establish a shared cost-report scope. The caller-supplied custom
+# passthrough header namespace (``X-Amzn-Bedrock-AgentCore-Runtime-Custom-*``)
+# is attacker-influenced and MUST NOT be trusted for authorization.
+RUNTIME_USER_ID_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-User-Id"
+
+
+def _lookup_header_case_insensitive(headers, name):
+    """Return the value for ``name`` from a plain header dict, case-insensitively.
+
+    Returns ``None`` when ``headers`` is falsy, not a mapping, or the header is
+    absent.
+    """
+    if not headers or not hasattr(headers, "items"):
+        return None
+    target = name.casefold()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.casefold() == target:
+            return value
+    return None
+
+
+def extract_runtime_user_id(context):
+    """Extract the trusted AgentCore runtime user identity from a RequestContext.
+
+    Reads the ``X-Amzn-Bedrock-AgentCore-Runtime-User-Id`` header
+    case-insensitively. The forwarded ``context.request_headers`` map is checked
+    first; if the header is absent there (the runtime allowlist does not forward
+    this reserved header into ``request_headers``), the underlying Starlette
+    request object (``context.request``) is consulted, whose ``headers`` mapping
+    is itself case-insensitive and carries the raw inbound headers.
+
+    Only this platform-established identity is trusted. Caller-supplied custom
+    passthrough headers are never consulted here, so they can never establish a
+    shared snapshot scope.
+
+    Returns the stripped identity string, or ``None`` when no context is supplied
+    or the header is missing/blank.
+    """
+    if context is None:
+        return None
+
+    value = _lookup_header_case_insensitive(getattr(context, "request_headers", None), RUNTIME_USER_ID_HEADER)
+
+    if not value:
+        request = getattr(context, "request", None)
+        request_headers = getattr(request, "headers", None)
+        if request_headers is not None and hasattr(request_headers, "get"):
+            try:
+                # Starlette's Headers.get is case-insensitive.
+                value = request_headers.get(RUNTIME_USER_ID_HEADER)
+            except Exception:
+                value = None
+
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
 
 
 def validate_aws_credentials():
@@ -208,14 +279,18 @@ def invoke_agent(prompt, context=None):
                 logger.error("❌ Service not ready: AWS credentials unavailable")
                 return "The service is still initializing and can't reach AWS yet. Please retry in a few moments."
 
-        # DIAGNOSTIC: Check AgentCore context object
+        # Establish the trusted transport identity (runtimeUserId) from the
+        # AgentCore platform. Only this value may bind a shared cost-report scope.
+        trusted_transport_actor = extract_runtime_user_id(context)
+
+        # DIAGNOSTIC: Check AgentCore context object. Never log the raw identity
+        # value — only whether the platform supplied one.
         logger.info("🔍 AgentCore Context Inspection:")
         if context:
             logger.info(f"   Context type: {type(context)}")
             if hasattr(context, "session_id"):
                 logger.info(f"   context.session_id: {context.session_id}")
-            if hasattr(context, "user_id"):
-                logger.info(f"   context.user_id: {context.user_id}")
+            logger.info(f"   Runtime user identity present: {trusted_transport_actor is not None}")
         else:
             logger.info("   Context is None")
 
@@ -267,17 +342,11 @@ def invoke_agent(prompt, context=None):
         # This prevents dev/prod memory collision while maintaining conversation continuity
         session_id = user_context.get("session_id") or thread_id or "default"
 
-        # PRIORITY: Use AgentCore context user_id if available (from runtimeUserId)
-        actor_id = persistent_user_id
-        if context and hasattr(context, "user_id") and context.user_id:
-            logger.info(f"🔄 Using user_id from AgentCore context: {context.user_id}")
-            actor_id = context.user_id
-        elif context and hasattr(context, "headers"):
-            # Fallback: Check headers for custom actor ID
-            header_actor_id = context.headers.get("X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actor-Id")
-            if header_actor_id:
-                logger.info(f"🔄 Using actor_id from headers: {header_actor_id}")
-                actor_id = header_actor_id
+        # PRIORITY: Use the trusted AgentCore transport identity (runtimeUserId)
+        # for the actor id when present; otherwise fall back to the body-supplied
+        # persistent user id for local/dev flows. The trusted transport identity
+        # was resolved above from the platform-established header only.
+        actor_id = trusted_transport_actor or persistent_user_id
 
         logger.info(f"👤 Authenticated user context [{auth_type}]")
         logger.info(f"🆔 Actor ID: {actor_id}")
@@ -318,7 +387,39 @@ def invoke_agent(prompt, context=None):
         # permanently poisoning the session (#155 / #125). The in-loop hooks fire
         # before the old 180s outer budget would have, so no coverage is lost.
         logger.info("🎯 Calling run_orchestrator (in-loop wall-clock hooks enforce timeout)...")
-        response = run_orchestrator(query=user_prompt, context=agent_context)
+        # Bind cost-report reuse to the trusted deployment tenant/workspace plus
+        # the request actor (#365). Set at the AgentCore boundary via a ContextVar
+        # so nested specialist tool calls inherit it, and reset afterwards so the
+        # scope never leaks across requests handled by the same worker.
+        #
+        # In shared mode (a snapshot table is configured, or the shared store is
+        # required) the scope actor is taken ONLY from the trusted transport
+        # identity — the platform-established runtimeUserId header — never the
+        # request body or a caller-supplied custom passthrough header. A trusted
+        # actor is required and a conflicting body identity is rejected as an
+        # identity-confusion signal. Raw identifiers are never logged.
+        shared_report_mode = COST_SNAPSHOT_STORE_REQUIRED or bool(COST_SNAPSHOT_TABLE_NAME)
+        try:
+            report_actor = resolve_scope_actor(
+                trusted_actor=trusted_transport_actor,
+                body_user_id=user_context.get("user_id"),
+                shared_mode=shared_report_mode,
+            )
+        except ScopeAuthorizationError:
+            # Do not echo the offending identifiers; the message is generic.
+            logger.warning("⚠️ Rejected request: could not establish a trusted cost-report actor")
+            return "I'm sorry, but your request could not be processed due to an identity verification issue."
+
+        report_scope = build_request_scope(
+            report_actor,
+            tenant=DEPLOYMENT_TENANT_ID,
+            workspace=DEPLOYMENT_WORKSPACE_ID,
+        )
+        scope_token = set_request_scope(report_scope)
+        try:
+            response = run_orchestrator(query=user_prompt, context=agent_context)
+        finally:
+            reset_request_scope(scope_token)
 
         logger.info(f"✅ Orchestrator returned response")
         logger.info(f"   Response type: {type(response)}")

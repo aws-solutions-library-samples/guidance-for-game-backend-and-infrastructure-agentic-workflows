@@ -54,6 +54,13 @@ def _find_existing(client, name):
     return None
 
 
+def _normalize_temperature(value):
+    """Normalize Bedrock float32 temperatures for stable comparisons."""
+    if value is None:
+        return None
+    return round(float(value), 6)
+
+
 def _variant_signature(variant):
     """Return deployment-relevant fields for idempotency comparisons."""
     text_config = variant.get("templateConfiguration", {}).get("text", {})
@@ -62,7 +69,7 @@ def _variant_signature(variant):
         "name": variant.get("name"),
         "modelId": variant.get("modelId"),
         "templateType": variant.get("templateType"),
-        "temperature": inference_text.get("temperature"),
+        "temperature": _normalize_temperature(inference_text.get("temperature")),
         "text": text_config.get("text", ""),
     }
 

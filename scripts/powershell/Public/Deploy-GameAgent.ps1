@@ -131,6 +131,24 @@ function Deploy-GameAgent {
         -Params @("ProjectName=$ProjectName")
     Write-Host ''
 
+    # Resolve the shared cost report snapshot table (#365). The base stack always
+    # exports this output, so a missing value means a broken/stale stack — fail
+    # closed rather than degrading to a process-local cache. Hosted deployments
+    # require the shared store.
+    $costSnapshotTableName = Get-StackOutput "$ProjectName-infrastructure" 'CostReportSnapshotTableName'
+    if (-not $costSnapshotTableName -or $costSnapshotTableName -eq 'None') {
+        throw 'Base stack did not export CostReportSnapshotTableName. Redeploy the base infrastructure stack so the shared cost report snapshot table exists.'
+    }
+    $costSnapshotRequired = 'true'
+    $costSnapshotTtlSeconds = if ($env:GBAW_COST_SNAPSHOT_TTL_SECONDS) { $env:GBAW_COST_SNAPSHOT_TTL_SECONDS } else { '1800' }
+    $ttlParsed = 0
+    if (-not [int]::TryParse($costSnapshotTtlSeconds, [ref]$ttlParsed) -or $ttlParsed -lt 60 -or $ttlParsed -gt 86400) {
+        throw "GBAW_COST_SNAPSHOT_TTL_SECONDS='$costSnapshotTtlSeconds' must be an integer in [60, 86400]."
+    }
+    Write-Host "   Cost snapshot table: $costSnapshotTableName"
+    Write-Host "   Cost snapshot TTL:   ${costSnapshotTtlSeconds}s (required=$costSnapshotRequired)"
+    Write-Host ''
+
     # ── Step 1.5: Guardrails ──
     Write-GameAgentStatus 'Step 1.5: Deploying Bedrock Guardrails...' -Type Info
     Deploy-Stack -StackName "$ProjectName-guardrails" `
@@ -196,7 +214,12 @@ function Deploy-GameAgent {
             -OrchestratorPromptArn $orchestratorPromptArn `
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
-            -CostPromptArn $costPromptArn
+            -CostPromptArn $costPromptArn `
+            -TenantId $tenantId `
+            -WorkspaceId $workspaceId `
+            -CostSnapshotTableName $costSnapshotTableName `
+            -CostSnapshotRequired $costSnapshotRequired `
+            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds
 
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
         Write-Host "Using execution role: $executionRoleArn"
@@ -335,7 +358,12 @@ function Deploy-GameAgent {
             -CostPromptArn $costPromptArn `
             -GameLiftKbId $gameliftKbId `
             -EksKbId $eksKbId `
-            -CostKbId $costKbId
+            -CostKbId $costKbId `
+            -TenantId $tenantId `
+            -WorkspaceId $workspaceId `
+            -CostSnapshotTableName $costSnapshotTableName `
+            -CostSnapshotRequired $costSnapshotRequired `
+            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success

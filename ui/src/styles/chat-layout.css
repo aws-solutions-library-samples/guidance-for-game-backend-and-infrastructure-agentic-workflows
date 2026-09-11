@@ -281,6 +281,157 @@
   color: #e6edf3 !important;
 }
 
+/* Inline charts (#255) — rendered by ChartRenderer inside assistant messages.
+   The chart follows the app theme via the --ga-chart-* palette and other
+   --ga-* tokens rather than shipping its own colours. */
+.ga-chart {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--ga-border);
+  border-radius: 12px;
+  background: var(--ga-surface-muted);
+}
+
+.copilotKitMarkdown .ga-chart__title {
+  margin: 0 0 8px 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--ga-text) !important;
+}
+
+.ga-chart__legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 0 0 6px 0;
+  padding: 0;
+}
+
+.copilotKitMarkdown .ga-chart__legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--ga-text-muted) !important;
+}
+
+/* Legend swatch shows the series' non-colour encoding (dash + marker for lines,
+   texture for bars/areas) so series stay distinguishable without relying on
+   colour alone (#255, finding 8). */
+.ga-chart__legend-swatch {
+  flex-shrink: 0;
+  overflow: visible;
+}
+
+.copilotKitMarkdown .ga-chart__legend-label {
+  color: var(--ga-text-muted) !important;
+}
+
+/* Horizontal scroll keeps the chart legible on narrow screens: rather than the
+   SVG (and its axis text) shrinking to nothing, it holds a minimum width and
+   the container scrolls (#255, finding 5). */
+.ga-chart__svg-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.ga-chart__svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* Rotated y-axis / centred x-axis titles (#255, finding 9). */
+.ga-chart__svg .ga-chart__axis-title {
+  fill: var(--ga-text-muted);
+  font-size: 12px;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+.copilotKitMarkdown .ga-chart__fallback {
+  margin: 8px 0 0 0;
+  font-size: 0.85rem;
+  color: var(--ga-text-muted) !important;
+}
+
+/* Axis + tick text. Specificity (0,2,0) plus scoping keeps it above the blanket
+   markdown span colour rule while still theming with the muted token. */
+.ga-chart__svg .ga-chart__tick {
+  fill: var(--ga-text-muted);
+  font-size: 11px;
+  font-family: 'Inter', system-ui, sans-serif;
+}
+
+.copilotKitMarkdown .ga-chart__summary {
+  margin: 8px 0 0 0;
+  font-size: 0.85rem;
+  color: var(--ga-text-muted) !important;
+}
+
+.ga-chart__data {
+  margin-top: 8px;
+  font-size: 0.8rem;
+}
+
+.copilotKitMarkdown .ga-chart__data summary {
+  cursor: pointer;
+  color: var(--ga-cyan) !important;
+  font-size: 0.8rem;
+}
+
+/* The data table can be wider than a narrow column (many series); let it scroll
+   horizontally instead of forcing the whole message to reflow (#255, finding 5). */
+.ga-chart__table-wrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.ga-chart__table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 0.8rem;
+}
+
+.copilotKitMarkdown .ga-chart__table caption {
+  text-align: left;
+  color: var(--ga-text-muted) !important;
+  padding-bottom: 4px;
+}
+
+.ga-chart__table th,
+.ga-chart__table td {
+  border: 1px solid var(--ga-border);
+  padding: 4px 8px;
+  text-align: right;
+}
+
+.copilotKitMarkdown .ga-chart__table th {
+  color: var(--ga-text) !important;
+  font-weight: 600;
+}
+
+.copilotKitMarkdown .ga-chart__table td {
+  color: var(--ga-text-muted) !important;
+}
+
+.ga-chart__table th[scope='row'],
+.ga-chart__table thead th:first-child {
+  text-align: left;
+}
+
+@media (max-width: 480px) {
+  .ga-chart {
+    padding: 10px;
+  }
+
+  .copilotKitMarkdown .ga-chart__legend-item {
+    font-size: 0.75rem;
+  }
+}
+
 /* Message controls positioning */
 .copilotKitMessageControls {
   position: absolute !important;
