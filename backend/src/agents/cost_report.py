@@ -20,6 +20,7 @@ from strands import tool
 
 # Local modules
 from agents.cost_report_scope import current_scope, current_scope_hash, is_trusted_scope
+from agents.cost_service_aliases import resolve_service_selection
 from agents.cost_snapshot_store import (
     CostSnapshotStore,
     CostSnapshotStoreError,
@@ -660,23 +661,14 @@ class CostReportService:
             return snapshot.report
 
         by_name = {item.service: item for item in snapshot.raw_services}
-        by_casefold = {item.service.casefold(): item for item in snapshot.raw_services}
-        selected: list[RawServiceCost] = []
-        missing: list[str] = []
-        seen_services: set[str] = set()
-        for requested_name in service_names:
-            match = by_name.get(requested_name) or by_casefold.get(requested_name.casefold())
-            if match is None:
-                missing.append(requested_name)
-            elif match.service not in seen_services:
-                selected.append(match)
-                seen_services.add(match.service)
-        if missing:
+        resolution = resolve_service_selection(service_names, by_name.keys())
+        if resolution.missing:
             raise CostReportError(
                 "SERVICE_NOT_IN_REPORT",
                 "One or more requested services are not present in that report snapshot. Check the service names and retry.",
                 retryable=False,
             )
+        selected: list[RawServiceCost] = [by_name[name] for name in resolution.resolved]
 
         selected_raw = sum((item.amount for item in selected), Decimal("0"))
         total_raw = Decimal(snapshot.report.total_raw)
