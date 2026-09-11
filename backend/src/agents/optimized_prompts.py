@@ -20,6 +20,7 @@ provides the code-level foundation for traceability.
 # Standard library
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # Local modules
 from agents.chart_directive import CHART_DIRECTIVE, with_chart_directive
@@ -205,6 +206,20 @@ def _get_prompt(name: str, fallback: VersionedPrompt) -> str:
     return _runtime_prompts.get(name, fallback.text)
 
 
+def _utc_now() -> datetime:
+    """Return the current UTC time. Patched in tests for a deterministic date."""
+    return datetime.now(timezone.utc)
+
+
+def _current_date_directive() -> str:
+    """Build a concise directive stating today's UTC date for relative ranges."""
+    today = _utc_now().astimezone(timezone.utc).date().isoformat()
+    return (
+        f"\n\nToday (UTC) is {today}. Derive relative periods "
+        "(e.g. current month, last N days) from this date, not prior knowledge."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public accessor functions (same signatures as before for compatibility)
 # ---------------------------------------------------------------------------
@@ -221,8 +236,13 @@ def get_optimized_eks_prompt() -> str:
 
 
 def get_optimized_cost_prompt() -> str:
-    """Get the optimized cost specialist system prompt."""
-    return with_chart_directive(_get_prompt("cost_specialist", COST_PROMPT))
+    """Get the cost prompt with the shared chart contract and runtime UTC date.
+
+    The current UTC date is appended at call time so the specialist derives
+    relative ranges from real time rather than stale model knowledge. The
+    shared chart directive remains composed into the managed/base prompt.
+    """
+    return with_chart_directive(_get_prompt("cost_specialist", COST_PROMPT)) + _current_date_directive()
 
 
 def get_optimized_orchestrator_prompt() -> str:

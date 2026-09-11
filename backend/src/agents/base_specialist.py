@@ -12,6 +12,7 @@ from typing import Any, Callable, List, Optional
 from strands import Agent, tool
 
 # Local modules
+from agents.specialist_capture import record_specialist_output
 from config.settings import AGENT_MAX_TURNS_SPECIALIST, AGENT_TIMEOUT_SPECIALIST_SECONDS, AWS_REGION, INFERENCE_CONFIG
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_specialist_bedrock_model
 from utils.kb_tools import create_kb_retrieve_tool
@@ -57,6 +58,11 @@ def create_specialist_agent(
         def agent_func(query: str) -> str:
             with time_operation(f"{service_name.lower()}_agent_total", {"query_length": len(query)}):
                 logger.debug(f"{emoji} {service_name} agent processing query ({len(query)} chars)")
+                # Mark participation before any per-request tool setup. If setup
+                # fails before the guarded agent block (for example, a Cost tool
+                # factory error), the orchestrator can still fail closed instead
+                # of trusting model-authored financial prose.
+                record_specialist_output(service_name, "")
 
                 # Build tools list
                 tools = list(additional_tools) if additional_tools else []
@@ -79,7 +85,9 @@ def create_specialist_agent(
                     # If no MCP clients created and fallback exists, use it
                     if mcp_clients_created == 0 and fallback_fn and not tools:
                         logger.warning(f"⚠️ {service_name} MCP unavailable, using fallback")
-                        return fallback_fn(AWS_REGION)
+                        fallback_message = fallback_fn(AWS_REGION)
+                        record_specialist_output(service_name, fallback_message)
+                        return fallback_message
 
                 # Add KB tool if configured
                 if kb_id:
@@ -119,6 +127,7 @@ def create_specialist_agent(
                             result = response_finalizer(result)
                         logger.debug(f"{emoji} {service_name} complete ({len(result)} chars)")
 
+                    record_specialist_output(service_name, result)
                     return result
 
                 except Exception:
@@ -128,8 +137,12 @@ def create_specialist_agent(
                     # errors). Return a generic message instead.
                     logger.error(f"❌ {service_name} agent failed", exc_info=True)
                     if fallback_fn:
-                        return fallback_fn(AWS_REGION)
-                    return f"Unable to process the {service_name} request right now. Please try again."
+                        fallback_message = fallback_fn(AWS_REGION)
+                        record_specialist_output(service_name, fallback_message)
+                        return fallback_message
+                    failure_message = f"Unable to process the {service_name} request right now. Please try again."
+                    record_specialist_output(service_name, failure_message)
+                    return failure_message
 
         # Set unique name and docstring
         agent_func.__name__ = f"{service_name.lower()}_agent"
