@@ -2,14 +2,42 @@
 """Unit tests for AgentCore startup and initialization."""
 
 # Standard library
-import sys
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 # Third-party packages
 import pytest
+from bedrock_agentcore.runtime.context import RequestContext
 from botocore.exceptions import ClientError, NoCredentialsError
+from starlette.requests import Request
 
 pytestmark = [pytest.mark.unit]
+
+RUNTIME_USER_ID_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-User-Id"
+
+
+def _context_with_forwarded_header(user_id, header_name=RUNTIME_USER_ID_HEADER, session_id="ctx-session"):
+    """Build a real RequestContext whose forwarded header map carries a user id.
+
+    This mirrors the SDK ``RequestContext`` shape (``request_headers`` is the
+    forwarded header dict) rather than inventing Mock attributes.
+    """
+    return RequestContext(session_id=session_id, request_headers={header_name: user_id})
+
+
+def _context_with_underlying_request(user_id, header_name=RUNTIME_USER_ID_HEADER, session_id="ctx-session"):
+    """Build a real RequestContext backed by a Starlette request carrying the header.
+
+    The runtime allowlist does not forward the reserved User-Id header into
+    ``request_headers``, so the deployed path reads it from the underlying
+    Starlette request object. Starlette header keys are wire-lowercased.
+    """
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/invocations",
+        "headers": [(header_name.lower().encode("latin-1"), user_id.encode("latin-1"))],
+    }
+    return RequestContext(session_id=session_id, request=Request(scope))
 
 
 class TestAgentCoreStartup:
@@ -161,15 +189,13 @@ class TestInvokeAgent:
         assert "try again" in result.lower()
 
     def test_invoke_agent_with_context(self, mock_orchestrator):
-        """Test invoke_agent extracts user_id and actor from context."""
+        """Test invoke_agent derives actor_id from the trusted runtimeUserId header."""
         # Local modules
         from agentcore_main import invoke_agent
 
-        mock_context = Mock()
-        mock_context.user_id = "test-user"
-        mock_context.headers = {}
+        # Real RequestContext carrying the platform-established runtime user id.
+        ctx = _context_with_forwarded_header("test-user")
 
-        # Pass user_id in the prompt dict
         result = invoke_agent(
             {
                 "prompt": "test prompt",
@@ -184,7 +210,7 @@ class TestInvokeAgent:
                     "session_id": "test-session-456",
                 },
             },
-            context=mock_context,
+            context=ctx,
         )
 
         assert result == "Test response"
@@ -192,7 +218,7 @@ class TestInvokeAgent:
         agent_context = call_args.kwargs["context"]
         # session_id should come from user_context.session_id
         assert agent_context["session_id"] == "test-session-456"
-        # actor_id should be from context.user_id
+        # actor_id must be the trusted transport identity from the header.
         assert agent_context["actor_id"] == "test-user"
         assert agent_context["client_id"] == "web-client"
         assert agent_context["audience"] == "web-client"
@@ -200,3 +226,208 @@ class TestInvokeAgent:
         assert agent_context["scopes"] == ["openid", "profile"]
         assert agent_context["tenant"] == "tenant-a"
         assert agent_context["workspace"] == "workspace-a"
+
+
+class TestExtractRuntimeUserId:
+    """Direct coverage of the trusted runtime-user-id extraction helper (#365).
+
+    Exercised against the real ``RequestContext`` (forwarded header map) and a
+    real Starlette request (underlying request object), plus case variants and
+    the missing/blank cases — never invented Mock attributes.
+    """
+
+    def test_returns_none_when_context_is_none(self):
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        assert extract_runtime_user_id(None) is None
+
+    def test_reads_from_forwarded_request_headers(self):
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        ctx = _context_with_forwarded_header("alice")
+        assert extract_runtime_user_id(ctx) == "alice"
+
+    def test_forwarded_header_lookup_is_case_insensitive(self):
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        ctx = _context_with_forwarded_header("bob", header_name="x-amzn-bedrock-agentcore-runtime-user-id")
+        assert extract_runtime_user_id(ctx) == "bob"
+
+        ctx_upper = _context_with_forwarded_header("carol", header_name="X-AMZN-BEDROCK-AGENTCORE-RUNTIME-USER-ID")
+        assert extract_runtime_user_id(ctx_upper) == "carol"
+
+    def test_falls_back_to_underlying_request_object(self):
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        # The reserved header is not forwarded into request_headers by the runtime
+        # allowlist; it is only present on the underlying Starlette request.
+        ctx = _context_with_underlying_request("dave")
+        assert ctx.request_headers is None
+        assert extract_runtime_user_id(ctx) == "dave"
+
+    def test_missing_header_returns_none(self):
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        ctx = RequestContext(session_id="s", request_headers={"X-Other-Header": "x"})
+        assert extract_runtime_user_id(ctx) is None
+
+    def test_blank_header_value_returns_none(self):
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        ctx = _context_with_forwarded_header("   ")
+        assert extract_runtime_user_id(ctx) is None
+
+    def test_ignores_custom_actor_passthrough_header(self):
+        """The caller-supplied custom passthrough header must NEVER be trusted as
+        the runtime user identity."""
+        # Local modules
+        from agentcore_main import extract_runtime_user_id
+
+        ctx = RequestContext(
+            session_id="s",
+            request_headers={"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actor-Id": "attacker"},
+        )
+        assert extract_runtime_user_id(ctx) is None
+
+
+class TestSharedModeScopeBoundary:
+    """Shared-mode trusted-actor resolution at the AgentCore boundary (#365).
+
+    All contexts are real ``RequestContext`` objects; the trusted actor is only
+    ever the platform-established runtimeUserId header.
+    """
+
+    @pytest.fixture
+    def mock_orchestrator(self):
+        with patch("agentcore_main.run_orchestrator") as mock:
+            mock.return_value = "Test response"
+            yield mock
+
+    def _shared_mode(self):
+        # Force shared mode regardless of the local test environment.
+        return patch.object(__import__("agentcore_main"), "COST_SNAPSHOT_TABLE_NAME", "snap-table")
+
+    def test_shared_mode_uses_trusted_context_actor(self, mock_orchestrator):
+        # Local modules
+        from agentcore_main import invoke_agent
+
+        ctx = _context_with_forwarded_header("trusted-user")
+
+        with self._shared_mode():
+            result = invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
+                context=ctx,
+            )
+
+        assert result == "Test response"
+        mock_orchestrator.assert_called_once()
+
+    def test_shared_mode_accepts_trusted_actor_from_underlying_request(self, mock_orchestrator):
+        # Local modules
+        from agentcore_main import invoke_agent
+
+        ctx = _context_with_underlying_request("trusted-user")
+
+        with self._shared_mode():
+            result = invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
+                context=ctx,
+            )
+
+        assert result == "Test response"
+        mock_orchestrator.assert_called_once()
+
+    def test_shared_mode_rejects_actor_mismatch(self, mock_orchestrator):
+        # Local modules
+        from agentcore_main import invoke_agent
+
+        ctx = _context_with_forwarded_header("trusted-user")
+
+        with self._shared_mode():
+            result = invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "someone-else"}},
+                context=ctx,
+            )
+
+        assert "identity verification" in result.lower()
+        mock_orchestrator.assert_not_called()
+
+    def test_shared_mode_requires_trusted_actor(self, mock_orchestrator):
+        # Local modules
+        from agentcore_main import invoke_agent
+
+        # No runtimeUserId header present at all; a body-only identity is not trusted.
+        ctx = RequestContext(session_id="s", request_headers={})
+
+        with self._shared_mode():
+            result = invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "body-only"}},
+                context=ctx,
+            )
+
+        assert "identity verification" in result.lower()
+        mock_orchestrator.assert_not_called()
+
+    def test_shared_mode_rejects_custom_actor_passthrough_header(self, mock_orchestrator):
+        """A request that supplies ONLY the caller-controlled custom passthrough
+        header (and no trusted runtimeUserId) must be rejected in shared mode: a
+        custom passthrough header can never establish snapshot scope."""
+        # Local modules
+        from agentcore_main import invoke_agent
+
+        ctx = RequestContext(
+            session_id="s",
+            request_headers={"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actor-Id": "attacker"},
+        )
+
+        with self._shared_mode():
+            result = invoke_agent({"prompt": "hi", "user_context": {}}, context=ctx)
+
+        assert "identity verification" in result.lower()
+        mock_orchestrator.assert_not_called()
+
+
+class TestRequestScopeLifecycle:
+    """The request scope must be reset after each invocation, including on error."""
+
+    def _shared_mode(self):
+        return patch.object(__import__("agentcore_main"), "COST_SNAPSHOT_TABLE_NAME", "snap-table")
+
+    def test_scope_reset_after_successful_invocation(self):
+        # Local modules
+        from agentcore_main import invoke_agent
+        from agents.cost_report_scope import UNSCOPED, current_scope
+
+        with patch("agentcore_main.run_orchestrator", return_value="ok") as mock:
+            ctx = _context_with_forwarded_header("trusted-user")
+            with self._shared_mode():
+                invoke_agent({"prompt": "hi", "user_context": {"user_id": "trusted-user"}}, context=ctx)
+            mock.assert_called_once()
+
+        # After the call returns, the boundary scope must be restored to UNSCOPED
+        # so it never leaks to the next request on the same worker.
+        assert current_scope() is UNSCOPED
+
+    def test_scope_reset_when_orchestrator_raises(self):
+        # Local modules
+        from agentcore_main import invoke_agent
+        from agents.cost_report_scope import UNSCOPED, current_scope
+
+        with patch("agentcore_main.run_orchestrator", side_effect=RuntimeError("boom")):
+            ctx = _context_with_forwarded_header("trusted-user")
+            with self._shared_mode():
+                result = invoke_agent(
+                    {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
+                    context=ctx,
+                )
+
+        # The exception is handled and a generic error returned...
+        assert "error" in result.lower()
+        # ...and the scope is still reset via the finally block.
+        assert current_scope() is UNSCOPED

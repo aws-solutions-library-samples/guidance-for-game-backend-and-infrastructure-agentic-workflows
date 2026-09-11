@@ -24,7 +24,11 @@ from typing import Dict, List, Optional
 
 # Third-party packages
 from mcp import StdioServerParameters, stdio_client
-from strands.tools.mcp import MCPClient
+
+# MCPTransport is re-exported from the package root (strands.tools.mcp.__all__),
+# so import it there rather than the internal mcp_types implementation module to
+# avoid a runtime dependency on the package's internal layout.
+from strands.tools.mcp import MCPClient, MCPTransport
 
 # Local modules
 from config.settings import AWS_REGION, RETRY_MAX_ATTEMPTS
@@ -109,12 +113,15 @@ def _resolve_mcp_command(server_name: str) -> List[str]:
     # Resolve via importlib.metadata entry points (AgentCore direct_code_deploy)
     try:
         eps = importlib.metadata.entry_points()
-        # Python 3.9-3.11: eps is dict-like; Python 3.12+: SelectableGroups
-        console_scripts = (
-            eps.get("console_scripts", [])
-            if isinstance(eps, dict)
-            else [ep for ep in eps if ep.group == "console_scripts"]
-        )
+        # Python 3.9-3.11: entry_points() returns a dict keyed by group; Python
+        # 3.12+ returns an EntryPoints collection that is iterable but has no
+        # .get(). Branch on the concrete type with an if/else (not a ternary) so
+        # the .get() call is scoped to the narrowed dict type and type-checks
+        # cleanly under both mypy versions we run.
+        if isinstance(eps, dict):
+            console_scripts = eps.get("console_scripts", [])
+        else:
+            console_scripts = [ep for ep in eps if ep.group == "console_scripts"]
         for ep in console_scripts:
             if ep.name == executable_name:
                 module, func = ep.value.rsplit(":", 1)
@@ -218,11 +225,17 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
             wrapper_path = os.path.join(os.path.dirname(__file__), "mcp_wrapper.py")
 
-            client = MCPClient(
-                lambda cmd=mcp_cmd, e=env, wp=wrapper_path: stdio_client(
-                    StdioServerParameters(command=sys.executable, args=[wp] + cmd, env=e)
+            # MCPClient wants a zero-arg transport factory (Callable[[], MCPTransport]).
+            # A lambda with snapshot default args can't be matched to that signature by
+            # mypy ("Cannot infer type of lambda"); a plain closure has the right arity.
+            # Closing over the loop locals is safe here — we return immediately below,
+            # so they can't be rebound before the factory is first called.
+            def _transport() -> MCPTransport:
+                return stdio_client(
+                    StdioServerParameters(command=sys.executable, args=[wrapper_path] + mcp_cmd, env=env)
                 )
-            )
+
+            client = MCPClient(_transport)
 
             # Cache the client (thread-safe)
             if use_cache:
