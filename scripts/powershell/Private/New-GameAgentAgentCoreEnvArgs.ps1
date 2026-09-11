@@ -21,6 +21,7 @@ function New-GameAgentAgentCoreEnvArgs {
     )
 
     $result = @(
+        '-env', 'GBAW_HOSTED_RUNTIME=true',
         '-env', "GBAW_ORCHESTRATOR_MODEL_ID=$OrchestratorModelId",
         '-env', "GBAW_SPECIALIST_MODEL_ID=$SpecialistModelId"
     )

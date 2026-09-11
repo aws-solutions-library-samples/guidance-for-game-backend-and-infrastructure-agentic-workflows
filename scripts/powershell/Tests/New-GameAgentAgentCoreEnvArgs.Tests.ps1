@@ -23,6 +23,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
 
         ($result -join "`n") | Should -Be (@(
             '-env'
+            'GBAW_HOSTED_RUNTIME=true'
+            '-env'
             'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
             '-env'
             'GBAW_SPECIALIST_MODEL_ID=specialist-model'
@@ -48,6 +50,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -CostSnapshotTtlSeconds '1800'
 
         ($result -join "`n") | Should -Be (@(
+            '-env'
+            'GBAW_HOSTED_RUNTIME=true'
             '-env'
             'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
             '-env'
@@ -95,6 +99,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
 
         ($result -join "`n") | Should -Be (@(
             '-env'
+            'GBAW_HOSTED_RUNTIME=true'
+            '-env'
             'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
             '-env'
             'GBAW_SPECIALIST_MODEL_ID=specialist-model'
@@ -118,6 +124,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -CostKbId 'cost-kb'
 
         ($result -join "`n") | Should -Be (@(
+            '-env'
+            'GBAW_HOSTED_RUNTIME=true'
             '-env'
             'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
             '-env'

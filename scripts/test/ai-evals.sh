@@ -34,6 +34,12 @@ else
     exit 1
 fi
 
+if [ -z "${GBAW_TEST_ACCESS_TOKEN:-}" ]; then
+    echo -e "${RED}❌ GBAW_TEST_ACCESS_TOKEN is required for JWT-authorized deployed AI evals${NC}"
+    echo -e "${BLUE}💡 Export a short-lived Cognito access token for an approved test user${NC}"
+    exit 1
+fi
+
 # Backend AI evaluation tests
 echo -e "\n${BLUE}🤖 AI Agent Behavior Tests${NC}"
 cd backend

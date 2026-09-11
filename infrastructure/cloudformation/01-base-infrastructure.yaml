@@ -462,14 +462,6 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: AgentCoreInvoke
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:InvokeAgentRuntime
-                  - bedrock-agentcore:InvokeAgentRuntimeForUser
-                Resource:
-                  # Scoped to this project's runtimes (#151) — shared account.
-                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/gameagent*'
               - Sid: BedrockModelInvoke
                 Effect: Allow
                 Action:

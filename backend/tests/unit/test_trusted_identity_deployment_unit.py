@@ -33,3 +33,32 @@ def test_both_deploy_paths_pass_the_resolved_bindings():
     assert "--identity-only" in powershell
     assert '"TenantId=$tenantId"' in powershell
     assert '"WorkspaceId=$workspaceId"' in powershell
+
+
+def test_deploy_paths_configure_cognito_jwt_authorization_and_header_forwarding():
+    bash = (PROJECT_ROOT / "scripts/deploy.sh").read_text(encoding="utf-8")
+    powershell = (PROJECT_ROOT / "scripts/powershell/Public/Deploy-GameAgent.ps1").read_text(encoding="utf-8")
+
+    for deployment in (bash, powershell):
+        assert "--authorizer-config" in deployment
+        assert "customJWTAuthorizer" in deployment
+        assert "allowedClients" in deployment
+        assert "/.well-known/openid-configuration" in deployment
+        assert "--request-header-allowlist" in deployment
+        assert "Authorization" in deployment
+
+
+def test_frontend_task_role_does_not_retain_sigv4_runtime_invocation_permissions():
+    template = (PROJECT_ROOT / "infrastructure/cloudformation/01-base-infrastructure.yaml").read_text(encoding="utf-8")
+    ecs_task_role = template.split("  ECSTaskRole:", 1)[1].split("  ECSTaskExecutionRole:", 1)[0]
+
+    assert "bedrock-agentcore:InvokeAgentRuntime" not in ecs_task_role
+    assert "bedrock-agentcore:InvokeAgentRuntimeForUser" not in ecs_task_role
+
+
+def test_full_deployed_suite_requires_a_short_lived_access_token():
+    full_test = (PROJECT_ROOT / "scripts/test/full.sh").read_text(encoding="utf-8")
+
+    assert "GBAW_TEST_ACCESS_TOKEN is required for complete deployed JWT validation" in full_test
+    assert "TEST_EMAIL and TEST_PASSWORD are required for authenticated deployed browser validation" in full_test
+    assert "FAILED=1" in full_test

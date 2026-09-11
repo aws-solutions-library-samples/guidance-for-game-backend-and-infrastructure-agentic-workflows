@@ -18,6 +18,7 @@ from botocore.exceptions import ClientError
 # Add tests directory to path for conftest import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # Local modules
+from ai_evals.test_config import make_agent_request
 from conftest import get_deployment_info
 
 pytestmark = pytest.mark.integration
@@ -41,42 +42,25 @@ class TestSystemIntegration:
         }
 
     def test_backend_health(self, backend_config):
-        """Test backend is healthy and responding."""
-        # Standard library
-        import json
-        import uuid
+        """Test the runtime control-plane state without bypassing JWT auth."""
+        client = boto3.client("bedrock-agentcore-control", region_name=backend_config["region"])
+        response = client.get_agent_runtime(agentRuntimeId=backend_config["runtime_id"])
 
-        client = boto3.client("bedrock-agentcore", region_name=backend_config["region"])
-        payload = json.dumps({"prompt": "health check"})
-        response = client.invoke_agent_runtime(
-            agentRuntimeArn=backend_config["runtime_arn"],
-            contentType="application/json",
-            payload=payload.encode("utf-8"),
-            # Shared cost-report reuse requires a trusted transport actor (#365).
-            runtimeUserId=f"integ-{uuid.uuid4().hex}",
-        )
-        assert response["statusCode"] == 200
-        assert "response" in response
+        assert response["status"] == "READY"
+        authorizer = response.get("authorizerConfiguration", {}).get("customJWTAuthorizer", {})
+        assert authorizer.get("discoveryUrl", "").startswith("https://cognito-idp.")
+        assert authorizer.get("discoveryUrl", "").endswith("/.well-known/openid-configuration")
+        assert authorizer.get("allowedClients")
+        assert response.get("requestHeaderConfiguration", {}).get("requestHeaderAllowlist") == ["Authorization"]
 
     @pytest.mark.slow
     def test_agent_invocation(self, backend_config):
-        """Test agent can be invoked and responds (slow AI call)."""
-        # Standard library
-        import json
-        import uuid
+        """Test a JWT-authorized agent invocation and response."""
+        assert os.getenv(
+            "GBAW_TEST_ACCESS_TOKEN", ""
+        ).strip(), "GBAW_TEST_ACCESS_TOKEN is required for hosted invocation"
 
-        client = boto3.client("bedrock-agentcore", region_name=backend_config["region"])
-
-        payload = json.dumps({"prompt": "Hello"})
-        response = client.invoke_agent_runtime(
-            agentRuntimeArn=backend_config["runtime_arn"],
-            contentType="application/json",
-            payload=payload.encode("utf-8"),
-            runtimeUserId=f"integ-{uuid.uuid4().hex}",
-        )
-
-        assert "response" in response
-        response_text = response["response"].read().decode("utf-8")
+        response_text = make_agent_request("Hello", backend_config)
         assert len(response_text) > 0
 
 
@@ -90,22 +74,10 @@ class TestDeployedStackIntegration:
             pytest.skip("Deployment-only test - requires deployed stack")
 
         try:
-            # Test runtime by invoking it (no get_agent_runtime API)
-            # Standard library
-            import json
-            import uuid
-
-            client = boto3.client("bedrock-agentcore", region_name=deployment["region"])
-            payload = json.dumps({"prompt": "test"})
-            response = client.invoke_agent_runtime(
-                agentRuntimeArn=deployment["runtime_arn"],
-                contentType="application/json",
-                payload=payload.encode("utf-8"),
-                # Shared cost-report reuse requires a trusted transport actor (#365).
-                runtimeUserId=f"integ-{uuid.uuid4().hex}",
-            )
-            # If invocation succeeds, runtime exists
-            assert response is not None
+            client = boto3.client("bedrock-agentcore-control", region_name=deployment["region"])
+            response = client.get_agent_runtime(agentRuntimeId=deployment["runtime_id"])
+            assert response["agentRuntimeArn"] == deployment["runtime_arn"]
+            assert response["status"] == "READY"
         except ClientError as e:
             pytest.fail(f"AgentCore Runtime not accessible: {e}")
 

@@ -15,7 +15,6 @@ jest.mock('@/utils/logger', () => ({
   redact: jest.fn((v?: string | null) => (v ? `${v.slice(0, 2)}…(redacted)` : '<none>')),
 }));
 
-jest.mock('@aws-sdk/client-bedrock-agentcore');
 jest.mock('@aws-sdk/client-sts');
 
 // Shared verifier mock: chat.ts builds verifiers via CognitoJwtVerifier.create();
