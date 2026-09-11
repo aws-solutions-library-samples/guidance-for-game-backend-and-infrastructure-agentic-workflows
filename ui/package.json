@@ -29,7 +29,7 @@
     "@aws-sdk/client-cloudwatch": "^3.1075.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1095.0",
     "@aws-sdk/client-cost-explorer": "^3.1075.0",
-    "@aws-sdk/client-eks": "^3.1075.0",
+    "@aws-sdk/client-eks": "^3.1127.0",
     "@aws-sdk/client-gamelift": "^3.1075.0",
     "@aws-sdk/client-sts": "^3.1127.0",
     "@copilotkit/react-core": "1.10.6",
