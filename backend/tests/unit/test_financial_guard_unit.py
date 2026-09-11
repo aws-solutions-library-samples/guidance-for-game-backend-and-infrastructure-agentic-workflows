@@ -136,3 +136,64 @@ def test_advisory_sanitizer_links_financial_label_across_one_intermediary_paragr
     assert "Estimate follows" not in result
     assert "999" not in result
     assert "commitment options" in result
+
+
+# Verbatim orchestrator output observed on the deployed demo stack for
+# "List my GameLift fleets and their status." A GameLift fleet's BillingType
+# (On-Demand/Spot) is an operational attribute, not a monetary value; the
+# guard replaced this whole answer with the withheld-cost notice.
+_GAMELIFT_FLEET_LISTING = (
+    "You have **1 active GameLift fleet**:\n\n"
+    "| Fleet | Type | Status | Instance Type | Billing |\n"
+    "|-------|------|--------|----------------|---------|\n"
+    "| lyra-gamelift-group | Container | ✅ ACTIVE | c6g.xlarge | On-Demand |\n\n"
+    "**Key details:**\n"
+    "- Container group `lyra-gamelift-group` (v1) is **READY**\n"
+    "- Running 1 instance with 2.0 vCPUs and 4,096 MiB memory\n"
+    "- Operating on Amazon Linux 2023\n"
+    "- Logs sent to CloudWatch\n"
+    "- Player Gateway Mode is disabled\n\n"
+    "The fleet is healthy and ready to serve game servers. "
+    "Would you like to check capacity, utilization, or scaling configuration?"
+)
+
+
+class TestOperationalOutputWithFinancialVocabulary:
+    """Financial nouns used as operational labels must not withhold clean output.
+
+    Cross-paragraph detection exists for a *labelled* financial value
+    ("Monthly cost:\\n\\n999"). It must not link an unrelated count on one
+    line to a financial noun several lines away.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            _GAMELIFT_FLEET_LISTING,
+            "| **Billing Type** | On-Demand |\n| **Instances** | 2 |",
+            "Billing type: SPOT\n\nCPU utilization is 42% across 3 instances",
+            "3 fleets are ACTIVE.\n\nThe fleet uses On-Demand billing.",
+            "Scaling rate limit applies.\n\nCurrently 4 game sessions are active.",
+        ],
+    )
+    def test_operational_text_with_financial_nouns_is_clean(self, text):
+        assert contains_unvalidated_financial_content(text) is False
+
+    def test_gamelift_fleet_listing_passes_through_advisory_sanitizer(self):
+        assert sanitize_advisory_section("Cost", _GAMELIFT_FLEET_LISTING) == _GAMELIFT_FLEET_LISTING
+
+    def test_gamelift_fleet_listing_passes_through_specialist_sanitizer(self):
+        assert sanitize_specialist_section("GameLift", _GAMELIFT_FLEET_LISTING) == _GAMELIFT_FLEET_LISTING
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Billing: 999",
+            "Billing total\n\n999.00",
+            "Estimated rate:\n\nSee below.\n\n0.20",
+            "Savings:\n\n25%",
+            "The fleet has 2 instances and the billing amount is 45.10",
+        ],
+    )
+    def test_labelled_or_same_line_financial_values_still_flagged(self, text):
+        assert contains_unvalidated_financial_content(text) is True

@@ -84,6 +84,13 @@ _CURRENCY_WORD_AMOUNT_RE = re.compile(
 # shaped number (integer, one or more decimals, or leading decimal). Percentages
 # are excluded so operational utilization remains valid. Generic "total" is not
 # a financial noun: "total latency is 12.00 ms" must remain operational text.
+#
+# Across lines, only a *labelled* value is linked: a financial noun that ends a
+# label ("Monthly cost:") followed within a bounded window by a number, so a
+# model cannot split "cost:" and "999" across Markdown blocks. An unlabelled
+# noun is never linked to a number on another line: operational output such as
+# a GameLift fleet table with a "Billing" (On-Demand/Spot) column or a "rate
+# limit" sentence must not withhold an unrelated instance count nearby.
 _FINANCIAL_NOUN = (
     r"cost|costs|spend|spends|spending|spent|bill|billed|billing|"
     r"charge|charged|charges|price|priced|rate|rates|estimate|estimated|balance|amount|"
@@ -95,16 +102,23 @@ _FINANCIAL_TOPIC_RE = re.compile(
     rf"\b(?:{_ISO_ALTERNATION})\b",
     re.IGNORECASE,
 )
+# A label line ends with the financial noun (plus at most two trailing words and
+# Markdown/colon decoration): "Monthly cost:", "**Billing total**", "Savings:".
+# A noun followed by other content on its line ("| Billing | On-Demand |",
+# "Billing type: SPOT", "rate limit applies.") is not a label.
+_LABEL_LINE_END = r"(?:\s+\w+){0,2}[ \t*:_]*\n"
 _VALUE_LANGUAGE_RE = re.compile(
-    rf"(?:\b(?:{_FINANCIAL_NOUN})\b[\s\S]{{0,200}}{_MONEY_NUMBER})"
-    rf"|(?:{_MONEY_NUMBER}[\s\S]{{0,200}}\b(?:{_FINANCIAL_NOUN})\b)",
+    rf"(?:\b(?:{_FINANCIAL_NOUN})\b[^\n]{{0,200}}{_MONEY_NUMBER})"
+    rf"|(?:{_MONEY_NUMBER}[^\n]{{0,200}}\b(?:{_FINANCIAL_NOUN})\b)"
+    rf"|(?:\b(?:{_FINANCIAL_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_MONEY_NUMBER})",
     re.IGNORECASE,
 )
+_PERCENT_NOUN = r"cost|costs|spend|spending|save|saved|savings?|discount|share|bill|billed|billing|drop"
+_PERCENT_VALUE = r"\d+(?:\.\d+)?\s*%"
 _FINANCIAL_PERCENT_RE = re.compile(
-    rf"(?:\b(?:cost|costs|spend|spending|save|saved|savings?|discount|share|bill|billed|billing|drop)\b"
-    rf"[\s\S]{{0,200}}\d+(?:\.\d+)?\s*%)"
-    rf"|(?:\d+(?:\.\d+)?\s*%[\s\S]{{0,200}}"
-    rf"\b(?:cost|costs|spend|spending|save|saved|savings?|discount|share|bill|billed|billing|drop)\b)",
+    rf"(?:\b(?:{_PERCENT_NOUN})\b[^\n]{{0,200}}{_PERCENT_VALUE})"
+    rf"|(?:{_PERCENT_VALUE}[^\n]{{0,200}}\b(?:{_PERCENT_NOUN})\b)"
+    rf"|(?:\b(?:{_PERCENT_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_PERCENT_VALUE})",
     re.IGNORECASE,
 )
 
