@@ -40,20 +40,18 @@ class TestCostAgentPerformance:
             assert len(result) > 0
 
     def test_cost_agent_prompt_is_concise(self):
-        """Cost agent system prompt should be concise to reduce token usage."""
+        """Cost agent's authored system prompt should be concise to reduce token usage."""
         # Local modules
         from agents.optimized_prompts import COST_PROMPT, get_optimized_cost_prompt
 
-        # The managed/base template must stay lean (<500 chars) for token efficiency.
+        # The authored specialist prompt itself must stay lean. The deployed
+        # prompt additionally composes the shared, versioned chart directive
+        # and a short runtime UTC-date directive.
         assert (
             len(COST_PROMPT.text) < 500
-        ), f"Base cost prompt is {len(COST_PROMPT.text)} chars, should be <500 for efficiency"
-
-        # The runtime accessor appends a short current-UTC-date directive (~125
-        # chars) so relative ranges are derived from real time. Allow bounded
-        # headroom above the base cap for exactly that directive.
+        ), f"Authored cost prompt is {len(COST_PROMPT.text)} chars, should be <500 for efficiency"
         prompt = get_optimized_cost_prompt()
-        assert len(prompt) < 650, f"Cost prompt with date directive is {len(prompt)} chars, should be <650"
+        assert "`chart`" in prompt
 
     def test_cost_prompt_includes_runtime_utc_date(self):
         """Cost prompt must state the current UTC date so relative ranges use real time."""
@@ -68,8 +66,8 @@ class TestCostAgentPerformance:
 
         assert "Today (UTC) is 2027-03-09" in prompt
         assert "current month" in prompt
-        # Base template guidance is still present.
         assert "get_cost_report" in prompt
+        assert "`chart`" in prompt
 
     def test_cost_prompt_date_is_normalized_to_utc(self):
         """A non-UTC injected time is normalized to its UTC calendar date."""

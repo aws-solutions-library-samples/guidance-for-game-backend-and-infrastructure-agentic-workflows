@@ -70,6 +70,8 @@ class TestContainsUnvalidatedFinancialContent:
             "Total latency is 12.00 ms",
             "Time was spent restarting pods",
             "Dollars and yen are currency names",
+            "AWS Costs and billing help are available. See https://docs.python.org/3/tutorial/controlflow.html",
+            "AWS Costs help is available; W3Schools explains Python functions.",
             "Run this shell snippet: `printf %s $1`",
             "```bash\nprintf '%s' \"$1\"\n```",
             "awk '{print $1}' input.txt",

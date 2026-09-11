@@ -669,7 +669,7 @@ def test_direct_advisory_model_response_withholds_financial_paragraph():
 
 
 def test_direct_operational_model_response_remains_unchanged():
-    """The global financial guard preserves ordinary operational metrics."""
+    """The output guard preserves ordinary nonfinancial operational metrics."""
     operational = "EKS has 3 nodes at 42% CPU utilization and 1.50 GiB memory."
 
     class StubOrchestratorAgent:
@@ -684,6 +684,27 @@ def test_direct_operational_model_response_remains_unchanged():
         response = orchestrator.run_orchestrator("List my EKS cluster utilization")
 
     assert response == operational
+
+
+def test_direct_operational_model_response_withholds_volunteered_financial_value():
+    """A monetary claim is withheld based on output even when the query is not cost-classified."""
+    model_response = "EKS is healthy, and its projected monthly cost is USD 999.00."
+
+    class StubOrchestratorAgent:
+        def __call__(self, query: str) -> str:
+            return model_response
+
+    with (
+        patch.object(orchestrator, "Agent", return_value=StubOrchestratorAgent()),
+        patch.object(orchestrator, "USE_BEDROCK_SESSIONS", False),
+        patch.object(orchestrator, "create_bedrock_model_with_overrides", return_value=MagicMock()),
+    ):
+        response = orchestrator.run_orchestrator("List my EKS cluster utilization")
+
+    assert orchestrator._has_cost_topic("List my EKS cluster utilization") is False
+    assert "USD 999.00" not in response
+    assert "Unvalidated financial figures were withheld." in response
+    assert "validated cost report path" in response
 
 
 def test_direct_cost_topic_never_returns_number_words_from_model():

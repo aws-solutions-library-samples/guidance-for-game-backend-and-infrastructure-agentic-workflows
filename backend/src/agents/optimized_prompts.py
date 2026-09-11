@@ -22,6 +22,9 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+# Local modules
+from agents.chart_directive import CHART_DIRECTIVE, with_chart_directive
+
 
 @dataclass(frozen=True)
 class VersionedPrompt:
@@ -224,36 +227,37 @@ def _current_date_directive() -> str:
 
 def get_optimized_gamelift_prompt() -> str:
     """Get the optimized GameLift specialist system prompt."""
-    return _get_prompt("gamelift_specialist", GAMELIFT_PROMPT)
+    return with_chart_directive(_get_prompt("gamelift_specialist", GAMELIFT_PROMPT))
 
 
 def get_optimized_eks_prompt() -> str:
     """Get the optimized EKS specialist system prompt."""
-    return _get_prompt("eks_specialist", EKS_PROMPT)
+    return with_chart_directive(_get_prompt("eks_specialist", EKS_PROMPT))
 
 
 def get_optimized_cost_prompt() -> str:
-    """Get the optimized cost specialist system prompt with a runtime UTC date.
+    """Get the cost prompt with the shared chart contract and runtime UTC date.
 
     The current UTC date is appended at call time so the specialist derives
-    relative ranges (e.g. "current month", "last 7 days") from real time rather
-    than the managed prompt's age or the model's stale training-cutoff knowledge.
-    The base template stays concise; only this short directive is added.
+    relative ranges from real time rather than stale model knowledge. The
+    shared chart directive remains composed into the managed/base prompt.
     """
-    return _get_prompt("cost_specialist", COST_PROMPT) + _current_date_directive()
+    return with_chart_directive(_get_prompt("cost_specialist", COST_PROMPT)) + _current_date_directive()
 
 
 def get_optimized_orchestrator_prompt() -> str:
     """Get the optimized orchestrator system prompt."""
-    return _get_prompt("orchestrator", ORCHESTRATOR_PROMPT)
+    return with_chart_directive(_get_prompt("orchestrator", ORCHESTRATOR_PROMPT))
 
 
 def get_prompt_versions() -> dict[str, str]:
     """Return a mapping of prompt name → version and source for logging/tracing."""
     versions = {p.name: p.version for p in _ALL_PROMPTS.values()}
+    # The chart contract directive (issue #255) is composed into every prompt
+    # above, so track its version alongside the authored prompts for traceability.
+    versions[CHART_DIRECTIVE.name] = CHART_DIRECTIVE.version
     versions["_source"] = _prompt_source
     return versions
-    return {p.name: p.version for p in _ALL_PROMPTS.values()}
 
 
 # ---------------------------------------------------------------------------

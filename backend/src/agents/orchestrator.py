@@ -29,6 +29,7 @@ from strands import Agent
 from agents.cost_report import begin_cost_report_capture, finish_cost_report_capture
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
+from agents.financial_guard import contains_unvalidated_financial_content, sanitize_advisory_section
 from agents.gamelift_specialist import gamelift_agent
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
 from agents.specialist_capture import begin_specialist_capture, finish_specialist_capture
@@ -444,15 +445,18 @@ def run_orchestrator(query: str, context: dict = None):
                 )
             elif _cost_specialist_ran(specialist_outputs):
                 # Cost advisory/forecast path without a historical report. Use
-                # captured specialist output only, and strip any unvalidated
-                # financial claims instead of trusting orchestrator prose.
-                response = _compose_advisory_response(specialist_outputs) or _COST_REPORT_UNAVAILABLE
+                # deterministic nonnumeric guidance with safe operational markers.
+                response = _compose_advisory_response(specialist_outputs)
             else:
                 # If the routing model answers a cost topic directly, discard
-                # its prose and return deterministic nonnumeric guidance. Pure
-                # operational responses remain unchanged; mixed cost responses
-                # never reach this branch because specialist capture is active.
-                response = _COST_ADVISORY_GUIDANCE if _has_cost_topic(query) else response
+                # its prose and return deterministic nonnumeric guidance. For a
+                # non-cost query, inspect the actual model output as the final
+                # defense: volunteered monetary claims must not escape merely
+                # because the query classifier did not predict them.
+                if _has_cost_topic(query):
+                    response = _COST_ADVISORY_GUIDANCE
+                elif contains_unvalidated_financial_content(str(response)):
+                    response = sanitize_advisory_section("Cost", str(response))
 
         # Extract and save semantic memories for LTM (non-blocking)
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:

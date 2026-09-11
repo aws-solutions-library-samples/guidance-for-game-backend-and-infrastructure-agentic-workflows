@@ -44,6 +44,7 @@ class TestSystemIntegration:
         """Test backend is healthy and responding."""
         # Standard library
         import json
+        import uuid
 
         client = boto3.client("bedrock-agentcore", region_name=backend_config["region"])
         payload = json.dumps({"prompt": "health check"})
@@ -51,6 +52,8 @@ class TestSystemIntegration:
             agentRuntimeArn=backend_config["runtime_arn"],
             contentType="application/json",
             payload=payload.encode("utf-8"),
+            # Shared cost-report reuse requires a trusted transport actor (#365).
+            runtimeUserId=f"integ-{uuid.uuid4().hex}",
         )
         assert response["statusCode"] == 200
         assert "response" in response
@@ -60,6 +63,7 @@ class TestSystemIntegration:
         """Test agent can be invoked and responds (slow AI call)."""
         # Standard library
         import json
+        import uuid
 
         client = boto3.client("bedrock-agentcore", region_name=backend_config["region"])
 
@@ -68,6 +72,7 @@ class TestSystemIntegration:
             agentRuntimeArn=backend_config["runtime_arn"],
             contentType="application/json",
             payload=payload.encode("utf-8"),
+            runtimeUserId=f"integ-{uuid.uuid4().hex}",
         )
 
         assert "response" in response
@@ -88,6 +93,7 @@ class TestDeployedStackIntegration:
             # Test runtime by invoking it (no get_agent_runtime API)
             # Standard library
             import json
+            import uuid
 
             client = boto3.client("bedrock-agentcore", region_name=deployment["region"])
             payload = json.dumps({"prompt": "test"})
@@ -95,6 +101,8 @@ class TestDeployedStackIntegration:
                 agentRuntimeArn=deployment["runtime_arn"],
                 contentType="application/json",
                 payload=payload.encode("utf-8"),
+                # Shared cost-report reuse requires a trusted transport actor (#365).
+                runtimeUserId=f"integ-{uuid.uuid4().hex}",
             )
             # If invocation succeeds, runtime exists
             assert response is not None

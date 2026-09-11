@@ -73,7 +73,7 @@ _CODE_AMOUNT_RE = re.compile(
 # Explicit currency words require an adjacent value; a bare discussion of
 # "dollars" or "yen" is not itself a financial figure.
 _CURRENCY_WORD = r"dollars?|cents?|euros?|yen"
-_MONEY_NUMBER = r"(?:\d[\d,]*(?:\.\d+)?|\.\d+)(?!(?:\d|,\d|\.\d|\s*%))"
+_MONEY_NUMBER = r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)" r"(?![A-Za-z0-9]|,\d|\.\d|\s*%)"
 _CURRENCY_WORD_AMOUNT_RE = re.compile(
     rf"(?:\b(?:{_CURRENCY_WORD})\b[^\n]{{0,20}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,20}}\b(?:{_CURRENCY_WORD})\b)",
@@ -114,6 +114,10 @@ _FINANCIAL_PERCENT_RE = re.compile(
 _SHELL_POSITIONAL_RE = re.compile(r"(?<!')\$(?:[1-9](?![\d,.])|\{[1-9]\d*\})")
 _CODE_FRAGMENT_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
 _SHELL_LINE_RE = re.compile(r"^.*\b(?:awk|bash|printf|sed|xargs)\b.*$", re.IGNORECASE | re.MULTILINE)
+# Documentation links and versioned URLs can contain unrelated digits long after
+# financial vocabulary in ordinary prose (for example, an "AWS Costs" capability
+# bullet followed by a Python 3 tutorial URL). URLs are references, not claims.
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 def _neutralize_shell_positionals(text: str) -> str:
@@ -145,6 +149,7 @@ def contains_unvalidated_financial_content(text: str) -> bool:
     if not text:
         return False
     scannable = _neutralize_shell_positionals(text)
+    scannable = _URL_RE.sub("", scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)
