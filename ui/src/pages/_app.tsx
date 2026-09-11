@@ -6,6 +6,11 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
 import type { CognitoUser } from 'amazon-cognito-identity-js';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
+import {
+  clearSessionRefreshMarker,
+  refreshSessionOnce,
+  subscribeToSessionExpiration,
+} from '@/utils/sessionRefresh';
 import { ThemeProvider } from '../components/ThemeProvider';
 
 const SESSION_EXPIRED_MESSAGE = 'Your session expired. Sign in again.';
@@ -14,9 +19,14 @@ const PUBLIC_API_PATHS = new Set([
   '/api/health',
   '/api/auth/login',
   '/api/auth/logout',
+  '/api/auth/refresh',
 ]);
 
 interface Config {
+  session?: {
+    absoluteLifetimeHours: number;
+    idleRefreshSeconds: number;
+  };
   cognito: {
     region: string;
     userPoolId: string;
@@ -42,6 +52,7 @@ function MyApp({ Component, pageProps }: AppProps) {
   const [authNotice, setAuthNotice] = useState('');
   const [sessionCleanupPending, setSessionCleanupPending] = useState(false);
   const sessionExpirationInProgress = useRef(false);
+  const lastActivityAt = useRef(0);
 
   const handleSessionExpired = useCallback(() => {
     if (authMode !== 'cognito' || !user || sessionExpirationInProgress.current) {
@@ -49,6 +60,7 @@ function MyApp({ Component, pageProps }: AppProps) {
     }
 
     sessionExpirationInProgress.current = true;
+    clearSessionRefreshMarker();
     setSessionCleanupPending(true);
     try {
       user.signOut();
@@ -70,13 +82,42 @@ function MyApp({ Component, pageProps }: AppProps) {
       });
   }, [authMode, user]);
 
+  useEffect(() => subscribeToSessionExpiration(handleSessionExpired), [handleSessionExpired]);
+
+  useEffect(() => {
+    if (authMode !== 'cognito' || !user) return;
+    const markActivity = () => {
+      lastActivityAt.current = Date.now();
+    };
+    window.addEventListener('pointerdown', markActivity, { passive: true });
+    window.addEventListener('keydown', markActivity);
+    window.addEventListener('touchstart', markActivity, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', markActivity);
+      window.removeEventListener('keydown', markActivity);
+      window.removeEventListener('touchstart', markActivity);
+    };
+  }, [authMode, user]);
+
   useEffect(() => {
     const originalFetch = window.fetch;
     const sessionAwareFetch: typeof window.fetch = async (input, init) => {
+      const retryInput = typeof Request !== 'undefined' && input instanceof Request
+        ? input.clone()
+        : input;
       const response = await originalFetch(input, init);
-      if (response.status === 401 && isProtectedApiRequest(input)) {
-        handleSessionExpired();
+      if (response.status !== 401 || !isProtectedApiRequest(input)) return response;
+
+      const idleRefreshMs = (config?.session?.idleRefreshSeconds ?? 900) * 1000;
+      const recentlyActive = Date.now() - lastActivityAt.current <= idleRefreshMs;
+      if (authMode === 'cognito' && user && recentlyActive) {
+        const refreshed = await refreshSessionOnce(originalFetch);
+        if (refreshed) {
+          return originalFetch(retryInput, init);
+        }
       }
+
+      handleSessionExpired();
       return response;
     };
 
@@ -86,7 +127,7 @@ function MyApp({ Component, pageProps }: AppProps) {
         window.fetch = originalFetch;
       }
     };
-  }, [handleSessionExpired]);
+  }, [authMode, config?.session?.idleRefreshSeconds, handleSessionExpired, user]);
 
   useEffect(() => {
     // Dev-only auth bypass is decided from build-time env (NOT from cookies):
@@ -140,6 +181,8 @@ function MyApp({ Component, pageProps }: AppProps) {
         notice={authNotice}
         onAuthenticated={(cognitoUser) => {
           setAuthNotice('');
+          clearSessionRefreshMarker();
+          lastActivityAt.current = Date.now();
           setUser(cognitoUser);
         }}
       />
