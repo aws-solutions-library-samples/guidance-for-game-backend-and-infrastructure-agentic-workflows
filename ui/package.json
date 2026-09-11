@@ -74,7 +74,7 @@
     "jest-environment-jsdom": "^30.4.1",
     "node-mocks-http": "^1.18.1",
     "prismjs": "^1.30.0",
-    "typescript": "6.0.3"
+    "typescript": "7.0.2"
   },
   "overrides": {
     "prismjs": "^1.30.0",
