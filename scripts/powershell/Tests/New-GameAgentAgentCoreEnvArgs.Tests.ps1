@@ -40,7 +40,12 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -CostPromptArn 'cost-prompt' `
             -GameLiftKbId 'gamelift-kb' `
             -EksKbId 'eks-kb' `
-            -CostKbId 'cost-kb'
+            -CostKbId 'cost-kb' `
+            -TenantId 'tenant-1' `
+            -WorkspaceId 'workspace-1' `
+            -CostSnapshotTableName 'game-agent-cost-report-snapshots' `
+            -CostSnapshotRequired 'true' `
+            -CostSnapshotTtlSeconds '1800'
 
         ($result -join "`n") | Should -Be (@(
             '-env'
@@ -65,6 +70,38 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             'GBAW_EKS_KB_ID=eks-kb'
             '-env'
             'GBAW_COST_KB_ID=cost-kb'
+            '-env'
+            'GBAW_TENANT_ID=tenant-1'
+            '-env'
+            'GBAW_WORKSPACE_ID=workspace-1'
+            '-env'
+            'GBAW_COST_SNAPSHOT_TABLE_NAME=game-agent-cost-report-snapshots'
+            '-env'
+            'GBAW_COST_SNAPSHOT_REQUIRED=true'
+            '-env'
+            'GBAW_COST_SNAPSHOT_TTL_SECONDS=1800'
+        ) -join "`n")
+    }
+
+    It 'Omits shared cost report wiring when unresolved' {
+        $result = New-GameAgentAgentCoreEnvArgs `
+            -OrchestratorModelId 'orchestrator-model' `
+            -SpecialistModelId 'specialist-model' `
+            -TenantId 'tenant-1' `
+            -WorkspaceId '' `
+            -CostSnapshotTableName 'None' `
+            -CostSnapshotRequired '' `
+            -CostSnapshotTtlSeconds '1800'
+
+        ($result -join "`n") | Should -Be (@(
+            '-env'
+            'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
+            '-env'
+            'GBAW_SPECIALIST_MODEL_ID=specialist-model'
+            '-env'
+            'GBAW_TENANT_ID=tenant-1'
+            '-env'
+            'GBAW_COST_SNAPSHOT_TTL_SECONDS=1800'
         ) -join "`n")
     }
 
