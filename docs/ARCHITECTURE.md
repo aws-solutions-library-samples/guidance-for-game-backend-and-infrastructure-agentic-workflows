@@ -221,10 +221,25 @@ const client = new BedrockAgentCoreClient({
   region: process.env.AWS_REGION || 'us-west-2'
 });
 
+// Derived server-side from the verified Cognito access token — never from
+// browser or model input. Shown here as generic placeholders.
+const principalId = verifiedPrincipal.sub;      // trusted user identity
+const sessionId = `${environment}-${threadId}`; // environment-isolated session
+
 const command = new InvokeAgentRuntimeCommand({
   agentRuntimeArn: process.env.AGENTCORE_RUNTIME_ARN,
   contentType: 'application/json',
-  payload: new TextEncoder().encode(JSON.stringify({ prompt: message }))
+  // The trusted transport identity (runtimeUserId) binds the shared cost-report
+  // scope. It MUST match the body user_context.user_id, or the runtime rejects
+  // the request at the identity boundary. Values here are generic placeholders.
+  runtimeUserId: principalId,
+  payload: new TextEncoder().encode(JSON.stringify({
+    prompt: message,
+    user_context: {
+      user_id: principalId,
+      session_id: sessionId
+    }
+  }))
 });
 
 const response = await client.send(command);
