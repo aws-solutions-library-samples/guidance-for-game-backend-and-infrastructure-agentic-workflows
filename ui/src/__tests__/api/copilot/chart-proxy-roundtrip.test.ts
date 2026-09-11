@@ -1,7 +1,7 @@
 /**
  * Chart fence survives the real proxy path and is accepted by the contract (#255).
  *
- * This exercises the ACTUAL chat.ts proxy (production AgentCore SDK path): the
+ * This exercises the ACTUAL chat.ts proxy (production AgentCore JWT path): the
  * backend returns an assistant message that contains a ```chart fence, the
  * proxy unwraps the AgentCore JSON envelope + unescapes it, and formats it into
  * the CopilotKit message the browser renders. We assert the fence arrives byte-
@@ -10,6 +10,7 @@
  * agree across the proxy.
  */
 import { createMocks } from 'node-mocks-http';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import handler from '../../../pages/api/copilot/chat';
 import { parseChartSpec } from '../../../components/charts/chartContract';
 
@@ -20,10 +21,8 @@ jest.mock('@/utils/logger', () => ({
   redact: jest.fn((v?: string | null) => (v ? '<redacted>' : '<none>')),
 }));
 
-const mockAgentCoreSend = jest.fn();
-jest.mock('@aws-sdk/client-bedrock-agentcore', () => ({
-  BedrockAgentCoreClient: jest.fn(() => ({ send: mockAgentCoreSend })),
-  InvokeAgentRuntimeCommand: jest.fn((input: unknown) => ({ input })),
+jest.mock('@/utils/fetchWithTimeout', () => ({
+  fetchWithTimeout: jest.fn(),
 }));
 
 jest.mock('@aws-sdk/client-sts', () => ({
@@ -92,12 +91,10 @@ describe('/api/copilot/chat - chart fence proxy round-trip', () => {
       'cognito:groups': ['users'],
     });
     // AgentCore JSON-serializes string returns; the proxy JSON.parses that wrapper.
-    mockAgentCoreSend.mockResolvedValue({
-      response: {
-        async *[Symbol.asyncIterator]() {
-          yield Buffer.from(JSON.stringify(backendMessage));
-        },
-      },
+    (fetchWithTimeout as jest.Mock).mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: jest.fn().mockResolvedValue(JSON.stringify(backendMessage)),
     });
   });
 

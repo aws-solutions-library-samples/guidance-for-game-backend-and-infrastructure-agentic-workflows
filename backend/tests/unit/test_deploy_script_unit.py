@@ -29,6 +29,8 @@ OPTIONAL_VARIABLES = (
     "COST_KB_ID",
     "GBAW_TENANT_ID",
     "GBAW_WORKSPACE_ID",
+    "COGNITO_ISSUER",
+    "COGNITO_CLIENT_ID",
     "COST_SNAPSHOT_TABLE_NAME",
     "COST_SNAPSHOT_REQUIRED",
     "COST_SNAPSHOT_TTL_SECONDS",
@@ -77,6 +79,8 @@ def test_agentcore_env_args_omit_unresolved_optional_values(unresolved_value):
 
     assert args == [
         "-env",
+        "GBAW_HOSTED_RUNTIME=true",
+        "-env",
         "GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model",
         "-env",
         "GBAW_SPECIALIST_MODEL_ID=specialist-model",
@@ -96,6 +100,8 @@ def test_agentcore_env_args_include_resolved_optional_values():
             "COST_KB_ID": "cost-kb",
             "GBAW_TENANT_ID": "tenant-1",
             "GBAW_WORKSPACE_ID": "workspace-1",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-1",
             "COST_SNAPSHOT_TABLE_NAME": "game-agent-cost-report-snapshots",
             "COST_SNAPSHOT_REQUIRED": "true",
             "COST_SNAPSHOT_TTL_SECONDS": "1800",
@@ -103,6 +109,8 @@ def test_agentcore_env_args_include_resolved_optional_values():
     )
 
     assert args == [
+        "-env",
+        "GBAW_HOSTED_RUNTIME=true",
         "-env",
         "GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model",
         "-env",
@@ -130,6 +138,10 @@ def test_agentcore_env_args_include_resolved_optional_values():
         "-env",
         "GBAW_WORKSPACE_ID=workspace-1",
         "-env",
+        "GBAW_COGNITO_ISSUER=https://issuer.example",
+        "-env",
+        "GBAW_COGNITO_CLIENT_ID=client-1",
+        "-env",
         "GBAW_COST_SNAPSHOT_TABLE_NAME=game-agent-cost-report-snapshots",
         "-env",
         "GBAW_COST_SNAPSHOT_REQUIRED=true",
@@ -153,6 +165,8 @@ def test_agentcore_env_args_filter_optional_values_independently():
     )
 
     assert args == [
+        "-env",
+        "GBAW_HOSTED_RUNTIME=true",
         "-env",
         "GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model",
         "-env",

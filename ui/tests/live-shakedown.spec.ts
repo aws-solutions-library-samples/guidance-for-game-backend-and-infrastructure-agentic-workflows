@@ -13,7 +13,8 @@
  * Tags: @live
  */
 
-import { test, expect, Page } from '@playwright/test';
+import { test, expect } from '@playwright/test';
+import { assertHealthySpecialistReply, sendAndAwaitReply } from './helpers/live-chat';
 
 const BASE = process.env.SHAKEDOWN_URL!;
 const EMAIL = process.env.SHAKEDOWN_EMAIL!;
@@ -29,50 +30,6 @@ const SPECIALIST_QUERIES = [
   { name: 'EKS', q: 'Show me my EKS clusters.', expects: ['cluster'] },
   { name: 'Cost', q: 'What were my AWS costs over the last 7 days?', expects: ['cost', '$', 'spend'] },
 ];
-
-const ASSISTANT_MSG = '.copilotKitAssistantMessage';
-
-/**
- * Send a chat message and wait for the NEW assistant reply to finish streaming.
- * Returns the reply text. Counting assistant messages (rather than measuring
- * total innerText growth) is essential: the user's own message echoes into the
- * list immediately, which would satisfy any length-based check before the
- * agent has replied at all.
- */
-async function sendAndAwaitReply(page: Page, query: string): Promise<string> {
-  const before = await page.locator(ASSISTANT_MSG).count();
-
-  const chatInput = page.locator('textarea').first();
-  await chatInput.fill(query);
-  await chatInput.press('Enter');
-
-  // A new assistant message appears once the orchestrator responds.
-  // Orchestrator -> specialist -> MCP round trips run 20-90s.
-  await expect
-    .poll(async () => page.locator(ASSISTANT_MSG).count(), {
-      timeout: 180_000,
-      intervals: [2_000],
-    })
-    .toBeGreaterThan(before);
-
-  // Wait for streaming to settle: the reply is done when its text is
-  // non-trivial and unchanged across two consecutive polls.
-  const reply = page.locator(ASSISTANT_MSG).last();
-  let prev = '';
-  await expect
-    .poll(
-      async () => {
-        const cur = (await reply.innerText()).trim();
-        const settled = cur.length > 20 && cur === prev;
-        prev = cur;
-        return settled;
-      },
-      { timeout: 120_000, intervals: [3_000] }
-    )
-    .toBe(true);
-
-  return prev;
-}
 
 test.describe('Live shakedown (authenticated, real MCP)', { tag: ['@live'] }, () => {
   test.beforeAll(() => {
@@ -110,18 +67,7 @@ test.describe('Live shakedown (authenticated, real MCP)', { tag: ['@live'] }, ()
     // --- Drive each specialist query and assert a real, on-topic response ---
     for (const { name, q, expects } of SPECIALIST_QUERIES) {
       const reply = await sendAndAwaitReply(page, q);
-      const lower = reply.toLowerCase();
-
-      // Fail loudly on visible runtime/MCP errors surfaced to the user.
-      expect(lower, `${name} reply surfaced an error: ${reply.slice(0, 200)}`).not.toMatch(
-        /internal server error|traceback|exception|failed to|unable to reach|mcp .*error|503|502/i
-      );
-
-      // The specialist must have answered on-topic, not deflected.
-      expect(
-        expects.some((s) => lower.includes(s)),
-        `${name} reply looks off-topic (expected one of ${JSON.stringify(expects)}): ${reply.slice(0, 200)}`
-      ).toBe(true);
+      assertHealthySpecialistReply(reply, expects, name);
     }
   });
 });

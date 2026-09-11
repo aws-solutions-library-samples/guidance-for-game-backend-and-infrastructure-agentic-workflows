@@ -9,7 +9,6 @@
  */
 
 import { createMocks } from 'node-mocks-http';
-import { BedrockAgentCoreClient } from '@aws-sdk/client-bedrock-agentcore';
 import { STSClient } from '@aws-sdk/client-sts';
 import handler from '../../../pages/api/copilot/chat';
 
@@ -20,7 +19,6 @@ jest.mock('@/utils/logger', () => ({
   redact: jest.fn((v?: string | null) => (v ? `${v.slice(0, 2)}…(redacted)` : '<none>')),
 }));
 
-jest.mock('@aws-sdk/client-bedrock-agentcore');
 jest.mock('@aws-sdk/client-sts');
 
 const mockVerify = jest.fn();
@@ -37,7 +35,6 @@ jest.mock('@/utils/fetchWithTimeout', () => ({
   fetchWithTimeout: (...args: unknown[]) => mockFetchWithTimeout(...args),
 }));
 
-const mockAgentCoreSend = jest.fn();
 const mockStsSend = jest.fn();
 
 function chatRequest(cookie = 'cognito_id_token=header.payload.signature') {
@@ -59,9 +56,9 @@ function chatRequest(cookie = 'cognito_id_token=header.payload.signature') {
 describe('/api/copilot/chat - error surfacing (#250)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockFetchWithTimeout.mockReset();
     process.env.NODE_ENV = 'development';
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
-    (BedrockAgentCoreClient as jest.Mock).mockImplementation(() => ({ send: mockAgentCoreSend }));
     (STSClient as jest.Mock).mockImplementation(() => ({ send: mockStsSend }));
     mockStsSend.mockResolvedValue({ Account: '123456789012' });
     mockVerify.mockResolvedValue({
@@ -122,7 +119,7 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
     expect(text).not.toContain('10.0.2.17');
   });
 
-  it('surfaces production AccessDenied failures as a visible assistant message', async () => {
+  it('surfaces production runtime authorization failures as a visible assistant message', async () => {
     process.env.NODE_ENV = 'production';
     process.env.AGENTCORE_RUNTIME_ID = 'runtime-errtest';
     process.env.COGNITO_CLIENT_ID = 'web-client';
@@ -136,9 +133,11 @@ describe('/api/copilot/chat - error surfacing (#250)', () => {
       email: 'test@example.com',
       'cognito:groups': ['users'],
     });
-    const accessDenied = new Error('not authorized to invoke runtime');
-    accessDenied.name = 'AccessDeniedException';
-    mockAgentCoreSend.mockRejectedValue(accessDenied);
+    mockFetchWithTimeout.mockResolvedValue({
+      ok: false,
+      status: 403,
+      text: jest.fn().mockResolvedValue('forbidden'),
+    });
 
     const { req, res } = chatRequest(
       'cognito_access_token=access-token; cognito_id_token=id-token'

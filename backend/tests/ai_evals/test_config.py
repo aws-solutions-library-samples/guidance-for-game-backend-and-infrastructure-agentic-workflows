@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import uuid
+from urllib.parse import quote
 
 # Third-party packages
 import pytest
@@ -46,53 +47,44 @@ def make_agent_request(query: str, config: dict = None):
         config = get_test_config()
 
     if config["mode"] == "deployed":
-        # Use AWS SDK to invoke deployed AgentCore Runtime
+        # Hosted production runtimes use Cognito JWT bearer authorization. The
+        # test token must be short-lived and supplied by the caller; tests never
+        # persist credentials or fall back to a spoofable body identity.
+        token = os.getenv("GBAW_TEST_ACCESS_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("GBAW_TEST_ACCESS_TOKEN is required for deployed AI evaluations")
+
+        unique = uuid.uuid4().hex
+        actor_id = os.getenv("GBAW_TEST_ACTOR_ID", "").strip()
+        payload = {
+            "prompt": query,
+            "user_context": {
+                **({"user_id": actor_id} if actor_id else {}),
+                "session_id": f"aieval-session-{unique}",
+            },
+        }
+        runtime_url = (
+            f"https://bedrock-agentcore.{config['region']}.amazonaws.com/runtimes/"
+            f"{quote(config['runtime_arn'], safe='')}/invocations?qualifier=DEFAULT"
+        )
+        response = requests.post(
+            runtime_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": f"aieval-session-{unique}",
+            },
+            data=json.dumps(payload),
+            timeout=180,
+        )
+        response.raise_for_status()
+        response_text = response.text
+
         try:
-            # Third-party packages
-            import boto3
-
-            client = boto3.client("bedrock-agentcore", region_name=config["region"])
-
-            # Use a FRESH unique session per request. Without this, requests fall
-            # to the shared anonymous/"default" session, where one interrupted turn
-            # (orphaned toolUse) bricks every later call for the whole test run
-            # (see #155). A unique session_id per request isolates each test.
-            unique = uuid.uuid4().hex
-            actor_id = f"aieval-{unique}"
-            payload = json.dumps(
-                {
-                    "prompt": query,
-                    "user_context": {
-                        "user_id": actor_id,
-                        "session_id": f"aieval-session-{unique}",
-                    },
-                }
-            )
-            payload_bytes = payload.encode("utf-8")
-
-            response = client.invoke_agent_runtime(
-                agentRuntimeArn=config["runtime_arn"],
-                contentType="application/json",
-                payload=payload_bytes,
-                # Shared cost-report reuse requires a trusted transport actor (#365).
-                # Match the body user_id so the boundary sees a consistent identity.
-                runtimeUserId=actor_id,
-            )
-
-            # Parse response - use 'response' key not 'payload'
-            response_text = response["response"].read().decode("utf-8")
-
-            # Handle JSON-serialized string format from AgentCore
-            try:
-                parsed = json.loads(response_text)
-                if isinstance(parsed, str):
-                    return parsed
-                return str(parsed)
-            except Exception:
-                return response_text
-
-        except Exception as e:
-            raise Exception(f"Failed to invoke deployed AgentCore Runtime: {e}")
+            parsed = json.loads(response_text)
+            return parsed if isinstance(parsed, str) else str(parsed)
+        except Exception:
+            return response_text
 
     else:
         # Use HTTP request to local server
@@ -114,9 +106,9 @@ def check_backend_available(config: dict = None):
         config = get_test_config()
 
     if config["mode"] == "deployed":
-        # For deployed mode, just check if we have valid config
-        # Don't actually invoke the runtime (too slow, can throttle)
-        return bool(config.get("runtime_arn") and config.get("runtime_id"))
+        return bool(
+            config.get("runtime_arn") and config.get("runtime_id") and os.getenv("GBAW_TEST_ACCESS_TOKEN", "").strip()
+        )
     else:
         # Check if local server is running by trying to connect
         try:

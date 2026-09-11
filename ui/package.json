@@ -24,7 +24,6 @@
     "test:all": "npm run test && npm run test:e2e"
   },
   "dependencies": {
-    "@aws-sdk/client-bedrock-agentcore": "^3.1075.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1127.0",
     "@aws-sdk/client-cloudwatch": "^3.1075.0",
     "@aws-sdk/client-cognito-identity-provider": "^3.1095.0",

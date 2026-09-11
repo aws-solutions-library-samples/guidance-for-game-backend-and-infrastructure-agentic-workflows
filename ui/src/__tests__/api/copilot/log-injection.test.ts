@@ -13,7 +13,6 @@ jest.mock('../../../utils/logger', () => ({
 }));
 
 // Mock AWS SDK
-jest.mock('@aws-sdk/client-bedrock-agentcore');
 jest.mock('@aws-sdk/client-sts');
 jest.mock('aws-jwt-verify');
 

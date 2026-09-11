@@ -39,16 +39,21 @@ from agents.cost_report_scope import (
 )
 from agents.orchestrator import run_orchestrator
 from config.settings import (
+    ALLOW_LOCAL_IDENTITY_BYPASS,
     AWS_REGION,
     BOTO3_CLIENT_CONFIG,
+    COGNITO_CLIENT_ID,
+    COGNITO_ISSUER,
     COST_SNAPSHOT_STORE_REQUIRED,
     COST_SNAPSHOT_TABLE_NAME,
     DEPLOYMENT_TENANT_ID,
     DEPLOYMENT_WORKSPACE_ID,
+    HOSTED_RUNTIME,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
     USE_BEDROCK_SESSIONS,
 )
+from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
 from utils.logger import logger
 from utils.response_parser import ResponseParser
 from utils.security import (
@@ -64,66 +69,6 @@ from utils.security import (
     validate_user_context,
     verify_request_authorization,
 )
-
-# Transport identity header established by the AgentCore platform for SIGV4
-# inbound auth (the SDK ``runtimeUserId``). This is the ONLY transport value
-# trusted to establish a shared cost-report scope. The caller-supplied custom
-# passthrough header namespace (``X-Amzn-Bedrock-AgentCore-Runtime-Custom-*``)
-# is attacker-influenced and MUST NOT be trusted for authorization.
-RUNTIME_USER_ID_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-User-Id"
-
-
-def _lookup_header_case_insensitive(headers, name):
-    """Return the value for ``name`` from a plain header dict, case-insensitively.
-
-    Returns ``None`` when ``headers`` is falsy, not a mapping, or the header is
-    absent.
-    """
-    if not headers or not hasattr(headers, "items"):
-        return None
-    target = name.casefold()
-    for key, value in headers.items():
-        if isinstance(key, str) and key.casefold() == target:
-            return value
-    return None
-
-
-def extract_runtime_user_id(context):
-    """Extract the trusted AgentCore runtime user identity from a RequestContext.
-
-    Reads the ``X-Amzn-Bedrock-AgentCore-Runtime-User-Id`` header
-    case-insensitively. The forwarded ``context.request_headers`` map is checked
-    first; if the header is absent there (the runtime allowlist does not forward
-    this reserved header into ``request_headers``), the underlying Starlette
-    request object (``context.request``) is consulted, whose ``headers`` mapping
-    is itself case-insensitive and carries the raw inbound headers.
-
-    Only this platform-established identity is trusted. Caller-supplied custom
-    passthrough headers are never consulted here, so they can never establish a
-    shared snapshot scope.
-
-    Returns the stripped identity string, or ``None`` when no context is supplied
-    or the header is missing/blank.
-    """
-    if context is None:
-        return None
-
-    value = _lookup_header_case_insensitive(getattr(context, "request_headers", None), RUNTIME_USER_ID_HEADER)
-
-    if not value:
-        request = getattr(context, "request", None)
-        request_headers = getattr(request, "headers", None)
-        if request_headers is not None and hasattr(request_headers, "get"):
-            try:
-                # Starlette's Headers.get is case-insensitive.
-                value = request_headers.get(RUNTIME_USER_ID_HEADER)
-            except Exception:
-                value = None
-
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    return value or None
 
 
 def validate_aws_credentials():
@@ -279,18 +224,18 @@ def invoke_agent(prompt, context=None):
                 logger.error("❌ Service not ready: AWS credentials unavailable")
                 return "The service is still initializing and can't reach AWS yet. Please retry in a few moments."
 
-        # Establish the trusted transport identity (runtimeUserId) from the
-        # AgentCore platform. Only this value may bind a shared cost-report scope.
-        trusted_transport_actor = extract_runtime_user_id(context)
+        # The hosted runtime is configured for Cognito JWT bearer authorization.
+        # AgentCore forwards the validated Authorization header to agent code;
+        # application code independently verifies it before admitting claims.
+        verified_runtime_identity = None
 
-        # DIAGNOSTIC: Check AgentCore context object. Never log the raw identity
-        # value — only whether the platform supplied one.
+        # DIAGNOSTIC: Check AgentCore context object. Never log token contents or
+        # raw identity values.
         logger.info("🔍 AgentCore Context Inspection:")
         if context:
             logger.info(f"   Context type: {type(context)}")
             if hasattr(context, "session_id"):
                 logger.info(f"   context.session_id: {context.session_id}")
-            logger.info(f"   Runtime user identity present: {trusted_transport_actor is not None}")
         else:
             logger.info("   Context is None")
 
@@ -320,15 +265,39 @@ def invoke_agent(prompt, context=None):
             logger.error(f"🚨 Security violation detected: {e}")
             return "I'm sorry, but your request could not be processed due to security restrictions."
 
+        shared_report_mode = COST_SNAPSHOT_STORE_REQUIRED or bool(COST_SNAPSHOT_TABLE_NAME)
+        local_identity_bypass = ALLOW_LOCAL_IDENTITY_BYPASS and not HOSTED_RUNTIME
+        if not local_identity_bypass:
+            try:
+                verified_runtime_identity = verify_cognito_runtime_identity(
+                    context,
+                    issuer=COGNITO_ISSUER,
+                    client_id=COGNITO_CLIENT_ID,
+                )
+            except RuntimeIdentityError:
+                logger.warning("⚠️ Rejected request: Cognito runtime identity verification failed")
+                return "I'm sorry, but your request could not be processed due to an identity verification issue."
+
+            if not verified_runtime_identity.groups.intersection({"admin", "users"}):
+                logger.warning("⚠️ Rejected request: verified user is not in an approved group")
+                return "I'm sorry, but your request could not be processed due to an identity verification issue."
+
         # Security: Log sanitized request info (redact sensitive data)
         logger.info(f"📝 User prompt (sanitized): '{sanitize_log_data(user_prompt, 100)}'")
         logger.info(f"🔗 Thread ID: {thread_id}")
 
-        # Extract rich user identity
-        persistent_user_id = user_context.get("user_id", "anonymous")
+        # Hosted identity comes only from the cryptographically verified access
+        # token. Local development keeps the existing body identity fallback
+        # because it has no hosted shared store or JWT authorizer.
+        persistent_user_id = (
+            verified_runtime_identity.subject_id
+            if verified_runtime_identity is not None
+            else user_context.get("user_id", "anonymous")
+        )
         username = user_context.get("username", "user")
         display_name = user_context.get("display_name", username)
-        auth_type = user_context.get("auth_type", "unknown")
+        auth_type = "cognito" if verified_runtime_identity is not None else user_context.get("auth_type", "unknown")
+        actor_id = persistent_user_id
 
         # Rate limiting: per-user throttle (WA GenAI Lens: Operational Excellence 2.2)
         try:
@@ -342,27 +311,40 @@ def invoke_agent(prompt, context=None):
         # This prevents dev/prod memory collision while maintaining conversation continuity
         session_id = user_context.get("session_id") or thread_id or "default"
 
-        # PRIORITY: Use the trusted AgentCore transport identity (runtimeUserId)
-        # for the actor id when present; otherwise fall back to the body-supplied
-        # persistent user id for local/dev flows. The trusted transport identity
-        # was resolved above from the platform-established header only.
-        actor_id = trusted_transport_actor or persistent_user_id
-
         logger.info(f"👤 Authenticated user context [{auth_type}]")
         logger.info(f"🆔 Actor ID: {actor_id}")
         logger.info(f"📍 Session ID: {session_id} (environment-isolated)")
         logger.info(f"🔑 Persistent User ID: {persistent_user_id}")
 
-        # Create enhanced agent context with rich user info
-        # Note: AgentCore Memory automatically loads conversation history via runtimeSessionId
+        verified_groups = (
+            sorted(verified_runtime_identity.groups)
+            if verified_runtime_identity is not None
+            else user_context.get("groups", [])
+        )
+        verified_scopes = (
+            sorted(verified_runtime_identity.scopes)
+            if verified_runtime_identity is not None
+            else user_context.get("scopes", [])
+        )
+        verified_client_id = (
+            verified_runtime_identity.client_id
+            if verified_runtime_identity is not None
+            else user_context.get("client_id")
+        )
+
+        # Create enhanced agent context with rich user info. Hosted authority
+        # fields are reconstructed from the verified JWT and deployment bindings;
+        # body claims cannot elevate or replace them.
         agent_context = {
             "user_id": persistent_user_id,
-            "client_id": user_context.get("client_id"),
-            "audience": user_context.get("audience"),
-            "groups": user_context.get("groups", []),
-            "scopes": user_context.get("scopes", []),
-            "tenant": user_context.get("tenant"),
-            "workspace": user_context.get("workspace"),
+            "client_id": verified_client_id,
+            "audience": verified_client_id if verified_runtime_identity is not None else user_context.get("audience"),
+            "groups": verified_groups,
+            "scopes": verified_scopes,
+            "tenant": DEPLOYMENT_TENANT_ID if verified_runtime_identity is not None else user_context.get("tenant"),
+            "workspace": (
+                DEPLOYMENT_WORKSPACE_ID if verified_runtime_identity is not None else user_context.get("workspace")
+            ),
             "session_id": session_id,
             "thread_id": thread_id,
             "username": username,
@@ -392,16 +374,12 @@ def invoke_agent(prompt, context=None):
         # so nested specialist tool calls inherit it, and reset afterwards so the
         # scope never leaks across requests handled by the same worker.
         #
-        # In shared mode (a snapshot table is configured, or the shared store is
-        # required) the scope actor is taken ONLY from the trusted transport
-        # identity — the platform-established runtimeUserId header — never the
-        # request body or a caller-supplied custom passthrough header. A trusted
-        # actor is required and a conflicting body identity is rejected as an
+        # In shared mode the actor is taken only from the independently verified
+        # Cognito access token. A conflicting body identity is rejected as an
         # identity-confusion signal. Raw identifiers are never logged.
-        shared_report_mode = COST_SNAPSHOT_STORE_REQUIRED or bool(COST_SNAPSHOT_TABLE_NAME)
         try:
             report_actor = resolve_scope_actor(
-                trusted_actor=trusted_transport_actor,
+                trusted_actor=(verified_runtime_identity.subject_id if verified_runtime_identity is not None else None),
                 body_user_id=user_context.get("user_id"),
                 shared_mode=shared_report_mode,
             )

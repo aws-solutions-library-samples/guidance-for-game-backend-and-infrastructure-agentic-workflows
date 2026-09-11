@@ -10,6 +10,7 @@
 
 import { test, expect } from '@playwright/test';
 import * as path from 'path';
+import { assertHealthySpecialistReply, sendAndAwaitReply } from './helpers/live-chat';
 
 // Get credentials from environment
 const TEST_EMAIL = process.env.TEST_EMAIL;
@@ -22,6 +23,7 @@ test.skip(!TEST_EMAIL || !TEST_PASSWORD || !FRONTEND_URL, 'TEST_EMAIL, TEST_PASS
 test.describe('Full System Test', () => {
 
   test('should login, chat, and exercise MCP tools', async ({ page }, testInfo) => {
+    test.setTimeout(900_000);
     test.setTimeout(900_000); // Cognito login plus five live agent/MCP round-trips
     // Use Playwright's output directory for screenshots
     const screenshotDir = testInfo.outputDir;
@@ -94,82 +96,41 @@ test.describe('Full System Test', () => {
       {
         query: 'What can you help me with?',
         description: 'Basic capabilities',
-        expectMCP: false,
-        waitTime: 15000
+        expectedTerms: ['aws', 'gamelift', 'eks', 'cost'],
       },
       {
         query: 'What are my current AWS costs this month?',
-        description: 'Cost Specialist - should use Cost Explorer MCP',
-        expectMCP: true,
-        waitTime: 30000
+        description: 'Cost Specialist',
+        expectedTerms: ['cost', '$', 'spend'],
       },
       {
         query: 'List my EKS clusters',
-        description: 'EKS Specialist - should use EKS MCP',
-        expectMCP: true,
-        waitTime: 30000
+        description: 'EKS Specialist',
+        expectedTerms: ['cluster', 'eks'],
       },
       {
         query: 'Show me GameLift fleet status',
-        description: 'GameLift Specialist - should use CCAPI MCP',
-        expectMCP: true,
-        waitTime: 30000
+        description: 'GameLift Specialist',
+        expectedTerms: ['fleet', 'gamelift'],
       },
       {
         query: 'Do you remember what I asked you about earlier in this conversation?',
-        description: 'Memory test - should recall previous queries',
-        expectMCP: false,
-        waitTime: 20000
-      }
+        description: 'Conversation memory',
+        expectedTerms: ['cost', 'eks', 'gamelift', 'asked'],
+      },
     ];
 
     for (let i = 0; i < testQueries.length; i++) {
-      const { query, description, expectMCP, waitTime } = testQueries[i];
+      const { query, description, expectedTerms } = testQueries[i];
       console.log(`\nQuery ${i + 1}/${testQueries.length}: ${description}`);
-      console.log(`  Sending: "${query.substring(0, 50)}${query.length > 50 ? '...' : ''}"`);
 
-      // Find and fill chat input
-      const input = page.locator('textarea').first();
-      await expect(input).toBeVisible();
-      await input.fill(query);
+      const reply = await sendAndAwaitReply(page, query);
+      assertHealthySpecialistReply(reply, expectedTerms, description);
 
-      // Send message (try Enter key)
-      await input.press('Enter');
-      console.log(`  Message sent`);
-
-      // Wait for loading to complete (button state or response indicator)
-      await page.waitForTimeout(2000); // Initial wait
-
-      // Look for response - either new message content or loading indicator disappears
-      try {
-        // Wait for any sign that the response is complete
-        await page.waitForFunction(
-          () => {
-            // Check if there's a loading indicator
-            const loading = document.querySelector('[class*="loading"], [class*="typing"], [class*="spinner"]');
-            if (loading) return false;
-
-            // Check if there's new content in the chat
-            const messages = document.querySelectorAll('[class*="message"], [class*="chat"], [class*="response"]');
-            return messages.length > 0;
-          },
-          { timeout: waitTime }
-        );
-      } catch {
-        // Continue even if selector doesn't match
-        console.log(`  (Timeout waiting for response indicator)`);
-      }
-
-      // Wait additional time for response to render
-      await page.waitForTimeout(3000);
-
-      // Take screenshot of this query result
-      await page.screenshot({ path: path.join(screenshotDir, `system-test-0${i + 2}-query-${i + 1}.png`), fullPage: true });
-      console.log(`  Screenshot saved`);
-
-      if (expectMCP) {
-        console.log(`  MCP call expected - verify in CloudWatch`);
-      }
+      await page.screenshot({
+        path: path.join(screenshotDir, `system-test-0${i + 2}-query-${i + 1}.png`),
+        fullPage: true,
+      });
     }
 
     // Step 4: Verify UI state after all queries
@@ -180,6 +141,7 @@ test.describe('Full System Test', () => {
     // Check we're still logged in
     const userMenu = page.locator('.ga-user-button, [class*="user-menu"], [class*="avatar"]').first();
     const isLoggedIn = await userMenu.isVisible().catch(() => false);
+    expect(isLoggedIn).toBe(true);
     console.log(`  User still logged in: ${isLoggedIn}`);
 
     // Take final screenshot

@@ -1,5 +1,5 @@
 import { createMocks } from 'node-mocks-http';
-import { InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import { logDebug, logError, logInfo } from '@/utils/logger';
 import handler from '../../../pages/api/copilot/chat';
 
@@ -10,10 +10,8 @@ jest.mock('@/utils/logger', () => ({
   redact: jest.fn((value?: string | null) => (value ? '<redacted>' : '<none>')),
 }));
 
-const mockAgentCoreSend = jest.fn();
-jest.mock('@aws-sdk/client-bedrock-agentcore', () => ({
-  BedrockAgentCoreClient: jest.fn(() => ({ send: mockAgentCoreSend })),
-  InvokeAgentRuntimeCommand: jest.fn((input: unknown) => ({ input })),
+jest.mock('@/utils/fetchWithTimeout', () => ({
+  fetchWithTimeout: jest.fn(),
 }));
 
 jest.mock('@aws-sdk/client-sts', () => ({
@@ -84,12 +82,10 @@ describe('/api/copilot/chat - trusted identity propagation', () => {
       email: 'person@example.com',
       'cognito:groups': ['admin'],
     });
-    mockAgentCoreSend.mockResolvedValue({
-      response: {
-        async *[Symbol.asyncIterator]() {
-          yield Buffer.from(JSON.stringify('ok'));
-        },
-      },
+    (fetchWithTimeout as jest.Mock).mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: jest.fn().mockResolvedValue(JSON.stringify('ok')),
     });
   });
 
@@ -117,8 +113,24 @@ describe('/api/copilot/chat - trusted identity propagation', () => {
     await handler(req, res);
 
     expect(res._getStatusCode()).toBe(200);
-    const commandInput = (InvokeAgentRuntimeCommand as jest.Mock).mock.calls[0][0];
-    const payload = JSON.parse(Buffer.from(commandInput.payload).toString('utf-8'));
+    expect(fetchWithTimeout).toHaveBeenCalledTimes(1);
+
+    const [runtimeUrl, requestInit] = (fetchWithTimeout as jest.Mock).mock.calls[0];
+    expect(runtimeUrl).toBe(
+      'https://bedrock-agentcore.us-west-2.amazonaws.com/runtimes/' +
+        encodeURIComponent('arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/runtime-identity') +
+        '/invocations?qualifier=DEFAULT',
+    );
+    expect(requestInit).toMatchObject({
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer access-token',
+        'Content-Type': 'application/json',
+        'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': 'prod-thread-identity',
+      },
+    });
+
+    const payload = JSON.parse(requestInit.body);
 
     expect(payload.user_context).toMatchObject({
       user_id: 'subject-123',
@@ -156,7 +168,6 @@ describe('/api/copilot/chat - trusted identity propagation', () => {
 
     expect(res._getStatusCode()).toBe(403);
     expect(mockIdVerify).not.toHaveBeenCalled();
-    expect(mockAgentCoreSend).not.toHaveBeenCalled();
   });
 
   it('rejects an expired access token before reading identity claims', async () => {
@@ -177,6 +188,5 @@ describe('/api/copilot/chat - trusted identity propagation', () => {
 
     expect(res._getStatusCode()).toBe(503);
     expect(JSON.parse(res._getData()).error).toBe('Identity configuration unavailable');
-    expect(mockAgentCoreSend).not.toHaveBeenCalled();
   });
 });

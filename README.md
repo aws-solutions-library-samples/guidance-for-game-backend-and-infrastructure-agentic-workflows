@@ -52,7 +52,7 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 
 1. User authenticates via Amazon Cognito (JWT tokens in HttpOnly cookies)
 2. User sends a natural language query through the Next.js frontend on ECS Express (Fargate + ALB)
-3. Frontend invokes Bedrock AgentCore Runtime using the AWS SDK with SigV4 authentication
+3. Frontend invokes Bedrock AgentCore Runtime with the verified Cognito access token; AgentCore JWT authorization and runtime verification bind the request to the user
 4. AgentCore routes the request to the Orchestrator agent
 5. Amazon Bedrock Guardrails filter input for prompt injection, off-topic content, and PII
 6. Orchestrator classifies the query and delegates to the appropriate specialist agent
@@ -365,7 +365,7 @@ The project includes unit, integration, end-to-end, and AI evaluation tests.
 | `./test-local.sh` | Unit tests only | None |
 | `./test-cloud.sh` | Cloud integration tests | Deployed stack |
 | `./test-e2e.sh` | End-to-end browser tests | Running services |
-| `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack |
+| `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack + short-lived Cognito access token |
 | `./test-stress.sh` | Performance and load tests | Deployed stack |
 | `./test-memory.sh` | Memory subsystem tests | Deployed stack |
 
