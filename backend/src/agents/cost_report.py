@@ -20,7 +20,15 @@ from strands import tool
 
 # Local modules
 from agents.chart_directive import CHART_CONTRACT_VERSION, render_chart_fence
-from config.settings import AWS_REGION, BOTO3_CLIENT_CONFIG
+from agents.cost_report_scope import current_scope, current_scope_hash, is_trusted_scope
+from agents.cost_service_aliases import resolve_service_selection
+from agents.cost_snapshot_store import (
+    CostSnapshotStore,
+    CostSnapshotStoreError,
+    SnapshotRecord,
+    build_default_snapshot_store,
+)
+from config.settings import AWS_REGION, BOTO3_CLIENT_CONFIG, COST_SNAPSHOT_TTL_SECONDS
 from utils.logger import logger
 
 _CENT = Decimal("0.01")
@@ -153,6 +161,28 @@ class CostReportCache:
     def clear(self) -> None:
         with self._lock:
             self._cache.clear()
+
+
+class _LegacyCacheSnapshotStore:
+    """Adapt a process-local :class:`CostReportCache` to the snapshot store API.
+
+    Preserves the historical local/test behavior for callers that pass an
+    explicit ``cache=``: snapshots are keyed by report ID within a single
+    process and scope is not enforced (the shared stores enforce scope). This
+    keeps backwards compatibility without reintroducing cross-worker sharing on
+    the in-process cache.
+    """
+
+    def __init__(self, cache: CostReportCache) -> None:
+        self._cache = cache
+
+    requires_trusted_scope = False
+
+    def put(self, record: SnapshotRecord) -> None:
+        self._cache.put(record.snapshot)
+
+    def get(self, report_id: str, scope_hash: str) -> CostReportSnapshot | None:
+        return self._cache.get(report_id)
 
 
 @dataclass(frozen=True)
@@ -407,14 +437,40 @@ class CostReportService:
         self,
         *,
         client_factory: Callable[[], Any] = _default_cost_explorer_client,
+        store: CostSnapshotStore | None = None,
         cache: CostReportCache | None = None,
         now: Callable[[], datetime] = _default_queried_at,
         report_id_factory: Callable[[], str] | None = None,
+        ttl_seconds: int = COST_SNAPSHOT_TTL_SECONDS,
     ) -> None:
         self._client_factory = client_factory
-        self._cache = cache or CostReportCache()
+        # Resolution order: an explicit store wins; an explicit legacy cache is
+        # adapted for backwards-compatible local/test behavior; otherwise the
+        # configured shared store (DynamoDB in the cloud, in-memory locally).
+        if store is not None:
+            self._store: CostSnapshotStore = store
+        elif cache is not None:
+            self._store = _LegacyCacheSnapshotStore(cache)
+        else:
+            self._store = build_default_snapshot_store()
+        self._requires_trusted_scope = bool(getattr(self._store, "requires_trusted_scope", False))
         self._now = now
         self._report_id_factory = report_id_factory or (lambda: f"cost-{uuid.uuid4().hex}")
+        self._ttl_seconds = ttl_seconds
+
+    def _ensure_trusted_scope(self) -> None:
+        """Reject an untrusted scope when the store requires one.
+
+        A shared/DynamoDB store must not persist or resolve a report under the
+        unscoped, empty, or anonymous actor. Raising here fails closed before any
+        store call. The raw scope values are never logged.
+        """
+        if self._requires_trusted_scope and not is_trusted_scope(current_scope()):
+            raise CostReportError(
+                "COST_REPORT_SCOPE_REQUIRED",
+                "A trusted, authenticated session is required to create or reuse a cost report.",
+                retryable=False,
+            )
 
     def create_report(
         self,
@@ -423,6 +479,7 @@ class CostReportService:
         metric: str = "UnblendedCost",
     ) -> CostReportSnapshot:
         started_at = time.perf_counter()
+        self._ensure_trusted_scope()
         start, end_inclusive, end_exclusive = _parse_period(start_date, end_date_inclusive)
         if metric not in _SUPPORTED_METRICS:
             raise CostReportError(
@@ -552,7 +609,23 @@ class CostReportService:
             estimated=estimated,
         )
         snapshot = CostReportSnapshot(report=report, raw_services=raw_services)
-        self._cache.put(snapshot)
+        expires_at = int(queried_at_datetime.timestamp()) + self._ttl_seconds
+        record = SnapshotRecord(
+            report_id=report.report_id,
+            scope_hash=current_scope_hash(),
+            snapshot=snapshot,
+            expires_at=expires_at,
+        )
+        try:
+            self._store.put(record)
+        except CostSnapshotStoreError as exc:
+            # Fail closed: do not hand back a report ID that was not durably
+            # stored, since a follow-up would fail nondeterministically.
+            raise CostReportError(
+                "COST_REPORT_STORE_UNAVAILABLE",
+                "The cost report could not be saved for reuse. Retry the request.",
+                retryable=True,
+            ) from exc
 
         latency_ms = round((time.perf_counter() - started_at) * 1000)
         logger.info(
@@ -563,7 +636,17 @@ class CostReportService:
         return snapshot
 
     def reuse_report(self, report_id: str, service_names: list[str] | None = None) -> CostReport | CostReportSelection:
-        snapshot = self._cache.get(report_id)
+        self._ensure_trusted_scope()
+        try:
+            snapshot = self._store.get(report_id, current_scope_hash())
+        except CostSnapshotStoreError as exc:
+            # A store read failure is indistinguishable to the user from an
+            # unknown report; fail closed with the generic not-found response.
+            raise CostReportError(
+                "COST_REPORT_NOT_FOUND",
+                "That cost report snapshot is unavailable or expired. Run a new cost report and try again.",
+                retryable=True,
+            ) from exc
         if snapshot is None:
             raise CostReportError(
                 "COST_REPORT_NOT_FOUND",
@@ -579,23 +662,14 @@ class CostReportService:
             return snapshot.report
 
         by_name = {item.service: item for item in snapshot.raw_services}
-        by_casefold = {item.service.casefold(): item for item in snapshot.raw_services}
-        selected: list[RawServiceCost] = []
-        missing: list[str] = []
-        seen_services: set[str] = set()
-        for requested_name in service_names:
-            match = by_name.get(requested_name) or by_casefold.get(requested_name.casefold())
-            if match is None:
-                missing.append(requested_name)
-            elif match.service not in seen_services:
-                selected.append(match)
-                seen_services.add(match.service)
-        if missing:
+        resolution = resolve_service_selection(service_names, by_name.keys())
+        if resolution.missing:
             raise CostReportError(
                 "SERVICE_NOT_IN_REPORT",
                 "One or more requested services are not present in that report snapshot. Check the service names and retry.",
                 retryable=False,
             )
+        selected: list[RawServiceCost] = [by_name[name] for name in resolution.resolved]
 
         selected_raw = sum((item.amount for item in selected), Decimal("0"))
         total_raw = Decimal(snapshot.report.total_raw)

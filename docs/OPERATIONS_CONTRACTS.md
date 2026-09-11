@@ -146,9 +146,25 @@ hard limit. Referenced file or diff content MUST be supplied through its
 limits cannot be verified. `validate_authorization_binding` binds a decision to
 the exact operation, requester, policy, authority requirement, and mandatory
 approval mode. `validate_approval_binding` requires one granted approval under
-the operation's exact policy and binds it to exact stored content. Identity
-lifecycle and expiry enforcement belong to the trusted services defined by
-later operations issues.
+the operation's exact policy and binds it to exact stored content.
+
+`operations.approval.ApprovalService` enforces the runtime side of that
+contract. It accepts only an operation identifier from the untrusted action
+payload, requires a fresh `VerifiedPrincipal` supplied out-of-band by an
+authenticated adapter, rechecks the configured client, audience, tenant, and
+workspace boundary, and reloads the stored operation. `VerifiedPrincipal` is a
+trusted capability and not a request-deserializable data-transfer object. The
+service recalculates the canonical hash, enforces operation state and expiry,
+applies the exact versioned approval policy, and constructs the approver field
+from verified identity rather than request data.
+
+Credential and operation expiry are rechecked immediately before persistence.
+The persistence port carries expected hash and state preconditions plus an
+exclusive `commit_not_after` deadline set to the earliest credential,
+operation, or approval-record expiry. It returns a typed recorded,
+precondition-failed, or deadline-expired outcome; raw string lookalikes fail
+closed. The durable store must enforce the hash, state, and deadline in the same
+conditional transaction that records the approval and state transition.
 
 ## Source-Control Profile
 

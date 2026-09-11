@@ -58,11 +58,12 @@ def make_agent_request(query: str, config: dict = None):
             # (orphaned toolUse) bricks every later call for the whole test run
             # (see #155). A unique session_id per request isolates each test.
             unique = uuid.uuid4().hex
+            actor_id = f"aieval-{unique}"
             payload = json.dumps(
                 {
                     "prompt": query,
                     "user_context": {
-                        "user_id": f"aieval-{unique}",
+                        "user_id": actor_id,
                         "session_id": f"aieval-session-{unique}",
                     },
                 }
@@ -70,7 +71,12 @@ def make_agent_request(query: str, config: dict = None):
             payload_bytes = payload.encode("utf-8")
 
             response = client.invoke_agent_runtime(
-                agentRuntimeArn=config["runtime_arn"], contentType="application/json", payload=payload_bytes
+                agentRuntimeArn=config["runtime_arn"],
+                contentType="application/json",
+                payload=payload_bytes,
+                # Shared cost-report reuse requires a trusted transport actor (#365).
+                # Match the body user_id so the boundary sees a consistent identity.
+                runtimeUserId=actor_id,
             )
 
             # Parse response - use 'response' key not 'payload'
