@@ -124,6 +124,7 @@ The following table provides a sample cost breakdown for deploying this Guidance
 | Node.js | 18+ | [Download](https://nodejs.org/) |
 | uv | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | yq | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
+| jq | 1.6+ | [Install Guide](https://jqlang.github.io/jq/download/) |
 | Docker | Latest (optional) | [Install Guide](https://docs.docker.com/get-docker/) |
 
 Python 3.13 and the AgentCore CLI are automatically installed by `uv` during setup. Docker is only required for building and deploying the frontend container image; frontend deployment steps are skipped if Docker is not available.
@@ -325,14 +326,18 @@ cd infrastructure/kubernetes
 # Basic enrollment
 ./enroll-cluster.sh my-cluster us-west-2
 
+# Use a Kubernetes administrator role when the active identity cannot apply RBAC
+./enroll-cluster.sh my-cluster us-west-2 \
+  --kube-role-arn arn:aws:iam::123456789012:role/eks-admin
+
 # With audit logging
 ./enroll-cluster.sh my-cluster us-west-2 --enable-audit-logs
 
-# Deregister a cluster
+# Deregister a cluster (pass the same administrator role when applicable)
 ./deregister-cluster.sh my-cluster us-west-2
 ```
 
-Enrollment configures read-only Kubernetes RBAC and updates the `aws-auth` ConfigMap. Secrets are explicitly excluded from the read-only permissions.
+Enrollment detects the cluster authentication mode. It uses EKS access entries for `API` and `API_AND_CONFIG_MAP` clusters and `aws-auth` for legacy `CONFIG_MAP` clusters. Both paths install the same read-only Kubernetes RBAC; secrets and mutating verbs are excluded. Enrollment requires a Kubernetes identity that can apply the monitoring ClusterRole and ClusterRoleBinding.
 
 ## Testing
 
