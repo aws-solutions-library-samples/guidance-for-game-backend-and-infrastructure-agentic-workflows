@@ -35,10 +35,10 @@ if curl -s http://localhost:3000 > /dev/null 2>&1; then
     echo -e "${GREEN}✅ Localhost frontend detected (port 3000)${NC}"
 fi
 
-# Check for deployed stack
+# Check for deployed stack using the same validated resolver as standalone
+# stress tests. This avoids eval, stale inherited targets, and profile drift.
 DEPLOYMENT_DETECTED=false
-if ./scripts/infrastructure/check-deployment.sh check; then
-    eval $(./scripts/infrastructure/check-deployment.sh urls)
+if source scripts/test/resolve-deployment-targets.sh; then
     DEPLOYMENT_DETECTED=true
     echo -e "${GREEN}✅ Deployed stack available${NC}"
     echo -e "${BLUE}🌐 Frontend: $FRONTEND_URL${NC}"
