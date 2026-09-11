@@ -261,9 +261,6 @@ Resources:
                   - ce:GetAnomalies
                   - ce:GetUsageReport
                 Resource: '*'
-                Condition:
-                  StringEquals:
-                    aws:RequestedRegion: !Ref AWS::Region
               - Sid: CloudControlReadAccess
                 Effect: Allow
                 Action:
@@ -365,6 +362,8 @@ Resources:
                 Action:
                   - s3:GetStorageLensConfiguration
                   - freetier:GetFreeTierUsage
+                  - pricing:DescribeServices
+                  - pricing:GetAttributeValues
                   - pricing:GetProducts
                 Resource: '*'
         # Security: Scoped logging access
@@ -404,6 +403,20 @@ Resources:
                   - xray:PutTraceSegments
                   - xray:PutTelemetryRecords
                 Resource: '*'
+        # Security: Scoped shared cost report snapshot store access (#365)
+        # Least-privilege: only GetItem/PutItem on this project's snapshot table.
+        # No DeleteItem (TTL handles expiration) and no Scan/Query.
+        - PolicyName: CostReportSnapshotStoreAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CostReportSnapshotReadWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource:
+                  - !GetAtt CostReportSnapshotTable.Arn
 
   # IAM Role for ECS Tasks (Application Permissions)
   # Security: Uses least-privilege permissions instead of FullAccess managed policies
@@ -652,6 +665,37 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
+  # Shared snapshot store for deterministic cross-worker cost report reuse (#365)
+  # On-demand table so a report ID created by one AgentCore worker resolves from
+  # any worker for the configured TTL. Snapshots expire automatically via the
+  # 'expiresAt' TTL attribute; the runtime uses only GetItem/PutItem (no scans).
+  CostReportSnapshotTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${ProjectName}-cost-report-snapshots'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: reportId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reportId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      # Encryption at rest (in transit is enforced by the HTTPS DynamoDB endpoint)
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: cost-report-snapshots
+        - Key: ManagedBy
+          Value: cloudformation
+
 Outputs:
   UserPoolId:
     Description: Cognito User Pool ID
@@ -706,3 +750,9 @@ Outputs:
     Value: !Ref AccessLogsBucket
     Export:
       Name: !Sub '${ProjectName}-AccessLogsBucketName'
+
+  CostReportSnapshotTableName:
+    Description: DynamoDB table for shared cost report snapshots
+    Value: !Ref CostReportSnapshotTable
+    Export:
+      Name: !Sub '${ProjectName}-CostReportSnapshotTableName'
