@@ -22,6 +22,7 @@ test.skip(!TEST_EMAIL || !TEST_PASSWORD || !FRONTEND_URL, 'TEST_EMAIL, TEST_PASS
 test.describe('Full System Test', () => {
 
   test('should login, chat, and exercise MCP tools', async ({ page }, testInfo) => {
+    test.setTimeout(900_000); // Cognito login plus five live agent/MCP round-trips
     // Use Playwright's output directory for screenshots
     const screenshotDir = testInfo.outputDir;
     // Get the deployed frontend URL (required via env var)

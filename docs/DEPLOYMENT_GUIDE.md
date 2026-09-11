@@ -183,7 +183,7 @@ cd infrastructure/kubernetes
 ./enroll-cluster.sh your-cluster-name us-west-2
 ```
 
-This grants Game Agent read-only access to monitor pods, deployments, and services.
+This grants Game Agent read-only access to monitor pods, nodes, deployments, and services. The script uses EKS access entries for `API` and `API_AND_CONFIG_MAP` clusters and `aws-auth` for legacy `CONFIG_MAP` clusters. If the active identity cannot apply Kubernetes RBAC, pass `--kube-role-arn` with an administrator role.
 
 ### Verify Deployment Health
 
@@ -194,6 +194,10 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 # Validate resources and cloud integration
 ./validate-deployment.sh
 ./test-cloud.sh
+
+# Verify all three Knowledge Bases (GameLift, EKS, Cost) return retrieval
+# results; exits non-zero if any stack, KB, or retrieval is broken
+./scripts/infrastructure/test-kb.sh
 
 # Exercise Guardrail behavior and specialist routing/tool use
 ./test-ai-evals.sh

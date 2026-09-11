@@ -49,8 +49,8 @@ jobs:
           <(grep -Ev '^[[:space:]]*(#|$)' requirements.txt) \
           <(grep -Ev '^[[:space:]]*(#|$)' /tmp/backend-requirements.txt)
 
-    - name: Test public-content scanner
-      run: python3 -m unittest discover -s scripts/test -p 'test_check_public_content.py'
+    - name: Run repository script tests
+      run: python3 -m unittest discover -s scripts/test -p 'test_*.py' -v
 
     - name: Scan tracked public content
       run: python3 scripts/check_public_content.py
