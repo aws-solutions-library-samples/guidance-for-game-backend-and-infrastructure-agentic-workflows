@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from strands import tool
 
 # Local modules
+from agents.chart_directive import CHART_CONTRACT_VERSION, render_chart_fence
 from agents.cost_report_scope import current_scope, current_scope_hash, is_trusted_scope
 from agents.cost_service_aliases import resolve_service_selection
 from agents.cost_snapshot_store import (
@@ -695,6 +696,42 @@ class CostReportService:
         )
 
 
+def _cost_report_chart_fence(report: CostReport) -> str:
+    """Build a deterministic ```chart fence for a validated cost report.
+
+    The chart is produced directly from the same validated, displayed amounts
+    that appear in the markdown table — the model never sees or reconstructs
+    these numbers — so the visual is exactly consistent with the authoritative
+    figures (issue #255). Returns "" if no chartable data or if the spec fails
+    the shared contract (fail-closed).
+    """
+    labels = [service.service for service in report.top_services]
+    values = [float(service.amount) for service in report.top_services]
+    if Decimal(report.other_services_total) != 0:
+        labels.append("Other services")
+        values.append(float(report.other_services_total))
+    if not labels:
+        return ""
+
+    leader = report.top_services[0] if report.top_services else None
+    summary = (
+        f"{leader.service} leads at {report.currency} {leader.amount} ({leader.percentage}% of total)."
+        if leader
+        else f"Total {report.currency} {report.total}."
+    )
+    spec = {
+        "type": "bar",
+        "version": CHART_CONTRACT_VERSION,
+        "title": f"Top services by {report.metric} ({report.currency})",
+        "summary": summary[:280],
+        "unit": report.currency,
+        "x": {"label": "Service", "values": labels},
+        "y": {"label": report.currency},
+        "series": [{"name": report.metric, "values": values}],
+    }
+    return render_chart_fence(spec)
+
+
 def render_cost_report(report: CostReport) -> str:
     """Render the immutable user-facing financial section."""
     lines = [
@@ -732,6 +769,9 @@ def render_cost_report(report: CostReport) -> str:
                 "timestamp, but AWS may revise open-period billing data.*",
             ]
         )
+    chart_fence = _cost_report_chart_fence(report)
+    if chart_fence:
+        lines.extend(["", chart_fence])
     return "\n".join(lines)
 
 
