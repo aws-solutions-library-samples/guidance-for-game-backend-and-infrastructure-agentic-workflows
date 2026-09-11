@@ -7,6 +7,15 @@ Parameters:
     Default: game-agent
     Description: Project name used for resource naming
 
+  SessionAbsoluteLifetimeHours:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 24
+    Description: >-
+      Absolute Cognito application-session lifetime in hours. Refresh tokens
+      expire at this boundary and require a fresh user authentication.
+
 Resources:
   # Cognito User Pool
   UserPool:
@@ -49,6 +58,13 @@ Resources:
       ClientName: !Sub '${ProjectName}-web'
       UserPoolId: !Ref UserPool
       GenerateSecret: false
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: !Ref SessionAbsoluteLifetimeHours
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: hours
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
         - ALLOW_USER_PASSWORD_AUTH
@@ -708,6 +724,12 @@ Outputs:
     Value: !Ref UserPoolClient
     Export:
       Name: !Sub '${ProjectName}-UserPoolClientId'
+
+  SessionAbsoluteLifetimeHours:
+    Description: Configured absolute Cognito session lifetime in hours
+    Value: !Ref SessionAbsoluteLifetimeHours
+    Export:
+      Name: !Sub '${ProjectName}-SessionAbsoluteLifetimeHours'
 
   BackendRepositoryUri:
     Description: Backend ECR Repository URI
