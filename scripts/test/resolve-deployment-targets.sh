@@ -2,10 +2,11 @@
 # Resolve and validate deployed test targets. Intended to be sourced.
 
 resolve_game_agent_deployment_targets() {
-    local script_dir project_root frontend_host runtime_id runtime_arn env_file
+    local script_dir project_root frontend_host runtime_id runtime_arn env_file agentcore_config
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     project_root="$(cd "$script_dir/../.." && pwd)"
     env_file="${GBAW_ENV_FILE:-$project_root/ui/.env.local}"
+    agentcore_config="${GBAW_AGENTCORE_CONFIG_FILE:-$project_root/backend/.bedrock_agentcore.yaml}"
 
     if [ -z "${AWS_PROFILE:-}" ] && [ -f "$env_file" ]; then
         AWS_PROFILE=$(grep -E '^AWS_PROFILE=' "$env_file" | cut -d= -f2 | tr -d '[:space:]')
@@ -26,9 +27,9 @@ resolve_game_agent_deployment_targets() {
         --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' \
         --output text) || return 1
     runtime_id=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_id' \
-        "$project_root/backend/.bedrock_agentcore.yaml") || return 1
+        "$agentcore_config") || return 1
     runtime_arn=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_arn' \
-        "$project_root/backend/.bedrock_agentcore.yaml") || return 1
+        "$agentcore_config") || return 1
 
     if [[ ! "$frontend_host" =~ ^[A-Za-z0-9-]+\.ecs\.${AWS_REGION}\.on\.aws$ ]]; then
         echo "❌ Refusing unrecognized frontend target: $frontend_host" >&2

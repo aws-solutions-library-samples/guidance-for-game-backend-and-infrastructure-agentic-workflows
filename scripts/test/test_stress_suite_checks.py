@@ -51,6 +51,8 @@ class DeploymentTargetResolverBehaviorTests(unittest.TestCase):
             profile_log = root / "profiles.log"
             env_file = root / "env.local"
             env_file.write_text("AWS_PROFILE=fallback-profile\n", encoding="utf-8")
+            agentcore_config = root / "agentcore.yaml"
+            agentcore_config.write_text("agents: {}\n", encoding="utf-8")
 
             aws = bin_dir / "aws"
             aws.write_text(
@@ -80,6 +82,7 @@ class DeploymentTargetResolverBehaviorTests(unittest.TestCase):
             env.pop("AWS_PROFILE", None)
             env["AWS_REGION"] = "us-west-2"
             env["GBAW_ENV_FILE"] = str(env_file)
+            env["GBAW_AGENTCORE_CONFIG_FILE"] = str(agentcore_config)
             env["PATH"] = f"{bin_dir}:{env['PATH']}"
             command = (
                 f"source {RESOLVER}; "
