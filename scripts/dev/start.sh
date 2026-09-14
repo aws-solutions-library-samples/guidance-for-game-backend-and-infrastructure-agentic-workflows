@@ -62,8 +62,10 @@ start_agentcore() {
         echo "$CURRENT_HASH" > .venv/.pyproject_hash
     fi
 
-    # Set environment for local development
+    # Set environment for local development. Hosted deployments never set this
+    # bypass and therefore require a cryptographically verified Cognito JWT.
     export PYTHONPATH=$(pwd)
+    export GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true
 
     # Auto-detect and set Memory ID if available
     if [ -f ".bedrock_agentcore.yaml" ]; then

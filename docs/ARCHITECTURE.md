@@ -207,47 +207,50 @@ The architecture follows these 12 steps:
 
 **How It Works**:
 1. User sends message through CopilotKit UI
-2. Frontend API route receives GraphQL-style request
-3. Uses `@aws-sdk/client-bedrock-agentcore` to invoke AgentCore Runtime
-4. Sends `InvokeAgentRuntimeCommand` with signed SigV4 request
-5. Receives streaming response from AgentCore Runtime
-6. Formats response for CopilotKit and returns to UI
+2. Frontend API route verifies the Cognito access token and builds a server-owned principal
+3. Frontend invokes the JWT-authorized AgentCore Runtime over HTTPS with the access token only in `Authorization`
+4. AgentCore validates issuer, signature, expiry, and client before forwarding the request
+5. Runtime code independently verifies the token and derives actor scope from `sub`
+6. Runtime returns the specialist response, which the proxy formats for CopilotKit
 
 **Key Code Pattern**:
 ```typescript
-import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
+const runtimeArn = `arn:aws:bedrock-agentcore:${region}:${accountId}:runtime/${runtimeId}`;
+const runtimeUrl =
+  `https://bedrock-agentcore.${region}.amazonaws.com/runtimes/` +
+  `${encodeURIComponent(runtimeArn)}/invocations?qualifier=DEFAULT`;
 
-const client = new BedrockAgentCoreClient({
-  region: process.env.AWS_REGION || 'us-west-2'
-});
-
-// Derived server-side from the verified Cognito access token — never from
-// browser or model input. Shown here as generic placeholders.
-const principalId = verifiedPrincipal.sub;      // trusted user identity
-const sessionId = `${environment}-${threadId}`; // environment-isolated session
-
-const command = new InvokeAgentRuntimeCommand({
-  agentRuntimeArn: process.env.AGENTCORE_RUNTIME_ARN,
-  contentType: 'application/json',
-  // The trusted transport identity (runtimeUserId) binds the shared cost-report
-  // scope. It MUST match the body user_context.user_id, or the runtime rejects
-  // the request at the identity boundary. Values here are generic placeholders.
-  runtimeUserId: principalId,
-  payload: new TextEncoder().encode(JSON.stringify({
+const response = await fetch(runtimeUrl, {
+  method: 'POST',
+  headers: {
+    Authorization: `Bearer ${verifiedAccessToken}`,
+    'Content-Type': 'application/json',
+    'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': sessionId,
+  },
+  body: JSON.stringify({
     prompt: message,
     user_context: {
-      user_id: principalId,
-      session_id: sessionId
-    }
-  }))
+      // Included only as a consistency check. Runtime authority comes from the
+      // independently verified JWT, never from this body field.
+      user_id: verifiedPrincipal.sub,
+      session_id: sessionId,
+    },
+  }),
 });
-
-const response = await client.send(command);
 ```
+
+The hosted runtime is configured with the Cognito OpenID discovery URL and
+allowed app client. `Authorization` is the only identity-bearing header forwarded
+to agent code. The runtime verifies the JWT again before creating the scoped
+cost-report actor; arbitrary body identities and custom passthrough headers are
+not trusted.
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
 - `AGENTCORE_RUNTIME_ARN` - ARN of deployed AgentCore Runtime
+- `GBAW_COGNITO_ISSUER` - Deployment-owned Cognito token issuer used by runtime verification
+- `GBAW_COGNITO_CLIENT_ID` - Allowed Cognito app client used by runtime verification
+- `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS` - Explicit local-dev-only bypass set by `dev-start.sh`; never set in hosted deployments
 - `NODE_ENV` - Environment (development/production)
 - `BACKEND_URL` - For local development only (http://localhost:8080)
 

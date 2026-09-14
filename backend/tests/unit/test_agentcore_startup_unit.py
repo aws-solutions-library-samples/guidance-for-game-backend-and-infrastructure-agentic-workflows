@@ -2,42 +2,31 @@
 """Unit tests for AgentCore startup and initialization."""
 
 # Standard library
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 # Third-party packages
 import pytest
 from bedrock_agentcore.runtime.context import RequestContext
 from botocore.exceptions import ClientError, NoCredentialsError
-from starlette.requests import Request
 
 pytestmark = [pytest.mark.unit]
 
-RUNTIME_USER_ID_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-User-Id"
+
+def _jwt_context(session_id="ctx-session"):
+    return RequestContext(session_id=session_id, request_headers={"Authorization": "Bearer test-token"})
 
 
-def _context_with_forwarded_header(user_id, header_name=RUNTIME_USER_ID_HEADER, session_id="ctx-session"):
-    """Build a real RequestContext whose forwarded header map carries a user id.
+def _verified_identity(subject="trusted-user"):
+    # Local modules
+    from runtime_identity import RuntimeIdentity
 
-    This mirrors the SDK ``RequestContext`` shape (``request_headers`` is the
-    forwarded header dict) rather than inventing Mock attributes.
-    """
-    return RequestContext(session_id=session_id, request_headers={header_name: user_id})
-
-
-def _context_with_underlying_request(user_id, header_name=RUNTIME_USER_ID_HEADER, session_id="ctx-session"):
-    """Build a real RequestContext backed by a Starlette request carrying the header.
-
-    The runtime allowlist does not forward the reserved User-Id header into
-    ``request_headers``, so the deployed path reads it from the underlying
-    Starlette request object. Starlette header keys are wire-lowercased.
-    """
-    scope = {
-        "type": "http",
-        "method": "POST",
-        "path": "/invocations",
-        "headers": [(header_name.lower().encode("latin-1"), user_id.encode("latin-1"))],
-    }
-    return RequestContext(session_id=session_id, request=Request(scope))
+    return RuntimeIdentity(
+        subject_id=subject,
+        client_id="web-client",
+        groups=frozenset({"users", "source-readers"}),
+        scopes=frozenset({"openid", "profile"}),
+    )
 
 
 class TestAgentCoreStartup:
@@ -189,119 +178,48 @@ class TestInvokeAgent:
         assert "try again" in result.lower()
 
     def test_invoke_agent_with_context(self, mock_orchestrator):
-        """Test invoke_agent derives actor_id from the trusted runtimeUserId header."""
+        """Hosted invocation derives authority from the verified Cognito JWT."""
         # Local modules
-        from agentcore_main import invoke_agent
+        import agentcore_main
 
-        # Real RequestContext carrying the platform-established runtime user id.
-        ctx = _context_with_forwarded_header("test-user")
-
-        result = invoke_agent(
-            {
-                "prompt": "test prompt",
-                "user_context": {
-                    "user_id": "test-user-123",
-                    "client_id": "web-client",
-                    "audience": "web-client",
-                    "groups": ["users", "source-readers"],
-                    "scopes": ["openid", "profile"],
-                    "tenant": "tenant-a",
-                    "workspace": "workspace-a",
-                    "session_id": "test-session-456",
+        ctx = _jwt_context()
+        with (
+            patch.object(agentcore_main, "COST_SNAPSHOT_TABLE_NAME", "snap-table"),
+            patch.object(agentcore_main, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+            patch.object(
+                agentcore_main,
+                "verify_cognito_runtime_identity",
+                return_value=_verified_identity("subject-123"),
+            ),
+        ):
+            result = agentcore_main.invoke_agent(
+                {
+                    "prompt": "test prompt",
+                    "user_context": {
+                        "user_id": "subject-123",
+                        "groups": ["admin"],
+                        "tenant": "attacker-tenant",
+                        "workspace": "attacker-workspace",
+                        "session_id": "test-session-456",
+                    },
                 },
-            },
-            context=ctx,
-        )
+                context=ctx,
+            )
 
         assert result == "Test response"
-        call_args = mock_orchestrator.call_args
-        agent_context = call_args.kwargs["context"]
-        # session_id should come from user_context.session_id
+        agent_context = mock_orchestrator.call_args.kwargs["context"]
         assert agent_context["session_id"] == "test-session-456"
-        # actor_id must be the trusted transport identity from the header.
-        assert agent_context["actor_id"] == "test-user"
+        assert agent_context["actor_id"] == "subject-123"
         assert agent_context["client_id"] == "web-client"
         assert agent_context["audience"] == "web-client"
-        assert agent_context["groups"] == ["users", "source-readers"]
+        assert agent_context["groups"] == ["source-readers", "users"]
         assert agent_context["scopes"] == ["openid", "profile"]
-        assert agent_context["tenant"] == "tenant-a"
-        assert agent_context["workspace"] == "workspace-a"
-
-
-class TestExtractRuntimeUserId:
-    """Direct coverage of the trusted runtime-user-id extraction helper (#365).
-
-    Exercised against the real ``RequestContext`` (forwarded header map) and a
-    real Starlette request (underlying request object), plus case variants and
-    the missing/blank cases — never invented Mock attributes.
-    """
-
-    def test_returns_none_when_context_is_none(self):
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        assert extract_runtime_user_id(None) is None
-
-    def test_reads_from_forwarded_request_headers(self):
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        ctx = _context_with_forwarded_header("alice")
-        assert extract_runtime_user_id(ctx) == "alice"
-
-    def test_forwarded_header_lookup_is_case_insensitive(self):
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        ctx = _context_with_forwarded_header("bob", header_name="x-amzn-bedrock-agentcore-runtime-user-id")
-        assert extract_runtime_user_id(ctx) == "bob"
-
-        ctx_upper = _context_with_forwarded_header("carol", header_name="X-AMZN-BEDROCK-AGENTCORE-RUNTIME-USER-ID")
-        assert extract_runtime_user_id(ctx_upper) == "carol"
-
-    def test_falls_back_to_underlying_request_object(self):
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        # The reserved header is not forwarded into request_headers by the runtime
-        # allowlist; it is only present on the underlying Starlette request.
-        ctx = _context_with_underlying_request("dave")
-        assert ctx.request_headers is None
-        assert extract_runtime_user_id(ctx) == "dave"
-
-    def test_missing_header_returns_none(self):
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        ctx = RequestContext(session_id="s", request_headers={"X-Other-Header": "x"})
-        assert extract_runtime_user_id(ctx) is None
-
-    def test_blank_header_value_returns_none(self):
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        ctx = _context_with_forwarded_header("   ")
-        assert extract_runtime_user_id(ctx) is None
-
-    def test_ignores_custom_actor_passthrough_header(self):
-        """The caller-supplied custom passthrough header must NEVER be trusted as
-        the runtime user identity."""
-        # Local modules
-        from agentcore_main import extract_runtime_user_id
-
-        ctx = RequestContext(
-            session_id="s",
-            request_headers={"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actor-Id": "attacker"},
-        )
-        assert extract_runtime_user_id(ctx) is None
+        assert agent_context["tenant"] == agentcore_main.DEPLOYMENT_TENANT_ID
+        assert agent_context["workspace"] == agentcore_main.DEPLOYMENT_WORKSPACE_ID
 
 
 class TestSharedModeScopeBoundary:
-    """Shared-mode trusted-actor resolution at the AgentCore boundary (#365).
-
-    All contexts are real ``RequestContext`` objects; the trusted actor is only
-    ever the platform-established runtimeUserId header.
-    """
+    """Shared-mode scope is established only by a verified Cognito token."""
 
     @pytest.fixture
     def mock_orchestrator(self):
@@ -309,35 +227,30 @@ class TestSharedModeScopeBoundary:
             mock.return_value = "Test response"
             yield mock
 
+    @contextmanager
     def _shared_mode(self):
-        # Force shared mode regardless of the local test environment.
-        return patch.object(__import__("agentcore_main"), "COST_SNAPSHOT_TABLE_NAME", "snap-table")
+        module = __import__("agentcore_main")
+        with (
+            patch.object(module, "COST_SNAPSHOT_TABLE_NAME", "snap-table"),
+            patch.object(module, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+        ):
+            yield
 
-    def test_shared_mode_uses_trusted_context_actor(self, mock_orchestrator):
+    def test_shared_mode_uses_verified_jwt_actor(self, mock_orchestrator):
         # Local modules
-        from agentcore_main import invoke_agent
+        import agentcore_main
 
-        ctx = _context_with_forwarded_header("trusted-user")
-
-        with self._shared_mode():
-            result = invoke_agent(
+        with (
+            self._shared_mode(),
+            patch.object(
+                agentcore_main,
+                "verify_cognito_runtime_identity",
+                return_value=_verified_identity("trusted-user"),
+            ),
+        ):
+            result = agentcore_main.invoke_agent(
                 {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
-                context=ctx,
-            )
-
-        assert result == "Test response"
-        mock_orchestrator.assert_called_once()
-
-    def test_shared_mode_accepts_trusted_actor_from_underlying_request(self, mock_orchestrator):
-        # Local modules
-        from agentcore_main import invoke_agent
-
-        ctx = _context_with_underlying_request("trusted-user")
-
-        with self._shared_mode():
-            result = invoke_agent(
-                {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
-                context=ctx,
+                context=_jwt_context(),
             )
 
         assert result == "Test response"
@@ -345,49 +258,154 @@ class TestSharedModeScopeBoundary:
 
     def test_shared_mode_rejects_actor_mismatch(self, mock_orchestrator):
         # Local modules
-        from agentcore_main import invoke_agent
+        import agentcore_main
 
-        ctx = _context_with_forwarded_header("trusted-user")
-
-        with self._shared_mode():
-            result = invoke_agent(
+        with (
+            self._shared_mode(),
+            patch.object(
+                agentcore_main,
+                "verify_cognito_runtime_identity",
+                return_value=_verified_identity("trusted-user"),
+            ),
+        ):
+            result = agentcore_main.invoke_agent(
                 {"prompt": "hi", "user_context": {"user_id": "someone-else"}},
-                context=ctx,
+                context=_jwt_context(),
             )
 
         assert "identity verification" in result.lower()
         mock_orchestrator.assert_not_called()
 
-    def test_shared_mode_requires_trusted_actor(self, mock_orchestrator):
+    def test_shared_mode_requires_verified_jwt(self, mock_orchestrator):
         # Local modules
-        from agentcore_main import invoke_agent
+        import agentcore_main
+        from runtime_identity import RuntimeIdentityError
 
-        # No runtimeUserId header present at all; a body-only identity is not trusted.
-        ctx = RequestContext(session_id="s", request_headers={})
-
-        with self._shared_mode():
-            result = invoke_agent(
+        with (
+            self._shared_mode(),
+            patch.object(
+                agentcore_main,
+                "verify_cognito_runtime_identity",
+                side_effect=RuntimeIdentityError(),
+            ),
+        ):
+            result = agentcore_main.invoke_agent(
                 {"prompt": "hi", "user_context": {"user_id": "body-only"}},
-                context=ctx,
+                context=RequestContext(session_id="s", request_headers={}),
             )
 
         assert "identity verification" in result.lower()
         mock_orchestrator.assert_not_called()
 
     def test_shared_mode_rejects_custom_actor_passthrough_header(self, mock_orchestrator):
-        """A request that supplies ONLY the caller-controlled custom passthrough
-        header (and no trusted runtimeUserId) must be rejected in shared mode: a
-        custom passthrough header can never establish snapshot scope."""
         # Local modules
-        from agentcore_main import invoke_agent
+        import agentcore_main
+        from runtime_identity import RuntimeIdentityError
 
-        ctx = RequestContext(
+        context = RequestContext(
             session_id="s",
             request_headers={"X-Amzn-Bedrock-AgentCore-Runtime-Custom-Actor-Id": "attacker"},
         )
+        with (
+            self._shared_mode(),
+            patch.object(
+                agentcore_main,
+                "verify_cognito_runtime_identity",
+                side_effect=RuntimeIdentityError(),
+            ),
+        ):
+            result = agentcore_main.invoke_agent({"prompt": "hi", "user_context": {}}, context=context)
 
-        with self._shared_mode():
-            result = invoke_agent({"prompt": "hi", "user_context": {}}, context=ctx)
+        assert "identity verification" in result.lower()
+        mock_orchestrator.assert_not_called()
+
+    def test_hosted_jwt_verification_does_not_depend_on_shared_snapshots(self, mock_orchestrator):
+        # Local modules
+        import agentcore_main
+
+        verifier = MagicMock(return_value=_verified_identity("trusted-user"))
+        with (
+            patch.object(agentcore_main, "COST_SNAPSHOT_STORE_REQUIRED", False),
+            patch.object(agentcore_main, "COST_SNAPSHOT_TABLE_NAME", ""),
+            patch.object(agentcore_main, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+            patch.object(agentcore_main, "COGNITO_ISSUER", "https://issuer.example"),
+            patch.object(agentcore_main, "COGNITO_CLIENT_ID", "web-client"),
+            patch.object(agentcore_main, "verify_cognito_runtime_identity", verifier),
+        ):
+            result = agentcore_main.invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
+                context=_jwt_context(),
+            )
+
+        assert result == "Test response"
+        verifier.assert_called_once()
+        mock_orchestrator.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("issuer", "client_id"),
+        [("", ""), ("https://issuer.example", ""), ("", "web-client")],
+        ids=["both-missing", "client-missing", "issuer-missing"],
+    )
+    def test_hosted_mode_rejects_missing_jwt_bindings(self, mock_orchestrator, issuer, client_id):
+        # Local modules
+        import agentcore_main
+
+        with (
+            patch.object(agentcore_main, "COST_SNAPSHOT_STORE_REQUIRED", False),
+            patch.object(agentcore_main, "COST_SNAPSHOT_TABLE_NAME", ""),
+            patch.object(agentcore_main, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+            patch.object(agentcore_main, "COGNITO_ISSUER", issuer),
+            patch.object(agentcore_main, "COGNITO_CLIENT_ID", client_id),
+        ):
+            result = agentcore_main.invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "body-only"}},
+                context=_jwt_context(),
+            )
+
+        assert "identity verification" in result.lower()
+        mock_orchestrator.assert_not_called()
+
+    def test_hosted_runtime_ignores_local_identity_bypass_flag(self, mock_orchestrator):
+        # Local modules
+        import agentcore_main
+        from runtime_identity import RuntimeIdentityError
+
+        with (
+            patch.object(agentcore_main, "HOSTED_RUNTIME", True),
+            patch.object(agentcore_main, "ALLOW_LOCAL_IDENTITY_BYPASS", True),
+            patch.object(
+                agentcore_main,
+                "verify_cognito_runtime_identity",
+                side_effect=RuntimeIdentityError(),
+            ),
+        ):
+            result = agentcore_main.invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "body-only"}},
+                context=RequestContext(session_id="s", request_headers={}),
+            )
+
+        assert "identity verification" in result.lower()
+        mock_orchestrator.assert_not_called()
+
+    def test_hosted_jwt_rejects_user_without_approved_group(self, mock_orchestrator):
+        # Local modules
+        import agentcore_main
+        from runtime_identity import RuntimeIdentity
+
+        unapproved = RuntimeIdentity(
+            subject_id="trusted-user",
+            client_id="web-client",
+            groups=frozenset(),
+            scopes=frozenset({"openid"}),
+        )
+        with (
+            self._shared_mode(),
+            patch.object(agentcore_main, "verify_cognito_runtime_identity", return_value=unapproved),
+        ):
+            result = agentcore_main.invoke_agent(
+                {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
+                context=_jwt_context(),
+            )
 
         assert "identity verification" in result.lower()
         mock_orchestrator.assert_not_called()
@@ -396,18 +414,29 @@ class TestSharedModeScopeBoundary:
 class TestRequestScopeLifecycle:
     """The request scope must be reset after each invocation, including on error."""
 
+    @contextmanager
     def _shared_mode(self):
-        return patch.object(__import__("agentcore_main"), "COST_SNAPSHOT_TABLE_NAME", "snap-table")
+        module = __import__("agentcore_main")
+        with (
+            patch.object(module, "COST_SNAPSHOT_TABLE_NAME", "snap-table"),
+            patch.object(module, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+        ):
+            yield
 
     def test_scope_reset_after_successful_invocation(self):
         # Local modules
         from agentcore_main import invoke_agent
         from agents.cost_report_scope import UNSCOPED, current_scope
 
-        with patch("agentcore_main.run_orchestrator", return_value="ok") as mock:
-            ctx = _context_with_forwarded_header("trusted-user")
+        with (
+            patch("agentcore_main.run_orchestrator", return_value="ok") as mock,
+            patch("agentcore_main.verify_cognito_runtime_identity", return_value=_verified_identity()),
+        ):
             with self._shared_mode():
-                invoke_agent({"prompt": "hi", "user_context": {"user_id": "trusted-user"}}, context=ctx)
+                invoke_agent(
+                    {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
+                    context=_jwt_context(),
+                )
             mock.assert_called_once()
 
         # After the call returns, the boundary scope must be restored to UNSCOPED
@@ -419,12 +448,14 @@ class TestRequestScopeLifecycle:
         from agentcore_main import invoke_agent
         from agents.cost_report_scope import UNSCOPED, current_scope
 
-        with patch("agentcore_main.run_orchestrator", side_effect=RuntimeError("boom")):
-            ctx = _context_with_forwarded_header("trusted-user")
+        with (
+            patch("agentcore_main.run_orchestrator", side_effect=RuntimeError("boom")),
+            patch("agentcore_main.verify_cognito_runtime_identity", return_value=_verified_identity()),
+        ):
             with self._shared_mode():
                 result = invoke_agent(
                     {"prompt": "hi", "user_context": {"user_id": "trusted-user"}},
-                    context=ctx,
+                    context=_jwt_context(),
                 )
 
         # The exception is handled and a generic error returned...

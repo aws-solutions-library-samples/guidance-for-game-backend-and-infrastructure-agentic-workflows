@@ -49,6 +49,14 @@ fi
 if [ "$DEPLOYMENT_DETECTED" = true ]; then
     TEST_MODE="deployed"
     echo -e "${BLUE}📋 Test Mode: DEPLOYED (testing against AWS)${NC}"
+    if [ -z "${GBAW_TEST_ACCESS_TOKEN:-}" ]; then
+        echo -e "${RED}❌ GBAW_TEST_ACCESS_TOKEN is required for complete deployed JWT validation${NC}"
+        FAILED=1
+    fi
+    if [ -z "${TEST_EMAIL:-}" ] || [ -z "${TEST_PASSWORD:-}" ]; then
+        echo -e "${RED}❌ TEST_EMAIL and TEST_PASSWORD are required for authenticated deployed browser validation${NC}"
+        FAILED=1
+    fi
 elif [ "$LOCALHOST_BACKEND" = true ]; then
     TEST_MODE="localhost"
     echo -e "${BLUE}📋 Test Mode: LOCALHOST (limited tests - memory UI only)${NC}"

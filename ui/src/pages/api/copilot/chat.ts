@@ -1,6 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { logInfo, logError, logDebug, redact } from '@/utils/logger';
-import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
@@ -56,46 +55,48 @@ function getIdVerifier() {
  * bind the id token to this access token so a valid access token cannot be paired
  * with a forged id token.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function verifyAccessToken(req: NextApiRequest): Promise<{ ok: boolean; payload: any }> {
+async function verifyAccessToken(
+  req: NextApiRequest,
+): Promise<{ ok: boolean; payload: Record<string, unknown> | null; token: string | null }> {
   // Skip JWT validation ONLY for the explicit local-dev bypass. NODE_ENV alone is
   // unsafe: a hosted staging/preview deploy is also !== 'production', and gating on
   // it would serve this route with no auth. Local dev sets NEXT_PUBLIC_SKIP_AUTH=true
   // (and has no Cognito cookies — identity comes from STS), so it still skips here.
   if (process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_SKIP_AUTH === 'true') {
-    return { ok: true, payload: null };
+    return { ok: true, payload: null, token: null };
   }
 
   const cookies = parse(req.headers.cookie || '');
   const token = cookies.cognito_access_token;
   if (!token) {
-    return { ok: false, payload: null };
+    return { ok: false, payload: null, token: null };
   }
 
   try {
     const payload = await getAccessVerifier().verify(token);
-    return { ok: true, payload };
+    return { ok: true, payload, token };
   } catch {
     logError('Access token validation failed');
-    return { ok: false, payload: null };
+    return { ok: false, payload: null, token: null };
   }
 }
 
-// Cache account ID to avoid repeated STS calls
-let cachedAccountId: string = '';
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let cachedUserIdentity: any = null;
+
+// Cache account ID to build the AgentCore runtime resource URL.
+let cachedAccountId = '';
 
 async function getAccountId(): Promise<string> {
-  if (cachedAccountId) {
-    return cachedAccountId;
-  }
-
+  if (cachedAccountId) return cachedAccountId;
   const sts = new STSClient({ region: process.env.AWS_REGION || 'us-west-2' });
   const identity = await sts.send(new GetCallerIdentityCommand({}));
-  cachedAccountId = identity.Account!;
+  if (!identity.Account) throw new Error('AWS account ID unavailable');
+  cachedAccountId = identity.Account;
   return cachedAccountId;
 }
+
+// Development identity is stable for the lifetime of the frontend process.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let cachedUserIdentity: any = null;
 
 // Enhanced user identity extraction with AWS principal
 async function getUserIdentity() {
@@ -211,7 +212,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] Received ${sanitizedMethod} request to /api/copilot/chat`);
 
     // Validate JWT in production
-    const { ok: isAuthenticated, payload: accessPayload } = await verifyAccessToken(req);
+    const { ok: isAuthenticated, payload: accessPayload, token: accessToken } = await verifyAccessToken(req);
     if (!isAuthenticated) {
       logError(`[${requestId}] ❌ Unauthorized: Invalid or missing JWT token`);
       return res.status(401).json({ error: 'Unauthorized', requestId });
@@ -508,7 +509,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     if (isProduction) {
       // Production: Use AWS SDK to invoke AgentCore Runtime
-      logInfo(`[${requestId}] 🚀 Calling AgentCore Runtime via AWS SDK`);
+      logInfo(`[${requestId}] 🚀 Calling AgentCore Runtime with Cognito JWT authorization`);
       logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
 
       const runtimeId = process.env.AGENTCORE_RUNTIME_ID;
@@ -516,27 +517,31 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         logError(`[${requestId}] ❌ AGENTCORE_RUNTIME_ID not configured`);
         throw new Error('AGENTCORE_RUNTIME_ID not configured - check environment variables');
       }
+      if (!accessToken) {
+        logError(`[${requestId}] ❌ Verified Cognito access token unavailable`);
+        throw new Error('Authentication required');
+      }
 
       const accountId = await getAccountId();
       const region = process.env.AWS_REGION || 'us-west-2';
-
-      logInfo(`[${requestId}] 🔧 AgentCore config: region=${region}, accountId=${accountId}, runtimeId=${runtimeId}`);
-
-      const client = new BedrockAgentCoreClient({ region });
+      const agentRuntimeArn = `arn:aws:bedrock-agentcore:${region}:${accountId}:runtime/${runtimeId}`;
+      const runtimeUrl =
+        `https://bedrock-agentcore.${region}.amazonaws.com/runtimes/` +
+        `${encodeURIComponent(agentRuntimeArn)}/invocations?qualifier=DEFAULT`;
 
       // AgentCore Memory Pattern:
-      // - Frontend sends ONLY current message + threadId
-      // - AgentCore Memory automatically loads conversation history via runtimeSessionId
-      // - DO NOT send conversation_history in payload (antipattern)
+      // - Frontend sends only the current message and environment-isolated thread.
+      // - The Cognito access token is carried only in the Authorization header.
+      // - Runtime code independently verifies the token and reconstructs authority.
       const payload = {
         prompt: message,
-        thread_id: isolatedThreadId,     // Environment-isolated session ID
+        thread_id: isolatedThreadId,
         user_context: {
-          user_id: userIdentity?.userId,   // Overridden by trusted principal in production
-          session_id: isolatedThreadId,    // Environment-isolated session ID
+          user_id: userIdentity?.userId,
+          session_id: isolatedThreadId,
           auth_type: userIdentity?.authType,
-          ...authorizationContext
-        }
+          ...authorizationContext,
+        },
       };
 
       logInfo(`[${requestId}] 📦 Payload to AgentCore:`);
@@ -545,81 +550,36 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       logInfo(`[${requestId}]   user_context.user_id: ${redact(payload.user_context.user_id)}`);
       logInfo(`[${requestId}]   user_context.session_id: ${redact(payload.user_context.session_id)}`);
 
-      const payloadString = JSON.stringify(payload);
-      const payloadBytes = new TextEncoder().encode(payloadString);
+      const runtimeResponse = await fetchWithTimeout(
+        runtimeUrl,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            'X-Amzn-Bedrock-AgentCore-Runtime-Session-Id': isolatedThreadId,
+          },
+          body: JSON.stringify(payload),
+        },
+        INVOCATION_TIMEOUT_MS,
+      );
 
-      const agentRuntimeArn = `arn:aws:bedrock-agentcore:${region}:${accountId}:runtime/${runtimeId}`;
-      logInfo(`[${requestId}] 🔧 AgentCore Runtime ARN: ${agentRuntimeArn}`);
-
-      // AgentCore Memory Integration:
-      // - runtimeSessionId: Thread-based for conversation continuity within a chat
-      // - runtimeUserId: User-based for long-term memory across sessions
-      // - Environment prefix on sessionId prevents dev/prod memory collision
-      const runtimeSessionIdValue = isolatedThreadId;  // Thread-based: dev-thread-123 or prod-thread-456
-      const runtimeUserIdValue = userIdentity?.userId;  // User-based: aws-123-user or cognito-sub-abc
-
-      // Production: Require authenticated user (no anonymous)
-      if (isProduction && !runtimeUserIdValue) {
-        logError(`[${requestId}] ❌ Production requires authenticated user`);
-        throw new Error('Authentication required');
+      if (!runtimeResponse.ok) {
+        logError(`[${requestId}] ❌ AgentCore JWT invocation failed with status ${runtimeResponse.status}`);
+        throw new Error('AgentCore Runtime invocation failed');
       }
 
-      logInfo(`[${requestId}] 🧠 AgentCore Memory Parameters:`);
-      logInfo(`[${requestId}]   runtimeSessionId: ${redact(runtimeSessionIdValue)} (STM: conversation history)`);
-      logInfo(`[${requestId}]   runtimeUserId: ${redact(runtimeUserIdValue)} (LTM: user preferences)`);
+      responseContent = await runtimeResponse.text();
+      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed`);
 
-      const command = new InvokeAgentRuntimeCommand({
-        agentRuntimeArn,
-        contentType: 'application/json',
-        payload: payloadBytes,
-        runtimeSessionId: runtimeSessionIdValue,        // STM: Session-scoped conversation history
-        runtimeUserId: runtimeUserIdValue               // LTM: User-scoped preferences & context
-      });
-
-      const sdkResponse = await client.send(command);
-
-      logInfo(`[${requestId}] ✅ AgentCore SDK call completed`);
-
-      // The response has a streaming response property
-      if (sdkResponse.response) {
-        const chunks: Uint8Array[] = [];
-        const stream = sdkResponse.response as AsyncIterable<Uint8Array>;
-        for await (const chunk of stream) {
-          chunks.push(chunk);
-        }
-        const responseBytes = Buffer.concat(chunks);
-        responseContent = responseBytes.toString('utf-8');
-
-        logInfo(`[${requestId}] 📦 STAGE 1 - RAW SDK STREAM`);
-        logInfo(`[${requestId}] Type: ${typeof responseContent}`);
-        logInfo(`[${requestId}] Has escaped quotes: ${responseContent.includes('\\"')}`);
-        logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
-
-        // AgentCore Runtime automatically JSON-serializes return values
-        // According to AWS docs, AgentCore wraps string returns in JSON
-        try {
-          const parsed = JSON.parse(responseContent);
-          if (typeof parsed === 'string') {
-            responseContent = parsed;
-            logInfo(`[${requestId}] 📥 STAGE 2 - PARSED AGENTCORE JSON WRAPPER`);
-            logInfo(`[${requestId}] Extracted string length: ${responseContent.length}`);
-            logInfo(`[${requestId}] Has escaped newlines: ${responseContent.includes('\\n')}`);
-          } else {
-            logInfo(`[${requestId}] 📥 STAGE 2 - UNEXPECTED JSON TYPE: ${typeof parsed}`);
-            responseContent = String(parsed);
-          }
-        } catch {
-          logInfo(`[${requestId}] 📥 STAGE 2 - RAW RESPONSE (no JSON wrapper)`);
-          // Use as-is if not JSON-wrapped
-        }
-
-        logInfo(`[${requestId}] 📥 Response length: ${responseContent.length}`);
-      } else {
-        logError(`[${requestId}] ❌ No response stream in AgentCore response`);
-        responseContent = 'No response stream from AgentCore Runtime';
+      // AgentCore serializes a string return value as a JSON string.
+      try {
+        const parsed = JSON.parse(responseContent);
+        responseContent = typeof parsed === 'string' ? parsed : String(parsed);
+      } catch {
+        // Preserve an unwrapped text response.
       }
-
-      logInfo(`[${requestId}] ✅ AgentCore responded via SDK`);
+      logInfo(`[${requestId}] 📥 Response length: ${responseContent.length}`);
     } else {
       // Fallback: Use local HTTP endpoint (only when AGENTCORE_RUNTIME_ID not set)
       const backendUrl = process.env.BACKEND_URL || 'http://localhost:8080';
@@ -729,41 +689,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return res.status(200).json(copilotResponse);
 
   } catch (error) {
-    // Specific handling for IAM permission errors
-    if (error instanceof Error && error.name === 'AccessDeniedException') {
-      logError(`[${requestId}] ❌ IAM Permission Error:`, error);
-
-      // Check if it's the specific InvokeAgentRuntimeForUser permission issue
-      const isMemoryPermissionError = error.message.includes('InvokeAgentRuntimeForUser');
-      if (isMemoryPermissionError) {
-        logError(`[${requestId}] 💡 Missing IAM permission: bedrock-agentcore:InvokeAgentRuntimeForUser`);
-        logError(`[${requestId}] 💡 This permission is required when using runtimeUserId for memory features`);
-        logError(`[${requestId}] 💡 Fix: Add bedrock-agentcore:InvokeAgentRuntimeForUser to ECS task role`);
-      }
-
-      // CopilotKit drops non-200 chat responses, including IAM failures.
-      if (req.body?.operationName === 'generateCopilotResponse') {
-        const threadId = req.body?.variables?.data?.threadId || `thread-${Date.now()}`;
-        return res.status(200).json(copilotErrorMessage(threadId, requestId));
-      }
-
-      if (isMemoryPermissionError) {
-        return res.status(500).json({
-          error: 'Memory feature configuration error',
-          message: 'The AI assistant is experiencing a configuration issue with memory features. Please contact support.',
-          details: process.env.NODE_ENV === 'development' ? error.message : undefined,
-          requestId
-        });
-      }
-
-      // Generic IAM error
-      return res.status(403).json({
-        error: 'Authorization error',
-        message: 'The AI assistant does not have permission to process this request.',
-        requestId
-      });
-    }
-
     // Generic error handling
     logError(`[${requestId}] ❌ Error processing request:`, error instanceof Error ? error : new Error(String(error)));
 
