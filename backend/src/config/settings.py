@@ -138,6 +138,10 @@ COST_SNAPSHOT_TTL_SECONDS = _coerce_ttl_seconds(
 # defaults used elsewhere so local runs remain deterministic.
 DEPLOYMENT_TENANT_ID = os.getenv("GBAW_TENANT_ID", "").strip() or "default-tenant"
 DEPLOYMENT_WORKSPACE_ID = os.getenv("GBAW_WORKSPACE_ID", "").strip() or "default-workspace"
+COGNITO_ISSUER = os.getenv("GBAW_COGNITO_ISSUER", "").strip().rstrip("/")
+COGNITO_CLIENT_ID = os.getenv("GBAW_COGNITO_CLIENT_ID", "").strip()
+HOSTED_RUNTIME = os.getenv("GBAW_HOSTED_RUNTIME", "false").lower() == "true"
+ALLOW_LOCAL_IDENTITY_BYPASS = os.getenv("GBAW_ALLOW_LOCAL_IDENTITY_BYPASS", "false").lower() == "true"
 
 # Memory layer configuration
 MEMORY_SESSION_TTL_HOURS = int(os.getenv("GBAW_MEMORY_SESSION_TTL_HOURS", "24"))  # Conversation memory

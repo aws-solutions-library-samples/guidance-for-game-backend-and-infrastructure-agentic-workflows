@@ -10,7 +10,7 @@
  *   session keeps replaying the old conversation into every new turn — the chat
  *   LOOKS empty but the context was never cleared.
  *
- * Long-term user memory (keyed by runtimeUserId) is intentionally untouched:
+ * Long-term user memory (keyed by the verified Cognito subject) is intentionally untouched:
  * "new chat" clears the conversation, not what the agent knows about the user.
  */
 
