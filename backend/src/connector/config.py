@@ -150,6 +150,21 @@ class Decision:
     branch: str | None = None
 
 
+def _path_under_prefix(path: str, prefix: str) -> bool:
+    """Directory-boundary-aware prefix match for the path dimension.
+
+    A requested ``path`` lies under ``prefix`` only when it equals the prefix exactly
+    or sits beneath it at a path-separator boundary. A bare ``str.startswith`` would let
+    a configured prefix such as ``infra`` (or ``infra/``) authorize the sibling
+    ``infra-secrets/prod.tf``; matching on the ``/`` boundary closes that hole. The
+    prefix's trailing slash is normalized so the documented ``infra/`` form and a bare
+    ``infra`` behave identically, and an exact file path (``infra/main.tf``) still
+    matches only itself.
+    """
+    normalized = prefix.rstrip("/")
+    return path == normalized or path.startswith(normalized + "/")
+
+
 @dataclass(frozen=True)
 class AuthorizationPolicy:
     """Seven-dimension authorization over a tuple of :class:`AllowlistEntry`.
@@ -190,8 +205,9 @@ class AuthorizationPolicy:
            match, the branch dimension fails.
         5. **path** — the request passes when **at least one** of the branch-matching
            entries permits every requested path: an entry with ``path_prefixes`` requires
-           each path to lie under one of them (``str.startswith``); an empty ``path_prefixes``
-           permits any path.
+           each path to lie under one of them on a directory-separator boundary (equal to
+           the prefix or beneath ``prefix + "/"``, so ``infra/`` does not admit
+           ``infra-secrets/``); an empty ``path_prefixes`` permits any path.
         6. **extension** — among the entries that passed the path check, the request passes
            when at least one also permits every requested extension (``str.endswith``); an
            empty ``extensions`` permits any extension. The first entry passing both path and
@@ -241,7 +257,7 @@ class AuthorizationPolicy:
         any_entry_passed_paths = False
         for entry in branch_entries:
             paths_ok = not entry.path_prefixes or all(
-                any(path.startswith(prefix) for prefix in entry.path_prefixes) for path in paths
+                any(_path_under_prefix(path, prefix) for prefix in entry.path_prefixes) for path in paths
             )
             if not paths_ok:
                 continue
