@@ -1,25 +1,29 @@
 #!/bin/bash
 
-# Game Agent - Stress Test Runner
-# Runs performance and stress tests independently
+# Game Agent - bounded deployed availability test runner
+set -euo pipefail
 
-set -e
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PROJECT_ROOT"
 
-echo "🚀 Running Game Agent Stress Tests..."
+echo "🚀 Running Game Agent Bounded Availability Tests..."
 echo "================================================"
 
-cd backend
+if ! source "$PROJECT_ROOT/scripts/test/resolve-deployment-targets.sh"; then
+    echo "❌ Availability tests require a valid deployed stack"
+    echo "   Deploy with: ./deploy-all.sh"
+    exit 1
+fi
 
-# Ensure .venv exists (uv is the standard)
+cd backend
 if [ ! -d ".venv" ]; then
     echo "📦 Creating .venv with uv sync..."
     uv sync
 fi
 
-# Run stress tests only
-echo "⚡ Running stress/performance tests..."
-uv run python -m pytest tests/ -m "stress" -v --tb=short
+echo "⚡ Running bounded, read-only frontend and AgentCore availability checks..."
+uv run python -m pytest tests/performance -m "stress" -v --tb=short
 
 echo ""
-echo "✅ Stress tests completed!"
+echo "✅ Bounded availability tests completed!"
 echo "================================================"
