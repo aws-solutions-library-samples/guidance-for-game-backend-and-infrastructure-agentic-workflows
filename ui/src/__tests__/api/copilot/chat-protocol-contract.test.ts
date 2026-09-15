@@ -22,7 +22,6 @@ jest.mock('@/utils/logger', () => ({
   logDebug: jest.fn(),
   redact: jest.fn((v?: string | null) => (v ? `${v.slice(0, 2)}…(redacted)` : '<none>')),
 }));
-jest.mock('@aws-sdk/client-bedrock-agentcore');
 jest.mock('@aws-sdk/client-sts');
 
 const mockVerify = jest.fn();

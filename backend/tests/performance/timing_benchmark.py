@@ -11,18 +11,15 @@ import json
 import os
 import sys
 import time
-import uuid
 from datetime import datetime
 from typing import Dict
-
-# Third-party packages
-import boto3
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Local modules
+from ai_evals.test_config import make_agent_request
 from conftest import get_deployment_info
 
 # Substring the AgentCore boundary emits when it rejects a request because it
@@ -63,64 +60,17 @@ BENCHMARK_QUERIES = {
 
 
 def invoke_agent(runtime_arn: str, region: str, query: str) -> tuple[str, float]:
-    """
-    Invoke the deployed agent and return response with timing.
-
-    Shared cost-report reuse requires a trusted transport actor (#365): supply a
-    synthetic ``runtimeUserId`` and a matching body ``user_context`` (user_id and
-    session_id) so the AgentCore boundary sees one consistent identity and does
-    not reject the request. A per-invocation unique actor also isolates memory so
-    a poisoned session cannot cascade across benchmark queries.
-
-    Returns:
-        tuple: (response_text, elapsed_seconds)
-
-    Raises:
-        IdentityVerificationRejected: if the deployed agent refuses the request
-            at the identity boundary. The caller must not record this as a
-            timing sample.
-    """
-    client = boto3.client("bedrock-agentcore", region_name=region)
-
-    # Synthetic, non-real identifiers. The runtimeUserId (trusted transport
-    # identity) and the body user_id MUST match, or the boundary rejects the call.
-    unique = uuid.uuid4().hex
-    actor_id = f"benchmark-{unique}"
-    payload = json.dumps(
-        {
-            "prompt": query,
-            "user_context": {
-                "user_id": actor_id,
-                "session_id": f"benchmark-session-{unique}",
-            },
-        }
-    )
-    payload_bytes = payload.encode("utf-8")
-
+    """Invoke the JWT-authorized deployed agent and return response timing."""
+    config = {
+        "mode": "deployed",
+        "runtime_id": runtime_arn.rsplit("/", 1)[-1],
+        "runtime_arn": runtime_arn,
+        "region": region,
+    }
     start_time = time.perf_counter()
+    response_text = make_agent_request(query, config)
+    elapsed = time.perf_counter() - start_time
 
-    response = client.invoke_agent_runtime(
-        agentRuntimeArn=runtime_arn,
-        contentType="application/json",
-        payload=payload_bytes,
-        runtimeUserId=actor_id,
-    )
-
-    response_text = response["response"].read().decode("utf-8")
-
-    end_time = time.perf_counter()
-    elapsed = end_time - start_time
-
-    # Parse response
-    try:
-        parsed = json.loads(response_text)
-        if isinstance(parsed, str):
-            response_text = parsed
-    except Exception:
-        pass
-
-    # An identity-boundary rejection is not a latency measurement — surface it so
-    # the caller records an error instead of a bogus "successful" timing.
     if _is_identity_rejection(response_text):
         raise IdentityVerificationRejected(
             "Deployed agent rejected the benchmark invocation at the identity boundary; " "not a valid timing sample."
