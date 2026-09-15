@@ -280,7 +280,12 @@ def test_no_source_control_write_resources_created(template: dict):
     resources = template.get("Resources", {})
     # The sole connector resource is the audit log group; it is a logs group, not a
     # source-control write resource. No DynamoDB / Step Functions / Lambda write infra.
+    # Scope this invariant to connector-owned resources (``Scm`` logical-id prefix):
+    # unrelated features legitimately own their own infra (e.g. the cost-report
+    # snapshot DynamoDB table, #365) and are out of scope for the read-only split.
     for logical_id, resource in resources.items():
+        if not logical_id.startswith("Scm"):
+            continue
         rtype = resource.get("Type", "") if isinstance(resource, dict) else ""
         assert rtype not in (
             "AWS::DynamoDB::Table",
