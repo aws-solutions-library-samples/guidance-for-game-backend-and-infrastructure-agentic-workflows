@@ -191,6 +191,40 @@ function Deploy-GameAgent {
         -Params $baseParams
     Write-Host ''
 
+    # Resolve Cognito bindings for AgentCore JWT bearer authorization.
+    $cognitoUserPoolId = Get-StackOutput "$ProjectName-infrastructure" 'UserPoolId'
+    $cognitoClientId = Get-StackOutput "$ProjectName-infrastructure" 'UserPoolClientId'
+    if (-not $cognitoUserPoolId -or $cognitoUserPoolId -eq 'None' -or -not $cognitoClientId -or $cognitoClientId -eq 'None') {
+        throw 'Base stack did not export Cognito JWT configuration.'
+    }
+    $cognitoIssuer = "https://cognito-idp.${Region}.amazonaws.com/${cognitoUserPoolId}"
+    $agentCoreAuthorizerConfig = @{
+        customJWTAuthorizer = @{
+            discoveryUrl = "${cognitoIssuer}/.well-known/openid-configuration"
+            allowedClients = @($cognitoClientId)
+        }
+    } | ConvertTo-Json -Compress -Depth 4
+    Write-GameAgentStatus 'Cognito JWT authorizer resolved' -Type Success
+    Write-Host ''
+
+    # Resolve the shared cost report snapshot table (#365). The base stack always
+    # exports this output, so a missing value means a broken/stale stack — fail
+    # closed rather than degrading to a process-local cache. Hosted deployments
+    # require the shared store.
+    $costSnapshotTableName = Get-StackOutput "$ProjectName-infrastructure" 'CostReportSnapshotTableName'
+    if (-not $costSnapshotTableName -or $costSnapshotTableName -eq 'None') {
+        throw 'Base stack did not export CostReportSnapshotTableName. Redeploy the base infrastructure stack so the shared cost report snapshot table exists.'
+    }
+    $costSnapshotRequired = 'true'
+    $costSnapshotTtlSeconds = if ($env:GBAW_COST_SNAPSHOT_TTL_SECONDS) { $env:GBAW_COST_SNAPSHOT_TTL_SECONDS } else { '1800' }
+    $ttlParsed = 0
+    if (-not [int]::TryParse($costSnapshotTtlSeconds, [ref]$ttlParsed) -or $ttlParsed -lt 60 -or $ttlParsed -gt 86400) {
+        throw "GBAW_COST_SNAPSHOT_TTL_SECONDS='$costSnapshotTtlSeconds' must be an integer in [60, 86400]."
+    }
+    Write-Host "   Cost snapshot table: $costSnapshotTableName"
+    Write-Host "   Cost snapshot TTL:   ${costSnapshotTtlSeconds}s (required=$costSnapshotRequired)"
+    Write-Host ''
+
     # ── Step 1.5: Guardrails ──
     Write-GameAgentStatus 'Step 1.5: Deploying Bedrock Guardrails...' -Type Info
     Deploy-Stack -StackName "$ProjectName-guardrails" `
@@ -259,7 +293,16 @@ function Deploy-GameAgent {
             -EksPromptArn $eksPromptArn `
             -CostPromptArn $costPromptArn `
             -SourceControlPromptArn $sourceControlPromptArn `
-            -ScmEnv $scmRuntimeEnv
+            -ScmEnv $scmRuntimeEnv `
+            -TenantId $tenantId `
+            -WorkspaceId $workspaceId `
+            -CostSnapshotTableName $costSnapshotTableName `
+            -CostSnapshotRequired $costSnapshotRequired `
+            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds
+        $agentCoreEnvArgs += @(
+            '-env', "GBAW_COGNITO_ISSUER=$cognitoIssuer",
+            '-env', "GBAW_COGNITO_CLIENT_ID=$cognitoClientId"
+        )
 
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
         Write-Host "Using execution role: $executionRoleArn"
@@ -290,19 +333,17 @@ function Deploy-GameAgent {
             if ($existingRuntime -eq 'null') { $existingRuntime = '' }
         }
 
-        if (-not $existingRuntime) {
-            Write-GameAgentStatus 'Configuring AgentCore (first deploy)...' -Type Info
-            uv run agentcore configure `
-                --entrypoint agentcore_main.py `
-                --name gameagentruntime `
-                --region $Region `
-                --execution-role $executionRoleArn `
-                --requirements-file requirements.txt `
-                --non-interactive
-            if ($LASTEXITCODE -ne 0) { throw "agentcore configure failed (exit code $LASTEXITCODE)" }
-        } else {
-            Write-GameAgentStatus 'AgentCore already configured, skipping configure step' -Type Info
-        }
+        Write-GameAgentStatus 'Configuring AgentCore Cognito JWT authorization...' -Type Info
+        uv run agentcore configure `
+            --entrypoint agentcore_main.py `
+            --name gameagentruntime `
+            --region $Region `
+            --execution-role $executionRoleArn `
+            --requirements-file requirements.txt `
+            --authorizer-config $agentCoreAuthorizerConfig `
+            --request-header-allowlist Authorization `
+            --non-interactive
+        if ($LASTEXITCODE -ne 0) { throw "agentcore configure failed (exit code $LASTEXITCODE)" }
 
         # Note: no Dockerfile patching needed for MCP servers. ccapi-mcp-server (which
         # needed a writable .schemas dir) was replaced by aws-api-mcp-server, whose
@@ -400,7 +441,16 @@ function Deploy-GameAgent {
             -GameLiftKbId $gameliftKbId `
             -EksKbId $eksKbId `
             -CostKbId $costKbId `
-            -ScmEnv $scmRuntimeEnv
+            -ScmEnv $scmRuntimeEnv `
+            -TenantId $tenantId `
+            -WorkspaceId $workspaceId `
+            -CostSnapshotTableName $costSnapshotTableName `
+            -CostSnapshotRequired $costSnapshotRequired `
+            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds
+        $agentCoreEnvArgs += @(
+            '-env', "GBAW_COGNITO_ISSUER=$cognitoIssuer",
+            '-env', "GBAW_COGNITO_CLIENT_ID=$cognitoClientId"
+        )
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success

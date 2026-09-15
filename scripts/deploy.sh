@@ -151,6 +151,30 @@ aws cloudformation deploy \
 echo "✅ Base infrastructure deployed"
 echo ""
 
+# Resolve the Cognito bindings used by AgentCore JWT bearer authorization.
+COGNITO_USER_POOL_ID=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT_NAME}-infrastructure" \
+  --region "$AWS_REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' \
+  --output text)
+COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT_NAME}-infrastructure" \
+  --region "$AWS_REGION" \
+  --query 'Stacks[0].Outputs[?OutputKey==`UserPoolClientId`].OutputValue' \
+  --output text)
+if [ -z "${COGNITO_USER_POOL_ID:-}" ] || [ "$COGNITO_USER_POOL_ID" = "None" ] || \
+   [ -z "${COGNITO_CLIENT_ID:-}" ] || [ "$COGNITO_CLIENT_ID" = "None" ]; then
+  echo "❌ Base stack did not export Cognito JWT configuration" >&2
+  exit 1
+fi
+COGNITO_ISSUER="https://cognito-idp.${AWS_REGION}.amazonaws.com/${COGNITO_USER_POOL_ID}"
+AGENTCORE_AUTHORIZER_CONFIG=$(jq -cn \
+  --arg discoveryUrl "${COGNITO_ISSUER}/.well-known/openid-configuration" \
+  --arg clientId "$COGNITO_CLIENT_ID" \
+  '{customJWTAuthorizer:{discoveryUrl:$discoveryUrl,allowedClients:[$clientId]}}')
+echo "✅ Cognito JWT authorizer resolved"
+echo ""
+
 # Step 1.5: Deploy Bedrock Guardrails
 echo "🛡️  Step 1.5: Deploying Bedrock Guardrails..."
 aws cloudformation deploy \
@@ -220,6 +244,36 @@ eval "$IDENTITY_EXPORTS"
 echo "   Tenant binding:      $GBAW_TENANT_ID"
 echo "   Workspace binding:   $GBAW_WORKSPACE_ID"
 
+# Resolve the shared cost report snapshot table (#365) from the base stack so the
+# runtime can reuse report IDs across workers. The base stack (deployed above)
+# always exports this output, so a missing value means a broken or stale stack —
+# fail closed rather than silently degrading to a process-local in-memory cache
+# that cannot satisfy cross-worker reuse.
+COST_SNAPSHOT_TABLE_NAME=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT_NAME}-infrastructure" \
+  --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`CostReportSnapshotTableName`].OutputValue' \
+  --output text 2>/dev/null || echo "")
+if [ -z "$COST_SNAPSHOT_TABLE_NAME" ] || [ "$COST_SNAPSHOT_TABLE_NAME" = "None" ]; then
+  echo "❌ Base stack did not export CostReportSnapshotTableName." >&2
+  echo "   The shared cost report snapshot store is required for a hosted deployment;" >&2
+  echo "   redeploy the base infrastructure stack so the table and output exist." >&2
+  exit 1
+fi
+# Hosted deployments require the shared store: never fall back to memory.
+COST_SNAPSHOT_REQUIRED=true
+
+# Validate a bounded, positive TTL (seconds) before passing it to the runtime.
+COST_SNAPSHOT_TTL_SECONDS="${GBAW_COST_SNAPSHOT_TTL_SECONDS:-1800}"
+if ! [[ "$COST_SNAPSHOT_TTL_SECONDS" =~ ^[0-9]+$ ]] \
+    || [ "$COST_SNAPSHOT_TTL_SECONDS" -lt 60 ] \
+    || [ "$COST_SNAPSHOT_TTL_SECONDS" -gt 86400 ]; then
+  echo "❌ GBAW_COST_SNAPSHOT_TTL_SECONDS='$COST_SNAPSHOT_TTL_SECONDS' must be an integer in [60, 86400]." >&2
+  exit 1
+fi
+echo "   Cost snapshot table: ${COST_SNAPSHOT_TABLE_NAME}"
+echo "   Cost snapshot TTL:   ${COST_SNAPSHOT_TTL_SECONDS}s (required=${COST_SNAPSHOT_REQUIRED})"
+
 is_resolved_deployment_value() {
   [ -n "${1:-}" ] && [ "$1" != "None" ]
 }
@@ -236,6 +290,7 @@ append_agentcore_env_if_resolved() {
 
 build_agentcore_env_args() {
   AGENTCORE_ENV_ARGS=(
+    -env "GBAW_HOSTED_RUNTIME=true"
     -env "GBAW_ORCHESTRATOR_MODEL_ID=$GBAW_ORCHESTRATOR_MODEL_ID"
     -env "GBAW_SPECIALIST_MODEL_ID=$GBAW_SPECIALIST_MODEL_ID"
   )
@@ -254,6 +309,14 @@ build_agentcore_env_args() {
   append_agentcore_env_if_resolved "GBAW_GAMELIFT_KB_ID" "${GAMELIFT_KB_ID:-}"
   append_agentcore_env_if_resolved "GBAW_EKS_KB_ID" "${EKS_KB_ID:-}"
   append_agentcore_env_if_resolved "GBAW_COST_KB_ID" "${COST_KB_ID:-}"
+  # Trusted deployment identity + shared cost report snapshot store (#365)
+  append_agentcore_env_if_resolved "GBAW_TENANT_ID" "${GBAW_TENANT_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_WORKSPACE_ID" "${GBAW_WORKSPACE_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_COGNITO_ISSUER" "${COGNITO_ISSUER:-}"
+  append_agentcore_env_if_resolved "GBAW_COGNITO_CLIENT_ID" "${COGNITO_CLIENT_ID:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TABLE_NAME" "${COST_SNAPSHOT_TABLE_NAME:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_REQUIRED" "${COST_SNAPSHOT_REQUIRED:-}"
+  append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TTL_SECONDS" "${COST_SNAPSHOT_TTL_SECONDS:-}"
   return 0
 }
 
@@ -288,21 +351,17 @@ else
   echo "⚠️  UV not found, using existing requirements.txt"
 fi
 
-# Run configure only if no existing runtime (first deploy)
-EXISTING_RUNTIME=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_arn' .bedrock_agentcore.yaml 2>/dev/null || echo "")
-if [ -z "$EXISTING_RUNTIME" ] || [ "$EXISTING_RUNTIME" = "null" ]; then
-  echo "📝 Configuring AgentCore (first deploy)..."
-  uv run agentcore configure \
-    --entrypoint agentcore_main.py \
-    --name gameagentruntime \
-    --region $AWS_REGION \
-    --execution-role "$EXECUTION_ROLE_ARN" \
-    --requirements-file requirements.txt \
-    --non-interactive
-  echo "✅ Configuration ready"
-else
-  echo "📝 AgentCore already configured, skipping configure step"
-fi
+echo "📝 Configuring AgentCore Cognito JWT authorization..."
+uv run agentcore configure \
+  --entrypoint agentcore_main.py \
+  --name gameagentruntime \
+  --region "$AWS_REGION" \
+  --execution-role "$EXECUTION_ROLE_ARN" \
+  --requirements-file requirements.txt \
+  --authorizer-config "$AGENTCORE_AUTHORIZER_CONFIG" \
+  --request-header-allowlist Authorization \
+  --non-interactive
+echo "✅ AgentCore JWT configuration ready"
 
 # Note: no Dockerfile patching needed for MCP servers. The previous ccapi-mcp-server
 # required a writable .schemas dir (read-only in the container); it was replaced by

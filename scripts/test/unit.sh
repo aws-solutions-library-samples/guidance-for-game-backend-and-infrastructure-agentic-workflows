@@ -7,12 +7,15 @@ set -e
 
 # Colors
 GREEN='\033[0;32m'
-RED='\033[0;31m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}🧪 Game Agent - Unit Tests${NC}"
 echo "=================================="
+
+# Repository script tests (mocked; no AWS or Kubernetes access)
+echo -e "\n${BLUE}🛠️  Repository Script Tests${NC}"
+python3 -m unittest discover -s scripts/test -p 'test_*.py' -v
 
 # Backend unit tests (fast, behavioral validation)
 echo -e "\n${BLUE}🐍 Backend Unit Tests (1.3s execution)${NC}"

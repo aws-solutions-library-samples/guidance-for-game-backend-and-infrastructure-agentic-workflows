@@ -12,17 +12,31 @@ import os
 import sys
 import time
 from datetime import datetime
-from typing import Dict, List
-
-# Third-party packages
-import boto3
+from typing import Dict
 
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # Local modules
+from ai_evals.test_config import make_agent_request
 from conftest import get_deployment_info
+
+# Substring the AgentCore boundary emits when it rejects a request because it
+# cannot establish a trusted cost-report actor (#365). A benchmark run that trips
+# this is measuring an auth rejection, not agent latency, so it must never be
+# counted as a successful timing sample.
+_IDENTITY_REJECTION_MARKER = "identity verification"
+
+
+class IdentityVerificationRejected(RuntimeError):
+    """The deployed agent rejected the invocation at the identity boundary."""
+
+
+def _is_identity_rejection(response_text: str) -> bool:
+    """Return True if the response is the boundary's identity-verification refusal."""
+    return _IDENTITY_REJECTION_MARKER in response_text.casefold()
+
 
 # Test queries categorized by type
 BENCHMARK_QUERIES = {
@@ -46,35 +60,21 @@ BENCHMARK_QUERIES = {
 
 
 def invoke_agent(runtime_arn: str, region: str, query: str) -> tuple[str, float]:
-    """
-    Invoke the deployed agent and return response with timing.
-
-    Returns:
-        tuple: (response_text, elapsed_seconds)
-    """
-    client = boto3.client("bedrock-agentcore", region_name=region)
-
-    payload = json.dumps({"prompt": query})
-    payload_bytes = payload.encode("utf-8")
-
+    """Invoke the JWT-authorized deployed agent and return response timing."""
+    config = {
+        "mode": "deployed",
+        "runtime_id": runtime_arn.rsplit("/", 1)[-1],
+        "runtime_arn": runtime_arn,
+        "region": region,
+    }
     start_time = time.perf_counter()
+    response_text = make_agent_request(query, config)
+    elapsed = time.perf_counter() - start_time
 
-    response = client.invoke_agent_runtime(
-        agentRuntimeArn=runtime_arn, contentType="application/json", payload=payload_bytes
-    )
-
-    response_text = response["response"].read().decode("utf-8")
-
-    end_time = time.perf_counter()
-    elapsed = end_time - start_time
-
-    # Parse response
-    try:
-        parsed = json.loads(response_text)
-        if isinstance(parsed, str):
-            response_text = parsed
-    except Exception:
-        pass
+    if _is_identity_rejection(response_text):
+        raise IdentityVerificationRejected(
+            "Deployed agent rejected the benchmark invocation at the identity boundary; " "not a valid timing sample."
+        )
 
     return response_text, elapsed
 
