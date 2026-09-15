@@ -199,7 +199,9 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 # results; exits non-zero if any stack, KB, or retrieval is broken
 ./scripts/infrastructure/test-kb.sh
 
-# Exercise Guardrail behavior and specialist routing/tool use
+# Exercise Guardrail behavior and specialist routing/tool use with a
+# short-lived access token from an approved Cognito test user
+export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
 ./test-ai-evals.sh
 
 # Confirm startup logged both resolved model roles

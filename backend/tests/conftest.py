@@ -24,6 +24,10 @@ backend_env = os.path.join(os.path.dirname(__file__), "..", ".env.local")
 if os.path.exists(backend_env):
     load_dotenv(backend_env)
 
+# Unit/local test processes intentionally exercise the explicit local identity
+# path. Hosted runtime deployment never sets this bypass.
+os.environ.setdefault("GBAW_ALLOW_LOCAL_IDENTITY_BYPASS", "true")
+
 
 def get_deployment_info():
     """
