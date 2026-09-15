@@ -132,11 +132,10 @@ def is_trusted_scope(scope: ReportScope) -> bool:
 def resolve_scope_actor(*, trusted_actor: str | None, body_user_id: str | None, shared_mode: bool) -> str:
     """Resolve the actor a report scope binds to at the AgentCore boundary.
 
-    In shared mode the actor is taken *only* from the trusted transport identity
-    (the platform-established AgentCore ``runtimeUserId`` header) — never from the
-    request body or a caller-supplied custom passthrough header. A trusted actor
-    is required, and a body-supplied identity that conflicts with it is rejected
-    as an identity-confusion signal.
+    In shared mode the actor is taken *only* from the cryptographically verified
+    Cognito access token — never from the request body or a caller-supplied
+    custom passthrough header. A trusted actor is required, and a body-supplied
+    identity that conflicts with it is rejected as an identity-confusion signal.
 
     In non-shared mode (local development, tests) the trusted actor is preferred
     but the body identity is accepted as a fallback so single-process flows stay
