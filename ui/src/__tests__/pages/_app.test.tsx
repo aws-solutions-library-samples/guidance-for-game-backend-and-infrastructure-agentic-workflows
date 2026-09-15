@@ -3,9 +3,10 @@
  */
 
 import React from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import MyApp from '../../pages/_app';
+import { resetRefreshCoordinatorForTests } from '@/utils/sessionRefresh';
 
 const mockCognitoSignOut = jest.fn();
 const mockEstablishSession = jest.fn();
@@ -54,6 +55,8 @@ describe('MyApp - Logout behavior', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockEstablishSession.mockReset();
+    resetRefreshCoordinatorForTests();
+    window.localStorage.clear();
     global.fetch = jest.fn();
     // Clear cookies
     Object.defineProperty(document, 'cookie', {
@@ -266,6 +269,168 @@ describe('MyApp - Logout behavior', () => {
     );
     expect(mockCognitoSignOut).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls.filter(([input]) => input.toString() === '/api/copilot/chat')).toHaveLength(2);
+  });
+
+  it('refreshes once and retries concurrent active requests without signing out', async () => {
+    let refreshed = false;
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleRefreshSeconds: 900, absoluteLifetimeHours: 8 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/copilot/chat') {
+        return {
+          ok: refreshed,
+          status: refreshed ? 200 : 401,
+          json: async () => refreshed ? ({ result: 'ok' }) : ({ error: 'Unauthorized' }),
+        } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        refreshed = true;
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        throw new Error('logout must not run after a successful refresh');
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void Promise.all([
+          fetch('/api/copilot/chat', { method: 'POST' }),
+          fetch('/api/copilot/chat', { method: 'POST' }),
+        ])}>
+          Submit message
+        </button>
+      </div>
+    );
+
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Submit message' }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/auth/refresh',
+    )).toHaveLength(1));
+    await waitFor(() => expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/copilot/chat',
+    )).toHaveLength(4));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+    expect(mockCognitoSignOut).not.toHaveBeenCalled();
+  });
+
+  it('keeps a refreshed session when the retried endpoint still returns 401', async () => {
+    let initialRequest = true;
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleRefreshSeconds: 900, absoluteLifetimeHours: 8 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/copilot/chat') {
+        initialRequest = false;
+        return { ok: false, status: 401, json: async () => ({ error: 'Unauthorized' }) } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        throw new Error('a successful refresh must not clear the session');
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>Submit message</button>
+      </div>
+    );
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Submit message' }));
+
+    await waitFor(() => expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/copilot/chat',
+    )).toHaveLength(2));
+    expect(initialRequest).toBe(false);
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+    expect(mockCognitoSignOut).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh an unattended session after the idle window', async () => {
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleRefreshSeconds: 1, absoluteLifetimeHours: 8 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/copilot/chat') {
+        return { ok: false, status: 401, json: async () => ({ error: 'Unauthorized' }) } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        throw new Error('idle sessions must not refresh');
+      }
+      if (url === '/api/auth/logout') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => <div data-testid="app-content">App Content</div>;
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    await waitFor(() => expect(screen.getByTestId('app-content')).toBeInTheDocument());
+
+    nowSpy.mockReturnValue(5_000);
+    await act(async () => {
+      await window.fetch('/api/copilot/chat', { method: 'POST' });
+    });
+
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/auth/refresh',
+    )).toHaveLength(0);
+    expect(fetchMock.mock.calls.filter(
+      ([input]) => input.toString() === '/api/auth/logout',
+    )).toHaveLength(1);
+    nowSpy.mockRestore();
   });
 
   it('does not let stale expiration cleanup clear a newly established session', async () => {
