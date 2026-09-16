@@ -164,6 +164,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
 
         ($result -join "`n") | Should -Be (@(
             '-env'
+            'GBAW_HOSTED_RUNTIME=true'
+            '-env'
             'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
             '-env'
             'GBAW_SPECIALIST_MODEL_ID=specialist-model'
@@ -199,6 +201,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -ScmEnv $scmEnv
 
         ($result -join "`n") | Should -Be (@(
+            '-env'
+            'GBAW_HOSTED_RUNTIME=true'
             '-env'
             'GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model'
             '-env'
