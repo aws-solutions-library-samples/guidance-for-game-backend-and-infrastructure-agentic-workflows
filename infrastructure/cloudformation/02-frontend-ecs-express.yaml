@@ -53,6 +53,13 @@ Parameters:
     Default: 4
     Description: Maximum number of tasks
 
+  SessionIdleRefreshSeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 3600
+    Description: Maximum idle time that still permits an automatic token refresh
+
 Resources:
   FrontendService:
     Type: AWS::ECS::ExpressGatewayService
@@ -83,6 +90,11 @@ Resources:
           - Name: COGNITO_CLIENT_ID
             Value:
               Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
+          - Name: GBAW_SESSION_ABSOLUTE_LIFETIME_HOURS
+            Value:
+              Fn::ImportValue: !Sub '${ProjectName}-SessionAbsoluteLifetimeHours'
+          - Name: GBAW_SESSION_IDLE_REFRESH_SECONDS
+            Value: !Ref SessionIdleRefreshSeconds
           - Name: GBAW_COGNITO_AUDIENCE
             Value:
               Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
