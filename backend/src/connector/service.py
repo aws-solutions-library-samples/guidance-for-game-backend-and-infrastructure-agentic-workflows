@@ -24,6 +24,7 @@ Read_Path_Contract_278 seam (:func:`_read_path_context`) — never from tool/mod
 from __future__ import annotations
 
 # Standard library
+import contextvars
 import posixpath
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Sequence
@@ -76,10 +77,14 @@ class PathTraversalError(ValueError):
 # reads reuse one boto3 client and its chained sequence token. ``_active_config`` holds the
 # config resolved by the current ``read_iac_files`` call so the signature-stable ``_audit``
 # helper can reach ``config.connector.audit_log_group`` without threading it through every
-# call site. Tests may monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to
-# inject a fake sink.
+# call site. It is a :class:`~contextvars.ContextVar` rather than a plain module global so a
+# per-request (or injected) config is isolated to the calling context — concurrent reads on
+# the same worker (async tasks or threads) never observe each other's config. Tests may
+# monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to inject a fake sink.
 _audit_sinks: dict[str, AuditSink] = {}
-_active_config: SourceControlConfig | None = None
+_active_config: contextvars.ContextVar[SourceControlConfig | None] = contextvars.ContextVar(
+    "scm_active_config", default=None
+)
 
 
 def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
@@ -103,9 +108,8 @@ def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
 
 def _reset_audit_sinks() -> None:
     """Clear the cached sinks and active config (test hook)."""
-    global _active_config
     _audit_sinks.clear()
-    _active_config = None
+    _active_config.set(None)
 
 
 def _resolve_config(config: SourceControlConfig | None) -> SourceControlConfig:
@@ -246,7 +250,7 @@ def _audit(level: str, message: str, /, **fields: object) -> bool:
     except Exception:  # noqa: BLE001 - local logging must never affect the read
         pass
 
-    sink = _get_audit_sink(_active_config)
+    sink = _get_audit_sink(_active_config.get())
     if sink is None:
         return False
     event = {"message": message, "level": level, **safe_fields}
@@ -375,11 +379,12 @@ def read_iac_files(
     omit them so the validated config is loaded and the concrete read adapter selected
     automatically.
     """
-    global _active_config
     resolved_config = _resolve_config(config)
-    # Publish the resolved config so the signature-stable ``_audit`` helper can reach the
-    # durable sink's audit log group.
-    _active_config = resolved_config
+    # Publish the resolved config on the context-local var so the signature-stable ``_audit``
+    # helper can reach the durable sink's audit log group. Using a ContextVar keeps this
+    # isolated to the calling context, so a concurrent read with a different (or injected)
+    # config never clobbers this request's audit target.
+    _active_config.set(resolved_config)
 
     # Normalize each requested path BEFORE the count check, authorization, and any read so
     # every downstream stage operates on the canonical form. A path that attempts to escape
