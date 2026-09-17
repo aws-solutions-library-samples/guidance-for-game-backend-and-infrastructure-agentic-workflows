@@ -398,12 +398,31 @@ def read_iac_files(
     automatically.
     """
     resolved_config = _resolve_config(config)
-    # Publish the resolved config on the context-local var so the signature-stable ``_audit``
-    # helper can reach the durable sink's audit log group. Using a ContextVar keeps this
-    # isolated to the calling context, so a concurrent read with a different (or injected)
-    # config never clobbers this request's audit target.
-    _active_config.set(resolved_config)
+    # Bind the resolved config for exactly this read. Reset the matching token in a
+    # ``finally`` so every early return, terminal provider exception, and nested/reentrant
+    # invocation restores the caller's previous audit target.
+    active_config_token = _active_config.set(resolved_config)
+    try:
+        return _read_iac_files_resolved(
+            paths,
+            repository=repository,
+            target_branch=target_branch,
+            resolved_config=resolved_config,
+            reader=reader,
+        )
+    finally:
+        _active_config.reset(active_config_token)
 
+
+def _read_iac_files_resolved(
+    paths: list[str],
+    *,
+    repository: str | None,
+    target_branch: str | None,
+    resolved_config: SourceControlConfig,
+    reader: "SourceControlReader | None",
+) -> FileFetchResult:
+    """Execute one read while the public wrapper owns active-config lifecycle."""
     # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
     # context, never from model/tool input. Resolve them before path normalization so even
     # an unsafe-path rejection can be attributed to the trusted requester and scope.
