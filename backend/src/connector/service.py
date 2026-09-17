@@ -24,6 +24,7 @@ Read_Path_Contract_278 seam (:func:`_read_path_context`) — never from tool/mod
 from __future__ import annotations
 
 # Standard library
+import contextvars
 import posixpath
 from datetime import datetime, timedelta, timezone
 from time import sleep as _sleep
@@ -81,10 +82,14 @@ class PathTraversalError(ValueError):
 # reads reuse one boto3 client and its chained sequence token. ``_active_config`` holds the
 # config resolved by the current ``read_iac_files`` call so the signature-stable ``_audit``
 # helper can reach ``config.connector.audit_log_group`` without threading it through every
-# call site. Tests may monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to
-# inject a fake sink.
+# call site. It is a :class:`~contextvars.ContextVar` rather than a plain module global so a
+# per-request (or injected) config is isolated to the calling context — concurrent reads on
+# the same worker (async tasks or threads) never observe each other's config. Tests may
+# monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to inject a fake sink.
 _audit_sinks: dict[str, AuditSink] = {}
-_active_config: SourceControlConfig | None = None
+_active_config: contextvars.ContextVar[SourceControlConfig | None] = contextvars.ContextVar(
+    "scm_active_config", default=None
+)
 
 
 def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
@@ -108,9 +113,8 @@ def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
 
 def _reset_audit_sinks() -> None:
     """Clear the cached sinks and active config (test hook)."""
-    global _active_config
     _audit_sinks.clear()
-    _active_config = None
+    _active_config.set(None)
 
 
 def _resolve_config(config: SourceControlConfig | None) -> SourceControlConfig:
@@ -251,7 +255,7 @@ def _audit(level: str, message: str, /, **fields: object) -> bool:
     except Exception:  # noqa: BLE001 - local logging must never affect the read
         pass
 
-    sink = _get_audit_sink(_active_config)
+    sink = _get_audit_sink(_active_config.get())
     if sink is None:
         return False
     event = {"message": message, "level": level, **safe_fields}
@@ -393,12 +397,32 @@ def read_iac_files(
     omit them so the validated config is loaded and the concrete read adapter selected
     automatically.
     """
-    global _active_config
     resolved_config = _resolve_config(config)
-    # Publish the resolved config so the signature-stable ``_audit`` helper can reach the
-    # durable sink's audit log group.
-    _active_config = resolved_config
+    # Bind the resolved config for exactly this read. Reset the matching token in a
+    # ``finally`` so every early return, terminal provider exception, and nested/reentrant
+    # invocation restores the caller's previous audit target.
+    active_config_token = _active_config.set(resolved_config)
+    try:
+        return _read_iac_files_resolved(
+            paths,
+            repository=repository,
+            target_branch=target_branch,
+            resolved_config=resolved_config,
+            reader=reader,
+        )
+    finally:
+        _active_config.reset(active_config_token)
 
+
+def _read_iac_files_resolved(
+    paths: list[str],
+    *,
+    repository: str | None,
+    target_branch: str | None,
+    resolved_config: SourceControlConfig,
+    reader: "SourceControlReader | None",
+) -> FileFetchResult:
+    """Execute one read while the public wrapper owns active-config lifecycle."""
     # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
     # context, never from model/tool input. Resolve them before path normalization so even
     # an unsafe-path rejection can be attributed to the trusted requester and scope.
