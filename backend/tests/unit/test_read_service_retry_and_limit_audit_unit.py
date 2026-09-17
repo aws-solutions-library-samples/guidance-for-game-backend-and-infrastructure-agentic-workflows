@@ -22,14 +22,17 @@ Validates: PR #319 review findings 4 and 8.
 from typing import Any
 
 # Third-party packages
+import httpx
 import pytest
 
 # Local modules
 import utils.security as security
+from connector import github_provider
 from connector import service as service_module
 from connector.config import AllowlistEntry
+from connector.github_provider import GitHubProvider
 from connector.models import FileContent, FileFetchResult
-from connector.provider import ProviderAuthError, ProviderTransientError
+from connector.provider import ProviderAuthError, ProviderError, ProviderTransientError
 from connector.service import read_iac_files
 from support.config_factory import make_source_control_config
 from support.fake_provider import FakeProvider
@@ -183,6 +186,45 @@ def test_auth_error_writes_durable_audit(captured_audit):
     assert event["requester"] == "reader-1"
     assert event["tenant"] == "acme"
     assert event["workspace"] == "prod"
+    _assert_secret_free(event)
+
+
+def test_malformed_github_payload_writes_sanitized_terminal_audit(monkeypatch, captured_audit):
+    """A malformed 2xx GitHub payload becomes one permanent typed failure and audit event."""
+    payload_marker = "DO_NOT_LOG_PROVIDER_PAYLOAD_7f31"
+    credential_marker = "DO_NOT_LOG_PROVIDER_CREDENTIAL_7f31"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=f'{{"content":"{payload_marker}"'.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+
+    def client_with_mock_transport(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(github_provider.httpx, "Client", client_with_mock_transport)
+    monkeypatch.setattr(github_provider, "get_secret", lambda *args, **kwargs: credential_marker)
+
+    config = _config(retry_max_attempts=3)
+    reader = GitHubProvider(config)
+    with pytest.raises(ProviderError, match="invalid Contents API response") as exc:
+        _read(["a.yaml"], config=config, reader=reader)
+
+    assert type(exc.value) is ProviderError
+    assert len(requests) == 1, "malformed provider payloads are permanent and must not be retried"
+    events = _terminal_failure_audit_events(captured_audit)
+    assert len(events) == 1
+    event = events[0]
+    assert event["reason"] == "ProviderError"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    assert payload_marker not in repr(event)
+    assert credential_marker not in repr(event)
     _assert_secret_free(event)
 
 
