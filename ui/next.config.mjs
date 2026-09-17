@@ -21,13 +21,14 @@ const nextConfig = {
     ignoreBuildErrors: false,
   },
 
-  // Strict ESLint checking (DO NOT disable in production)
-  eslint: {
-    ignoreDuringBuilds: false,
-  },
-
-  // Security headers for production
+  // Security headers are production-only. Next.js development serves its
+  // client middleware manifest as JSON while loading it through a script path;
+  // applying nosniff to that internal asset makes browsers reject it (#404).
   async headers() {
+    if (process.env.NODE_ENV !== 'production') {
+      return []
+    }
+
     // Content Security Policy. CopilotKit's chat UI uses inline styles and the
     // Next runtime needs inline/eval scripts, so 'unsafe-inline'/'unsafe-eval'
     // are required for script/style; everything else is locked to 'self'.
