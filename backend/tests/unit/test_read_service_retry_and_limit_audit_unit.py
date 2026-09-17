@@ -64,6 +64,14 @@ def captured_audit(monkeypatch) -> _FakeAuditSink:
     return sink
 
 
+@pytest.fixture
+def retry_delays(monkeypatch) -> list[float]:
+    """Capture connector retry sleeps so tests stay deterministic and never wait."""
+    delays: list[float] = []
+    monkeypatch.setattr(service_module, "_sleep", delays.append)
+    return delays
+
+
 def _config(*, max_files: int = 20, retry_max_attempts: int = 3):
     """Build an enabled config whose single allowlist entry is org/iac@main (any path)."""
     return make_source_control_config(
@@ -90,7 +98,7 @@ def _read(paths, *, config, reader):
 # --- Finding #4: configured retry count ---------------------------------------------------
 
 
-def test_transient_error_retried_then_succeeds(captured_audit):
+def test_transient_error_retried_then_succeeds(captured_audit, retry_delays):
     """A transient failure on the first get_files is retried and the retry's result is served."""
     served = FileFetchResult(
         files=(FileContent(path="a.yaml", content="Resources: {}"),),
@@ -105,9 +113,10 @@ def test_transient_error_retried_then_succeeds(captured_audit):
 
     assert result is served
     assert len(reader.calls_for("get_files")) == 2, "expected exactly one retry after the transient failure"
+    assert retry_delays == [0.5]
 
 
-def test_transient_error_exhausts_attempts_then_raises(captured_audit):
+def test_transient_error_exhausts_attempts_then_raises(captured_audit, retry_delays):
     """A transient failure on every attempt propagates after exactly retry_max_attempts calls."""
     reader = FakeProvider()
     reader.fail("get_files", ProviderTransientError("still throttled"))
@@ -116,9 +125,10 @@ def test_transient_error_exhausts_attempts_then_raises(captured_audit):
         _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
 
     assert len(reader.calls_for("get_files")) == 3, "must attempt exactly retry_max_attempts times"
+    assert retry_delays == [0.5, 1.0]
 
 
-def test_auth_error_is_not_retried(captured_audit):
+def test_auth_error_is_not_retried(captured_audit, retry_delays):
     """A ProviderAuthError is a permanent failure: it propagates on the first call, no retry."""
     reader = FakeProvider()
     reader.fail("get_files", ProviderAuthError("credential rejected"))
@@ -127,6 +137,38 @@ def test_auth_error_is_not_retried(captured_audit):
         _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
 
     assert len(reader.calls_for("get_files")) == 1, "auth failures must never be retried"
+    assert retry_delays == []
+
+
+def test_provider_retry_hint_is_honored_and_bounded(captured_audit, retry_delays):
+    """A provider delay longer than the exponential floor is honored up to the hard cap."""
+    served = FileFetchResult(
+        files=(FileContent(path="a.yaml", content="Resources: {}"),),
+        missing=(),
+        limit_exceeded=False,
+    )
+    reader = FakeProvider()
+    reader.program(
+        "get_files",
+        side_effects=[ProviderTransientError("throttled", retry_after_seconds=60), served],
+    )
+
+    result = _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    assert result is served
+    assert retry_delays == [5.0]
+
+
+def test_single_attempt_never_sleeps_after_terminal_failure(captured_audit, retry_delays):
+    """The final configured attempt re-raises immediately without a trailing sleep."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderTransientError("still throttled", retry_after_seconds=5))
+
+    with pytest.raises(ProviderTransientError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=1), reader=reader)
+
+    assert len(reader.calls_for("get_files")) == 1
+    assert retry_delays == []
 
 
 # --- Finding #3: durable audit on a terminal provider failure -----------------------------
@@ -147,7 +189,7 @@ def _assert_secret_free(event: dict[str, Any]) -> None:
         assert "Bearer" not in str(value), "audit must not echo a credential"
 
 
-def test_exhausted_transient_failure_writes_durable_audit(captured_audit):
+def test_exhausted_transient_failure_writes_durable_audit(captured_audit, retry_delays):
     """An exhausted-transient terminal failure is durably audited before it propagates."""
     reader = FakeProvider()
     reader.fail("get_files", ProviderTransientError("still throttled"))
@@ -155,8 +197,10 @@ def test_exhausted_transient_failure_writes_durable_audit(captured_audit):
     with pytest.raises(ProviderTransientError):
         _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
 
-    # Retry policy preserved: exactly retry_max_attempts calls before the terminal failure.
+    # Retry policy preserved: exactly retry_max_attempts calls before the terminal failure,
+    # with no sleep after the final attempt.
     assert len(reader.calls_for("get_files")) == 3
+    assert retry_delays == [0.5, 1.0]
 
     events = _terminal_failure_audit_events(captured_audit)
     assert len(events) == 1, "a terminal transient failure must be durably audited exactly once"

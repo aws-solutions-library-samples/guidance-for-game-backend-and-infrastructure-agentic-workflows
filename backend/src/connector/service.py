@@ -26,13 +26,14 @@ from __future__ import annotations
 # Standard library
 import posixpath
 from datetime import datetime, timedelta, timezone
+from time import sleep as _sleep
 from typing import TYPE_CHECKING, Sequence
 
 # Local modules
 from connector.audit import AuditSink
 from connector.config import AuthorizationPolicy, Decision, SourceControlConfig
 from connector.models import FileFetchResult
-from connector.provider import ProviderError, ProviderTransientError
+from connector.provider import MAX_PROVIDER_RETRY_DELAY_SECONDS, ProviderError, ProviderTransientError
 from connector.registry import get_provider
 from utils.logger import logger
 from utils.request_context import get_request_context
@@ -51,6 +52,10 @@ __all__ = ["read_iac_files"]
 
 # The rate-limit endpoint label for per-requester READ limiting.
 _RATE_LIMIT_ENDPOINT = "scm_read"
+
+# Retry delays are intentionally internal and bounded: no deployment/configuration surface is
+# added for this hardening, and an untrusted provider header cannot stall the tool indefinitely.
+_PROVIDER_RETRY_BASE_DELAY_SECONDS = 0.5
 
 
 class PathTraversalError(ValueError):
@@ -300,7 +305,9 @@ def _fetch_files_with_retry(
 
     A :class:`~connector.provider.ProviderTransientError` (provider rate limits, temporary
     5xx/unavailability, read timeouts) is safe to repeat for a read, so it is retried up to
-    ``max_attempts`` total calls before the final failure propagates. Every other exception —
+    ``max_attempts`` total calls before the final failure propagates. Before each retry the
+    service applies bounded exponential backoff and honors a longer sanitized provider delay
+    up to :data:`~connector.provider.MAX_PROVIDER_RETRY_DELAY_SECONDS`. Every other exception —
     including :class:`~connector.provider.ProviderAuthError` (credential rejected; retrying
     cannot help) and any permanent validation failure — propagates on the first raise with no
     retry, so the read still fails closed. ``max_attempts`` is the connector's configured
@@ -315,13 +322,24 @@ def _fetch_files_with_retry(
             last_exc = exc
             if attempt >= attempts:
                 raise
+            exponential_delay = min(
+                _PROVIDER_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                MAX_PROVIDER_RETRY_DELAY_SECONDS,
+            )
+            provider_delay = getattr(exc, "retry_after_seconds", None)
+            retry_delay = min(
+                max(exponential_delay, provider_delay or 0.0),
+                MAX_PROVIDER_RETRY_DELAY_SECONDS,
+            )
             logger.warning(
                 "IaC file read: transient provider failure, retrying",
                 event="scm_read",
                 action="read",
                 attempt=attempt,
                 max_attempts=attempts,
+                retry_delay_seconds=retry_delay,
             )
+            _sleep(retry_delay)
     # Unreachable: the loop either returns, or re-raises on the final attempt.
     raise last_exc  # type: ignore[misc]  # pragma: no cover
 
