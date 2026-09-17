@@ -381,6 +381,12 @@ def read_iac_files(
     # durable sink's audit log group.
     _active_config = resolved_config
 
+    # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
+    # context, never from model/tool input. Resolve them before path normalization so even
+    # an unsafe-path rejection can be attributed to the trusted requester and scope.
+    user_id, groups, tenant, workspace = _read_path_context()
+    requester = user_id or "anonymous"
+
     # Normalize each requested path BEFORE the count check, authorization, and any read so
     # every downstream stage operates on the canonical form. A path that attempts to escape
     # the repository root (absolute, ``..`` escape, or illegal character) is rejected here and
@@ -394,16 +400,13 @@ def read_iac_files(
             event="scm_read",
             action="read",
             outcome="rejected",
+            requester=requester,
+            tenant=tenant,
+            workspace=workspace,
             reason="path_invalid",
             detail=exc.reason,
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=False)
-
-    # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
-    # context, never from model/tool input. Resolved before the file-count check so the
-    # rejection audit can name the requester/tenant/workspace.
-    user_id, groups, tenant, workspace = _read_path_context()
-    requester = user_id or "anonymous"
 
     # Reject an over-limit request BEFORE contacting the provider. This is a policy
     # rejection, so it is written to the durable audit sink (requester/tenant/workspace/
