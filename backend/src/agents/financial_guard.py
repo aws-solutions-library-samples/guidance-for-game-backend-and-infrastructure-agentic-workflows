@@ -102,11 +102,19 @@ _FINANCIAL_TOPIC_RE = re.compile(
     rf"\b(?:{_ISO_ALTERNATION})\b",
     re.IGNORECASE,
 )
-# A label line ends with the financial noun (plus at most two trailing words and
-# Markdown/colon decoration): "Monthly cost:", "**Billing total**", "Savings:".
-# A noun followed by other content on its line ("| Billing | On-Demand |",
-# "Billing type: SPOT", "rate limit applies.") is not a label.
-_LABEL_LINE_END = r"(?:\s+\w+){0,2}[ \t*:_]*\n"
+# A label line ends with the financial noun plus at most two allowlisted
+# financial-label words and Markdown/colon decoration: "Monthly cost:",
+# "**Billing total**", "Cost per month:". Restricting the suffix prevents
+# ordinary operational prose such as "cost efficiency" from becoming a label
+# merely because a numeric line follows it.
+_FINANCIAL_LABEL_WORD = (
+    r"total|amount|estimate|value|rate|price|cost|spend|spending|savings?|"
+    r"charges?|bill|billing|per|hour|day|week|month|year|hourly|daily|weekly|"
+    r"monthly|annual|yearly"
+)
+# A noun followed by other non-label content on its line, such as a Billing /
+# On-Demand table row, "Billing type: SPOT", or "rate limit applies", is not a label.
+_LABEL_LINE_END = rf"(?:\s+(?:{_FINANCIAL_LABEL_WORD})){{0,2}}[ \t*:_]*\n"
 _VALUE_LANGUAGE_RE = re.compile(
     rf"(?:\b(?:{_FINANCIAL_NOUN})\b[^\n]{{0,200}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,200}}\b(?:{_FINANCIAL_NOUN})\b)"
