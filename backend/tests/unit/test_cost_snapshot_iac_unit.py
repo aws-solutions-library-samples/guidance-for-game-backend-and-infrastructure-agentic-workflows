@@ -76,7 +76,10 @@ def test_table_is_tagged_with_project_conventions(template):
 
 def _snapshot_policy(template: dict) -> dict:
     policies = template["Resources"]["AgentCoreExecutionRole"]["Properties"]["Policies"]
-    matches = [p for p in policies if p["PolicyName"] == "CostReportSnapshotStoreAccess"]
+    # Skip non-mapping entries: the same role also carries opt-in Source Control
+    # Connector policies expressed as CloudFormation ``!If`` conditionals, which the
+    # test loader represents as lists rather than dicts.
+    matches = [p for p in policies if isinstance(p, dict) and p.get("PolicyName") == "CostReportSnapshotStoreAccess"]
     assert matches, "CostReportSnapshotStoreAccess policy not found"
     return matches[0]
 
