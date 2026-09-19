@@ -112,9 +112,13 @@ _FINANCIAL_LABEL_WORD = (
     r"charges?|bill|billing|per|hour|day|week|month|year|hourly|daily|weekly|"
     r"monthly|annual|yearly"
 )
-# A noun followed by other non-label content on its line, such as a Billing /
-# On-Demand table row, "Billing type: SPOT", or "rate limit applies", is not a label.
-_LABEL_LINE_END = rf"(?:\s+(?:{_FINANCIAL_LABEL_WORD})){{0,2}}[ \t*:_]*\n"
+# An explicit colon is a strong label delimiter, so allow bounded arbitrary
+# qualifiers before it ("Amount due:", "Invoice subtotal:", "Cost per
+# instance:"). Without a colon, allow only known financial-label words so
+# ordinary prose such as "cost efficiency" cannot bind to a later count.
+_EXPLICIT_LABEL_LINE_END = r"[^\n:]{0,80}:[ \t*]*\n"
+_IMPLICIT_LABEL_LINE_END = rf"(?:\s+(?:{_FINANCIAL_LABEL_WORD})){{0,2}}[ \t*]*\n"
+_LABEL_LINE_END = rf"(?:{_EXPLICIT_LABEL_LINE_END}|{_IMPLICIT_LABEL_LINE_END})"
 _VALUE_LANGUAGE_RE = re.compile(
     rf"(?:\b(?:{_FINANCIAL_NOUN})\b[^\n]{{0,200}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,200}}\b(?:{_FINANCIAL_NOUN})\b)"

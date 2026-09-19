@@ -200,6 +200,10 @@ class TestOperationalOutputWithFinancialVocabulary:
         [
             "Billing: 999",
             "Billing total\n\n999.00",
+            "Amount due:\n999",
+            "Invoice subtotal:\n999",
+            "Cost per instance:\n0.20",
+            "Savings projection:\n25%",
             "Estimated rate:\n\nSee below.\n\n0.20",
             "Savings:\n\n25%",
             "The fleet has 2 instances and the billing amount is 45.10",
