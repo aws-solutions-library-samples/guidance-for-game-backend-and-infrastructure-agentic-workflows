@@ -30,6 +30,10 @@ Key capabilities:
 - **GameLift Management** -- Fleet monitoring, scaling configuration, and game session analysis
 - **EKS/Kubernetes Operations** -- Cluster management, pod monitoring, and troubleshooting
 - **Cost Intelligence** -- Spending analysis, forecasting, and optimization recommendations
+- **Optional Source Control Connector** -- Disabled-by-default, read-only IaC retrieval through a
+  connector tool capability rather than a fourth long-term domain agent; the current runtime uses a
+  model-backed compatibility specialist to route to the tool. See
+  [Source Control Connector](docs/SOURCE_CONTROL_CONNECTOR.md)
 - **Conversation Memory** -- Session-scoped context with optional cross-session long-term memory
 - **Guardrails** -- Content filtering, PII protection, and prompt injection detection via Amazon Bedrock Guardrails
 
@@ -58,8 +62,12 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 6. Orchestrator classifies the query and delegates to the appropriate specialist agent
 7. Specialist queries its Bedrock Knowledge Base for domain-specific context (RAG)
 8. Specialist invokes MCP servers or owned boto3 tools for live AWS data
-9. Read-only API calls execute against target AWS services with least-privilege IAM policies
-10. Response flows back through the chain to the user
+9. For enabled IaC requests, the Orchestrator can route through the current model-backed
+   `source_control_agent` compatibility specialist to the optional `get_iac_file` Source Control
+   connector tool for authorized, read-only IaC retrieval; this is legacy exposure plumbing, not a
+   fourth long-term domain
+10. Read-only API calls execute against target services with least-privilege permissions
+11. Response flows back through the chain to the user
 
 ### Technology Stack
 
@@ -414,6 +422,7 @@ sample-game-backend-agentic-workflows/
 ├── backend/                        # Python AgentCore Runtime backend
 │   ├── src/
 │   │   ├── agents/                 # Orchestrator and specialist agents
+│   │   ├── connector/              # Optional read-only Source Control connector/tool
 │   │   ├── config/                 # Configuration (settings.py)
 │   │   ├── models/                 # AI model configurations
 │   │   ├── utils/                  # MCP client factory, logging, timing
@@ -437,6 +446,7 @@ sample-game-backend-agentic-workflows/
 │   └── infrastructure/             # Infrastructure utilities
 ├── docs/                           # Additional documentation
 │   ├── ARCHITECTURE.md             # Detailed architecture documentation
+│   ├── SOURCE_CONTROL_CONNECTOR.md # Optional read-only connector deep-dive
 │   ├── DEPLOYMENT_GUIDE.md         # Step-by-step deployment guide
 │   ├── SECURITY.md                 # Security controls and compliance
 │   ├── THREAT_MODEL.md             # STRIDE threat analysis
