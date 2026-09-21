@@ -26,6 +26,7 @@ _CLEARED_ENV = (
     "COGNITO_CLIENT_ID",
     "TENANT_ID",
     "WORKSPACE_ID",
+    "GBAW_OPERATIONS_ARTIFACT_BUCKET",
     "CODE_S3_BUCKET",
     "CODE_S3_KEY",
 )
@@ -82,6 +83,26 @@ def test_deploy_enable_without_tenant_refuses():
     assert result.returncode == 3
     combined = (result.stdout + result.stderr).upper()
     assert "TENANT" in combined or "WORKSPACE" in combined
+
+
+def test_deploy_enable_without_artifact_bucket_refuses():
+    # With mode + cognito + tenant/workspace but no explicit artifact bucket, the
+    # wrapper must refuse (exit 6) before any AWS write: it never discovers or
+    # creates a bucket. This path exits before the credential/AWS calls.
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+        },
+    )
+    assert result.returncode == 6
+    combined = (result.stdout + result.stderr).upper()
+    assert "GBAW_OPERATIONS_ARTIFACT_BUCKET" in combined
 
 
 def test_deploy_unknown_arg_exits_nonzero():

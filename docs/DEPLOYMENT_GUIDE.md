@@ -332,7 +332,9 @@ stack is deployed only by its dedicated wrapper and is never wired into
 
 # Explicit opt-in deploy (observe mode env value AND the flag are required):
 GBAW_OPERATIONS_MODE=observe COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
-  TENANT_ID=... WORKSPACE_ID=... AWS_PROFILE=... AWS_REGION=... \
+  TENANT_ID=... WORKSPACE_ID=... \
+  GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket> \
+  AWS_PROFILE=... AWS_REGION=... \
   ./scripts/infrastructure/deploy-operations.sh --enable --environment prod
 
 # Safe, data-preserving disable/rollback (removes the request path, keeps data):

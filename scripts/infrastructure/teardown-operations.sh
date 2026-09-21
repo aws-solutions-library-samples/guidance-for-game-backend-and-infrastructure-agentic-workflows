@@ -19,6 +19,11 @@ AWS_REGION="${AWS_REGION:-us-west-2}"
 PROJECT_NAME="game-agent"
 STACK_NAME="${PROJECT_NAME}-operations"
 
+# AWS_PROFILE is passed EXPLICITLY to every aws call rather than relied on
+# ambiently. When unset we fall back to "default" so the flag is always present.
+AWS_PROFILE="${AWS_PROFILE:-default}"
+AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
+
 CONFIRM=""
 
 usage() {
@@ -63,14 +68,14 @@ echo "Stack:  $STACK_NAME"
 echo ""
 
 echo "🔐 Verifying AWS credentials and region before any write ..."
-echo "   AWS_PROFILE=${AWS_PROFILE:-<default>}  AWS_REGION=${AWS_REGION}"
-if ! CALLER_IDENTITY="$(aws sts get-caller-identity --region "$AWS_REGION" --output text 2>/dev/null)"; then
+echo "   AWS_PROFILE=${AWS_PROFILE}  AWS_REGION=${AWS_REGION}"
+if ! CALLER_IDENTITY="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --output text 2>/dev/null)"; then
     echo "❌ Unable to verify caller identity. Configure AWS_PROFILE/AWS_REGION and credentials." >&2
     exit 4
 fi
 echo "   Caller identity: $CALLER_IDENTITY"
 
-if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
     echo "⚠️  Stack $STACK_NAME does not exist; nothing to do."
     exit 0
 fi
@@ -80,7 +85,7 @@ echo "    will be LEFT IN PLACE with their audit data intact. This script does"
 echo "    not erase audit data; that is a separate, explicit, manual future step."
 
 echo "🗑️  Deleting CloudFormation stack $STACK_NAME ..."
-aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$AWS_REGION"
-aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$AWS_REGION" || true
+aws cloudformation delete-stack "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION"
+aws cloudformation wait stack-delete-complete "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" || true
 
 echo "✅ Stack deletion requested. Retained audit data is unaffected."

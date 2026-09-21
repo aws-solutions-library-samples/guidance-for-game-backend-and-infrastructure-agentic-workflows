@@ -95,18 +95,22 @@ Parameters:
     MinValue: 5
     MaxValue: 29
     Description: >-
-      Total observation request budget in seconds (ADR 0005). Bounded below the
-      30 s API Gateway HTTP API integration ceiling so the request fails closed
-      before the gateway times out.
+      Total observation request budget in seconds (ADR 0005), used ONLY as the
+      Lambda function Timeout. It is NOT injected as a runtime environment
+      variable: the core settings module derives the effective deadline from the
+      per-read + persistence sub-budgets plus the cancellation margin. Bounded
+      below the 30 s API Gateway HTTP API integration ceiling so the request
+      fails closed before the gateway times out.
 
-  ProviderReadBudgetSeconds:
+  PerReadBudgetSeconds:
     Type: Number
     Default: 3
     MinValue: 1
     MaxValue: 29
     Description: >-
-      Per-provider-read sub-budget in seconds (ADR 0005). A read that blocks past
-      this bound is abandoned and a typed retryable error is raised.
+      Per-provider-read sub-budget in seconds (ADR 0005), injected as
+      GBAW_OPERATIONS_PER_READ_BUDGET_S. A read that blocks past this bound is
+      abandoned and a typed retryable error is raised.
 
   PersistenceBudgetSeconds:
     Type: Number
@@ -114,16 +118,29 @@ Parameters:
     MinValue: 1
     MaxValue: 29
     Description: >-
-      Persistence + canonical serialization sub-budget in seconds (ADR 0005).
+      Persistence + canonical serialization sub-budget in seconds (ADR 0005),
+      injected as GBAW_OPERATIONS_PERSISTENCE_BUDGET_S.
 
-  RecordTtlSeconds:
+  CancellationMarginSeconds:
     Type: Number
-    Default: 2592000
-    MinValue: 3600
+    Default: 3
+    MinValue: 1
+    MaxValue: 29
     Description: >-
-      Time-to-live in seconds applied to the DynamoDB `ttl` attribute for
-      expiring transient observation records. The audit ledger and idempotency
-      mapping are retained for the full audit window and are not TTL-managed.
+      Cancellation-margin sub-budget in seconds (ADR 0005), injected as
+      GBAW_OPERATIONS_CANCELLATION_MARGIN_S. Reserved headroom so an in-flight
+      request is abandoned before the gateway integration ceiling is reached.
+
+  ObservationTtlSeconds:
+    Type: Number
+    Default: 1800
+    MinValue: 60
+    Description: >-
+      Observation freshness / DynamoDB TTL horizon in seconds for the transient
+      observation records, injected as GBAW_OPERATIONS_OBSERVATION_TTL_S (the
+      value the handler stamps on the `ttl` attribute). Matches the core default
+      (1800 s = 30 min). The audit ledger and idempotency mapping are retained
+      for the full audit window and are not TTL-managed.
 
   LambdaMemoryMb:
     Type: Number
@@ -436,10 +453,10 @@ Resources:
             - HasExplicitTrustedAudience
             - !Ref TrustedAudience
             - !Ref CognitoClientId
-          GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS: !Ref RequestDeadlineSeconds
-          GBAW_OPERATIONS_PROVIDER_READ_BUDGET_SECONDS: !Ref ProviderReadBudgetSeconds
-          GBAW_OPERATIONS_PERSISTENCE_BUDGET_SECONDS: !Ref PersistenceBudgetSeconds
-          GBAW_OPERATIONS_RECORD_TTL_SECONDS: !Ref RecordTtlSeconds
+          GBAW_OPERATIONS_PER_READ_BUDGET_S: !Ref PerReadBudgetSeconds
+          GBAW_OPERATIONS_PERSISTENCE_BUDGET_S: !Ref PersistenceBudgetSeconds
+          GBAW_OPERATIONS_CANCELLATION_MARGIN_S: !Ref CancellationMarginSeconds
+          GBAW_OPERATIONS_OBSERVATION_TTL_S: !Ref ObservationTtlSeconds
       Code:
         S3Bucket: !Ref CodeS3Bucket
         S3Key: !Ref CodeS3Key
@@ -512,7 +529,8 @@ Resources:
       AuthorizerId: !Ref JwtAuthorizer
       Target: !Sub 'integrations/${ObservationIntegration}'
 
-  # GET status route retained: core (#413) will implement operation status reads.
+  # GET status route: core (#413) implements the operation status read behind
+  # this frozen path parameter route (GET /operations/{operationId}).
   StatusRoute:
     Type: AWS::ApiGatewayV2::Route
     Condition: OperationsEnabled
