@@ -2,7 +2,8 @@
 
 These execute the wrappers' *refusal* and *help* paths only, which exit before
 any ``aws`` invocation, so they never touch AWS. They prove the opt-in and
-confirmation gates fail closed and that the scripts parse under ``bash -n``.
+confirmation gates fail closed under the frozen ``observe`` mode vocabulary and
+that the scripts parse under ``bash -n``.
 """
 
 # Standard library
@@ -19,12 +20,21 @@ PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 DEPLOY = PROJECT_ROOT / "scripts/infrastructure/deploy-operations.sh"
 TEARDOWN = PROJECT_ROOT / "scripts/infrastructure/teardown-operations.sh"
 
+_CLEARED_ENV = (
+    "GBAW_OPERATIONS_MODE",
+    "COGNITO_ISSUER",
+    "COGNITO_CLIENT_ID",
+    "TENANT_ID",
+    "WORKSPACE_ID",
+    "CODE_S3_BUCKET",
+    "CODE_S3_KEY",
+)
+
 
 def _run(script, *args, env_extra=None):
     env = os.environ.copy()
-    env.pop("GBAW_OPERATIONS_MODE", None)
-    env.pop("COGNITO_ISSUER", None)
-    env.pop("COGNITO_CLIENT_ID", None)
+    for key in _CLEARED_ENV:
+        env.pop(key, None)
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -41,16 +51,37 @@ def test_scripts_parse_under_bash_n(script):
     assert result.returncode == 0, result.stderr
 
 
-def test_deploy_enable_without_env_refuses():
+def test_deploy_enable_without_observe_mode_refuses():
+    # Enable requires GBAW_OPERATIONS_MODE=observe; absence fails closed.
     result = _run(DEPLOY, "--enable")
     assert result.returncode == 3
     assert "Refusing to enable" in result.stdout + result.stderr
 
 
-def test_deploy_enable_without_cognito_refuses():
+def test_deploy_enable_with_wrong_mode_refuses():
     result = _run(DEPLOY, "--enable", env_extra={"GBAW_OPERATIONS_MODE": "enabled"})
     assert result.returncode == 3
+
+
+def test_deploy_enable_without_cognito_refuses():
+    result = _run(DEPLOY, "--enable", env_extra={"GBAW_OPERATIONS_MODE": "observe"})
+    assert result.returncode == 3
     assert "COGNITO" in (result.stdout + result.stderr).upper()
+
+
+def test_deploy_enable_without_tenant_refuses():
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+        },
+    )
+    assert result.returncode == 3
+    combined = (result.stdout + result.stderr).upper()
+    assert "TENANT" in combined or "WORKSPACE" in combined
 
 
 def test_deploy_unknown_arg_exits_nonzero():
@@ -73,3 +104,8 @@ def test_teardown_help_is_clean():
     result = _run(TEARDOWN, "--help")
     assert result.returncode == 0
     assert "never called by teardown-all.sh" in result.stdout
+
+
+def test_teardown_help_has_no_delete_data_flag():
+    result = _run(TEARDOWN, "--help")
+    assert "--delete-data" not in result.stdout
