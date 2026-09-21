@@ -39,11 +39,14 @@ new generation. Both ``complete_observation`` and ``fail_observation`` accept th
 holder's fencing ``generation`` so a superseded writer fails closed.
 
 A ``TransactionCanceledException`` is classified from its actual cancellation
-reasons: only ``ConditionalCheckFailed`` (with no transient conflict/throttle
-reason) resolves to idempotency/state handling; a throttle, transaction conflict,
-capacity limit, or provider fault surfaces as a retryable unavailable outcome and
-never as a false 409. ``load_status`` resolves an operation by id under trusted
-workspace ownership.
+reasons, read from the real botocore ``exc.response["CancellationReasons"]`` wire
+shape (never a fabricated ``cancellation_reasons`` attribute): only a pure
+``ConditionalCheckFailed`` (with no transient/validation reason) resolves to
+idempotency/state handling; a throttle, transaction conflict, capacity limit,
+validation error, unknown reason, absent reasons, or a mix of conditional with a
+transient reason all fail closed as a retryable unavailable outcome and never as
+a false 409. ``load_status`` resolves an operation by id under trusted workspace
+ownership.
 
 The store never issues a ``Scan`` or an unconditional ``PutItem``, holds no
 write path to any provider, and enforces the exclusive ``commit_not_after``
@@ -650,40 +653,81 @@ class DynamoDbObservationStore(ObservationStore):
 # Cancellation-reason codes DynamoDB reports on a TransactionCanceledException.
 # Only ConditionalCheckFailed means a real precondition failed (the idempotency
 # mapping or a fenced state already exists) and routes to idempotency/state
-# resolution. Every other reason — a transient conflict, throttle, or capacity
-# limit — is a retryable unavailable condition, NOT a 409 conflict.
+# resolution. Every other reason — a transient conflict, throttle, capacity
+# limit, or validation error — is NOT a 409 conflict and must fail closed as a
+# retryable unavailable condition.
+#
+# The reasons live on the wire inside ``exc.response["CancellationReasons"]`` —
+# a positional list aligned to the transaction's legs, where a non-failing leg
+# reports ``{"Code": "None"}``. A real ``botocore.exceptions.ClientError`` does
+# NOT expose a ``cancellation_reasons`` attribute; reading one is a test-fake
+# artifact that never matches production, so classification reads ``response``.
 _CONDITIONAL_REASON = "ConditionalCheckFailed"
-_TRANSIENT_REASONS = frozenset({"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"})
+_TRANSACTION_CANCELED_CODE = "TransactionCanceledException"
+_BARE_CONDITIONAL_CODE = "ConditionalCheckFailedException"
+# Reasons that make the whole transaction retryable/unavailable rather than a
+# genuine precondition failure. "None" is DynamoDB's marker for a leg that did
+# not fail and is inert here (a pure-conditional cancel is [CCF, None, ...]).
+_TRANSIENT_REASONS = frozenset(
+    {
+        "TransactionConflict",
+        "ThrottlingError",
+        "ProvisionedThroughputExceeded",
+        "ValidationError",
+    }
+)
+
+
+def _cancellation_reason_codes(response: dict[str, Any]) -> set[str] | None:
+    """Extract the set of cancellation-reason codes from a ClientError response.
+
+    Returns ``None`` when the response carries no structured reasons list, which
+    the caller treats as unconfirmable (and therefore fail-closed).
+    """
+    reasons = response.get("CancellationReasons")
+    if not isinstance(reasons, list):
+        return None
+    return {r.get("Code") for r in reasons if isinstance(r, dict)}
 
 
 def _is_conditional_failure(exc: Exception) -> bool:
     """Return whether an error is a genuine conditional-check failure.
 
-    A TransactionCanceledException is classified from its actual cancellation
-    reasons: it is conditional only when at least one reason is
-    ConditionalCheckFailed and no reason is a transient conflict/throttle. A
-    bare ConditionalCheckFailedException (from a non-transactional write) is
-    conditional. Throttling, transaction conflicts, validation, and provider
-    faults are never treated as conditional — the caller maps them to a
-    retryable unavailable state instead of a false idempotency/state conflict.
+    Classification reads the real botocore wire shape from ``exc.response``:
+
+    * A bare ``ConditionalCheckFailedException`` (from a non-transactional
+      conditional write) is conditional — an idempotency/state precondition.
+    * A ``TransactionCanceledException`` is conditional only when its
+      ``CancellationReasons`` contain ``ConditionalCheckFailed`` AND contain no
+      transient/validation reason. Any ``TransactionConflict``,
+      ``ThrottlingError``, ``ProvisionedThroughputExceeded``, ``ValidationError``,
+      unknown reason, absent/empty reasons, or a mix of conditional with a
+      transient reason fails closed as retryable/unavailable — never a false
+      idempotency/state 409.
+
+    Every other error is non-conditional and maps to a retryable unavailable
+    state by the caller.
     """
-    reasons = getattr(exc, "cancellation_reasons", None)
-    if isinstance(reasons, list):
-        reason_codes = {r.get("Code") for r in reasons if isinstance(r, dict)}
-        if reason_codes & _TRANSIENT_REASONS:
-            # A transient reason present anywhere makes the whole transaction
-            # retryable, even if another leg reports ConditionalCheckFailed.
-            return False
-        return _CONDITIONAL_REASON in reason_codes
     response = getattr(exc, "response", None)
-    if isinstance(response, dict):
-        code = response.get("Error", {}).get("Code", "")
-        if code == "ConditionalCheckFailedException":
-            return True
-        # A TransactionCanceledException with no structured reasons cannot be
-        # confirmed as conditional; treat it as transient/retryable.
+    if not isinstance(response, dict):
         return False
-    return False
+    code = response.get("Error", {}).get("Code", "")
+    if code == _BARE_CONDITIONAL_CODE:
+        return True
+    if code != _TRANSACTION_CANCELED_CODE:
+        return False
+    reason_codes = _cancellation_reason_codes(response)
+    if reason_codes is None:
+        # A TransactionCanceledException with no structured reasons cannot be
+        # confirmed as conditional; fail closed as transient/retryable.
+        return False
+    if reason_codes & _TRANSIENT_REASONS:
+        # A transient/validation reason anywhere makes the whole transaction
+        # retryable, even when another leg reports ConditionalCheckFailed.
+        return False
+    # Unknown reasons (neither conditional nor a recognized transient) also fail
+    # closed: only a pure, recognized ConditionalCheckFailed is conditional.
+    return _CONDITIONAL_REASON in reason_codes
 
 
 def _marshal(item: dict[str, Any]) -> dict[str, dict[str, Any]]:

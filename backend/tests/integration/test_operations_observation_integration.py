@@ -22,6 +22,7 @@ from typing import Any
 
 # Third-party packages
 import pytest
+from botocore.exceptions import ClientError
 
 # Local modules
 from operations.contracts.canonical import canonical_sha256
@@ -117,11 +118,16 @@ class FakeDynamoClient:
         return {"Item": item} if item else {}
 
     @staticmethod
-    def _cancelled() -> Exception:
-        exc = Exception("TransactionCanceledException")
-        exc.response = {"Error": {"Code": "TransactionCanceledException"}}  # type: ignore[attr-defined]
-        exc.cancellation_reasons = [{"Code": "ConditionalCheckFailed"}]  # type: ignore[attr-defined]
-        return exc
+    def _cancelled() -> ClientError:
+        # A real botocore ClientError: reasons live in response["CancellationReasons"],
+        # not a fabricated cancellation_reasons attribute. Pure ConditionalCheckFailed.
+        return ClientError(
+            {
+                "Error": {"Code": "TransactionCanceledException", "Message": "Transaction cancelled"},
+                "CancellationReasons": [{"Code": "ConditionalCheckFailed"}],
+            },
+            "TransactWriteItems",
+        )
 
 
 class _Reader:

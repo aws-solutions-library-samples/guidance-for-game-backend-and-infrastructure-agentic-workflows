@@ -9,6 +9,7 @@ from typing import Any
 
 # Third-party packages
 import pytest
+from botocore.exceptions import ClientError
 
 # Local modules
 from operations.contracts.canonical import canonical_sha256
@@ -41,11 +42,25 @@ def _observation() -> dict[str, Any]:
     }
 
 
-class TransactionCanceled(Exception):
-    def __init__(self) -> None:
-        self.response = {"Error": {"Code": "TransactionCanceledException"}}
-        self.cancellation_reasons = [{"Code": "ConditionalCheckFailed"}]
-        super().__init__("transaction canceled")
+def _transaction_canceled(*reason_codes: str) -> ClientError:
+    """Build a real botocore ClientError shaped like DynamoDB's wire response.
+
+    Reasons live inside ``response["CancellationReasons"]`` (a positional list
+    aligned to the transaction legs). A real ClientError never exposes a
+    ``cancellation_reasons`` attribute, so tests must not fabricate one.
+    """
+    return ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException", "Message": "Transaction cancelled"},
+            "CancellationReasons": [{"Code": code} for code in reason_codes],
+        },
+        "TransactWriteItems",
+    )
+
+
+def TransactionCanceled() -> ClientError:
+    """A pure ConditionalCheckFailed transaction cancellation (real shape)."""
+    return _transaction_canceled("ConditionalCheckFailed")
 
 
 class StatefulDynamoClient:
@@ -416,13 +431,9 @@ def test_table_name_required() -> None:
 # --- Adversarial: stale-lease reclaim, fencing races -----------------------
 
 
-class _TransactionCanceled(Exception):
-    """A TransactionCanceledException carrying explicit cancellation reasons."""
-
-    def __init__(self, *reason_codes: str) -> None:
-        self.response = {"Error": {"Code": "TransactionCanceledException"}}
-        self.cancellation_reasons = [{"Code": code} for code in reason_codes]
-        super().__init__("transaction canceled")
+def _TransactionCanceled(*reason_codes: str) -> ClientError:
+    """A real TransactionCanceledException carrying explicit cancellation reasons."""
+    return _transaction_canceled(*reason_codes)
 
 
 def _seed_observing(
