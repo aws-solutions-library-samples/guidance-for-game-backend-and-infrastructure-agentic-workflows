@@ -55,15 +55,33 @@ What the spike establishes now:
   `ComputeType`, excluding container fleets.
 - A public-safe evidence schema and reproduction guide under
   [`docs/evidence/`](../evidence/README.md).
+- Two explicit persistence modes for the measured path: a deterministic
+  **in-memory** mode for unit tests only (never acceptable as live evidence),
+  and an opt-in **real DynamoDB transactional** mode that writes synthetic,
+  per-sample-unique operation-state and append-only ledger items to a
+  caller-specified disposable table in one `TransactWriteItems` call with
+  conditional no-replacement (`attribute_not_exists`) semantics, under the
+  persistence deadline, writing no fleet id, account id, ARN, or provider
+  payload. A live provider-read measurement exposed that the harness's
+  original default persistence callable was a **no-op** that measured only
+  canonical serialization; the acceptance rule below now requires the real
+  transactional mode so a measured p99 reflects durable persistence.
 
 Acceptance rule to apply once the live run exists: **synchronous accepted iff
-the sample is a clean run (zero failures, zero timeouts, zero partial denials)
-AND the measured p99 ≤ 27.0 s** over a representative sample. A single
-non-success sample denies acceptance regardless of the successful-subset p99.
+the run used the real DynamoDB transactional persistence mode AND the sample
+is a clean run (zero failures, zero timeouts, zero partial denials) AND the
+measured p99 ≤ 27.0 s** over a representative sample. A single non-success
+sample denies acceptance regardless of the successful-subset p99, and a run
+that used the in-memory (test-only) mode is denied regardless of its p99
+because it did not exercise durable persistence. The emitted evidence states
+the actual persistence mode (`assumptions.persistence_mode`,
+`evaluation.persistence_mode`, `evaluation.persistence_acceptable`).
 
 Remaining live step (not completed in the read-only validation wave): run the
-harness against **one classic GameLift fleet** in a non-production account and
-record `docs/evidence/e0-latency-<date>.json`. The available demo account has no
+harness against **one classic GameLift fleet** in a non-production account,
+with `--persistence-mode dynamodb-transactional` and a disposable,
+task-owned, on-demand `--persistence-table`, and record
+`docs/evidence/e0-latency-<date>.json`. The available demo account has no
 classic fleet — only a container fleet, which `describe_fleet_utilization`
 rejects (`Operation only supports Fleet resource`) — so representative live
 measurement requires provisioning a classic fleet, an AWS mutation outside this

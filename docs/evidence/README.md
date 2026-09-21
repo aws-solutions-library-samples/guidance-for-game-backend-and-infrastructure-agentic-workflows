@@ -21,7 +21,10 @@ Inside one API Gateway HTTP API request, the E1 observation performs, in order:
    - `describe_scaling_policies`
 2. **Representative persistence** of the observation state transition and its
    ledger events (the transactional write described in ADR 0005,
-   "Durable observation state without queues").
+   "Durable observation state without queues"). This is exercised by an
+   explicit persistence mode (see [Persistence modes](#persistence-modes-and-the-disposable-table)):
+   the real **DynamoDB transactional** mode for live evidence, or a
+   deterministic **in-memory** mode for unit tests only.
 3. **Canonical serialization** of the persisted records with
    [RFC 8785 (JSON Canonicalization Scheme)](https://www.rfc-editor.org/rfc/rfc8785),
    using `operations.contracts.canonical` — the same canonicalization the
@@ -66,6 +69,93 @@ typed retryable error is raised, and no partial observation is ever returned as
 success. These numbers are the spike's declared assumptions; the implementing
 issue may tighten them.
 
+## Persistence modes and the disposable table
+
+The harness's original default persistence callable was a **no-op**: a live
+provider-read measurement showed it measured only canonical serialization, not a
+real durable write, so it did not meet ADR 0005's durable acceptance boundary.
+The harness now selects persistence with `--persistence-mode`:
+
+| Mode | Flag value | What it does | Acceptable as live evidence? |
+|---|---|---|---|
+| In-memory (deterministic) | `in-memory` (default) | Canonicalizes the record in-process; writes nothing | **No** — unit tests only |
+| DynamoDB transactional (real) | `dynamodb-transactional` | One `TransactWriteItems` write of synthetic items | **Yes** — required for acceptance |
+
+The evidence document states the **actual** mode in
+`assumptions.persistence_mode` and `evaluation.persistence_mode`, and the
+`evaluation.persistence_acceptable` flag is `true` only for the transactional
+mode. **Synchronous acceptance is denied unless the run used the real
+transactional mode AND the sample was clean** (`evaluation.rule` records this).
+
+### What the real mode writes (synthetic only)
+
+For each sample, in **one** `TransactWriteItems` call, the harness writes exactly
+two items with conditional no-replacement semantics:
+
+- an **operation-state** item (`PK = OP#<uuid4>`, `SK = STATE#0`), conditional on
+  `attribute_not_exists(PK)` so it never overwrites an existing item; and
+- an **append-only ledger** item (same `PK`, `SK = LEDGER#0`), conditional on
+  `attribute_not_exists(SK)` so a ledger event is never overwritten.
+
+Every value is synthetic and bounded: a per-sample-unique random `operation_id`,
+a fixed synthetic `state`/`event_type`, a `sequence`, a `synthetic: true` marker,
+the canonical byte length, an RFC 8785 `canonical_sha256` digest of each item,
+and — when `--ttl-seconds` is set — a numeric `ttl` epoch-second attribute. The
+harness **never** writes a fleet id, account id, ARN, or any provider payload,
+and it issues **no read and no `Scan`** — only conditional puts. The persistence
+deadline is enforced on the injected clock; a slow write fails closed with the
+typed retryable `PROVIDER_UNAVAILABLE` error.
+
+### Minimal table contract
+
+The `--persistence-table` must be a **disposable, task-owned** table you create
+and delete for this measurement. Minimal contract:
+
+| Attribute / setting | Value |
+|---|---|
+| Partition key `PK` | String (`S`) |
+| Sort key `SK` | String (`S`) |
+| Billing mode | `PAY_PER_REQUEST` (on-demand) |
+| TTL attribute (optional) | `ttl` (numeric epoch seconds) — enable if using `--ttl-seconds` |
+
+Apply current guidance for a **disposable** validation table: on-demand billing,
+least-privilege access (the run needs only `dynamodb:TransactWriteItems` on this
+one table — no `Scan`, `Query`, or `GetItem`), synthetic data only, and a TTL
+field for safe expiry of leftover rows. **PITR, encryption at rest with a managed
+key, and access logging/metrics are required for the final production operations
+table (ADR 0005) and are provisioned and reviewed separately — they are out of
+scope for this disposable spike.**
+
+### Safe creation and cleanup (non-production account)
+
+Create the disposable table (on-demand, PK/SK, optional TTL):
+
+```bash
+aws dynamodb create-table \
+  --table-name e0-latency-spike-disposable \
+  --attribute-definitions AttributeName=PK,AttributeType=S AttributeName=SK,AttributeType=S \
+  --key-schema AttributeName=PK,KeyType=HASH AttributeName=SK,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST \
+  --profile <demo> --region us-west-2
+
+# Optional: enable TTL on the 'ttl' attribute (matches --ttl-seconds).
+aws dynamodb update-time-to-live \
+  --table-name e0-latency-spike-disposable \
+  --time-to-live-specification "Enabled=true,AttributeName=ttl" \
+  --profile <demo> --region us-west-2
+```
+
+Delete it as soon as the measurement is captured:
+
+```bash
+aws dynamodb delete-table \
+  --table-name e0-latency-spike-disposable \
+  --profile <demo> --region us-west-2
+```
+
+Deleting a disposable table you created for this spike is safe; do not point
+`--persistence-table` at any shared or production table.
+
 ## Concurrency arrival model
 
 The harness measures under a **closed-loop** arrival model: `--concurrency`
@@ -79,11 +169,14 @@ evidence document at `assumptions.arrival_model`.
 
 ## Acceptance rule
 
-> **Synchronous accepted** iff the sample is a **clean run** (zero failures,
-> zero timeouts, zero partial denials) **and** the measured **p99 ≤ acceptance
-> ceiling** (`gateway_integration_timeout − cancellation_margin` = 27.0 s), over
-> a representative sample. Percentiles use the **nearest-rank** method so a
-> reported p99 is an actually-observed measurement, never an interpolation.
+> **Synchronous accepted** iff the run used the **real DynamoDB transactional
+> persistence mode** (`evaluation.persistence_acceptable == true`) **and** the
+> sample is a **clean run** (zero failures, zero timeouts, zero partial
+> denials) **and** the measured **p99 ≤ acceptance ceiling**
+> (`gateway_integration_timeout − cancellation_margin` = 27.0 s), over a
+> representative sample. Percentiles use the **nearest-rank** method so a
+> reported p99 is an actually-observed measurement, never an interpolation. A
+> run under the in-memory (test-only) mode is denied regardless of its p99.
 
 A single non-success sample denies acceptance regardless of the p99 over the
 successful subset: the whole sample must be clean. The harness records sample
@@ -112,6 +205,9 @@ aws gamelift list-fleets --profile <demo> --region us-west-2
 PYTHONPATH=backend/src uv --project backend run python -m operations.validation.e0_harness \
   --profile <demo> --region us-west-2 \
   --fleet-id <classic-fleet-id> \
+  --persistence-mode dynamodb-transactional \
+  --persistence-table e0-latency-spike-disposable \
+  --ttl-seconds 3600 \
   --samples 200 --concurrency 4 \
   --out docs/evidence/e0-latency-<YYYY-MM-DD>.json
 ```
@@ -145,10 +241,14 @@ Verified on the `demo` profile in `us-west-2` (read-only, `2026-09` wave):
 ### Exact remaining live step
 
 Provision (or point at) **one classic GameLift fleet** in a non-production
-account, then run the reproduction command above with that fleet's id to
-capture `e0-latency-<date>.json`. Provisioning a fleet is an AWS mutation and is
-**out of scope for this read-only wave**; it is the single remaining action
-before ADR 0005 can be evaluated.
+account, create a disposable, task-owned, on-demand persistence table (see
+[Persistence modes](#persistence-modes-and-the-disposable-table)), then run the
+reproduction command above with that fleet's id, `--persistence-mode
+dynamodb-transactional`, and `--persistence-table` to capture
+`e0-latency-<date>.json`. Provisioning a fleet and a table are AWS mutations and
+are **out of scope for this read-only wave**; they are the remaining actions
+before ADR 0005 can be evaluated. A run under the in-memory (test-only)
+persistence mode is **not** acceptance evidence.
 
 Until that live evidence exists and is reviewed:
 

@@ -79,6 +79,13 @@ from operations.validation.e0_latency import (
     PartialObservationError,
     summarize_latencies,
 )
+from operations.validation.e0_persistence import (
+    MODE_DYNAMODB_TRANSACT,
+    MODE_IN_MEMORY,
+    DynamoDbTransactionalSink,
+    InMemoryPersistenceSink,
+    PersistenceSink,
+)
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -91,6 +98,12 @@ CLASSIC_COMPUTE_TYPE = "EC2"
 
 # The single documented arrival model this harness measures under.
 ARRIVAL_MODEL = "closed-loop"
+
+# CLI persistence-mode tokens. ``in-memory`` is the deterministic, test-only
+# mode and is NOT acceptable as live evidence; ``dynamodb-transactional`` is
+# the real, opt-in transactional write and is the only acceptable live mode.
+PERSISTENCE_MODE_IN_MEMORY = "in-memory"
+PERSISTENCE_MODE_DYNAMODB = "dynamodb-transactional"
 
 
 def _short_target_ref(fleet_id: str) -> str:
@@ -212,9 +225,22 @@ def _measure(
     fleet_id: str,
     budget: LatencyBudget,
     config: _RunConfig,
+    *,
+    sink: PersistenceSink | None = None,
 ) -> dict[str, Any]:
-    """Run the observation ``samples`` times and return a public-safe document."""
-    runner = ObservationRunner(budget=budget)
+    """Run the observation ``samples`` times and return a public-safe document.
+
+    ``sink`` selects the persistence mode exercised on the measured path. When it
+    is ``None`` the harness uses a deterministic in-memory sink, whose mode is
+    recorded and is **never** acceptable as live evidence: acceptance requires the
+    real transactional mode. The measured p99 therefore only ever gates a run
+    that actually performed durable persistence.
+    """
+    if sink is None:
+        sink = InMemoryPersistenceSink()
+    runner = ObservationRunner(budget=budget, sink=sink)
+    persistence_mode = sink.mode
+    persistence_acceptable = sink.acceptable_for_live_evidence
 
     def one_run(_: int) -> tuple[str, float]:
         reads = _build_reads(client, fleet_id)
@@ -225,7 +251,7 @@ def _measure(
             return ("timeout", 0.0)
         except PartialObservationError:
             return ("partial_denial", 0.0)
-        except Exception:  # noqa: BLE001 - any other provider failure is a failed sample
+        except Exception:  # noqa: BLE001 - any other provider/persistence failure is a failed sample
             return ("failure", 0.0)
 
     outcomes = _run_samples(one_run, config.samples, config.concurrency)
@@ -252,9 +278,12 @@ def _measure(
     )
     p99_ms = summary.p99_ms
     acceptance_ceiling_ms = budget.acceptance_ceiling_s * 1000.0
-    # Strict acceptance: the whole sample must be clean AND the p99 must pass.
+    # Strict acceptance: the run must have used the REAL transactional persistence
+    # mode AND the whole sample must be clean AND the p99 must pass. A clean run
+    # under the deterministic in-memory mode (or a no-op) is never accepted,
+    # because it did not exercise durable persistence (issue #412 finding).
     clean_run = summary.clean_run
-    passes = clean_run and p99_ms <= acceptance_ceiling_ms
+    passes = persistence_acceptable and clean_run and p99_ms <= acceptance_ceiling_ms
 
     return {
         "spike": "e0-synchronous-observation-latency",
@@ -275,7 +304,7 @@ def _measure(
             "arrival_model": config.arrival_model,
             "boto3_retry_mode": config.retry_mode,
             "boto3_max_attempts": config.max_attempts,
-            "persistence": "representative in-memory sink + RFC 8785 canonical serialization",
+            "persistence_mode": persistence_mode,
         },
         "budget_ms": {
             "gateway_integration_timeout": budget.ceiling_s * 1000.0,
@@ -287,9 +316,13 @@ def _measure(
         },
         "results_ms": summary.as_public_dict(),
         "evaluation": {
-            "rule": "clean_run AND p99 <= gateway_integration_timeout - cancellation_margin",
+            "rule": (
+                "persistence_acceptable AND clean_run AND " "p99 <= gateway_integration_timeout - cancellation_margin"
+            ),
             "acceptance_ceiling_ms": acceptance_ceiling_ms,
             "p99_ms": p99_ms,
+            "persistence_mode": persistence_mode,
+            "persistence_acceptable": persistence_acceptable,
             "clean_run": clean_run,
             "synchronous_accepted": passes,
         },
@@ -304,7 +337,92 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--out", default=None, help="Write the evidence JSON here (default: stdout)")
+    parser.add_argument(
+        "--persistence-mode",
+        choices=[PERSISTENCE_MODE_IN_MEMORY, PERSISTENCE_MODE_DYNAMODB],
+        default=PERSISTENCE_MODE_IN_MEMORY,
+        help=(
+            "Persistence mode exercised on the measured path. "
+            f"'{PERSISTENCE_MODE_IN_MEMORY}' is deterministic and TEST-ONLY (never acceptable as live "
+            f"evidence); '{PERSISTENCE_MODE_DYNAMODB}' performs the real transactional write and is the "
+            "only mode under which a run can be accepted."
+        ),
+    )
+    parser.add_argument(
+        "--persistence-table",
+        default=None,
+        help=(
+            "Caller-specified, task-owned, disposable DynamoDB table name. REQUIRED for "
+            f"--persistence-mode {PERSISTENCE_MODE_DYNAMODB}. Must be an on-demand table with a string "
+            "PK and string SK; the harness only issues conditional puts (no reads, no scans)."
+        ),
+    )
+    parser.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Optional TTL horizon (seconds from now) written as a numeric 'ttl' attribute on each "
+            "synthetic item so leftover disposable rows expire. Requires the table's TTL to be "
+            "configured on the 'ttl' attribute."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _build_dynamodb_client(profile: str | None, region: str, budget: LatencyBudget) -> Any:
+    """Construct a DynamoDB client with socket/retry bounds under the budget.
+
+    Only ``transact_write_items`` is ever called. The connect/read timeouts sit
+    at or below the persistence budget so a stuck socket surfaces as a fast error
+    rather than silently consuming the whole persistence deadline.
+    """
+    # Third-party packages
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+
+    persistence_s = budget.persistence_s
+    botocore_config = BotocoreConfig(
+        connect_timeout=min(2.0, persistence_s / 2.0),
+        read_timeout=persistence_s,
+        retries={"mode": "adaptive", "max_attempts": 2},
+    )
+    session = boto3.Session(profile_name=profile, region_name=region)
+    return session.client("dynamodb", config=botocore_config)
+
+
+def _build_sink(
+    args: argparse.Namespace,
+    budget: LatencyBudget,
+    *,
+    dynamodb_client: Any | None = None,
+) -> PersistenceSink:
+    """Build the persistence sink selected by the CLI arguments.
+
+    For the real transactional mode, ``--persistence-table`` is mandatory; a
+    missing table is a usage error (exit via ``SystemExit``) rather than a silent
+    fallback to a non-acceptable mode. ``dynamodb_client`` is injectable so unit
+    tests can pass a fake; production supplies a real bounded client.
+    """
+    if args.persistence_mode == PERSISTENCE_MODE_DYNAMODB:
+        if not args.persistence_table:
+            raise SystemExit(
+                "--persistence-table is required for --persistence-mode "
+                f"{PERSISTENCE_MODE_DYNAMODB}: name a disposable, task-owned, on-demand table."
+            )
+        client = (
+            dynamodb_client
+            if dynamodb_client is not None
+            else _build_dynamodb_client(args.profile, args.region, budget)
+        )
+        return DynamoDbTransactionalSink(
+            client=client,
+            table_name=args.persistence_table,
+            persistence_budget_s=budget.persistence_s,
+            ttl_seconds=args.ttl_seconds,
+        )
+    # Test-only deterministic mode. Not acceptable as live evidence.
+    return InMemoryPersistenceSink()
 
 
 def _build_client(profile: str | None, region: str, retry_mode: str, max_attempts: int) -> Any:
@@ -361,7 +479,8 @@ def main(argv: list[str] | None = None) -> int:
         max_attempts=max_attempts,
         arrival_model=ARRIVAL_MODEL,
     )
-    document = _measure(client, args.fleet_id, DEFAULT_BUDGET, config)
+    sink = _build_sink(args, DEFAULT_BUDGET)
+    document = _measure(client, args.fleet_id, DEFAULT_BUDGET, config, sink=sink)
     rendered = json.dumps(document, indent=2, sort_keys=True)
 
     if args.out:

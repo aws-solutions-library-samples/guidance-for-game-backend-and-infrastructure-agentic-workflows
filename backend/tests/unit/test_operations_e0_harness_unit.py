@@ -115,7 +115,36 @@ def test_measure_evaluation_uses_ceiling_minus_margin():
     ev = doc["evaluation"]
     expected = (DEFAULT_BUDGET.ceiling_s - DEFAULT_BUDGET.cancellation_margin_s) * 1000.0
     assert ev["acceptance_ceiling_ms"] == pytest.approx(expected)
-    # Fast fakes should pass the synchronous gate.
+    # The default (in-memory, test-only) persistence mode is NOT acceptable as
+    # live evidence, so even a fast clean run is denied (issue #412 finding).
+    assert ev["persistence_acceptable"] is False
+    assert ev["synchronous_accepted"] is False
+
+
+def test_measure_accepts_only_under_real_transactional_persistence():
+    # Third-party packages / local: a fake DynamoDB client keeps this offline.
+    # Local modules
+    from operations.validation.e0_persistence import DynamoDbTransactionalSink
+
+    class FakeDynamoDbClient:
+        def __init__(self):
+            self.calls = []
+
+        def transact_write_items(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    client = FakeGameLiftClient()
+    sink = DynamoDbTransactionalSink(
+        client=FakeDynamoDbClient(),
+        table_name="e0-latency-spike-disposable",
+        persistence_budget_s=DEFAULT_BUDGET.persistence_s,
+    )
+    doc = _measure(client, FAKE_FLEET_ID, DEFAULT_BUDGET, _config(samples=5), sink=sink)
+    ev = doc["evaluation"]
+    # Fast fakes under the real transactional mode pass the synchronous gate.
+    assert ev["persistence_acceptable"] is True
+    assert ev["clean_run"] is True
     assert ev["synchronous_accepted"] is True
 
 

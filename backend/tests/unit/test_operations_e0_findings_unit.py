@@ -131,13 +131,43 @@ def test_acceptance_requires_zero_failed_samples_even_with_good_p99():
     assert doc["evaluation"]["synchronous_accepted"] is False
 
 
-def test_all_clean_successes_accept():
+class _FakeDynamoDbClient:
+    """Records transactional writes; issues no I/O (offline test double)."""
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def transact_write_items(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+
+def test_all_clean_successes_accept_under_real_transactional_persistence():
+    # Local modules
+    from operations.validation.e0_persistence import DynamoDbTransactionalSink
+
     client = FakeGameLiftClient()
-    doc = _measure(client, FAKE_FLEET_ID, DEFAULT_BUDGET, _config(samples=5))
+    sink = DynamoDbTransactionalSink(
+        client=_FakeDynamoDbClient(),
+        table_name="e0-latency-spike-disposable",
+        persistence_budget_s=DEFAULT_BUDGET.persistence_s,
+    )
+    doc = _measure(client, FAKE_FLEET_ID, DEFAULT_BUDGET, _config(samples=5), sink=sink)
     assert doc["results_ms"]["failures"] == 0
     assert doc["results_ms"]["timeouts"] == 0
     assert doc["results_ms"]["partial_denials"] == 0
+    assert doc["evaluation"]["persistence_acceptable"] is True
     assert doc["evaluation"]["synchronous_accepted"] is True
+
+
+def test_clean_run_under_in_memory_mode_is_denied():
+    # A clean sample is NOT sufficient: the in-memory (test-only) mode is never
+    # acceptable as live evidence, so acceptance is denied (issue #412 finding).
+    client = FakeGameLiftClient()
+    doc = _measure(client, FAKE_FLEET_ID, DEFAULT_BUDGET, _config(samples=5))
+    assert doc["evaluation"]["clean_run"] is True
+    assert doc["evaluation"]["persistence_acceptable"] is False
+    assert doc["evaluation"]["synchronous_accepted"] is False
 
 
 # ---------------------------------------------------------------------------

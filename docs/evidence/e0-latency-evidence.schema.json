@@ -44,7 +44,7 @@
         "arrival_model",
         "boto3_retry_mode",
         "boto3_max_attempts",
-        "persistence"
+        "persistence_mode"
       ],
       "properties": {
         "region": { "type": "string" },
@@ -65,7 +65,11 @@
         },
         "boto3_retry_mode": { "type": "string" },
         "boto3_max_attempts": { "type": "integer", "minimum": 1 },
-        "persistence": { "type": "string" }
+        "persistence_mode": {
+          "description": "Persistence mode actually exercised on the measured path. 'in-memory-deterministic' is TEST-ONLY and never acceptable as live evidence; 'dynamodb-transactional' is the real transactional write required for acceptance.",
+          "type": "string",
+          "enum": ["in-memory-deterministic", "dynamodb-transactional"]
+        }
       }
     },
     "budget_ms": {
@@ -123,15 +127,19 @@
         "rule",
         "acceptance_ceiling_ms",
         "p99_ms",
+        "persistence_mode",
+        "persistence_acceptable",
         "clean_run",
         "synchronous_accepted"
       ],
       "properties": {
         "rule": {
-          "const": "clean_run AND p99 <= gateway_integration_timeout - cancellation_margin"
+          "const": "persistence_acceptable AND clean_run AND p99 <= gateway_integration_timeout - cancellation_margin"
         },
         "acceptance_ceiling_ms": { "type": "number", "exclusiveMinimum": 0 },
         "p99_ms": { "type": "number", "minimum": 0 },
+        "persistence_mode": { "type": "string", "enum": ["in-memory-deterministic", "dynamodb-transactional"] },
+        "persistence_acceptable": { "type": "boolean" },
         "clean_run": { "type": "boolean" },
         "synchronous_accepted": { "type": "boolean" }
       }
