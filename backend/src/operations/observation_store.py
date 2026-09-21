@@ -65,6 +65,9 @@ from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+# Third-party packages
+from loguru import logger
+
 # Local modules
 from operations.contracts.canonical import canonical_sha256
 from operations.observation import (
@@ -215,6 +218,7 @@ class DynamoDbObservationStore(ObservationStore):
             # transaction conflict, validation, or provider fault is a retryable
             # unavailable state and must never masquerade as a 409 conflict.
             if not _is_conditional_failure(exc):
+                _log_store_exception("begin_observation", exc, classification="unavailable")
                 return ObservationBegin(ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
             return self._resolve_existing(idem_pk, idempotency_fingerprint, deadline, reclaim_lease_holder=lease_holder)
 
@@ -366,6 +370,7 @@ class DynamoDbObservationStore(ObservationStore):
             self._client.transact_write_items(TransactItems=transact_items)
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if not _is_conditional_failure(exc):
+                _log_store_exception("reclaim_observation", exc, classification="unavailable")
                 return ObservationBegin(ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
             # Lost the reclaim race (another writer advanced the generation) or
             # the operation already left observing: report in-progress so the
@@ -492,6 +497,7 @@ class DynamoDbObservationStore(ObservationStore):
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if not _is_conditional_failure(exc):
                 # Throttle/conflict/validation/provider fault: retryable, not 409.
+                _log_store_exception("complete_observation", exc, classification="unavailable")
                 return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
             # A racing writer may have already reached succeeded: replay it.
             snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
@@ -578,7 +584,10 @@ class DynamoDbObservationStore(ObservationStore):
         ]
         try:
             self._client.transact_write_items(TransactItems=transact_items)
-        except Exception:  # noqa: BLE001 - best effort; a fail record is not mandatory
+        except Exception as exc:  # noqa: BLE001 - best effort; a fail record is not mandatory
+            # Best-effort: a fail record is not mandatory, but leave a bounded
+            # breadcrumb rather than vanishing silently.
+            _log_store_exception("fail_observation", exc, classification="best_effort")
             return None
         return None
 
@@ -632,11 +641,17 @@ class DynamoDbObservationStore(ObservationStore):
         return observation, recorded_hash if isinstance(recorded_hash, str) else None
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
-        response = self._client.get_item(
-            TableName=self._table_name,
-            Key=_marshal({"PK": pk, "SK": sk}),
-            ConsistentRead=True,
-        )
+        try:
+            response = self._client.get_item(
+                TableName=self._table_name,
+                Key=_marshal({"PK": pk, "SK": sk}),
+                ConsistentRead=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - log a bounded breadcrumb, then re-raise
+            # A read failure must not vanish into a false "not found"; surface a
+            # bounded diagnostic and let the caller's own handling propagate it.
+            _log_store_exception("read_item", exc, classification="read_error")
+            raise
         item = response.get("Item") if isinstance(response, dict) else None
         return _unmarshal(item) if item else None
 
@@ -728,6 +743,76 @@ def _is_conditional_failure(exc: Exception) -> bool:
     # Unknown reasons (neither conditional nor a recognized transient) also fail
     # closed: only a pure, recognized ConditionalCheckFailed is conditional.
     return _CONDITIONAL_REASON in reason_codes
+
+
+# -- Safe diagnostic logging at store exception boundaries (#413) -------------
+#
+# Live diagnosis of the demo E1 503 (PROVIDER_UNAVAILABLE, no item written)
+# found the store swallowed the underlying DynamoDB failure with no log line, so
+# only the AWS-layer signal (DynamoDB UserErrors) survived. These helpers emit a
+# BOUNDED structured record at each boundary: the store operation name, the
+# exception TYPE, the AWS error code, and the transaction cancellation-reason
+# codes — and nothing else.
+#
+# Reconciling #409: general call sites use ``logger.exception`` so the class,
+# message, and frames reach CloudWatch (with ``diagnose=False`` stripping local
+# VALUES). This boundary is deliberately stricter. The store handles idempotency
+# tokens, operation ids, canonical intent, and request items, any of which can
+# appear in a botocore exception MESSAGE or in stack locals. So this boundary
+# emits sanitized metadata ONLY: never the exception message, ``str(exc)``, a
+# traceback, or ``exc_info``. Bounded lengths cap any adversarial code/reason a
+# provider could return.
+_MAX_CODE_LEN = 128
+_MAX_REASON_CODES = 16
+
+
+def _aws_error_code(exc: Exception) -> str | None:
+    """The bounded AWS error code from a botocore-shaped exception, or None.
+
+    Reads only ``exc.response["Error"]["Code"]`` (a short, provider-defined
+    token). Never reads the error MESSAGE.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    code = response.get("Error", {}).get("Code")
+    if not isinstance(code, str) or not code:
+        return None
+    return code[:_MAX_CODE_LEN]
+
+
+def _bounded_reason_codes(exc: Exception) -> list[str]:
+    """The bounded, sorted set of transaction cancellation-reason codes.
+
+    Reads only the ``Code`` of each entry in ``CancellationReasons`` (dropping
+    the inert ``"None"`` marker). Never reads any reason ``Message``.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return []
+    codes = _cancellation_reason_codes(response)
+    if not codes:
+        return []
+    bounded = sorted(code[:_MAX_CODE_LEN] for code in codes if isinstance(code, str) and code and code != "None")
+    return bounded[:_MAX_REASON_CODES]
+
+
+def _log_store_exception(operation: str, exc: Exception, *, classification: str) -> None:
+    """Emit a bounded, sanitized diagnostic record for a store-boundary error.
+
+    Logs ONLY the operation name, the exception type, the AWS error code, and
+    the bounded cancellation-reason codes. It never logs the exception message,
+    request items, ids, tokens, table/account/ARN, or provider data, and it
+    never attaches a traceback or ``exc_info`` (see the boundary note above).
+    """
+    logger.bind(
+        event="dynamodb_store_exception",
+        operation=operation,
+        classification=classification,
+        exception_type=type(exc).__name__,
+        aws_error_code=_aws_error_code(exc),
+        cancellation_reason_codes=_bounded_reason_codes(exc),
+    ).warning("dynamodb_store_exception")
 
 
 def _marshal(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
