@@ -240,7 +240,7 @@ def test_get_status_returns_200_with_state() -> None:
         state=ObservationStatusView.OBSERVING,
     )
     handler, _ = _handler(FakeStore(status=status))
-    response = handler.handle(_event(method="GET", path_parameters={"operation_id": OPERATION_ID}))
+    response = handler.handle(_event(method="GET", path_parameters={"operationId": OPERATION_ID}))
     assert response["statusCode"] == 200
     body = json.loads(response["body"])
     assert body["operation_id"] == OPERATION_ID
@@ -249,7 +249,7 @@ def test_get_status_returns_200_with_state() -> None:
 
 def test_get_status_missing_is_404() -> None:
     handler, _ = _handler(FakeStore(status=None))
-    response = handler.handle(_event(method="GET", path_parameters={"operation_id": OPERATION_ID}))
+    response = handler.handle(_event(method="GET", path_parameters={"operationId": OPERATION_ID}))
     assert response["statusCode"] == 404
     assert json.loads(response["body"])["error_code"] == "NOT_FOUND"
 
@@ -261,20 +261,20 @@ def test_get_status_cross_workspace_is_404() -> None:
         state=ObservationStatusView.OBSERVING,
     )
     handler, _ = _handler(FakeStore(status=status))
-    response = handler.handle(_event(method="GET", path_parameters={"operation_id": OPERATION_ID}))
+    response = handler.handle(_event(method="GET", path_parameters={"operationId": OPERATION_ID}))
     assert response["statusCode"] == 404
 
 
 def test_get_status_invalid_operation_id_is_400() -> None:
     handler, _ = _handler()
-    response = handler.handle(_event(method="GET", path_parameters={"operation_id": "not-an-op"}))
+    response = handler.handle(_event(method="GET", path_parameters={"operationId": "not-an-op"}))
     assert response["statusCode"] == 400
 
 
 def test_get_status_without_authorizer_is_401() -> None:
     handler, _ = _handler()
     response = handler.handle(
-        _event(method="GET", path_parameters={"operation_id": OPERATION_ID}, with_authorizer=False)
+        _event(method="GET", path_parameters={"operationId": OPERATION_ID}, with_authorizer=False)
     )
     assert response["statusCode"] == 401
 
@@ -284,7 +284,7 @@ def test_get_status_without_authorizer_is_401() -> None:
 
 def test_unsupported_method_is_400() -> None:
     handler, _ = _handler()
-    response = handler.handle(_event(method="DELETE", path_parameters={"operation_id": OPERATION_ID}))
+    response = handler.handle(_event(method="DELETE", path_parameters={"operationId": OPERATION_ID}))
     assert response["statusCode"] == 400
 
 

@@ -28,8 +28,22 @@ deadline:
 3. writes the immutable ``STATE#1`` transition; and
 4. appends the ``LEDGER#1`` event.
 
-``fail_observation`` records a bounded ``failed`` transition where possible.
-``load_status`` resolves an operation by id under trusted workspace ownership.
+``fail_observation`` records a bounded, terminal ``failed`` transition where
+possible; a later retry under the same idempotency token replays that stored
+failure deterministically rather than being marked retryable. A retry that finds
+an ``observing`` operation whose single-flight lease has expired triggers a fenced
+reclaim: the fencing generation is advanced under a conditional write, a recovery
+ledger event (``LEDGER#RECLAIM#<generation>``) is appended atomically, and the
+operation is reported reclaimed so the caller reruns the read-only work under the
+new generation. Both ``complete_observation`` and ``fail_observation`` accept the
+holder's fencing ``generation`` so a superseded writer fails closed.
+
+A ``TransactionCanceledException`` is classified from its actual cancellation
+reasons: only ``ConditionalCheckFailed`` (with no transient conflict/throttle
+reason) resolves to idempotency/state handling; a throttle, transaction conflict,
+capacity limit, or provider fault surfaces as a retryable unavailable outcome and
+never as a false 409. ``load_status`` resolves an operation by id under trusted
+workspace ownership.
 
 The store never issues a ``Scan`` or an unconditional ``PutItem``, holds no
 write path to any provider, and enforces the exclusive ``commit_not_after``
@@ -71,6 +85,10 @@ _LEDGER_1_SK = "LEDGER#1"
 _RESULT_SK = "RESULT#current"
 _IDEM_SK = "MAP#current"
 _CONTRACT_VERSION = "1.0"
+
+# The initial fencing generation a fresh operation holds. A stale-lease reclaim
+# advances it so a superseded writer's generation-1 commit fails closed.
+_INITIAL_GENERATION = 1
 
 # The DynamoDB item-size limit. The canonical observation JSON must serialize
 # below this ceiling; a larger result fails closed rather than being written.
@@ -188,15 +206,32 @@ class DynamoDbObservationStore(ObservationStore):
 
         try:
             self._client.transact_write_items(TransactItems=transact_items)
-        except Exception as exc:  # noqa: BLE001 - classify by conditional-failure shape
+        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
+            # Only a genuine ConditionalCheckFailed means the idempotency mapping
+            # already exists: route it to idempotency resolution. A throttle,
+            # transaction conflict, validation, or provider fault is a retryable
+            # unavailable state and must never masquerade as a 409 conflict.
             if not _is_conditional_failure(exc):
-                return ObservationBegin(ObservationBeginOutcome.STATE_CONFLICT)
-            return self._resolve_existing(idem_pk, idempotency_fingerprint)
+                return ObservationBegin(ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
+            return self._resolve_existing(idem_pk, idempotency_fingerprint, deadline, reclaim_lease_holder=lease_holder)
 
         return ObservationBegin(ObservationBeginOutcome.CREATED, operation_id=operation_id)
 
-    def _resolve_existing(self, idem_pk: str, expected_fingerprint: str) -> ObservationBegin:
-        """A mapping already exists: replay/in-progress iff the fingerprint matches."""
+    def _resolve_existing(
+        self, idem_pk: str, expected_fingerprint: str, deadline: datetime, *, reclaim_lease_holder: str
+    ) -> ObservationBegin:
+        """A mapping already exists: resolve it by fingerprint and current state.
+
+        * A matching completed operation replays its stored bounded observation.
+        * A matching terminally-failed operation replays its stored bounded
+          failure (distinct from in-progress — it can never make progress under
+          the same token).
+        * A matching in-progress operation with a still-live single-flight lease
+          reports in-progress (no second operation, no recovery claim).
+        * A matching in-progress operation whose lease has EXPIRED is reclaimed:
+          the fencing generation is advanced under a conditional write and a
+          recovery ledger transition is appended, so the caller can safely rerun.
+        """
         mapping = self._get(idem_pk, _IDEM_SK)
         if not mapping:
             return ObservationBegin(ObservationBeginOutcome.STATE_CONFLICT)
@@ -223,13 +258,123 @@ class DynamoDbObservationStore(ObservationStore):
                 observation=observation,
                 observation_hash=observation_hash,
             )
-        # Non-terminal (observing) or terminal failure: report as in progress so
-        # the caller retries rather than creating a second operation.
+        if state == STATE_FAILED:
+            # A terminal failure replays deterministically and is never retried
+            # under the same token.
+            reason = snapshot.get("reason_code")
+            return ObservationBegin(
+                ObservationBeginOutcome.REPLAY_FAILED,
+                operation_id=operation_id,
+                current_state=STATE_FAILED,
+                failure_reason=reason if isinstance(reason, str) else None,
+            )
+        if state != STATE_OBSERVING:
+            return ObservationBegin(ObservationBeginOutcome.STATE_CONFLICT)
+
+        # In progress. If the single-flight lease is still live, report
+        # in-progress. If it has expired, attempt a fenced reclaim.
+        now_epoch_s = int(self._clock().timestamp())
+        lease_not_after = snapshot.get("lease_not_after")
+        current_generation = snapshot.get("generation")
+        lease_expired = isinstance(lease_not_after, int) and lease_not_after <= now_epoch_s
+        if lease_expired and isinstance(current_generation, int):
+            return self._reclaim_observation(
+                op_pk=op_pk,
+                operation_id=operation_id,
+                current_generation=current_generation,
+                new_lease_holder=reclaim_lease_holder,
+                deadline=deadline,
+                ttl_epoch_s=int(snapshot["ttl"]) if isinstance(snapshot.get("ttl"), int) else now_epoch_s,
+            )
         return ObservationBegin(
             ObservationBeginOutcome.IN_PROGRESS,
             operation_id=operation_id,
             lease_holder=snapshot.get("lease_holder") if isinstance(snapshot.get("lease_holder"), str) else None,
             current_state=state if isinstance(state, str) else None,
+        )
+
+    def _reclaim_observation(
+        self,
+        *,
+        op_pk: str,
+        operation_id: str,
+        current_generation: int,
+        new_lease_holder: str,
+        deadline: datetime,
+        ttl_epoch_s: int,
+    ) -> ObservationBegin:
+        """Conditionally reclaim a stale-lease observing operation.
+
+        The snapshot's fencing generation is advanced (and the lease taken) under
+        a condition that still requires the observing state, sequence 0, the
+        observed generation, and an EXPIRED lease. A recovery ledger event keyed
+        by the new generation is appended in the same transaction. If the
+        condition fails (another writer reclaimed or the op advanced), we fall
+        back to in-progress rather than creating a second operation.
+        """
+        now = self._clock()
+        if now >= _utc(deadline, "commit_not_after"):
+            return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
+        now_epoch_s = int(now.timestamp())
+        new_generation = current_generation + 1
+        # A new lease window bounded by the same commit deadline.
+        new_lease_epoch_s = int(_utc(deadline, "commit_not_after").timestamp())
+
+        reclaim_ledger_sk = f"LEDGER#RECLAIM#{new_generation}"
+        ledger_item = {
+            "PK": op_pk,
+            "SK": reclaim_ledger_sk,
+            "record_type": "observation_ledger_event",
+            "contract_version": _CONTRACT_VERSION,
+            "operation_id": operation_id,
+            "event_type": "observation.lease_reclaimed",
+            "generation": new_generation,
+            "ttl": int(ttl_epoch_s),
+        }
+        snapshot_update = {
+            "Update": {
+                "TableName": self._table_name,
+                "Key": _marshal({"PK": op_pk, "SK": _STATE_SNAPSHOT_SK}),
+                "UpdateExpression": ("SET #gen = :new_gen, lease_holder = :holder, lease_not_after = :new_lease"),
+                "ConditionExpression": (
+                    "attribute_exists(PK) AND #state = :observing AND #seq = :zero "
+                    "AND #gen = :cur_gen AND lease_not_after <= :now"
+                ),
+                "ExpressionAttributeNames": {
+                    "#state": "state",
+                    "#seq": "sequence",
+                    "#gen": "generation",
+                },
+                "ExpressionAttributeValues": _marshal_values(
+                    {
+                        ":observing": STATE_OBSERVING,
+                        ":zero": 0,
+                        ":cur_gen": current_generation,
+                        ":new_gen": new_generation,
+                        ":holder": new_lease_holder,
+                        ":new_lease": new_lease_epoch_s,
+                        ":now": now_epoch_s,
+                    }
+                ),
+            }
+        }
+        transact_items = [snapshot_update, self._conditional_put(ledger_item, "attribute_not_exists(SK)")]
+        try:
+            self._client.transact_write_items(TransactItems=transact_items)
+        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
+            if not _is_conditional_failure(exc):
+                return ObservationBegin(ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
+            # Lost the reclaim race (another writer advanced the generation) or
+            # the operation already left observing: report in-progress so the
+            # caller retries and eventually replays the winner's result.
+            return ObservationBegin(
+                ObservationBeginOutcome.IN_PROGRESS, operation_id=operation_id, current_state=STATE_OBSERVING
+            )
+        return ObservationBegin(
+            ObservationBeginOutcome.RECLAIMED,
+            operation_id=operation_id,
+            current_state=STATE_OBSERVING,
+            generation=new_generation,
         )
 
     # -- Phase 2: finalize after reads -----------------------------------
@@ -243,6 +388,7 @@ class DynamoDbObservationStore(ObservationStore):
         commit_not_after: datetime,
         ttl_epoch_s: int,
         observation: Mapping[str, Any],
+        generation: int = _INITIAL_GENERATION,
     ) -> ObservationComplete:
         deadline = _utc(commit_not_after, "commit_not_after")
         now = self._clock()
@@ -317,7 +463,7 @@ class DynamoDbObservationStore(ObservationStore):
                         ":observing": STATE_OBSERVING,
                         ":zero": 0,
                         ":one": 1,
-                        ":gen": 1,
+                        ":gen": generation,
                         ":holder": lease_holder,
                         ":now": now_epoch_s,
                         ":state1": _STATE_TRANSITION_1_SK,
@@ -340,9 +486,10 @@ class DynamoDbObservationStore(ObservationStore):
 
         try:
             self._client.transact_write_items(TransactItems=transact_items)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if not _is_conditional_failure(exc):
-                return ObservationComplete(ObservationCompleteOutcome.STATE_CONFLICT)
+                # Throttle/conflict/validation/provider fault: retryable, not 409.
+                return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
             # A racing writer may have already reached succeeded: replay it.
             snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
             if snapshot and snapshot.get("state") == STATE_SUCCEEDED:
@@ -365,6 +512,7 @@ class DynamoDbObservationStore(ObservationStore):
         lease_holder: str,
         reason_code: str,
         ttl_epoch_s: int,
+        generation: int = _INITIAL_GENERATION,
     ) -> None:
         """Record a bounded failed transition where possible (best effort)."""
         op_pk = f"OP#{operation_id}"
@@ -412,7 +560,7 @@ class DynamoDbObservationStore(ObservationStore):
                         ":observing": STATE_OBSERVING,
                         ":zero": 0,
                         ":one": 1,
-                        ":gen": 1,
+                        ":gen": generation,
                         ":holder": lease_holder,
                         ":reason": reason_code,
                         ":ttl": int(ttl_epoch_s),
@@ -499,17 +647,43 @@ class DynamoDbObservationStore(ObservationStore):
         }
 
 
+# Cancellation-reason codes DynamoDB reports on a TransactionCanceledException.
+# Only ConditionalCheckFailed means a real precondition failed (the idempotency
+# mapping or a fenced state already exists) and routes to idempotency/state
+# resolution. Every other reason — a transient conflict, throttle, or capacity
+# limit — is a retryable unavailable condition, NOT a 409 conflict.
+_CONDITIONAL_REASON = "ConditionalCheckFailed"
+_TRANSIENT_REASONS = frozenset({"TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded"})
+
+
 def _is_conditional_failure(exc: Exception) -> bool:
-    """Return whether a boto3/botocore error is a conditional-check failure."""
+    """Return whether an error is a genuine conditional-check failure.
+
+    A TransactionCanceledException is classified from its actual cancellation
+    reasons: it is conditional only when at least one reason is
+    ConditionalCheckFailed and no reason is a transient conflict/throttle. A
+    bare ConditionalCheckFailedException (from a non-transactional write) is
+    conditional. Throttling, transaction conflicts, validation, and provider
+    faults are never treated as conditional — the caller maps them to a
+    retryable unavailable state instead of a false idempotency/state conflict.
+    """
+    reasons = getattr(exc, "cancellation_reasons", None)
+    if isinstance(reasons, list):
+        reason_codes = {r.get("Code") for r in reasons if isinstance(r, dict)}
+        if reason_codes & _TRANSIENT_REASONS:
+            # A transient reason present anywhere makes the whole transaction
+            # retryable, even if another leg reports ConditionalCheckFailed.
+            return False
+        return _CONDITIONAL_REASON in reason_codes
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
         code = response.get("Error", {}).get("Code", "")
-        if code in {"ConditionalCheckFailedException", "TransactionCanceledException"}:
+        if code == "ConditionalCheckFailedException":
             return True
-    reasons = getattr(exc, "cancellation_reasons", None)
-    if isinstance(reasons, list):
-        return any(isinstance(r, dict) and r.get("Code") == "ConditionalCheckFailed" for r in reasons)
-    return "ConditionalCheckFailed" in str(exc)
+        # A TransactionCanceledException with no structured reasons cannot be
+        # confirmed as conditional; treat it as transient/retryable.
+        return False
+    return False
 
 
 def _marshal(item: dict[str, Any]) -> dict[str, dict[str, Any]]:

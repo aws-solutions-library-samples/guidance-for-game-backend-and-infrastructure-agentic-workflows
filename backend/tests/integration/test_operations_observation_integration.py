@@ -80,6 +80,12 @@ class FakeDynamoClient:
             return False
         if int(current.get("sequence", {}).get("N", "-1")) != int(values.get(":zero", {}).get("N", "0")):
             return False
+        if ":cur_gen" in values:  # reclaim: observed generation + expired lease
+            if int(current.get("generation", {}).get("N", "-1")) != int(values[":cur_gen"]["N"]):
+                return False
+            if int(current.get("lease_not_after", {}).get("N", "0")) > int(values[":now"]["N"]):
+                return False
+            return True
         if int(current.get("generation", {}).get("N", "-1")) != int(values.get(":gen", {}).get("N", "0")):
             return False
         if current.get("lease_holder", {}).get("S") != values.get(":holder", {}).get("S"):
@@ -95,6 +101,14 @@ class FakeDynamoClient:
         if ":succeeded" in values:
             current["state"] = values[":succeeded"]
             current["sequence"] = values[":one"]
+        elif ":failed" in values:
+            current["state"] = values[":failed"]
+            current["sequence"] = values[":one"]
+            current["reason_code"] = values[":reason"]
+        elif ":cur_gen" in values:
+            current["generation"] = values[":new_gen"]
+            current["lease_holder"] = values[":holder"]
+            current["lease_not_after"] = values[":new_lease"]
         self.items[key] = current
 
     def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
@@ -188,7 +202,7 @@ def _get_event(operation_id: str) -> dict[str, Any]:
     event = _post_event()
     event["requestContext"]["http"]["method"] = "GET"
     event.pop("body")
-    event["pathParameters"] = {"operation_id": operation_id}
+    event["pathParameters"] = {"operationId": operation_id}
     return event
 
 
@@ -309,9 +323,9 @@ def test_deployable_lambda_handler_end_to_end(monkeypatch: pytest.MonkeyPatch) -
                 ]
             }
 
-        def describe_fleet_location_capacity(self, **kwargs: Any) -> dict[str, Any]:
+        def describe_fleet_capacity(self, **kwargs: Any) -> dict[str, Any]:
             return {
-                "LocationCapacities": [
+                "FleetCapacity": [
                     {
                         "Location": "us-west-2",
                         "InstanceCounts": {"DESIRED": 10, "MINIMUM": 2, "MAXIMUM": 20, "ACTIVE": 10, "IDLE": 2},

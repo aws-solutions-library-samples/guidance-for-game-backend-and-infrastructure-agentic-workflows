@@ -23,9 +23,16 @@ Lifecycle (ADR 0005, "create before reads"):
    hash re-verified, without any new provider read.
 3. **A changed intent under the same token conflicts.** A stored fingerprint
    that differs fails with ``IDEMPOTENCY_CONFLICT`` and mutates nothing.
-4. **An in-progress retry is safe.** A non-terminal existing operation either
-   returns its status or, under a bounded single-flight lease, safely resumes
-   the read-only work — it never creates a second operation.
+4. **An in-progress retry is safe, and a stale lease is recovered.** A
+   non-terminal existing operation whose single-flight lease is still live
+   returns a bounded, retryable in-progress state — it never creates a second
+   operation and makes no recovery claim. Once that lease has *expired*, the
+   store conditionally advances the fencing generation and lease, appends a
+   recovery ledger transition, and reports the operation as reclaimed; the
+   service then safely reruns the read-only observation under the reclaimed
+   lease. A *terminally failed* operation is distinct: it replays its stored
+   bounded failure deterministically and is not retryable under the same token —
+   a new observation requires a new idempotency token.
 5. **Execute reads, then finalize.** After a fresh create, the three reads run
    under the E0-validated deadlines; on success the bounded, validated,
    canonicalized, hashed observation is persisted while the state transitions
@@ -41,9 +48,11 @@ Boundaries enforced here, consistent with ADR 0001/0002/0003 and the
   never from the untrusted :class:`ObservationRequest` (fleet id and idempotency
   token only).
 * **Explicit ceilings.** The six ADR 0001 authority inputs are recorded and the
-  deterministic minimum is the effective authority, additionally capped at
-  ``observe``. Every recorded input is likewise capped at ``observe`` so a higher
-  deployment ceiling still yields ``observe`` without contract disagreement.
+  deterministic minimum is the effective authority. The five caller/deployment
+  inputs are recorded exactly as supplied — a higher deployment or principal
+  ceiling is never rewritten — while this capability's own maximum is the
+  explicit ``observe`` phase ceiling. The effective authority is therefore the
+  real ``min(inputs)``, which for this phase can never exceed ``observe``.
 * **No provider writes.** Only injected read callables are invoked.
 * **Fail closed, no partial success.** Any deadline overrun, empty read,
   malformed or oversized shape, replay/idempotency conflict, or state conflict
@@ -276,9 +285,12 @@ class ObservationBeginOutcome(str, Enum):
 
     CREATED = "created"
     REPLAY_COMPLETED = "replay_completed"
+    REPLAY_FAILED = "replay_failed"
+    RECLAIMED = "reclaimed"
     IN_PROGRESS = "in_progress"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     STATE_CONFLICT = "state_conflict"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
     DEADLINE_EXPIRED = "deadline_expired"
 
 
@@ -288,13 +300,16 @@ class ObservationCompleteOutcome(str, Enum):
     RECORDED = "recorded"
     ALREADY_TERMINAL = "already_terminal"
     STATE_CONFLICT = "state_conflict"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
     DEADLINE_EXPIRED = "deadline_expired"
 
 
 @dataclass(frozen=True, slots=True)
 class ObservationBegin:
     """The store's create result: an outcome, the bound operation id, and,
-    on a completed replay, the stored observation and its recorded hash."""
+    depending on the outcome, the stored observation and hash (a completed
+    replay), the stored bounded failure reason (a terminal-failed replay), or the
+    reclaimed fencing generation (a stale-lease reclaim)."""
 
     outcome: ObservationBeginOutcome
     operation_id: str | None = None
@@ -302,6 +317,8 @@ class ObservationBegin:
     observation_hash: str | None = None
     lease_holder: str | None = None
     current_state: str | None = None
+    generation: int = 1
+    failure_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -373,8 +390,14 @@ class ObservationStore(Protocol):
         commit_not_after: datetime,
         ttl_epoch_s: int,
         observation: Mapping[str, Any],
+        generation: int = 1,
     ) -> ObservationComplete:
-        """Atomically persist the bounded result and transition to succeeded."""
+        """Atomically persist the bounded result and transition to succeeded.
+
+        generation fences the write on the caller's fencing token so a writer
+        holding a reclaimed lease (generation > 1) commits while a superseded
+        writer's generation-1 commit fails closed.
+        """
         ...
 
     def fail_observation(
@@ -385,8 +408,14 @@ class ObservationStore(Protocol):
         lease_holder: str,
         reason_code: str,
         ttl_epoch_s: int,
+        generation: int = 1,
     ) -> None:
-        """Record a bounded failed transition where possible (best effort)."""
+        """Record a bounded failed transition where possible (best effort).
+
+        The stored bounded failure is terminal and deterministic: a later retry
+        under the same idempotency token replays it verbatim rather than being
+        marked retryable. generation fences the write on the caller's lease.
+        """
         ...
 
     def load_status(self, *, operation_id: str, workspace_id: str) -> ObservationStatus | None:
@@ -482,6 +511,20 @@ class ObservationService:
             # verbatim with no new provider read; its hash is re-verified.
             return self._replay(begin)
 
+        if begin.outcome is ObservationBeginOutcome.REPLAY_FAILED:
+            # A terminal failed operation is distinct from an in-progress one: it
+            # returns its stored bounded failure deterministically and is NOT
+            # retryable, because the same idempotency token can never make
+            # progress. A caller that wants to try again must start a new
+            # operation with a fresh idempotency token.
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "terminal"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.PROVIDER_UNAVAILABLE,
+                "a prior observation for this idempotency token failed terminally; "
+                "start a new operation with a new idempotency token",
+                retryable=False,
+            )
+
         if begin.outcome is ObservationBeginOutcome.IN_PROGRESS:
             return self._resume_in_progress(begin)
 
@@ -492,12 +535,49 @@ class ObservationService:
                 "idempotency token was reused with different intent",
             )
 
+        if begin.outcome is ObservationBeginOutcome.PROVIDER_UNAVAILABLE:
+            # A non-conditional store error (throttle, transaction conflict,
+            # validation, or provider fault) is a retryable unavailable state,
+            # never a false 409 idempotency/state conflict.
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "store"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.PROVIDER_UNAVAILABLE,
+                "observation state store is temporarily unavailable",
+                retryable=True,
+            )
+
         if begin.outcome is ObservationBeginOutcome.DEADLINE_EXPIRED:
             self._metrics.record("observation.failed", 1.0, dimensions={"reason": "deadline"})
             raise ObservationBoundaryError(
                 ObservationErrorCode.PROVIDER_UNAVAILABLE,
                 "observation deadline elapsed before the operation was created",
                 retryable=True,
+            )
+
+        if begin.outcome is ObservationBeginOutcome.RECLAIMED:
+            # A stale in-progress operation whose lease expired was reclaimed:
+            # the store advanced the fencing generation, took the lease, and
+            # appended a recovery ledger transition. We now safely rerun the
+            # read-only observation and finalize under the reclaimed generation.
+            reclaimed_id = begin.operation_id
+            if reclaimed_id is None:
+                self._metrics.record("observation.failed", 1.0, dimensions={"reason": "state"})
+                raise ObservationBoundaryError(
+                    ObservationErrorCode.STATE_CONFLICT, "observation could not be reclaimed"
+                )
+            self._metrics.record("observation.reclaimed", 1.0)
+            return self._read_and_finalize(
+                request=request,
+                context=context,
+                operation_id=reclaimed_id,
+                lease_holder=lease_holder,
+                requester_identity=requester_identity,
+                effective_authority=effective_authority,
+                authority_inputs=authority_inputs,
+                expires_at=expires_at,
+                commit_not_after=commit_not_after,
+                ttl_epoch_s=ttl_epoch_s,
+                generation=begin.generation,
             )
 
         if begin.outcome is not ObservationBeginOutcome.CREATED or begin.operation_id is None:
@@ -518,6 +598,7 @@ class ObservationService:
             expires_at=expires_at,
             commit_not_after=commit_not_after,
             ttl_epoch_s=ttl_epoch_s,
+            generation=1,
         )
 
     # -- Status -----------------------------------------------------------
@@ -570,27 +651,27 @@ class ObservationService:
                 ObservationErrorCode.IDENTITY_CONTEXT_INVALID, "authenticated observation identity is invalid"
             ) from exc
 
-        # 3. Effective authority: deterministic minimum of the six inputs. Every
-        #    recorded input is capped at observe so a higher deployment ceiling
-        #    still yields observe without disagreeing with the effective value.
-        raw_inputs = {
+        # 3. Effective authority: the real deterministic minimum of the six ADR
+        #    0001 inputs. The five caller/deployment inputs are recorded exactly
+        #    as supplied — a higher deployment or principal ceiling is NOT capped
+        #    or rewritten, so the recorded ceilings stay truthful. Only this
+        #    capability's own maximum is the explicit observe-phase ceiling, so
+        #    the observation can never carry more than observe authority while the
+        #    contract's ``effective == min(inputs)`` invariant still holds.
+        authority_inputs = {
             "deployment_mode": self._settings.mode,
             "tenant_policy": context.authority_inputs.tenant_policy,
             "workspace_policy": context.authority_inputs.workspace_policy,
             "principal_authority": context.authority_inputs.principal_authority,
-            "capability_maximum": context.authority_inputs.capability_maximum,
+            "capability_maximum": _cap_at_observe(context.authority_inputs.capability_maximum),
             "risk_policy": context.authority_inputs.risk_policy,
         }
-        raw_effective = min(raw_inputs.values(), key=_AUTHORITY_ORDER.__getitem__)
-        if _AUTHORITY_ORDER[raw_effective] < _AUTHORITY_ORDER[_OBSERVE_AUTHORITY]:
+        effective_authority = min(authority_inputs.values(), key=_AUTHORITY_ORDER.__getitem__)
+        if _AUTHORITY_ORDER[effective_authority] < _AUTHORITY_ORDER[_OBSERVE_AUTHORITY]:
             self._metrics.record("observation.denied", 1.0, dimensions={"reason": "authority"})
             raise ObservationBoundaryError(
                 ObservationErrorCode.AUTHORIZATION_DENIED, "effective authority does not permit observation"
             )
-        # The observe phase never carries more than observe authority. Recording
-        # every input capped at observe keeps ``effective == min(inputs)`` true.
-        authority_inputs = {name: _cap_at_observe(value) for name, value in raw_inputs.items()}
-        effective_authority = _cap_at_observe(raw_effective)
         return requester_identity, effective_authority, authority_inputs
 
     @staticmethod
@@ -622,6 +703,7 @@ class ObservationService:
         expires_at: datetime,
         commit_not_after: datetime,
         ttl_epoch_s: int,
+        generation: int = 1,
     ) -> dict[str, Any]:
         reads: list[ProviderRead] = [
             lambda: self._reader.read_utilization(request.fleet_id),
@@ -643,6 +725,7 @@ class ObservationService:
                 lease_holder=lease_holder,
                 reason_code="provider_unavailable",
                 ttl_epoch_s=ttl_epoch_s,
+                generation=generation,
             )
             raise ObservationBoundaryError(
                 ObservationErrorCode.PROVIDER_UNAVAILABLE,
@@ -687,6 +770,7 @@ class ObservationService:
                 lease_holder=lease_holder,
                 reason_code="contract_invalid",
                 ttl_epoch_s=ttl_epoch_s,
+                generation=generation,
             )
             raise ObservationBoundaryError(
                 ObservationErrorCode.CONTRACT_INVALID, "observation result is invalid"
@@ -699,6 +783,7 @@ class ObservationService:
             commit_not_after=commit_not_after,
             ttl_epoch_s=ttl_epoch_s,
             observation=deepcopy(observation),
+            generation=generation,
         )
         return self._resolve_complete(outcome, observation)
 
@@ -729,6 +814,16 @@ class ObservationService:
                 retryable=True,
             )
 
+        if complete.outcome is ObservationCompleteOutcome.PROVIDER_UNAVAILABLE:
+            # A non-conditional store fault on finalize is retryable/unavailable,
+            # never a false state conflict.
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "store"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.PROVIDER_UNAVAILABLE,
+                "observation state store is temporarily unavailable",
+                retryable=True,
+            )
+
         self._metrics.record("observation.failed", 1.0, dimensions={"reason": "state"})
         raise ObservationBoundaryError(
             ObservationErrorCode.STATE_CONFLICT, "observation changed before it could be recorded"
@@ -748,9 +843,12 @@ class ObservationService:
         return deepcopy(begin.observation)
 
     def _resume_in_progress(self, begin: ObservationBegin) -> dict[str, Any]:
-        # An in-progress retry under an active lease held by another attempt is
-        # a state conflict, not a second operation. The caller retries and
-        # eventually replays the completed result or reclaims an expired lease.
+        # An in-progress retry under an ACTIVE (unexpired) lease held by another
+        # attempt is a bounded, retryable state conflict, not a second operation.
+        # This path makes no recovery claim: the store only reports IN_PROGRESS
+        # while the lease is live, and returns RECLAIMED (handled in observe)
+        # once the lease has expired. Before expiry the caller retries and
+        # eventually replays the winner's completed result or triggers a reclaim.
         self._metrics.record("observation.in_progress", 1.0)
         raise ObservationBoundaryError(
             ObservationErrorCode.STATE_CONFLICT,

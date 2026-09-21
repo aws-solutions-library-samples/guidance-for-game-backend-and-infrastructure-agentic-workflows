@@ -35,22 +35,20 @@ class FakeGameLift:
             },
         )
 
-    def describe_fleet_location_capacity(self, **kwargs: Any) -> dict[str, Any]:
+    def describe_fleet_capacity(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("capacity", kwargs))
         return self._responses.get(
             "capacity",
             {
-                "LocationCapacities": [
+                "FleetCapacity": [
                     {
+                        "FleetId": "fleet-x",
                         "Location": "us-west-2",
                         "InstanceCounts": {"DESIRED": 10, "MINIMUM": 2, "MAXIMUM": 20, "ACTIVE": 10, "IDLE": 2},
                     }
                 ]
             },
         )
-
-    def describe_fleet_capacity(self, **kwargs: Any) -> dict[str, Any]:
-        return {}
 
     def describe_scaling_policies(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("scaling", kwargs))
@@ -79,16 +77,47 @@ def test_read_capacity_is_normalized_per_location() -> None:
     assert result == [{"location": "us-west-2", "desired": 10, "minimum": 2, "maximum": 20, "active": 10, "idle": 2}]
 
 
-def test_read_capacity_supports_single_fleet_capacity_shape() -> None:
+def test_read_capacity_uses_exact_describe_fleet_capacity_call() -> None:
+    # The adapter MUST use the exact E0-accepted API describe_fleet_capacity with
+    # FleetIds=[fleet_id] — never describe_fleet_location_capacity.
+    fake = FakeGameLift()
+    adapter = GameLiftObservationAdapter(fake)
+    adapter.read_capacity("fleet-x")
+    capacity_calls = [call for call in fake.calls if call[0] == "capacity"]
+    assert capacity_calls == [("capacity", {"FleetIds": ["fleet-x"]})]
+    # The Protocol no longer declares describe_fleet_location_capacity.
+    # Local modules
+    from operations.observe.gamelift_adapter import GameLiftClient
+
+    assert "describe_fleet_location_capacity" not in dir(GameLiftClient)
+    assert "describe_fleet_capacity" in dir(GameLiftClient)
+
+
+def test_read_capacity_returns_bounded_location_list() -> None:
+    # describe_fleet_capacity returns a per-location list; the adapter returns
+    # the bounded location list the contract expects.
     response = {
-        "FleetCapacity": {
-            "Location": "eu-west-1",
-            "InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 3, "ACTIVE": 1, "IDLE": 0},
-        }
+        "FleetCapacity": [
+            {
+                "Location": "us-west-2",
+                "InstanceCounts": {"DESIRED": 10, "MINIMUM": 2, "MAXIMUM": 20, "ACTIVE": 10, "IDLE": 2},
+            },
+            {
+                "Location": "eu-west-1",
+                "InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 3, "ACTIVE": 1, "IDLE": 0},
+            },
+        ]
     }
     adapter = GameLiftObservationAdapter(FakeGameLift(capacity=response))
     result = adapter.read_capacity("fleet-x")
-    assert result[0]["location"] == "eu-west-1"
+    assert [entry["location"] for entry in result] == ["us-west-2", "eu-west-1"]
+    assert result[1] == {"location": "eu-west-1", "desired": 1, "minimum": 0, "maximum": 3, "active": 1, "idle": 0}
+
+
+def test_read_capacity_missing_fleet_capacity_fails_closed() -> None:
+    adapter = GameLiftObservationAdapter(FakeGameLift(capacity={}))
+    with pytest.raises(ValueError):
+        adapter.read_capacity("fleet-x")
 
 
 def test_read_scaling_policies_is_normalized() -> None:
