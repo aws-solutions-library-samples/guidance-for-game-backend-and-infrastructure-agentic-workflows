@@ -322,6 +322,30 @@ request count and error/timeout rate. Disable by setting operations mode to
 `disabled` and removing the optional stack. E1 rollout (#413) is blocked on this
 reviewed cost evidence.
 
+**Deploy, disable, and teardown (all explicit and opt-in).** The optional E1
+stack is deployed only by its dedicated wrapper and is never wired into
+`deploy-all.sh`:
+
+```bash
+# Preview only — renders a plan and creates nothing:
+./scripts/infrastructure/deploy-operations.sh
+
+# Explicit opt-in deploy (both the env value and the flag are required):
+GBAW_OPERATIONS_MODE=enabled COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
+  ./scripts/infrastructure/deploy-operations.sh --enable --environment prod
+
+# Safe, data-preserving disable/rollback (removes the request path, keeps data):
+GBAW_OPERATIONS_MODE=disabled ./scripts/infrastructure/deploy-operations.sh --disable
+
+# Explicit teardown — never invoked by teardown-all.sh:
+./scripts/infrastructure/teardown-operations.sh --confirm delete-operations
+```
+
+Full frozen names (handler, environment bindings, metric names, and the exact
+three GameLift read actions), the default-disabled invariant, and the safe
+rollback/disable and teardown procedure are documented in the
+[E1 deployment & runbook](OPERATIONS_E1_DEPLOYMENT.md).
+
 ### Cost Optimization Tips
 
 - Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
