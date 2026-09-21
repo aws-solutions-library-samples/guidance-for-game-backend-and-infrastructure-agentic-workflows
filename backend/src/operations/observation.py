@@ -1,32 +1,56 @@
 """Read-only GameLift observation application service (issue #413, E1 Agent A).
 
 This protocol-neutral service performs the exact E1 observation described in
-ADR 0005 ("Durable observation state without queues"): three bounded, read-only
-GameLift reads for one fleet — utilization, capacity, and scaling policies —
-plus a conditional/idempotent DynamoDB state write and an append-only ledger
-transaction, all inside one request under explicit wall-clock deadlines.
+ADR 0005 ("Persist operations state and recover workflows"): three bounded,
+read-only GameLift reads for one fleet — utilization, capacity, and scaling
+policies — durably bracketed by conditional/idempotent DynamoDB state and an
+append-only ledger, all inside one request under explicit wall-clock deadlines.
+
+Lifecycle (ADR 0005, "create before reads"):
+
+1. **Resolve/create idempotency before any provider read.** The canonical
+   idempotency fingerprint is a SHA-256 canonical hash over the trusted
+   workspace, the idempotency token, and the *request intent* — the capability,
+   provider, phase, and target. It is computed from the request and never from
+   the observation result, observation id, or a timestamp, so it is stable
+   across retries. ``begin_observation`` atomically creates the idempotency
+   mapping (carrying the fingerprint), the initial ``observing`` state snapshot,
+   the immutable ``STATE#0`` transition, and the initial ledger event — all or
+   nothing — *before* any read runs.
+2. **A matching completed retry replays.** If the mapping already exists with a
+   matching fingerprint and the operation reached a terminal ``succeeded``
+   state, the stored bounded observation is returned verbatim, its canonical
+   hash re-verified, without any new provider read.
+3. **A changed intent under the same token conflicts.** A stored fingerprint
+   that differs fails with ``IDEMPOTENCY_CONFLICT`` and mutates nothing.
+4. **An in-progress retry is safe.** A non-terminal existing operation either
+   returns its status or, under a bounded single-flight lease, safely resumes
+   the read-only work — it never creates a second operation.
+5. **Execute reads, then finalize.** After a fresh create, the three reads run
+   under the E0-validated deadlines; on success the bounded, validated,
+   canonicalized, hashed observation is persisted while the state transitions
+   ``observing`` -> ``succeeded`` and a matching ledger event appends, atomically.
+   A read failure or timeout records a bounded ``failed`` transition where
+   possible and raises a typed error.
 
 Boundaries enforced here, consistent with ADR 0001/0002/0003 and the
 ``ApprovalService`` precedent:
 
-* **Verifier-derived identity only.** The service accepts an untrusted
-  :class:`ObservationRequest` (fleet id and idempotency token only) plus a
-  trusted :class:`ObservationRequestContext` carrying a
-  :class:`~operations.identity.VerifiedPrincipal`. Tenant, workspace, subject,
-  and client are taken from the verified principal, never from the request.
+* **Verifier-derived identity only.** Tenant, workspace, subject, and client
+  come only from the trusted :class:`~operations.identity.VerifiedPrincipal`,
+  never from the untrusted :class:`ObservationRequest` (fleet id and idempotency
+  token only).
 * **Explicit ceilings.** The six ADR 0001 authority inputs are recorded and the
   deterministic minimum is the effective authority, additionally capped at
-  ``observe``. A ``disabled`` deployment denies before any provider read.
-* **No provider writes.** Only injected read callables are invoked. There is no
-  write method on this service or its ports.
-* **Fail closed, no partial success.** Any per-read or persistence deadline
-  overrun, a read with no usable result, a replay/idempotency conflict, or a
-  state conflict raises a typed :class:`ObservationBoundaryError`; a partial
-  observation is never returned as success.
+  ``observe``. Every recorded input is likewise capped at ``observe`` so a higher
+  deployment ceiling still yields ``observe`` without contract disagreement.
+* **No provider writes.** Only injected read callables are invoked.
+* **Fail closed, no partial success.** Any deadline overrun, empty read,
+  malformed or oversized shape, replay/idempotency conflict, or state conflict
+  raises a typed :class:`ObservationBoundaryError`.
 * **Bounded, sanitized output.** The observation validates against the additive
-  ``gamelift-observation`` contract (bounded sizes), is canonicalized (RFC 8785)
-  and hashed, and only bounded, public-safe metrics are emitted — never an
-  account id, ARN, or raw provider payload.
+  ``gamelift-observation`` contract, is canonicalized (RFC 8785) and hashed, and
+  only bounded, public-safe metrics are emitted.
 """
 
 from __future__ import annotations
@@ -37,7 +61,7 @@ import re
 import time
 from collections.abc import Callable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Protocol
@@ -58,7 +82,7 @@ from operations.validation.e0_latency import (
 _FLEET_ID_PATTERN = re.compile(r"^fleet-[a-f0-9-]{1,120}$")
 _IDEMPOTENCY_PATTERN = re.compile(r"^idem_[A-Za-z0-9_-]{20,128}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
-_OBSERVATION_ID_PATTERN = re.compile(r"^obs_[a-z0-9]{26}$")
+_OPERATION_ID_PATTERN = re.compile(r"^obs_[a-z0-9]{26}$")
 
 _OBSERVE_AUTHORITY = "observe"
 _DISABLED_AUTHORITY = "disabled"
@@ -79,6 +103,17 @@ _SCALING_POLICY_STATUSES = frozenset(
     {"ACTIVE", "UPDATE_REQUESTED", "UPDATING", "DELETE_REQUESTED", "DELETING", "DELETED", "ERROR"}
 )
 
+# ADR 0005 observation states used by the two-phase lifecycle.
+STATE_OBSERVING = "observing"
+STATE_SUCCEEDED = "succeeded"
+STATE_FAILED = "failed"
+_TERMINAL_STATES = frozenset({STATE_SUCCEEDED, STATE_FAILED})
+
+
+def _cap_at_observe(authority: str) -> str:
+    """Return ``authority`` capped at the observe-phase ceiling."""
+    return min((authority, _OBSERVE_AUTHORITY), key=_AUTHORITY_ORDER.__getitem__)
+
 
 def _utc(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
@@ -94,7 +129,7 @@ def _system_clock() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _new_observation_id() -> str:
+def _new_operation_id() -> str:
     # 26 lowercase base32-ish characters, matching ^obs_[a-z0-9]{26}$.
     return "obs_" + uuid4().hex[:26]
 
@@ -108,6 +143,8 @@ class ObservationErrorCode(str, Enum):
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
     STATE_CONFLICT = "STATE_CONFLICT"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+    NOT_FOUND = "NOT_FOUND"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
 class ObservationBoundaryError(RuntimeError):
@@ -141,9 +178,24 @@ class ObservationRequest:
         return cls(fleet_id=payload["fleet_id"], idempotency_token=payload["idempotency_token"])
 
 
+@dataclass(frozen=True, slots=True)
+class StatusRequest:
+    """Untrusted status lookup input. Identity is excluded by construction."""
+
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.operation_id, str) or not _OPERATION_ID_PATTERN.fullmatch(self.operation_id):
+            raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "status request is invalid")
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AuthorityInputs:
-    """The six ADR 0001 authority ceilings that bound this observation."""
+    """The five ADR 0001 request-side authority ceilings that bound this observation.
+
+    The deployment mode is the sixth input and is supplied by trusted settings,
+    not by the request; it is combined at evaluation time.
+    """
 
     tenant_policy: str
     workspace_policy: str
@@ -183,6 +235,20 @@ class ObservationRequestContext:
             raise ValueError("capability_version must be MAJOR.MINOR")
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StatusRequestContext:
+    """Trusted adapter context for a status lookup (identity only)."""
+
+    requester: VerifiedPrincipal
+    request_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.requester, VerifiedPrincipal):
+            raise ValueError("requester must be a VerifiedPrincipal")
+        if not isinstance(self.request_id, str) or not _IDENTIFIER_PATTERN.fullmatch(self.request_id):
+            raise ValueError("request_id must be a valid operations identifier")
+
+
 class GameLiftObservationReader(Protocol):
     """Injected, read-only provider port. It exposes no write method.
 
@@ -205,47 +271,126 @@ class GameLiftObservationReader(Protocol):
         ...
 
 
-class ObservationCommitOutcome(str, Enum):
-    """Authoritative result of the store's conditional observation transaction."""
+class ObservationBeginOutcome(str, Enum):
+    """Authoritative result of the store's conditional create transaction."""
 
-    RECORDED = "recorded"
-    REPLAY = "replay"
+    CREATED = "created"
+    REPLAY_COMPLETED = "replay_completed"
+    IN_PROGRESS = "in_progress"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     STATE_CONFLICT = "state_conflict"
     DEADLINE_EXPIRED = "deadline_expired"
 
 
-@dataclass(frozen=True, slots=True)
-class ObservationCommit:
-    """The store's result: an outcome and, on replay, the stored observation."""
+class ObservationCompleteOutcome(str, Enum):
+    """Authoritative result of the store's conditional finalize transaction."""
 
-    outcome: ObservationCommitOutcome
+    RECORDED = "recorded"
+    ALREADY_TERMINAL = "already_terminal"
+    STATE_CONFLICT = "state_conflict"
+    DEADLINE_EXPIRED = "deadline_expired"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationBegin:
+    """The store's create result: an outcome, the bound operation id, and,
+    on a completed replay, the stored observation and its recorded hash."""
+
+    outcome: ObservationBeginOutcome
+    operation_id: str | None = None
     observation: dict[str, Any] | None = None
+    observation_hash: str | None = None
+    lease_holder: str | None = None
+    current_state: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationComplete:
+    """The store's finalize result: an outcome and, if already terminal, the
+    stored observation and hash so a racing writer replays rather than fails."""
+
+    outcome: ObservationCompleteOutcome
+    observation: dict[str, Any] | None = None
+    observation_hash: str | None = None
+
+
+class ObservationStatusView(str, Enum):
+    """Public status of an operation as seen by a status lookup."""
+
+    OBSERVING = "observing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationStatus:
+    """Typed, workspace-scoped status of one operation."""
+
+    operation_id: str
+    workspace_id: str
+    state: ObservationStatusView
+    observation: dict[str, Any] | None = None
+    observation_hash: str | None = None
 
 
 class ObservationStore(Protocol):
-    """Persistence port; implementations MUST use a conditional atomic commit.
+    """Persistence port; implementations MUST use conditional atomic commits.
 
-    ``record_observation`` writes, in one DynamoDB ``TransactWriteItems`` call:
-    the idempotency mapping (conditional on absence, carrying the fingerprint),
-    the current-state snapshot, the immutable initial state transition, and the
-    initial append-only ledger event — all or nothing. It enforces the exclusive
-    ``commit_not_after`` deadline in the same transaction and returns a typed
-    :class:`ObservationCommit`; a raw string lookalike fails closed at the caller.
+    ``begin_observation`` writes, in one DynamoDB ``TransactWriteItems`` call:
+    the idempotency mapping (conditional on absence, carrying the intent
+    fingerprint), the current-state snapshot at ``observing``, the immutable
+    ``STATE#0`` transition, and the initial append-only ledger event — all or
+    nothing, before any provider read. ``complete_observation`` atomically
+    persists the bounded result and advances ``observing`` -> ``succeeded`` with
+    a matching ledger append. ``fail_observation`` records a bounded ``failed``
+    transition where possible. ``load_status`` resolves an operation by id under
+    trusted workspace ownership. Every required read is a key lookup; no method
+    issues a scan or an unconditional put.
     """
 
-    def record_observation(
+    def begin_observation(
         self,
         *,
-        observation_id: str,
+        operation_id: str,
         idempotency_fingerprint: str,
         workspace_id: str,
         idempotency_token: str,
+        lease_holder: str,
+        commit_not_after: datetime,
+        lease_not_after: datetime,
+        ttl_epoch_s: int,
+        intent: Mapping[str, Any],
+    ) -> ObservationBegin:
+        """Resolve or atomically create the operation before any read."""
+        ...
+
+    def complete_observation(
+        self,
+        *,
+        operation_id: str,
+        workspace_id: str,
+        lease_holder: str,
         commit_not_after: datetime,
         ttl_epoch_s: int,
         observation: Mapping[str, Any],
-    ) -> ObservationCommit:
-        """Conditionally record before the deadline; return the authoritative outcome."""
+    ) -> ObservationComplete:
+        """Atomically persist the bounded result and transition to succeeded."""
+        ...
+
+    def fail_observation(
+        self,
+        *,
+        operation_id: str,
+        workspace_id: str,
+        lease_holder: str,
+        reason_code: str,
+        ttl_epoch_s: int,
+    ) -> None:
+        """Record a bounded failed transition where possible (best effort)."""
+        ...
+
+    def load_status(self, *, operation_id: str, workspace_id: str) -> ObservationStatus | None:
+        """Return the typed status if it exists and is owned by the workspace."""
         ...
 
 
@@ -275,7 +420,7 @@ class ObservationService:
         store: ObservationStore,
         clock: Callable[[], datetime] = _system_clock,
         monotonic: Callable[[], float] | None = None,
-        observation_id_factory: Callable[[], str] = _new_observation_id,
+        operation_id_factory: Callable[[], str] = _new_operation_id,
         metrics: ObservationMetrics | None = None,
     ) -> None:
         self._settings = settings
@@ -283,7 +428,7 @@ class ObservationService:
         self._reader = reader
         self._store = store
         self._clock = clock
-        self._observation_id_factory = observation_id_factory
+        self._operation_id_factory = operation_id_factory
         self._metrics = metrics or NullObservationMetrics()
         # Reuse the E0-validated budget/deadline enforcement for the read phase.
         self._budget = LatencyBudget(
@@ -293,8 +438,121 @@ class ObservationService:
         )
         self._monotonic = monotonic or time.monotonic
 
+    # -- Observe ----------------------------------------------------------
+
     def observe(self, request: ObservationRequest, context: ObservationRequestContext) -> dict[str, Any]:
-        """Validate, read, canonicalize, and conditionally persist one observation."""
+        """Resolve/create idempotency, then read, canonicalize, and persist."""
+        requester_identity, effective_authority, authority_inputs = self._authorize(context)
+
+        # Intent fingerprint: trusted workspace + exact request intent. It is
+        # computed BEFORE any read and never depends on the observation result,
+        # its id, or a timestamp, so a retry recomputes the same value.
+        intent = self._intent(request, context)
+        fingerprint = canonical_sha256(
+            {
+                "workspace_id": requester_identity["workspace_id"],
+                "idempotency_token": request.idempotency_token,
+                "intent_hash": canonical_sha256(intent),
+            }
+        )
+
+        now = _utc(self._clock(), "clock")
+        expires_at = now + timedelta(seconds=self._settings.observation_ttl_s)
+        commit_not_after = min(expires_at, context.requester.expires_at)
+        lease_not_after = min(now + timedelta(seconds=self._budget.total_deadline_s), context.requester.expires_at)
+        ttl_epoch_s = int(expires_at.timestamp())
+        operation_id = self._operation_id_factory()
+        lease_holder = context.request_id
+
+        begin = self._store.begin_observation(
+            operation_id=operation_id,
+            idempotency_fingerprint=fingerprint,
+            workspace_id=requester_identity["workspace_id"],
+            idempotency_token=request.idempotency_token,
+            lease_holder=lease_holder,
+            commit_not_after=commit_not_after,
+            lease_not_after=lease_not_after,
+            ttl_epoch_s=ttl_epoch_s,
+            intent=intent,
+        )
+        begin = self._require_begin(begin)
+
+        if begin.outcome is ObservationBeginOutcome.REPLAY_COMPLETED:
+            # A matching completed retry returns the stored bounded observation
+            # verbatim with no new provider read; its hash is re-verified.
+            return self._replay(begin)
+
+        if begin.outcome is ObservationBeginOutcome.IN_PROGRESS:
+            return self._resume_in_progress(begin)
+
+        if begin.outcome is ObservationBeginOutcome.IDEMPOTENCY_CONFLICT:
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "idempotency"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.IDEMPOTENCY_CONFLICT,
+                "idempotency token was reused with different intent",
+            )
+
+        if begin.outcome is ObservationBeginOutcome.DEADLINE_EXPIRED:
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "deadline"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.PROVIDER_UNAVAILABLE,
+                "observation deadline elapsed before the operation was created",
+                retryable=True,
+            )
+
+        if begin.outcome is not ObservationBeginOutcome.CREATED or begin.operation_id is None:
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "state"})
+            raise ObservationBoundaryError(ObservationErrorCode.STATE_CONFLICT, "observation could not be created")
+
+        # A fresh operation now exists at ``observing`` under our lease. Execute
+        # the reads and finalize. Any failure records a bounded failed transition.
+        created_id = begin.operation_id
+        return self._read_and_finalize(
+            request=request,
+            context=context,
+            operation_id=created_id,
+            lease_holder=lease_holder,
+            requester_identity=requester_identity,
+            effective_authority=effective_authority,
+            authority_inputs=authority_inputs,
+            expires_at=expires_at,
+            commit_not_after=commit_not_after,
+            ttl_epoch_s=ttl_epoch_s,
+        )
+
+    # -- Status -----------------------------------------------------------
+
+    def get_status(self, request: StatusRequest, context: StatusRequestContext) -> ObservationStatus:
+        """Return the typed status of one operation, enforcing workspace ownership."""
+        if not self._settings.observe_enabled:
+            raise ObservationBoundaryError(
+                ObservationErrorCode.AUTHORIZATION_DENIED, "operations observe is not enabled"
+            )
+        try:
+            evaluated_at = _utc(self._clock(), "clock")
+            requester_identity = self._identity_boundary.bind_requester(context.requester, now=evaluated_at)
+        except (IdentityBoundaryError, ValueError) as exc:
+            raise ObservationBoundaryError(
+                ObservationErrorCode.IDENTITY_CONTEXT_INVALID, "authenticated observation identity is invalid"
+            ) from exc
+
+        status = self._store.load_status(
+            operation_id=request.operation_id, workspace_id=requester_identity["workspace_id"]
+        )
+        # A missing record, or one owned by a different workspace, is NOT_FOUND:
+        # ownership is enforced by the store's workspace-scoped key, and a
+        # cross-workspace id is never disclosed as existing.
+        if not isinstance(status, ObservationStatus):
+            raise ObservationBoundaryError(ObservationErrorCode.NOT_FOUND, "observation was not found")
+        if status.workspace_id != requester_identity["workspace_id"]:
+            raise ObservationBoundaryError(ObservationErrorCode.NOT_FOUND, "observation was not found")
+        if status.state is ObservationStatusView.SUCCEEDED and isinstance(status.observation, dict):
+            self._verify_stored_hash(status.observation, status.observation_hash)
+        return status
+
+    # -- Internals --------------------------------------------------------
+
+    def _authorize(self, context: ObservationRequestContext) -> tuple[dict[str, str], str, dict[str, str]]:
         # 1. Deployment ceiling. A disabled deployment denies before any read.
         if not self._settings.observe_enabled:
             self._metrics.record("observation.denied", 1.0, dimensions={"reason": "deployment_disabled"})
@@ -302,8 +560,7 @@ class ObservationService:
                 ObservationErrorCode.AUTHORIZATION_DENIED, "operations observe is not enabled"
             )
 
-        # 2. Verifier-derived identity. Tenant/workspace/subject/client come from
-        #    the verified principal, re-bound to the configured deployment boundary.
+        # 2. Verifier-derived identity, re-bound to the configured boundary.
         try:
             evaluated_at = _utc(self._clock(), "clock")
             requester_identity = self._identity_boundary.bind_requester(context.requester, now=evaluated_at)
@@ -313,9 +570,10 @@ class ObservationService:
                 ObservationErrorCode.IDENTITY_CONTEXT_INVALID, "authenticated observation identity is invalid"
             ) from exc
 
-        # 3. Effective authority: deterministic minimum of the six inputs, then
-        #    capped at the deployment ceiling and the observe phase ceiling.
-        authority_inputs = {
+        # 3. Effective authority: deterministic minimum of the six inputs. Every
+        #    recorded input is capped at observe so a higher deployment ceiling
+        #    still yields observe without disagreeing with the effective value.
+        raw_inputs = {
             "deployment_mode": self._settings.mode,
             "tenant_policy": context.authority_inputs.tenant_policy,
             "workspace_policy": context.authority_inputs.workspace_policy,
@@ -323,16 +581,48 @@ class ObservationService:
             "capability_maximum": context.authority_inputs.capability_maximum,
             "risk_policy": context.authority_inputs.risk_policy,
         }
-        effective_authority = min(authority_inputs.values(), key=_AUTHORITY_ORDER.__getitem__)
-        if _AUTHORITY_ORDER[effective_authority] < _AUTHORITY_ORDER[_OBSERVE_AUTHORITY]:
+        raw_effective = min(raw_inputs.values(), key=_AUTHORITY_ORDER.__getitem__)
+        if _AUTHORITY_ORDER[raw_effective] < _AUTHORITY_ORDER[_OBSERVE_AUTHORITY]:
             self._metrics.record("observation.denied", 1.0, dimensions={"reason": "authority"})
             raise ObservationBoundaryError(
                 ObservationErrorCode.AUTHORIZATION_DENIED, "effective authority does not permit observation"
             )
-        # The observe phase never carries more than observe authority.
-        effective_authority = min((effective_authority, _OBSERVE_AUTHORITY), key=_AUTHORITY_ORDER.__getitem__)
+        # The observe phase never carries more than observe authority. Recording
+        # every input capped at observe keeps ``effective == min(inputs)`` true.
+        authority_inputs = {name: _cap_at_observe(value) for name, value in raw_inputs.items()}
+        effective_authority = _cap_at_observe(raw_effective)
+        return requester_identity, effective_authority, authority_inputs
 
-        # 4. Three bounded, read-only provider reads under wall-clock deadlines.
+    @staticmethod
+    def _intent(request: ObservationRequest, context: ObservationRequestContext) -> dict[str, Any]:
+        """The exact request intent that fingerprints an operation.
+
+        It carries the capability (playbook), provider, phase, and target only —
+        never the observation result, its id, or a timestamp — so a retry with
+        the same request reproduces it exactly.
+        """
+        return {
+            "phase": "observe",
+            "provider": "gamelift",
+            "capability_id": context.capability_id,
+            "capability_version": context.capability_version,
+            "target": {"provider": "gamelift", "fleet_id": request.fleet_id},
+        }
+
+    def _read_and_finalize(
+        self,
+        *,
+        request: ObservationRequest,
+        context: ObservationRequestContext,
+        operation_id: str,
+        lease_holder: str,
+        requester_identity: dict[str, str],
+        effective_authority: str,
+        authority_inputs: dict[str, str],
+        expires_at: datetime,
+        commit_not_after: datetime,
+        ttl_epoch_s: int,
+    ) -> dict[str, Any]:
         reads: list[ProviderRead] = [
             lambda: self._reader.read_utilization(request.fleet_id),
             lambda: self._reader.read_capacity(request.fleet_id),
@@ -341,20 +631,29 @@ class ObservationService:
         try:
             utilization, capacity, scaling_policies = self._run_reads(reads)
         except (DeadlineExceededError, PartialObservationError) as exc:
-            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider"})
+            # A deadline overrun is a timeout; any other provider condition is a
+            # failure. The two are reported through distinct metric events.
+            if isinstance(exc, DeadlineExceededError):
+                self._metrics.record("observation.timeout", 1.0, dimensions={"reason": "provider"})
+            else:
+                self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider"})
+            self._store.fail_observation(
+                operation_id=operation_id,
+                workspace_id=requester_identity["workspace_id"],
+                lease_holder=lease_holder,
+                reason_code="provider_unavailable",
+                ttl_epoch_s=ttl_epoch_s,
+            )
             raise ObservationBoundaryError(
                 ObservationErrorCode.PROVIDER_UNAVAILABLE,
                 "provider observation could not be completed",
                 retryable=True,
             ) from exc
 
-        # 5. Build, validate, and hash the bounded observation document.
         observed_at = _utc(self._clock(), "clock")
-        expires_at = observed_at + timedelta(seconds=self._settings.observation_ttl_s)
-        observation_id = self._observation_id_factory()
         observation: dict[str, Any] = {
             "observation_contract_version": CONTRACT_VERSION,
-            "observation_id": observation_id,
+            "observation_id": operation_id,
             "idempotency_token": request.idempotency_token,
             "phase": "observe",
             "provider": "gamelift",
@@ -382,60 +681,47 @@ class ObservationService:
             validate_observation(observation)
         except ObservationContractError as exc:
             self._metrics.record("observation.failed", 1.0, dimensions={"reason": "contract"})
+            self._store.fail_observation(
+                operation_id=operation_id,
+                workspace_id=requester_identity["workspace_id"],
+                lease_holder=lease_holder,
+                reason_code="contract_invalid",
+                ttl_epoch_s=ttl_epoch_s,
+            )
             raise ObservationBoundaryError(
                 ObservationErrorCode.CONTRACT_INVALID, "observation result is invalid"
             ) from exc
 
-        observation_hash = canonical_sha256(observation)
-        idempotency_fingerprint = canonical_sha256(
-            {
-                "workspace_id": requester_identity["workspace_id"],
-                "idempotency_token": request.idempotency_token,
-                "observation_hash": observation_hash,
-            }
-        )
-
-        # 6. Conditional/idempotent transactional persistence with a deadline.
-        commit_not_after = min(expires_at, context.requester.expires_at)
-        ttl_epoch_s = int(expires_at.timestamp())
-        outcome = self._store.record_observation(
-            observation_id=observation_id,
-            idempotency_fingerprint=idempotency_fingerprint,
+        outcome = self._store.complete_observation(
+            operation_id=operation_id,
             workspace_id=requester_identity["workspace_id"],
-            idempotency_token=request.idempotency_token,
+            lease_holder=lease_holder,
             commit_not_after=commit_not_after,
             ttl_epoch_s=ttl_epoch_s,
             observation=deepcopy(observation),
         )
-        return self._resolve_commit(outcome, observation)
+        return self._resolve_complete(outcome, observation)
 
-    def _resolve_commit(self, commit: object, observation: dict[str, Any]) -> dict[str, Any]:
-        # A raw string lookalike (not an ObservationCommit) fails closed.
-        if not isinstance(commit, ObservationCommit):
+    def _resolve_complete(self, complete: object, observation: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(complete, ObservationComplete):
             self._metrics.record("observation.failed", 1.0, dimensions={"reason": "store"})
             raise ObservationBoundaryError(ObservationErrorCode.STATE_CONFLICT, "observation could not be recorded")
 
-        if commit.outcome is ObservationCommitOutcome.RECORDED:
+        if complete.outcome is ObservationCompleteOutcome.RECORDED:
             self._metrics.record(
                 "observation.recorded", 1.0, dimensions={"authority": observation["effective_authority"]}
             )
             return deepcopy(observation)
 
-        if commit.outcome is ObservationCommitOutcome.REPLAY:
-            # A replay returns the stored observation without repeating work.
-            if not isinstance(commit.observation, dict):
+        if complete.outcome is ObservationCompleteOutcome.ALREADY_TERMINAL:
+            # A concurrent writer finalized first: replay the stored result.
+            if not isinstance(complete.observation, dict):
                 raise ObservationBoundaryError(ObservationErrorCode.STATE_CONFLICT, "observation replay is unavailable")
+            self._verify_stored_hash(complete.observation, complete.observation_hash)
             self._metrics.record("observation.replay", 1.0)
-            return deepcopy(commit.observation)
+            return deepcopy(complete.observation)
 
-        if commit.outcome is ObservationCommitOutcome.IDEMPOTENCY_CONFLICT:
-            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "idempotency"})
-            raise ObservationBoundaryError(
-                ObservationErrorCode.IDEMPOTENCY_CONFLICT,
-                "idempotency token was reused with different content",
-            )
-
-        if commit.outcome is ObservationCommitOutcome.DEADLINE_EXPIRED:
+        if complete.outcome is ObservationCompleteOutcome.DEADLINE_EXPIRED:
             self._metrics.record("observation.failed", 1.0, dimensions={"reason": "deadline"})
             raise ObservationBoundaryError(
                 ObservationErrorCode.PROVIDER_UNAVAILABLE,
@@ -443,11 +729,43 @@ class ObservationService:
                 retryable=True,
             )
 
-        # STATE_CONFLICT or any other non-success outcome.
         self._metrics.record("observation.failed", 1.0, dimensions={"reason": "state"})
         raise ObservationBoundaryError(
             ObservationErrorCode.STATE_CONFLICT, "observation changed before it could be recorded"
         )
+
+    def _require_begin(self, begin: object) -> ObservationBegin:
+        if not isinstance(begin, ObservationBegin):
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "store"})
+            raise ObservationBoundaryError(ObservationErrorCode.STATE_CONFLICT, "observation could not be created")
+        return begin
+
+    def _replay(self, begin: ObservationBegin) -> dict[str, Any]:
+        if not isinstance(begin.observation, dict):
+            raise ObservationBoundaryError(ObservationErrorCode.STATE_CONFLICT, "observation replay is unavailable")
+        self._verify_stored_hash(begin.observation, begin.observation_hash)
+        self._metrics.record("observation.replay", 1.0)
+        return deepcopy(begin.observation)
+
+    def _resume_in_progress(self, begin: ObservationBegin) -> dict[str, Any]:
+        # An in-progress retry under an active lease held by another attempt is
+        # a state conflict, not a second operation. The caller retries and
+        # eventually replays the completed result or reclaims an expired lease.
+        self._metrics.record("observation.in_progress", 1.0)
+        raise ObservationBoundaryError(
+            ObservationErrorCode.STATE_CONFLICT,
+            "an observation for this idempotency token is already in progress",
+            retryable=True,
+        )
+
+    def _verify_stored_hash(self, observation: dict[str, Any], recorded_hash: str | None) -> None:
+        """Re-verify the stored observation's canonical hash before returning it."""
+        actual = canonical_sha256(observation)
+        if not isinstance(recorded_hash, str) or actual != recorded_hash:
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "hash"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.STATE_CONFLICT, "stored observation failed hash verification"
+            )
 
     def _run_reads(
         self, reads: list[ProviderRead]

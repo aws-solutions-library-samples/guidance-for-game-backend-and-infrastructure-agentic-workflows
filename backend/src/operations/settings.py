@@ -7,6 +7,12 @@ This module resolves that ceiling and the observe-phase read budgets from the
 environment with the existing centralized configuration pattern, and never reads
 provider write settings — the observe phase has no write path.
 
+The full deployment contract needed to bootstrap the deployable observe handler
+is frozen here so a misconfigured deployment fails closed at load rather than at
+request time. In addition to the ceiling and budgets it resolves the DynamoDB
+table name, the CloudWatch metric namespace, and the trusted tenant/workspace/
+audience binding the handler uses to construct verified principals.
+
 Values are validated at load time and any invalid value fails closed (raises)
 rather than silently downgrading, so a misconfigured deployment cannot present a
 higher authority than intended.
@@ -16,6 +22,7 @@ from __future__ import annotations
 
 # Standard library
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -35,6 +42,12 @@ DEFAULT_CANCELLATION_MARGIN_S = 3.0
 
 # Observation freshness / DynamoDB TTL horizon for the transient state.
 DEFAULT_OBSERVATION_TTL_S = 1800
+
+# The DynamoDB TTL attribute name is frozen: the table's TimeToLiveSpecification
+# and every written item agree on ``ttl``.
+TTL_ATTRIBUTE = "ttl"
+
+_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 
 
 def _positive_float(env: Mapping[str, str], key: str, default: float) -> float:
@@ -60,6 +73,20 @@ def _positive_int(env: Mapping[str, str], key: str, default: int) -> int:
         raise ValueError(f"{key} must be a positive integer") from exc
     if value <= 0:
         raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
+def _required_str(env: Mapping[str, str], key: str) -> str:
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return raw.strip()
+
+
+def _required_identifier(env: Mapping[str, str], key: str) -> str:
+    value = _required_str(env, key)
+    if not _IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError(f"{key} must be a valid operations identifier")
     return value
 
 
@@ -94,6 +121,33 @@ class OperationsSettings:
         return min((self.mode, requested), key=_AUTHORITY_ORDER.__getitem__)
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationDeploymentSettings:
+    """The full frozen deployment contract the observe handler bootstraps from.
+
+    All fields are resolved and validated at load time. It embeds the authority
+    ceiling/budget :class:`OperationsSettings` and adds the durable-store,
+    metrics, and trusted-identity binding a deployable Lambda needs. A missing or
+    malformed value fails closed (raises) rather than defaulting to a permissive
+    or unbound value.
+    """
+
+    operations: OperationsSettings
+    table_name: str
+    metric_namespace: str
+    tenant_id: str
+    workspace_id: str
+    trusted_audience: str
+
+    @property
+    def mode(self) -> str:
+        return self.operations.mode
+
+    @property
+    def observe_enabled(self) -> bool:
+        return self.operations.observe_enabled
+
+
 def resolve_operations_settings(env: Mapping[str, str] | None = None) -> OperationsSettings:
     """Resolve operations settings from the environment, failing closed."""
     source: Mapping[str, str] = os.environ if env is None else env
@@ -108,4 +162,19 @@ def resolve_operations_settings(env: Mapping[str, str] | None = None) -> Operati
             source, "GBAW_OPERATIONS_CANCELLATION_MARGIN_S", DEFAULT_CANCELLATION_MARGIN_S
         ),
         observation_ttl_s=_positive_int(source, "GBAW_OPERATIONS_OBSERVATION_TTL_S", DEFAULT_OBSERVATION_TTL_S),
+    )
+
+
+def resolve_observation_deployment_settings(
+    env: Mapping[str, str] | None = None,
+) -> ObservationDeploymentSettings:
+    """Resolve the full frozen observe deployment contract, failing closed."""
+    source: Mapping[str, str] = os.environ if env is None else env
+    return ObservationDeploymentSettings(
+        operations=resolve_operations_settings(source),
+        table_name=_required_str(source, "GBAW_OPERATIONS_TABLE_NAME"),
+        metric_namespace=_required_str(source, "GBAW_OPERATIONS_METRIC_NAMESPACE"),
+        tenant_id=_required_identifier(source, "GBAW_OPERATIONS_TENANT_ID"),
+        workspace_id=_required_identifier(source, "GBAW_OPERATIONS_WORKSPACE_ID"),
+        trusted_audience=_required_str(source, "GBAW_OPERATIONS_TRUSTED_AUDIENCE"),
     )
