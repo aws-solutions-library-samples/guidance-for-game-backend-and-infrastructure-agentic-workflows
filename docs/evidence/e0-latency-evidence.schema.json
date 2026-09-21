@@ -41,6 +41,7 @@
         "read_count",
         "sample_size",
         "concurrency",
+        "arrival_model",
         "boto3_retry_mode",
         "boto3_max_attempts",
         "persistence"
@@ -57,6 +58,11 @@
         "read_count": { "const": 3 },
         "sample_size": { "type": "integer", "minimum": 1 },
         "concurrency": { "type": "integer", "minimum": 1 },
+        "arrival_model": {
+          "description": "Load model under which the percentiles were measured. Declared so the p99 has a defensible meaning.",
+          "type": "string",
+          "enum": ["closed-loop"]
+        },
         "boto3_retry_mode": { "type": "string" },
         "boto3_max_attempts": { "type": "integer", "minimum": 1 },
         "persistence": { "type": "string" }
@@ -90,6 +96,7 @@
         "successes",
         "failures",
         "timeouts",
+        "partial_denials",
         "percentile_method",
         "p50_ms",
         "p95_ms",
@@ -101,6 +108,7 @@
         "successes": { "type": "integer", "minimum": 0 },
         "failures": { "type": "integer", "minimum": 0 },
         "timeouts": { "type": "integer", "minimum": 0 },
+        "partial_denials": { "type": "integer", "minimum": 0 },
         "percentile_method": { "const": "nearest_rank" },
         "p50_ms": { "type": "number", "minimum": 0 },
         "p95_ms": { "type": "number", "minimum": 0 },
@@ -115,14 +123,16 @@
         "rule",
         "acceptance_ceiling_ms",
         "p99_ms",
+        "clean_run",
         "synchronous_accepted"
       ],
       "properties": {
         "rule": {
-          "const": "p99 <= gateway_integration_timeout - cancellation_margin"
+          "const": "clean_run AND p99 <= gateway_integration_timeout - cancellation_margin"
         },
         "acceptance_ceiling_ms": { "type": "number", "exclusiveMinimum": 0 },
         "p99_ms": { "type": "number", "minimum": 0 },
+        "clean_run": { "type": "boolean" },
         "synchronous_accepted": { "type": "boolean" }
       }
     }

@@ -29,7 +29,7 @@ Inside one API Gateway HTTP API request, the E1 observation performs, in order:
 
 Model inference is explicitly excluded.
 
-## Budgets
+## Budgets and deadline enforcement
 
 The API Gateway HTTP API **integration timeout has a documented ceiling of 30
 seconds and cannot be raised** (see
@@ -48,22 +48,48 @@ strictly less than that ceiling and reserve a cancellation margin
 | Gateway integration ceiling | 30.0 s | documented, non-raisable |
 | **Acceptance ceiling** (`ceiling − margin`) | **27.0 s** | the value a measured p99 must beat |
 
-Each read is issued with its own deadline; the whole request has a total
-deadline of 15.0 s. On any per-call, persistence, or total overrun the request
-**fails closed**: in-flight work is abandoned, a typed **retryable** error
-(`PROVIDER_UNAVAILABLE`) is raised, and no partial observation is ever returned
-as success. These numbers are the spike's declared assumptions; the implementing
+Each read is enforced with a **real wall-clock deadline**: the read runs in a
+worker thread and the request waits at most the smaller of the per-read budget
+and the remaining total budget. A read that blocks past that deadline is
+**abandoned** — the request raises a typed **retryable** error
+(`PROVIDER_UNAVAILABLE`) *before* the read returns and does **not** join the
+still-running worker, so a hung provider read can never make the request (or the
+harness) wait past its deadline. A read that returns but whose measured elapsed
+time still exceeds its budget is likewise rejected.
+
+To keep a stuck socket from silently consuming a read budget below the level the
+thread deadline can observe, the live client also bounds botocore itself:
+`connect_timeout` and `read_timeout` are set at or below the per-read budget and
+retries are capped (`adaptive`, `max_attempts=3`). On any per-call, persistence,
+or total overrun the request **fails closed**: in-flight work is abandoned, the
+typed retryable error is raised, and no partial observation is ever returned as
+success. These numbers are the spike's declared assumptions; the implementing
 issue may tighten them.
+
+## Concurrency arrival model
+
+The harness measures under a **closed-loop** arrival model: `--concurrency`
+worker threads each issue observations back-to-back with zero think time, a new
+one starting only when the previous returns. This is a bounded-concurrency
+model, **not** an open (Poisson-arrival) one, and it is **not** a model of
+production request rate. A closed-loop p99 is a conservative, reproducible
+stand-in for the single-request synchronous path; declaring the model is what
+gives the measured percentile a defensible meaning. The model is recorded in the
+evidence document at `assumptions.arrival_model`.
 
 ## Acceptance rule
 
-> **Synchronous accepted** iff the measured **p99 ≤ acceptance ceiling**
-> (`gateway_integration_timeout − cancellation_margin` = 27.0 s), over a
-> representative sample. Percentiles use the **nearest-rank** method so a
+> **Synchronous accepted** iff the sample is a **clean run** (zero failures,
+> zero timeouts, zero partial denials) **and** the measured **p99 ≤ acceptance
+> ceiling** (`gateway_integration_timeout − cancellation_margin` = 27.0 s), over
+> a representative sample. Percentiles use the **nearest-rank** method so a
 > reported p99 is an actually-observed measurement, never an interpolation.
 
-The harness records sample size, successes, failures, timeouts, and
-p50/p95/p99/max. Its output conforms to
+A single non-success sample denies acceptance regardless of the p99 over the
+successful subset: the whole sample must be clean. The harness records sample
+size, successes, failures, timeouts, **partial denials** (reported separately
+from timeouts), and p50/p95/p99/max, plus a `clean_run` flag in the evaluation.
+Its output conforms to
 [`e0-latency-evidence.schema.json`](e0-latency-evidence.schema.json), which
 forbids (via `additionalProperties: false`) any field that could carry an
 account id, fleet id, ARN, credential, or provider payload. The measured fleet
@@ -72,26 +98,31 @@ appears only as a non-reversible short hash (`target_ref`).
 ## Reproducing the measurement (read-only)
 
 Prerequisites: read-only credentials for a **non-production** account with at
-least one **classic** GameLift fleet, and `uv`.
+least one **classic** GameLift fleet, and `uv`. Run all commands from the
+repository root.
 
 ```bash
-cd backend
-
 # Discover a classic fleet id (read-only). Container fleets do NOT support
-# describe_fleet_utilization, so a classic fleet is required.
+# describe_fleet_utilization, so a classic (EC2 compute type) fleet is required.
 aws gamelift list-fleets --profile <demo> --region us-west-2
 
 # Run the harness against that fleet id (read-only; writes public-safe JSON).
-PYTHONPATH=src uv run python -m operations.validation.e0_harness \
+# The harness itself pages list_fleets and filters to classic (EC2) fleets,
+# excluding container fleets, when no --fleet-id is given.
+PYTHONPATH=backend/src uv --project backend run python -m operations.validation.e0_harness \
   --profile <demo> --region us-west-2 \
   --fleet-id <classic-fleet-id> \
   --samples 200 --concurrency 4 \
-  --out ../docs/evidence/e0-latency-<YYYY-MM-DD>.json
+  --out docs/evidence/e0-latency-<YYYY-MM-DD>.json
 ```
 
-Then scan the emitted document before publishing:
+Then scan the emitted document before publishing. The public-content checker
+lives at the repository root and resolves paths relative to the repository, so
+invoke it from the repository root (not from `backend/`):
 
 ```bash
+python3 scripts/check_public_content.py docs/evidence/e0-latency-<YYYY-MM-DD>.json
+# or scan every tracked text file:
 python3 scripts/check_public_content.py
 ```
 
