@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-observation",
+  "title": "GameLift Read-Only Observation 1.0",
+  "$comment": "Additive read-only observation contract. It reuses the immutable common $defs but is not part of the published write-contract schema set bound by the source-control playbook, so it never alters an existing v1 write contract or its playbook hash.",
+  "$defs": {
+    "authority_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_mode",
+        "tenant_policy",
+        "workspace_policy",
+        "principal_authority",
+        "capability_maximum",
+        "risk_policy"
+      ],
+      "properties": {
+        "deployment_mode": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "tenant_policy": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "workspace_policy": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "principal_authority": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "capability_maximum": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "risk_policy": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        }
+      }
+    },
+    "utilization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active_server_processes",
+        "active_game_sessions",
+        "current_player_sessions",
+        "maximum_player_sessions"
+      ],
+      "properties": {
+        "active_server_processes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "active_game_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "current_player_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000000
+        },
+        "maximum_player_sessions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000000
+        }
+      }
+    },
+    "capacity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "location",
+        "desired",
+        "minimum",
+        "maximum",
+        "active",
+        "idle"
+      ],
+      "properties": {
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "desired": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "active": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "idle": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      }
+    },
+    "scaling_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status",
+        "metric_name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "UPDATE_REQUESTED",
+            "UPDATING",
+            "DELETE_REQUESTED",
+            "DELETING",
+            "DELETED",
+            "ERROR"
+          ]
+        },
+        "metric_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "observation_contract_version",
+    "observation_id",
+    "idempotency_token",
+    "phase",
+    "provider",
+    "capability",
+    "effective_authority",
+    "authority_inputs",
+    "requester",
+    "correlation",
+    "target",
+    "observed_at",
+    "expires_at",
+    "results"
+  ],
+  "properties": {
+    "observation_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "observation_id": {
+      "type": "string",
+      "pattern": "^obs_[a-z0-9]{26}$"
+    },
+    "idempotency_token": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/idempotency_token"
+    },
+    "phase": {
+      "type": "string",
+      "const": "observe"
+    },
+    "provider": {
+      "type": "string",
+      "const": "gamelift"
+    },
+    "capability": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/capability_binding"
+    },
+    "effective_authority": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+    },
+    "authority_inputs": {
+      "$ref": "#/$defs/authority_inputs"
+    },
+    "requester": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/trusted_identity"
+    },
+    "correlation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "fleet_id"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "const": "gamelift"
+        },
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        }
+      }
+    },
+    "observed_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "results": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "utilization",
+        "capacity",
+        "scaling_policies"
+      ],
+      "properties": {
+        "utilization": {
+          "$ref": "#/$defs/utilization"
+        },
+        "capacity": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/capacity"
+          }
+        },
+        "scaling_policies": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/scaling_policy"
+          }
+        }
+      }
+    }
+  }
+}
