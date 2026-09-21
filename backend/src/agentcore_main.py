@@ -55,6 +55,7 @@ from config.settings import (
 )
 from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
 from utils.logger import logger
+from utils.request_context import reset_request_context, set_request_context
 from utils.response_parser import ResponseParser
 from utils.security import (
     InputValidationError,
@@ -253,6 +254,16 @@ def invoke_agent(prompt, context=None):
             logger.info(f"📦 Prompt type: {type(prompt)}")
 
         # Security: Validate and sanitize input
+        #
+        # TRUST BOUNDARY (PR #319 finding F2 / PR #320): the requester, tenant, workspace,
+        # and groups in `user_context` are the VERIFIED frontend identity forwarded to this
+        # AgentCore runtime entry. `validate_user_context` only allow-lists the permitted
+        # keys and sanitizes their values (length/type) — it does NOT itself re-verify the
+        # origin or authenticity of that identity. The validated values are what get placed
+        # into the request context below (`set_request_context`) and are the ONLY identity
+        # the downstream Source Control Connector authorization gate trusts. Therefore this
+        # runtime endpoint must remain reachable only via that verified boundary; a caller
+        # that could invoke it directly would be trusted as the forwarded principal.
         logger.info("🔒 Security: Validating input...")
         try:
             user_prompt = validate_prompt(user_prompt, strict_mode=False)
@@ -337,6 +348,14 @@ def invoke_agent(prompt, context=None):
         # body claims cannot elevate or replace them.
         agent_context = {
             "user_id": persistent_user_id,
+            # Hosted-authority fields are reconstructed from the VERIFIED runtime
+            # identity (validated JWT + deployment bindings), never from spoofable
+            # agent/model input. Top-level groups/scopes carry the validated claims
+            # into the request contextvar so downstream components (e.g. the Source
+            # Control Connector authorization gate, which reads ctx.get("groups"))
+            # resolve real membership; they fall back to the validated user_context
+            # only when no verified identity is present, and default to empty so the
+            # gate fails closed rather than KeyError-ing.
             "client_id": verified_client_id,
             "audience": verified_client_id if verified_runtime_identity is not None else user_context.get("audience"),
             "groups": verified_groups,
@@ -393,10 +412,20 @@ def invoke_agent(prompt, context=None):
             tenant=DEPLOYMENT_TENANT_ID,
             workspace=DEPLOYMENT_WORKSPACE_ID,
         )
+        # Set both request-scoped contexts immediately before running the
+        # orchestrator. The cost-report scope (#365) binds report reuse to the
+        # trusted tenant/workspace/actor; the connector identity context lets
+        # downstream components (e.g. the Source Control Connector service) read the
+        # validated user_id/groups/session_id without relying on spoofable
+        # model/tool arguments. Both tokens are reset in the finally block so the
+        # scope and identity are isolated per invocation and never leak across
+        # requests handled by the same worker.
         scope_token = set_request_scope(report_scope)
+        _context_token = set_request_context(agent_context)
         try:
             response = run_orchestrator(query=user_prompt, context=agent_context)
         finally:
+            reset_request_context(_context_token)
             reset_request_scope(scope_token)
 
         logger.info(f"✅ Orchestrator returned response")
