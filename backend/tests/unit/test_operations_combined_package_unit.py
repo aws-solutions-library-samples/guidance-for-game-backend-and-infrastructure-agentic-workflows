@@ -6,12 +6,17 @@ infra worktree merged with issue #413 core, which owns the real
 ``operations/observe/lambda_entry.py`` handler. The infra worktree itself ships
 NO ``operations/observe`` placeholder (that package was deleted so it cannot
 add/add-conflict with core). These tests therefore synthesise a *combined-tree
-fixture* entirely inside a temp directory — no runtime placeholder source is
-added to ``backend/src`` — and assert the packaging invariants the wrapper
-depends on:
+fixture* (or a sibling core worktree, when present) entirely outside
+``backend/src`` — no runtime placeholder source is added to ``backend/src`` — and
+assert the packaging invariants the wrapper depends on:
 
-* a combined tree that contains the real handler passes the handler-present gate,
-  and one that lacks it fails closed;
+* a materialized combined tree carries a real, module-level ``handler`` at the
+  frozen path — exactly the CloudFormation ``Handler`` — and a tree that lacks it
+  fails the wrapper's handler-present gate closed;
+* the infra worktree itself *tracks* no ``operations/observe`` source and no
+  ``register_observer`` seam (checked against the git index, not the on-disk
+  path, so it stays correct on a legitimate combined tree where core owns the
+  path);
 * the deterministic zip (sorted entries, fixed epoch mtime) is byte-stable across
   repeated builds of an unchanged tree, so the content-hash S3 key is stable;
 * the structural, fail-closed import probe accepts a package that carries every
@@ -31,11 +36,21 @@ import zipfile
 
 # Third-party packages
 import pytest
+from _combined_tree import (
+    HANDLER_DOTTED,
+    materialize_combined_operations_tree,
+    module_defines_top_level_handler,
+    observe_placeholder_seam_hits,
+)
+
+# Local modules
+from _cfn_yaml import load_cfn_template
 
 pytestmark = pytest.mark.unit
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 DEPLOY_WRAPPER = PROJECT_ROOT / "scripts/infrastructure/deploy-operations.sh"
+TEMPLATE = PROJECT_ROOT / "infrastructure/cloudformation/06-operations-observation.yaml"
 HANDLER_REL = "operations/observe/lambda_entry.py"
 EPOCH_STAMP = (2000, 1, 1, 0, 0, 0)
 
@@ -107,15 +122,40 @@ def _structural_probe(stage: pathlib.Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Handler-present gate on a combined tree
+# Handler-present gate on a combined tree; infra contributes no placeholder
 # --------------------------------------------------------------------------- #
-def test_combined_tree_has_real_handler_and_no_repo_placeholder(tmp_path):
-    src = _combined_operations_tree(tmp_path)
-    assert (src / HANDLER_REL).is_file(), "combined tree must carry core's real handler"
-    # The infra repo source must NOT carry a placeholder observe package.
-    assert not (
-        PROJECT_ROOT / "backend/src/operations/observe"
-    ).exists(), "the infra worktree must not ship an operations/observe placeholder"
+def test_combined_tree_has_real_module_level_handler(tmp_path):
+    """A materialized combined tree (sibling core worktree when present, else a
+    faithful fixture) carries ``operations/observe/lambda_entry.py`` defining a
+    module-level ``handler`` — the exact CloudFormation ``Handler``. Always
+    materialized, so this never becomes vacuous in the infra-only context."""
+    src = materialize_combined_operations_tree(tmp_path, PROJECT_ROOT)
+    lambda_entry = src / HANDLER_REL
+    assert lambda_entry.is_file(), "combined tree must carry core's real handler"
+    assert module_defines_top_level_handler(
+        lambda_entry
+    ), "the combined-tree handler must define a module-level def handler(...)"
+    handler_value = load_cfn_template(TEMPLATE.read_text(encoding="utf-8"))["Resources"]
+    # Find the Lambda function's Handler and confirm it names the combined-tree
+    # module. Kept resource-name-agnostic to avoid coupling to the logical id.
+    lambda_handlers = [
+        r["Properties"]["Handler"] for r in handler_value.values() if r.get("Type") == "AWS::Lambda::Function"
+    ]
+    assert lambda_handlers == [HANDLER_DOTTED], (
+        f"template Handler {lambda_handlers!r} must be exactly [{HANDLER_DOTTED!r}] "
+        "so the packaged combined-tree module is what Lambda invokes"
+    )
+
+
+def test_no_observe_placeholder_seam_is_tracked():
+    """No tracked ``operations/observe`` source may carry an infra-style
+    placeholder seam (a ``register_observer`` shim or fail-closed placeholder
+    stub). Asserted by tracked-file *content*, not the on-disk path, so it holds
+    both when the path is untracked (infra-only) and when core's real handler is
+    tracked (combined). This is the invariant that keeps a core+infra merge free
+    of add/add conflicts."""
+    hits = observe_placeholder_seam_hits(PROJECT_ROOT)
+    assert hits == [], f"no operations/observe placeholder or register_observer seam may be tracked; found: {hits}"
 
 
 def test_wrapper_gate_rejects_tree_without_handler(tmp_path):

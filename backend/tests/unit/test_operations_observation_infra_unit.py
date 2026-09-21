@@ -40,6 +40,14 @@ import re
 
 # Third-party packages
 import pytest
+from _combined_tree import (
+    HANDLER_DOTTED,
+    HANDLER_IMPORT,
+    HANDLER_REL,
+    materialize_combined_operations_tree,
+    module_defines_top_level_handler,
+    observe_placeholder_seam_hits,
+)
 
 # Local modules
 from _cfn_yaml import load_cfn_template
@@ -504,16 +512,64 @@ def test_teardown_all_never_invokes_operations_teardown():
 
 
 # --------------------------------------------------------------------------- #
-# Placeholder package removal (core's real handler is the only owner)
+# Ownership seam: infra contributes NO placeholder/register_observer, core owns
+# the sole real handler (asserted against the tracked contribution + a
+# materialized combined tree, so it holds in both the infra-only and combined
+# contexts and never conflates "no placeholder" with "path must not exist").
 # --------------------------------------------------------------------------- #
-def test_infra_owned_placeholder_observe_package_is_removed():
-    """The infra worktree must not ship its own operations/observe placeholder;
-    on a combined tree core's real handler must be the only owner of the path."""
-    observe_dir = BACKEND_SRC / "operations" / "observe"
-    assert not observe_dir.exists(), (
-        "the infra-owned placeholder operations/observe package must be deleted "
-        "so it cannot add/add-conflict with core's real handler"
+def test_no_placeholder_or_register_observer_seam_is_tracked():
+    """No tracked ``operations/observe`` source may carry an infra-style
+    placeholder seam — a ``register_observer`` shim or a fail-closed placeholder
+    stub. This is asserted by *content of the tracked files*, not by the on-disk
+    path, so it is correct in both contexts and never conflates "no placeholder"
+    with "path must not exist":
+
+    * infra-only — nothing is tracked under ``operations/observe`` (no hits); and
+    * combined — the tracked files are core's real handler, which carries no
+      placeholder seam (no hits).
+
+    It goes red only if the deleted infra placeholder/register_observer seam is
+    reintroduced, which is exactly the add/add-conflict this guards against."""
+    hits = observe_placeholder_seam_hits(PROJECT_ROOT)
+    assert hits == [], (
+        "no operations/observe placeholder or register_observer seam may be "
+        f"tracked (core owns the real handler); found: {hits}"
     )
+
+
+def test_combined_tree_carries_real_core_handler_the_template_points_at(tmp_path):
+    """On a materialized combined tree, ``operations/observe/lambda_entry.py``
+    exists and defines a module-level ``handler`` — the exact CloudFormation
+    ``Handler`` — proving the infra template references core's real, deployable
+    entry point (not a placeholder). Always materialized, so never vacuous."""
+    src = materialize_combined_operations_tree(tmp_path, PROJECT_ROOT)
+    lambda_entry = src / HANDLER_REL
+    assert lambda_entry.is_file(), "combined tree must carry core's real observe handler"
+    assert module_defines_top_level_handler(
+        lambda_entry
+    ), "the combined-tree handler must define a module-level def handler(...)"
+    # The template Handler must name exactly this module + attribute.
+    handler_value = _observation_function(load_cfn_template(TEMPLATE.read_text(encoding="utf-8")))["Handler"]
+    assert handler_value == HANDLER_DOTTED, (
+        f"template Handler {handler_value!r} must point at the combined-tree " f"module {HANDLER_DOTTED!r}"
+    )
+
+
+def test_wrapper_packages_and_imports_the_combined_tree_handler():
+    """The deploy wrapper must package the combined tree's handler module and
+    import-probe it, so the artifact it uploads is exactly the module the
+    template invokes. Encodes the wrapper's handler-present gate and probe."""
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # The wrapper packages by the frozen module path...
+    assert (
+        f'HANDLER_MODULE_PATH="{HANDLER_REL}"' in text
+    ), "wrapper must package the frozen handler module path from the combined tree"
+    # ...gates the enable on that module being present in the combined tree...
+    assert 'if [ ! -f "$BACKEND_SRC/$HANDLER_MODULE_PATH" ]; then' in text
+    assert "exit 5" in text
+    # ...and import-probes the dotted module + its module-level handler attr.
+    assert f'HANDLER_IMPORT="{HANDLER_IMPORT}"' in text
+    assert "assert callable(m.handler)" in text
 
 
 # --------------------------------------------------------------------------- #
