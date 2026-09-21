@@ -87,6 +87,30 @@ else
 fi
 echo ""
 
+# --- ADOT Exporter Observability (issue #420) ---
+# Non-blocking: surfaces transient cold-start exporter auth blips (known,
+# platform-owned) as a WARN, and escalates a persistent pattern to a FAIL via the
+# detection script's exit code. Read-only; never mutates or suppresses.
+echo "ADOT Exporter Observability:"
+_RID=""
+if [ -f backend/.bedrock_agentcore.yaml ] && command -v yq >/dev/null 2>&1; then
+    _RID=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_id' backend/.bedrock_agentcore.yaml 2>/dev/null || echo "")
+fi
+if [ -n "$_RID" ] && [ "$_RID" != "null" ]; then
+    # PASS on clean/transient (exit 0), FAIL on persistent regression (exit 1).
+    if _EXPORTER_MSG=$(AWS_REGION="$AWS_REGION" "$SCRIPT_DIR/scripts/infrastructure/check-exporter-auth.sh" --runtime-id "$_RID" --lookback-hours 24 2>/dev/null); then
+        echo -e "  ${GREEN}PASS${NC} ${_EXPORTER_MSG}"
+        PASS=$((PASS + 1))
+    else
+        echo -e "  ${RED}FAIL${NC} ${_EXPORTER_MSG:-exporter auth check reported a persistent failure pattern}"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo -e "  ${YELLOW}WARN${NC} Runtime id unavailable; skipped exporter auth check"
+    WARN=$((WARN + 1))
+fi
+echo ""
+
 # --- Frontend (ECS Express) ---
 echo "Frontend (ECS Express):"
 FRONTEND_URL=$(aws cloudformation describe-stacks --stack-name "${PROJECT_NAME}-frontend" --region $AWS_REGION --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' --output text 2>/dev/null || echo "")
