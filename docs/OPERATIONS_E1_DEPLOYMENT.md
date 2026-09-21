@@ -38,10 +38,13 @@ and tests all bind to them.
 | --- | --- |
 | Lambda handler | `operations.observe.lambda_entry.handler` |
 
-The handler module (`backend/src/operations/observe/lambda_entry.py`) is the
-infrastructure-owned packaging seam. It honors the `GBAW_OPERATIONS_MODE` kill
-switch and **fails closed** (HTTP 503) until issue #413 core registers the real
-observation callable; it never returns a placeholder success.
+The handler module (`backend/src/operations/observe/lambda_entry.py`) is owned
+and implemented by issue #413 **core** — it is the real, deployable handler. The
+infrastructure does not ship a placeholder for this path (any prior infra-owned
+placeholder was removed so core's handler is the sole owner). The handler honors
+the `GBAW_OPERATIONS_MODE` kill switch and **fails closed** rather than returning
+a placeholder success. On a combined tree the infrastructure wrapper packages and
+invokes this core handler directly.
 
 ### OperationsMode vocabulary
 
@@ -60,24 +63,33 @@ observation callable; it never returns a placeholder success.
 | `GBAW_OPERATIONS_TENANT_ID` | Server-side trusted tenant binding |
 | `GBAW_OPERATIONS_WORKSPACE_ID` | Server-side trusted workspace binding |
 | `GBAW_OPERATIONS_TRUSTED_AUDIENCE` | Server-side trusted audience (defaults to the Cognito client id) |
-| `GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS` | Total request budget (`15`), below the 30 s gateway ceiling |
-| `GBAW_OPERATIONS_PROVIDER_READ_BUDGET_SECONDS` | Per-provider-read sub-budget (`3`) |
-| `GBAW_OPERATIONS_PERSISTENCE_BUDGET_SECONDS` | Persistence + canonical serialization sub-budget (`3`) |
-| `GBAW_OPERATIONS_RECORD_TTL_SECONDS` | TTL applied to the DynamoDB `ttl` attribute for transient records |
+| `GBAW_OPERATIONS_PER_READ_BUDGET_S` | Per-provider-read sub-budget (`3`) |
+| `GBAW_OPERATIONS_PERSISTENCE_BUDGET_S` | Persistence + canonical serialization sub-budget (`3`) |
+| `GBAW_OPERATIONS_CANCELLATION_MARGIN_S` | Cancellation-margin sub-budget (`3`) |
+| `GBAW_OPERATIONS_OBSERVATION_TTL_S` | Observation freshness / DynamoDB `ttl` horizon for transient records (`1800` = 30 min) |
 | `COGNITO_ISSUER` | JWT issuer URL for the HTTP API authorizer |
 | `COGNITO_CLIENT_ID` | Cognito app client id (JWT audience) |
 
-The four budget/TTL variables follow the ADR 0005 sub-budget model (total
-request deadline, per-read budget, persistence budget) plus the transient-record
-TTL that drives the DynamoDB `ttl` attribute. There is **no** content-bucket
-binding: the unused S3 content bucket, its runtime permissions, its environment
-binding, and its output were removed.
+These four budget/TTL variables are the **frozen `_S` names** the core settings
+module (`resolve_operations_settings`) actually reads. They follow the ADR 0005
+sub-budget model — per-read budget, persistence budget, and cancellation margin —
+plus the transient-record TTL the handler stamps on the DynamoDB `ttl` attribute.
+The core service derives the **total request deadline** from the sub-budgets plus
+the margin, so there is **no** request-deadline environment variable: the
+`RequestDeadlineSeconds` parameter is used only as the Lambda function `Timeout`.
+There is likewise **no** content-bucket binding: the unused S3 content bucket, its
+runtime permissions, its environment binding, and its output were removed. Each
+budget/TTL variable is backed by a validated CloudFormation parameter
+(`PerReadBudgetSeconds`, `PersistenceBudgetSeconds`, `CancellationMarginSeconds`,
+`ObservationTtlSeconds`) so operators tune real, bounded runtime knobs.
 
 ### DynamoDB TTL
 
 The table's TTL attribute is `ttl` (frozen). Only transient observation records
-carry a `ttl`; the append-only audit ledger and idempotency mapping are retained
-for the full audit window and are not TTL-managed.
+carry a `ttl`, expiring after `GBAW_OPERATIONS_OBSERVATION_TTL_S` seconds
+(default `1800` = 30 minutes, matching the core default); the append-only audit
+ledger and idempotency mapping are retained for the full audit window and are not
+TTL-managed.
 
 ### CloudWatch metric names (namespace `GameAgent/Operations`)
 
@@ -123,29 +135,54 @@ GBAW_OPERATIONS_MODE=observe \
   COGNITO_ISSUER=https://cognito-idp.us-west-2.amazonaws.com/us-west-2_example \
   COGNITO_CLIENT_ID=<client-id> \
   TENANT_ID=<tenant> WORKSPACE_ID=<workspace> \
+  GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket> \
   AWS_PROFILE=<profile> AWS_REGION=us-west-2 \
   ./scripts/infrastructure/deploy-operations.sh --enable
 ```
 
 The wrapper refuses to create enabled resources unless **both** the
 `GBAW_OPERATIONS_MODE=observe` environment value **and** the `--enable` flag are
-present, and it requires the Cognito issuer/audience and the tenant/workspace
-bindings. Before any write it verifies `AWS_PROFILE`/`AWS_REGION` and the caller
-identity (`aws sts get-caller-identity`).
+present, and it requires the Cognito issuer/audience, the tenant/workspace
+bindings, and an explicit, pre-existing `GBAW_OPERATIONS_ARTIFACT_BUCKET`. All of
+these inputs are validated **before** any AWS call. `AWS_PROFILE` is passed
+explicitly to every `aws` invocation (not relied on ambiently), and before any
+write the wrapper verifies `AWS_PROFILE`/`AWS_REGION` and the caller identity
+(`aws sts get-caller-identity`).
 
 ### Real packaging path (no placeholder code)
 
-On `--enable` the wrapper builds a **deterministic, minimal Lambda zip**
-containing the `operations` code and the required third-party dependency
-(`rfc8785`, used by the canonical serializer). It verifies the packaged handler
-imports in a clean environment, uploads the zip to an **explicitly supplied or
-safely discovered existing** deployment bucket (`CODE_S3_BUCKET`; the wrapper
-never creates a bucket) under a **content-hash** key
+On `--enable` the wrapper builds a **deterministic, Lambda-compatible Python 3.13
+/ x86_64 zip** from a **combined tree** (the infra worktree merged with issue #413
+core, which owns the real `operations/observe/lambda_entry.py`). The infra
+worktree ships **no** `operations/observe` placeholder — core's handler is the
+sole owner. The zip carries the `operations` code plus **every transitive runtime
+dependency pinned at the version frozen in `backend/uv.lock`**: `rfc8785==0.1.4`
+(canonical JSON) and `jsonschema==4.26.0` + `referencing==0.36.2` (contract
+validation) with their dependencies `jsonschema-specifications==2025.9.1`,
+`attrs==25.4.0`, and the native `rpds-py==2026.5.1`.
+
+Dependencies are installed for the **Lambda `manylinux2014_x86_64` / cp313 ABI**
+via a deterministic cross-platform `pip`/`uv` platform install (binary-only), or,
+when a container runtime is available, an explicitly versioned Lambda build
+container (`public.ecr.aws/lambda/python:3.13-x86_64`). **Host-architecture native
+wheels are never packaged**: the wrapper aborts if any non-Linux/x86 native wheel
+(macOS, arm64/aarch64, Windows) is staged, and requires the native `rpds-py`
+Linux extension to be present. A **clean Linux/x86 import probe** then imports the
+frozen handler from the built artifact alone — inside the Lambda runtime image
+when a container runtime is available, otherwise via a fail-closed structural
+probe that rejects a package missing the handler or any required dependency.
+
+The wrapper uploads the zip to an **explicit, pre-existing artifact bucket**
+named by `GBAW_OPERATIONS_ARTIFACT_BUCKET` under a **content-hash** key
 (`operations/observe/<sha256>.zip`), and passes `CodeS3Bucket`/`CodeS3Key` to the
-stack. If the frozen handler module is absent from the source tree, the wrapper
-fails closed — no enabled route ever points at placeholder code. The template's
-`Rules` block independently rejects an `observe`-mode deploy that is missing the
-issuer, audience, tenant, workspace, or code artifact inputs.
+stack. There is **no bucket-name discovery and no bucket creation**: the wrapper
+verifies the bucket exists and is owned by the caller's account
+(`aws s3api head-bucket --expected-bucket-owner`) and that its Region matches the
+deploy Region (`aws s3api get-bucket-location`) before uploading. If the frozen
+handler module is absent from the source tree, the wrapper fails closed — no
+enabled route ever points at placeholder code. The template's `Rules` block
+independently rejects an `observe`-mode deploy that is missing the issuer,
+audience, tenant, workspace, or code artifact inputs.
 
 Environment (`beta`/`prod`) is selected with `--environment`; production sets
 DynamoDB deletion protection and a dedicated retention posture (see the

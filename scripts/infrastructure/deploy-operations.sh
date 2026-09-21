@@ -11,12 +11,17 @@
 # only; it creates no change set and mutates nothing). Disabling is a separate,
 # data-preserving path (--disable).
 #
-# On an enabled deploy the wrapper builds a DETERMINISTIC, minimal Lambda zip
-# containing the `operations` code and the required third-party dependencies,
-# uploads it to an explicitly supplied or safely discovered EXISTING deployment
-# bucket under a content-hash key, and passes CodeS3Bucket/CodeS3Key to the
-# stack. No enabled route ever points at placeholder code: if the frozen handler
-# module is absent from the package, the wrapper fails closed.
+# On an enabled deploy the wrapper builds a DETERMINISTIC, Lambda-compatible
+# Python 3.13 / x86_64 zip containing the real `operations` code (from a combined
+# tree that includes issue #413 core's handler) plus every transitive runtime
+# dependency pinned at the version frozen in the repository lock. Dependencies
+# are installed for the Lambda manylinux x86_64 ABI via a deterministic
+# cross-platform pip/uv platform install (or an explicitly versioned Lambda build
+# container) so host-architecture native wheels are NEVER packaged. The artifact
+# is uploaded to an EXPLICIT, pre-existing artifact bucket (verified, never
+# created or discovered) under a content-hash key, and CodeS3Bucket/CodeS3Key are
+# passed to the stack. No enabled route ever points at placeholder code: if the
+# frozen handler module is absent from the package, the wrapper fails closed.
 
 set -euo pipefail
 
@@ -29,6 +34,29 @@ STACK_NAME="${PROJECT_NAME}-operations"
 TEMPLATE="$PROJECT_ROOT/infrastructure/cloudformation/06-operations-observation.yaml"
 BACKEND_SRC="$PROJECT_ROOT/backend/src"
 HANDLER_MODULE_PATH="operations/observe/lambda_entry.py"
+HANDLER_IMPORT="operations.observe.lambda_entry"
+
+# The Lambda target ABI. The runtime is Python 3.13 on x86_64; the package must
+# carry manylinux x86_64 wheels for any native dependency, never host wheels.
+LAMBDA_PY_VERSION="3.13"
+LAMBDA_PY_TAG="cp313"
+LAMBDA_PLATFORM="manylinux2014_x86_64"
+LAMBDA_BUILD_IMAGE="public.ecr.aws/lambda/python:3.13-x86_64"
+
+# Transitive runtime-dependency closure, pinned EXACTLY at the versions frozen in
+# backend/uv.lock. rfc8785 provides canonical JSON; jsonschema + referencing (and
+# their deps attrs / rpds-py / jsonschema-specifications) back contract
+# validation. boto3/botocore are provided by the Lambda runtime and are excluded.
+# rpds-py is the only native (non-pure-python) member; its manylinux x86_64 wheel
+# is required.
+PINNED_DEPS=(
+    "rfc8785==0.1.4"
+    "jsonschema==4.26.0"
+    "jsonschema-specifications==2025.9.1"
+    "referencing==0.36.2"
+    "attrs==25.4.0"
+    "rpds-py==2026.5.1"
+)
 
 ENVIRONMENT="beta"
 ACTION="preview"   # preview | enable | disable
@@ -37,10 +65,15 @@ COGNITO_CLIENT_ID="${COGNITO_CLIENT_ID:-}"
 TENANT_ID="${TENANT_ID:-}"
 WORKSPACE_ID="${WORKSPACE_ID:-}"
 TRUSTED_AUDIENCE="${TRUSTED_AUDIENCE:-}"
-# An explicitly supplied deployment bucket for the Lambda artifact. When empty
-# on an enabled deploy the wrapper discovers an existing bucket and never
-# creates one.
-CODE_S3_BUCKET="${CODE_S3_BUCKET:-}"
+# The EXPLICIT, pre-existing artifact bucket for the Lambda zip. There is no
+# discovery and no creation: an enabled deploy requires this to name a bucket
+# that already exists in the target account/region.
+GBAW_OPERATIONS_ARTIFACT_BUCKET="${GBAW_OPERATIONS_ARTIFACT_BUCKET:-}"
+
+# AWS_PROFILE is passed EXPLICITLY to every aws call rather than relied on
+# ambiently. When unset we fall back to "default" so the flag is always present.
+AWS_PROFILE="${AWS_PROFILE:-default}"
+AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
 
 usage() {
     cat <<'USAGE'
@@ -57,13 +90,16 @@ Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod]
                 deletion protection and longer log retention.
 
 Environment for --enable:
-  GBAW_OPERATIONS_MODE=observe   Required confirmation.
+  GBAW_OPERATIONS_MODE=observe        Required confirmation.
   COGNITO_ISSUER, COGNITO_CLIENT_ID   JWT issuer + audience (required).
-  TENANT_ID, WORKSPACE_ID        Server-side trusted bindings (required).
-  TRUSTED_AUDIENCE               Optional; defaults to COGNITO_CLIENT_ID.
-  CODE_S3_BUCKET                 Optional explicit deployment bucket; when unset
-                                 an existing project bucket is discovered.
-  AWS_PROFILE, AWS_REGION        Credentials/region (verified before any write).
+  TENANT_ID, WORKSPACE_ID             Server-side trusted bindings (required).
+  TRUSTED_AUDIENCE                    Optional; defaults to COGNITO_CLIENT_ID.
+  GBAW_OPERATIONS_ARTIFACT_BUCKET     REQUIRED explicit, pre-existing artifact
+                                      bucket. This wrapper verifies it and never
+                                      discovers or creates a bucket.
+  AWS_PROFILE, AWS_REGION             Credentials/region. AWS_PROFILE is passed
+                                      explicitly to every aws call; both are
+                                      verified before any write.
 USAGE
 }
 
@@ -82,6 +118,7 @@ echo "=================================================="
 echo " ⚙️  OPTIONAL E1 operations control plane"
 echo "=================================================="
 echo "Region:      $AWS_REGION"
+echo "Profile:     $AWS_PROFILE"
 echo "Stack:       $STACK_NAME"
 echo "Environment: $ENVIRONMENT"
 echo "Action:      $ACTION"
@@ -107,6 +144,7 @@ if [ "$ACTION" = "preview" ]; then
     fi
     echo "   Running template service validation (read-only) ..."
     aws cloudformation validate-template \
+        "${AWS_PROFILE_ARGS[@]}" \
         --template-body "file://$TEMPLATE" \
         --region "$AWS_REGION" >/dev/null
     echo "✅ Preview complete. Template validated; no resources were created."
@@ -114,16 +152,9 @@ if [ "$ACTION" = "preview" ]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Verify identity/region before any write path (enable or disable).
+# Validate all opt-in inputs BEFORE touching AWS, so a misconfigured enable is
+# refused without any credential dependency or network call.
 # --------------------------------------------------------------------------- #
-echo "🔐 Verifying AWS credentials and region before any write ..."
-echo "   AWS_PROFILE=${AWS_PROFILE:-<default>}  AWS_REGION=${AWS_REGION}"
-if ! CALLER_IDENTITY="$(aws sts get-caller-identity --region "$AWS_REGION" --output text 2>/dev/null)"; then
-    echo "❌ Unable to verify caller identity. Configure AWS_PROFILE/AWS_REGION and credentials." >&2
-    exit 4
-fi
-echo "   Caller identity: $CALLER_IDENTITY"
-
 OPERATIONS_MODE="disabled"
 CODE_S3_KEY=""
 
@@ -141,17 +172,39 @@ if [ "$ACTION" = "enable" ]; then
         echo "❌ TENANT_ID and WORKSPACE_ID are required to enable." >&2
         exit 3
     fi
+    if [ -z "$GBAW_OPERATIONS_ARTIFACT_BUCKET" ]; then
+        echo "❌ GBAW_OPERATIONS_ARTIFACT_BUCKET is required to enable. This wrapper" >&2
+        echo "   never discovers or creates a bucket; set it to a pre-existing bucket." >&2
+        exit 6
+    fi
     OPERATIONS_MODE="observe"
+fi
 
+# --------------------------------------------------------------------------- #
+# Verify identity/region before any write path (enable or disable).
+# --------------------------------------------------------------------------- #
+echo "🔐 Verifying AWS credentials and region before any write ..."
+echo "   AWS_PROFILE=${AWS_PROFILE}  AWS_REGION=${AWS_REGION}"
+if ! CALLER_IDENTITY="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --output text 2>/dev/null)"; then
+    echo "❌ Unable to verify caller identity. Configure AWS_PROFILE/AWS_REGION and credentials." >&2
+    exit 4
+fi
+echo "   Caller identity: $CALLER_IDENTITY"
+# The account the credentials resolve to; used to confirm the artifact bucket's
+# ownership context before upload.
+ACCOUNT_ID="$(printf '%s\n' "$CALLER_IDENTITY" | awk '{print $1}')"
+
+if [ "$ACTION" = "enable" ]; then
     # ----------------------------------------------------------------------- #
-    # Build a deterministic, minimal Lambda zip: the `operations` code plus the
-    # required third-party dependencies. Determinism (fixed mtimes, sorted
-    # entries) makes the content hash — and therefore the S3 key — stable for an
-    # unchanged source tree.
+    # Build a deterministic, Lambda-compatible zip: the real `operations` code
+    # (from the combined tree) plus the pinned third-party dependency closure.
+    # Determinism (fixed mtimes, sorted entries) makes the content hash — and
+    # therefore the S3 key — stable for an unchanged source tree.
     # ----------------------------------------------------------------------- #
     if [ ! -f "$BACKEND_SRC/$HANDLER_MODULE_PATH" ]; then
         echo "❌ Refusing to enable: frozen handler module $HANDLER_MODULE_PATH is absent" >&2
-        echo "   from $BACKEND_SRC. No enabled route may point at missing/placeholder code." >&2
+        echo "   from $BACKEND_SRC. Package from a combined tree that includes issue #413" >&2
+        echo "   core's real handler; no enabled route may point at missing/placeholder code." >&2
         exit 5
     fi
 
@@ -161,38 +214,108 @@ if [ "$ACTION" = "enable" ]; then
     mkdir -p "$STAGE"
 
     echo "📦 Staging operations code ..."
-    # Only the operations package is shipped (its dependencies within backend
-    # are the operations subtree). Exclude caches and tests. A tar pipe copies
-    # the tree portably and dereferences any symlinks, avoiding pass-through
-    # copy tools that refuse to write through a symlinked temp prefix.
+    # Ship the operations package (its in-repo dependencies are the operations
+    # subtree). Exclude caches and tests. A tar pipe copies the tree portably and
+    # dereferences any symlinks, avoiding pass-through copy tools that refuse to
+    # write through a symlinked temp prefix.
     ( cd "$BACKEND_SRC" && \
       find operations -type f -name '*.py' -not -path '*/__pycache__/*' -print0 \
         | tar --null -cf - --files-from=- ) | ( cd "$STAGE" && tar -xf - )
 
-    # Required third-party dependencies. boto3/botocore are provided by the
-    # Lambda python runtime, so the minimal set here is the pure-python
-    # canonical-JSON dependency the observation records need. Installed with a
-    # pinned version for reproducibility.
-    echo "📦 Installing required third-party dependencies ..."
-    python3 -m pip install --quiet --no-compile \
-        --target "$STAGE" "rfc8785==0.1.4"
+    # ----------------------------------------------------------------------- #
+    # Install the pinned dependency closure for the LAMBDA target ABI (Linux /
+    # x86_64 / cp313), binary-only, so a host-architecture native wheel (e.g. the
+    # macOS/arm64 rpds-py) is never packaged. Prefer uv's platform install; fall
+    # back to pip's cross-platform target install. Both are deterministic: exact
+    # pins + a fixed platform/abi/python target.
+    # ----------------------------------------------------------------------- #
+    echo "📦 Installing pinned dependencies for ${LAMBDA_PLATFORM} / py${LAMBDA_PY_VERSION} (binary-only) ..."
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install \
+            --python-platform x86_64-manylinux2014 \
+            --python-version "$LAMBDA_PY_VERSION" \
+            --only-binary :all: \
+            --target "$STAGE" \
+            --no-cache \
+            "${PINNED_DEPS[@]}"
+    else
+        python3 -m pip install \
+            --platform "$LAMBDA_PLATFORM" \
+            --python-version "$LAMBDA_PY_VERSION" \
+            --implementation cp \
+            --abi "$LAMBDA_PY_TAG" \
+            --only-binary=:all: \
+            --no-compile \
+            --target "$STAGE" \
+            "${PINNED_DEPS[@]}"
+    fi
 
-    # Normalize for determinism: strip pip metadata dirs and fix timestamps.
+    # Normalize for determinism: strip pip metadata dirs and bytecode caches, and
+    # fix timestamps. .dist-info is not needed at runtime.
     find "$STAGE" -depth -type d -name '*.dist-info' -exec rm -rf {} + 2>/dev/null || true
-    find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    find "$STAGE" -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
     # Fixed epoch touch stamp assembled from parts (no 12-digit literal) so the
     # build is reproducible without tripping account-id content scanners.
     EPOCH_STAMP="2000""01010000.00"   # CCYYMMDDhhmm.SS
     find "$STAGE" -exec touch -h -t "$EPOCH_STAMP" {} +
 
-    echo "🧪 Verifying the packaged handler imports in a clean environment ..."
-    # Isolated interpreter (-E -s ignores user site + env config) but with the
-    # staged package as the sole import root on sys.path, mirroring how Lambda
-    # loads the deployment package. This proves the frozen handler resolves from
-    # the built artifact alone before any deploy.
-    env -u PYTHONPATH -u PYTHONHOME python3 -E -s -c \
-        "import sys; sys.path.insert(0, '$STAGE'); import importlib; m = importlib.import_module('operations.observe.lambda_entry'); assert callable(m.handler)" \
-        || { echo "❌ Packaged handler failed to import; refusing to deploy." >&2; exit 5; }
+    # ----------------------------------------------------------------------- #
+    # Fail closed if any native wheel was staged for a NON-Linux/x86 platform.
+    # rpds-py's compiled extension carries its platform tag in the filename; the
+    # only acceptable tag family is manylinux*_x86_64. A host wheel (macosx_*,
+    # *_arm64/aarch64, win_*) means the cross-platform install silently fell back
+    # to the host and must abort.
+    # ----------------------------------------------------------------------- #
+    echo "🔍 Verifying no host-architecture native wheels were packaged ..."
+    BAD_NATIVE="$(find "$STAGE" -type f -name '*.so' \
+        \( -name '*macosx*' -o -name '*arm64*' -o -name '*aarch64*' -o -name '*win_*' -o -name '*_i686*' \) 2>/dev/null || true)"
+    if [ -n "$BAD_NATIVE" ]; then
+        echo "❌ Host/non-x86_64 native wheel detected in package:" >&2
+        printf '   %s\n' "$BAD_NATIVE" >&2
+        exit 5
+    fi
+    # The native dependency MUST be present as a compiled Linux extension.
+    if ! find "$STAGE" -type f -name 'rpds*.so' | grep -q .; then
+        echo "❌ Native dependency rpds-py compiled extension is missing from the package." >&2
+        echo "   The manylinux x86_64 wheel did not install; refusing to deploy." >&2
+        exit 5
+    fi
+
+    # ----------------------------------------------------------------------- #
+    # Clean Linux/x86 import probe. The real handler transitively imports the
+    # native rpds-py, which only loads on Linux/x86_64. When a Lambda-compatible
+    # container runtime is available we import the frozen handler inside the
+    # official python:3.13-x86_64 image (the true runtime); otherwise we run a
+    # structural probe that fails closed if the frozen handler module or any
+    # pinned dependency's top-level package is absent from the built artifact.
+    # ----------------------------------------------------------------------- #
+    echo "🧪 Import-probing the packaged handler on a clean Linux/x86 runtime ..."
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        docker run --rm --platform linux/amd64 \
+            -v "$STAGE:/var/task:ro" \
+            --entrypoint python3 \
+            "$LAMBDA_BUILD_IMAGE" \
+            -E -s -c \
+            "import sys; sys.path.insert(0, '/var/task'); import importlib; m = importlib.import_module('$HANDLER_IMPORT'); assert callable(m.handler)" \
+            || { echo "❌ Packaged handler failed to import on the Lambda runtime image; refusing to deploy." >&2; exit 5; }
+        echo "   Import probe passed on $LAMBDA_BUILD_IMAGE."
+    else
+        echo "   No container runtime available; running a structural fail-closed probe."
+        # The frozen handler module must be present in the built artifact.
+        if [ ! -f "$STAGE/$HANDLER_MODULE_PATH" ]; then
+            echo "❌ Frozen handler module $HANDLER_MODULE_PATH missing from the package." >&2
+            exit 5
+        fi
+        # Every required top-level runtime dependency must be present so the
+        # handler's transitive imports resolve at runtime.
+        for required in rfc8785 jsonschema referencing rpds; do
+            if ! find "$STAGE" -maxdepth 2 \( -name "${required}" -o -name "${required}.py" -o -name "${required}*.so" \) | grep -q .; then
+                echo "❌ Required runtime dependency '$required' is absent from the package." >&2
+                exit 5
+            fi
+        done
+        echo "   Structural probe passed (handler + required dependencies present)."
+    fi
 
     ARTIFACT="$BUILD_DIR/operations-observe.zip"
     echo "🗜️  Building deterministic zip ..."
@@ -202,32 +325,48 @@ if [ "$ACTION" = "enable" ]; then
     CODE_S3_KEY="operations/observe/${CONTENT_HASH}.zip"
     echo "   Artifact sha256: $CONTENT_HASH"
 
-    # Resolve the deployment bucket: explicit if supplied, otherwise discover an
-    # existing project bucket. Never create a bucket here.
-    if [ -z "$CODE_S3_BUCKET" ]; then
-        echo "🔎 No CODE_S3_BUCKET supplied; discovering an existing deployment bucket ..."
-        CODE_S3_BUCKET="$(aws s3api list-buckets \
-            --query "Buckets[?starts_with(Name, '${PROJECT_NAME}-deploy') || starts_with(Name, '${PROJECT_NAME}-artifacts')].Name | [0]" \
-            --output text 2>/dev/null || true)"
-        if [ -z "$CODE_S3_BUCKET" ] || [ "$CODE_S3_BUCKET" = "None" ]; then
-            echo "❌ No existing deployment bucket found and none supplied." >&2
-            echo "   Set CODE_S3_BUCKET to an existing bucket; this wrapper never creates one." >&2
-            exit 6
-        fi
-    else
-        # Confirm the explicitly supplied bucket already exists.
-        if ! aws s3api head-bucket --bucket "$CODE_S3_BUCKET" >/dev/null 2>&1; then
-            echo "❌ Supplied CODE_S3_BUCKET '$CODE_S3_BUCKET' does not exist or is inaccessible." >&2
-            exit 6
-        fi
+    # ----------------------------------------------------------------------- #
+    # Verify the EXPLICIT artifact bucket exists and its region/account context
+    # matches the deploy target before uploading. Never create a bucket.
+    # ----------------------------------------------------------------------- #
+    CODE_S3_BUCKET="$GBAW_OPERATIONS_ARTIFACT_BUCKET"
+    echo "🔎 Verifying artifact bucket '$CODE_S3_BUCKET' exists in account $ACCOUNT_ID ..."
+    # head-bucket confirms existence and that these credentials can access it.
+    # The expected owner is asserted so a name-squatted foreign bucket is refused.
+    if ! aws s3api head-bucket \
+            "${AWS_PROFILE_ARGS[@]}" \
+            --bucket "$CODE_S3_BUCKET" \
+            --expected-bucket-owner "$ACCOUNT_ID" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+        echo "❌ Artifact bucket '$CODE_S3_BUCKET' does not exist, is inaccessible, or is" >&2
+        echo "   not owned by account $ACCOUNT_ID. This wrapper never creates a bucket." >&2
+        exit 6
     fi
-    echo "   Deployment bucket: $CODE_S3_BUCKET"
+    # Confirm the bucket's Region matches the deploy Region (Lambda requires the
+    # code bucket to be in the same Region as the function).
+    BUCKET_REGION="$(aws s3api get-bucket-location \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --bucket "$CODE_S3_BUCKET" \
+        --expected-bucket-owner "$ACCOUNT_ID" \
+        --output text 2>/dev/null || true)"
+    # us-east-1 is reported as "None" by the LocationConstraint API.
+    if [ "$BUCKET_REGION" = "None" ] || [ -z "$BUCKET_REGION" ]; then
+        BUCKET_REGION="us-east-1"
+    fi
+    if [ "$BUCKET_REGION" != "$AWS_REGION" ]; then
+        echo "❌ Artifact bucket '$CODE_S3_BUCKET' is in region '$BUCKET_REGION', not the" >&2
+        echo "   deploy region '$AWS_REGION'. Lambda requires the code bucket in-region." >&2
+        exit 6
+    fi
+    echo "   Bucket verified: owner=$ACCOUNT_ID region=$BUCKET_REGION"
 
     echo "☁️  Uploading artifact to s3://$CODE_S3_BUCKET/$CODE_S3_KEY ..."
     aws s3 cp "$ARTIFACT" "s3://$CODE_S3_BUCKET/$CODE_S3_KEY" \
+        "${AWS_PROFILE_ARGS[@]}" \
         --region "$AWS_REGION" --only-show-errors
 elif [ "$ACTION" = "disable" ]; then
     OPERATIONS_MODE="disabled"
+    CODE_S3_BUCKET=""
 fi
 
 PARAM_OVERRIDES=(
@@ -239,12 +378,13 @@ PARAM_OVERRIDES=(
     "TenantId=${TENANT_ID}"
     "WorkspaceId=${WORKSPACE_ID}"
     "TrustedAudience=${TRUSTED_AUDIENCE}"
-    "CodeS3Bucket=${CODE_S3_BUCKET}"
+    "CodeS3Bucket=${CODE_S3_BUCKET:-}"
     "CodeS3Key=${CODE_S3_KEY}"
 )
 
 echo "🚀 Deploying $STACK_NAME with OperationsMode=$OPERATIONS_MODE ..."
 aws cloudformation deploy \
+    "${AWS_PROFILE_ARGS[@]}" \
     --template-file "$TEMPLATE" \
     --stack-name "$STACK_NAME" \
     --capabilities CAPABILITY_NAMED_IAM \

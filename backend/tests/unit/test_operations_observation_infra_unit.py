@@ -11,8 +11,9 @@ contract**:
   distinct least-privilege observation role, alarms/metrics/log retention,
   outputs, and tags);
 * the frozen handler, ``OperationsMode`` vocabulary (``disabled``/``observe``),
-  the exact Lambda environment bindings, the ``ttl`` TTL attribute, the frozen
-  metric names, the ExtendedStatistic p99 latency alarm, the multi-tenant and
+  the exact Lambda environment bindings (the four frozen ``_S`` budget/TTL names
+  the core settings module reads), the ``ttl`` TTL attribute, the frozen metric
+  names, the ExtendedStatistic p99 latency alarm, the multi-tenant and
   code-artifact parameters with enabled-mode ``Rules`` validation, and the
   CloudWatch Logs KMS key-policy grant;
 * negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
@@ -20,8 +21,17 @@ contract**:
   ``kms:Encrypt``, no GameLift write, ``iam:PassRole``, Step Functions,
   ``UpdateItem``/``DeleteItem``/``PutItem``/``Scan``, or wildcard action);
 * the removal of the unused S3 content bucket, its env binding, and its output;
+* the removal of the unused request-deadline env var (it survives only as the
+  Lambda ``Timeout`` parameter, never as a runtime env binding);
+* the removal of the infra-owned placeholder ``operations/observe`` package so
+  core's real handler is the only owner;
+* the packaging contract (deterministic cross-platform Linux/x86_64 install of
+  every transitive runtime dependency pinned from the repository lock, never
+  host-architecture native wheels, plus a clean import probe);
+* the artifact-bucket contract (an explicit, pre-existing bucket is required and
+  verified; no discovery, no bucket creation);
 * the default-disabled invariant; and
-* shell safety of the deploy/teardown wrappers.
+* shell safety and explicit-profile propagation of the deploy/teardown wrappers.
 """
 
 # Standard library
@@ -44,6 +54,7 @@ MAIN_DEPLOY = PROJECT_ROOT / "scripts/deploy.sh"
 MAIN_TEARDOWN = PROJECT_ROOT / "scripts/teardown.sh"
 DEPLOY_ALL = PROJECT_ROOT / "deploy-all.sh"
 TEARDOWN_ALL = PROJECT_ROOT / "teardown-all.sh"
+BACKEND_SRC = PROJECT_ROOT / "backend/src"
 
 HANDLER = "operations.observe.lambda_entry.handler"
 METRIC_NAMESPACE = "GameAgent/Operations"
@@ -53,8 +64,12 @@ FROZEN_METRICS = (
     "StuckOperations",
     "ObservationRequestLatency",
 )
-# Exact Lambda environment bindings frozen for E1. The content bucket binding is
-# intentionally NOT here — it was removed with the unused S3 content bucket.
+# Exact Lambda environment bindings frozen for E1. These budget/TTL names are
+# the *frozen* ``_S`` names the core settings module (resolve_operations_settings)
+# actually reads; the infra must inject exactly these so operator-set knobs take
+# runtime effect. The content bucket binding is intentionally NOT here (removed
+# with the unused S3 content bucket), and neither is a request-deadline env var
+# (core derives the deadline from the sub-budgets + margin).
 REQUIRED_ENV_KEYS = frozenset(
     {
         "GBAW_OPERATIONS_MODE",
@@ -63,14 +78,25 @@ REQUIRED_ENV_KEYS = frozenset(
         "GBAW_OPERATIONS_TENANT_ID",
         "GBAW_OPERATIONS_WORKSPACE_ID",
         "GBAW_OPERATIONS_TRUSTED_AUDIENCE",
-        # The four budget/TTL variables (ADR 0005 sub-budget model).
+        # The four frozen budget/TTL variables the core contract reads.
+        "GBAW_OPERATIONS_PER_READ_BUDGET_S",
+        "GBAW_OPERATIONS_PERSISTENCE_BUDGET_S",
+        "GBAW_OPERATIONS_CANCELLATION_MARGIN_S",
+        "GBAW_OPERATIONS_OBSERVATION_TTL_S",
+    }
+)
+# The unused content bucket binding and the unused request-deadline env var must
+# never appear in the runtime environment. The old ``_SECONDS`` budget names are
+# also forbidden: they diverged from the core contract and were silently ignored.
+FORBIDDEN_ENV_KEYS = frozenset(
+    {
+        "GBAW_OPERATIONS_CONTENT_BUCKET",
         "GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS",
         "GBAW_OPERATIONS_PROVIDER_READ_BUDGET_SECONDS",
         "GBAW_OPERATIONS_PERSISTENCE_BUDGET_SECONDS",
         "GBAW_OPERATIONS_RECORD_TTL_SECONDS",
     }
 )
-FORBIDDEN_ENV_KEYS = frozenset({"GBAW_OPERATIONS_CONTENT_BUCKET"})
 GAMELIFT_READ_ACTIONS = frozenset(
     {
         "gamelift:DescribeFleetUtilization",
@@ -107,6 +133,22 @@ FORBIDDEN_ACTION_SUBSTRINGS = (
     # GenerateDataKey and reads via Decrypt.
     "kms:Encrypt",
 )
+
+# The transitive runtime-dependency closure the core handler imports at load
+# time (rfc8785 for canonical JSON; jsonschema + referencing for contract
+# validation) and their own dependencies. Every one must be pinned in the
+# package at the version frozen in the repository lock (backend/uv.lock).
+PINNED_RUNTIME_DEPS = {
+    "rfc8785": "0.1.4",
+    "jsonschema": "4.26.0",
+    "jsonschema-specifications": "2025.9.1",
+    "referencing": "0.36.2",
+    "attrs": "25.4.0",
+    "rpds-py": "2026.5.1",
+}
+# The one native (non-pure-python) dependency: its wheels are platform-specific,
+# so the package MUST carry a Linux/x86_64 manylinux wheel, never the host wheel.
+NATIVE_DEP = "rpds-py"
 
 
 # --------------------------------------------------------------------------- #
@@ -176,6 +218,29 @@ def test_multi_tenant_and_code_artifact_parameters_present(template):
         assert required in params, f"missing parameter {required}"
 
 
+def test_budget_and_ttl_parameters_are_validated_and_present(template):
+    """Each frozen budget/TTL env var must be backed by a validated CFN
+    parameter so operators tune real, bounded runtime knobs."""
+    params = template["Parameters"]
+    for name in ("PerReadBudgetSeconds", "PersistenceBudgetSeconds", "CancellationMarginSeconds"):
+        assert name in params, f"missing budget parameter {name}"
+        p = params[name]
+        assert p["Type"] == "Number"
+        assert int(p["MinValue"]) >= 1
+        assert int(p["MaxValue"]) <= 29, f"{name} must be bounded below the 30s gateway ceiling"
+    ttl = params["ObservationTtlSeconds"]
+    assert ttl["Type"] == "Number"
+    assert int(ttl["MinValue"]) >= 1
+
+
+def test_unused_request_deadline_env_parameter_absent_from_env(template):
+    """RequestDeadlineSeconds survives only as the Lambda Timeout; core derives
+    the deadline from the sub-budgets + margin, so no deadline env is injected."""
+    fn = _observation_function(template)
+    env = fn["Environment"]["Variables"]
+    assert "GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS" not in env
+
+
 def test_enabled_mode_validation_rules_present(template):
     """When OperationsMode=observe, the enabling inputs must be validated so an
     enabled deploy cannot proceed with empty issuer/audience/tenant/code."""
@@ -213,11 +278,14 @@ def test_http_api_is_authenticated_with_jwt_on_every_route(template):
         assert "AuthorizerId" in props, f"{name} must reference the authorizer"
 
 
-def test_status_route_is_retained(template):
-    """Core (#413) will implement GET status; the route must remain."""
+def test_status_route_is_the_frozen_operation_id_path(template):
+    """Status is read at the frozen path parameter route.
+
+    The status route key must be exactly ``GET /operations/{operationId}``.
+    """
     routes = _resources_of_type(template, "AWS::ApiGatewayV2::Route")
     route_keys = {r["Properties"].get("RouteKey") for r in routes.values()}
-    assert any(k and k.startswith("GET ") for k in route_keys), "GET status route must be retained"
+    assert "GET /operations/{operationId}" in route_keys, f"status route must be the frozen path, got {route_keys}"
 
 
 def test_http_api_has_access_logs_and_throttling(template):
@@ -250,6 +318,12 @@ def test_lambda_has_reserved_concurrency_and_bounded_timeout(template):
     assert (
         int(params["RequestDeadlineSeconds"]["MaxValue"]) <= 29
     ), "timeout must be bounded below the 30s gateway ceiling"
+
+
+def test_lambda_runtime_is_python313_x86_64(template):
+    fn = _observation_function(template)
+    assert fn["Runtime"] == "python3.13", "runtime must be the frozen Python 3.13"
+    assert fn.get("Architectures") == ["x86_64"], "architecture must be x86_64"
 
 
 def test_lambda_code_points_to_s3_artifact_not_inline_placeholder(template):
@@ -430,7 +504,46 @@ def test_teardown_all_never_invokes_operations_teardown():
 
 
 # --------------------------------------------------------------------------- #
-# Shell safety of the wrappers
+# Placeholder package removal (core's real handler is the only owner)
+# --------------------------------------------------------------------------- #
+def test_infra_owned_placeholder_observe_package_is_removed():
+    """The infra worktree must not ship its own operations/observe placeholder;
+    on a combined tree core's real handler must be the only owner of the path."""
+    observe_dir = BACKEND_SRC / "operations" / "observe"
+    assert not observe_dir.exists(), (
+        "the infra-owned placeholder operations/observe package must be deleted "
+        "so it cannot add/add-conflict with core's real handler"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Packaging contract (cross-platform Linux/x86_64, pinned, import-probed)
+# --------------------------------------------------------------------------- #
+def test_packaging_pins_every_transitive_runtime_dependency():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    for name, version in PINNED_RUNTIME_DEPS.items():
+        assert f"{name}=={version}" in text, f"packaging must pin {name}=={version} from the repository lock"
+
+
+def test_packaging_targets_linux_x86_64_never_host_wheels():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # A deterministic cross-platform install: pip/uv platform targeting for the
+    # Lambda manylinux x86_64 ABI, binary-only so no host wheel is ever built.
+    assert "--platform" in text, "packaging must use an explicit --platform target"
+    assert "manylinux" in text and "x86_64" in text, "packaging must target the Linux x86_64 manylinux ABI"
+    assert "--only-binary" in text, "packaging must be binary-only so host native wheels are never built"
+    assert "--python-version" in text or "3.13" in text, "packaging must target the Python 3.13 ABI"
+
+
+def test_packaging_import_probe_runs_on_clean_linux_environment():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # The import probe must resolve the frozen handler from the staged package.
+    assert "importlib.import_module" in text or "import operations.observe.lambda_entry" in text
+    assert "lambda_entry" in text
+
+
+# --------------------------------------------------------------------------- #
+# Shell safety and explicit-profile propagation of the wrappers
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("wrapper", ["deploy", "teardown"])
 def test_wrappers_use_strict_mode(wrapper):
@@ -438,6 +551,30 @@ def test_wrappers_use_strict_mode(wrapper):
     assert path.exists(), f"missing wrapper: {path}"
     text = path.read_text(encoding="utf-8")
     assert re.search(r"set -euo pipefail", text), "wrapper must use strict mode"
+
+
+@pytest.mark.parametrize("wrapper", ["deploy", "teardown"])
+def test_wrappers_pass_profile_explicitly_to_every_aws_call(wrapper):
+    """Every ``aws`` invocation must pass ``--profile`` explicitly rather than
+    relying on an ambient AWS_PROFILE only."""
+    path = DEPLOY_WRAPPER if wrapper == "deploy" else TEARDOWN_WRAPPER
+    text = path.read_text(encoding="utf-8")
+    # Fold backslash-continued lines so a multi-line aws call is one logical line,
+    # then look for actual command invocations of the aws CLI. A command position
+    # is line start, after a pipe/`;`/`&&`, or inside a `$( ... )` / backtick
+    # capture. Comment lines (first non-space char is ``#``) and prose are skipped.
+    folded = text.replace("\\\n", " ")
+    invocation = re.compile(r"(?:^|[;&|]|\$\(|`)\s*(?:! )?(?:[A-Z_]+=\"?\$\()?aws\s")
+    for raw in folded.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            continue
+        if invocation.search(raw):
+            # The profile is passed explicitly either as a literal --profile flag
+            # or via the AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE") array, which
+            # is the DRY form the wrappers use on every call.
+            has_profile = "--profile" in raw or "AWS_PROFILE_ARGS" in raw
+            assert has_profile, f"aws call must pass --profile explicitly: {stripped}"
 
 
 def test_deploy_wrapper_requires_explicit_opt_in():
@@ -461,6 +598,23 @@ def test_deploy_wrapper_builds_and_uploads_artifact():
     assert "CodeS3Bucket" in text and "CodeS3Key" in text
     assert "s3 cp" in text or "s3api put-object" in text
     assert "sha256" in text.lower(), "artifact key must be content-hash addressed"
+
+
+def test_deploy_wrapper_requires_explicit_existing_artifact_bucket():
+    """The artifact bucket must be an explicit, pre-existing bucket that the
+    wrapper verifies; it must never discover or create a bucket."""
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    assert "GBAW_OPERATIONS_ARTIFACT_BUCKET" in text, "an explicit artifact bucket env var is required"
+    assert "head-bucket" in text, "the supplied bucket must be verified to exist"
+    # No unsafe name discovery and no bucket creation.
+    assert "list-buckets" not in text, "bucket-name discovery via list-buckets must be removed"
+    assert "create-bucket" not in text, "the wrapper must never create a bucket"
+
+
+def test_deploy_wrapper_verifies_bucket_region_and_account_context():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # The bucket's region/account context is confirmed before upload.
+    assert "get-bucket-location" in text, "bucket region context must be verified"
 
 
 def test_preview_is_read_only_no_change_set():
