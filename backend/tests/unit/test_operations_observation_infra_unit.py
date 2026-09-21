@@ -35,6 +35,7 @@ contract**:
 """
 
 # Standard library
+import json
 import pathlib
 import re
 
@@ -692,3 +693,201 @@ def test_teardown_wrapper_has_no_delete_data_claim():
     path; cleanup of retained data is a separate, explicit future step."""
     text = TEARDOWN_WRAPPER.read_text(encoding="utf-8")
     assert "--delete-data" not in text, "the silent --delete-data claim must be removed"
+
+
+# --------------------------------------------------------------------------- #
+# Rollback-safe stateful resources + CloudWatch Logs / API Gateway authorization
+# regression suite (GitHub issue #413 beta-stack create failure).
+#
+# A real beta `create` failed at BOTH KMS-encrypted log groups with a CloudWatch
+# Logs AccessDenied because the CMK key policy granted the logs service principal
+# only kms:Decrypt + kms:GenerateDataKey, while CloudWatch Logs additionally
+# requires Encrypt / ReEncrypt* / Describe* to attach a KMS key to a log group.
+# The failed create then ORPHANED an empty DynamoDB table and CMK because
+# DeletionPolicy: Retain also retains on create-rollback. These tests reproduce
+# the exact missing-action failure structurally and enforce rollback-safe
+# stateful policies, the documented least-privilege logs grant scoped by
+# encryption context to exactly the two log-group ARNs, and the API Gateway
+# access-log-delivery resource policy.
+# --------------------------------------------------------------------------- #
+
+# The exact least-privilege action set the CloudWatch Logs service principal
+# needs to attach a CMK to a log group and read/write encrypted log data, per
+# the AWS "Encrypt log data in CloudWatch Logs using AWS KMS" guide. Encrypt and
+# ReEncrypt were the actions missing in the failed beta create.
+REQUIRED_LOGS_KMS_ACTION_PREFIXES = (
+    "kms:Encrypt",
+    "kms:Decrypt",
+    "kms:ReEncrypt",
+    "kms:GenerateDataKey",
+    "kms:Describe",
+)
+
+# The two CMK-encrypted log groups whose ARNs the key-policy encryption-context
+# condition must scope to exactly. Both failed in the real create.
+LAMBDA_LOG_GROUP_SUFFIX = "log-group:/aws/lambda/${ProjectName}-operations-observe"
+ACCESS_LOG_GROUP_SUFFIX = "log-group:/aws/apigateway/${ProjectName}-operations-access"
+
+# Stateful resources that must survive teardown/update-replacement but must NOT
+# orphan on a failed initial create.
+STATEFUL_RESOURCE_TYPES = frozenset(
+    {
+        "AWS::KMS::Key",
+        "AWS::DynamoDB::Table",
+        "AWS::Logs::LogGroup",
+    }
+)
+
+
+def _kms_key(template):
+    keys = _resources_of_type(template, "AWS::KMS::Key")
+    assert keys, "expected a CMK"
+    return next(iter(keys.values()))
+
+
+def _logs_key_statements(template):
+    """Every CMK key-policy statement whose principal is a ``logs.*`` service."""
+    statements = _kms_key(template)["Properties"]["KeyPolicy"]["Statement"]
+    matched = []
+    for stmt in statements:
+        principal = stmt.get("Principal", {})
+        service = principal.get("Service")
+        services = [service] if isinstance(service, str) else (service or [])
+        if any(isinstance(svc, str) and "logs." in svc for svc in services):
+            matched.append(stmt)
+    return matched
+
+
+def _statement_action_set(stmt):
+    return set(_iter_action_strings([stmt.get("Action")]))
+
+
+def test_kms_key_policy_grants_full_cloudwatch_logs_action_set(template):
+    """RED against the failed beta create: the logs-principal grant carried only
+    Decrypt + GenerateDataKey. CloudWatch Logs also requires Encrypt, ReEncrypt*,
+    and Describe* to attach the CMK to a log group, so a grant missing any of
+    them reproduces the AccessDenied that failed the create."""
+    logs_statements = _logs_key_statements(template)
+    assert logs_statements, "KMS key policy must grant the CloudWatch Logs service principal"
+    granted = set()
+    for stmt in logs_statements:
+        assert stmt.get("Effect") == "Allow", "logs grant must be an Allow"
+        granted |= _statement_action_set(stmt)
+    for required in REQUIRED_LOGS_KMS_ACTION_PREFIXES:
+        assert any(
+            action.startswith(required) for action in granted
+        ), f"CloudWatch Logs KMS grant is missing a {required}* action (got {sorted(granted)})"
+
+
+def test_kms_logs_grant_scoped_by_encryption_context_to_exactly_two_log_groups(template):
+    """The logs grant must be scoped by the aws:logs:arn encryption context to
+    exactly the two operations log groups (Lambda + API access), not a broad
+    wildcard that would over-grant, and not a scope that omits either group so
+    that its create fails."""
+    logs_statements = _logs_key_statements(template)
+    assert logs_statements, "expected a logs-principal grant"
+    context_values = []
+    for stmt in logs_statements:
+        condition = stmt.get("Condition", {})
+        for _operator, mapping in condition.items():
+            for ctx_key, ctx_val in mapping.items():
+                if "kms:EncryptionContext:aws:logs:arn" in ctx_key:
+                    if isinstance(ctx_val, list):
+                        context_values.extend(ctx_val)
+                    else:
+                        context_values.append(ctx_val)
+    assert context_values, "logs grant must be scoped by the aws:logs:arn encryption context"
+    joined = "\n".join(context_values)
+    assert LAMBDA_LOG_GROUP_SUFFIX in joined, "encryption context must include the Lambda log group ARN"
+    assert ACCESS_LOG_GROUP_SUFFIX in joined, "encryption context must include the API access log group ARN"
+    # No bare account/region wildcard that matches every log group in the account.
+    for value in context_values:
+        assert not value.rstrip().endswith(":*"), f"encryption-context scope is too broad: {value}"
+        assert not value.rstrip().endswith("log-group:*"), f"encryption-context scope is too broad: {value}"
+
+
+def test_kms_logs_grant_uses_regional_service_principal(template):
+    """CloudWatch Logs must be granted via its Region-qualified service principal
+    (logs.<region>.amazonaws.com), matching the account/region the key lives in."""
+    logs_statements = _logs_key_statements(template)
+    assert logs_statements, "expected a logs-principal grant"
+    for stmt in logs_statements:
+        principal = stmt["Principal"]["Service"]
+        services = [principal] if isinstance(principal, str) else principal
+        assert any(
+            "${AWS::Region}" in svc or re.match(r"logs\.[a-z0-9-]+\.amazonaws\.com", svc) for svc in services
+        ), f"logs principal must be Region-qualified, got {services}"
+
+
+def test_execution_role_kms_grant_still_excludes_encrypt(template):
+    """E1 preservation: adding Encrypt to the *key policy* for the logs service
+    must NOT leak kms:Encrypt into the Lambda execution *role* — the runtime
+    still uses only Decrypt + envelope GenerateDataKey."""
+    role_actions = [a for a in _all_policy_actions(template) if a.lower().startswith("kms:")]
+    assert role_actions, "expected scoped KMS actions on the execution role"
+    for action in role_actions:
+        assert action in {"kms:Decrypt", "kms:GenerateDataKey"}, f"unexpected role KMS action: {action}"
+
+
+def test_stateful_resources_are_rollback_safe_not_plain_retain(template):
+    """RED against the orphaning defect: KMS key, DynamoDB table, and log groups
+    used DeletionPolicy: Retain, which retains even on a failed initial create,
+    orphaning empty resources. They must use RetainExceptOnCreate so a rolled-back
+    create cleans up, while still retaining in-use data on teardown."""
+    found = 0
+    for name, body in template["Resources"].items():
+        if body.get("Type") in STATEFUL_RESOURCE_TYPES:
+            found += 1
+            assert (
+                body.get("DeletionPolicy") == "RetainExceptOnCreate"
+            ), f"{name} must use DeletionPolicy: RetainExceptOnCreate, got {body.get('DeletionPolicy')!r}"
+    assert found >= 3, "expected the KMS key, DynamoDB table, and at least one log group"
+
+
+def test_stateful_resources_retain_data_on_update_replacement(template):
+    """Retained data must survive an update that replaces the physical resource:
+    UpdateReplacePolicy stays Retain (RetainExceptOnCreate is not a valid
+    UpdateReplacePolicy value and would not protect a replacement)."""
+    for name, body in template["Resources"].items():
+        if body.get("Type") in STATEFUL_RESOURCE_TYPES:
+            assert (
+                body.get("UpdateReplacePolicy") == "Retain"
+            ), f"{name} must keep UpdateReplacePolicy: Retain to preserve data on replacement"
+
+
+def test_api_gateway_access_log_delivery_resource_policy_present(template):
+    """API Gateway access-log delivery to CloudWatch Logs requires a log-group
+    resource policy granting the log-delivery service principal
+    CreateLogStream/PutLogEvents. Without it, enabling access logging fails at
+    delivery time. Scope it to this account and this API."""
+    policies = _resources_of_type(template, "AWS::Logs::ResourcePolicy")
+    assert policies, "expected an AWS::Logs::ResourcePolicy for access-log delivery"
+    body = next(iter(policies.values()))
+    props = body.get("Properties", {})
+    assert props.get("PolicyName"), "resource policy must be named"
+    doc_text = props.get("PolicyDocument", "")
+    if isinstance(doc_text, dict):
+        # Some loaders may surface the embedded JSON as a mapping; normalize.
+        doc_text = json.dumps(doc_text)
+    assert isinstance(doc_text, str), "PolicyDocument is expected to be an embedded JSON string"
+    assert "delivery.logs.amazonaws.com" in doc_text, "must grant the log-delivery service principal"
+    assert "logs:CreateLogStream" in doc_text, "must allow CreateLogStream for delivery"
+    assert "logs:PutLogEvents" in doc_text, "must allow PutLogEvents for delivery"
+    # Scoped to this account and this API where CloudFormation permits.
+    assert "aws:SourceAccount" in doc_text, "delivery grant must be scoped by SourceAccount"
+    assert "${AWS::AccountId}" in doc_text, "delivery grant must reference this account"
+    assert "HttpApi" in doc_text, "delivery grant must be scoped to this API (SourceArn)"
+
+
+def test_access_log_resource_policy_is_gated_and_scoped_to_access_group(template):
+    """The delivery resource policy is part of the optional stack (gated on
+    OperationsEnabled) and targets the API access log group, not the whole
+    account's log groups."""
+    policies = _resources_of_type(template, "AWS::Logs::ResourcePolicy")
+    assert policies, "expected an AWS::Logs::ResourcePolicy"
+    for name, body in policies.items():
+        assert body.get("Condition") == "OperationsEnabled", f"{name} must be gated on OperationsEnabled"
+    doc_text = next(iter(policies.values()))["Properties"]["PolicyDocument"]
+    if isinstance(doc_text, dict):
+        doc_text = json.dumps(doc_text)
+    assert "operations-access" in doc_text, "delivery grant must target the API access log group"
