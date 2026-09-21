@@ -23,13 +23,22 @@ Design constraints enforced here (issue #412 / ADR 0005):
 * Explicit per-call, persistence/serialization, total, and cancellation-margin
   budgets whose components sum to strictly less than the 30-second gateway
   ceiling.
-* Every provider read is issued with its own deadline; the whole request also
-  has a total deadline set below ``ceiling - cancellation_margin``.
+* Every provider read is issued with its own **wall-clock** deadline: the read
+  runs in a worker thread and the request thread waits at most the smaller of
+  the per-read budget and the remaining total budget. A read that blocks past
+  that deadline is abandoned and a typed *retryable* error is raised **before**
+  the read returns, so the request fails closed ahead of the gateway timeout
+  rather than merely detecting the overrun after a blocking call returns. A read
+  that *does* return but took longer than its budget (measured on the injected
+  clock) is also rejected, so the two checks together cover both a hung read and
+  a merely-slow one.
 * On any deadline overrun the request **fails closed**: in-flight work is
-  abandoned, a typed *retryable* error is raised, and no partial observation is
-  ever returned as success.
+  abandoned (the runner's executor is shut down without waiting), a typed
+  *retryable* error is raised, and no partial observation is ever returned as
+  success.
 * Correct percentile reporting (nearest-rank) over the collected sample, with
-  sample size, p50/p95/p99/max, failure, and timeout counts.
+  sample size, p50/p95/p99/max, and separate failure, timeout, and partial
+  denial counts.
 
 This is a disposable spike. It adds no production tables, buckets, API routes,
 queues, workers, or provider write permissions, and does not enable operations.
@@ -41,10 +50,11 @@ provider payloads.
 from __future__ import annotations
 
 # Standard library
+import concurrent.futures
 import math
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 # Local modules
@@ -61,7 +71,7 @@ PROVIDER_READ_COUNT: int = 3
 
 
 class DeadlineExceededError(TimeoutError):
-    """A per-call, persistence, or total deadline was exceeded.
+    """A per-call or persistence deadline was exceeded.
 
     Raised when the observation cannot complete within its budget. It maps to a
     typed, *retryable* application error (``PROVIDER_UNAVAILABLE``) so the
@@ -91,7 +101,9 @@ class PartialObservationError(RuntimeError):
 
     Fail-closed guard: an observation that could not gather all three reads is
     never returned as success. Retryable for the same reason as
-    :class:`DeadlineExceededError`.
+    :class:`DeadlineExceededError`. Reported separately from timeouts because it
+    is a distinct provider condition (a read that answered, but with no usable
+    result) rather than a latency overrun.
     """
 
     error_code: str = "PROVIDER_UNAVAILABLE"
@@ -193,17 +205,34 @@ def percentile_nearest_rank(samples: Sequence[float], percentile: float) -> floa
 
 @dataclass(frozen=True)
 class LatencySummary:
-    """Public-safe latency statistics for a batch of observation runs."""
+    """Public-safe latency statistics for a batch of observation runs.
+
+    ``failures``, ``timeouts``, and ``partial_denials`` are three distinct
+    fail-closed buckets: a provider error, a wall-clock deadline overrun, and a
+    read that answered with no usable result, respectively. Keeping them apart
+    lets a reader see *why* the run was not clean, not just that it was not.
+    """
 
     sample_size: int
     successes: int
     failures: int
     timeouts: int
+    partial_denials: int
     percentile_method: str
     p50_ms: float
     p95_ms: float
     p99_ms: float
     max_ms: float
+
+    @property
+    def clean_run(self) -> bool:
+        """True iff every attempted sample succeeded (no non-success outcome).
+
+        This is the strict acceptance predicate: a measured p99 is only
+        meaningful evidence for the synchronous design if the whole sample
+        completed without any failure, timeout, or partial denial.
+        """
+        return self.sample_size > 0 and self.successes == self.sample_size
 
     def as_public_dict(self) -> dict[str, Any]:
         """Return a JSON-safe dict. Contains statistics only, no identifiers."""
@@ -212,6 +241,7 @@ class LatencySummary:
             "successes": self.successes,
             "failures": self.failures,
             "timeouts": self.timeouts,
+            "partial_denials": self.partial_denials,
             "percentile_method": self.percentile_method,
             "p50_ms": round(self.p50_ms, 3),
             "p95_ms": round(self.p95_ms, 3),
@@ -225,27 +255,30 @@ def summarize_latencies(
     *,
     failures: int = 0,
     timeouts: int = 0,
+    partial_denials: int = 0,
 ) -> LatencySummary:
-    """Summarize successful-run latencies plus failure and timeout counts.
+    """Summarize successful-run latencies plus fail-closed counts.
 
     ``success_latencies_s`` holds the wall-clock duration (seconds) of every run
     that completed successfully. Percentiles are computed over successful runs
-    only, using the nearest-rank method; failures and timeouts are reported as
-    counts so a reader can see the fail-closed rate alongside the latency
-    distribution. Sample size is the total number of runs attempted.
+    only, using the nearest-rank method; failures, timeouts, and partial denials
+    are reported as separate counts so a reader can see the fail-closed rate and
+    its cause alongside the latency distribution. Sample size is the total
+    number of runs attempted.
     """
-    if failures < 0 or timeouts < 0:
-        raise ValueError("failure and timeout counts must be non-negative")
+    if failures < 0 or timeouts < 0 or partial_denials < 0:
+        raise ValueError("failure, timeout, and partial-denial counts must be non-negative")
     successes = len(success_latencies_s)
-    sample_size = successes + failures + timeouts
+    sample_size = successes + failures + timeouts + partial_denials
     if successes == 0:
         # No successful runs: percentiles are undefined; report zeros so the
-        # summary is still emitted and the failure/timeout counts tell the story.
+        # summary is still emitted and the fail-closed counts tell the story.
         return LatencySummary(
             sample_size=sample_size,
             successes=0,
             failures=failures,
             timeouts=timeouts,
+            partial_denials=partial_denials,
             percentile_method="nearest_rank",
             p50_ms=0.0,
             p95_ms=0.0,
@@ -257,6 +290,7 @@ def summarize_latencies(
         successes=successes,
         failures=failures,
         timeouts=timeouts,
+        partial_denials=partial_denials,
         percentile_method="nearest_rank",
         p50_ms=percentile_nearest_rank(success_latencies_s, 50) * 1000.0,
         p95_ms=percentile_nearest_rank(success_latencies_s, 95) * 1000.0,
@@ -290,12 +324,20 @@ ProviderRead = Callable[[], Any]
 class ObservationRunner:
     """Executes the deterministic E1 observation request path under budget.
 
-    The runner is constructed with a :class:`LatencyBudget`, a monotonic clock,
-    and an optional persistence sink. Each :meth:`run` performs the three
-    supplied read-only reads under their per-call deadlines, then persists and
-    canonically serializes a representative observation record under the
-    persistence deadline, enforcing the total deadline throughout and failing
-    closed on any overrun.
+    The runner is constructed with a :class:`LatencyBudget`, a clock used to
+    *measure* durations, and an optional persistence sink. Each :meth:`run`
+    performs the three supplied read-only reads under their per-call **wall-clock**
+    deadlines, then persists and canonically serializes a representative
+    observation record under the persistence deadline, enforcing the total
+    deadline throughout and failing closed on any overrun.
+
+    Wall-clock enforcement is real: each read is executed in a worker thread and
+    the request waits at most the remaining budget for it. If the read does not
+    return in time it is abandoned — the request raises immediately and does not
+    join the still-running worker, so a hung provider read can never make the
+    request (or the harness) wait past its deadline. A read that returns within
+    the wait but whose measured elapsed time still exceeds the per-read budget
+    is likewise rejected.
     """
 
     def __init__(
@@ -317,58 +359,93 @@ class ObservationRunner:
         return self._budget
 
     def run(self, reads: Sequence[ProviderRead]) -> ObservationOutcome:
-        """Run one observation. Raises on deadline overrun or partial result."""
+        """Run one observation. Raises on deadline overrun or partial result.
+
+        Raises :class:`DeadlineExceededError` (retryable) when a read exceeds its
+        per-read budget — enforced both as a real wall-clock wait (a hung read is
+        pre-empted before it returns) and as a post-return elapsed check — or
+        when persistence exceeds its budget, and :class:`PartialObservationError`
+        (retryable) if a read yields no usable result. The whole-request (total)
+        deadline is enforced *compositionally* by these per-phase bounds plus the
+        positive cancellation margin, not by a separate late check. Never returns
+        a partial observation as success.
+        """
         if len(reads) != self._budget.read_count:
             raise ValueError(f"observation requires exactly {self._budget.read_count} reads, got {len(reads)}")
 
         start = self._clock()
-        deadline = start + self._budget.total_deadline_s
+        deadline_s = self._budget.total_deadline_s
         read_durations: list[float] = []
-        results: list[Any] = []
 
-        for i, read in enumerate(reads):
-            call_start = self._clock()
-            # Fail closed before issuing a read if the total budget is already
-            # spent — never start work we cannot finish in time.
-            if call_start >= deadline:
-                raise DeadlineExceededError("total", call_start - start, self._budget.total_deadline_s)
-            result = read()
-            call_elapsed = self._clock() - call_start
-            # Per-call deadline: a single slow read must not consume the whole
-            # request budget.
-            if call_elapsed > self._budget.per_read_s:
-                raise DeadlineExceededError(f"read[{i}]", call_elapsed, self._budget.per_read_s)
-            if result is None:
-                # A read that produced nothing cannot yield a complete
-                # observation: fail closed rather than persist a partial result.
-                raise PartialObservationError("provider read returned no result")
-            read_durations.append(call_elapsed)
-            results.append(result)
+        # One dedicated single-worker executor per request. On any overrun we
+        # shut it down with wait=False and cancel_futures=True so the request
+        # never blocks on abandoned work; a still-running read thread is left to
+        # finish on its own (it holds no lock and performs only a read).
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="e0-read")
+        abandoned = False
+        try:
+            for i, read in enumerate(reads):
+                call_start = self._clock()
+                # Wall-clock budget for this read: never wait longer than either
+                # the per-read budget or whatever remains of the total deadline.
+                # remaining_total is a defensive floor; the budget invariant
+                # (read_count*per_read + persistence + margin == total, margin > 0)
+                # makes per_read_s the binding bound during reads.
+                remaining_total = deadline_s - (call_start - start)
+                read_budget = min(self._budget.per_read_s, remaining_total)
+                future = executor.submit(read)
+                try:
+                    result = future.result(timeout=read_budget)
+                except concurrent.futures.TimeoutError:
+                    # The read is still running; abandon it and fail closed
+                    # before it returns rather than waiting for the worker.
+                    abandoned = True
+                    future.cancel()
+                    call_elapsed = self._clock() - call_start
+                    raise DeadlineExceededError(f"read[{i}]", call_elapsed, self._budget.per_read_s)
 
-        # Persistence + canonical serialization phase.
-        persist_start = self._clock()
-        if persist_start >= deadline:
-            raise DeadlineExceededError("total", persist_start - start, self._budget.total_deadline_s)
-        record = self._build_record(read_durations)
-        # Canonical (RFC 8785) serialization of the representative persisted
-        # record, then a representative persistence write via the sink.
-        canonical_bytes = canonicalize(record)
-        record_hash = canonical_sha256(record)
-        self._persist(canonical_bytes)
-        persist_elapsed = self._clock() - persist_start
-        if persist_elapsed > self._budget.persistence_s:
-            raise DeadlineExceededError("persistence", persist_elapsed, self._budget.persistence_s)
+                call_elapsed = self._clock() - call_start
+                # Post-return per-call check on the measured clock: a read that
+                # returned but took longer than its budget still fails closed.
+                if call_elapsed > self._budget.per_read_s:
+                    raise DeadlineExceededError(f"read[{i}]", call_elapsed, self._budget.per_read_s)
+                if result is None:
+                    # A read that produced nothing cannot yield a complete
+                    # observation: fail closed rather than persist a partial one.
+                    raise PartialObservationError("provider read returned no result")
+                read_durations.append(call_elapsed)
 
-        total_elapsed = self._clock() - start
-        if total_elapsed > self._budget.total_deadline_s:
-            raise DeadlineExceededError("total", total_elapsed, self._budget.total_deadline_s)
+            # Persistence + canonical serialization phase, bounded on its own.
+            persist_start = self._clock()
+            record = self._build_record(read_durations)
+            canonical_bytes = canonicalize(record)
+            record_hash = canonical_sha256(record)
+            self._persist(canonical_bytes)
+            persist_elapsed = self._clock() - persist_start
+            if persist_elapsed > self._budget.persistence_s:
+                raise DeadlineExceededError("persistence", persist_elapsed, self._budget.persistence_s)
 
-        return ObservationOutcome(
-            read_durations_s=read_durations,
-            persistence_s=persist_elapsed,
-            total_s=total_elapsed,
-            record_hash=record_hash,
-        )
+            # The whole-request deadline is enforced *compositionally*, not by a
+            # separate late check: each read is bounded by per_read_s and
+            # persistence by persistence_s, and the budget guarantees
+            # read_count*per_read_s + persistence_s + cancellation_margin_s ==
+            # total_deadline_s with a strictly positive margin. A late "total"
+            # check after these bounds could therefore never fire for any valid
+            # budget, so it is intentionally omitted rather than left as dead,
+            # misleading code. total_s below is reported for the evidence record.
+            total_elapsed = self._clock() - start
+
+            return ObservationOutcome(
+                read_durations_s=read_durations,
+                persistence_s=persist_elapsed,
+                total_s=total_elapsed,
+                record_hash=record_hash,
+            )
+        finally:
+            # Never block the request on abandoned work. When a read timed out we
+            # cannot wait for the worker; when the run completed cleanly the
+            # worker is already idle and a non-blocking shutdown is still safe.
+            executor.shutdown(wait=not abandoned, cancel_futures=True)
 
     def _build_record(self, read_durations: Sequence[float]) -> dict[str, Any]:
         """Build a representative, public-safe observation record to serialize.

@@ -5,9 +5,16 @@ Covers issue #412 acceptance behaviors that do not require live AWS:
 * explicit sub-budgets that sum below the 30s gateway ceiling and reserve a
   cancellation margin;
 * the deterministic three-read + persistence + canonical-serialization path;
-* correct nearest-rank percentile reporting with sample/failure/timeout counts;
+* correct nearest-rank percentile reporting with sample/failure/timeout/partial
+  counts;
 * fail-closed behavior on per-call, persistence, and total deadline overrun; and
 * denial of partial results as success.
+
+Real wall-clock enforcement (a hung read pre-empted before it returns) is
+covered separately in ``test_operations_e0_wallclock_unit.py``. The tests here
+drive the runner with a deterministic ``FakeClock`` that advances only the
+*measurement* clock; the reads themselves return instantly in real time, so the
+post-return elapsed checks are exercised without real sleeping.
 """
 
 from __future__ import annotations
@@ -110,11 +117,14 @@ def test_percentile_rejects_empty_and_out_of_range():
 
 def test_summary_reports_counts_and_public_safe_dict():
     latencies = [x / 1000.0 for x in range(1, 101)]  # 1ms..100ms
-    summary = summarize_latencies(latencies, failures=2, timeouts=1)
-    assert summary.sample_size == 103
+    summary = summarize_latencies(latencies, failures=2, timeouts=1, partial_denials=1)
+    assert summary.sample_size == 104
     assert summary.successes == 100
     assert summary.failures == 2
     assert summary.timeouts == 1
+    assert summary.partial_denials == 1
+    # A sample with any non-success is not a clean run.
+    assert summary.clean_run is False
     assert summary.percentile_method == "nearest_rank"
     assert summary.p50_ms == pytest.approx(50.0)
     assert summary.p99_ms == pytest.approx(99.0)
@@ -128,6 +138,7 @@ def test_summary_reports_counts_and_public_safe_dict():
         "successes",
         "failures",
         "timeouts",
+        "partial_denials",
         "percentile_method",
         "p50_ms",
         "p95_ms",
@@ -136,11 +147,20 @@ def test_summary_reports_counts_and_public_safe_dict():
     }
 
 
+def test_summary_all_successes_is_clean_run():
+    summary = summarize_latencies([0.01, 0.02, 0.03])
+    assert summary.clean_run is True
+    assert summary.sample_size == 3
+    assert summary.successes == 3
+
+
 def test_summary_with_no_successes_reports_zero_percentiles():
-    summary = summarize_latencies([], failures=3, timeouts=2)
-    assert summary.sample_size == 5
+    summary = summarize_latencies([], failures=3, timeouts=2, partial_denials=1)
+    assert summary.sample_size == 6
     assert summary.successes == 0
+    assert summary.partial_denials == 1
     assert summary.p99_ms == 0.0
+    assert summary.clean_run is False
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +173,7 @@ def test_run_completes_three_reads_and_returns_hashed_record():
     persisted: list[bytes] = []
     runner = ObservationRunner(clock=clock, persist=persisted.append)
 
-    # Each read advances the clock by 0.5s; persistence by 0.2s.
+    # Each read advances the measurement clock by 0.5s; persistence by 0.2s.
     def timed_read(i):
         def _read():
             clock.advance(0.5)
@@ -212,25 +232,28 @@ def test_persistence_overrun_fails_closed():
     assert exc.value.retryable is True
 
 
-def test_total_deadline_overrun_before_persistence_fails_closed():
+def test_over_budget_read_fails_closed_on_its_per_read_bound():
+    # A read that runs far longer than its per-read budget fails closed on that
+    # per-read bound. The whole-request (total) deadline is enforced
+    # compositionally by the per-read and persistence bounds plus the positive
+    # cancellation margin, so there is no separate late "total" branch to hit
+    # here: the offending read is caught first, by its own budget.
     clock = FakeClock()
     runner = ObservationRunner(clock=clock)
 
-    # Each read consumes exactly the per-read budget (allowed individually), but
-    # together they exhaust the total deadline before persistence can start.
     per = DEFAULT_BUDGET.per_read_s
 
     def edge_read():
-        clock.advance(per)
+        clock.advance(per)  # exactly at budget: allowed
         return {"ok": True}
 
-    # Push the total past the deadline by making the last read land beyond it.
-    def last_read():
-        clock.advance(DEFAULT_BUDGET.total_deadline_s)
+    def over_budget_read():
+        clock.advance(DEFAULT_BUDGET.total_deadline_s)  # far over per-read budget
         return {"ok": True}
 
-    with pytest.raises(DeadlineExceededError):
-        runner.run([edge_read, edge_read, last_read])
+    with pytest.raises(DeadlineExceededError) as exc:
+        runner.run([edge_read, edge_read, over_budget_read])
+    assert exc.value.phase == "read[2]"
 
 
 def test_partial_result_never_returned_as_success():
