@@ -20,11 +20,12 @@ Parameters:
     Default: disabled
     AllowedValues:
       - disabled
-      - enabled
+      - observe
     Description: >-
       Master enablement for the optional operations control plane. "disabled"
       (the default) creates zero E1 resources even when this stack is deployed.
-      Set to "enabled" only when an owner explicitly opts in.
+      "observe" is the only enabled mode for E1: synchronous, read-only GameLift
+      observation. Set to "observe" only when an owner explicitly opts in.
 
   Environment:
     Type: String
@@ -42,14 +43,51 @@ Parameters:
     Description: >-
       JWT issuer URL (Cognito user pool issuer, e.g.
       https://cognito-idp.us-west-2.amazonaws.com/us-west-2_example) bound to the
-      HTTP API authorizer. Required when OperationsMode=enabled.
+      HTTP API authorizer. Required when OperationsMode=observe.
 
   CognitoClientId:
     Type: String
     Default: ''
     Description: >-
       Cognito application client id used as the JWT audience on every route.
-      Required when OperationsMode=enabled.
+      Required when OperationsMode=observe.
+
+  TenantId:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted tenant binding injected into the runtime as
+      GBAW_OPERATIONS_TENANT_ID. Required when OperationsMode=observe.
+
+  WorkspaceId:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted workspace binding injected into the runtime as
+      GBAW_OPERATIONS_WORKSPACE_ID. Required when OperationsMode=observe.
+
+  TrustedAudience:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted audience the runtime enforces (GBAW_OPERATIONS_TRUSTED_AUDIENCE).
+      Defaults to the Cognito client id when left empty at enable time (the
+      wrapper supplies it); an explicit value overrides.
+
+  CodeS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 bucket holding the packaged operations Lambda artifact. Supplied by the
+      deploy wrapper after it builds and uploads a deterministic zip. Required
+      when OperationsMode=observe.
+
+  CodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Content-hash-addressed S3 key of the packaged operations Lambda artifact.
+      Supplied by the deploy wrapper. Required when OperationsMode=observe.
 
   RequestDeadlineSeconds:
     Type: Number
@@ -57,9 +95,35 @@ Parameters:
     MinValue: 5
     MaxValue: 29
     Description: >-
-      Total observation request budget in seconds. Bounded below the 30 s API
-      Gateway HTTP API integration ceiling so the request fails closed before
-      the gateway times out.
+      Total observation request budget in seconds (ADR 0005). Bounded below the
+      30 s API Gateway HTTP API integration ceiling so the request fails closed
+      before the gateway times out.
+
+  ProviderReadBudgetSeconds:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      Per-provider-read sub-budget in seconds (ADR 0005). A read that blocks past
+      this bound is abandoned and a typed retryable error is raised.
+
+  PersistenceBudgetSeconds:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      Persistence + canonical serialization sub-budget in seconds (ADR 0005).
+
+  RecordTtlSeconds:
+    Type: Number
+    Default: 2592000
+    MinValue: 3600
+    Description: >-
+      Time-to-live in seconds applied to the DynamoDB `ttl` attribute for
+      expiring transient observation records. The audit ledger and idempotency
+      mapping are retained for the full audit window and are not TTL-managed.
 
   LambdaMemoryMb:
     Type: Number
@@ -104,12 +168,37 @@ Parameters:
 Conditions:
   # Master switch. Every resource references this, so OperationsMode=disabled
   # (the default) provisions nothing.
-  OperationsEnabled: !Equals [!Ref OperationsMode, enabled]
+  OperationsEnabled: !Equals [!Ref OperationsMode, observe]
   IsProd: !Equals [!Ref Environment, prod]
+  # An explicit trusted audience overrides the Cognito client id fallback.
+  HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
+
+Rules:
+  # Enabled-mode validation: when OperationsMode=observe, the enabling inputs
+  # must be non-empty so an enabled deploy can never proceed with a missing
+  # issuer, audience, tenant, workspace, or code artifact.
+  EnabledModeRequiresInputs:
+    RuleCondition: !Equals [!Ref OperationsMode, observe]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoIssuer, '']]
+        AssertDescription: CognitoIssuer is required when OperationsMode=observe.
+      - Assert: !Not [!Equals [!Ref CognitoClientId, '']]
+        AssertDescription: CognitoClientId is required when OperationsMode=observe.
+      - Assert: !Not [!Equals [!Ref TenantId, '']]
+        AssertDescription: TenantId is required when OperationsMode=observe.
+      - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
+        AssertDescription: WorkspaceId is required when OperationsMode=observe.
+      - Assert: !Not [!Equals [!Ref CodeS3Bucket, '']]
+        AssertDescription: CodeS3Bucket is required when OperationsMode=observe.
+      - Assert: !Not [!Equals [!Ref CodeS3Key, '']]
+        AssertDescription: CodeS3Key is required when OperationsMode=observe.
 
 Resources:
   # --------------------------------------------------------------------------- #
   # KMS customer-managed key for at-rest encryption of E1 audit data.
+  # The key policy also grants the CloudWatch Logs service principal the
+  # encrypt/decrypt actions it needs to write to the CMK-encrypted log groups,
+  # scoped to this account's operations log groups.
   # --------------------------------------------------------------------------- #
   OperationsKmsKey:
     Type: AWS::KMS::Key
@@ -128,6 +217,17 @@ Resources:
               AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
+          - Sid: AllowCloudWatchLogsEncryptDecrypt
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*/${ProjectName}-operations*'
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -168,7 +268,7 @@ Resources:
         - AttributeName: SK
           KeyType: RANGE
       TimeToLiveSpecification:
-        AttributeName: expiresAt
+        AttributeName: ttl
         Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
@@ -181,39 +281,6 @@ Resources:
         MaxReadRequestUnits: !Ref MaxReadRequestUnits
         MaxWriteRequestUnits: !Ref MaxWriteRequestUnits
       DeletionProtectionEnabled: !If [IsProd, true, false]
-      Tags:
-        - Key: Project
-          Value: !Ref ProjectName
-        - Key: Component
-          Value: operations-observation
-        - Key: CostCenter
-          Value: game-operations
-        - Key: ManagedBy
-          Value: cloudformation
-
-  # --------------------------------------------------------------------------- #
-  # S3: content-addressed observation records.
-  # --------------------------------------------------------------------------- #
-  OperationsContentBucket:
-    Type: AWS::S3::Bucket
-    Condition: OperationsEnabled
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketName: !Sub '${ProjectName}-operations-content-${AWS::AccountId}-${AWS::Region}'
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: aws:kms
-              KMSMasterKeyID: !Ref OperationsKmsKey
-            BucketKeyEnabled: true
-      VersioningConfiguration:
-        Status: Enabled
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -249,9 +316,10 @@ Resources:
 
   # --------------------------------------------------------------------------- #
   # IAM: dedicated, least-privilege observation execution role.
-  # Exactly three GameLift reads; scoped DynamoDB + S3 + KMS + logs + metrics.
-  # No GameLift writes, no iam:PassRole, no Step Functions, no
-  # UpdateItem/DeleteItem/Scan, no wildcard actions.
+  # Exactly three GameLift reads; DynamoDB limited to the reads and single
+  # transactional write core uses; KMS decrypt + envelope generation only;
+  # namespace-scoped PutMetricData. No S3, no GameLift writes, no iam:PassRole,
+  # no Step Functions, no UpdateItem/DeleteItem/PutItem/Scan, no wildcard action.
   # --------------------------------------------------------------------------- #
   ObservationRole:
     Type: AWS::IAM::Role
@@ -281,38 +349,22 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: TableScopedReadsAndTransactionalWrites
+              - Sid: TableScopedReadsAndTransactionalWrite
                 Effect: Allow
                 Action:
                   - 'dynamodb:GetItem'
                   - 'dynamodb:Query'
-                  - 'dynamodb:BatchGetItem'
-                  - 'dynamodb:PutItem'
-                  - 'dynamodb:ConditionCheckItem'
                   - 'dynamodb:TransactWriteItems'
-                  - 'dynamodb:TransactGetItems'
                 Resource:
                   - !GetAtt OperationsTable.Arn
-        - PolicyName: OperationsContentAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: ContentAddressedObjects
-                Effect: Allow
-                Action:
-                  - 's3:GetObject'
-                  - 's3:PutObject'
-                Resource:
-                  - !Sub '${OperationsContentBucket.Arn}/*'
         - PolicyName: OperationsKmsUse
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: EncryptDecryptAuditData
+              - Sid: EnvelopeEncryptAuditData
                 Effect: Allow
                 Action:
                   - 'kms:Decrypt'
-                  - 'kms:Encrypt'
                   - 'kms:GenerateDataKey'
                 Resource:
                   - !GetAtt OperationsKmsKey.Arn
@@ -353,7 +405,9 @@ Resources:
           Value: cloudformation
 
   # --------------------------------------------------------------------------- #
-  # Lambda: request-scoped observation compute.
+  # Lambda: request-scoped observation compute. Code is a real packaged artifact
+  # loaded from S3 (built and uploaded by the deploy wrapper under a content-hash
+  # key); no inline shim is ever the deployed artifact for an enabled route.
   # --------------------------------------------------------------------------- #
   ObservationFunction:
     Type: AWS::Lambda::Function
@@ -375,20 +429,20 @@ Resources:
         Variables:
           GBAW_OPERATIONS_MODE: !Ref OperationsMode
           GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTable
-          GBAW_OPERATIONS_CONTENT_BUCKET: !Ref OperationsContentBucket
           GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
+            - HasExplicitTrustedAudience
+            - !Ref TrustedAudience
+            - !Ref CognitoClientId
           GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS: !Ref RequestDeadlineSeconds
+          GBAW_OPERATIONS_PROVIDER_READ_BUDGET_SECONDS: !Ref ProviderReadBudgetSeconds
+          GBAW_OPERATIONS_PERSISTENCE_BUDGET_SECONDS: !Ref PersistenceBudgetSeconds
+          GBAW_OPERATIONS_RECORD_TTL_SECONDS: !Ref RecordTtlSeconds
       Code:
-        # Placeholder inline shim. Repository automation (deploy-operations.sh)
-        # repackages the backend "operations.observe.lambda_entry" handler owned
-        # by issue #413 (core) before an enabled deploy. This inline body keeps
-        # the template self-contained and lintable; it is never the deployed
-        # artifact for a real observation path.
-        ZipFile: |
-          def handler(event, context):
-              raise RuntimeError(
-                  "operations observe placeholder; package operations.observe.lambda_entry"
-              )
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -458,6 +512,7 @@ Resources:
       AuthorizerId: !Ref JwtAuthorizer
       Target: !Sub 'integrations/${ObservationIntegration}'
 
+  # GET status route retained: core (#413) will implement operation status reads.
   StatusRoute:
     Type: AWS::ApiGatewayV2::Route
     Condition: OperationsEnabled
@@ -553,7 +608,8 @@ Resources:
       AlarmDescription: Observation request latency approaching the request deadline.
       Namespace: 'GameAgent/Operations'
       MetricName: ObservationRequestLatency
-      Statistic: p99
+      # p99 is a percentile and must be an ExtendedStatistic, not Statistic.
+      ExtendedStatistic: p99
       Period: 300
       EvaluationPeriods: 1
       # 27,000 ms acceptance ceiling from ADR 0005 (ceiling - margin).
@@ -579,13 +635,6 @@ Outputs:
     Value: !Ref OperationsTable
     Export:
       Name: !Sub '${ProjectName}-OperationsTableName'
-
-  OperationsContentBucketName:
-    Condition: OperationsEnabled
-    Description: S3 bucket for content-addressed observation records.
-    Value: !Ref OperationsContentBucket
-    Export:
-      Name: !Sub '${ProjectName}-OperationsContentBucketName'
 
   ObservationRoleArn:
     Condition: OperationsEnabled

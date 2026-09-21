@@ -327,17 +327,19 @@ stack is deployed only by its dedicated wrapper and is never wired into
 `deploy-all.sh`:
 
 ```bash
-# Preview only — renders a plan and creates nothing:
+# Preview only — READ-ONLY validate + lint, creates nothing (no change set):
 ./scripts/infrastructure/deploy-operations.sh
 
-# Explicit opt-in deploy (both the env value and the flag are required):
-GBAW_OPERATIONS_MODE=enabled COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
+# Explicit opt-in deploy (observe mode env value AND the flag are required):
+GBAW_OPERATIONS_MODE=observe COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
+  TENANT_ID=... WORKSPACE_ID=... AWS_PROFILE=... AWS_REGION=... \
   ./scripts/infrastructure/deploy-operations.sh --enable --environment prod
 
 # Safe, data-preserving disable/rollback (removes the request path, keeps data):
-GBAW_OPERATIONS_MODE=disabled ./scripts/infrastructure/deploy-operations.sh --disable
+./scripts/infrastructure/deploy-operations.sh --disable
 
-# Explicit teardown — never invoked by teardown-all.sh:
+# Explicit teardown — never invoked by teardown-all.sh. Deletes only the stack;
+# retained audit data is left intact (separate manual future step to remove it):
 ./scripts/infrastructure/teardown-operations.sh --confirm delete-operations
 ```
 

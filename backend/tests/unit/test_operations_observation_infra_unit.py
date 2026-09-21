@@ -2,25 +2,29 @@
 operations observation control plane (GitHub issue #413).
 
 These tests never call AWS. They parse the repository-owned CloudFormation
-template and shell wrappers as data and assert:
+template and shell wrappers as data and assert the **frozen E1 runtime
+contract**:
 
 * positive resources (authenticated HTTP API + JWT authorizer on every route,
   access logs, Lambda with reserved concurrency and bounded timeout, DynamoDB
-  PAY_PER_REQUEST with PK/SK + TTL + PITR + KMS + deletion protection, a
+  PAY_PER_REQUEST with PK/SK + ``ttl`` TTL + PITR + KMS + deletion protection, a
   distinct least-privilege observation role, alarms/metrics/log retention,
   outputs, and tags);
-* negative IAM invariants (exactly three GameLift reads; no GameLift write,
-  ``iam:PassRole``, Step Functions, DynamoDB ``UpdateItem``/``DeleteItem``/
-  ``Scan``, or wildcard action);
-* the default-disabled invariant (every resource gated on ``OperationsEnabled``,
-  ``OperationsMode`` default ``disabled``, and the stack un-wired from
-  ``deploy-all.sh`` / ``scripts/deploy.sh``); and
-* shell safety of the deploy/teardown wrappers (strict mode, explicit opt-in,
-  teardown never invoked automatically).
+* the frozen handler, ``OperationsMode`` vocabulary (``disabled``/``observe``),
+  the exact Lambda environment bindings, the ``ttl`` TTL attribute, the frozen
+  metric names, the ExtendedStatistic p99 latency alarm, the multi-tenant and
+  code-artifact parameters with enabled-mode ``Rules`` validation, and the
+  CloudWatch Logs KMS key-policy grant;
+* negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
+  ``GetItem``/``Query``/``TransactWriteItems``; no S3 runtime access, no
+  ``kms:Encrypt``, no GameLift write, ``iam:PassRole``, Step Functions,
+  ``UpdateItem``/``DeleteItem``/``PutItem``/``Scan``, or wildcard action);
+* the removal of the unused S3 content bucket, its env binding, and its output;
+* the default-disabled invariant; and
+* shell safety of the deploy/teardown wrappers.
 """
 
 # Standard library
-import json
 import pathlib
 import re
 
@@ -49,11 +53,38 @@ FROZEN_METRICS = (
     "StuckOperations",
     "ObservationRequestLatency",
 )
+# Exact Lambda environment bindings frozen for E1. The content bucket binding is
+# intentionally NOT here — it was removed with the unused S3 content bucket.
+REQUIRED_ENV_KEYS = frozenset(
+    {
+        "GBAW_OPERATIONS_MODE",
+        "GBAW_OPERATIONS_TABLE_NAME",
+        "GBAW_OPERATIONS_METRIC_NAMESPACE",
+        "GBAW_OPERATIONS_TENANT_ID",
+        "GBAW_OPERATIONS_WORKSPACE_ID",
+        "GBAW_OPERATIONS_TRUSTED_AUDIENCE",
+        # The four budget/TTL variables (ADR 0005 sub-budget model).
+        "GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS",
+        "GBAW_OPERATIONS_PROVIDER_READ_BUDGET_SECONDS",
+        "GBAW_OPERATIONS_PERSISTENCE_BUDGET_SECONDS",
+        "GBAW_OPERATIONS_RECORD_TTL_SECONDS",
+    }
+)
+FORBIDDEN_ENV_KEYS = frozenset({"GBAW_OPERATIONS_CONTENT_BUCKET"})
 GAMELIFT_READ_ACTIONS = frozenset(
     {
         "gamelift:DescribeFleetUtilization",
         "gamelift:DescribeFleetCapacity",
         "gamelift:DescribeScalingPolicies",
+    }
+)
+# DynamoDB runtime actions are limited to what core actually uses: bounded reads
+# and the single transactional write.
+ALLOWED_DYNAMODB_ACTIONS = frozenset(
+    {
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:TransactWriteItems",
     }
 )
 FORBIDDEN_ACTION_SUBSTRINGS = (
@@ -67,7 +98,14 @@ FORBIDDEN_ACTION_SUBSTRINGS = (
     "states:",
     "dynamodb:UpdateItem",
     "dynamodb:DeleteItem",
+    "dynamodb:PutItem",
     "dynamodb:Scan",
+    "dynamodb:BatchWriteItem",
+    # The unused content bucket and its runtime access are removed entirely.
+    "s3:",
+    # Encrypt is unnecessary; the runtime uses envelope encryption via
+    # GenerateDataKey and reads via Decrypt.
+    "kms:Encrypt",
 )
 
 
@@ -117,18 +155,42 @@ def _all_policy_actions(template):
     return actions
 
 
+def _observation_function(template):
+    functions = _resources_of_type(template, "AWS::Lambda::Function")
+    assert functions, "expected the observation Lambda"
+    return next(iter(functions.values()))["Properties"]
+
+
+# --------------------------------------------------------------------------- #
+# Frozen mode vocabulary and parameters
+# --------------------------------------------------------------------------- #
+def test_operations_mode_vocabulary_is_disabled_or_observe(template):
+    mode = template["Parameters"]["OperationsMode"]
+    assert mode["Default"] == "disabled"
+    assert set(mode["AllowedValues"]) == {"disabled", "observe"}
+
+
+def test_multi_tenant_and_code_artifact_parameters_present(template):
+    params = template["Parameters"]
+    for required in ("TenantId", "WorkspaceId", "CodeS3Bucket", "CodeS3Key"):
+        assert required in params, f"missing parameter {required}"
+
+
+def test_enabled_mode_validation_rules_present(template):
+    """When OperationsMode=observe, the enabling inputs must be validated so an
+    enabled deploy cannot proceed with empty issuer/audience/tenant/code."""
+    rules = template.get("Rules", {})
+    assert rules, "expected a Rules block enforcing enabled-mode inputs"
+    text = TEMPLATE.read_text(encoding="utf-8")
+    # The rule must key off observe mode and assert the critical inputs.
+    assert "observe" in text
+    for referenced in ("CognitoIssuer", "CognitoClientId", "TenantId", "WorkspaceId", "CodeS3Bucket", "CodeS3Key"):
+        assert referenced in text, f"enabled-mode validation must reference {referenced}"
+
+
 # --------------------------------------------------------------------------- #
 # Positive resource assertions
 # --------------------------------------------------------------------------- #
-def test_template_is_a_separate_optional_stack(template):
-    assert "OperationsMode" in template["Parameters"]
-    assert template["Parameters"]["OperationsMode"]["Default"] == "disabled"
-    assert set(template["Parameters"]["OperationsMode"]["AllowedValues"]) == {
-        "disabled",
-        "enabled",
-    }
-
-
 def test_http_api_is_authenticated_with_jwt_on_every_route(template):
     apis = _resources_of_type(template, "AWS::ApiGatewayV2::Api")
     assert apis, "expected an HTTP API"
@@ -151,6 +213,13 @@ def test_http_api_is_authenticated_with_jwt_on_every_route(template):
         assert "AuthorizerId" in props, f"{name} must reference the authorizer"
 
 
+def test_status_route_is_retained(template):
+    """Core (#413) will implement GET status; the route must remain."""
+    routes = _resources_of_type(template, "AWS::ApiGatewayV2::Route")
+    route_keys = {r["Properties"].get("RouteKey") for r in routes.values()}
+    assert any(k and k.startswith("GET ") for k in route_keys), "GET status route must be retained"
+
+
 def test_http_api_has_access_logs_and_throttling(template):
     stages = _resources_of_type(template, "AWS::ApiGatewayV2::Stage")
     assert stages, "expected an API stage"
@@ -164,16 +233,10 @@ def test_http_api_has_access_logs_and_throttling(template):
 
 
 def test_lambda_has_reserved_concurrency_and_bounded_timeout(template):
-    functions = _resources_of_type(template, "AWS::Lambda::Function")
-    assert functions, "expected the observation Lambda"
-    fn = next(iter(functions.values()))["Properties"]
+    fn = _observation_function(template)
     assert fn["Handler"] == HANDLER
     assert fn["TracingConfig"]["Mode"] == "Active", "X-Ray tracing required"
 
-    # CloudFormation intrinsics (!Ref) render as plain strings under the safe
-    # loader, so assert the resource wires the bounded parameters and that those
-    # parameters carry the required numeric constraints. This is the
-    # parser-verifiable truth without resolving intrinsics.
     params = template["Parameters"]
 
     reserved_ref = fn["ReservedConcurrentExecutions"]
@@ -189,6 +252,30 @@ def test_lambda_has_reserved_concurrency_and_bounded_timeout(template):
     ), "timeout must be bounded below the 30s gateway ceiling"
 
 
+def test_lambda_code_points_to_s3_artifact_not_inline_placeholder(template):
+    """No enabled route may point at placeholder code: the function loads a real
+    packaged artifact from S3 (Code.S3Bucket / Code.S3Key), never an inline
+    ZipFile shim."""
+    fn = _observation_function(template)
+    code = fn.get("Code", {})
+    assert "ZipFile" not in code, "inline placeholder code is forbidden for an enabled route"
+    assert code.get("S3Bucket") == "CodeS3Bucket", "Code.S3Bucket must come from the CodeS3Bucket parameter"
+    assert code.get("S3Key") == "CodeS3Key", "Code.S3Key must come from the CodeS3Key parameter"
+    text = TEMPLATE.read_text(encoding="utf-8")
+    assert "placeholder" not in text.lower(), "no placeholder code path may remain"
+
+
+def test_lambda_environment_bindings_are_exact(template):
+    fn = _observation_function(template)
+    env = fn["Environment"]["Variables"]
+    present = set(env.keys())
+    missing = REQUIRED_ENV_KEYS - present
+    assert not missing, f"missing frozen env bindings: {sorted(missing)}"
+    forbidden = FORBIDDEN_ENV_KEYS & present
+    assert not forbidden, f"forbidden env bindings present: {sorted(forbidden)}"
+    assert env["GBAW_OPERATIONS_METRIC_NAMESPACE"] == METRIC_NAMESPACE
+
+
 def test_dynamodb_table_is_secure_and_recoverable(template):
     tables = _resources_of_type(template, "AWS::DynamoDB::Table")
     assert tables, "expected the operations table"
@@ -199,22 +286,27 @@ def test_dynamodb_table_is_secure_and_recoverable(template):
     assert key_types.get("HASH") == "PK", "partition key must be PK"
     assert key_types.get("RANGE") == "SK", "sort key must be SK"
 
-    assert table["TimeToLiveSpecification"]["Enabled"] is True
+    ttl = table["TimeToLiveSpecification"]
+    assert ttl["Enabled"] is True
+    assert ttl["AttributeName"] == "ttl", "frozen TTL attribute must be 'ttl'"
     assert table["PointInTimeRecoverySpecification"]["PointInTimeRecoveryEnabled"] is True
     sse = table["SSESpecification"]
     assert sse["SSEEnabled"] is True
     assert sse.get("SSEType") == "KMS", "table must use KMS encryption"
-    # Denial-of-wallet cap on on-demand throughput.
     on_demand = table.get("OnDemandThroughput", {})
     assert on_demand.get("MaxReadRequestUnits")
     assert on_demand.get("MaxWriteRequestUnits")
+
+
+def test_no_s3_content_bucket_resource(template):
+    buckets = _resources_of_type(template, "AWS::S3::Bucket")
+    assert not buckets, "the unused E1 content bucket must be removed"
 
 
 def test_alarms_metrics_and_log_retention_present(template):
     alarms = _resources_of_type(template, "AWS::CloudWatch::Alarm")
     assert len(alarms) >= 4, "expected at least four alarms"
     alarm_metrics = {a["Properties"].get("MetricName") for a in alarms.values()}
-    # Failures, timeouts, stuck operations must each have an alarm.
     for required in ("ObservationFailures", "ObservationTimeouts", "StuckOperations"):
         assert required in alarm_metrics, f"missing alarm for {required}"
     for a in alarms.values():
@@ -226,11 +318,54 @@ def test_alarms_metrics_and_log_retention_present(template):
         assert lg["Properties"].get("RetentionInDays"), "log retention must be set"
 
 
+def test_latency_alarm_uses_extended_statistic_p99(template):
+    alarms = _resources_of_type(template, "AWS::CloudWatch::Alarm")
+    latency = [
+        a["Properties"] for a in alarms.values() if a["Properties"].get("MetricName") == "ObservationRequestLatency"
+    ]
+    assert latency, "expected a latency alarm"
+    props = latency[0]
+    # p99 is a percentile: it must be expressed as ExtendedStatistic, not the
+    # invalid Statistic: p99.
+    assert "Statistic" not in props, "percentile must not use the Statistic field"
+    assert props.get("ExtendedStatistic") == "p99", "latency alarm must use ExtendedStatistic p99"
+
+
+def test_cloudwatch_logs_kms_key_policy_present(template):
+    """The CMK encrypts the Lambda and API access log groups, so its key policy
+    must grant the CloudWatch Logs service principal encrypt/decrypt on the key,
+    scoped to this account's log groups."""
+    keys = _resources_of_type(template, "AWS::KMS::Key")
+    assert keys, "expected a CMK"
+    key = next(iter(keys.values()))["Properties"]
+    statements = key["KeyPolicy"]["Statement"]
+
+    def _principal_services(stmt):
+        principal = stmt.get("Principal", {})
+        service = principal.get("Service")
+        if isinstance(service, str):
+            return [service]
+        if isinstance(service, list):
+            return service
+        return []
+
+    logs_statements = [s for s in statements if any("logs." in svc for svc in _principal_services(s))]
+    assert logs_statements, "KMS key policy must grant the CloudWatch Logs service principal"
+    granted = set(_iter_action_strings([s.get("Action") for s in logs_statements]))
+    assert any(a.startswith("kms:Decrypt") for a in granted)
+    assert any(a.startswith("kms:GenerateDataKey") for a in granted)
+
+
 def test_outputs_and_tags_present(template):
     assert "Outputs" in template and template["Outputs"], "expected stack outputs"
-    # Every taggable resource carries the cost-allocation project tag.
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "Project" in text and "ManagedBy" in text
+
+
+def test_no_content_bucket_output(template):
+    outputs = template.get("Outputs", {})
+    for name in outputs:
+        assert "ContentBucket" not in name, "content bucket output must be removed"
 
 
 # --------------------------------------------------------------------------- #
@@ -261,18 +396,15 @@ def test_no_forbidden_actions(template):
 def test_dynamodb_actions_are_scoped_and_bounded(template):
     actions = [a for a in _all_policy_actions(template) if a.lower().startswith("dynamodb:")]
     assert actions, "expected scoped DynamoDB actions"
-    # Only these read/transactional verbs; no bulk Scan, UpdateItem, DeleteItem.
-    allowed = {
-        "dynamodb:GetItem",
-        "dynamodb:Query",
-        "dynamodb:BatchGetItem",
-        "dynamodb:PutItem",
-        "dynamodb:ConditionCheckItem",
-        "dynamodb:TransactWriteItems",
-        "dynamodb:TransactGetItems",
-    }
     for action in actions:
-        assert action in allowed, f"unexpected DynamoDB action: {action}"
+        assert action in ALLOWED_DYNAMODB_ACTIONS, f"unexpected DynamoDB action: {action}"
+
+
+def test_kms_actions_are_minimal(template):
+    actions = [a for a in _all_policy_actions(template) if a.lower().startswith("kms:")]
+    # Runtime policy uses only decrypt + envelope generation; no Encrypt.
+    for action in actions:
+        assert action in {"kms:Decrypt", "kms:GenerateDataKey"}, f"unexpected KMS action: {action}"
 
 
 # --------------------------------------------------------------------------- #
@@ -310,11 +442,32 @@ def test_wrappers_use_strict_mode(wrapper):
 
 def test_deploy_wrapper_requires_explicit_opt_in():
     text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
-    # Must gate enabled deploys behind both an env value and a flag.
+    # Enabled deploys are gated behind both the observe env value and the flag.
     assert "GBAW_OPERATIONS_MODE" in text
+    assert "observe" in text
     assert "--enable" in text
-    # Default (no opt-in) must not run an enabling cloudformation deploy.
-    assert "OperationsMode=disabled" in text or "disabled" in text
+
+
+def test_deploy_wrapper_verifies_caller_identity_before_writes():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    assert "get-caller-identity" in text, "wrapper must verify caller identity before any write"
+    assert "AWS_PROFILE" in text and "AWS_REGION" in text
+
+
+def test_deploy_wrapper_builds_and_uploads_artifact():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # A real packaging path: build a deterministic zip and upload under a
+    # content-hash key, then pass CodeS3Bucket / CodeS3Key.
+    assert "CodeS3Bucket" in text and "CodeS3Key" in text
+    assert "s3 cp" in text or "s3api put-object" in text
+    assert "sha256" in text.lower(), "artifact key must be content-hash addressed"
+
+
+def test_preview_is_read_only_no_change_set():
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # Preview validates/lints only; it must not create a change set.
+    assert "create-change-set" not in text, "preview must not create a change set"
+    assert "validate-template" in text or "cfn-lint" in text
 
 
 def test_teardown_wrapper_requires_explicit_confirmation():
@@ -322,3 +475,10 @@ def test_teardown_wrapper_requires_explicit_confirmation():
     assert "--confirm" in text
     assert "delete-operations" in text
     assert "delete-stack" in text
+
+
+def test_teardown_wrapper_has_no_delete_data_claim():
+    """Teardown retains audit data and must not advertise a silent --delete-data
+    path; cleanup of retained data is a separate, explicit future step."""
+    text = TEARDOWN_WRAPPER.read_text(encoding="utf-8")
+    assert "--delete-data" not in text, "the silent --delete-data claim must be removed"
