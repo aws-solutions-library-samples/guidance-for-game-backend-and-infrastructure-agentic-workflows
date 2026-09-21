@@ -18,7 +18,13 @@ These tests:
 1. Prove the (now fixed) production call sites emit the exception class and
    message through a captured loguru sink configured exactly like production
    (``backtrace=False, diagnose=False``), while NOT leaking sensitive locals.
-2. Guard against the regression at the framework level by asserting that
+2. Make that non-disclosure assertion genuinely *discriminating*: the same
+   raising code path is exercised through a ``diagnose=True`` sink to prove the
+   sensitive local's VALUE would in fact be disclosed there, and through the
+   production ``diagnose=False`` sink to prove it is not. Without the positive
+   half, ``_SENSITIVE_LOCAL not in output`` could pass simply because the value
+   never enters any traceback — proving nothing about ``diagnose``.
+3. Guard against the regression at the framework level by asserting that
    ``exc_info=`` on a production-shaped loguru sink drops the traceback (the
    bug), so the value of switching to ``logger.exception`` is pinned by a test.
 """
@@ -42,6 +48,17 @@ pytestmark = pytest.mark.unit
 _SENSITIVE_LOCAL = "SECRET-token-value-should-never-be-logged"
 
 
+def _add_sink(buffer: io.StringIO, *, diagnose: bool) -> int:
+    """Add a loguru sink; ``diagnose`` toggles local-VALUE annotation."""
+    return logger.add(
+        buffer,
+        level="DEBUG",
+        format="{level} | {name}:{function}:{line} | {message}",
+        backtrace=False,
+        diagnose=diagnose,
+    )
+
+
 class _ProductionSink:
     """A loguru sink configured exactly like the production stdout handler.
 
@@ -52,13 +69,7 @@ class _ProductionSink:
 
     def __init__(self) -> None:
         self._buffer = io.StringIO()
-        self._sink_id = logger.add(
-            self._buffer,
-            level="DEBUG",
-            format="{level} | {name}:{function}:{line} | {message}",
-            backtrace=False,
-            diagnose=False,
-        )
+        self._sink_id = _add_sink(self._buffer, diagnose=False)
 
     def __enter__(self) -> "io.StringIO":
         return self._buffer
@@ -67,9 +78,31 @@ class _ProductionSink:
         logger.remove(self._sink_id)
 
 
-def _raise_client_error() -> None:
-    """Raise a realistic botocore error with a sensitive value in a local."""
-    secret_request_token = _SENSITIVE_LOCAL  # noqa: F841 -- present to prove it is not logged
+class _DiagnoseSink:
+    """A loguru sink with ``diagnose=True`` — annotates local VALUES.
+
+    This is the debug/non-production configuration (utils/logger.py enables it
+    only when ``_DEBUG_LOGGING``). It exists here to prove the sensitive value
+    genuinely flows into the traceback, so the production sink's *absence* of it
+    is a real property of ``diagnose=False`` and not an artifact of the value
+    never appearing.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = io.StringIO()
+        self._sink_id = _add_sink(self._buffer, diagnose=True)
+
+    def __enter__(self) -> "io.StringIO":
+        return self._buffer
+
+    def __exit__(self, *_exc: object) -> None:
+        logger.remove(self._sink_id)
+
+
+def _boom(_token: str) -> None:
+    """Innermost frame that raises. ``_token`` is bound so the caller's
+    reference to the sensitive local sits on the failing source line, which is
+    what loguru's ``diagnose`` annotates."""
     raise ClientError(
         {
             "Error": {
@@ -79,6 +112,13 @@ def _raise_client_error() -> None:
         },
         "GetCostAndUsage",
     )
+
+
+def _raise_client_error() -> None:
+    """Raise a realistic botocore error, passing a sensitive value on the
+    failing call line so ``diagnose=True`` would annotate its VALUE."""
+    secret_request_token = _SENSITIVE_LOCAL
+    _boom(secret_request_token)
 
 
 def _failing_client_factory():
@@ -113,6 +153,45 @@ def test_create_report_emits_exception_class_and_message():
 
     # But it must NOT leak local variable VALUES (diagnose=False).
     assert _SENSITIVE_LOCAL not in output
+
+
+def test_sensitive_local_disclosure_is_discriminating():
+    """The non-disclosure guarantee is a property of ``diagnose=False``.
+
+    Exercising the identical raising path through both sinks proves the point:
+    with ``diagnose=True`` the sensitive local's VALUE is annotated into the
+    traceback, and with the production ``diagnose=False`` sink it is not. This is
+    what makes ``_SENSITIVE_LOCAL not in output`` a real assertion rather than a
+    vacuous one.
+    """
+    # Positive half: diagnose=True DOES disclose the local's value.
+    with _DiagnoseSink() as diag_buffer:
+        try:
+            _raise_client_error()
+        except ClientError:
+            logger.exception("operation failed")
+        diagnose_output = diag_buffer.getvalue()
+
+    assert "ClientError" in diagnose_output
+    assert "Traceback (most recent call last)" in diagnose_output
+    assert _SENSITIVE_LOCAL in diagnose_output, (
+        "expected diagnose=True to annotate the sensitive local's VALUE; if this "
+        "fails the negative assertion below proves nothing"
+    )
+
+    # Negative half: the production sink (diagnose=False) does NOT disclose it,
+    # while still carrying class + message + frames.
+    with _ProductionSink() as prod_buffer:
+        try:
+            _raise_client_error()
+        except ClientError:
+            logger.exception("operation failed")
+        production_output = prod_buffer.getvalue()
+
+    assert "ClientError" in production_output
+    assert "ValidationException" in production_output
+    assert "Traceback (most recent call last)" in production_output
+    assert _SENSITIVE_LOCAL not in production_output
 
 
 def test_production_sink_records_exception_via_logger_exception():
