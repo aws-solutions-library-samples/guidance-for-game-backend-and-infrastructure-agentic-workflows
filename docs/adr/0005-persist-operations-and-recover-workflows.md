@@ -19,6 +19,42 @@ and approval authority) are stable and can be reviewed now, but the record
 stays Proposed until the latency acceptance evidence exists. See
 [Deferred decisions](#deferred-decisions).
 
+### E0 latency validation status (issue #412)
+
+The E0 validation spike ([#412](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/412))
+has produced the deterministic measurement path and its acceptance gate, but not
+yet a live measured percentile. It therefore does **not** move this record to
+Accepted.
+
+What the spike establishes now:
+
+- The exact E1 observation is three bounded, read-only GameLift reads for one
+  fleet — `describe_fleet_utilization`, `describe_fleet_capacity`,
+  `describe_scaling_policies` — plus the transactional persistence and RFC 8785
+  canonical serialization of the observation records.
+- Explicit sub-budgets that sum below the 30 s gateway integration ceiling:
+  3.0 s per read (×3), 3.0 s persistence + canonical serialization, and a 3.0 s
+  cancellation margin, for a 15.0 s total request deadline. The acceptance
+  ceiling is `ceiling − margin` = 27.0 s.
+- A read-only harness and full offline test suite that issue exactly the three
+  reads, fail closed with a typed **retryable** error (`PROVIDER_UNAVAILABLE`)
+  on any per-call, persistence, or total overrun, never return a partial result
+  as success, and report sample size, failures, timeouts, and p50/p95/p99/max
+  using the nearest-rank percentile method.
+- A public-safe evidence schema and reproduction guide under
+  [`docs/evidence/`](../evidence/README.md).
+
+Acceptance rule to apply once the live run exists: **synchronous accepted iff
+the measured p99 ≤ 27.0 s** over a representative sample.
+
+Remaining live step (not completed in the read-only validation wave): run the
+harness against **one classic GameLift fleet** in a non-production account and
+record `docs/evidence/e0-latency-<date>.json`. The available demo account has no
+classic fleet — only a container fleet, which `describe_fleet_utilization`
+rejects (`Operation only supports Fleet resource`) — so representative live
+measurement requires provisioning a classic fleet, an AWS mutation outside this
+wave. This record stays **Proposed** until that evidence exists and is reviewed.
+
 ## Context
 
 The optional operations control plane accepted in [ADR 0001](0001-preserve-chat-and-add-optional-operations.md)
