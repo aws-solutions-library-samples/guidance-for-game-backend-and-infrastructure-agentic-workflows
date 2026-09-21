@@ -293,3 +293,99 @@ Run them with:
 ```bash
 cd backend && uv run pytest -m unit -k "operations_observation or operations_wrappers or operations_observe_lambda_entry"
 ```
+
+## Deployed shakedown (manual, credentialed, read-only)
+
+The template/wrapper tests above prove the deployed *shape* without any AWS
+call. The **deployed shakedown** is the complementary step: it exercises an
+already-deployed, `observe`-mode E1 endpoint end-to-end over HTTP to prove the
+live boundary *behaves* the way the frozen contract promises. It is a
+disposable, read-only harness — it performs **no** AWS mutation, never deploys,
+enables, disables, or tears down anything, and emits only a **sanitized**
+public-safe summary.
+
+It is a manual, credentialed step, deliberately kept **out** of the default
+no-credential unit run (`./test-unit.sh`). Run it by hand against a deployed
+stack, with a short-lived Cognito **access** token you mint yourself.
+
+### Inputs (from environment or arguments; never logged)
+
+The endpoint, the short-lived access token, the classic fleet id, and the
+optional id token are read **only** from the environment or flags and are
+**never** logged, echoed, or written to the summary. Prefer the environment form
+so tokens never land in shell history or a process listing:
+
+| Input | Environment variable | Flag |
+| --- | --- | --- |
+| Deployed API base URL (`https://…`) | `GBAW_E1_ENDPOINT` | `--endpoint` |
+| Short-lived Cognito **access** token | `GBAW_E1_ACCESS_TOKEN` | `--access-token` |
+| Classic GameLift fleet id | `GBAW_E1_FLEET_ID` | `--fleet-id` |
+| A second, different classic fleet id | `GBAW_E1_ALT_FLEET_ID` | `--alt-fleet-id` |
+| Optional Cognito **id** token (proves it is denied) | `GBAW_E1_ID_TOKEN` | `--id-token` |
+| AWS profile / region for the optional postcheck | `AWS_PROFILE` / `AWS_REGION` | `--profile` / `--region` |
+
+The two fleet ids must both be valid classic (`EC2`) fleet ids and must differ:
+the second is used only to prove that reusing an idempotency token against a
+*changed but still valid* target conflicts before any provider read.
+
+### Run
+
+```bash
+cd backend
+GBAW_E1_ENDPOINT=https://<api-id>.execute-api.us-west-2.amazonaws.com \
+GBAW_E1_ACCESS_TOKEN=<short-lived-cognito-access-token> \
+GBAW_E1_FLEET_ID=<classic-fleet-id> \
+GBAW_E1_ALT_FLEET_ID=<second-classic-fleet-id> \
+GBAW_E1_ID_TOKEN=<optional-cognito-id-token> \
+  PYTHONPATH=src uv run python -m operations.validation.e1_shakedown \
+    --profile <read-only-profile> --region us-west-2 \
+    --out ../docs/evidence/e1-shakedown-<date>.json
+```
+
+The exit code is `0` only when every non-skipped check passes; `2` when a
+required input is missing (the message names *which* input, never a value); and
+`4` when the shakedown ran but a check failed.
+
+### What it asserts
+
+Each item is one discriminating check (the emitted summary records pass/skip,
+the observed HTTP status, and — for typed application errors — the observed
+`error_code`, but never a raw body):
+
+1. Unauthenticated POST is denied at the gateway (401/403).
+2. A malformed / identity-injection payload is denied (`400 CONTRACT_INVALID`);
+   identity is never read from the body.
+3. A valid authenticated POST returns `200` with a bounded, typed observation.
+4. An identical retry replays the byte-equivalent stored result with the **same**
+   `operation_id`.
+5. The same token with a changed valid-looking target returns
+   `409 IDEMPOTENCY_CONFLICT` before any provider access.
+6. `GET /operations/{operationId}` returns a matching `succeeded` status/result.
+7. An id token cannot gain access — denied at the gateway or the handler
+   (skipped, not passed, when no id token is supplied).
+8. An unknown operation returns a bounded `404 NOT_FOUND`.
+9. Every response is bounded (JSON content type, under the size ceiling) and
+   free of any raw AWS ARN, 12-digit account id, or provider payload.
+
+### Optional read-only CloudWatch postcheck
+
+When a `--profile`/`--region` (or `AWS_PROFILE`/`AWS_REGION`) is supplied, the
+harness additionally runs **read-only** CloudWatch `ListMetrics` calls to report
+whether the E1 metric names (`ObservationFailures`, `ObservationTimeouts`,
+`StuckOperations`, `ObservationRequestLatency`) are present in the
+`GameAgent/Operations` namespace. This is best-effort and **never mutates** AWS:
+a missing metric or absent credentials is reported, never fatal. Pass
+`--skip-postcheck` to omit it.
+
+### Discriminating unit coverage (runs in the default suite)
+
+The harness's assertions are proven **discriminating** by unit tests that drive
+it against a local stdlib fake HTTP server: a compliant fake passes every check,
+and a family of deliberately broken fakes (accepts identity injection,
+non-deterministic replay, no idempotency conflict, id-token allowed, unknown
+returns 500, leaky content type, leaky body) each fail exactly the matching
+check. These require **no** credentials and run in the default unit suite:
+
+```bash
+cd backend && uv run pytest -m unit -k operations_e1_shakedown
+```
