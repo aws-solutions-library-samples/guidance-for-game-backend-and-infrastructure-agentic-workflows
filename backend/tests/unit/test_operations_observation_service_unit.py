@@ -1,4 +1,12 @@
-"""Exhaustive unit tests for the read-only observation service (issue #413)."""
+"""Exhaustive unit tests for the read-only observation service (issue #413).
+
+These cover the ADR 0005 "create before reads" lifecycle: the intent
+fingerprint computed before any provider read, a no-second-read completed
+replay, an idempotency conflict on changed intent, an in-progress retry, the
+two-phase persistence outcomes, hash re-verification, typed status retrieval
+with cross-workspace denial, the effective-authority cap fix, and the
+timeout-vs-failure metric split.
+"""
 
 from __future__ import annotations
 
@@ -12,26 +20,33 @@ from typing import Any
 import pytest
 
 # Local modules
+from operations.contracts import canonical_sha256
 from operations.contracts.observation import validate_observation
 from operations.identity import ApprovalIdentityBoundary, VerifiedPrincipal
 from operations.observation import (
     AuthorityInputs,
     GameLiftObservationReader,
+    ObservationBegin,
+    ObservationBeginOutcome,
     ObservationBoundaryError,
-    ObservationCommit,
-    ObservationCommitOutcome,
+    ObservationComplete,
+    ObservationCompleteOutcome,
     ObservationErrorCode,
     ObservationRequest,
     ObservationRequestContext,
     ObservationService,
+    ObservationStatus,
+    ObservationStatusView,
+    StatusRequest,
+    StatusRequestContext,
 )
 from operations.settings import resolve_operations_settings
-from operations.validation.e0_latency import LatencyBudget
 
 NOW = datetime(2026, 9, 21, 19, 11, 52, tzinfo=timezone.utc)
 FLEET_ID = "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789"
 IDEMPOTENCY_TOKEN = "idem_abcdefghijklmnopqrstuvwx"
 REQUEST_ID = "request.observe-1"
+OPERATION_ID = "obs_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 
 def _principal(**overrides: Any) -> VerifiedPrincipal:
@@ -108,19 +123,64 @@ class FakeReader:
 
 
 class FakeStore:
-    def __init__(self, outcome: ObservationCommitOutcome = ObservationCommitOutcome.RECORDED) -> None:
-        self.outcome = outcome
-        self.calls: list[dict[str, Any]] = []
+    """A two-phase store fake driving explicit begin/complete outcomes."""
+
+    def __init__(
+        self,
+        *,
+        begin: ObservationBeginOutcome = ObservationBeginOutcome.CREATED,
+        complete: ObservationCompleteOutcome = ObservationCompleteOutcome.RECORDED,
+    ) -> None:
+        self.begin_outcome = begin
+        self.complete_outcome = complete
+        self.begin_calls: list[dict[str, Any]] = []
+        self.complete_calls: list[dict[str, Any]] = []
+        self.fail_calls: list[dict[str, Any]] = []
+        self.status_calls: list[dict[str, Any]] = []
         self.replay_observation: dict[str, Any] | None = None
+        self.replay_hash: str | None = None
+        self.status_result: ObservationStatus | None = None
         self.commit_time: datetime | None = None
 
-    def record_observation(self, **kwargs: Any) -> ObservationCommit:
-        self.calls.append(deepcopy(kwargs))
+    def begin_observation(self, **kwargs: Any) -> ObservationBegin:
+        self.begin_calls.append(deepcopy(kwargs))
         if self.commit_time is not None and self.commit_time >= kwargs["commit_not_after"]:
-            return ObservationCommit(ObservationCommitOutcome.DEADLINE_EXPIRED)
-        if self.outcome is ObservationCommitOutcome.REPLAY:
-            return ObservationCommit(ObservationCommitOutcome.REPLAY, deepcopy(self.replay_observation))
-        return ObservationCommit(self.outcome)
+            return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
+        if self.begin_outcome is ObservationBeginOutcome.REPLAY_COMPLETED:
+            return ObservationBegin(
+                ObservationBeginOutcome.REPLAY_COMPLETED,
+                operation_id=kwargs["operation_id"],
+                observation=deepcopy(self.replay_observation),
+                observation_hash=self.replay_hash,
+            )
+        if self.begin_outcome is ObservationBeginOutcome.IN_PROGRESS:
+            return ObservationBegin(
+                ObservationBeginOutcome.IN_PROGRESS, operation_id=kwargs["operation_id"], current_state="observing"
+            )
+        if self.begin_outcome is ObservationBeginOutcome.CREATED:
+            return ObservationBegin(ObservationBeginOutcome.CREATED, operation_id=kwargs["operation_id"])
+        return ObservationBegin(self.begin_outcome)
+
+    def complete_observation(self, **kwargs: Any) -> ObservationComplete:
+        self.complete_calls.append(deepcopy(kwargs))
+        if self.complete_outcome is ObservationCompleteOutcome.ALREADY_TERMINAL:
+            return ObservationComplete(
+                ObservationCompleteOutcome.ALREADY_TERMINAL,
+                observation=deepcopy(self.replay_observation),
+                observation_hash=self.replay_hash,
+            )
+        if self.complete_outcome is ObservationCompleteOutcome.RECORDED:
+            return ObservationComplete(
+                ObservationCompleteOutcome.RECORDED, observation_hash=canonical_sha256(kwargs["observation"])
+            )
+        return ObservationComplete(self.complete_outcome)
+
+    def fail_observation(self, **kwargs: Any) -> None:
+        self.fail_calls.append(deepcopy(kwargs))
+
+    def load_status(self, **kwargs: Any) -> ObservationStatus | None:
+        self.status_calls.append(deepcopy(kwargs))
+        return self.status_result
 
 
 class RecordingMetrics:
@@ -129,6 +189,9 @@ class RecordingMetrics:
 
     def record(self, name: str, value: float, *, dimensions: dict[str, str] | None = None) -> None:
         self.events.append((name, value, dimensions))
+
+    def names(self) -> list[str]:
+        return [name for name, _, _ in self.events]
 
 
 def _service(
@@ -164,7 +227,7 @@ def _service(
         store=store,
         clock=clock,
         monotonic=monotonic,
-        observation_id_factory=lambda: "obs_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        operation_id_factory=lambda: OPERATION_ID,
         metrics=metrics,
     )
     return service, reader, store, metrics
@@ -183,19 +246,82 @@ def test_successful_observation_is_valid_and_persisted() -> None:
 
     validate_observation(result)
     assert result["effective_authority"] == "observe"
+    assert result["observation_id"] == OPERATION_ID
     assert result["target"]["fleet_id"] == FLEET_ID
     assert result["requester"]["tenant_id"] == "tenant.default"
     assert reader.calls == ["utilization", "capacity", "scaling"]
-    assert len(store.calls) == 1
-    assert any(name == "observation.recorded" for name, _, _ in metrics.events)
+    assert len(store.begin_calls) == 1
+    assert len(store.complete_calls) == 1
+    assert "observation.recorded" in metrics.names()
+
+
+def test_idempotency_is_resolved_before_any_read() -> None:
+    # The begin call must precede any provider read: a completed replay performs
+    # no reads at all.
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_COMPLETED)
+    recorded_service, _, _, _ = _service()
+    stored = recorded_service.observe(_request(), _context())
+    store.replay_observation = stored
+    store.replay_hash = canonical_sha256(stored)
+
+    service, reader, _, _ = _service(store=store)
+    result = service.observe(_request(), _context())
+    assert result == stored
+    assert reader.calls == []  # no second read
+    assert store.complete_calls == []
+
+
+def test_fingerprint_is_over_workspace_and_intent_not_result() -> None:
+    service, _, store, _ = _service()
+    service.observe(_request(), _context())
+    call = store.begin_calls[0]
+    assert call["workspace_id"] == "workspace.default"
+    assert call["idempotency_token"] == IDEMPOTENCY_TOKEN
+    assert call["idempotency_fingerprint"].startswith("sha256:")
+    # The intent carries only the request-side identity of the operation.
+    assert call["intent"]["target"] == {"provider": "gamelift", "fleet_id": FLEET_ID}
+    assert call["intent"]["capability_id"] == "gamelift.observe-fleet"
+    assert "observation_id" not in call["intent"]
+    assert "observed_at" not in call["intent"]
+
+
+def test_same_intent_different_fleet_produces_different_fingerprint() -> None:
+    service, _, store, _ = _service()
+    other_fleet = "fleet-9999abcd-5678-90ef-a1b2-c3d4e5f60789"
+    service.observe(_request(), _context())
+    service.observe(ObservationRequest(fleet_id=other_fleet, idempotency_token=IDEMPOTENCY_TOKEN), _context())
+    assert store.begin_calls[0]["idempotency_fingerprint"] != store.begin_calls[1]["idempotency_fingerprint"]
+
+
+# --- Effective authority (higher ceilings still yield observe) ------------
 
 
 def test_effective_authority_is_minimum_capped_at_observe() -> None:
     service, _, _, _ = _service()
     result = service.observe(_request(), _context(authority_inputs=_authority_inputs(principal_authority="operate")))
-    # Every input is >= observe and the deployment mode is observe, so the
-    # deterministic minimum (and the phase cap) is observe.
     assert result["effective_authority"] == "observe"
+
+
+def test_higher_deployment_ceiling_still_yields_observe_without_contract_disagreement() -> None:
+    # Every input is >= observe and the deployment mode is 'operate'. The
+    # effective authority is capped at observe AND every recorded input is
+    # capped at observe, so validate_observation does not disagree.
+    service, _, _, _ = _service(settings_mode="operate")
+    result = service.observe(
+        _request(),
+        _context(
+            authority_inputs=_authority_inputs(
+                tenant_policy="operate",
+                workspace_policy="operate",
+                principal_authority="operate",
+                capability_maximum="operate",
+                risk_policy="operate",
+            )
+        ),
+    )
+    validate_observation(result)
+    assert result["effective_authority"] == "observe"
+    assert set(result["authority_inputs"].values()) == {"observe"}
 
 
 def test_requester_identity_comes_from_verified_principal_not_request() -> None:
@@ -214,19 +340,20 @@ def test_disabled_deployment_denies_before_any_read() -> None:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.AUTHORIZATION_DENIED
     assert reader.calls == []
-    assert store.calls == []
+    assert store.begin_calls == []
 
 
 # --- Identity boundary ----------------------------------------------------
 
 
 def test_tenant_mismatch_is_denied() -> None:
-    service, reader, _, _ = _service()
+    service, reader, store, _ = _service()
     context = _context(requester=_principal(tenant_id="tenant.other"))
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), context)
     assert exc.value.error_code is ObservationErrorCode.IDENTITY_CONTEXT_INVALID
     assert reader.calls == []
+    assert store.begin_calls == []
 
 
 def test_expired_credential_is_denied() -> None:
@@ -249,11 +376,12 @@ def test_untrusted_client_is_denied() -> None:
 
 
 def test_principal_below_observe_is_denied() -> None:
-    service, reader, _, _ = _service()
+    service, reader, store, _ = _service()
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context(authority_inputs=_authority_inputs(capability_maximum="disabled")))
     assert exc.value.error_code is ObservationErrorCode.AUTHORIZATION_DENIED
     assert reader.calls == []
+    assert store.begin_calls == []
 
 
 # --- Request payload boundary --------------------------------------------
@@ -280,17 +408,22 @@ def test_request_payload_accepts_exact_shape() -> None:
 # --- Provider read failures (fail closed, no partial success) -------------
 
 
-def test_provider_read_exception_fails_closed_retryable() -> None:
+def test_provider_read_exception_fails_closed_retryable_and_records_failed() -> None:
     class BoomReader(FakeReader):
         def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
             raise RuntimeError("provider boom")
 
-    service, _, store, _ = _service(reader=BoomReader())
+    service, _, store, metrics = _service(reader=BoomReader())
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
     assert exc.value.retryable is True
-    assert store.calls == []
+    # The operation was created before the read, so a bounded failed transition
+    # is recorded and no result is completed.
+    assert len(store.begin_calls) == 1
+    assert store.complete_calls == []
+    assert len(store.fail_calls) == 1
+    assert "observation.failed" in metrics.names()
 
 
 def test_provider_none_result_fails_closed() -> None:
@@ -302,17 +435,19 @@ def test_provider_none_result_fails_closed() -> None:
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
-    assert store.calls == []
+    assert store.complete_calls == []
 
 
-def test_slow_read_exceeding_budget_fails_closed() -> None:
+def test_slow_read_exceeding_budget_records_timeout_metric() -> None:
+    # Local modules
+    from operations.validation.e0_latency import LatencyBudget
+
     class SlowReader(FakeReader):
         def read_utilization(self, fleet_id: str) -> dict[str, int]:
             time.sleep(0.05)
             return super().read_utilization(fleet_id)
 
-    # Drive the monotonic clock so the measured elapsed exceeds the per-read budget.
-    service, _, store, _ = _service(
+    service, _, store, metrics = _service(
         reader=SlowReader(),
         monotonic_times=[0.0, 0.0, 100.0, 200.0, 300.0, 400.0],
     )
@@ -320,7 +455,8 @@ def test_slow_read_exceeding_budget_fails_closed() -> None:
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
-    assert store.calls == []
+    assert store.complete_calls == []
+    assert "observation.timeout" in metrics.names()
 
 
 def test_malformed_provider_shape_fails_closed() -> None:
@@ -332,7 +468,7 @@ def test_malformed_provider_shape_fails_closed() -> None:
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
-    assert store.calls == []
+    assert store.complete_calls == []
 
 
 def test_oversized_capacity_fails_closed() -> None:
@@ -347,44 +483,64 @@ def test_oversized_capacity_fails_closed() -> None:
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
-    assert store.calls == []
+    assert store.complete_calls == []
 
 
-# --- Persistence outcomes -------------------------------------------------
+# --- Begin outcomes -------------------------------------------------------
 
 
-def test_replay_returns_stored_observation_without_rerunning() -> None:
-    store = FakeStore(ObservationCommitOutcome.REPLAY)
-    service, _, _, metrics = _service(store=store)
+def test_completed_replay_returns_stored_without_rerunning() -> None:
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_COMPLETED)
     recorded_service, _, _, _ = _service()
     stored = recorded_service.observe(_request(), _context())
     store.replay_observation = stored
+    store.replay_hash = canonical_sha256(stored)
 
+    service, reader, _, metrics = _service(store=store)
     result = service.observe(_request(), _context())
     assert result == stored
-    assert any(name == "observation.replay" for name, _, _ in metrics.events)
+    assert reader.calls == []
+    assert "observation.replay" in metrics.names()
 
 
-def test_idempotency_conflict_is_typed_and_not_retryable() -> None:
-    store = FakeStore(ObservationCommitOutcome.IDEMPOTENCY_CONFLICT)
-    service, _, _, _ = _service(store=store)
-    with pytest.raises(ObservationBoundaryError) as exc:
-        service.observe(_request(), _context())
-    assert exc.value.error_code is ObservationErrorCode.IDEMPOTENCY_CONFLICT
-    assert exc.value.retryable is False
+def test_replay_with_tampered_hash_fails_closed() -> None:
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_COMPLETED)
+    recorded_service, _, _, _ = _service()
+    stored = recorded_service.observe(_request(), _context())
+    store.replay_observation = stored
+    store.replay_hash = "sha256:" + "0" * 64  # does not match the canonical hash
 
-
-def test_state_conflict_is_typed() -> None:
-    store = FakeStore(ObservationCommitOutcome.STATE_CONFLICT)
     service, _, _, _ = _service(store=store)
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
 
 
-def test_deadline_expired_is_retryable() -> None:
+def test_idempotency_conflict_is_typed_and_not_retryable() -> None:
+    store = FakeStore(begin=ObservationBeginOutcome.IDEMPOTENCY_CONFLICT)
+    service, reader, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.IDEMPOTENCY_CONFLICT
+    assert exc.value.retryable is False
+    assert reader.calls == []
+
+
+def test_in_progress_retry_does_not_create_second_operation() -> None:
+    store = FakeStore(begin=ObservationBeginOutcome.IN_PROGRESS)
+    service, reader, _, metrics = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
+    assert exc.value.retryable is True
+    assert reader.calls == []
+    assert store.complete_calls == []
+    assert "observation.in_progress" in metrics.names()
+
+
+def test_begin_deadline_expired_is_retryable() -> None:
     store = FakeStore()
-    store.commit_time = NOW + timedelta(hours=2)  # past any commit_not_after
+    store.commit_time = NOW + timedelta(hours=2)
     service, _, _, _ = _service(store=store)
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
@@ -392,9 +548,61 @@ def test_deadline_expired_is_retryable() -> None:
     assert exc.value.retryable is True
 
 
-def test_string_lookalike_outcome_fails_closed() -> None:
-    class StringStore:
-        def record_observation(self, **kwargs: Any) -> Any:
+def test_begin_state_conflict_is_typed() -> None:
+    store = FakeStore(begin=ObservationBeginOutcome.STATE_CONFLICT)
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
+
+
+def test_begin_string_lookalike_fails_closed() -> None:
+    class StringStore(FakeStore):
+        def begin_observation(self, **kwargs: Any) -> Any:
+            return "created"
+
+    service, _, _, _ = _service(store=StringStore())
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
+
+
+# --- Complete outcomes ----------------------------------------------------
+
+
+def test_complete_already_terminal_replays_racing_result() -> None:
+    store = FakeStore(complete=ObservationCompleteOutcome.ALREADY_TERMINAL)
+    recorded_service, _, _, _ = _service()
+    stored = recorded_service.observe(_request(), _context())
+    store.replay_observation = stored
+    store.replay_hash = canonical_sha256(stored)
+
+    service, _, _, metrics = _service(store=store)
+    result = service.observe(_request(), _context())
+    assert result == stored
+    assert "observation.replay" in metrics.names()
+
+
+def test_complete_state_conflict_is_typed() -> None:
+    store = FakeStore(complete=ObservationCompleteOutcome.STATE_CONFLICT)
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
+
+
+def test_complete_deadline_expired_is_retryable() -> None:
+    store = FakeStore(complete=ObservationCompleteOutcome.DEADLINE_EXPIRED)
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is True
+
+
+def test_complete_string_lookalike_fails_closed() -> None:
+    class StringStore(FakeStore):
+        def complete_observation(self, **kwargs: Any) -> Any:
             return "recorded"
 
     service, _, _, _ = _service(store=StringStore())
@@ -403,23 +611,85 @@ def test_string_lookalike_outcome_fails_closed() -> None:
     assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
 
 
-# --- Persistence transaction inputs --------------------------------------
+# --- Status retrieval -----------------------------------------------------
 
 
-def test_store_receives_fingerprint_ttl_and_deadline() -> None:
-    service, _, store, _ = _service()
-    service.observe(_request(), _context())
-    call = store.calls[0]
-    assert call["workspace_id"] == "workspace.default"
-    assert call["idempotency_token"] == IDEMPOTENCY_TOKEN
-    assert call["idempotency_fingerprint"].startswith("sha256:")
-    assert call["ttl_epoch_s"] > int(NOW.timestamp())
-    assert call["commit_not_after"] <= _principal().expires_at
+def _status_context(**overrides: Any) -> StatusRequestContext:
+    values: dict[str, Any] = {"requester": _principal(), "request_id": REQUEST_ID}
+    values.update(overrides)
+    return StatusRequestContext(**values)
+
+
+def test_status_returns_typed_succeeded_view() -> None:
+    recorded_service, _, _, _ = _service()
+    stored = recorded_service.observe(_request(), _context())
+    store = FakeStore()
+    store.status_result = ObservationStatus(
+        operation_id=OPERATION_ID,
+        workspace_id="workspace.default",
+        state=ObservationStatusView.SUCCEEDED,
+        observation=stored,
+        observation_hash=canonical_sha256(stored),
+    )
+    service, _, _, _ = _service(store=store)
+    status = service.get_status(StatusRequest(operation_id=OPERATION_ID), _status_context())
+    assert status.state is ObservationStatusView.SUCCEEDED
+    assert status.observation == stored
+    assert store.status_calls[0]["workspace_id"] == "workspace.default"
+
+
+def test_status_missing_is_not_found() -> None:
+    store = FakeStore()
+    store.status_result = None
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.get_status(StatusRequest(operation_id=OPERATION_ID), _status_context())
+    assert exc.value.error_code is ObservationErrorCode.NOT_FOUND
+
+
+def test_status_cross_workspace_is_denied_as_not_found() -> None:
+    store = FakeStore()
+    store.status_result = ObservationStatus(
+        operation_id=OPERATION_ID,
+        workspace_id="workspace.other",
+        state=ObservationStatusView.OBSERVING,
+    )
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.get_status(StatusRequest(operation_id=OPERATION_ID), _status_context())
+    assert exc.value.error_code is ObservationErrorCode.NOT_FOUND
+
+
+def test_status_denied_when_observe_disabled() -> None:
+    service, _, _, _ = _service(settings_mode="disabled")
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.get_status(StatusRequest(operation_id=OPERATION_ID), _status_context())
+    assert exc.value.error_code is ObservationErrorCode.AUTHORIZATION_DENIED
+
+
+def test_status_verifies_stored_hash() -> None:
+    recorded_service, _, _, _ = _service()
+    stored = recorded_service.observe(_request(), _context())
+    store = FakeStore()
+    store.status_result = ObservationStatus(
+        operation_id=OPERATION_ID,
+        workspace_id="workspace.default",
+        state=ObservationStatusView.SUCCEEDED,
+        observation=stored,
+        observation_hash="sha256:" + "0" * 64,
+    )
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.get_status(StatusRequest(operation_id=OPERATION_ID), _status_context())
+    assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
+
+
+# --- No provider-write surface -------------------------------------------
 
 
 def test_no_write_method_on_service_or_ports() -> None:
     public = {name for name in dir(ObservationService) if not name.startswith("_")}
-    assert public == {"observe"}
+    assert public == {"observe", "get_status"}
     reader_methods = {m for m in dir(GameLiftObservationReader) if not m.startswith("_")}
     assert reader_methods == {"read_utilization", "read_capacity", "read_scaling_policies"}
 

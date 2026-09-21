@@ -8,14 +8,21 @@ the request body, query string, or a custom header, so a direct or unattributed
 invocation — one without a verified authorizer context — is rejected before any
 provider read.
 
-The handler builds a trusted :class:`~operations.identity.VerifiedPrincipal` from
-the authorizer claims and the deployment-owned tenant/workspace binding, parses
-the untrusted body into an :class:`~operations.observation.ObservationRequest`
-(fleet id and idempotency token only), and delegates to
-:class:`~operations.observation.ObservationService`. It exposes no
-provider-write method and maps any typed
+The handler dispatches two routes on the verified caller:
+
+* ``POST /operations/observe`` parses the untrusted body into an
+  :class:`~operations.observation.ObservationRequest` (fleet id and idempotency
+  token only) and delegates to :meth:`ObservationService.observe`.
+* ``GET /operations/observe/{operation_id}`` parses the path into a
+  :class:`~operations.observation.StatusRequest` and delegates to
+  :meth:`ObservationService.get_status`, which enforces trusted workspace
+  ownership.
+
+It exposes no provider-write method and maps any typed
 :class:`~operations.observation.ObservationBoundaryError` to a bounded
-application-error response with the correct HTTP status.
+application-error response with the correct HTTP status. Any unexpected
+exception is caught and returned as a sanitized generic 500 — a raw stack trace,
+provider payload, or internal detail never crosses the boundary.
 """
 
 from __future__ import annotations
@@ -36,6 +43,9 @@ from operations.observation import (
     ObservationRequest,
     ObservationRequestContext,
     ObservationService,
+    ObservationStatus,
+    StatusRequest,
+    StatusRequestContext,
 )
 
 # HTTP status for each typed boundary error. Everything else is a generic 500.
@@ -43,10 +53,14 @@ _STATUS_BY_ERROR = {
     ObservationErrorCode.CONTRACT_INVALID: 400,
     ObservationErrorCode.IDENTITY_CONTEXT_INVALID: 401,
     ObservationErrorCode.AUTHORIZATION_DENIED: 403,
+    ObservationErrorCode.NOT_FOUND: 404,
     ObservationErrorCode.IDEMPOTENCY_CONFLICT: 409,
     ObservationErrorCode.STATE_CONFLICT: 409,
     ObservationErrorCode.PROVIDER_UNAVAILABLE: 503,
+    ObservationErrorCode.INTERNAL_ERROR: 500,
 }
+
+_OBSERVE_ROUTE = "/operations/observe"
 
 
 class HandlerConfigError(RuntimeError):
@@ -80,23 +94,36 @@ class ObservationRequestHandler:
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one API Gateway HTTP API (payload v2) invocation."""
         try:
-            request = self._parse_request(event)
-            context = self._build_context(event)
+            return self._dispatch(event)
         except ObservationBoundaryError as exc:
             return _error_response(exc)
+        except Exception:  # noqa: BLE001 - catch-all: never leak an internal detail
+            return _error_response(
+                ObservationBoundaryError(ObservationErrorCode.INTERNAL_ERROR, "observation request failed")
+            )
 
-        try:
+    def _dispatch(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        method = _method(event)
+        principal = self._verified_principal(event)
+        if method == "POST":
+            request = self._parse_observe_request(event)
+            context = ObservationRequestContext(
+                requester=principal,
+                request_id=_request_id(event),
+                authority_inputs=self._authority_inputs,
+                capability_id=self._capability_id,
+                capability_version=self._capability_version,
+            )
             observation = self._service.observe(request, context)
-        except ObservationBoundaryError as exc:
-            return _error_response(exc)
+            return _json_response(200, observation)
+        if method == "GET":
+            status_request = self._parse_status_request(event)
+            status_context = StatusRequestContext(requester=principal, request_id=_request_id(event))
+            status = self._service.get_status(status_request, status_context)
+            return _json_response(200, _status_body(status))
+        raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "unsupported method")
 
-        return {
-            "statusCode": 200,
-            "headers": {"content-type": "application/json"},
-            "body": json.dumps(observation, separators=(",", ":")),
-        }
-
-    def _parse_request(self, event: Mapping[str, Any]) -> ObservationRequest:
+    def _parse_observe_request(self, event: Mapping[str, Any]) -> ObservationRequest:
         raw_body = event.get("body")
         if event.get("isBase64Encoded"):
             # The observe request is small JSON; a base64 body is unexpected and
@@ -112,7 +139,14 @@ class ObservationRequestHandler:
             ) from exc
         return ObservationRequest.from_payload(payload)
 
-    def _build_context(self, event: Mapping[str, Any]) -> ObservationRequestContext:
+    def _parse_status_request(self, event: Mapping[str, Any]) -> StatusRequest:
+        params = event.get("pathParameters")
+        operation_id = params.get("operation_id") if isinstance(params, Mapping) else None
+        if not isinstance(operation_id, str):
+            raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "status request is invalid")
+        return StatusRequest(operation_id=operation_id)
+
+    def _verified_principal(self, event: Mapping[str, Any]) -> VerifiedPrincipal:
         claims = _authorizer_claims(event)
         if claims is None:
             # No verified authorizer context: a direct or unattributed call.
@@ -134,9 +168,8 @@ class ObservationRequestHandler:
                 ObservationErrorCode.IDENTITY_CONTEXT_INVALID, "verified caller context is incomplete"
             )
 
-        request_id = _request_id(event)
         try:
-            principal = VerifiedPrincipal(
+            return VerifiedPrincipal(
                 subject_id=subject,
                 client_id=client_id,
                 audience=self._trusted_audience,
@@ -146,17 +179,30 @@ class ObservationRequestHandler:
                 groups=_string_set(claims.get("cognito:groups")),
                 scopes=_string_set(claims.get("scope")),
             )
-            return ObservationRequestContext(
-                requester=principal,
-                request_id=request_id,
-                authority_inputs=self._authority_inputs,
-                capability_id=self._capability_id,
-                capability_version=self._capability_version,
-            )
         except (ValueError, ObservationBoundaryError) as exc:
             raise ObservationBoundaryError(
                 ObservationErrorCode.IDENTITY_CONTEXT_INVALID, "verified caller context is invalid"
             ) from exc
+
+
+def _status_body(status: ObservationStatus) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "status_contract_version": CONTRACT_VERSION,
+        "operation_id": status.operation_id,
+        "state": status.state.value,
+    }
+    if status.observation is not None:
+        body["observation"] = status.observation
+    return body
+
+
+def _method(event: Mapping[str, Any]) -> str:
+    request_context = event.get("requestContext")
+    http = request_context.get("http") if isinstance(request_context, Mapping) else None
+    method = http.get("method") if isinstance(http, Mapping) else None
+    if isinstance(method, str) and method:
+        return method.upper()
+    return ""
 
 
 def _authorizer_claims(event: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -211,6 +257,14 @@ def _string_set(value: object) -> frozenset[str]:
     return frozenset(item for item in parts if item and len(item) <= 256)
 
 
+def _json_response(status: int, body: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "statusCode": status,
+        "headers": {"content-type": "application/json"},
+        "body": json.dumps(body, separators=(",", ":")),
+    }
+
+
 def _error_response(error: ObservationBoundaryError) -> dict[str, Any]:
     status = _STATUS_BY_ERROR.get(error.error_code, 500)
     body = {
@@ -219,8 +273,4 @@ def _error_response(error: ObservationBoundaryError) -> dict[str, Any]:
         "safe_message": error.safe_message,
         "retryable": error.retryable,
     }
-    return {
-        "statusCode": status,
-        "headers": {"content-type": "application/json"},
-        "body": json.dumps(body, separators=(",", ":")),
-    }
+    return _json_response(status, body)
