@@ -389,19 +389,13 @@ def run_orchestrator(query: str, context: dict = None):
                     cost_only=cost_report_followup,
                 )
             elif cost_report_followup:
-                logger.error(
-                    "Cost report ID follow-up failed before producing a deterministic rendering",
-                    exc_info=True,
-                )
+                logger.exception("Cost report ID follow-up failed before producing a deterministic rendering")
                 response = _COST_REPORT_FOLLOWUP_FAILURE
             elif _cost_attempted(query, specialist_outputs):
                 # A fresh account-report request raised before producing an
                 # authoritative rendering. Fail closed and preserve only safe
                 # non-cost specialist sections.
-                logger.error(
-                    "Cost-bearing request raised before a validated cost report; failing closed",
-                    exc_info=True,
-                )
+                logger.exception("Cost-bearing request raised before a validated cost report; failing closed")
                 response = _compose_final_response(
                     _COST_REPORT_UNAVAILABLE,
                     specialist_outputs,
