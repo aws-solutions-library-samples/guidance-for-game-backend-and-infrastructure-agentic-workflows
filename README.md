@@ -116,9 +116,14 @@ The following table provides a sample cost breakdown for deploying this Guidance
 
 ### Optional operations control plane (E1)
 
-The optional E1 operations control plane is **default-disabled and adds no
-incremental cost** to the numbers above. Nothing in the table changes unless an
-owner explicitly enables operations. When enabled, E1 deploys the accepted
+The optional E1 operations control plane is **default-unprovisioned and adds no
+incremental cost** to the numbers above. A default deployment leaves
+`Provisioned=false`, so it creates **zero** resources, costs **$0.00**, and holds
+no data. Nothing in the table changes unless an owner explicitly **provisions and
+enables** operations. Note that *disabling* an already-provisioned stack is
+**not** the $0 state: an emergency `--disable` keeps every resource (and its
+retained audit data) under CloudFormation and flips only the runtime kill switch,
+so the standing (fixed) charges below continue until the stack is torn down. When enabled, E1 deploys the accepted
 synchronous, read-only GameLift observation design
 ([ADR 0005](docs/adr/0005-persist-operations-and-recover-workflows.md)): an
 API Gateway HTTP API route, request-scoped compute (modelled as AWS Lambda,
@@ -133,11 +138,21 @@ provider-write permission is deployed.
 Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**, AWS
 Price List us-west-2 rates; free-tier allowances intentionally excluded):
 
-| Scenario | Fixed | Variable | Total [USD] |
-| --- | --- | --- | --- |
-| Default-disabled | $0.00 | $0.00 | **$0.00** |
-| Enabled, idle (0 requests) | $1.65 | $0.00 | **$1.65** |
-| Enabled, 100,000 observations | $1.84 | $3.49 | **$5.33** |
+| Scenario | Provisioned | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- | --- |
+| Default (unprovisioned) | no | $0.00 | $0.00 | **$0.00** |
+| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, idle (0 requests) | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations | yes | $1.84 | $3.49 | **$5.33** |
+
+> **Default-unprovisioned vs. disabled-after-provision.** The **$0.00** row is
+> the *default, unprovisioned* stack — no resources, no data. A
+> *disabled-but-provisioned* stack (after an emergency `--disable`) keeps its
+> retained DynamoDB table (storage + PITR), KMS key, log groups, and CloudWatch
+> alarms/metrics, so it continues to cost the **fixed** standing charges and to
+> **retain audit data** — the same fixed cost as "enabled, idle". Disabling stops
+> serving requests; it does not stop the standing cost. Only teardown removes the
+> resources.
 
 > **Note:** These E1 numbers are computed from
 > [`docs/operations-cost-model.json`](docs/operations-cost-model.json), which
