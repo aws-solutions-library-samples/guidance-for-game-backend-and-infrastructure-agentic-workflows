@@ -220,7 +220,9 @@ Resources:
   OperationsKmsKey:
     Type: AWS::KMS::Key
     Condition: OperationsEnabled
-    DeletionPolicy: Retain
+    # RetainExceptOnCreate: keep the CMK on teardown/replacement, but delete it
+    # if the stack's initial create rolls back (avoids orphaning an empty key).
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       Description: !Sub 'CMK for ${ProjectName} optional operations control plane (E1)'
@@ -234,17 +236,28 @@ Resources:
               AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
+          # CloudWatch Logs needs the full encrypt/decrypt/describe action set to
+          # attach this CMK to a log group; granting only Decrypt+GenerateDataKey
+          # is what caused the beta create to fail with AccessDenied at both log
+          # groups. These are the documented least-privilege service actions,
+          # scoped by encryption context to EXACTLY the two operations log groups
+          # (Lambda + API access) via their full ARNs (no account-wide wildcard).
           - Sid: AllowCloudWatchLogsEncryptDecrypt
             Effect: Allow
             Principal:
               Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
             Action:
+              - 'kms:Encrypt'
               - 'kms:Decrypt'
-              - 'kms:GenerateDataKey'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
             Resource: '*'
             Condition:
-              ArnLike:
-                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/*/${ProjectName}-operations*'
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn':
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-operations-observe'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access'
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -269,7 +282,9 @@ Resources:
   OperationsTable:
     Type: AWS::DynamoDB::Table
     Condition: OperationsEnabled
-    DeletionPolicy: Retain
+    # RetainExceptOnCreate: preserve audit data on teardown/replacement, but
+    # delete the empty table if the initial create rolls back (no orphan).
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub '${ProjectName}-operations'
@@ -314,7 +329,7 @@ Resources:
   ObservationFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: OperationsEnabled
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-observe'
@@ -324,12 +339,39 @@ Resources:
   AccessLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: OperationsEnabled
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/apigateway/${ProjectName}-operations-access'
       RetentionInDays: !If [IsProd, 90, 14]
       KmsKeyId: !GetAtt OperationsKmsKey.Arn
+
+  # Grant the CloudWatch Logs vended-log delivery principal permission to write
+  # HTTP API access logs into the access log group. Without this resource policy
+  # the API's access-log delivery fails. Scoped to this account and this API.
+  AccessLogDeliveryResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: OperationsEnabled
+    DependsOn: AccessLogGroup
+    Properties:
+      PolicyName: !Sub '${ProjectName}-operations-access-log-delivery'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "ApiGatewayAccessLogDelivery",
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access:*",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
+                "ArnLike": { "aws:SourceArn": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApi}" }
+              }
+            }
+          ]
+        }
 
   # --------------------------------------------------------------------------- #
   # IAM: dedicated, least-privilege observation execution role.
