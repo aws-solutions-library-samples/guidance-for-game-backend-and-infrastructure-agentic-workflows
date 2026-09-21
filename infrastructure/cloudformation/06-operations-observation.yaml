@@ -1,0 +1,600 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Game Agent - OPTIONAL E1 operations observation control plane (GitHub issue
+  #413). Default-disabled: this stack is not wired into deploy-all.sh, and every
+  resource is additionally gated on the OperationsEnabled condition
+  (OperationsMode defaults to "disabled"), so a deploy with defaults creates
+  ZERO E1 resources. Implements the accepted synchronous, read-only GameLift
+  observation design in docs/adr/0005-persist-operations-and-recover-workflows.md.
+  No provider-write permission, no queue/worker/dead-letter queue, and no Step
+  Functions are created.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming.
+
+  OperationsMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - enabled
+    Description: >-
+      Master enablement for the optional operations control plane. "disabled"
+      (the default) creates zero E1 resources even when this stack is deployed.
+      Set to "enabled" only when an owner explicitly opts in.
+
+  Environment:
+    Type: String
+    Default: beta
+    AllowedValues:
+      - beta
+      - prod
+    Description: >-
+      Target environment. "prod" enables DynamoDB deletion protection and a
+      longer log-retention posture appropriate to production audit data.
+
+  CognitoIssuer:
+    Type: String
+    Default: ''
+    Description: >-
+      JWT issuer URL (Cognito user pool issuer, e.g.
+      https://cognito-idp.us-west-2.amazonaws.com/us-west-2_example) bound to the
+      HTTP API authorizer. Required when OperationsMode=enabled.
+
+  CognitoClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      Cognito application client id used as the JWT audience on every route.
+      Required when OperationsMode=enabled.
+
+  RequestDeadlineSeconds:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 29
+    Description: >-
+      Total observation request budget in seconds. Bounded below the 30 s API
+      Gateway HTTP API integration ceiling so the request fails closed before
+      the gateway times out.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    Description: Lambda memory size (MB); matches the accepted E1 cost model.
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: >-
+      Reserved concurrency cap for the observation function. Bounds blast radius
+      and is a denial-of-wallet control.
+
+  MaxReadRequestUnits:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    Description: DynamoDB on-demand maximum read request units (denial-of-wallet cap).
+
+  MaxWriteRequestUnits:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    Description: DynamoDB on-demand maximum write request units (denial-of-wallet cap).
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: HTTP API stage throttling burst limit (denial-of-wallet control).
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: HTTP API stage throttling steady-state rate limit (denial-of-wallet control).
+
+Conditions:
+  # Master switch. Every resource references this, so OperationsMode=disabled
+  # (the default) provisions nothing.
+  OperationsEnabled: !Equals [!Ref OperationsMode, enabled]
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  # --------------------------------------------------------------------------- #
+  # KMS customer-managed key for at-rest encryption of E1 audit data.
+  # --------------------------------------------------------------------------- #
+  OperationsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: OperationsEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub 'CMK for ${ProjectName} optional operations control plane (E1)'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountManagement
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  OperationsKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: OperationsEnabled
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-operations'
+      TargetKeyId: !Ref OperationsKmsKey
+
+  # --------------------------------------------------------------------------- #
+  # DynamoDB: operation-state snapshot, immutable transitions, idempotency
+  # mapping, lease, and append-only ledger — single table, PK/SK.
+  # --------------------------------------------------------------------------- #
+  OperationsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: OperationsEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-operations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref OperationsKmsKey
+      # Denial-of-wallet: cap on-demand throughput.
+      OnDemandThroughput:
+        MaxReadRequestUnits: !Ref MaxReadRequestUnits
+        MaxWriteRequestUnits: !Ref MaxWriteRequestUnits
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # S3: content-addressed observation records.
+  # --------------------------------------------------------------------------- #
+  OperationsContentBucket:
+    Type: AWS::S3::Bucket
+    Condition: OperationsEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-operations-content-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref OperationsKmsKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # Log groups: Lambda logs + HTTP API access logs, with retention.
+  # --------------------------------------------------------------------------- #
+  ObservationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: OperationsEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-observe'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !GetAtt OperationsKmsKey.Arn
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: OperationsEnabled
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-operations-access'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !GetAtt OperationsKmsKey.Arn
+
+  # --------------------------------------------------------------------------- #
+  # IAM: dedicated, least-privilege observation execution role.
+  # Exactly three GameLift reads; scoped DynamoDB + S3 + KMS + logs + metrics.
+  # No GameLift writes, no iam:PassRole, no Step Functions, no
+  # UpdateItem/DeleteItem/Scan, no wildcard actions.
+  # --------------------------------------------------------------------------- #
+  ObservationRole:
+    Type: AWS::IAM::Role
+    Condition: OperationsEnabled
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-observe-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: GameLiftReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GameLiftThreeReads
+                Effect: Allow
+                Action:
+                  - 'gamelift:DescribeFleetUtilization'
+                  - 'gamelift:DescribeFleetCapacity'
+                  - 'gamelift:DescribeScalingPolicies'
+                Resource: '*'
+        - PolicyName: OperationsTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TableScopedReadsAndTransactionalWrites
+                Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:ConditionCheckItem'
+                  - 'dynamodb:TransactWriteItems'
+                  - 'dynamodb:TransactGetItems'
+                Resource:
+                  - !GetAtt OperationsTable.Arn
+        - PolicyName: OperationsContentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ContentAddressedObjects
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub '${OperationsContentBucket.Arn}/*'
+        - PolicyName: OperationsKmsUse
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EncryptDecryptAuditData
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:Encrypt'
+                  - 'kms:GenerateDataKey'
+                Resource:
+                  - !GetAtt OperationsKmsKey.Arn
+        - PolicyName: OperationsLogsAndMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !GetAtt ObservationFunctionLogGroup.Arn
+                  - !Sub '${ObservationFunctionLogGroup.Arn}:*'
+              - Sid: PublishScopedMetrics
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GameAgent/Operations'
+              - Sid: XRayTraceWrite
+                Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # Lambda: request-scoped observation compute.
+  # --------------------------------------------------------------------------- #
+  ObservationFunction:
+    Type: AWS::Lambda::Function
+    Condition: OperationsEnabled
+    DependsOn: ObservationFunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-observe'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.observe.lambda_entry.handler
+      Role: !GetAtt ObservationRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref RequestDeadlineSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          GBAW_OPERATIONS_MODE: !Ref OperationsMode
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTable
+          GBAW_OPERATIONS_CONTENT_BUCKET: !Ref OperationsContentBucket
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_REQUEST_DEADLINE_SECONDS: !Ref RequestDeadlineSeconds
+      Code:
+        # Placeholder inline shim. Repository automation (deploy-operations.sh)
+        # repackages the backend "operations.observe.lambda_entry" handler owned
+        # by issue #413 (core) before an enabled deploy. This inline body keeps
+        # the template self-contained and lintable; it is never the deployed
+        # artifact for a real observation path.
+        ZipFile: |
+          def handler(event, context):
+              raise RuntimeError(
+                  "operations observe placeholder; package operations.observe.lambda_entry"
+              )
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # API Gateway HTTP API with a Cognito/JWT authorizer on every route.
+  # --------------------------------------------------------------------------- #
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: OperationsEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-operations'
+      ProtocolType: HTTP
+      # Restrictive CORS: no wildcard origin, credentials disabled by omission.
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+          - GET
+        AllowHeaders:
+          - authorization
+          - content-type
+        MaxAge: 300
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-observation
+        CostCenter: game-operations
+        ManagedBy: cloudformation
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: OperationsEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-operations-jwt'
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Issuer: !Ref CognitoIssuer
+        Audience:
+          - !Ref CognitoClientId
+
+  ObservationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: OperationsEnabled
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ObservationFunction.Arn
+      PayloadFormatVersion: '2.0'
+      # Bounded below the 30 s ceiling (milliseconds).
+      TimeoutInMillis: 29000
+
+  ObserveRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: OperationsEnabled
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /operations/observe'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  StatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: OperationsEnabled
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /operations/{operationId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: OperationsEnabled
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+        ThrottlingRateLimit: !Ref ThrottlingRateLimit
+        DetailedMetricsEnabled: true
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-observation
+        ManagedBy: cloudformation
+
+  ObservationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: OperationsEnabled
+    Properties:
+      FunctionName: !Ref ObservationFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # --------------------------------------------------------------------------- #
+  # CloudWatch alarms on the four frozen metrics.
+  # --------------------------------------------------------------------------- #
+  ObservationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: OperationsEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-failures'
+      AlarmDescription: Observation requests are failing.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ObservationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ObservationTimeoutsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: OperationsEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-timeouts'
+      AlarmDescription: Observation requests are exceeding their deadline.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ObservationTimeouts
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  StuckOperationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: OperationsEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-stuck'
+      AlarmDescription: Stuck or lease-expired operations detected.
+      Namespace: 'GameAgent/Operations'
+      MetricName: StuckOperations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ObservationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: OperationsEnabled
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-latency'
+      AlarmDescription: Observation request latency approaching the request deadline.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ObservationRequestLatency
+      Statistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      # 27,000 ms acceptance ceiling from ADR 0005 (ceiling - margin).
+      Threshold: 27000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  OperationsMode:
+    Description: Effective operations mode for this stack deployment.
+    Value: !Ref OperationsMode
+
+  HttpApiEndpoint:
+    Condition: OperationsEnabled
+    Description: Base URL of the authenticated operations HTTP API.
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-OperationsHttpApiEndpoint'
+
+  OperationsTableName:
+    Condition: OperationsEnabled
+    Description: DynamoDB table for operation state, idempotency, and the ledger.
+    Value: !Ref OperationsTable
+    Export:
+      Name: !Sub '${ProjectName}-OperationsTableName'
+
+  OperationsContentBucketName:
+    Condition: OperationsEnabled
+    Description: S3 bucket for content-addressed observation records.
+    Value: !Ref OperationsContentBucket
+    Export:
+      Name: !Sub '${ProjectName}-OperationsContentBucketName'
+
+  ObservationRoleArn:
+    Condition: OperationsEnabled
+    Description: Dedicated least-privilege observation execution role ARN.
+    Value: !GetAtt ObservationRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsObservationRoleArn'
+
+  OperationsMetricNamespace:
+    Condition: OperationsEnabled
+    Description: CloudWatch namespace for E1 metrics.
+    Value: 'GameAgent/Operations'
