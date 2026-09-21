@@ -58,18 +58,29 @@ worked-around failure mode).
 A read-only detection check surfaces these failures instead of hiding them:
 
 - `backend/src/utils/adot_exporter_auth_detector.py` — pure classification logic
-  (unit-tested in `backend/tests/unit/test_adot_exporter_auth_detector_unit.py`).
+  (unit-tested in `backend/tests/unit/test_adot_exporter_auth_detector_unit.py`
+  and `backend/tests/unit/test_adot_exporter_auth_failclosed_unit.py`).
   It matches the exporter auth signatures, **excludes** the unrelated
   `400 / ResourceNotFound` case, clusters near-simultaneous lines into incidents,
   and classifies the result as:
-  - `clean` — no exporter auth failures (PASS);
+  - `clean` — no exporter auth failures (PASS, exit 0);
   - `transient_cold_start` — a bounded number of incidents, each adjacent to an
-    instance transition (WARN, non-blocking — the known behavior above);
+    instance transition (WARN, non-blocking, exit 0 — the known behavior above);
   - `persistent` — failures not bounded to cold start, or above the transient
-    budget (FAIL — investigate as a real regression, e.g. a broken IAM policy or
-    exporter misconfiguration).
+    budget (FAIL, exit 1 — investigate as a real regression, e.g. a broken IAM
+    policy or exporter misconfiguration);
+  - `unavailable` — the CloudWatch Logs query that feeds the classifier could
+    **not run** (bad/absent AWS profile, `AccessDenied`, throttling, a malformed
+    query, or a missing log group). This is a distinct, bounded, public-safe
+    result reported as WARN (exit 2). It is deliberately **not** reported as a
+    clean PASS: a failed query produces zero events, and treating that as "clean"
+    would be a **fail-open** bug that hides a broken check. The exporter status
+    is simply UNKNOWN until the query can run.
 - `scripts/infrastructure/check-exporter-auth.sh` — read-only wrapper that
-  fetches the runtime logs and runs the classifier. Run it directly:
+  fetches the runtime logs and runs the classifier. It captures the log-query
+  exit status: on a query failure it emits the `unavailable` WARN (exit 2) with a
+  public-safe reason and **never** leaks stderr, ARNs, accounts, or endpoints.
+  Run it directly:
 
   ```bash
   AWS_PROFILE=<profile> AWS_REGION=us-west-2 \
@@ -77,7 +88,9 @@ A read-only detection check surfaces these failures instead of hiding them:
   ```
 
   It is also invoked by `validate-deployment.sh` as a non-blocking observability
-  check after a deployment.
+  check after a deployment: exit 0 → PASS, exit 1 → FAIL, exit 2 → WARN
+  (shell-level fail-closed behavior is covered by
+  `backend/tests/unit/test_check_exporter_auth_script_unit.py`).
 
 ## Minimal, public-safe reproduction
 

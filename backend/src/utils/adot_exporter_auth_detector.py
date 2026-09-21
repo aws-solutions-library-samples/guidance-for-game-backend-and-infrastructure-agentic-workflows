@@ -24,6 +24,19 @@ distinguish the known transient cold-start signature (report as WARN, expected
 platform behavior) from a persistent pattern (report as FAIL, a genuine
 regression such as a broken IAM policy or exporter misconfiguration).
 
+Fail-closed on query failure
+----------------------------
+The classifier is only meaningful when the log query that produced ``events``
+actually ran. When the upstream CloudWatch Logs query itself fails — a bad/absent
+AWS profile, an authorization/throttling error, a malformed query, or a missing
+log group — there are zero events for a reason unrelated to health, and treating
+that empty result as ``clean`` would be a fail-*open* PASS that hides a broken
+check. Callers must instead build an ``unavailable`` report (see
+``unavailable_report``); it is a distinct, bounded, public-safe result that maps
+to a non-blocking WARN (never a clean PASS) so ``validate-deployment`` surfaces
+that the check could not run. The known transient cold-start WARN and the
+persistent regression FAIL are unchanged.
+
 Incident clustering
 --------------------
 A single cold-start credential gap emits more than one log line (a credential
@@ -104,6 +117,22 @@ DEFAULT_INCIDENT_GAP_MS = 5_000
 # transient blip. More than this (even near a transition) is a real regression.
 DEFAULT_TRANSIENT_BUDGET = 3
 
+# Classification labels.
+CLASSIFICATION_CLEAN = "clean"
+CLASSIFICATION_TRANSIENT = "transient_cold_start"
+CLASSIFICATION_PERSISTENT = "persistent"
+# The log query that feeds the classifier could not run (bad/absent profile,
+# authorization/throttle error, malformed query, or missing log group). This is
+# NOT "clean": we could not observe the runtime, so the check is unavailable.
+CLASSIFICATION_UNAVAILABLE = "unavailable"
+
+# Process exit statuses (also the contract with check-exporter-auth.sh /
+# validate-deployment.sh). 0 = clean/transient (PASS/WARN), 1 = persistent
+# (FAIL), 2 = unavailable (the check could not run -> WARN, never a clean PASS).
+EXIT_OK = 0
+EXIT_PERSISTENT = 1
+EXIT_UNAVAILABLE = 2
+
 
 def _body_of(event: dict[str, Any]) -> str:
     return str(event.get("body") or event.get("message") or "")
@@ -181,37 +210,65 @@ class ExporterAuthReport:
     """Result of classifying exporter auth failures over a set of log events."""
 
     failure_count: int  # number of distinct incidents (clustered)
-    classification: str  # "clean" | "transient_cold_start" | "persistent"
+    classification: str  # "clean" | "transient_cold_start" | "persistent" | "unavailable"
     line_count: int = 0  # raw matching log lines (pre-clustering)
     failure_timestamps: list[int] = field(default_factory=list)  # one per incident
     cold_start_adjacent: int = 0
     transient_budget: int = DEFAULT_TRANSIENT_BUDGET
+    # Bounded, public-safe reason for an ``unavailable`` classification (e.g.
+    # "log query failed"). Never contains raw stderr, ARNs, accounts, or bodies.
+    unavailable_reason: str = ""
 
     @property
     def has_failures(self) -> bool:
         return self.failure_count > 0
 
     def is_warning(self) -> bool:
-        """Transient cold-start failures are a non-blocking WARN (known platform behavior)."""
-        return self.classification == "transient_cold_start"
+        """Non-blocking WARN conditions.
+
+        Both the KNOWN transient cold-start signature (expected platform
+        behavior) and an ``unavailable`` check (the query could not run) are
+        surfaced as a non-blocking WARN — never as a silent clean PASS.
+        """
+        return self.classification in (CLASSIFICATION_TRANSIENT, CLASSIFICATION_UNAVAILABLE)
 
     def is_blocking(self) -> bool:
         """Persistent failures are a blocking FAIL (unexpected regression)."""
-        return self.classification == "persistent"
+        return self.classification == CLASSIFICATION_PERSISTENT
+
+    def is_unavailable(self) -> bool:
+        """True when the log query could not run, so nothing could be observed."""
+        return self.classification == CLASSIFICATION_UNAVAILABLE
 
     def exit_status(self) -> int:
-        """0 for clean/transient (WARN), 1 for persistent (FAIL)."""
-        return 1 if self.is_blocking() else 0
+        """Exit-code contract: 0 clean/transient, 1 persistent, 2 unavailable.
+
+        ``unavailable`` gets its own non-zero code so the shell wrapper can map
+        it to a WARN (the check could not run) distinctly from a persistent FAIL,
+        and can never let a failed query fall through to a clean PASS.
+        """
+        if self.is_blocking():
+            return EXIT_PERSISTENT
+        if self.is_unavailable():
+            return EXIT_UNAVAILABLE
+        return EXIT_OK
 
     def summary(self) -> str:
         """Public-safe, one-line human summary. No ARNs / accounts / endpoints / bodies."""
-        if self.classification == "clean":
+        if self.classification == CLASSIFICATION_CLEAN:
             return "ADOT exporter auth: OK — no exporter 403/credential failures found."
-        if self.classification == "transient_cold_start":
+        if self.classification == CLASSIFICATION_TRANSIENT:
             return (
                 f"ADOT exporter auth: WARN — {self.failure_count} transient cold-start "
                 f"exporter incident(s) (all adjacent to an instance transition; known "
                 f"platform behavior, telemetry recovers). See issue #420."
+            )
+        if self.classification == CLASSIFICATION_UNAVAILABLE:
+            reason = self.unavailable_reason or "log query failed"
+            return (
+                f"ADOT exporter auth: WARN — check could not run ({reason}); "
+                f"exporter auth status is UNKNOWN, not clean. Verify AWS "
+                f"profile/permissions/log group and re-run. See issue #420."
             )
         return (
             f"ADOT exporter auth: FAIL — {self.failure_count} exporter 403/credential "
@@ -219,6 +276,40 @@ class ExporterAuthReport:
             f"Investigate exporter credentials/IAM; this exceeds the known #420 "
             f"transient signature."
         )
+
+
+# A compact allow-list of public-safe reason phrases. The shell wrapper passes a
+# short token describing *why* the query failed; we normalize it to one of these
+# so no raw stderr (which could carry ARNs/accounts/endpoints) ever reaches the
+# summary. Any unrecognized token collapses to the generic phrase.
+_SAFE_REASONS = {
+    "query_failed": "log query failed",
+    "profile_not_found": "AWS profile not found",
+    "access_denied": "access denied to log group",
+    "throttled": "request throttled",
+    "log_group_missing": "log group not found",
+    "invalid_query": "malformed log query",
+}
+
+
+def unavailable_report(reason: str = "query_failed") -> ExporterAuthReport:
+    """Build a bounded, public-safe ``unavailable`` report.
+
+    Use this when the upstream CloudWatch Logs query could not run (bad/absent
+    profile, authorization/throttle error, malformed query, or missing log
+    group). ``reason`` is a short token normalized against a fixed allow-list;
+    unknown tokens collapse to a generic phrase so no raw stderr is ever
+    surfaced.
+    """
+    safe = _SAFE_REASONS.get(str(reason).strip().lower(), _SAFE_REASONS["query_failed"])
+    return ExporterAuthReport(
+        failure_count=0,
+        classification=CLASSIFICATION_UNAVAILABLE,
+        line_count=0,
+        failure_timestamps=[],
+        cold_start_adjacent=0,
+        unavailable_reason=safe,
+    )
 
 
 def classify_exporter_events(
@@ -252,6 +343,10 @@ def classify_exporter_events(
           are cold-start adjacent (the known #420 behavior; WARN, non-blocking).
         * ``persistent``          — any incident not cold-start adjacent, or more
           incidents than the transient budget (FAIL, blocking).
+
+    Note: this function assumes the log query that produced ``events`` actually
+    ran. A failed query must NOT be routed here (its empty result would look
+    ``clean``); callers build :func:`unavailable_report` instead.
     """
     transitions = list(instance_transitions)
     failures = [e for e in events if is_exporter_auth_failure(e)]
@@ -262,7 +357,7 @@ def classify_exporter_events(
     if count == 0:
         return ExporterAuthReport(
             failure_count=0,
-            classification="clean",
+            classification=CLASSIFICATION_CLEAN,
             line_count=len(failures),
             failure_timestamps=[],
             cold_start_adjacent=0,
@@ -274,7 +369,7 @@ def classify_exporter_events(
     all_adjacent = adjacent == count
     within_budget = count <= transient_budget
 
-    classification = "transient_cold_start" if (all_adjacent and within_budget) else "persistent"
+    classification = CLASSIFICATION_TRANSIENT if (all_adjacent and within_budget) else CLASSIFICATION_PERSISTENT
 
     return ExporterAuthReport(
         failure_count=count,
