@@ -104,6 +104,19 @@ CONTRACT_VERSION = "1.0"
 # document; any response larger than this indicates an unbounded/leaky body.
 MAX_RESPONSE_BYTES = 64 * 1024
 
+# Explicit, separate connect/read timeouts for the real HTTP transport. Their
+# sum stays *below* the 30s API Gateway integration ceiling
+# (operations.settings) so the client gives up before the gateway would, and a
+# slow-loris peer can never hold the connection open past the ceiling.
+CONNECT_TIMEOUT_S = 5.0
+READ_TIMEOUT_S = 20.0
+
+# The number of bytes we are ever willing to pull off the wire for one response:
+# one byte past the accepted ceiling, so an over-ceiling body is detected as
+# oversized without ever being buffered unboundedly. A hostile server that
+# streams forever is aborted here.
+MAX_READ_BYTES = MAX_RESPONSE_BYTES + 1
+
 # The E1 CloudWatch metric namespace and the frozen metric names, for the
 # optional read-only postcheck.
 METRIC_NAMESPACE = "GameAgent/Operations"
@@ -191,8 +204,58 @@ class HttpResponse:
 Transport = Callable[[str, str, Optional[Mapping[str, str]], Optional[bytes]], HttpResponse]
 
 
+class TransportSecurityError(RuntimeError):
+    """A request violated a hard transport-security invariant.
+
+    Raised *instead of* returning an :class:`HttpResponse` when the peer does
+    something the harness must never tolerate: a non-HTTPS URL, a redirect
+    (any 3xx), or an over-ceiling / unbounded response body. Raising rather
+    than returning guarantees the offending exchange (a redirect that would
+    otherwise resubmit the bearer token, or a hostile streamed body) is never
+    followed, resubmitted, or buffered.
+    """
+
+
+def _read_bounded(response: Any) -> bytes:
+    """Stream at most ``MAX_READ_BYTES`` off the wire, then close the response.
+
+    We read ``iter_content`` up to one byte past the accepted ceiling and stop.
+    If the peer had *more* to send, the body is over the ceiling: we raise
+    (never buffering the rest) so an unbounded/hostile body cannot exhaust
+    memory. The response is always released.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= MAX_READ_BYTES:
+                # We have pulled one byte past the ceiling (or exactly the
+                # cap). Stop immediately without reading the remainder.
+                raise TransportSecurityError("response body exceeded the byte ceiling")
+    finally:
+        response.close()
+    return b"".join(chunks)
+
+
 def _requests_transport() -> Transport:
-    """Build a ``requests``-backed transport (deferred import; existing dep)."""
+    """Build a hardened ``requests``-backed transport (deferred import).
+
+    Security invariants enforced on every request:
+
+    * **HTTPS only.** A non-``https://`` URL is refused before any socket opens.
+    * **Certificate verification on** (``verify=True``).
+    * **No redirects.** ``allow_redirects=False`` and any 3xx status is a hard
+      failure, so a ``Location`` redirect can never resubmit the ``Authorization``
+      header to another origin.
+    * **Streamed + bounded.** ``stream=True`` plus an up-front ``Content-Length``
+      rejection and a byte-capped read mean a hostile or oversized body is never
+      buffered unboundedly.
+    * **Explicit connect/read timeouts** whose sum is below the API ceiling.
+    """
     # Third-party packages
     import requests
 
@@ -204,18 +267,46 @@ def _requests_transport() -> Transport:
         headers: Optional[Mapping[str, str]],
         body: Optional[bytes],
     ) -> HttpResponse:
+        if not url.lower().startswith("https://"):
+            raise TransportSecurityError("refusing to send a request over a non-HTTPS URL")
+
         response = session.request(
             method,
             url,
             headers=dict(headers or {}),
             data=body,
-            timeout=30,
+            timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
+            verify=True,
+            allow_redirects=False,
+            stream=True,
         )
-        return HttpResponse(
-            status=response.status_code,
-            content_type=response.headers.get("content-type", ""),
-            body_bytes=response.content,
-        )
+        try:
+            # Any 3xx is refused: never follow a redirect (it would resubmit the
+            # bearer token to the redirect target).
+            if 300 <= response.status_code < 400:
+                raise TransportSecurityError("refusing to follow an HTTP redirect (3xx)")
+
+            # Reject an over-ceiling body up front when the peer declares one,
+            # before reading any of it.
+            declared = response.headers.get("content-length")
+            if declared is not None:
+                try:
+                    declared_len = int(declared)
+                except ValueError:
+                    raise TransportSecurityError("response declared a malformed Content-Length")
+                if declared_len > MAX_RESPONSE_BYTES:
+                    raise TransportSecurityError("response Content-Length exceeds the size ceiling")
+
+            body_bytes = _read_bounded(response)
+            return HttpResponse(
+                status=response.status_code,
+                content_type=response.headers.get("content-type", ""),
+                body_bytes=body_bytes,
+            )
+        finally:
+            # Idempotent; ensures the connection is released even on the raise
+            # paths above (before _read_bounded took ownership).
+            response.close()
 
     return _do
 

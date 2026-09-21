@@ -377,14 +377,49 @@ whether the E1 metric names (`ObservationFailures`, `ObservationTimeouts`,
 a missing metric or absent credentials is reported, never fatal. Pass
 `--skip-postcheck` to omit it.
 
+### Hardened HTTP transport
+
+The production transport (`_requests_transport`, the code the `python -m` CLI
+uses) enforces hard security invariants on every request so a hostile or
+misconfigured endpoint cannot subvert the run:
+
+- **HTTPS only** — a non-`https://` URL is refused before any socket opens.
+- **Certificate verification on** (`verify=True`).
+- **No redirects** — `allow_redirects=False` and any `3xx` status is a hard
+  failure (`TransportSecurityError`), so a `Location` redirect can never
+  resubmit the `Authorization` bearer token to another origin.
+- **Streamed and bounded** — `stream=True`, plus an up-front `Content-Length`
+  rejection and a byte-capped read that pulls at most `MAX_RESPONSE_BYTES + 1`
+  off the wire before closing, so an oversized or unbounded body is never
+  buffered.
+- **Explicit split timeouts** — separate connect/read timeouts whose sum stays
+  below the 30s API Gateway integration ceiling.
+
 ### Discriminating unit coverage (runs in the default suite)
 
 The harness's assertions are proven **discriminating** by unit tests that drive
-it against a local stdlib fake HTTP server: a compliant fake passes every check,
-and a family of deliberately broken fakes (accepts identity injection,
-non-deterministic replay, no idempotency conflict, id-token allowed, unknown
-returns 500, leaky content type, leaky body) each fail exactly the matching
-check. These require **no** credentials and run in the default unit suite:
+it against a local stdlib fake HTTP server (real TCP) and, for the precise
+per-check isolation assertions, an equivalent in-process transport for
+determinism. A compliant fake passes every check; a family of deliberately
+broken fakes each fail exactly the matching check, so **all nine** checks are
+shown to discriminate:
+
+- allows unauthenticated POST → fails check 1 (unauthenticated denial)
+- accepts identity injection → fails check 2
+- valid POST returns a typed error → fails check 3 (authenticated success)
+- non-deterministic replay → fails check 4
+- no idempotency conflict → fails check 5
+- status GET returns a mismatched op/state → fails check 6 (status/result match)
+- id-token allowed → fails check 7
+- unknown returns `500` → fails check 8
+- leaky content type / leaky body → fail check 3/9 on the bound/leak axis
+
+Dedicated transport tests drive the real `_requests_transport` through a mocked
+`requests` session to prove that a `3xx` redirect is refused **without**
+following it or resubmitting the `Authorization` header, and that a hostile
+unbounded stream is aborted at the byte bound **without** reading the rest.
+
+These require **no** credentials and run in the default unit suite:
 
 ```bash
 cd backend && uv run pytest -m unit -k operations_e1_shakedown
