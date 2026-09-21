@@ -14,18 +14,39 @@ Functions.
 > that the operations stack is deployed. The base stack and normal deployment
 > (`./deploy-all.sh`) never create any E1 resource.
 
-## Default-disabled invariant
+## Default-unprovisioned invariant (and provisioning vs. runtime authority)
 
 `infrastructure/cloudformation/06-operations-observation.yaml` is a **separate
 stack**. It is **not** referenced by `scripts/deploy.sh` or `deploy-all.sh`. A
 normal deployment therefore creates **zero** E1 resources.
 
-The template additionally gates every resource behind a `Condition`
-(`OperationsEnabled`) driven by the `OperationsMode` parameter, whose default is
-`disabled`. Deploying the optional stack with defaults still creates zero E1
-resources; the operator must pass `OperationsMode=observe` explicitly. This is a
-belt-and-braces control: the stack is both un-wired from automation *and*
-internally default-disabled.
+The template separates two independent concepts:
+
+- **Provisioning** (`Provisioned`, default **`false`**) — whether the E1 resource
+  set exists at all. Every resource is gated on the `ResourcesProvisioned`
+  condition (`Provisioned=true`). A defaults deploy leaves `Provisioned=false`,
+  so it creates **zero** resources and costs **$0** and holds no data.
+- **Runtime authority** (`OperationsMode`, default **`disabled`**) — the kill
+  switch for an *already-provisioned* control plane. It is injected as
+  `GBAW_OPERATIONS_MODE` and additionally throttles the HTTP API stage to zero
+  when it is not `observe`, so a provisioned-but-disabled stack **fails closed**
+  at both the API and the handler. It does **not** gate resource existence.
+
+This split is what makes disable safe and reversible. An **emergency disable**
+sets `OperationsMode=disabled` while keeping `Provisioned=true`: every resource
+stays under CloudFormation with **stable physical names** and **retained audit
+data**, and a later re-enable simply flips the authority back. Because resource
+existence is gated on `Provisioned` (not on `OperationsMode`), disabling deletes
+**nothing** — the earlier single-condition design, where disabling removed every
+resource and a re-enable then collided on retained physical names, is fixed.
+
+The template's `Rules` enforce the safe combinations: `OperationsMode=observe`
+**requires** `Provisioned=true` (you cannot enable runtime authority against a
+zero-resource stack), and whenever `Provisioned=true` the bindings the resources
+reference (JWT issuer/audience, tenant, workspace, and the Lambda code artifact
+bucket/key) **must be non-empty** — in `observe` *and* in
+disabled-after-provision. That is why an emergency disable **reuses** the stack's
+existing parameter values rather than blanking them.
 
 ## Frozen names
 
@@ -57,7 +78,7 @@ invokes this core handler directly.
 
 | Name | Meaning |
 | --- | --- |
-| `GBAW_OPERATIONS_MODE` | `disabled` (default) or `observe`; the runtime kill switch |
+| `GBAW_OPERATIONS_MODE` | `disabled` (default) or `observe`; the runtime kill switch, injected from the `OperationsMode` parameter. Independent of `Provisioned`: a disabled-but-provisioned stack keeps all resources |
 | `GBAW_OPERATIONS_TABLE_NAME` | DynamoDB operation-state / idempotency / ledger table |
 | `GBAW_OPERATIONS_METRIC_NAMESPACE` | CloudWatch namespace for E1 metrics (`GameAgent/Operations`) |
 | `GBAW_OPERATIONS_TENANT_ID` | Server-side trusted tenant binding |
@@ -188,19 +209,47 @@ Environment (`beta`/`prod`) is selected with `--environment`; production sets
 DynamoDB deletion protection and a dedicated retention posture (see the
 template `Environment` parameter).
 
-## Disable / rollback (safe)
+## Disable / rollback (safe, data-preserving, reversible)
 
-Disabling is a data-preserving, reversible operation:
+Disabling is an emergency, data-preserving, reversible operation on an
+**already-provisioned** stack:
 
 ```bash
-# Re-deploy the stack in disabled mode: routes and compute stop serving,
-# durable data (DynamoDB table) is retained.
+# Keep every resource under CloudFormation; only flip the runtime authority to
+# disabled so the API and handler fail closed. No code rebuild, no Docker.
 ./scripts/infrastructure/deploy-operations.sh --disable
 ```
 
-Because durable resources use a retain policy, disabling removes the request
-path (API route, authorizer, compute) while preserving audit data. Re-enabling
-restores the path against the same data.
+What `--disable` does — and does **not** — do:
+
+- It **keeps `Provisioned=true`** and every resource in place: the KMS key,
+  DynamoDB table, log groups, IAM role, Lambda function, HTTP API, and alarms
+  are **not deleted** and keep their **stable physical names**. Disabling deletes
+  **nothing**.
+- It sets only **`OperationsMode=disabled`**, so `GBAW_OPERATIONS_MODE=disabled`
+  is injected (the handler fails closed) and the HTTP API stage throttles to
+  zero (the gateway fails closed). Direct/API calls are rejected.
+- It **reuses** the stack's current parameter values via CloudFormation
+  `UsePreviousValue` (issuer, audience, tenant, workspace, code artifact
+  bucket/key, budgets). It does **not rebuild code or run Docker** — an emergency
+  disable must not depend on a working build.
+- It first **verifies the exact target stack exists** in the credential's
+  account/region and that it is actually provisioned (`Provisioned=true`),
+  refusing (exit 7) otherwise, then **updates through CloudFormation**
+  (`update-stack`) and waits for completion.
+
+Because resources and their retained data stay under CloudFormation, a later
+`--enable` is fully **reversible**: it flips `OperationsMode` back to `observe`
+against the same resources, names, and data — no re-create, no name collision.
+
+> **Cost note.** A **disabled-but-provisioned** stack is **not** the same as the
+> default `$0` state. The retained DynamoDB table (storage + PITR), the KMS key,
+> the log groups (storage), and the CloudWatch alarms/metrics continue to incur
+> their standing (fixed) charges and continue to **retain audit data** while
+> disabled. Only the **default, unprovisioned** stack (`Provisioned=false`, the
+> deploy default) costs $0 and holds no data. To stop the standing charges,
+> tear the stack down explicitly (see below) — teardown, not disable, is the
+> path that removes resources.
 
 ## Teardown (explicit, never automatic)
 

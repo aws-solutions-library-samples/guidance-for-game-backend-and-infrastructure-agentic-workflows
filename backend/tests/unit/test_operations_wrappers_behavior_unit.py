@@ -130,3 +130,95 @@ def test_teardown_help_is_clean():
 def test_teardown_help_has_no_delete_data_flag():
     result = _run(TEARDOWN, "--help")
     assert "--delete-data" not in result.stdout
+
+
+# --------------------------------------------------------------------------- #
+# Rollback design: the --disable path must be a data-preserving, no-rebuild
+# update that reuses the stack's existing parameter values and only flips the
+# runtime authority. These assertions read the wrapper source (the AWS-dependent
+# branch cannot execute without credentials/a live stack), which is the same
+# static-contract style the infra test uses for wrapper invariants.
+# --------------------------------------------------------------------------- #
+_DEPLOY_TEXT = DEPLOY.read_text(encoding="utf-8")
+
+
+def _disable_branch():
+    """Return the source of the `if [ "$ACTION" = "disable" ]; then ... fi`
+    branch so assertions target the disable path specifically."""
+    marker = 'if [ "$ACTION" = "disable" ]; then'
+    start = _DEPLOY_TEXT.index(marker)
+    # The enable-path deploy comment reliably follows the disable branch.
+    end = _DEPLOY_TEXT.index("# ENABLE path deploy", start)
+    return _DEPLOY_TEXT[start:end]
+
+
+def test_disable_keeps_provisioned_true_and_sets_mode_disabled():
+    branch = _disable_branch()
+    assert (
+        "ParameterKey=Provisioned,ParameterValue=true" in branch
+    ), "disable must KEEP Provisioned=true so resources are not deleted"
+    assert (
+        "ParameterKey=OperationsMode,ParameterValue=disabled" in branch
+    ), "disable must set OperationsMode=disabled (fail closed)"
+
+
+def test_disable_reuses_existing_parameter_values():
+    """Every binding the provisioned resources reference must be reused via
+    UsePreviousValue, never blanked — blanking would violate the template Rules
+    and (previously) orphan/rename resources."""
+    branch = _disable_branch()
+    for reused in (
+        "CognitoIssuer",
+        "CognitoClientId",
+        "TenantId",
+        "WorkspaceId",
+        "TrustedAudience",
+        "CodeS3Bucket",
+        "CodeS3Key",
+    ):
+        assert (
+            f"ParameterKey={reused},UsePreviousValue=true" in branch
+        ), f"disable must reuse {reused} via UsePreviousValue"
+
+
+def test_disable_does_not_rebuild_code_or_run_docker():
+    branch = _disable_branch()
+    for forbidden in ("zip", "pip install", "uv pip", "docker", "shasum", "s3 cp", "head-bucket"):
+        assert forbidden not in branch, f"disable path must not '{forbidden}': emergency disable rebuilds no code"
+
+
+def test_disable_verifies_target_stack_and_refuses_unprovisioned():
+    branch = _disable_branch()
+    assert "describe-stacks" in branch, "disable must verify the target stack exists"
+    assert (
+        "Provisioned" in branch and "not provisioned" in branch
+    ), "disable must refuse a stack that is not provisioned"
+    # Distinct exit codes for 'no/unprovisioned stack' (7) and 'update failed' (8).
+    assert "exit 7" in branch
+    assert "exit 8" in branch
+
+
+def test_disable_updates_through_cloudformation_reversibly():
+    branch = _disable_branch()
+    assert "update-stack" in branch, "disable must update through CloudFormation"
+    assert "--template-body" in branch
+    assert "stack-update-complete" in branch, "disable should wait for the update"
+    assert "--enable" in branch, "disable messaging must point at the reversible re-enable"
+
+
+def test_enable_path_provisions_resources():
+    """The enable deploy must pass Provisioned=true so resources are created
+    (observe requires Provisioned=true per the template Rule)."""
+    # The enable PARAM_OVERRIDES block sets Provisioned=true.
+    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
+    enable = _DEPLOY_TEXT[idx:]
+    assert '"Provisioned=true"' in enable, "enable must provision resources (Provisioned=true)"
+    assert '"OperationsMode=${OPERATIONS_MODE}"' in enable
+
+
+def test_disable_help_describes_data_preserving_no_rebuild():
+    result = _run(DEPLOY, "--help")
+    assert result.returncode == 0
+    combined = result.stdout + result.stderr
+    assert "data-preserving" in combined.lower()
+    assert "does not rebuild" in combined.lower() or "rebuild" in combined.lower()

@@ -1,12 +1,16 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Game Agent - OPTIONAL E1 operations observation control plane (GitHub issue
-  #413). Default-disabled: this stack is not wired into deploy-all.sh, and every
-  resource is additionally gated on the OperationsEnabled condition
-  (OperationsMode defaults to "disabled"), so a deploy with defaults creates
-  ZERO E1 resources. Implements the accepted synchronous, read-only GameLift
-  observation design in docs/adr/0005-persist-operations-and-recover-workflows.md.
-  No provider-write permission, no queue/worker/dead-letter queue, and no Step
+  #413). Default-unprovisioned: this stack is not wired into deploy-all.sh, and
+  every resource is gated on the ResourcesProvisioned condition (Provisioned
+  defaults to "false"), so a deploy with defaults creates ZERO E1 resources and
+  costs $0. Provisioning (Provisioned=true) and runtime authority (OperationsMode
+  observe|disabled) are SEPARATE: an emergency disable sets OperationsMode=disabled
+  while keeping Provisioned=true, so resources and their retained audit data stay
+  under CloudFormation with stable physical names and a later re-enable is
+  reversible. Implements the accepted synchronous, read-only GameLift observation
+  design in docs/adr/0005-persist-operations-and-recover-workflows.md. No
+  provider-write permission, no queue/worker/dead-letter queue, and no Step
   Functions are created.
 
 Parameters:
@@ -15,6 +19,25 @@ Parameters:
     Default: game-agent
     Description: Project name used for resource naming.
 
+  Provisioned:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Initial-provisioning authority, SEPARATE from the runtime OperationsMode
+      kill switch. "false" (the default) creates ZERO E1 resources, so a default
+      new stack costs $0 and holds no data. "true" provisions the full E1
+      resource set (KMS key, DynamoDB table, log groups, role, Lambda, HTTP API,
+      alarms). Provisioning is a deliberate, owner-approved act. Once "true", it
+      MUST stay "true" for the life of the data: an emergency disable flips
+      OperationsMode to "disabled" but keeps Provisioned="true" so every resource
+      stays under CloudFormation with stable physical names and retained audit
+      data, and a later re-enable is reversible. Setting it back to "false"
+      REMOVES the resources (data-bearing ones detach under their retain policy)
+      and is a teardown decision, not a disable.
+
   OperationsMode:
     Type: String
     Default: disabled
@@ -22,10 +45,14 @@ Parameters:
       - disabled
       - observe
     Description: >-
-      Master enablement for the optional operations control plane. "disabled"
-      (the default) creates zero E1 resources even when this stack is deployed.
-      "observe" is the only enabled mode for E1: synchronous, read-only GameLift
-      observation. Set to "observe" only when an owner explicitly opts in.
+      Runtime authority (kill switch) for a PROVISIONED control plane, SEPARATE
+      from the Provisioned flag that controls whether resources exist at all.
+      "disabled" (the default) is fail-closed: injected as GBAW_OPERATIONS_MODE
+      so the handler and API reject every operation. "observe" is the only
+      enabled mode for E1: synchronous, read-only GameLift observation. On an
+      already-provisioned stack, an emergency disable sets this to "disabled"
+      while leaving Provisioned="true" (resources and data retained, reversible);
+      it does NOT delete resources. "observe" requires Provisioned="true".
 
   Environment:
     Type: String
@@ -183,32 +210,56 @@ Parameters:
     Description: HTTP API stage throttling steady-state rate limit (denial-of-wallet control).
 
 Conditions:
-  # Master switch. Every resource references this, so OperationsMode=disabled
-  # (the default) provisions nothing.
+  # Resource existence gate. Every resource references THIS, driven by the
+  # Provisioned flag (default "false"), so a default deploy provisions nothing
+  # and costs $0. This is deliberately DECOUPLED from OperationsMode: an
+  # emergency disable sets OperationsMode=disabled but keeps Provisioned="true",
+  # so the resources and their retained data stay under CloudFormation and a
+  # later re-enable is reversible.
+  ResourcesProvisioned: !Equals [!Ref Provisioned, 'true']
+  # Runtime authority (kill switch). Does NOT gate resource existence; it only
+  # feeds the injected GBAW_OPERATIONS_MODE so a provisioned-but-disabled stack
+  # fails closed at the handler/API.
   OperationsEnabled: !Equals [!Ref OperationsMode, observe]
   IsProd: !Equals [!Ref Environment, prod]
   # An explicit trusted audience overrides the Cognito client id fallback.
   HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
 
 Rules:
-  # Enabled-mode validation: when OperationsMode=observe, the enabling inputs
-  # must be non-empty so an enabled deploy can never proceed with a missing
-  # issuer, audience, tenant, workspace, or code artifact.
-  EnabledModeRequiresInputs:
+  # Reject the unsafe combination "observe without provisioning": the runtime
+  # authority can only be enabled when the resources it needs actually exist.
+  # This is what makes --enable require Provisioned=true and prevents an
+  # observe-mode deploy against a zero-resource stack.
+  EnabledModeRequiresProvisioning:
     RuleCondition: !Equals [!Ref OperationsMode, observe]
     Assertions:
+      - Assert: !Equals [!Ref Provisioned, 'true']
+        AssertDescription: >-
+          OperationsMode=observe requires Provisioned=true; enabling runtime
+          authority against a zero-resource (unprovisioned) stack is rejected.
+
+  # Whenever resources exist (Provisioned=true) the bindings those resources
+  # reference — the JWT issuer/audience on the authorizer, the trusted
+  # tenant/workspace bindings, and the Lambda code artifact — must be non-empty,
+  # in observe AND in disabled-after-provision. This is why an emergency disable
+  # must REUSE the existing parameter values rather than blanking them: a
+  # provisioned stack can never carry an empty issuer, audience, tenant,
+  # workspace, or code artifact.
+  ProvisionedRequiresInputs:
+    RuleCondition: !Equals [!Ref Provisioned, 'true']
+    Assertions:
       - Assert: !Not [!Equals [!Ref CognitoIssuer, '']]
-        AssertDescription: CognitoIssuer is required when OperationsMode=observe.
+        AssertDescription: CognitoIssuer is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref CognitoClientId, '']]
-        AssertDescription: CognitoClientId is required when OperationsMode=observe.
+        AssertDescription: CognitoClientId is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref TenantId, '']]
-        AssertDescription: TenantId is required when OperationsMode=observe.
+        AssertDescription: TenantId is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
-        AssertDescription: WorkspaceId is required when OperationsMode=observe.
+        AssertDescription: WorkspaceId is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref CodeS3Bucket, '']]
-        AssertDescription: CodeS3Bucket is required when OperationsMode=observe.
+        AssertDescription: CodeS3Bucket is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref CodeS3Key, '']]
-        AssertDescription: CodeS3Key is required when OperationsMode=observe.
+        AssertDescription: CodeS3Key is required when Provisioned=true.
 
 Resources:
   # --------------------------------------------------------------------------- #
@@ -219,7 +270,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   OperationsKmsKey:
     Type: AWS::KMS::Key
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     # RetainExceptOnCreate: keep the CMK on teardown/replacement, but delete it
     # if the stack's initial create rolls back (avoids orphaning an empty key).
     DeletionPolicy: RetainExceptOnCreate
@@ -270,7 +321,7 @@ Resources:
 
   OperationsKmsAlias:
     Type: AWS::KMS::Alias
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       AliasName: !Sub 'alias/${ProjectName}-operations'
       TargetKeyId: !Ref OperationsKmsKey
@@ -281,7 +332,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   OperationsTable:
     Type: AWS::DynamoDB::Table
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     # RetainExceptOnCreate: preserve audit data on teardown/replacement, but
     # delete the empty table if the initial create rolls back (no orphan).
     DeletionPolicy: RetainExceptOnCreate
@@ -328,7 +379,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   ObservationFunctionLogGroup:
     Type: AWS::Logs::LogGroup
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
@@ -338,7 +389,7 @@ Resources:
 
   AccessLogGroup:
     Type: AWS::Logs::LogGroup
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
@@ -351,7 +402,7 @@ Resources:
   # the API's access-log delivery fails. Scoped to this account and this API.
   AccessLogDeliveryResourcePolicy:
     Type: AWS::Logs::ResourcePolicy
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     DependsOn: AccessLogGroup
     Properties:
       PolicyName: !Sub '${ProjectName}-operations-access-log-delivery'
@@ -382,7 +433,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   ObservationRole:
     Type: AWS::IAM::Role
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       RoleName: !Sub '${ProjectName}-operations-observe-role'
       AssumeRolePolicyDocument:
@@ -470,7 +521,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   ObservationFunction:
     Type: AWS::Lambda::Function
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     DependsOn: ObservationFunctionLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-operations-observe'
@@ -517,7 +568,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       Name: !Sub '${ProjectName}-operations'
       ProtocolType: HTTP
@@ -538,7 +589,7 @@ Resources:
 
   JwtAuthorizer:
     Type: AWS::ApiGatewayV2::Authorizer
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       Name: !Sub '${ProjectName}-operations-jwt'
       ApiId: !Ref HttpApi
@@ -552,7 +603,7 @@ Resources:
 
   ObservationIntegration:
     Type: AWS::ApiGatewayV2::Integration
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       ApiId: !Ref HttpApi
       IntegrationType: AWS_PROXY
@@ -563,7 +614,7 @@ Resources:
 
   ObserveRoute:
     Type: AWS::ApiGatewayV2::Route
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: 'POST /operations/observe'
@@ -575,7 +626,7 @@ Resources:
   # this frozen path parameter route (GET /operations/{operationId}).
   StatusRoute:
     Type: AWS::ApiGatewayV2::Route
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: 'GET /operations/{operationId}'
@@ -585,7 +636,7 @@ Resources:
 
   ApiStage:
     Type: AWS::ApiGatewayV2::Stage
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       ApiId: !Ref HttpApi
       StageName: '$default'
@@ -595,8 +646,13 @@ Resources:
         Format: >-
           {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
       DefaultRouteSettings:
-        ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
-        ThrottlingRateLimit: !Ref ThrottlingRateLimit
+        # API-safe kill switch: when OperationsMode is not "observe" (e.g. after
+        # an emergency --disable on a provisioned stack) the gateway throttles to
+        # zero, so the API itself fails closed and rejects every request BEFORE
+        # the integration — without deleting the stage or any resource. When
+        # enabled, the operator-tuned denial-of-wallet limits apply.
+        ThrottlingBurstLimit: !If [OperationsEnabled, !Ref ThrottlingBurstLimit, 0]
+        ThrottlingRateLimit: !If [OperationsEnabled, !Ref ThrottlingRateLimit, 0]
         DetailedMetricsEnabled: true
       Tags:
         Project: !Ref ProjectName
@@ -605,7 +661,7 @@ Resources:
 
   ObservationInvokePermission:
     Type: AWS::Lambda::Permission
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       FunctionName: !Ref ObservationFunction
       Action: 'lambda:InvokeFunction'
@@ -617,7 +673,7 @@ Resources:
   # --------------------------------------------------------------------------- #
   ObservationFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-failures'
       AlarmDescription: Observation requests are failing.
@@ -632,7 +688,7 @@ Resources:
 
   ObservationTimeoutsAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-timeouts'
       AlarmDescription: Observation requests are exceeding their deadline.
@@ -647,7 +703,7 @@ Resources:
 
   StuckOperationsAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-stuck'
       AlarmDescription: Stuck or lease-expired operations detected.
@@ -662,7 +718,7 @@ Resources:
 
   ObservationLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-latency'
       AlarmDescription: Observation request latency approaching the request deadline.
@@ -678,32 +734,41 @@ Resources:
       TreatMissingData: notBreaching
 
 Outputs:
+  Provisioned:
+    Description: >-
+      Whether this stack has provisioned the E1 resource set. "false" means zero
+      resources ($0, no data). "true" means resources exist; a disabled-but-
+      provisioned stack keeps them (and their retained data) under CloudFormation.
+    Value: !Ref Provisioned
+
   OperationsMode:
-    Description: Effective operations mode for this stack deployment.
+    Description: >-
+      Effective runtime authority (kill switch) for this stack. "disabled" fails
+      closed; "observe" serves read-only observation. Independent of Provisioned.
     Value: !Ref OperationsMode
 
   HttpApiEndpoint:
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Description: Base URL of the authenticated operations HTTP API.
     Value: !GetAtt HttpApi.ApiEndpoint
     Export:
       Name: !Sub '${ProjectName}-OperationsHttpApiEndpoint'
 
   OperationsTableName:
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Description: DynamoDB table for operation state, idempotency, and the ledger.
     Value: !Ref OperationsTable
     Export:
       Name: !Sub '${ProjectName}-OperationsTableName'
 
   ObservationRoleArn:
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Description: Dedicated least-privilege observation execution role ARN.
     Value: !GetAtt ObservationRole.Arn
     Export:
       Name: !Sub '${ProjectName}-OperationsObservationRoleArn'
 
   OperationsMetricNamespace:
-    Condition: OperationsEnabled
+    Condition: ResourcesProvisioned
     Description: CloudWatch namespace for E1 metrics.
     Value: 'GameAgent/Operations'

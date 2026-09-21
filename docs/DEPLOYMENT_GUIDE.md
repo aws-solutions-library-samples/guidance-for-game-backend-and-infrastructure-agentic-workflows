@@ -282,22 +282,33 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 ### Optional operations control plane (E1)
 
-The optional E1 operations control plane is **default-disabled** and adds
-**$0.00** incremental cost. It creates no HTTP API route, compute, table,
-bucket, metric, or alarm unless an owner explicitly enables operations. When
-enabled, it deploys the accepted synchronous, read-only GameLift observation
-design ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with
-**no queue, worker, dead-letter queue, or Step Functions** in the observation
-path and no provider-write permission.
+The optional E1 operations control plane is **default-unprovisioned** and adds
+**$0.00** incremental cost. With the deploy default (`Provisioned=false`) it
+creates no HTTP API route, compute, table, metric, or alarm and holds no data,
+unless an owner explicitly **provisions and enables** operations. When enabled,
+it deploys the accepted synchronous, read-only GameLift observation design
+([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with **no
+queue, worker, dead-letter queue, or Step Functions** in the observation path and
+no provider-write permission. Provisioning (`Provisioned`) and runtime authority
+(`OperationsMode`) are **separate**: an emergency `--disable` keeps every resource
+(and its retained data) and flips only the kill switch, so it is **not** the $0
+state — see the note below the table.
 
 Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**;
 free-tier allowances excluded):
 
-| Scenario | Fixed | Variable | Total [USD] |
-| --- | --- | --- | --- |
-| Default-disabled | $0.00 | $0.00 | **$0.00** |
-| Enabled, idle | $1.65 | $0.00 | **$1.65** |
-| Enabled, 100,000 observations/mo | $1.84 | $3.49 | **$5.33** |
+| Scenario | Provisioned | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- | --- |
+| Default (unprovisioned) | no | $0.00 | $0.00 | **$0.00** |
+| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, idle | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations/mo | yes | $1.84 | $3.49 | **$5.33** |
+
+Only the **default, unprovisioned** row is $0. A **disabled-but-provisioned**
+stack retains its DynamoDB table (storage + PITR), KMS key, log groups, and
+CloudWatch alarms/metrics, so it keeps incurring the **fixed** standing charges
+and **retains audit data** at the same fixed cost as "enabled, idle". Disable
+stops serving requests; teardown (not disable) removes the resources.
 
 Enabled resources and their charge basis:
 
@@ -318,9 +329,10 @@ recomputed by `backend/tests/unit/test_operations_cost_model_unit.py` so these
 tables cannot drift. **Denial-of-wallet controls:** create an AWS Budget on the
 optional stack's cost-allocation tag; set DynamoDB on-demand per-table maximum
 read/write request units; enable HTTP API stage throttling; and alarm on
-request count and error/timeout rate. Disable by setting operations mode to
-`disabled` and removing the optional stack. E1 rollout (#413) is blocked on this
-reviewed cost evidence.
+request count and error/timeout rate. `--disable` flips the runtime kill switch
+to `disabled` while keeping resources and data (fixed cost continues); use
+teardown to remove the resources and stop the standing charges. E1 rollout (#413)
+is blocked on this reviewed cost evidence.
 
 **Deploy, disable, and teardown (all explicit and opt-in).** The optional E1
 stack is deployed only by its dedicated wrapper and is never wired into
@@ -337,7 +349,10 @@ GBAW_OPERATIONS_MODE=observe COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
   AWS_PROFILE=... AWS_REGION=... \
   ./scripts/infrastructure/deploy-operations.sh --enable --environment prod
 
-# Safe, data-preserving disable/rollback (removes the request path, keeps data):
+# Emergency, data-preserving disable/rollback. Keeps Provisioned=true and every
+# resource under CloudFormation (stable names, retained data), reuses existing
+# parameter values, and sets only OperationsMode=disabled so the API and handler
+# fail closed. No code rebuild, no Docker. Reversible via --enable:
 ./scripts/infrastructure/deploy-operations.sh --disable
 
 # Explicit teardown — never invoked by teardown-all.sh. Deletes only the stack;
@@ -346,8 +361,9 @@ GBAW_OPERATIONS_MODE=observe COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
 ```
 
 Full frozen names (handler, environment bindings, metric names, and the exact
-three GameLift read actions), the default-disabled invariant, and the safe
-rollback/disable and teardown procedure are documented in the
+three GameLift read actions), the default-unprovisioned invariant, the
+provisioning-vs-runtime-authority split, and the safe rollback/disable and
+teardown procedure are documented in the
 [E1 deployment & runbook](OPERATIONS_E1_DEPLOYMENT.md).
 
 ### Cost Optimization Tips

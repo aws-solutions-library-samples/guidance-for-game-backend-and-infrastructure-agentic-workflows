@@ -493,11 +493,26 @@ def test_kms_actions_are_minimal(template):
 # --------------------------------------------------------------------------- #
 # Default-disabled behavior
 # --------------------------------------------------------------------------- #
-def test_every_resource_is_gated_on_operations_enabled(template):
+def test_every_resource_is_gated_on_resources_provisioned(template):
+    """Resource EXISTENCE is gated on ResourcesProvisioned (driven by the
+    Provisioned flag), NOT on OperationsMode. This is the core of the rollback
+    fix: an emergency disable flips OperationsMode to disabled but keeps
+    Provisioned=true, so gating existence on ResourcesProvisioned means disable
+    deletes NOTHING. Gating on the old OperationsEnabled (observe) condition
+    would delete every resource on disable — the defect this guards against."""
     conditions = template.get("Conditions", {})
-    assert "OperationsEnabled" in conditions, "expected an OperationsEnabled condition"
+    assert "ResourcesProvisioned" in conditions, "expected a ResourcesProvisioned condition"
+    # The scoped CFN loader renders !Equals [!Ref Provisioned, 'true'] as a plain
+    # list ["Provisioned", "true"]; assert it is driven by the Provisioned flag.
+    assert conditions["ResourcesProvisioned"] == [
+        "Provisioned",
+        "true",
+    ], "ResourcesProvisioned must be driven by the Provisioned flag, not OperationsMode"
     for name, body in template["Resources"].items():
-        assert body.get("Condition") == "OperationsEnabled", f"resource {name} must be gated on OperationsEnabled"
+        assert body.get("Condition") == "ResourcesProvisioned", (
+            f"resource {name} must be gated on ResourcesProvisioned (existence), "
+            "never on OperationsEnabled (which would delete it on disable)"
+        )
 
 
 def test_stack_is_unwired_from_normal_deployment():
@@ -886,8 +901,165 @@ def test_access_log_resource_policy_is_gated_and_scoped_to_access_group(template
     policies = _resources_of_type(template, "AWS::Logs::ResourcePolicy")
     assert policies, "expected an AWS::Logs::ResourcePolicy"
     for name, body in policies.items():
-        assert body.get("Condition") == "OperationsEnabled", f"{name} must be gated on OperationsEnabled"
+        assert body.get("Condition") == "ResourcesProvisioned", f"{name} must be gated on ResourcesProvisioned"
     doc_text = next(iter(policies.values()))["Properties"]["PolicyDocument"]
     if isinstance(doc_text, dict):
         doc_text = json.dumps(doc_text)
     assert "operations-access" in doc_text, "delivery grant must target the API access log group"
+
+
+# --------------------------------------------------------------------------- #
+# Rollback design: separate initial PROVISIONING from runtime AUTHORITY.
+#
+# Defect being guarded against (live re-review): every resource was gated on a
+# single OperationsEnabled=(OperationsMode==observe) condition, so --disable
+# (OperationsMode=disabled) removed EVERY resource. Stateful resources retained
+# on that delete, so a later --enable failed on existing physical names and
+# CloudFormation lost ownership. The fix: a default-false Provisioned flag gates
+# resource existence, while OperationsMode is a runtime kill switch that leaves
+# resources in place. These tests are red against the old single-condition
+# design and green only against the split model.
+# --------------------------------------------------------------------------- #
+def _stage(template):
+    stages = _resources_of_type(template, "AWS::ApiGatewayV2::Stage")
+    assert stages, "expected an HTTP API stage"
+    return next(iter(stages.values()))
+
+
+def test_provisioned_parameter_defaults_to_false_and_is_boolean(template):
+    """A default new stack must be UNPROVISIONED: Provisioned defaults to
+    'false' so a defaults deploy creates zero resources and costs $0."""
+    params = template["Parameters"]
+    assert "Provisioned" in params, "expected a Provisioned parameter"
+    p = params["Provisioned"]
+    assert p["Default"] == "false", "Provisioned must default to 'false' (zero resources, $0)"
+    assert set(p["AllowedValues"]) == {"false", "true"}
+
+
+def test_resource_existence_is_decoupled_from_operations_mode(template):
+    """The resource-existence condition must be driven by Provisioned, and the
+    OperationsEnabled (observe) condition must NOT gate any resource — otherwise
+    a disable (mode=disabled) would delete resources."""
+    conditions = template["Conditions"]
+    assert conditions["ResourcesProvisioned"] == ["Provisioned", "true"]
+    assert conditions["OperationsEnabled"] == ["OperationsMode", "observe"]
+    for name, body in template["Resources"].items():
+        assert body.get("Condition") != "OperationsEnabled", (
+            f"{name} is gated on OperationsEnabled; disabling would delete it. "
+            "Resource existence must be gated on ResourcesProvisioned."
+        )
+
+
+def test_default_deploy_provisions_zero_resources(template):
+    """With Provisioned='false' (the default), the ResourcesProvisioned condition
+    is false, so no resource is created. Assert every resource is behind it and
+    the default evaluates false."""
+    assert template["Parameters"]["Provisioned"]["Default"] == "false"
+    for name, body in template["Resources"].items():
+        assert body.get("Condition") == "ResourcesProvisioned", name
+
+
+def test_rule_rejects_observe_without_provisioning(template):
+    """Unsafe combination: OperationsMode=observe with Provisioned=false. A Rule
+    must reject it (observe requires the resources it drives to exist)."""
+    rules = template["Rules"]
+    rule = rules.get("EnabledModeRequiresProvisioning")
+    assert rule, "expected an EnabledModeRequiresProvisioning rule"
+    assert rule["RuleCondition"] == ["OperationsMode", "observe"]
+    asserts = rule["Assertions"]
+    # The single assertion requires Provisioned == 'true'.
+    joined = json.dumps(asserts)
+    assert "Provisioned" in joined and "true" in joined, "observe-mode rule must assert Provisioned=true"
+
+
+def test_rule_requires_bindings_whenever_provisioned(template):
+    """Whenever resources exist (Provisioned=true) the issuer, audience, tenant,
+    workspace, and code artifact bindings the resources reference must be
+    non-empty — in observe AND in disabled-after-provision. This is what makes an
+    emergency disable REUSE existing values rather than blank them."""
+    rules = template["Rules"]
+    rule = rules.get("ProvisionedRequiresInputs")
+    assert rule, "expected a ProvisionedRequiresInputs rule"
+    assert rule["RuleCondition"] == ["Provisioned", "true"]
+    joined = json.dumps(rule["Assertions"])
+    for referenced in ("CognitoIssuer", "CognitoClientId", "TenantId", "WorkspaceId", "CodeS3Bucket", "CodeS3Key"):
+        assert referenced in joined, f"provisioned rule must require {referenced}"
+
+
+def test_handler_kill_switch_injects_operations_mode(template):
+    """The Lambda's GBAW_OPERATIONS_MODE must be wired straight from the
+    OperationsMode parameter, so an emergency disable (mode=disabled) makes the
+    handler fail closed WITHOUT changing the function's identity or code."""
+    fn = _observation_function(template)
+    env = fn["Environment"]["Variables"]
+    assert (
+        env["GBAW_OPERATIONS_MODE"] == "OperationsMode"
+    ), "GBAW_OPERATIONS_MODE must be !Ref OperationsMode so disable flips it to disabled"
+
+
+def test_api_stage_kill_switch_throttles_to_zero_when_not_observe(template):
+    """API-safe kill switch: when OperationsMode is not observe, the HTTP API
+    stage throttles to zero so the gateway itself fails closed — without deleting
+    or renaming the stage. Enabled uses the operator-tuned limits."""
+    stage = _stage(template)
+    settings = stage["Properties"]["DefaultRouteSettings"]
+    burst = settings["ThrottlingBurstLimit"]
+    rate = settings["ThrottlingRateLimit"]
+    # !If [OperationsEnabled, <limit>, 0] renders as ["OperationsEnabled", <limit>, 0].
+    for value in (burst, rate):
+        assert (
+            isinstance(value, list) and value[0] == "OperationsEnabled"
+        ), "stage throttle must be gated on OperationsEnabled for the kill switch"
+        assert value[-1] in (0, "0"), "disabled (non-observe) must throttle to zero"
+
+
+def test_physical_names_are_stable_and_not_tied_to_mode(template):
+    """Physical resource names must be deterministic (derived from ProjectName)
+    and independent of OperationsMode/Provisioned, so a disable→enable cycle
+    reuses the SAME names and CloudFormation never loses ownership or collides on
+    re-create."""
+    resources = template["Resources"]
+    fn = _observation_function(template)
+    assert fn["FunctionName"] == "${ProjectName}-operations-observe"
+    table = next(iter(_resources_of_type(template, "AWS::DynamoDB::Table").values()))
+    assert table["Properties"]["TableName"] == "${ProjectName}-operations"
+    log_groups = _resources_of_type(template, "AWS::Logs::LogGroup")
+    names = {json.dumps(b["Properties"]["LogGroupName"]) for b in log_groups.values()}
+    assert any("operations-observe" in n for n in names)
+    assert any("operations-access" in n for n in names)
+    # None of these names interpolate OperationsMode or Provisioned.
+    text = TEMPLATE.read_text(encoding="utf-8")
+    for tainted in ("${OperationsMode}", "${Provisioned}"):
+        assert tainted not in text, f"physical identifiers must not embed {tainted}"
+
+
+def test_reenable_reuses_same_names_no_deletion_on_disable(template):
+    """Combined invariant proving the re-enable path is reversible:
+
+    * resource existence is gated on ResourcesProvisioned (disable keeps
+      Provisioned=true, so nothing is deleted);
+    * stateful resources use RetainExceptOnCreate + UpdateReplacePolicy Retain
+      (data survives); and
+    * physical names are fixed (re-enable reuses them, no collision)."""
+    for name, body in template["Resources"].items():
+        assert body.get("Condition") == "ResourcesProvisioned", name
+    stateful = 0
+    for body in template["Resources"].values():
+        if body.get("Type") in STATEFUL_RESOURCE_TYPES:
+            stateful += 1
+            assert body.get("DeletionPolicy") == "RetainExceptOnCreate"
+            assert body.get("UpdateReplacePolicy") == "Retain"
+    assert stateful >= 3
+    fn = _observation_function(template)
+    assert fn["FunctionName"] == "${ProjectName}-operations-observe"
+
+
+def test_operations_mode_and_provisioned_outputs_are_unconditional(template):
+    """Both control-plane state outputs echo their parameters and must be
+    UNCONDITIONAL, so an operator can read Provisioned/OperationsMode from a
+    disabled-but-provisioned stack (and from an unprovisioned one)."""
+    outputs = template["Outputs"]
+    assert outputs["OperationsMode"].get("Condition") is None
+    assert outputs["Provisioned"].get("Condition") is None
+    assert outputs["OperationsMode"]["Value"] == "OperationsMode"
+    assert outputs["Provisioned"]["Value"] == "Provisioned"

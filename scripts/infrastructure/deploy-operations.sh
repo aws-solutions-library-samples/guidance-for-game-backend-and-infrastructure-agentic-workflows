@@ -7,9 +7,13 @@
 # to create *enabled* (observe-mode) resources unless the operator supplies BOTH:
 #   * GBAW_OPERATIONS_MODE=observe  (environment), and
 #   * --enable                      (flag)
-# Without both, it runs a READ-ONLY preview (template service validation + lint
-# only; it creates no change set and mutates nothing). Disabling is a separate,
-# data-preserving path (--disable).
+# An enabled deploy provisions resources (Provisioned=true) AND sets the runtime
+# authority to observe. Without both opt-ins, it runs a READ-ONLY preview
+# (template service validation + lint only; it creates no change set and mutates
+# nothing). Provisioning and runtime authority are SEPARATE: --disable is an
+# emergency, data-preserving path that keeps Provisioned=true and every resource
+# in place, flipping only OperationsMode to disabled so the stack fails closed
+# and a later --enable is reversible. It rebuilds no code and runs no Docker.
 #
 # On an enabled deploy the wrapper builds a DETERMINISTIC, Lambda-compatible
 # Python 3.13 / x86_64 zip containing the real `operations` code (from a combined
@@ -84,8 +88,12 @@ Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod]
   --enable      Build/upload the operations Lambda artifact and deploy the stack
                 with OperationsMode=observe. Requires GBAW_OPERATIONS_MODE=observe
                 in the environment plus the enabling inputs below.
-  --disable     Re-deploy the stack with OperationsMode=disabled (data-preserving
-                rollback: request path removed, durable audit data retained).
+  --disable     Emergency, data-preserving disable of an EXISTING provisioned
+                stack: keeps Provisioned=true and every resource under
+                CloudFormation (stable physical names, retained data), reuses all
+                current parameter values, and sets only OperationsMode=disabled so
+                the API and handler fail closed. Does NOT delete resources and
+                does NOT rebuild code or run Docker. Reversible via --enable.
   --environment Target environment (default: beta). "prod" enables DynamoDB
                 deletion protection and longer log retention.
 
@@ -364,13 +372,117 @@ if [ "$ACTION" = "enable" ]; then
     aws s3 cp "$ARTIFACT" "s3://$CODE_S3_BUCKET/$CODE_S3_KEY" \
         "${AWS_PROFILE_ARGS[@]}" \
         --region "$AWS_REGION" --only-show-errors
-elif [ "$ACTION" = "disable" ]; then
-    OPERATIONS_MODE="disabled"
-    CODE_S3_BUCKET=""
 fi
 
+if [ "$ACTION" = "disable" ]; then
+    # ----------------------------------------------------------------------- #
+    # EMERGENCY DISABLE (data-preserving, reversible). This does NOT delete or
+    # rename any resource and does NOT rebuild code or run Docker. It targets an
+    # EXISTING, PROVISIONED stack in the verified account/region and flips only
+    # the runtime authority to "disabled" while keeping Provisioned=true, so
+    # every resource stays under CloudFormation with stable physical names and
+    # retained audit data. All other parameters (issuer, audience, tenant,
+    # workspace, code artifact bucket/key, budgets) are REUSED from the stack's
+    # current values via UsePreviousValue, so direct/API calls fail closed and a
+    # later --enable is reversible. The API stage additionally throttles to zero
+    # (template kill switch) because OperationsMode is no longer "observe".
+    # ----------------------------------------------------------------------- #
+    echo "🔎 Verifying target stack '$STACK_NAME' exists in account $ACCOUNT_ID / $AWS_REGION ..."
+    if ! aws cloudformation describe-stacks \
+            "${AWS_PROFILE_ARGS[@]}" \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" >/dev/null 2>&1; then
+        echo "❌ Stack '$STACK_NAME' does not exist in account $ACCOUNT_ID / $AWS_REGION." >&2
+        echo "   Nothing to disable. (Disable operates on an already-provisioned stack;" >&2
+        echo "   an unprovisioned/default deployment holds zero resources and no data.)" >&2
+        exit 7
+    fi
+
+    # Read the stack's CURRENT Provisioned parameter value directly (no jq). A
+    # provisioned stack must carry Provisioned=true; refuse to "disable" a stack
+    # that never provisioned resources — blanking-and-redeploying it would be the
+    # very orphaning bug this design prevents.
+    CURRENT_PROVISIONED="$(aws cloudformation describe-stacks \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --stack-name "$STACK_NAME" \
+        --region "$AWS_REGION" \
+        --query "Stacks[0].Parameters[?ParameterKey=='Provisioned'].ParameterValue | [0]" \
+        --output text 2>/dev/null || true)"
+    if [ "$CURRENT_PROVISIONED" != "true" ]; then
+        echo "❌ Stack '$STACK_NAME' is not provisioned (Provisioned='${CURRENT_PROVISIONED:-<unset>}')." >&2
+        echo "   Refusing to disable: there are no resources to keep failing closed." >&2
+        exit 7
+    fi
+
+    echo "🔒 Disabling (data-preserving): keeping Provisioned=true, setting"
+    echo "   OperationsMode=disabled, reusing every other parameter unchanged."
+    echo "   No code rebuild, no Docker, no resource deletion."
+
+    # UsePreviousValue reuses the stack's existing artifact identifiers and every
+    # binding, so nothing is rebuilt and no value is blanked. Only the two safety
+    # levers are overridden. (aws cloudformation deploy does not support
+    # UsePreviousValue, so the disable path uses update-stack directly.)
+    DISABLE_PARAMS=(
+        "ParameterKey=Provisioned,ParameterValue=true"
+        "ParameterKey=OperationsMode,ParameterValue=disabled"
+        "ParameterKey=ProjectName,UsePreviousValue=true"
+        "ParameterKey=Environment,UsePreviousValue=true"
+        "ParameterKey=CognitoIssuer,UsePreviousValue=true"
+        "ParameterKey=CognitoClientId,UsePreviousValue=true"
+        "ParameterKey=TenantId,UsePreviousValue=true"
+        "ParameterKey=WorkspaceId,UsePreviousValue=true"
+        "ParameterKey=TrustedAudience,UsePreviousValue=true"
+        "ParameterKey=CodeS3Bucket,UsePreviousValue=true"
+        "ParameterKey=CodeS3Key,UsePreviousValue=true"
+        "ParameterKey=RequestDeadlineSeconds,UsePreviousValue=true"
+        "ParameterKey=PerReadBudgetSeconds,UsePreviousValue=true"
+        "ParameterKey=PersistenceBudgetSeconds,UsePreviousValue=true"
+        "ParameterKey=CancellationMarginSeconds,UsePreviousValue=true"
+        "ParameterKey=ObservationTtlSeconds,UsePreviousValue=true"
+        "ParameterKey=LambdaMemoryMb,UsePreviousValue=true"
+        "ParameterKey=ReservedConcurrency,UsePreviousValue=true"
+        "ParameterKey=MaxReadRequestUnits,UsePreviousValue=true"
+        "ParameterKey=MaxWriteRequestUnits,UsePreviousValue=true"
+        "ParameterKey=ThrottlingBurstLimit,UsePreviousValue=true"
+        "ParameterKey=ThrottlingRateLimit,UsePreviousValue=true"
+    )
+
+    DISABLE_ERR="$(mktemp "${TMPDIR:-/tmp}/gbaw-ops-disable.XXXXXXXX")"
+    trap 'rm -f "$DISABLE_ERR"' EXIT
+    echo "🚀 Updating $STACK_NAME to OperationsMode=disabled (Provisioned=true retained) ..."
+    if ! aws cloudformation update-stack \
+            "${AWS_PROFILE_ARGS[@]}" \
+            --stack-name "$STACK_NAME" \
+            --template-body "file://$TEMPLATE" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION" \
+            --parameters "${DISABLE_PARAMS[@]}" 2>"$DISABLE_ERR"; then
+        if grep -q "No updates are to be performed" "$DISABLE_ERR"; then
+            echo "ℹ️  Stack already disabled with these values; nothing to change."
+            exit 0
+        fi
+        echo "❌ Disable update failed:" >&2
+        cat "$DISABLE_ERR" >&2
+        exit 8
+    fi
+    echo "⏳ Waiting for the disable update to complete ..."
+    aws cloudformation wait stack-update-complete \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --stack-name "$STACK_NAME" \
+        --region "$AWS_REGION"
+    echo "✅ Disabled (data-preserving). Resources and audit data retained under"
+    echo "   CloudFormation; API and handler fail closed. Re-enable with --enable."
+    exit 0
+fi
+
+# --------------------------------------------------------------------------- #
+# ENABLE path deploy: provision resources (Provisioned=true) and set the
+# runtime authority to observe. All enabling inputs were validated above and the
+# artifact was built and uploaded.
+# --------------------------------------------------------------------------- #
 PARAM_OVERRIDES=(
     "ProjectName=${PROJECT_NAME}"
+    "Provisioned=true"
     "OperationsMode=${OPERATIONS_MODE}"
     "Environment=${ENVIRONMENT}"
     "CognitoIssuer=${COGNITO_ISSUER}"
@@ -382,7 +494,7 @@ PARAM_OVERRIDES=(
     "CodeS3Key=${CODE_S3_KEY}"
 )
 
-echo "🚀 Deploying $STACK_NAME with OperationsMode=$OPERATIONS_MODE ..."
+echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."
 aws cloudformation deploy \
     "${AWS_PROFILE_ARGS[@]}" \
     --template-file "$TEMPLATE" \
@@ -391,4 +503,4 @@ aws cloudformation deploy \
     --region "$AWS_REGION" \
     --parameter-overrides "${PARAM_OVERRIDES[@]}"
 
-echo "✅ Deploy complete (OperationsMode=$OPERATIONS_MODE)."
+echo "✅ Deploy complete (Provisioned=true, OperationsMode=$OPERATIONS_MODE)."
