@@ -91,11 +91,20 @@ class StatefulDynamoClient:
         if current is None:
             return False
         values = upd.get("ExpressionAttributeValues", {})
-        # Emulate the specific fencing condition used by complete/fail.
         if current.get("state", {}).get("S") != values.get(":observing", {}).get("S"):
             return False
         if int(current.get("sequence", {}).get("N", "-1")) != int(values.get(":zero", {}).get("N", "0")):
             return False
+        # Reclaim path: fenced on the observed generation (:cur_gen) and an
+        # EXPIRED lease (lease_not_after <= :now). No holder match required.
+        if ":cur_gen" in values:
+            if int(current.get("generation", {}).get("N", "-1")) != int(values[":cur_gen"]["N"]):
+                return False
+            if int(current.get("lease_not_after", {}).get("N", "0")) > int(values[":now"]["N"]):
+                return False
+            return True
+        # complete/fail path: fenced on the held generation, holder, and an
+        # UNEXPIRED lease (lease_not_after > :now) when :now is present.
         if int(current.get("generation", {}).get("N", "-1")) != int(values.get(":gen", {}).get("N", "0")):
             return False
         if current.get("lease_holder", {}).get("S") != values.get(":holder", {}).get("S"):
@@ -115,6 +124,12 @@ class StatefulDynamoClient:
         elif ":failed" in values:
             current["state"] = values[":failed"]
             current["sequence"] = values[":one"]
+            current["reason_code"] = values[":reason"]
+        elif ":cur_gen" in values:
+            # Reclaim: advance generation, take the lease.
+            current["generation"] = values[":new_gen"]
+            current["lease_holder"] = values[":holder"]
+            current["lease_not_after"] = values[":new_lease"]
         self.items[key] = current
 
     def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
@@ -188,11 +203,13 @@ def test_begin_expired_deadline_fails_closed_without_writing() -> None:
     assert client.transactions == []
 
 
-def test_begin_non_conditional_error_is_state_conflict() -> None:
+def test_begin_non_conditional_error_is_provider_unavailable() -> None:
+    # A non-conditional store fault (throttle/conflict) is a retryable
+    # unavailable state, never a false idempotency/state 409.
     client = StatefulDynamoClient()
     client.raise_non_conditional = True
     begin = _begin(_store(client))
-    assert begin.outcome is ObservationBeginOutcome.STATE_CONFLICT
+    assert begin.outcome is ObservationBeginOutcome.PROVIDER_UNAVAILABLE
 
 
 # --- replay / conflict / in-progress --------------------------------------
@@ -394,3 +411,204 @@ def test_load_status_missing_is_none() -> None:
 def test_table_name_required() -> None:
     with pytest.raises(ValueError):
         DynamoDbObservationStore(client=StatefulDynamoClient(), table_name="  ")
+
+
+# --- Adversarial: stale-lease reclaim, fencing races -----------------------
+
+
+class _TransactionCanceled(Exception):
+    """A TransactionCanceledException carrying explicit cancellation reasons."""
+
+    def __init__(self, *reason_codes: str) -> None:
+        self.response = {"Error": {"Code": "TransactionCanceledException"}}
+        self.cancellation_reasons = [{"Code": code} for code in reason_codes]
+        super().__init__("transaction canceled")
+
+
+def _seed_observing(
+    client: StatefulDynamoClient, *, lease_not_after: int, generation: int = 1, holder: str = HOLDER
+) -> None:
+    """Seed a raw observing snapshot with an explicit lease deadline/generation."""
+    store = _store(client)
+    store.begin_observation(
+        operation_id=OPERATION_ID,
+        idempotency_fingerprint=FINGERPRINT,
+        workspace_id=WORKSPACE,
+        idempotency_token=TOKEN,
+        lease_holder=holder,
+        commit_not_after=NOW + timedelta(minutes=30),
+        lease_not_after=NOW + timedelta(seconds=15),
+        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
+        intent=INTENT,
+    )
+    snap = dict(client.items[(f"OP#{OPERATION_ID}", "STATE#current")])
+    snap["lease_not_after"] = {"N": str(lease_not_after)}
+    snap["generation"] = {"N": str(generation)}
+    client.items[(f"OP#{OPERATION_ID}", "STATE#current")] = snap
+
+
+def test_begin_reclaims_stale_lease_and_advances_generation() -> None:
+    client = StatefulDynamoClient()
+    # Lease already expired at NOW.
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    store = _store(client, clock=NOW)
+    retry = _begin(store, operation_id="obs_" + "b" * 26)
+    assert retry.outcome is ObservationBeginOutcome.RECLAIMED
+    assert retry.operation_id == OPERATION_ID
+    assert retry.generation == 2
+    snapshot = client.items[(f"OP#{OPERATION_ID}", "STATE#current")]
+    assert snapshot["generation"]["N"] == "2"
+    assert snapshot["lease_holder"]["S"] == HOLDER  # the reclaiming caller's holder
+    # A recovery ledger transition was appended, keyed by the new generation.
+    assert (f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#2") in client.items
+    reclaim = client.items[(f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#2")]
+    assert reclaim["event_type"]["S"] == "observation.lease_reclaimed"
+
+
+def test_begin_live_lease_is_in_progress_not_reclaimed() -> None:
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW + timedelta(seconds=15)).timestamp()))
+    store = _store(client, clock=NOW)
+    retry = _begin(store, operation_id="obs_" + "b" * 26)
+    assert retry.outcome is ObservationBeginOutcome.IN_PROGRESS
+    # The live lease is untouched: no reclaim ledger event, generation unchanged.
+    assert (f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#2") not in client.items
+    assert client.items[(f"OP#{OPERATION_ID}", "STATE#current")]["generation"]["N"] == "1"
+
+
+def test_reclaim_race_loser_conditional_failure_is_in_progress_not_duplicate() -> None:
+    # A reclaimer that observed the stale generation-1 lease but lost the race
+    # (a concurrent winner already advanced to generation 2) submits its fenced
+    # :cur_gen=1 update, which now fails the ConditionalCheck. It must fall back
+    # to in-progress — never a second operation, never a duplicate reclaim.
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    winner = _begin(_store(client, clock=NOW), operation_id="obs_" + "b" * 26)
+    assert winner.outcome is ObservationBeginOutcome.RECLAIMED
+    assert client.items[(f"OP#{OPERATION_ID}", "STATE#current")]["generation"]["N"] == "2"
+
+    # The loser still holds a stale read (generation 1) and its transact write
+    # is rejected with a pure ConditionalCheckFailed. Simulate the wire failure
+    # its reclaim update would receive after the winner advanced the generation.
+    original = client.transact_write_items
+
+    def _reject_stale_reclaim(*, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+        for entry in TransactItems:
+            if "Update" in entry:
+                vals = entry["Update"].get("ExpressionAttributeValues", {})
+                if ":cur_gen" in vals and int(vals[":cur_gen"]["N"]) == 1:
+                    raise _TransactionCanceled("ConditionalCheckFailed")
+        return original(TransactItems=TransactItems)
+
+    client.transact_write_items = _reject_stale_reclaim  # type: ignore[method-assign]
+    # Force the loser to observe the pre-winner generation-1 lease as expired.
+    snap = dict(client.items[(f"OP#{OPERATION_ID}", "STATE#current")])
+    snap["generation"] = {"N": "1"}
+    snap["lease_not_after"] = {"N": str(int((NOW - timedelta(seconds=1)).timestamp()))}
+    client.items[(f"OP#{OPERATION_ID}", "STATE#current")] = snap
+    loser = _begin(_store(client, clock=NOW), operation_id="obs_" + "c" * 26)
+    assert loser.outcome is ObservationBeginOutcome.IN_PROGRESS
+    # No duplicate reclaim ledger for a generation-3 was written.
+    assert (f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#3") not in client.items
+
+
+def test_complete_under_reclaimed_generation_fences_out_superseded_writer() -> None:
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    store = _store(client, clock=NOW)
+    reclaim = _begin(store, operation_id="obs_" + "b" * 26)
+    assert reclaim.outcome is ObservationBeginOutcome.RECLAIMED
+    # The superseded writer (generation 1, original holder) can no longer commit.
+    stale = store.complete_observation(
+        operation_id=OPERATION_ID,
+        workspace_id=WORKSPACE,
+        lease_holder=HOLDER,
+        commit_not_after=NOW + timedelta(minutes=30),
+        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
+        observation=_observation(),
+        generation=1,
+    )
+    assert stale.outcome is ObservationCompleteOutcome.STATE_CONFLICT
+    # The reclaiming writer (generation 2) commits.
+    won = store.complete_observation(
+        operation_id=OPERATION_ID,
+        workspace_id=WORKSPACE,
+        lease_holder=HOLDER,
+        commit_not_after=NOW + timedelta(minutes=30),
+        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
+        observation=_observation(),
+        generation=2,
+    )
+    assert won.outcome is ObservationCompleteOutcome.RECORDED
+    assert client.items[(f"OP#{OPERATION_ID}", "STATE#current")]["state"]["S"] == "succeeded"
+
+
+# --- Adversarial: terminal-failed replay -----------------------------------
+
+
+def test_begin_replays_terminal_failure_distinctly_from_in_progress() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    store.fail_observation(
+        operation_id=OPERATION_ID,
+        workspace_id=WORKSPACE,
+        lease_holder=HOLDER,
+        reason_code="provider_unavailable",
+        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
+    )
+    replay = _begin(store, operation_id="obs_" + "f" * 26)
+    assert replay.outcome is ObservationBeginOutcome.REPLAY_FAILED
+    assert replay.operation_id == OPERATION_ID
+    assert replay.failure_reason == "provider_unavailable"
+    # No second operation snapshot was created.
+    snapshots = [k for k in client.items if k[1] == "STATE#current"]
+    assert len(snapshots) == 1
+
+
+# --- Adversarial: non-conditional TransactionCanceled classification --------
+
+
+def test_begin_transaction_conflict_reason_is_provider_unavailable_not_409() -> None:
+    client = StatefulDynamoClient()
+
+    def _raise(**_kwargs: Any) -> None:
+        raise _TransactionCanceled("TransactionConflict", "None")
+
+    client.transact_write_items = _raise  # type: ignore[method-assign]
+    begin = _begin(_store(client))
+    assert begin.outcome is ObservationBeginOutcome.PROVIDER_UNAVAILABLE
+
+
+def test_begin_throttling_reason_is_provider_unavailable() -> None:
+    client = StatefulDynamoClient()
+
+    def _raise(**_kwargs: Any) -> None:
+        raise _TransactionCanceled("ThrottlingError")
+
+    client.transact_write_items = _raise  # type: ignore[method-assign]
+    begin = _begin(_store(client))
+    assert begin.outcome is ObservationBeginOutcome.PROVIDER_UNAVAILABLE
+
+
+def test_begin_mixed_conflict_and_conditional_reason_is_retryable_not_conditional() -> None:
+    # If a transient conflict reason is present anywhere, the whole transaction
+    # is retryable even when another leg reports ConditionalCheckFailed — it must
+    # never be resolved as a 409 idempotency/state conflict.
+    client = StatefulDynamoClient()
+
+    def _raise(**_kwargs: Any) -> None:
+        raise _TransactionCanceled("ConditionalCheckFailed", "TransactionConflict")
+
+    client.transact_write_items = _raise  # type: ignore[method-assign]
+    begin = _begin(_store(client))
+    assert begin.outcome is ObservationBeginOutcome.PROVIDER_UNAVAILABLE
+
+
+def test_begin_pure_conditional_reason_resolves_idempotency() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)  # seed the mapping so resolution finds an in-progress op
+    # A pure ConditionalCheckFailed routes to idempotency resolution.
+    retry = _begin(store, operation_id="obs_" + "b" * 26)
+    assert retry.outcome is ObservationBeginOutcome.IN_PROGRESS

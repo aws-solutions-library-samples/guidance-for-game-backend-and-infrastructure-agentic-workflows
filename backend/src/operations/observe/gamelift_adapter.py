@@ -33,8 +33,6 @@ class GameLiftClient(Protocol):
 
     def describe_fleet_utilization(self, **kwargs: Any) -> dict[str, Any]: ...
 
-    def describe_fleet_location_capacity(self, **kwargs: Any) -> dict[str, Any]: ...
-
     def describe_fleet_capacity(self, **kwargs: Any) -> dict[str, Any]: ...
 
     def describe_scaling_policies(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -70,17 +68,13 @@ class GameLiftObservationAdapter:
         }
 
     def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
-        response = self._client.describe_fleet_location_capacity(FleetId=fleet_id)
-        # describe_fleet_location_capacity returns a single LocationCapacity;
-        # normalize into the per-location list the domain expects.
-        capacities: list[dict[str, Any]] = []
-        if isinstance(response, dict):
-            single = response.get("FleetCapacity")
-            if isinstance(single, dict):
-                capacities = [single]
-            location_list = response.get("LocationCapacities")
-            if isinstance(location_list, list):
-                capacities = location_list
+        # Use the exact E0-accepted read: describe_fleet_capacity(FleetIds=[...]).
+        # It returns FleetCapacity as a per-location list already, so normalize
+        # each entry into the bounded location list the contract expects.
+        response = self._client.describe_fleet_capacity(FleetIds=[fleet_id])
+        capacities = response.get("FleetCapacity") if isinstance(response, dict) else None
+        if not isinstance(capacities, list):
+            raise ValueError("no fleet capacity returned")
         result: list[dict[str, Any]] = []
         for entry in capacities[: _MAX_CAPACITY_LOCATIONS + 1]:
             if not isinstance(entry, dict):

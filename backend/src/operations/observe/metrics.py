@@ -2,10 +2,10 @@
 
 The observe service emits internal, bounded metric events through the
 :class:`~operations.observation.ObservationMetrics` port
-(``observation.failed``, ``observation.recorded``, ``observation.replay``,
-``observation.in_progress``, ``observation.denied``). This sink translates those
-public-safe events into the four CloudWatch metrics the deployment monitors,
-named **exactly**:
+(``observation.failed``, ``observation.timeout``, ``observation.recorded``,
+``observation.replay``, ``observation.reclaimed``, ``observation.in_progress``,
+``observation.denied``). This sink translates those public-safe events into the
+four CloudWatch metrics the deployment monitors, named **exactly**:
 
 * ``ObservationFailures`` — a request that failed for any non-timeout reason
   (provider error, contract, idempotency conflict, state conflict, hash).
@@ -31,9 +31,6 @@ METRIC_FAILURES = "ObservationFailures"
 METRIC_TIMEOUTS = "ObservationTimeouts"
 METRIC_STUCK = "StuckOperations"
 METRIC_LATENCY = "ObservationRequestLatency"
-
-# Internal failure events whose ``reason`` dimension marks a deadline overrun.
-_TIMEOUT_REASONS = frozenset({"deadline", "provider"})
 
 
 class CloudWatchClient(Protocol):
@@ -69,8 +66,9 @@ class CloudWatchObservationMetrics:
         if name == "observation.in_progress":
             self._put(METRIC_STUCK, 1.0)
             return
-        # observation.recorded / observation.replay / observation.denied carry
-        # no dedicated CloudWatch metric here; latency is published separately.
+        # observation.recorded / observation.replay / observation.reclaimed /
+        # observation.denied carry no dedicated CloudWatch metric here; latency
+        # is published separately.
 
     def put_latency_ms(self, latency_ms: float) -> None:
         """Publish end-to-end request latency in milliseconds."""

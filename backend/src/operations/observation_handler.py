@@ -13,7 +13,7 @@ The handler dispatches two routes on the verified caller:
 * ``POST /operations/observe`` parses the untrusted body into an
   :class:`~operations.observation.ObservationRequest` (fleet id and idempotency
   token only) and delegates to :meth:`ObservationService.observe`.
-* ``GET /operations/observe/{operation_id}`` parses the path into a
+* ``GET /operations/{operationId}`` parses the path into a
   :class:`~operations.observation.StatusRequest` and delegates to
   :meth:`ObservationService.get_status`, which enforces trusted workspace
   ownership.
@@ -141,7 +141,9 @@ class ObservationRequestHandler:
 
     def _parse_status_request(self, event: Mapping[str, Any]) -> StatusRequest:
         params = event.get("pathParameters")
-        operation_id = params.get("operation_id") if isinstance(params, Mapping) else None
+        # The GET status route is ``/operations/{operationId}``, so the API
+        # Gateway path parameter is ``operationId`` (camelCase).
+        operation_id = params.get("operationId") if isinstance(params, Mapping) else None
         if not isinstance(operation_id, str):
             raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "status request is invalid")
         return StatusRequest(operation_id=operation_id)

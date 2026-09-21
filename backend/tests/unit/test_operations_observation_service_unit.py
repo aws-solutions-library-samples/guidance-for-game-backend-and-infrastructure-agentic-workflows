@@ -141,6 +141,8 @@ class FakeStore:
         self.replay_hash: str | None = None
         self.status_result: ObservationStatus | None = None
         self.commit_time: datetime | None = None
+        self.failure_reason: str | None = None
+        self.reclaim_generation: int = 2
 
     def begin_observation(self, **kwargs: Any) -> ObservationBegin:
         self.begin_calls.append(deepcopy(kwargs))
@@ -156,6 +158,20 @@ class FakeStore:
         if self.begin_outcome is ObservationBeginOutcome.IN_PROGRESS:
             return ObservationBegin(
                 ObservationBeginOutcome.IN_PROGRESS, operation_id=kwargs["operation_id"], current_state="observing"
+            )
+        if self.begin_outcome is ObservationBeginOutcome.REPLAY_FAILED:
+            return ObservationBegin(
+                ObservationBeginOutcome.REPLAY_FAILED,
+                operation_id=kwargs["operation_id"],
+                current_state="failed",
+                failure_reason=self.failure_reason,
+            )
+        if self.begin_outcome is ObservationBeginOutcome.RECLAIMED:
+            return ObservationBegin(
+                ObservationBeginOutcome.RECLAIMED,
+                operation_id=kwargs["operation_id"],
+                current_state="observing",
+                generation=self.reclaim_generation,
             )
         if self.begin_outcome is ObservationBeginOutcome.CREATED:
             return ObservationBegin(ObservationBeginOutcome.CREATED, operation_id=kwargs["operation_id"])
@@ -303,9 +319,12 @@ def test_effective_authority_is_minimum_capped_at_observe() -> None:
 
 
 def test_higher_deployment_ceiling_still_yields_observe_without_contract_disagreement() -> None:
-    # Every input is >= observe and the deployment mode is 'operate'. The
-    # effective authority is capped at observe AND every recorded input is
-    # capped at observe, so validate_observation does not disagree.
+    # Every input is >= observe and the deployment mode is 'operate'. The five
+    # caller/deployment inputs are recorded EXACTLY as supplied (truthful raw
+    # ceilings), only this capability's own maximum is normalized to the observe
+    # phase ceiling, and the effective authority is the real min(inputs) = observe.
+    # validate_observation still agrees because capability_maximum == observe
+    # makes observe the true minimum.
     service, _, _, _ = _service(settings_mode="operate")
     result = service.observe(
         _request(),
@@ -321,7 +340,15 @@ def test_higher_deployment_ceiling_still_yields_observe_without_contract_disagre
     )
     validate_observation(result)
     assert result["effective_authority"] == "observe"
-    assert set(result["authority_inputs"].values()) == {"observe"}
+    # Raw ceilings are preserved unchanged; only capability_maximum is the phase
+    # ceiling; deployment_mode reflects the real 'operate' deployment.
+    inputs = result["authority_inputs"]
+    assert inputs["deployment_mode"] == "operate"
+    assert inputs["tenant_policy"] == "operate"
+    assert inputs["workspace_policy"] == "operate"
+    assert inputs["principal_authority"] == "operate"
+    assert inputs["risk_policy"] == "operate"
+    assert inputs["capability_maximum"] == "observe"
 
 
 def test_requester_identity_comes_from_verified_principal_not_request() -> None:
@@ -709,3 +736,141 @@ def test_observation_carries_no_provider_payload_fields() -> None:
                 _walk(child)
 
     _walk(result)
+
+
+# --- Adversarial: honest stale-lease recovery ------------------------------
+
+
+def test_reclaimed_operation_reruns_reads_and_finalizes_under_generation() -> None:
+    # A stale-lease reclaim reruns the read-only observation and finalizes under
+    # the reclaimed fencing generation reported by the store.
+    store = FakeStore(begin=ObservationBeginOutcome.RECLAIMED)
+    store.reclaim_generation = 2
+    service, reader, _, metrics = _service(store=store)
+    result = service.observe(_request(), _context())
+    validate_observation(result)
+    # The read-only observation was actually rerun under the reclaimed lease.
+    assert reader.calls == ["utilization", "capacity", "scaling"]
+    # The finalize used the reclaimed generation, not the initial generation 1.
+    assert store.complete_calls[0]["generation"] == 2
+    assert "observation.reclaimed" in metrics.names()
+
+
+def test_reclaimed_read_failure_records_failed_under_reclaimed_generation() -> None:
+    class BoomReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            raise RuntimeError("provider boom")
+
+    store = FakeStore(begin=ObservationBeginOutcome.RECLAIMED)
+    store.reclaim_generation = 3
+    service, _, _, _ = _service(store=store, reader=BoomReader())
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert store.fail_calls[0]["generation"] == 3
+
+
+def test_reclaimed_without_operation_id_is_state_conflict() -> None:
+    class NoIdStore(FakeStore):
+        def begin_observation(self, **kwargs: Any) -> ObservationBegin:
+            return ObservationBegin(ObservationBeginOutcome.RECLAIMED, operation_id=None, generation=2)
+
+    service, _, _, _ = _service(store=NoIdStore())
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.STATE_CONFLICT
+
+
+# --- Adversarial: terminal-failed replay (new token required) --------------
+
+
+def test_terminal_failed_replay_is_not_retryable_and_reruns_nothing() -> None:
+    # A terminally failed operation replays its bounded failure deterministically
+    # and is NOT retryable: the same token can never make progress.
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_FAILED)
+    store.failure_reason = "provider_unavailable"
+    service, reader, _, metrics = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is False
+    assert "new idempotency token" in exc.value.safe_message
+    assert reader.calls == []  # no rerun under the same token
+    assert store.complete_calls == []
+
+
+def test_new_idempotency_token_after_terminal_failure_starts_new_operation() -> None:
+    # Documented behavior: a NEW idempotency token is a new fingerprint, so the
+    # store creates a brand-new operation rather than replaying the failure.
+    store = FakeStore(begin=ObservationBeginOutcome.CREATED)
+    service, reader, _, _ = _service(store=store)
+    new_token = "idem_zzzzzzzzzzzzzzzzzzzzzzzz"
+    result = service.observe(ObservationRequest(fleet_id=FLEET_ID, idempotency_token=new_token), _context())
+    validate_observation(result)
+    assert reader.calls == ["utilization", "capacity", "scaling"]
+    assert store.begin_calls[0]["idempotency_token"] == new_token
+
+
+# --- Adversarial: non-conditional store fault is retryable, not 409 --------
+
+
+def test_begin_provider_unavailable_is_retryable_not_conflict() -> None:
+    store = FakeStore(begin=ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
+    service, reader, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is True
+    assert reader.calls == []
+
+
+def test_complete_provider_unavailable_is_retryable_not_conflict() -> None:
+    store = FakeStore(complete=ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is True
+
+
+# --- Adversarial: truthful raw authority ceilings --------------------------
+
+
+def test_high_raw_authority_inputs_are_recorded_unchanged() -> None:
+    # A caller presenting high raw ceilings has them recorded verbatim; only this
+    # capability's own maximum is normalized to the observe phase ceiling, and
+    # effective authority is the real min(inputs) = observe.
+    service, _, _, _ = _service(settings_mode="operate")
+    result = service.observe(
+        _request(),
+        _context(
+            authority_inputs=_authority_inputs(
+                tenant_policy="operate",
+                workspace_policy="remediate",
+                principal_authority="operate",
+                capability_maximum="operate",
+                risk_policy="advise",
+            )
+        ),
+    )
+    validate_observation(result)
+    inputs = result["authority_inputs"]
+    assert inputs["deployment_mode"] == "operate"
+    assert inputs["tenant_policy"] == "operate"
+    assert inputs["workspace_policy"] == "remediate"
+    assert inputs["principal_authority"] == "operate"
+    assert inputs["risk_policy"] == "advise"
+    # Only capability_maximum is the phase ceiling.
+    assert inputs["capability_maximum"] == "observe"
+    # Effective is the real deterministic minimum of the six recorded inputs.
+    assert result["effective_authority"] == "observe"
+
+
+def test_effective_authority_is_real_minimum_when_an_input_is_below_capability() -> None:
+    # If a raw input is itself observe (the true min alongside capability_maximum),
+    # effective stays observe. The min is NOT computed by capping every input.
+    service, _, _, _ = _service()
+    result = service.observe(_request(), _context(authority_inputs=_authority_inputs(risk_policy="observe")))
+    assert result["effective_authority"] == "observe"
+    # tenant_policy 'remediate' from the default fixture is preserved unchanged.
+    assert result["authority_inputs"]["tenant_policy"] == "remediate"
