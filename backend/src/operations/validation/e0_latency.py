@@ -53,9 +53,10 @@ from __future__ import annotations
 import concurrent.futures
 import math
 import time
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 # Local modules
 from operations.contracts.canonical import canonical_sha256, canonicalize
@@ -321,6 +322,19 @@ class ObservationOutcome:
 ProviderRead = Callable[[], Any]
 
 
+class _PersistenceSink(Protocol):
+    """Structured persistence hook invoked once per observation sample.
+
+    Distinct from the legacy byte-sink ``persist`` callable: a sink receives
+    the built observation ``record`` (already stamped with a per-sample-unique
+    ``operation_id``) and its RFC 8785 canonical bytes, so a real backend can
+    persist uniquely-keyed items. Implementations run inside the measured
+    persistence phase and must fail closed on any deadline overrun.
+    """
+
+    def persist(self, record: dict[str, Any], canonical_bytes: bytes) -> None: ...
+
+
 class ObservationRunner:
     """Executes the deterministic E1 observation request path under budget.
 
@@ -346,17 +360,37 @@ class ObservationRunner:
         *,
         clock: Callable[[], float] = time.monotonic,
         persist: Callable[[bytes], None] | None = None,
+        sink: _PersistenceSink | None = None,
     ) -> None:
         self._budget = budget
         self._clock = clock
-        # Default persistence sink is a no-op: representative persistence cost is
-        # exercised by canonical serialization plus the caller-supplied sink. A
-        # live harness passes a sink that writes to a disposable local store.
-        self._persist = persist if persist is not None else (lambda _b: None)
+        # Two mutually exclusive persistence hooks:
+        #  * ``sink`` (preferred) is the structured persistence sink: it receives
+        #    the built record and its canonical bytes and can persist uniquely
+        #    keyed items (e.g. a real transactional DynamoDB write).
+        #  * ``persist`` is the legacy byte sink retained for existing unit tests.
+        # When neither is supplied the sink is a no-op *and the run is flagged as
+        # not durably persisted*: a no-op measures only canonical serialization and
+        # is never acceptable as live durable evidence (issue #412 finding).
+        if sink is not None and persist is not None:
+            raise ValueError("pass either a structured sink or a legacy persist callable, not both")
+        self._sink = sink
+        self._persist = persist
+        self._durably_persisted = sink is not None or persist is not None
 
     @property
     def budget(self) -> LatencyBudget:
         return self._budget
+
+    @property
+    def durably_persisted(self) -> bool:
+        """True iff this runner writes through a real persistence hook.
+
+        A runner with neither a structured ``sink`` nor a legacy ``persist``
+        callable measures only canonical serialization; such a run must never be
+        reported as durable, live acceptance evidence.
+        """
+        return self._durably_persisted
 
     def run(self, reads: Sequence[ProviderRead]) -> ObservationOutcome:
         """Run one observation. Raises on deadline overrun or partial result.
@@ -416,11 +450,17 @@ class ObservationRunner:
                 read_durations.append(call_elapsed)
 
             # Persistence + canonical serialization phase, bounded on its own.
+            # A per-sample-unique operation id is stamped into the record so the
+            # canonical bytes differ per sample and a real sink can key items
+            # uniquely with conditional no-replacement semantics.
             persist_start = self._clock()
             record = self._build_record(read_durations)
             canonical_bytes = canonicalize(record)
             record_hash = canonical_sha256(record)
-            self._persist(canonical_bytes)
+            if self._sink is not None:
+                self._sink.persist(record, canonical_bytes)
+            elif self._persist is not None:
+                self._persist(canonical_bytes)
             persist_elapsed = self._clock() - persist_start
             if persist_elapsed > self._budget.persistence_s:
                 raise DeadlineExceededError("persistence", persist_elapsed, self._budget.persistence_s)
@@ -459,6 +499,10 @@ class ObservationRunner:
             "observation_contract_version": "1.0",
             "phase": "observe",
             "provider": "gamelift",
+            # Per-sample-unique synthetic operation id: makes each persisted
+            # item uniquely keyed and each sample's canonical bytes distinct. It
+            # is a random uuid4, never derived from any fleet or account id.
+            "operation_id": str(uuid.uuid4()),
             "read_count": len(read_durations),
             # Bounded synthetic ledger-event stand-ins; sequence is strictly
             # increasing to mirror the append-only ledger.

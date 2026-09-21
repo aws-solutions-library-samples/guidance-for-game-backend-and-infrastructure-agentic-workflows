@@ -58,3 +58,39 @@ def test_harness_document_validates_against_evidence_schema():
     )
     errors = sorted(Draft202012Validator(schema).iter_errors(doc), key=str)
     assert errors == [], f"evidence document failed schema: {errors}"
+
+
+def test_transactional_mode_document_validates_and_states_mode():
+    # Local modules
+    from operations.validation.e0_persistence import (
+        MODE_DYNAMODB_TRANSACT,
+        DynamoDbTransactionalSink,
+    )
+
+    class FakeDynamoDbClient:
+        def transact_write_items(self, **kwargs):
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    sink = DynamoDbTransactionalSink(
+        client=FakeDynamoDbClient(),
+        table_name="e0-latency-spike-disposable",
+        persistence_budget_s=DEFAULT_BUDGET.persistence_s,
+    )
+    doc = _measure(
+        FakeGameLiftClient(),
+        FAKE_FLEET_ID,
+        DEFAULT_BUDGET,
+        _RunConfig(
+            region="us-west-2",
+            samples=5,
+            concurrency=1,
+            retry_mode="adaptive",
+            max_attempts=3,
+        ),
+        sink=sink,
+    )
+    errors = sorted(Draft202012Validator(schema).iter_errors(doc), key=str)
+    assert errors == [], f"transactional evidence document failed schema: {errors}"
+    assert doc["assumptions"]["persistence_mode"] == MODE_DYNAMODB_TRANSACT
+    assert doc["evaluation"]["persistence_acceptable"] is True
