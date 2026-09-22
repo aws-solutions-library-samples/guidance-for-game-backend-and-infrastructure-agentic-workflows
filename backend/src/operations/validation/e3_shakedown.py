@@ -13,7 +13,10 @@ What it asserts (each is one discriminating check):
    token never reaches the handler (401/403).
 2. **A valid admin dispatch is accepted** (202/200) with a bounded, typed
    ``dispatched`` acknowledgement.
-3. **A non-admin token is denied** (403) — execution is admin-only.
+3. **A non-admin token is denied** (403) — execution is admin-only. This check
+   runs only when a non-admin (plain ``users``) bearer token is supplied
+   (``--non-admin-bearer`` / ``GBAW_E3_NON_ADMIN_BEARER``); it is skipped when no
+   such token is available, since a deployment may not mint one.
 
 Secret hygiene
 --------------
@@ -60,6 +63,10 @@ class E3ShakedownConfig:
     operation_id: str
     admin_bearer: str
     fleet_id: str
+    # Optional short-lived non-admin (plain ``users`` group) access token. When
+    # provided, the harness runs the admin-only denial check against it; when
+    # absent the check is skipped (a deployment may not mint a non-admin token).
+    non_admin_bearer: str = ""
 
     def __post_init__(self) -> None:
         if not self.endpoint or not self.endpoint.lower().startswith("https://"):
@@ -138,12 +145,25 @@ class E3ShakedownHarness:
             observed_error_code=self._error_code(response),
         )
 
+    def check_non_admin_dispatch_denied(self) -> CheckResult:
+        """Assert a plain non-admin (users) token is denied (403): admin-only."""
+        response = self._post(bearer=self._config.non_admin_bearer)
+        passed = response.status == 403
+        return CheckResult(
+            name="non_admin_dispatch_denied",
+            passed=passed,
+            observed_status=response.status,
+            observed_error_code=self._error_code(response),
+        )
+
     def run(self) -> dict[str, Any]:
         """Run every check and return a fully sanitized summary document."""
         checks = [
             self.check_unauthenticated_dispatch_denied(),
             self.check_admin_dispatch_accepted(),
         ]
+        if self._config.non_admin_bearer.strip():
+            checks.append(self.check_non_admin_dispatch_denied())
         return {
             "harness": "e3-execute-dispatch",
             "endpoint_ref": _short_ref("ep", self._config.endpoint),
@@ -166,6 +186,7 @@ def _build_config(args: argparse.Namespace) -> E3ShakedownConfig:
         operation_id=args.operation_id or os.environ.get("GBAW_E3_OPERATION_ID", ""),
         admin_bearer=args.admin_bearer or os.environ.get("GBAW_E3_ADMIN_BEARER", ""),
         fleet_id=args.fleet_id or os.environ.get("GBAW_E3_FLEET_ID", ""),
+        non_admin_bearer=args.non_admin_bearer or os.environ.get("GBAW_E3_NON_ADMIN_BEARER", ""),
     )
 
 
@@ -175,6 +196,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--operation-id", dest="operation_id", default="")
     parser.add_argument("--admin-bearer", dest="admin_bearer", default="")
     parser.add_argument("--fleet-id", dest="fleet_id", default="")
+    parser.add_argument("--non-admin-bearer", dest="non_admin_bearer", default="")
     args = parser.parse_args(argv)
 
     config = _build_config(args)
