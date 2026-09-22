@@ -36,6 +36,7 @@ from typing import Any
 
 # Local modules
 from operations.contracts import CONTRACT_VERSION
+from operations.contracts.canonical import CanonicalizationError, canonicalize
 from operations.identity import VerifiedPrincipal
 from operations.observation import (
     AuthorityInputs,
@@ -275,10 +276,38 @@ def _string_set(value: object) -> frozenset[str]:
 
 
 def _json_response(status: int, body: Mapping[str, Any]) -> dict[str, Any]:
+    # Serialize every response deterministically. The freshly built observation
+    # (Python insertion order) and a replay loaded from the sort-key canonical
+    # ``observation_json`` are semantically equal but differ in key order, so a
+    # non-deterministic ``json.dumps`` yields byte-different bodies for the same
+    # operation and breaks raw-body idempotency on retry (#413). RFC 8785
+    # canonicalization is the project's single canonical serializer (it also
+    # produces the observation hash), and every bounded response shape here —
+    # success observation, status, and error — is I-JSON, so it applies to all
+    # of them. A body outside the I-JSON domain would be a handler bug, not a
+    # client input, so it fails closed as a sanitized 500 rather than emitting
+    # a non-deterministic body.
+    try:
+        serialized = canonicalize(dict(body)).decode("utf-8")
+    except CanonicalizationError:
+        logging.getLogger("operations.observation").error(
+            "observation response body was not canonicalizable", extra={"status": status}
+        )
+        error_body = {
+            "error_contract_version": CONTRACT_VERSION,
+            "error_code": ObservationErrorCode.INTERNAL_ERROR.value,
+            "safe_message": "observation request failed",
+            "retryable": False,
+        }
+        return {
+            "statusCode": 500,
+            "headers": {"content-type": "application/json"},
+            "body": canonicalize(error_body).decode("utf-8"),
+        }
     return {
         "statusCode": status,
         "headers": {"content-type": "application/json"},
-        "body": json.dumps(body, separators=(",", ":")),
+        "body": serialized,
     }
 
 

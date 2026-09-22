@@ -308,3 +308,44 @@ def test_unexpected_exception_is_sanitized_to_500() -> None:
 def test_handler_exposes_no_write_surface() -> None:
     public = {name for name in dir(ObservationRequestHandler) if not name.startswith("_")}
     assert public == {"handle"}
+
+
+# --- Deterministic serialization (#413) -----------------------------------
+
+
+def _assert_deterministically_serialized(response: dict[str, Any]) -> None:
+    # Every handler JSON body must be byte-identical to a stable, compact,
+    # key-sorted serialization of its parsed content, so a freshly built
+    # (insertion-order) response and a replayed (sort-key canonical) response
+    # serialize to the SAME bytes.
+    parsed = json.loads(response["body"])
+    expected = json.dumps(parsed, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    assert response["body"] == expected
+
+
+def test_post_success_body_is_deterministically_serialized() -> None:
+    handler, _ = _handler()
+    response = handler.handle(_event())
+    assert response["statusCode"] == 200
+    _assert_deterministically_serialized(response)
+
+
+def test_status_body_is_deterministically_serialized() -> None:
+    status = ObservationStatus(
+        operation_id=OPERATION_ID,
+        state=ObservationStatusView.OBSERVING,
+        workspace_id="workspace.default",
+        observation=None,
+        observation_hash=None,
+    )
+    handler, _ = _handler(FakeStore(status=status))
+    response = handler.handle(_event(method="GET", path_parameters={"operationId": OPERATION_ID}))
+    assert response["statusCode"] == 200
+    _assert_deterministically_serialized(response)
+
+
+def test_error_body_is_deterministically_serialized() -> None:
+    handler, _ = _handler(FakeStore(begin=ObservationBeginOutcome.IDEMPOTENCY_CONFLICT))
+    response = handler.handle(_event())
+    assert response["statusCode"] == 409
+    _assert_deterministically_serialized(response)

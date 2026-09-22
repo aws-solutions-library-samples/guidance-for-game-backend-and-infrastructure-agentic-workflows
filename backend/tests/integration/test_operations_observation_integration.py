@@ -399,3 +399,32 @@ def test_deployable_lambda_handler_end_to_end(monkeypatch: pytest.MonkeyPatch) -
     # And the adapter class exposes exactly the three read-only methods.
     adapter_methods = {m for m in dir(GameLiftObservationAdapter) if not m.startswith("_")}
     assert adapter_methods == {"read_utilization", "read_capacity", "read_scaling_policies"}
+
+
+def test_record_then_replay_returns_byte_identical_body_and_same_operation() -> None:
+    # Live E1 diagnosis (#413): a first success serializes the freshly built
+    # observation in Python insertion order, while the replay loads the stored
+    # ``observation_json`` (written sort-key canonical) and serializes THAT
+    # order. Both bodies are semantically equal and equal in size, yet differ
+    # byte-for-byte, so a client asserting raw-body idempotency fails on retry.
+    # The handler MUST serialize every response deterministically so a real
+    # record and its replay are byte-identical, carry the same operation id, and
+    # trigger zero additional provider reads.
+    client = FakeDynamoClient()
+    reader = _Reader()
+    handler = _handler(client, reader)
+
+    first = handler.handle(_post_event())
+    assert first["statusCode"] == 200
+    reads_after_first = reader.calls
+
+    second = handler.handle(_post_event())
+    assert second["statusCode"] == 200
+
+    # Raw bytes, not just parsed structure, must match on replay.
+    assert second["body"] == first["body"]
+    # The replay is the same logical operation.
+    assert json.loads(first["body"])["observation_id"] == OPERATION_ID
+    assert json.loads(second["body"])["observation_id"] == OPERATION_ID
+    # A replay performs no new provider read.
+    assert reader.calls == reads_after_first
