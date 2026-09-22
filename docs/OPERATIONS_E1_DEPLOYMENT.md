@@ -635,6 +635,9 @@ slice.
 | `GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL` | `LowRiskSelfApproval` | `false` | Server-owned low-risk self-approval posture. `false` means the preparer can **never** approve their own operation; `true` permits self-approval **only** for the server-defined low-risk action set the core policy recognises. Defaults to disabled. |
 | `GBAW_OPERATIONS_PREPARATION_EXPIRY_S` | `PreparationExpirySeconds` | `900` | Preparation validity window (seconds). A prepared operation not approved within it expires and can no longer be approved. Bounded to at most one day. |
 | `GBAW_OPERATIONS_APPROVAL_EXPIRY_S` | `ApprovalExpirySeconds` | `1800` | Approval validity window (seconds). Matches the core `ApprovalPolicy` default (30 min) and the contract that an approval TTL is > 0 and ≤ one day. |
+| `GBAW_OPERATIONS_CAPACITY_FLOOR` | `CapacityFloor` | `0` | Server-owned minimum desired-instance floor for a bounded proposal. Integer ≥ 0. |
+| `GBAW_OPERATIONS_CAPACITY_CEILING` | `CapacityCeiling` | `1` | Server-owned maximum desired-instance ceiling (denial-of-wallet cap). Integer ≥ 1. The default `1` caps a demo/fresh deploy at **one** instance. |
+| `GBAW_OPERATIONS_CAPACITY_MAX_STEP` | `CapacityMaxStep` | `1` | Server-owned maximum single-step change in desired instances. Integer, `0 < max_step ≤ (ceiling − floor)`. |
 
 ## E2 CloudWatch metric names (namespace `GameAgent/Operations`)
 
@@ -680,6 +683,38 @@ The advise-mode settings are server-owned and default safely:
 `GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL=false` (never self-approve),
 `GBAW_OPERATIONS_PREPARATION_EXPIRY_S=900`, `GBAW_OPERATIONS_APPROVAL_EXPIRY_S=1800`.
 Override any of them in the environment before `--enable`.
+
+## E2 server-owned capacity policy (safe by default, one instance)
+
+The bounded-capacity band is **server-owned** and injected as three frozen
+core env names from validated integer CloudFormation parameters:
+`GBAW_OPERATIONS_CAPACITY_FLOOR` / `_CEILING` / `_MAX_STEP`
+(`CapacityFloor` / `CapacityCeiling` / `CapacityMaxStep`). They are **never**
+taken from a request body.
+
+The defaults are **`0` / `1` / `1`**, which **cap every demo or fresh
+deployment at exactly one instance**: floor `0`, ceiling `1`, single-step
+change `1`. A fresh deploy therefore can never silently scale to a large
+fleet.
+
+**Increasing any capacity bound is a deliberate, cost-relevant act.** It
+requires an **explicit stack update** with new parameter values *and a cost
+review* — a larger ceiling directly raises the maximum fleet size (and spend)
+the advise plane can propose. The wrapper accepts explicit, bounded overrides
+only from the `GBAW_OPERATIONS_CAPACITY_*` environment variables before
+`--enable`; it never reads them from a request body.
+
+Coherence — `floor ≤ ceiling` and `0 < max_step ≤ (ceiling − floor)` — is a
+numeric bound. CloudFormation `Rules` have equality/set-membership functions
+only (no numeric less-than), so it is enforced in two layers that together
+are at least as strict as the stated bound: the `CapacityBandIsCoherent`
+template Rule rejects the equality-expressible degenerate band (`floor ==
+ceiling`) at deploy time before any resource is created, and the deploy
+wrapper enforces the full arithmetic (`floor` strictly below `ceiling`, and
+`0 < max_step ≤ ceiling − floor`) on any explicit override before any AWS
+call. Every parameter is additionally integer-bounded (`MinValue`/`MaxValue`)
+so no dimension can be edited to a runaway ("million-instance") fleet within
+the template's own bounds.
 
 ## Packaging carries the E2 contract schemas
 

@@ -216,6 +216,57 @@ Parameters:
       zero and no more than one day. A recorded approval past this window is
       expired and cannot dispatch.
 
+  # ------------------------------------------------------------------------- #
+  # E2 (issue #414) server-owned CAPACITY POLICY defaults. The core resolves
+  # per-fleet/location bounds through a trusted enrollment/policy port; these
+  # three integer parameters are the frozen server-owned defaults it consumes
+  # (injected as the frozen core env names below). They are NEVER caller-
+  # supplied. The SAFE defaults 0/1/1 cap a demo/fresh deployment at exactly ONE
+  # instance: floor 0, ceiling 1, single-step change 1. Raising any of them is a
+  # deliberate, cost-relevant act that requires an explicit stack update and a
+  # cost review; a fresh deploy can never silently scale to a large fleet.
+  # ------------------------------------------------------------------------- #
+  CapacityFloor:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 10000
+    Description: >-
+      Server-owned minimum desired-instance floor for a bounded capacity
+      proposal (E2), injected as GBAW_OPERATIONS_CAPACITY_FLOOR. Integer, at
+      least zero. The default 0 with a ceiling of 1 caps a fresh/demo deploy at
+      one instance. Must be no greater than CapacityCeiling; the deploy wrapper
+      enforces the full numeric bound on any explicit override.
+
+  CapacityCeiling:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10000
+    Description: >-
+      Server-owned maximum desired-instance ceiling for a bounded capacity
+      proposal (E2), injected as GBAW_OPERATIONS_CAPACITY_CEILING. Integer, at
+      least one and a denial-of-wallet cap. The default 1 caps a fresh/demo
+      deploy at one instance; raising it requires an explicit stack update and a
+      cost review. Must be at least CapacityFloor and strictly greater than it
+      (a non-degenerate band), enforced by the CapacityBandIsCoherent Rule and
+      the deploy wrapper.
+
+  CapacityMaxStep:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10000
+    Description: >-
+      Server-owned maximum single-step change in desired instances a bounded
+      capacity proposal may request (E2), injected as
+      GBAW_OPERATIONS_CAPACITY_MAX_STEP. Integer, strictly positive, and no
+      larger than the CapacityCeiling - CapacityFloor span so a single proposal
+      can never jump past the server-owned band. The default 1 matches the
+      default one-instance band. CloudFormation Rules cannot compare numbers, so
+      the deploy wrapper enforces 0 < max_step <= (ceiling - floor) on any
+      explicit override before any AWS call.
+
   LambdaMemoryMb:
     Type: Number
     Default: 512
@@ -322,6 +373,27 @@ Rules:
         AssertDescription: CodeS3Bucket is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref CodeS3Key, '']]
         AssertDescription: CodeS3Key is required when Provisioned=true.
+
+  # E2 (issue #414) server-owned capacity band must be COHERENT. The full
+  # numeric bound is floor <= ceiling and 0 < max_step <= (ceiling - floor).
+  # CloudFormation Rule functions are equality/set-membership only (there is no
+  # numeric less-than), so this Rule rejects the equality-expressible incoherent
+  # case — a DEGENERATE band where floor equals ceiling (zero span, which no
+  # positive max_step can satisfy) — at deploy time before any resource is
+  # created. The deploy wrapper enforces the remaining arithmetic (floor below
+  # ceiling and the max_step span) on any explicit override. Together they are
+  # at least as strict as the stated coherent bound. This Rule is unconditional:
+  # it holds for every mode, provisioned or not.
+  CapacityBandIsCoherent:
+    Assertions:
+      - Assert: !Not
+          - !Equals [!Ref CapacityFloor, !Ref CapacityCeiling]
+        AssertDescription: >-
+          CapacityFloor must be strictly below CapacityCeiling (a non-degenerate
+          band). The full coherent bound floor <= ceiling and
+          0 < CapacityMaxStep <= (CapacityCeiling - CapacityFloor) is enforced by
+          the deploy wrapper, which validates any explicit override before any
+          AWS call.
 
 Resources:
   # --------------------------------------------------------------------------- #
@@ -680,6 +752,11 @@ Resources:
           GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL: !Ref LowRiskSelfApproval
           GBAW_OPERATIONS_PREPARATION_EXPIRY_S: !Ref PreparationExpirySeconds
           GBAW_OPERATIONS_APPROVAL_EXPIRY_S: !Ref ApprovalExpirySeconds
+          # E2 (issue #414) server-owned capacity-policy defaults — frozen core
+          # env names. Safe defaults 0/1/1 cap a fresh/demo deploy at one instance.
+          GBAW_OPERATIONS_CAPACITY_FLOOR: !Ref CapacityFloor
+          GBAW_OPERATIONS_CAPACITY_CEILING: !Ref CapacityCeiling
+          GBAW_OPERATIONS_CAPACITY_MAX_STEP: !Ref CapacityMaxStep
       Code:
         S3Bucket: !Ref CodeS3Bucket
         S3Key: !Ref CodeS3Key
