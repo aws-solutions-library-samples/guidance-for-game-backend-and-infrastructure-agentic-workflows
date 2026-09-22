@@ -45,9 +45,11 @@ from operations.contracts.capacity import (
     CAPABILITY_ID,
     CAPABILITY_VERSION,
     PHASE,
+    PREPARE_MINIMUM_AUTHORITY,
     PREPARED_OPERATION_SCHEMA_NAME,
     PROFILE,
     PROVIDER,
+    REQUIRED_EXECUTION_AUTHORITY,
     capacity_prepared_hash,
     effective_authority,
     validate_capacity_contract,
@@ -60,10 +62,16 @@ _ADVICE_ID_PATTERN = re.compile(r"^adv_[a-z0-9]{26}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 _AUTHORITY_ORDER = {"disabled": 0, "observe": 1, "advise": 2, "remediate": 3, "operate": 4}
 
-# A GameLift capacity change is a remediate-class action. It is never authorized
-# outright; the strongest non-denied outcome is a prepared operation awaiting a
-# direct human approval.
-_MINIMUM_NON_DENIED_AUTHORITY = "remediate"
+# E2 prepare/approval is an ``advise``-authority capability: preparing an
+# operation and recording a human approval are advisory acts that never touch a
+# provider, so a non-denied outcome only requires the six authority inputs to
+# clear ``advise`` (``observe``/``disabled`` still deny). A GameLift capacity
+# change is still never authorized outright — the strongest non-denied outcome is
+# a prepared operation awaiting a direct human approval — and the operation always
+# carries the immutable, hash-bound ``required_execution_authority`` (``remediate``)
+# that a future E3 executor re-verifies before any write. Approval never elevates
+# execution authority.
+_MINIMUM_NON_DENIED_AUTHORITY = PREPARE_MINIMUM_AUTHORITY
 
 
 class PrepareErrorCode(str, Enum):
@@ -285,6 +293,10 @@ class PrepareService:
             },
             "retry_policy": dict(self._playbook.retry_policy),
             "future_executor_binding": dict(self._playbook.future_executor_binding),
+            # Immutable execution authority a future E3 executor independently
+            # re-verifies (mode/policy >= remediate) before any write. Bound by
+            # prepared_hash; the advise-authority E2 phase never elevates it.
+            "required_execution_authority": REQUIRED_EXECUTION_AUTHORITY,
         }
         operation["prepared_hash"] = capacity_prepared_hash(operation)
 
@@ -298,6 +310,7 @@ class PrepareService:
             "effective_authority": effective,
             "decision": decision.value,
             "reason_codes": reason_codes,
+            "required_execution_authority": REQUIRED_EXECUTION_AUTHORITY,
             "policy_version": advice["bounds"]["policy"]["policy_version"],
             "evaluated_at": created_at,
             "expires_at": expires_at,

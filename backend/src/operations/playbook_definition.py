@@ -22,7 +22,13 @@ from typing import Any, Mapping
 
 # Local modules
 from operations.contracts.canonical import canonical_sha256
-from operations.contracts.capacity import ACTION, CAPABILITY_ID, CAPABILITY_VERSION, PROFILE
+from operations.contracts.capacity import (
+    ACTION,
+    CAPABILITY_ID,
+    CAPABILITY_VERSION,
+    PROFILE,
+    REQUIRED_EXECUTION_AUTHORITY,
+)
 
 PLAYBOOK_ID = "playbook.gamelift-capacity"
 PLAYBOOK_VERSION = "1.0.0"
@@ -93,6 +99,10 @@ def _build_definition() -> dict[str, Any]:
         "parameter_bounds": _plain(PARAMETER_BOUNDS),
         "preconditions": list(PRECONDITIONS),
         "future_executor_binding": _plain(FUTURE_EXECUTOR_BINDING),
+        # The immutable execution authority a future E3 executor must
+        # independently re-verify (mode/policy >= remediate) before any write.
+        # Frozen into the playbook so any drift changes the playbook hash.
+        "required_execution_authority": REQUIRED_EXECUTION_AUTHORITY,
     }
 
 

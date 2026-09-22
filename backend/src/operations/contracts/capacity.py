@@ -90,6 +90,19 @@ _AUTHORITY_INPUT_FIELDS = (
 # authorized outright, only prepared for a direct human approval.
 _APPROVAL_ONLY_DECISION = "approval_required"
 
+# The E2 prepare/approval phase is an ``advise``-authority capability: preparing
+# an operation and recording a human approval are advisory acts that never touch
+# a provider. A non-denied E2 decision therefore only requires the six authority
+# inputs to clear ``advise`` (``observe``/``disabled`` still deny). Approval does
+# not elevate execution authority.
+PREPARE_MINIMUM_AUTHORITY = "advise"
+
+# The immutable execution authority a *future* E3 executor MUST independently
+# re-verify (deployment mode and policy at or above ``remediate``) before any
+# provider write. It is carried, hash-bound, on every prepared operation and
+# authorization; E2 preparing/approving never satisfies it and never elevates it.
+REQUIRED_EXECUTION_AUTHORITY = "remediate"
+
 
 class CapacityContractError(ValueError):
     """A capacity document failed its schema or semantic contract."""
@@ -335,8 +348,14 @@ def _authorization_semantic_errors(document: dict[str, Any]) -> list[str]:
     elif decision == "denied" and "APPROVAL_REQUIRED" in reasons:
         errors.append("denied decision cannot carry the APPROVAL_REQUIRED reason code")
 
-    if decision != "denied" and _AUTHORITY_ORDER[effective] < _AUTHORITY_ORDER["remediate"]:
-        errors.append("a non-denied capacity decision requires at least remediate authority")
+    if decision != "denied" and _AUTHORITY_ORDER[effective] < _AUTHORITY_ORDER[PREPARE_MINIMUM_AUTHORITY]:
+        errors.append("a non-denied capacity decision requires at least advise authority")
+
+    # The immutable execution authority a future E3 executor must independently
+    # re-verify before any write is always ``remediate`` and never elevated by
+    # the advise-authority E2 phase.
+    if document["required_execution_authority"] != REQUIRED_EXECUTION_AUTHORITY:
+        errors.append("required_execution_authority must be remediate")
 
     if authority_inputs["deployment_mode"] == "disabled":
         if decision != "denied":
@@ -376,6 +395,12 @@ def _prepared_operation_semantic_errors(document: dict[str, Any]) -> list[str]:
         errors.append("target.provider does not match the operation provider")
     if document["expires_at"] <= document["created_at"]:
         errors.append("expires_at must be strictly after created_at")
+
+    # The advise-authority E2 phase never elevates the immutable execution
+    # authority a future E3 executor must re-verify before any write. This value
+    # is inside the hashed material, so tampering also breaks prepared_hash.
+    if document["required_execution_authority"] != REQUIRED_EXECUTION_AUTHORITY:
+        errors.append("required_execution_authority must be remediate")
 
     if document["prepared_hash"] != capacity_prepared_hash(document):
         errors.append("prepared_hash does not bind the canonical prepared operation")
@@ -440,5 +465,7 @@ def validate_prepared_operation_binding(
         errors.append("authorization effective_authority does not match the prepared operation authority")
     if authorization["authority_inputs"] != prepared_operation["authority"]["authority_inputs"]:
         errors.append("authorization authority_inputs do not match the prepared operation authority")
+    if authorization["required_execution_authority"] != prepared_operation["required_execution_authority"]:
+        errors.append("authorization required_execution_authority does not match the prepared operation")
     if errors:
         raise CapacityContractError("gamelift-capacity-authorization-binding", errors)

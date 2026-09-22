@@ -100,5 +100,6 @@
     "executor_id": "executor.gamelift-capacity",
     "executor_binding_version": "1.0"
   },
-  "prepared_hash": "sha256:2217fff5f2634364a933e729ed5d2de25a57171f7d80553b7179333335d22542"
+  "required_execution_authority": "remediate",
+  "prepared_hash": "sha256:62e1b2ff7853fa8dd8817bdcab7ef81a91784709df4624000ec1484bc46a0707"
 }

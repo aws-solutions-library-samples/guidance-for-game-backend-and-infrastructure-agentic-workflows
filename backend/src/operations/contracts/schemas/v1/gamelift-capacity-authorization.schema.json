@@ -18,7 +18,8 @@
     "policy_version",
     "evaluated_at",
     "expires_at",
-    "correlation"
+    "correlation",
+    "required_execution_authority"
   ],
   "properties": {
     "authorization_contract_version": {
@@ -112,6 +113,11 @@
     },
     "correlation": {
       "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    },
+    "required_execution_authority": {
+      "type": "string",
+      "const": "remediate",
+      "$comment": "Immutable minimum execution authority a future E3 executor MUST independently re-verify (mode/policy >= remediate) before any provider write. The E2 authorization runs at advise authority and never elevates this; it must equal the bound prepared operation's required_execution_authority."
     }
   }
 }

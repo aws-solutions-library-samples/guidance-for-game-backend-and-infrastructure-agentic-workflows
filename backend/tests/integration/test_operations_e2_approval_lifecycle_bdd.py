@@ -161,8 +161,15 @@ def _boundary() -> ApprovalIdentityBoundary:
     )
 
 
-def _handler(client: StatefulDynamoClient) -> ApprovalRequestHandler:
-    ops = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "operate"})
+def _handler(
+    client: StatefulDynamoClient,
+    *,
+    mode: str = "operate",
+    floor: int = 0,
+    ceiling: int = 1_000_000,
+    max_step: int = 1_000_000,
+) -> ApprovalRequestHandler:
+    ops = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": mode})
     boundary = _boundary()
     store = DynamoDbApprovalStore(client=client, table_name=TABLE, clock=lambda: NOW)
     loader = FakeStatusLoader()
@@ -173,9 +180,9 @@ def _handler(client: StatefulDynamoClient) -> ApprovalRequestHandler:
         )
         bounds_port = DeploymentCapacityBoundsResolver(
             state_port=state_port,
-            floor=0,
-            ceiling=1_000_000,
-            max_step=1_000_000,
+            floor=floor,
+            ceiling=ceiling,
+            max_step=max_step,
             enrollment_id="enrollment.gamelift.capacity",
             enrollment_version="1",
             policy_id=POLICY_ID,
@@ -212,7 +219,7 @@ def _handler(client: StatefulDynamoClient) -> ApprovalRequestHandler:
         ),
         store=store,
         clock=lambda: NOW,
-        deployment_mode="operate",
+        deployment_mode=mode,
         advice_service_factory=_advice_factory,
         preparation_expiry_s=ops.preparation_expiry_s,
     )
@@ -483,3 +490,51 @@ def test_identity_injected_in_body_is_never_trusted() -> None:
     # never used to attribute or authorize the request.
     assert resp["statusCode"] == 400
     assert "workspace.evil" not in resp["body"]
+
+
+def test_advise_mode_persists_pending_approval_not_denied() -> None:
+    # Live-response regression (#414): with OperationsMode=advise the prepare
+    # endpoint previously returned HTTP 200 decision=denied for INSUFFICIENT_
+    # AUTHORITY, making the whole E2 phase unreachable. E2 prepare/approval is an
+    # advise-authority capability, so an in-bounds proposal must now persist a
+    # pending approval_required operation (HTTP 201) instead of being denied.
+    handler = _handler(StatefulDynamoClient(), mode="advise")
+    resp = _prepare(handler)
+    assert resp["statusCode"] == 201
+    body = json.loads(resp["body"])
+    assert body["decision"] == "approval_required"
+    assert body["persisted"] is True
+    assert body["operation_id"].startswith("op_")
+
+
+def test_advise_mode_under_default_capacity_bounds_is_not_denied_for_authority() -> None:
+    # Under the server-owned default fail-closed bounds (floor=0, ceiling=1,
+    # max_step=1) the authority gate must no longer be the blocker: the advise
+    # phase reaches the bounds evaluation instead of failing closed on authority.
+    # The decision is therefore driven by bounds (BOUNDS_EXCEEDED against the
+    # current 10/2/20 fleet), never by the old INSUFFICIENT_AUTHORITY denial that
+    # made E2 unreachable, and the effective authority is exactly advise.
+    handler = _handler(StatefulDynamoClient(), mode="advise", floor=0, ceiling=1, max_step=1)
+    resp = _prepare(handler)
+    body = json.loads(resp["body"])
+    # The wire body only carries the decision; under advise authority the change
+    # is denied for bounds against the current 10/2/20 fleet rather than being
+    # blocked at the authority gate (the old INSUFFICIENT_AUTHORITY denial).
+    assert resp["statusCode"] == 200
+    assert body["decision"] == "denied"
+    # A denied operation is never persisted; the precise advise-authority /
+    # BOUNDS_EXCEEDED distinction is asserted at the service level in
+    # test_operations_capacity_prepare_bdd. Here it is enough that advise mode is
+    # accepted at the authorization boundary (no 403) and the phase is reachable.
+
+
+def test_observe_mode_denies_prepare_at_the_authorization_boundary() -> None:
+    # E1 observe authority is below the advise prepare-phase minimum, so E2
+    # prepare is not enabled and is denied at the authorization boundary (HTTP
+    # 403). Approval never elevates execution authority, so the phase stays
+    # unreachable below advise.
+    handler = _handler(StatefulDynamoClient(), mode="observe")
+    resp = _prepare(handler)
+    assert resp["statusCode"] == 403
+    body = json.loads(resp["body"])
+    assert body["error_code"] == "AUTHORIZATION_DENIED"

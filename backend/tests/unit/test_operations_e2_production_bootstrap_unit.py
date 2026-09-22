@@ -42,7 +42,7 @@ AUDIENCE = "client.operations-web"
 
 # The exact expected digest of the complete immutable playbook definition. Any
 # definition or serialization drift changes this and fails the vector test.
-_EXPECTED_PLAYBOOK_HASH = "sha256:598cef3f94f6b27c8cd149d86a981075a6b10b99072d339b0a8aa02e45710e7f"
+_EXPECTED_PLAYBOOK_HASH = "sha256:553649474fd2c1d0340bca1d0901c389b65b45baefc3c87846e6b83ed4e2e2a3"
 
 
 # --------------------------------------------------------------------------- #
@@ -201,6 +201,9 @@ def test_playbook_definition_carries_the_complete_immutable_binding() -> None:
     }
     assert set(definition["parameter_bounds"]) == {"desired", "minimum", "maximum"}
     assert "preconditions" in definition
+    # The immutable execution authority a future E3 executor re-verifies before
+    # any write is frozen into the playbook and therefore into its hash.
+    assert definition["required_execution_authority"] == "remediate"
 
 
 @pytest.mark.parametrize(
@@ -213,6 +216,7 @@ def test_playbook_definition_carries_the_complete_immutable_binding() -> None:
         lambda d: d["parameter_bounds"].__setitem__("desired", {"minimum": -1, "maximum": 999}),
         lambda d: d["preconditions"].append("EXTRA_PRECONDITION"),
         lambda d: d["capability"].__setitem__("capability_version", "1.1"),
+        lambda d: d.__setitem__("required_execution_authority", "operate"),
     ],
 )
 def test_any_definition_drift_changes_the_hash(mutate) -> None:
