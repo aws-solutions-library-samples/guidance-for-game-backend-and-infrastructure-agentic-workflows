@@ -1186,8 +1186,8 @@ Resources:
         Periodic kill-switch freshness sweeper: re-issues the current document
         before not_after so a live control plane keeps a fresh document and a
         stopped one fails closed.
-      # A fixed 2-minute cadence is a safe default well inside the 5-minute
-      # default freshness horizon.
+      # A fixed 2-minute cadence is safely inside the 30-minute default refresh
+      # lead and leaves repeated retry opportunities before expiry.
       ScheduleExpression: 'rate(2 minutes)'
       State: !If [ControlEnabled, ENABLED, DISABLED]
       Targets:
