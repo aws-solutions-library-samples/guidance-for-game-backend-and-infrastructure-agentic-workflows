@@ -3,7 +3,7 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './tests',
   // Authenticated live tests have their own config and explicit credentials.
-  testIgnore: ['live-shakedown.spec.ts'],
+  testIgnore: ['live-shakedown.spec.ts', 'live-operator.spec.ts'],
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -31,7 +31,7 @@ export default defineConfig({
   ],
 
   webServer: {
-    command: 'npm run dev',
+    command: 'COGNITO_USER_POOL_ID=us-west-2_example01 COGNITO_CLIENT_ID=exampleclient00000000000000 NEXT_PUBLIC_SKIP_AUTH=true NEXT_PUBLIC_OPERATIONS_UI_ENABLED=true npm run dev',
     url: 'http://localhost:3000',
     reuseExistingServer: !process.env.CI,
     timeout: 120000,

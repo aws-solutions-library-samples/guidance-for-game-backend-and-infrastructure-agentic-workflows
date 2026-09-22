@@ -4,6 +4,10 @@ import { useRouter } from 'next/router';
 import { logError } from '@/utils/logger';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import ThemeToggle from './ThemeToggle';
+import OperatorNav from './operations/OperatorNav';
+import { fetchCapabilities } from '@/operations/client';
+import { operationsUiEnabled } from '@/operations/uiGate';
+import type { CapabilityDiscovery } from '@/operations/schema';
 
 interface NavigationProps {
   pageTitle?: string;
@@ -13,7 +17,9 @@ interface NavigationProps {
 export default function Navigation({ pageTitle, showBackButton = false }: NavigationProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [userInfo, setUserInfo] = useState<{ username: string; email: string; isAdmin: boolean } | null>(null);
+  const [operatorCapabilities, setOperatorCapabilities] = useState<CapabilityDiscovery[]>([]);
   const router = useRouter();
+  const operatorUiEnabled = operationsUiEnabled();
 
   // Fetch user info when component mounts
   useEffect(() => {
@@ -28,6 +34,34 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
         setUserInfo({ username: 'User', email: '', isAdmin: false });
       });
   }, []);
+
+  // When the signed-in user is an admin, discover operator capabilities so the
+  // operator nav entry appears only when discovery says a capability is
+  // available/provisioned. This is a best-effort UX affordance; the proxy
+  // routes and backend independently re-check the admin group and every gate.
+  useEffect(() => {
+    let cancelled = false;
+    if (!operatorUiEnabled || !userInfo?.isAdmin) {
+      // Clear asynchronously (microtask) so we never call setState synchronously
+      // during the effect body; covers an admin -> non-admin transition.
+      Promise.resolve().then(() => {
+        if (!cancelled) setOperatorCapabilities([]);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
+    fetchCapabilities()
+      .then((doc) => {
+        if (!cancelled) setOperatorCapabilities(doc.capabilities);
+      })
+      .catch(() => {
+        if (!cancelled) setOperatorCapabilities([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [operatorUiEnabled, userInfo?.isAdmin]);
 
   const handleSignOut = async () => {
     try {
@@ -103,6 +137,12 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
                   <div className="ga-user-info">
                     <div className="ga-user-email">{userInfo.email || username}</div>
                   </div>
+
+                  {operatorUiEnabled && userInfo.isAdmin && router.pathname !== '/operations' && (
+                    <div onClick={() => setShowMenu(false)}>
+                      <OperatorNav isAdmin={userInfo.isAdmin} capabilities={operatorCapabilities} />
+                    </div>
+                  )}
 
                   {(userInfo.isAdmin) && router.pathname !== '/admin/users' && (
                     <Link

@@ -1,5 +1,9 @@
 require('@testing-library/jest-dom')
 
+// jest-axe: register the toHaveNoViolations matcher for accessibility assertions.
+const { toHaveNoViolations } = require('jest-axe')
+expect.extend(toHaveNoViolations)
+
 const { TextDecoder, TextEncoder } = require('util')
 
 global.TextDecoder = global.TextDecoder || TextDecoder
