@@ -426,12 +426,16 @@ Resources:
 
   # --------------------------------------------------------------------------- #
   # IAM: dedicated, least-privilege observation execution role.
-  # Exactly three GameLift reads; DynamoDB limited to the reads and single
-  # transactional write core uses; the documented DynamoDB customer-managed-key
-  # data-plane action set pinned to DynamoDB via kms:ViaService, with CreateGrant
-  # isolated and guarded by kms:GrantIsForAWSResource=true; namespace-scoped
-  # PutMetricData. No S3, no GameLift writes, no iam:PassRole, no Step Functions,
-  # no UpdateItem/DeleteItem/PutItem/Scan, no direct/generic KMS use, no wildcard
+  # Exactly three GameLift reads; DynamoDB limited to dynamodb:PutItem -- the one
+  # underlying item action that governs the store's two conditional transactional
+  # Put legs (transactional legs are authorized by the underlying PutItem/
+  # UpdateItem/DeleteItem/GetItem permissions, not by any "TransactWriteItems"
+  # action, which does not exist in IAM); the documented DynamoDB
+  # customer-managed-key data-plane action set pinned to DynamoDB via
+  # kms:ViaService, with CreateGrant isolated and guarded by
+  # kms:GrantIsForAWSResource=true; namespace-scoped PutMetricData. No S3, no
+  # GameLift writes, no iam:PassRole, no Step Functions, no unused GetItem/Query,
+  # no UpdateItem/DeleteItem/Scan/Batch*, no direct/generic KMS use, no wildcard
   # action.
   # --------------------------------------------------------------------------- #
   ObservationRole:
@@ -462,12 +466,27 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: TableScopedReadsAndTransactionalWrite
+              # The runtime persists exactly one TransactWriteItems call with two
+              # conditional *Put* legs (operations.validation.e0_persistence
+              # .DynamoDbTransactionalSink) and issues no read, update, delete,
+              # query, scan, or batch call. Per the AWS "Using IAM with DynamoDB
+              # transactions" guide, permissions for the Put/Update/Delete/Get
+              # legs of a transaction are governed by the underlying
+              # PutItem/UpdateItem/DeleteItem/GetItem permissions -- there is no
+              # "dynamodb:TransactWriteItems" IAM action (granting it is
+              # ineffective and cfn-lint flags it W3037). So the only underlying
+              # action this role needs is dynamodb:PutItem, scoped to the exact
+              # table ARN. The previously granted GetItem/Query were unused by any
+              # real call and are removed. DeleteItem, Scan, Batch*, and provider
+              # writes remain denied by omission (see the negative-IAM contract
+              # tests).
+              #
+              # Ref:
+              #   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
+              - Sid: TableScopedTransactionalPut
                 Effect: Allow
                 Action:
-                  - 'dynamodb:GetItem'
-                  - 'dynamodb:Query'
-                  - 'dynamodb:TransactWriteItems'
+                  - 'dynamodb:PutItem'
                 Resource:
                   - !GetAtt OperationsTable.Arn
         - PolicyName: OperationsKmsUse
