@@ -41,6 +41,21 @@ from typing import Any
 import pytest
 
 # Local modules
+# Reuse the proven fakes/constants/boundary from the lifecycle BDD so the store
+# contract cannot drift between the two suites.
+from integration.test_operations_e2_approval_lifecycle_bdd import (
+    AUDIENCE,
+    FLEET,
+    LOCATION,
+    NOW,
+    OBS_ID,
+    POLICY_ID,
+    POLICY_VERSION,
+    TOKEN,
+    FakeStatusLoader,
+    StatefulDynamoClient,
+    _boundary,
+)
 from operations.advice import AdviceService
 from operations.approval import ApprovalPolicy, ApprovalService
 from operations.approval_handler import ApprovalRequestHandler
@@ -58,22 +73,6 @@ from operations.evidence import E2EvidenceService
 from operations.prepare import CapacityPlaybook, PrepareService
 from operations.prepare_orchestrator import PrepareOrchestrator
 from operations.settings import resolve_operations_settings
-
-# Reuse the proven fakes/constants/boundary from the lifecycle BDD so the store
-# contract cannot drift between the two suites.
-from integration.test_operations_e2_approval_lifecycle_bdd import (
-    AUDIENCE,
-    FLEET,
-    LOCATION,
-    NOW,
-    OBS_ID,
-    POLICY_ID,
-    POLICY_VERSION,
-    TOKEN,
-    FakeStatusLoader,
-    StatefulDynamoClient,
-    _boundary,
-)
 
 pytestmark = [pytest.mark.integration, pytest.mark.localhost]
 
