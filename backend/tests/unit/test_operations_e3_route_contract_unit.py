@@ -34,6 +34,7 @@ from _cfn_yaml import load_cfn_template
 from operations.validation.e1_shakedown import HttpResponse
 from operations.validation.e3_shakedown import (
     DISPATCH_ROUTE_TEMPLATE,
+    REQUIRED_CONFIRMATION,
     E3ShakedownConfig,
     E3ShakedownHarness,
 )
@@ -77,7 +78,13 @@ class _RecordingTransport:
 
 
 def _config() -> E3ShakedownConfig:
-    return E3ShakedownConfig(endpoint=_ENDPOINT, operation_id=_OP, admin_bearer=_ADMIN, fleet_id=_FLEET)
+    return E3ShakedownConfig(
+        endpoint=_ENDPOINT,
+        operation_id=_OP,
+        admin_bearer=_ADMIN,
+        fleet_id=_FLEET,
+        confirmation=REQUIRED_CONFIRMATION,
+    )
 
 
 def _find_execution_template() -> Optional[pathlib.Path]:

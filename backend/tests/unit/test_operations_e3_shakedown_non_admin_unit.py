@@ -16,7 +16,12 @@ from typing import Any, Optional
 
 # Local modules
 from operations.validation.e1_shakedown import HttpResponse
-from operations.validation.e3_shakedown import E3ShakedownConfig, E3ShakedownHarness, summary_is_public_safe
+from operations.validation.e3_shakedown import (
+    REQUIRED_CONFIRMATION,
+    E3ShakedownConfig,
+    E3ShakedownHarness,
+    summary_is_public_safe,
+)
 
 _ENDPOINT = "https://abc123.execute-api.us-west-2.amazonaws.com"
 _OP = "op_aaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -54,6 +59,9 @@ def _config() -> E3ShakedownConfig:
         admin_bearer=_ADMIN,
         fleet_id=_FLEET,
         non_admin_bearer=_NON_ADMIN,
+        # The write-capable admin check needs explicit confirmation; without
+        # it run() would refuse that check and accepted would be False.
+        confirmation=REQUIRED_CONFIRMATION,
     )
 
 
@@ -91,7 +99,13 @@ def test_run_includes_non_admin_check_when_token_configured() -> None:
 
 
 def test_non_admin_check_absent_when_no_token_configured() -> None:
-    config = E3ShakedownConfig(endpoint=_ENDPOINT, operation_id=_OP, admin_bearer=_ADMIN, fleet_id=_FLEET)
+    config = E3ShakedownConfig(
+        endpoint=_ENDPOINT,
+        operation_id=_OP,
+        admin_bearer=_ADMIN,
+        fleet_id=_FLEET,
+        confirmation=REQUIRED_CONFIRMATION,
+    )
     transport = _BearerAwareTransport(
         {None: _resp(401, {"error_code": "IDENTITY_CONTEXT_INVALID"}), _ADMIN: _resp(202, {"state": "dispatched"})}
     )
