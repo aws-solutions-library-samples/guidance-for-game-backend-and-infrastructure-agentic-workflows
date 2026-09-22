@@ -300,6 +300,43 @@ revision yields a distinct hash. Provider writes and executor credentials are
 structurally absent: there is no provider-write parameter and the future executor
 binding is an identifier only.
 
+### Expiry (lazy-on-access)
+
+A prepared operation carries an immutable, hash-bound `expires_at`. Expiry is
+enforced **lazily on access**: before the E2 request handler treats an operation
+as active — on `GET /operations/{id}` evidence and on
+`approve` / `reject` / `cancel` — it first calls
+`LifecycleDecisionService.expire_if_due`. If the operation is past `expires_at`
+and still in a non-terminal, pre-dispatch state (`prepared` / `pending_approval`
+/ `approved`), that call atomically transitions it to `expired` with a **system**
+actor (`operations.expiry-sweeper`) and an appended `operation.state-changed`
+ledger entry, through the same fenced, conditional store transaction the other
+terminal decisions use. Expiry is driven by the trusted system clock and needs
+no caller credential.
+
+Consequences the handler guarantees:
+
+- **Terminal is a safe no-op.** An already-terminal operation (or a lost race)
+  makes `expire_if_due` a no-op; the opportunistic call is swallowed and the
+  underlying route returns its own bounded response (e.g. a `409` conflict, or a
+  `404` if the record is gone).
+- **One terminal state, one transition.** A race between expiry and
+  `approve` / `reject` / `cancel` resolves through the single fenced writer, so
+  exactly one terminal state and one state transition win; the loser observes a
+  bounded `STATE_CONFLICT` / `APPROVAL_EXPIRED`.
+- **Approval after due never grants.** `ApprovalService.grant` independently
+  rechecks `expires_at` against a fresh clock before and immediately before
+  commit, returning `APPROVAL_EXPIRED` (`409`) — a due operation is never
+  granted, whether or not the lazy transition has already run.
+- **Metric on transition win.** When the lazy transition wins, the handler emits
+  the bounded `ApprovalExpired` CloudWatch metric (no identifiers/dimensions).
+
+There is **no scheduler or Step Functions sweep** in this phase. Expiry is
+observed only when an operation is next accessed; an untouched due operation
+stays at its stored non-terminal state until the first access transitions it.
+A periodic background sweep that expires idle operations without an access is
+deliberately deferred to **E4**.
+
 ## Compatibility and Publication
 
 Version `1.0` is exact, not a minimum. Consumers MUST use an explicit allowlist

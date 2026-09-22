@@ -164,3 +164,22 @@ def test_generic_approval_service_defaults_remain_backward_compatible() -> None:
     assert service._operation_validator is _default_validate
     assert service._operation_hasher is _default_hash
     assert service._binding_validator is _default_binding_validate
+
+
+def test_bootstrap_wires_lifecycle_decision_service_for_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The deployable handler must expose a decision service that also drives
+    # lazy-on-access expiry (expire_if_due), sharing the SAME store and clock as
+    # reject/cancel so an expiry transition is fenced and atomic exactly like the
+    # other terminal decisions. Without this wiring a due operation would be
+    # treated as active by GET/approve forever (no scheduler exists yet: #414
+    # documents lazy-on-access expiry and leaves the periodic sweep to E4).
+    # Local modules
+    from operations.decisions import LifecycleDecisionService
+
+    router = _build_router(monkeypatch)
+    decision_service = router._approval_handler._decision_service
+    assert isinstance(decision_service, LifecycleDecisionService)
+    assert hasattr(decision_service, "expire_if_due")
+    # The expiry path shares the approval store (one fenced writer) so a race
+    # between expiry and approve/cancel resolves to a single terminal state.
+    assert decision_service._store is router._approval_handler._approval_service._store
