@@ -61,7 +61,7 @@ from operations.settings import resolve_operations_settings
 
 # Reuse the proven fakes/constants/boundary from the lifecycle BDD so the store
 # contract cannot drift between the two suites.
-from tests.integration.test_operations_e2_approval_lifecycle_bdd import (
+from integration.test_operations_e2_approval_lifecycle_bdd import (
     AUDIENCE,
     FLEET,
     LOCATION,
