@@ -202,7 +202,11 @@ def test_disable_verifies_target_stack_and_refuses_unprovisioned():
 def test_disable_updates_through_cloudformation_reversibly():
     branch = _disable_branch()
     assert "update-stack" in branch, "disable must update through CloudFormation"
-    assert "--template-body" in branch
+    # The emergency disable is rebuild-free and size-safe: it reuses the
+    # already-deployed template via --use-previous-template and NEVER re-sends
+    # the (over-inline-limit) template body, changing only parameters.
+    assert "--use-previous-template" in branch, "disable must reuse the deployed template"
+    assert "--template-body" not in branch, "disable must not re-send the template body"
     assert "stack-update-complete" in branch, "disable should wait for the update"
     assert "--enable" in branch, "disable messaging must point at the reversible re-enable"
 

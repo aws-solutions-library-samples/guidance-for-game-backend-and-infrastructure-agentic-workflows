@@ -55,6 +55,7 @@ _CLEARED_ENV = (
     "GBAW_OPERATIONS_TENANT_ID",
     "GBAW_OPERATIONS_WORKSPACE_ID",
     "GBAW_OPERATIONS_TRUSTED_AUDIENCE",
+    "GBAW_OPERATIONS_TEMPLATE",
 )
 
 
@@ -185,10 +186,32 @@ def fakes(tmp_path):
 # --------------------------------------------------------------------------- #
 # (1) Preview: warning-only lint CONTINUES to validate-template; errors STOP.
 # --------------------------------------------------------------------------- #
+def _under_limit_template(tmp_path) -> pathlib.Path:
+    """A syntactically-real, minimal CFN template comfortably under the inline
+    limit, so the size-aware preview reaches validate-template --template-body."""
+    path = tmp_path / "under-limit.yaml"
+    path.write_text(
+        "AWSTemplateFormatVersion: '2010-09-09'\n"
+        "Description: under-limit fixture\n"
+        "Resources:\n"
+        "  Noop:\n"
+        "    Type: AWS::CloudFormation::WaitConditionHandle\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.mark.parametrize("script", [DEPLOY_OBSERVE, DEPLOY_EXECUTE])
-def test_preview_warning_only_lint_continues_to_validate(script, fakes):
+def test_preview_warning_only_lint_continues_to_validate(script, fakes, tmp_path):
     """Warning-only cfn-lint (exit 4 by default, 0 with the error gate) must not
-    abort preview; the wrapper must still reach AWS validate-template."""
+    abort preview; the wrapper must still reach AWS validate-template.
+
+    The wrappers now run a size-aware preview that only calls
+    ``validate-template --template-body`` when the template is within the inline
+    limit, so this lint-gate test is driven against an UNDER-limit fixture (via
+    the test-only ``GBAW_OPERATIONS_TEMPLATE`` override) to keep it focused on
+    the cfn-lint exit-code semantics rather than template size. A benign
+    ``python3`` fake satisfies the new local-parse probe under PATH isolation."""
     _make_exe(
         fakes["bindir"] / "cfn-lint",
         _fake_cfn_lint(fakes["cfn_args"], warn_exit=4, error_exit=0),
@@ -197,7 +220,13 @@ def test_preview_warning_only_lint_continues_to_validate(script, fakes):
         fakes["bindir"] / "aws",
         _fake_aws(fakes["validate"], fakes["upload"]),
     )
-    result = _run_with_fakes(script, fakes=fakes)
+    _make_exe(fakes["bindir"] / "python3", "#!/usr/bin/env bash\nexit 0\n")
+    under = _under_limit_template(tmp_path)
+    result = _run_with_fakes(
+        script,
+        fakes=fakes,
+        env_extra={"GBAW_OPERATIONS_TEMPLATE": str(under)},
+    )
     combined = result.stdout + result.stderr
     assert result.returncode == 0, f"preview aborted on warning-only lint: {combined}"
     assert fakes["validate"].exists(), "preview never reached validate-template"
