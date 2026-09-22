@@ -16,15 +16,39 @@ import detailFixture from '../../../../../backend/tests/fixtures/operations/v1/o
 import controlResponseFixture from '../../../../../backend/tests/fixtures/operations/v1/operations-control-response.valid.json';
 import killSwitchFixture from '../../../../../backend/tests/fixtures/operations/v1/operations-kill-switch.valid.json';
 
-function mockBackend(status: number, body: unknown) {
-  global.fetch = jest.fn(async () =>
-    ({
+/**
+ * Build a fetch Response stand-in the hardened proxy can drain: a streamable
+ * body and a headers.get(). This mirrors what the transport layer relies on
+ * (redirect:'manual', bounded streamed read) so the route-level tests exercise
+ * the real plumbing rather than a shortcut.
+ */
+function mockBackend(status: number, body: unknown, headers: Record<string, string> = {}) {
+  const encoded = new TextEncoder().encode(JSON.stringify(body));
+  const hdr = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+  global.fetch = jest.fn(async () => {
+    let sent = false;
+    return {
       ok: status >= 200 && status < 300,
       status,
+      redirected: false,
+      headers: { get: (name: string) => hdr.get(name.toLowerCase()) ?? null },
+      body: {
+        getReader() {
+          return {
+            read: async () => {
+              if (sent) return { done: true, value: undefined };
+              sent = true;
+              return { done: false, value: encoded };
+            },
+            cancel: async () => undefined,
+            releaseLock: () => undefined,
+          };
+        },
+      },
       json: async () => body,
       text: async () => JSON.stringify(body),
-    }) as unknown as Response,
-  ) as unknown as typeof fetch;
+    } as unknown as Response;
+  }) as unknown as typeof fetch;
 }
 
 beforeEach(() => {
@@ -174,6 +198,14 @@ describe('POST /api/operations/control', () => {
     expect(forwarded).toEqual(validBody);
   });
 
+  it('forwards the request with redirect set to manual (no credentialed redirect)', async () => {
+    mockBackend(200, controlResponseFixture);
+    const { req, res } = post(validBody);
+    await controlHandler(req, res);
+    const init = (global.fetch as jest.Mock).mock.calls[0][1] as RequestInit;
+    expect(init.redirect).toBe('manual');
+  });
+
   it('rejects a non-POST method (405)', async () => {
     mockBackend(200, controlResponseFixture);
     const { req, res } = createMocks<NextApiRequest, NextApiResponse>({ method: 'GET' });
@@ -206,5 +238,12 @@ describe('POST /api/operations/control', () => {
     await controlHandler(req, res);
     expect(res._getStatusCode()).toBe(400);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('maps an upstream redirect to a bounded 502 (does not follow it)', async () => {
+    mockBackend(302, {}, { location: 'https://evil.example.com/steal' });
+    const { req, res } = post(validBody);
+    await controlHandler(req, res);
+    expect(res._getStatusCode()).toBe(502);
   });
 });

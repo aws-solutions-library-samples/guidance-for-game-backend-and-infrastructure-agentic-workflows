@@ -162,6 +162,65 @@ test.describe('Operator workflow (mocked backend)', { tag: ['@e2e', '@operator']
     expect(body.desired.capabilities['gamelift.capacity-adjustment'].execute).toBe(true);
   });
 
+  test('cancels a pre-dispatch operation from the detail view and refreshes the timeline', async ({
+    page,
+  }) => {
+    // A cancellable (pending_approval) operation; the detail flips to cancelled
+    // after the cancel proxy is called, so the refreshed timeline reflects it.
+    const cancellableDetail = {
+      ...DETAIL,
+      state: 'pending_approval',
+      phases: [{ phase: 'prepare', status: 'succeeded', occurred_at: '2026-01-15T00:00:10Z' }],
+      verification: { applicable: false, outcome: 'not_applicable' },
+      rollback: { applicable: false, outcome: 'not_applicable' },
+    };
+    const cancelledDetail = { ...cancellableDetail, state: 'cancelled', updated_at: '2026-01-15T00:03:00Z' };
+
+    const json = (body: unknown) => ({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+
+    let cancelled = false;
+    let cancelCalls = 0;
+
+    await page.route('**/api/operations/capabilities', (route) => route.fulfill(json(CAPABILITIES)));
+    await page.route('**/api/operations/kill-switch', (route) => route.fulfill(json(KILL_SWITCH)));
+    // The cancel action route must be matched BEFORE the bare detail route.
+    await page.route(/\/api\/operations\/op_[a-z0-9]{26}\/cancel$/, (route) => {
+      cancelCalls += 1;
+      cancelled = true;
+      return route.fulfill(json({ operation_id: 'op_00000000000000000000000001', new_state: 'cancelled' }));
+    });
+    await page.route(/\/api\/operations\/op_[a-z0-9]{26}$/, (route) =>
+      route.fulfill(json(cancelled ? cancelledDetail : cancellableDetail)),
+    );
+    await page.route(/\/api\/operations(\?.*)?$/, (route) => route.fulfill(json(LIST)));
+
+    await page.goto('/operations');
+    await page.waitForLoadState('domcontentloaded');
+
+    await page.getByRole('button', { name: /op_00000000000000000000000001/i }).click();
+    const detail = page.getByRole('region', { name: /operation op_00000000000000000000000001/i });
+
+    // The cancel control is offered for a cancellable state; there is no expire action.
+    const cancelBtn = detail.getByRole('button', { name: /cancel operation/i });
+    await expect(cancelBtn).toBeVisible();
+    await expect(page.getByRole('button', { name: /expire/i })).toHaveCount(0);
+
+    await cancelBtn.click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole('button', { name: /cancel operation/i }).click();
+
+    // After a successful cancel the timeline refreshes to the terminal state.
+    await expect(detail.getByText('Cancelled')).toBeVisible({ timeout: 10000 });
+    expect(cancelCalls).toBe(1);
+    // Once terminal, the cancel control is no longer offered.
+    await expect(detail.getByRole('button', { name: /cancel operation/i })).toHaveCount(0);
+  });
+
   test('shows an access-denied message when the proxy returns 403', async ({ page }) => {
     await page.route('**/api/operations/capabilities', (route) =>
       route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"denied"}' }),

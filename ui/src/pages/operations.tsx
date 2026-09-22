@@ -6,6 +6,7 @@ import OperationTimeline from '@/components/operations/OperationTimeline';
 import KillSwitchPanel from '@/components/operations/KillSwitchPanel';
 import {
   OperationsClientError,
+  cancelOperation,
   fetchCapabilities,
   fetchKillSwitch,
   fetchOperations,
@@ -88,6 +89,22 @@ export default function OperationsPage() {
     }
   }, []);
 
+  const onCancelOperation = useCallback(
+    async (operationId: string) => {
+      // Cancellation is owned by the E2 action API; the proxy enforces admin +
+      // CSRF and forwards the verified token. On success, refresh the detail
+      // timeline (and the list) so the new terminal state is reflected.
+      await cancelOperation(operationId);
+      try {
+        setDetail(await fetchOperationDetail(operationId));
+      } catch (error) {
+        logError('Failed to refresh operation after cancel', error instanceof Error ? error : undefined);
+      }
+      void loadList();
+    },
+    [loadList],
+  );
+
   const onSubmitControl = useCallback(async (request: ControlRequest) => {
     const response = await submitControl(request);
     // Refresh the kill-switch document so the panel reflects the new version.
@@ -137,7 +154,7 @@ export default function OperationsPage() {
                       Loading operation…
                     </p>
                   ) : detail ? (
-                    <OperationTimeline detail={detail} />
+                    <OperationTimeline detail={detail} onCancel={onCancelOperation} />
                   ) : (
                     <p className="ga-ops-muted">Select an operation to view its timeline.</p>
                   )}

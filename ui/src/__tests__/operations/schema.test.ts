@@ -1,9 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 import {
+  CANCELLABLE_STATES,
   OPERATION_STATES,
+  OPERATIONS_ACTION_ROUTES,
   OPERATIONS_ROUTES,
   MAX_PAGE_SIZE,
+  isCancellable,
+  parseCancelResponse,
   parseCapabilityDiscovery,
   parseOperationsListResponse,
   parseOperationDetail,
@@ -198,5 +202,52 @@ describe('parseControlResponse', () => {
     const doc = loadFixture('operations-control-response.valid.json') as Record<string, unknown>;
     doc.outcome = 'exploded';
     expect(() => parseControlResponse(doc)).toThrow(SchemaGuardError);
+  });
+});
+
+
+describe('operations action routes and cancel guard (E2 lifecycle)', () => {
+  it('keeps the E2 cancel action route separate from the frozen E4 routes', () => {
+    expect(OPERATIONS_ACTION_ROUTES).toEqual({
+      cancel: '/operations/{operationId}/cancel',
+    });
+    // The E4 control-plane map must NOT carry the E2 cancel action.
+    expect(Object.keys(OPERATIONS_ROUTES)).not.toContain('cancel');
+  });
+
+  it('marks only pre-dispatch states as cancellable, matching the backend', () => {
+    expect([...CANCELLABLE_STATES]).toEqual(['prepared', 'pending_approval', 'approved']);
+    for (const state of ['prepared', 'pending_approval', 'approved'] as const) {
+      expect(isCancellable(state)).toBe(true);
+    }
+    for (const state of ['dispatched', 'executing', 'succeeded', 'failed', 'cancelled', 'expired'] as const) {
+      expect(isCancellable(state)).toBe(false);
+    }
+  });
+
+  it('never treats the system-owned "expired" state as cancellable', () => {
+    expect(isCancellable('expired')).toBe(false);
+  });
+
+  it('projects a successful cancel to a minimal public-safe confirmation', () => {
+    const parsed = parseCancelResponse({
+      state_contract_version: '1.0',
+      state_change_id: 'state-change:x',
+      operation_id: 'op_00000000000000000000000001',
+      prepared_operation_hash: 'sha256:' + 'a'.repeat(64),
+      previous_state: 'pending_approval',
+      new_state: 'cancelled',
+      actor: { actor_type: 'user', actor_id: 'operator:u1' },
+    });
+    expect(parsed).toEqual({
+      operation_id: 'op_00000000000000000000000001',
+      new_state: 'cancelled',
+    });
+  });
+
+  it('fails closed when the state did not transition to cancelled', () => {
+    expect(() =>
+      parseCancelResponse({ operation_id: 'op_00000000000000000000000001', new_state: 'expired' }),
+    ).toThrow(SchemaGuardError);
   });
 });

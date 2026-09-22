@@ -7,11 +7,13 @@
  */
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import {
+  parseCancelResponse,
   parseCapabilityDiscovery,
   parseControlResponse,
   parseKillSwitch,
   parseOperationDetail,
   parseOperationsListResponse,
+  type CancelResponse,
   type CapabilityDiscoveryDocument,
   type ControlRequest,
   type ControlResponse,
@@ -79,4 +81,22 @@ export async function submitControl(request: ControlRequest): Promise<ControlRes
     throw new OperationsClientError(res.status, `Control request failed (${res.status})`);
   }
   return parseControlResponse(await res.json());
+}
+
+/**
+ * Request cancellation of a pre-dispatch operation via the same-origin E2
+ * action proxy route. The operation id is a path parameter; there is no body.
+ * The proxy enforces admin + CSRF and forwards the verified access token; this
+ * client never handles credentials. Callers should re-fetch the detail after a
+ * success to refresh the timeline.
+ */
+export async function cancelOperation(operationId: string): Promise<CancelResponse> {
+  const res = await fetchWithTimeout(
+    `/api/operations/${encodeURIComponent(operationId)}/cancel`,
+    { method: 'POST', headers: { Accept: 'application/json' } },
+  );
+  if (!res.ok) {
+    throw new OperationsClientError(res.status, `Cancel request failed (${res.status})`);
+  }
+  return parseCancelResponse(await res.json());
 }

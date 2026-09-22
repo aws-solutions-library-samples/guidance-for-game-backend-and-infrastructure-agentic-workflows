@@ -17,7 +17,11 @@ infrastructure.
     states, keyboard-activatable rows);
   - an on-demand **detail timeline** distinguishing the proposal, authorization,
     approval, dispatch, execution, verification, rollback, and terminal facets,
-    plus bounded provider-free evidence summaries;
+    plus bounded provider-free evidence summaries. For a **pre-dispatch**
+    operation (`prepared`, `pending_approval`, `approved`) it offers a
+    confirmation-gated **Cancel operation** control; once the operation has
+    dispatched or reached a terminal state the control disappears. Expiry is
+    **never** offered as a human action — it is system-owned (see below);
   - a **kill-switch panel** with the deployment master switch and the single
     capability's prepare/dispatch/execute toggles, a static/dynamic **gate
     panel**, an explicit confirmation dialog (focus managed), a compare-and-set
@@ -27,15 +31,16 @@ infrastructure.
 ## Server-side proxy routes
 
 The browser never talks to the backend directly. Same-origin Next.js API routes
-proxy the frozen E4 routes and are the security boundary:
+proxy the frozen routes and are the security boundary:
 
-| UI route | Backend (frozen) route |
-| --- | --- |
-| `GET /api/operations/capabilities` | `GET /operations/capabilities` |
-| `GET /api/operations` | `GET /operations` |
-| `GET /api/operations/[operationId]` | `GET /operations/{operationId}` |
-| `GET /api/operations/kill-switch` | `GET /operations/control/kill-switch` |
-| `POST /api/operations/control` | `POST /operations/control` |
+| UI route | Backend (frozen) route | Backend API |
+| --- | --- | --- |
+| `GET /api/operations/capabilities` | `GET /operations/capabilities` | E4 control plane |
+| `GET /api/operations` | `GET /operations` | E4 control plane |
+| `GET /api/operations/[operationId]` | `GET /operations/{operationId}` | E4 control plane |
+| `GET /api/operations/kill-switch` | `GET /operations/control/kill-switch` | E4 control plane |
+| `POST /api/operations/control` | `POST /operations/control` | E4 control plane |
+| `POST /api/operations/[operationId]/cancel` | `POST /operations/{operationId}/cancel` | **E2 action API** |
 
 Each route:
 
@@ -43,7 +48,8 @@ Each route:
    the same subject.
 2. Forwards **only** the verified access token as a `Bearer` credential — never
    the cookie, never the ID token. Tokens never reach browser JS.
-3. Same-origin **CSRF** check on the state-changing control route.
+3. Same-origin **CSRF** check on the state-changing routes (`control` and
+   `cancel`).
 4. Validates untrusted inputs against the frozen bounds before calling the
    backend (page size ≤ 50, known states, `op_` id pattern, opaque cursor) and
    rejects control bodies carrying identity/credential/policy.
@@ -51,14 +57,55 @@ Each route:
    **fails closed** (502) on any contract violation, never echoing the raw
    upstream body.
 
-The backend base URL comes from `GBAW_OPERATIONS_API_BASE_URL` (server-side
-only), falling back to `BACKEND_URL` then `http://localhost:8080`.
+### Cancellation vs. expiry (lifecycle ownership)
+
+Cancellation is owned by the **E2 approval/decision service**
+(`backend/src/operations/decisions.py`), not the E4 control plane, so it is
+proxied to a **separate server-only base URL** and kept in its own route map
+(`OPERATIONS_ACTION_ROUTES`). A cancel is permitted only for the pre-dispatch,
+non-terminal states `prepared`, `pending_approval`, `approved` — the UI mirrors
+the backend `_CANCELLABLE_STATES` via `isCancellable()`.
+
+**Expiry is system-owned.** The backend transitions a due operation to `expired`
+from its own trusted clock (`{"actor_type": "system", ...}`), with no caller
+credential. The UI therefore never exposes an "expire" action; `expired` is a
+terminal state you can observe, never one an operator triggers.
+
+### Transport hardening (defense in depth)
+
+Below the schema guards, every upstream call (`src/operations/proxy.ts`):
+
+- is issued with `redirect: 'manual'`. A `3xx` upstream is treated as a contract
+  violation and mapped to a bounded **502** — the forwarded `Bearer` credential
+  is never replayed to a redirect target the upstream chose;
+- requires the server-only base URL to be **HTTPS outside the explicit local-dev
+  bypass**, so the credential is never sent in the clear;
+- reads the response body under a hard **byte ceiling** (both the declared
+  `Content-Length` and the streamed bytes) *before* JSON parsing; an oversize or
+  malformed body maps to a bounded **502**.
+
+## Server-side base URLs
+
+Both resolve server-side only and are never exposed to the browser. Outside the
+local-dev bypass each must be **HTTPS**.
+
+- `GBAW_OPERATIONS_API_BASE_URL` — the **E4 control-plane** API (reads +
+  kill-switch control), falling back to `BACKEND_URL` then
+  `http://localhost:8080`.
+- `GBAW_OPERATIONS_ACTION_API_BASE_URL` — the **E2 operations action** API
+  (approval-lifecycle decisions such as cancel), falling back to
+  `GBAW_OPERATIONS_API_BASE_URL`, then `BACKEND_URL`, then
+  `http://localhost:8080`. Set this when the E2 action API is deployed at a
+  different origin than the E4 control plane.
 
 ## Never rendered
 
 The projections are public-safe by contract, and the schema guards additionally
 **fail closed** if any of these ever appears: email, display name, token, ARN,
-account id, fleet id, or a raw provider payload.
+account id, fleet id, or a raw provider payload. The cancel response is projected
+to a minimal `{ operation_id, new_state }` confirmation so the internal
+state-change ledger record (prepared-operation hash, actor, correlation ids) is
+never exposed to the browser.
 
 ## Framework decision
 
@@ -69,13 +116,15 @@ evidence and the reskin-friendly boundaries.
 
 ## Tests
 
-- `src/__tests__/operations/*` — schema guards and proxy auth.
+- `src/__tests__/operations/*` — schema guards, proxy auth, and transport
+  hardening (redirect, oversize/malformed body, HTTPS-required base).
 - `src/__tests__/api/operations/*` — proxy route authorization, CSRF, validation,
-  and fail-closed behavior.
+  fail-closed behavior, and the E2 cancel route (auth/CSRF/state/forwarding).
 - `src/__tests__/components/operations/*` and `src/__tests__/pages/operations.test.tsx`
-  — component and page behavior, each with `jest-axe` accessibility assertions.
+  — component and page behavior, each with `jest-axe` accessibility assertions,
+  including the cancel control (cancellable-only, no expire action).
 - `tests/e2e-operator-workflow.spec.ts` — mocked Playwright workflow (no live
-  backend/AWS).
+  backend/AWS), including the cancel-and-refresh flow.
 - `tests/live-operator.spec.ts` (+ `playwright.live-operator.config.ts`) —
   authenticated live scaffold against a deployed stack; opt-in, skipped by
   default, and never writes unless `LIVE_OPERATOR_ALLOW_CONTROL=true`.

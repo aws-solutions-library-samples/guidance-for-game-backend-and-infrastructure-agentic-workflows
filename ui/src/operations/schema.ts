@@ -29,6 +29,16 @@ export const OPERATIONS_ROUTES = {
   killSwitch: '/operations/control/kill-switch',
 } as const;
 
+/**
+ * E2 operations *action* routes. Cancellation is owned by the E2
+ * approval/decision service, not the E4 control plane, so it is kept in a
+ * separate map: the proxy forwards these to the E2 action base URL
+ * (GBAW_OPERATIONS_ACTION_API_BASE_URL), never the E4 control base.
+ */
+export const OPERATIONS_ACTION_ROUTES = {
+  cancel: '/operations/{operationId}/cancel',
+} as const;
+
 export const MAX_PAGE_SIZE = 50;
 
 export const OPERATION_STATES = [
@@ -45,6 +55,20 @@ export const OPERATION_STATES = [
   'expired',
 ] as const;
 export type OperationState = (typeof OPERATION_STATES)[number];
+
+/**
+ * Pre-dispatch, non-terminal states an operator may cancel. Must match the
+ * backend E2 decision service (`_CANCELLABLE_STATES` in operations/decisions.py):
+ * once an operation has dispatched or reached a terminal state it can no longer
+ * be cancelled. Expiry, by contrast, is system-owned and never an operator
+ * action, so `expired` is not — and must never be — cancellable.
+ */
+export const CANCELLABLE_STATES = ['prepared', 'pending_approval', 'approved'] as const;
+
+/** True when an operation is in a state an operator may cancel. */
+export function isCancellable(state: OperationState): boolean {
+  return (CANCELLABLE_STATES as readonly string[]).includes(state);
+}
 
 export const AUTHORITIES = ['disabled', 'observe', 'advise', 'remediate', 'operate'] as const;
 export type Authority = (typeof AUTHORITIES)[number];
@@ -639,6 +663,32 @@ export function parseControlResponse(value: unknown): ControlResponse {
     result.effective = parseKillSwitch(o.effective);
   }
   return result;
+}
+
+export interface CancelResponse {
+  operation_id: string;
+  new_state: OperationState;
+}
+
+/**
+ * Validate the upstream cancel response and project it to a minimal, public-safe
+ * confirmation. The E2 action API returns a full internal state-change ledger
+ * record (prepared-operation hash, actor, correlation ids); the operator UI must
+ * not depend on or expose that internal detail, so we assert the state actually
+ * transitioned to `cancelled` and surface only the operation id and new state.
+ * The detail timeline is re-fetched after a successful cancel for the full view.
+ */
+export function parseCancelResponse(value: unknown): CancelResponse {
+  const path = 'cancel-response';
+  const o = obj(value, path);
+  const newState = enumValue(o.new_state, `${path}.new_state`, OPERATION_STATES);
+  if (newState !== 'cancelled') {
+    fail(`${path}.new_state`, 'cancel did not transition the operation to cancelled');
+  }
+  return {
+    operation_id: pattern(o.operation_id, `${path}.operation_id`, OPERATION_ID_PATTERN),
+    new_state: newState,
+  };
 }
 
 // ---------------------------------------------------------------------------

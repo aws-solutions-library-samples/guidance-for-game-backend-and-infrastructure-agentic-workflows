@@ -22,19 +22,87 @@ import { ACCESS_TOKEN_COOKIE, ID_TOKEN_COOKIE } from '@/utils/authSession';
 const DEFAULT_LOCAL_BACKEND = 'http://localhost:8080';
 
 /**
- * The base URL of the E4 operations control-plane REST API.
+ * True only for the explicit local-dev bypass. NODE_ENV alone is unsafe (a
+ * hosted preview is also !== 'production'), so we require NEXT_PUBLIC_SKIP_AUTH.
  *
- * Resolution order (server-side only, never exposed to the browser):
- *  1. GBAW_OPERATIONS_API_BASE_URL — the deployed API Gateway stage URL.
+ * Declared before the base-URL resolvers because they consult it to decide
+ * whether a plaintext (http) backend base is permissible.
+ */
+export function isLocalDevBypass(): boolean {
+  return process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
+}
+
+/**
+ * Raised when a server-only base URL is not usable (e.g. plaintext http outside
+ * the local-dev bypass). Kept in this module so both the base-URL resolvers and
+ * the proxy transport can share one error type.
+ */
+export class BaseUrlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BaseUrlError';
+  }
+}
+
+/**
+ * Require the resolved base URL to be transport-secure (HTTPS) unless we are in
+ * the explicit local-dev bypass. A misconfigured plaintext base would send the
+ * forwarded Bearer access token in the clear, so we fail closed rather than
+ * forward the credential. localhost/127.0.0.1 remain acceptable only under the
+ * bypass (the local backend has no TLS).
+ */
+export function requireSecureBase(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new BaseUrlError('operations base URL is not a valid URL');
+  }
+  if (url.protocol === 'https:') return raw;
+  if (url.protocol === 'http:' && isLocalDevBypass()) return raw;
+  throw new BaseUrlError('operations base URL must be https outside local-dev');
+}
+
+function resolveBase(...candidates: (string | undefined)[]): string {
+  const raw = candidates.map((c) => c?.trim()).find((c) => c) || DEFAULT_LOCAL_BACKEND;
+  return requireSecureBase(raw.replace(/\/+$/, ''));
+}
+
+/**
+ * The base URL of the E4 operations control-plane REST API (read + kill-switch
+ * control). Server-side only, never exposed to the browser.
+ *
+ * Resolution order:
+ *  1. GBAW_OPERATIONS_API_BASE_URL — the deployed control-plane API stage URL.
  *  2. BACKEND_URL — the shared local-dev backend.
  *  3. http://localhost:8080 — the default local backend.
+ *
+ * The resolved value must be HTTPS outside the local-dev bypass.
  */
 export function operationsBackendBaseUrl(): string {
-  const raw =
-    process.env.GBAW_OPERATIONS_API_BASE_URL?.trim() ||
-    process.env.BACKEND_URL?.trim() ||
-    DEFAULT_LOCAL_BACKEND;
-  return raw.replace(/\/+$/, '');
+  return resolveBase(process.env.GBAW_OPERATIONS_API_BASE_URL, process.env.BACKEND_URL);
+}
+
+/**
+ * The base URL of the E2 operations *action* API (approval-lifecycle decisions
+ * such as `POST /operations/{operationId}/cancel`). Cancellation is owned by the
+ * E2 approval/decision service, not the E4 control plane, so it has its own
+ * server-only base. Server-side only, never exposed to the browser.
+ *
+ * Resolution order:
+ *  1. GBAW_OPERATIONS_ACTION_API_BASE_URL — the deployed E2 action API stage URL.
+ *  2. GBAW_OPERATIONS_API_BASE_URL — co-located deployment fallback.
+ *  3. BACKEND_URL — the shared local-dev backend.
+ *  4. http://localhost:8080 — the default local backend.
+ *
+ * The resolved value must be HTTPS outside the local-dev bypass.
+ */
+export function operationsActionBaseUrl(): string {
+  return resolveBase(
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL,
+    process.env.GBAW_OPERATIONS_API_BASE_URL,
+    process.env.BACKEND_URL,
+  );
 }
 
 /** Headers for a forwarded backend request. The access token is the only credential. */
@@ -92,14 +160,6 @@ function productionVerifiers(): VerifierBundle {
     });
   }
   return { idVerifier: idVerifierSingleton, accessVerifier: accessVerifierSingleton };
-}
-
-/**
- * True only for the explicit local-dev bypass. NODE_ENV alone is unsafe (a
- * hosted preview is also !== 'production'), so we require NEXT_PUBLIC_SKIP_AUTH.
- */
-export function isLocalDevBypass(): boolean {
-  return process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_SKIP_AUTH === 'true';
 }
 
 /**

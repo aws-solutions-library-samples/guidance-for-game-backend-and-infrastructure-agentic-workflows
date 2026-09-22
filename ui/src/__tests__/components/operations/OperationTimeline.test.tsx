@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, within, fireEvent, waitFor } from '@testing-library/react';
 import { axe } from 'jest-axe';
 import fs from 'fs';
 import path from 'path';
@@ -16,6 +16,9 @@ const detail: OperationDetail = parseOperationDetail(
     ),
   ),
 );
+
+/** A cancellable (pre-dispatch) variant derived from the valid fixture. */
+const pendingDetail: OperationDetail = { ...detail, state: 'pending_approval' };
 
 describe('OperationTimeline', () => {
   it('renders each lifecycle phase with a distinct label', () => {
@@ -55,5 +58,48 @@ describe('OperationTimeline', () => {
   it('has no detectable accessibility violations', async () => {
     const { container } = render(<OperationTimeline detail={detail} />);
     expect(await axe(container)).toHaveNoViolations();
+  });
+
+  describe('cancel control', () => {
+    it('does not render a cancel control for a terminal (non-cancellable) state', () => {
+      render(<OperationTimeline detail={detail} onCancel={jest.fn()} />);
+      expect(screen.queryByRole('button', { name: /cancel operation/i })).not.toBeInTheDocument();
+    });
+
+    it('does not render a cancel control when no onCancel handler is provided', () => {
+      render(<OperationTimeline detail={pendingDetail} />);
+      expect(screen.queryByRole('button', { name: /cancel operation/i })).not.toBeInTheDocument();
+    });
+
+    it('never offers an "expire" action (expiry is system-owned)', () => {
+      render(<OperationTimeline detail={pendingDetail} onCancel={jest.fn()} />);
+      expect(screen.queryByRole('button', { name: /expire/i })).not.toBeInTheDocument();
+    });
+
+    it('renders a cancel control for a cancellable state and confirms before calling onCancel', async () => {
+      const onCancel = jest.fn().mockResolvedValue(undefined);
+      render(<OperationTimeline detail={pendingDetail} onCancel={onCancel} />);
+
+      const trigger = screen.getByRole('button', { name: /cancel operation/i });
+      fireEvent.click(trigger);
+
+      // A confirmation dialog appears; onCancel is not called until confirmed.
+      const dialog = screen.getByRole('dialog');
+      expect(onCancel).not.toHaveBeenCalled();
+
+      const confirm = within(dialog).getByRole('button', { name: /cancel operation|confirm/i });
+      fireEvent.click(confirm);
+
+      await waitFor(() => expect(onCancel).toHaveBeenCalledWith(pendingDetail.operation_id));
+    });
+
+    it('has no accessibility violations while the confirm dialog is open', async () => {
+      const { container } = render(
+        <OperationTimeline detail={pendingDetail} onCancel={jest.fn().mockResolvedValue(undefined)} />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: /cancel operation/i }));
+      expect(screen.getByRole('dialog')).toBeInTheDocument();
+      expect(await axe(container)).toHaveNoViolations();
+    });
   });
 });

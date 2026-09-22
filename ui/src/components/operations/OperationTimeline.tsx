@@ -1,4 +1,6 @@
-import type { OperationDetail } from '@/operations/schema';
+import { useState } from 'react';
+import { isCancellable, type OperationDetail } from '@/operations/schema';
+import ConfirmDialog from '@/components/operations/ConfirmDialog';
 import {
   EVIDENCE_CATEGORY_LABELS,
   PHASE_LABELS,
@@ -12,6 +14,15 @@ import {
 
 interface OperationTimelineProps {
   detail: OperationDetail;
+  /**
+   * Optional operator action to cancel a pre-dispatch operation. When provided
+   * AND the operation is in a cancellable state, a confirmation-gated "Cancel
+   * operation" control is shown. Cancellation is the only lifecycle action an
+   * operator may take here — expiry is system-owned and is never offered as a
+   * human action. The handler performs the cancel and refreshes the timeline;
+   * this component only gates it behind a confirmation.
+   */
+  onCancel?: (operationId: string) => Promise<void>;
 }
 
 /**
@@ -21,7 +32,27 @@ interface OperationTimelineProps {
  * Renders only public-safe projection fields; there is no raw payload, ARN,
  * account, or fleet id anywhere in the projection.
  */
-export default function OperationTimeline({ detail }: OperationTimelineProps) {
+export default function OperationTimeline({ detail, onCancel }: OperationTimelineProps) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const cancellable = Boolean(onCancel) && isCancellable(detail.state);
+
+  const handleConfirm = async () => {
+    if (!onCancel) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await onCancel(detail.operation_id);
+      setConfirming(false);
+    } catch {
+      setActionError('The operation could not be cancelled. It may have already progressed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="ga-op-detail" aria-label={`Operation ${detail.operation_id}`}>
       <header className="ga-op-head">
@@ -44,6 +75,26 @@ export default function OperationTimeline({ detail }: OperationTimelineProps) {
           <dd>{formatTimestamp(detail.updated_at)}</dd>
         </div>
       </dl>
+
+      {cancellable && (
+        <div className="ga-op-actions">
+          <button
+            type="button"
+            className="ga-op-cancel-btn"
+            onClick={() => {
+              setActionError(null);
+              setConfirming(true);
+            }}
+          >
+            Cancel operation
+          </button>
+        </div>
+      )}
+      {actionError && (
+        <p role="alert" className="ga-op-action-error">
+          {actionError}
+        </p>
+      )}
 
       <h3 className="ga-op-h3">Lifecycle</h3>
       <ol className="ga-op-timeline" aria-label="Lifecycle timeline">
@@ -95,6 +146,23 @@ export default function OperationTimeline({ detail }: OperationTimelineProps) {
         </ul>
       )}
 
+      {confirming && (
+        <ConfirmDialog
+          title="Cancel this operation?"
+          confirmLabel="Cancel operation"
+          cancelLabel="Keep operation"
+          danger
+          busy={busy}
+          onConfirm={() => {
+            void handleConfirm();
+          }}
+          onCancel={() => setConfirming(false)}
+        >
+          This stops the operation before it dispatches. This cannot be undone; a new
+          operation would have to be proposed to proceed.
+        </ConfirmDialog>
+      )}
+
       <style jsx>{styles}</style>
     </section>
   );
@@ -116,6 +184,14 @@ const styles = `
   .ga-op-meta { display: flex; gap: 32px; margin: 16px 0; }
   .ga-op-meta dt { color: var(--ga-text-subtle); font-size: 12px; }
   .ga-op-meta dd { margin: 2px 0 0 0; font-size: 14px; }
+  .ga-op-actions { margin: 8px 0 4px; }
+  .ga-op-cancel-btn {
+    background: var(--ga-danger-bg); color: var(--ga-danger); border: 1px solid var(--ga-danger-border);
+    border-radius: 8px; padding: 8px 16px; font-weight: 600; font-size: 14px; cursor: pointer;
+  }
+  .ga-op-cancel-btn:hover { filter: brightness(0.97); }
+  .ga-op-cancel-btn:focus-visible { outline: 2px solid var(--ga-danger); outline-offset: 2px; }
+  .ga-op-action-error { color: var(--ga-danger); font-size: 14px; margin: 4px 0 0; }
   .ga-op-h3 { margin: 24px 0 12px; font-size: 15px; }
   .ga-op-timeline { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
   .ga-op-phase { display: grid; grid-template-columns: auto 1fr auto auto; gap: 12px; align-items: center; }

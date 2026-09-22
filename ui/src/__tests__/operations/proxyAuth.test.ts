@@ -1,6 +1,8 @@
 import { createMocks } from 'node-mocks-http';
 import type { NextApiRequest } from 'next';
 import {
+  BaseUrlError,
+  operationsActionBaseUrl,
   operationsBackendBaseUrl,
   requireOperatorAdmin,
   forwardHeaders,
@@ -16,11 +18,14 @@ afterEach(() => {
 describe('operationsBackendBaseUrl', () => {
   it('prefers the operations-specific base url', () => {
     process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod';
-    process.env.BACKEND_URL = 'http://localhost:8080';
+    process.env.BACKEND_URL = 'https://shared.example.com';
     expect(operationsBackendBaseUrl()).toBe('https://ops.example.com/prod');
   });
 
-  it('falls back to BACKEND_URL then localhost', () => {
+  it('falls back to BACKEND_URL then the localhost default under the local-dev bypass', () => {
+    // Plaintext localhost is only permissible in the explicit local-dev bypass.
+    process.env.NODE_ENV = 'development';
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
     delete process.env.GBAW_OPERATIONS_API_BASE_URL;
     process.env.BACKEND_URL = 'http://localhost:9999';
     expect(operationsBackendBaseUrl()).toBe('http://localhost:9999');
@@ -31,6 +36,35 @@ describe('operationsBackendBaseUrl', () => {
   it('strips a trailing slash', () => {
     process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod/';
     expect(operationsBackendBaseUrl()).toBe('https://ops.example.com/prod');
+  });
+
+  it('rejects a plaintext http base url outside the local-dev bypass', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.GBAW_OPERATIONS_API_BASE_URL = 'http://ops.example.com';
+    expect(() => operationsBackendBaseUrl()).toThrow(BaseUrlError);
+  });
+});
+
+describe('operationsActionBaseUrl', () => {
+  it('prefers the dedicated E2 action base over the control-plane base', () => {
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'https://actions.example.com/prod';
+    process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod';
+    expect(operationsActionBaseUrl()).toBe('https://actions.example.com/prod');
+  });
+
+  it('falls back to the control-plane base when no dedicated action base is set', () => {
+    delete process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL;
+    process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod';
+    expect(operationsActionBaseUrl()).toBe('https://ops.example.com/prod');
+  });
+
+  it('requires https outside the local-dev bypass', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    delete process.env.GBAW_OPERATIONS_API_BASE_URL;
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'http://actions.example.com';
+    expect(() => operationsActionBaseUrl()).toThrow(BaseUrlError);
   });
 });
 
