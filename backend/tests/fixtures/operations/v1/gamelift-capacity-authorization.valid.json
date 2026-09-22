@@ -1,0 +1,32 @@
+{
+  "authorization_contract_version": "1.0",
+  "decision_id": "authz.op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "phase": "advise",
+  "prepared_operation_hash": "sha256:2dad46196946c6375450960d769fb7abe59a1f12a3605e153fb64e58e48cd435",
+  "principal": {
+    "subject_id": "subject.operator-1",
+    "client_id": "client.web-console",
+    "tenant_id": "tenant.default",
+    "workspace_id": "workspace.default"
+  },
+  "authority_inputs": {
+    "deployment_mode": "operate",
+    "tenant_policy": "operate",
+    "workspace_policy": "operate",
+    "principal_authority": "remediate",
+    "capability_maximum": "remediate",
+    "operation_risk_policy": "operate"
+  },
+  "effective_authority": "remediate",
+  "decision": "approval_required",
+  "reason_codes": [
+    "APPROVAL_REQUIRED"
+  ],
+  "policy_version": "2026-09-01",
+  "evaluated_at": "2026-09-21T19:11:52Z",
+  "expires_at": "2026-09-21T19:26:52Z",
+  "correlation": {
+    "correlation_id": "corr.prepare-1",
+    "request_id": "request.prepare-1"
+  }
+}

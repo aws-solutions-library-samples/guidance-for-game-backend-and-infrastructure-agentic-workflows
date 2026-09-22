@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-advice",
+  "title": "GameLift Capacity Adjustment Advice 1.0",
+  "$comment": "Additive deterministic E2 advice for gamelift.capacity-adjustment/1.0. It is a pure, server-computed reading of one proposal against one trusted current-state observation: the exact desired/min/max change, server-owned bounds outcome, and deterministic risk. It reuses the immutable common $defs, is not in the published source-control write-contract schema set, and carries no free-form model text, executor, or credential field.",
+  "$defs": {
+    "capacity_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "desired",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "desired": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      }
+    },
+    "capacity_delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "desired",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "desired": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "advice_contract_version",
+    "advice_id",
+    "phase",
+    "provider",
+    "capability",
+    "target",
+    "current_state",
+    "requested",
+    "change",
+    "bounds",
+    "calculated_risk",
+    "advised_at"
+  ],
+  "properties": {
+    "advice_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "advice_id": {
+      "type": "string",
+      "pattern": "^adv_[a-z0-9]{26}$"
+    },
+    "phase": {
+      "type": "string",
+      "const": "advise"
+    },
+    "provider": {
+      "type": "string",
+      "const": "gamelift"
+    },
+    "capability": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/capability_binding"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "fleet_id",
+        "location"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "const": "gamelift"
+        },
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        }
+      }
+    },
+    "current_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation_id",
+        "observation_hash",
+        "capacity"
+      ],
+      "properties": {
+        "observation_id": {
+          "type": "string",
+          "pattern": "^obs_[a-z0-9]{26}$"
+        },
+        "observation_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        },
+        "capacity": {
+          "$ref": "#/$defs/capacity_values"
+        }
+      }
+    },
+    "requested": {
+      "$ref": "#/$defs/capacity_values"
+    },
+    "change": {
+      "$ref": "#/$defs/capacity_delta"
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "within_bounds",
+        "enrollment",
+        "policy",
+        "violations"
+      ],
+      "properties": {
+        "within_bounds": {
+          "type": "boolean"
+        },
+        "enrollment": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/resource_enrollment"
+        },
+        "policy": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/policy_binding"
+        },
+        "violations": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "DESIRED_BELOW_FLOOR",
+              "DESIRED_ABOVE_CEILING",
+              "MINIMUM_BELOW_FLOOR",
+              "MAXIMUM_ABOVE_CEILING",
+              "MINIMUM_EXCEEDS_MAXIMUM",
+              "DESIRED_OUTSIDE_RANGE",
+              "DELTA_EXCEEDS_MAX_STEP",
+              "TARGET_NOT_ENROLLED"
+            ]
+          }
+        }
+      }
+    },
+    "calculated_risk": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/calculated_risk"
+    },
+    "advised_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    }
+  }
+}

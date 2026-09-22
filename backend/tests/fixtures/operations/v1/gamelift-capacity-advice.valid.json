@@ -1,0 +1,55 @@
+{
+  "advice_contract_version": "1.0",
+  "advice_id": "adv_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "phase": "advise",
+  "provider": "gamelift",
+  "capability": {
+    "capability_id": "gamelift.capacity-adjustment",
+    "capability_version": "1.0"
+  },
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+    "location": "us-west-2"
+  },
+  "current_state": {
+    "observation_id": "obs_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "observation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "capacity": {
+      "desired": 10,
+      "minimum": 2,
+      "maximum": 20
+    }
+  },
+  "requested": {
+    "desired": 14,
+    "minimum": 2,
+    "maximum": 20
+  },
+  "change": {
+    "desired": 4,
+    "minimum": 0,
+    "maximum": 0
+  },
+  "bounds": {
+    "within_bounds": true,
+    "enrollment": {
+      "enrollment_id": "enroll.fleet-default",
+      "enrollment_version": "2026-09-01"
+    },
+    "policy": {
+      "policy_id": "policy.capacity-default",
+      "policy_version": "2026-09-01"
+    },
+    "violations": []
+  },
+  "calculated_risk": {
+    "level": "moderate",
+    "score": 30,
+    "factors": [
+      "desired-magnitude",
+      "scale-up"
+    ]
+  },
+  "advised_at": "2026-09-21T19:11:52Z"
+}
