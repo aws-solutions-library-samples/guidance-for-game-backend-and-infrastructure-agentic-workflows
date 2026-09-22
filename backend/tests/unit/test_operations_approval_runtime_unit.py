@@ -53,6 +53,7 @@ class FakeApprovalStore:
         expected_state: str,
         commit_not_after: datetime,
         approval,
+        workspace_id: str | None = None,
     ) -> object:
         self.commits.append(
             {

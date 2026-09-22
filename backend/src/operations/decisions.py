@@ -179,6 +179,7 @@ class DecisionStore(Protocol):
         state_change: Mapping[str, Any],
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
+        workspace_id: str | None = None,
     ) -> DecisionCommitOutcome:
         """Conditionally record the terminal transition, fenced and atomic."""
         ...
@@ -255,6 +256,7 @@ class LifecycleDecisionService:
             ledger_event,
             approval,
             commit_not_after=min(context.principal.expires_at, self._operation_expiry(prepared_operation)),
+            workspace_id=_operation_workspace_id(prepared_operation),
         )
         return dict(approval)
 
@@ -303,6 +305,7 @@ class LifecycleDecisionService:
             ledger_event,
             None,
             commit_not_after=min(context.principal.expires_at, self._operation_expiry(prepared_operation)),
+            workspace_id=_operation_workspace_id(prepared_operation),
         )
         return dict(state_change)
 
@@ -355,6 +358,7 @@ class LifecycleDecisionService:
             ledger_event,
             None,
             commit_not_after=_FAR_FUTURE,
+            workspace_id=_operation_workspace_id(prepared_operation),
         )
         return dict(state_change)
 
@@ -554,6 +558,7 @@ class LifecycleDecisionService:
         approval: Mapping[str, Any] | None,
         *,
         commit_not_after: datetime,
+        workspace_id: str | None = None,
     ) -> None:
         outcome = self._store.record_terminal_decision(
             operation_id=request.operation_id,
@@ -564,6 +569,7 @@ class LifecycleDecisionService:
             state_change=dict(state_change),
             ledger_event=dict(ledger_event),
             approval=dict(approval) if approval is not None else None,
+            workspace_id=workspace_id,
         )
         if outcome is DecisionCommitOutcome.DEADLINE_EXPIRED:
             raise ApprovalBoundaryError(
@@ -573,6 +579,16 @@ class LifecycleDecisionService:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.STATE_CONFLICT, "operation changed before the decision could be recorded"
             )
+
+
+def _operation_workspace_id(operation: Mapping[str, Any]) -> str | None:
+    """Return the operation's requester workspace id, or None if absent."""
+    requester = operation.get("requester")
+    if isinstance(requester, Mapping):
+        workspace_id = requester.get("workspace_id")
+        if isinstance(workspace_id, str) and workspace_id:
+            return workspace_id
+    return None
 
 
 def _principal_actor(principal_identity: Mapping[str, str]) -> dict[str, str]:

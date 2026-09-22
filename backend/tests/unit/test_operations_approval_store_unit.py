@@ -200,9 +200,16 @@ def test_persist_materializes_prepared_operation_atomically() -> None:
 
     assert result.outcome is PersistOutcome.PERSISTED
     assert result.operation_id == OPERATION_ID
-    # One transaction writing all five legs: idem, prepared, snapshot, state#0, ledger#0.
+    # One transaction writing all six legs: idem, prepared, snapshot, state#0,
+    # ledger#0, and the workspace catalog row (#416).
     assert len(client.transactions) == 1
-    assert len(client.transactions[0]) == 5
+    assert len(client.transactions[0]) == 6
+    catalog_sks = [
+        put["Put"]["Item"]["SK"]["S"]
+        for put in client.transactions[0]
+        if "Put" in put and put["Put"]["Item"].get("record_type", {}).get("S") == "operation_catalog_entry"
+    ]
+    assert len(catalog_sks) == 1
 
 
 def test_persist_no_e2_record_carries_a_ttl_attribute() -> None:

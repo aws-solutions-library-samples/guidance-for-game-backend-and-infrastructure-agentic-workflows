@@ -62,6 +62,7 @@ class FakeDecisionStore:
         state_change: Any,
         ledger_event: Any,
         approval: Any | None,
+        workspace_id: str | None = None,
     ) -> object:
         self.commits.append(
             {

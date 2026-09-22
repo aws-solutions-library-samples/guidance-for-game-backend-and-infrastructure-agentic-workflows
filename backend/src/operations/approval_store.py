@@ -57,6 +57,7 @@ from __future__ import annotations
 # Standard library
 import logging
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -76,6 +77,20 @@ _CONTRACT_VERSION = "1.0"
 _INITIAL_GENERATION = 1
 _PENDING_APPROVAL = "pending_approval"
 
+# The workspace catalog partition. Each prepared operation writes one
+# catalog item (transactionally, in the same TransactWriteItems that
+# materializes it) under PK=WS#<workspace_id>#CATALOG, SK=OP#<operation_id>,
+# so the bounded E4 list projection reads a single workspace partition with a
+# Query and NEVER a Scan. The stable OP#<operation_id> sort key lets a
+# terminal decision update the catalog projection without a chronological
+# lookup. The catalog holds only public-safe summary fields.
+_CATALOG_PK_PREFIX = "WS#"
+_CATALOG_PK_SUFFIX = "#CATALOG"
+_CATALOG_SK_PREFIX = "OP#"
+# Hard bound on any single catalog Query page so a caller can never force an
+# unbounded read; aligned with the control-plane MAX_PAGE_SIZE (50).
+_CATALOG_MAX_PAGE_SIZE = 50
+
 # The prepared-operation lifecycle appends at most a small, bounded number of
 # ledger entries (materialization + one terminal transition), so an evidence
 # read walks a short, contiguous LEDGER#<seq> chain rather than issuing a Scan.
@@ -84,6 +99,20 @@ _MAX_LEDGER_SEQUENCE = 32
 # The DynamoDB item-size limit. The canonical prepared-operation JSON must
 # serialize below this ceiling; a larger operation fails closed.
 _DYNAMODB_ITEM_SIZE_LIMIT_BYTES = 400 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogPage:
+    """One bounded page of workspace catalog rows plus an opaque continuation.
+
+    ``rows`` are the public-safe summary dicts (operation_id, capability_id,
+    state, created_at, updated_at). ``last_evaluated_key`` is the raw DynamoDB
+    key to pass as the next ``exclusive_start_key``; it is ``None`` when the
+    workspace partition has no further rows.
+    """
+
+    rows: list[dict[str, Any]]
+    last_evaluated_key: dict[str, Any] | None
 
 
 class ApprovalStoreError(RuntimeError):
@@ -220,12 +249,24 @@ class DynamoDbApprovalStore:
             }
         )
 
+        catalog_item = _marshal(
+            _catalog_item(
+                workspace_id=workspace_id,
+                operation_id=operation_id,
+                prepared_operation=prepared_operation,
+                state=_PENDING_APPROVAL,
+                updated_at=_operation_created_at(prepared_operation),
+            )
+        )
         transact_items = [
             self._conditional_put(_marshal(idem_item), "attribute_not_exists(PK)"),
             self._conditional_put(_marshal(prepared_item), "attribute_not_exists(PK)"),
             self._conditional_put(_marshal(snapshot_item), "attribute_not_exists(PK)"),
             self._conditional_put(transition_item, "attribute_not_exists(SK)"),
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
+            # Transactional workspace catalog row: an operation is discoverable
+            # to the bounded Query-based list the instant it exists, or not at all.
+            self._conditional_put(catalog_item, "attribute_not_exists(SK)"),
         ]
 
         if self._clock() >= deadline:
@@ -267,6 +308,7 @@ class DynamoDbApprovalStore:
         expected_state: str,
         commit_not_after: datetime,
         approval: Mapping[str, Any],
+        workspace_id: str | None = None,
     ) -> ApprovalCommitOutcome:
         deadline = _utc(commit_not_after, "commit_not_after")
         if self._clock() >= deadline:
@@ -283,6 +325,8 @@ class DynamoDbApprovalStore:
             ledger_event=ledger_event,
             approval=approval,
             deadline=deadline,
+            workspace_id=workspace_id,
+            catalog_state="approved",
         )
         return _to_approval_outcome(outcome)
 
@@ -302,6 +346,7 @@ class DynamoDbApprovalStore:
         state_change: Mapping[str, Any],
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
+        workspace_id: str | None = None,
     ) -> DecisionCommitOutcome:
         deadline = _utc(commit_not_after, "commit_not_after")
         if self._clock() >= deadline:
@@ -316,6 +361,8 @@ class DynamoDbApprovalStore:
             ledger_event=ledger_event,
             approval=approval,
             deadline=deadline,
+            workspace_id=workspace_id,
+            catalog_state=new_state,
         )
 
     # -- Shared terminal-commit transaction ------------------------------
@@ -332,6 +379,8 @@ class DynamoDbApprovalStore:
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
         deadline: datetime,
+        workspace_id: str | None = None,
+        catalog_state: str | None = None,
     ) -> DecisionCommitOutcome:
         op_pk = f"OP#{operation_id}"
 
@@ -382,6 +431,19 @@ class DynamoDbApprovalStore:
             self._conditional_put(transition_item, "attribute_not_exists(SK)"),
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
+        # Keep the workspace catalog projection consistent with the
+        # authoritative snapshot in the SAME atomic transaction. The update is
+        # conditional on the catalog row existing (it was written at prepare);
+        # a caller that does not pass workspace_id simply omits it.
+        if workspace_id is not None and catalog_state is not None:
+            transact_items.append(
+                self._catalog_state_update(
+                    workspace_id=workspace_id,
+                    operation_id=operation_id,
+                    state=catalog_state,
+                    updated_at=_iso_now(self._clock()),
+                )
+            )
         if approval is not None:
             approval_item = _marshal(
                 {
@@ -522,6 +584,59 @@ class DynamoDbApprovalStore:
             entries.append({"sequence": sequence, "event_type": event_type, "occurred_at": occurred_at})
         return entries
 
+    # -- Workspace catalog (Query, never Scan) ---------------------------
+
+    def query_workspace_catalog(
+        self,
+        *,
+        workspace_id: str,
+        limit: int,
+        exclusive_start_key: Mapping[str, Any] | None = None,
+    ) -> CatalogPage:
+        """Return one bounded, workspace-scoped catalog page via a Query.
+
+        Reads a single workspace partition (PK=WS#<workspace_id>#CATALOG) with a
+        bounded DynamoDB Query. It NEVER issues a Scan and never crosses a
+        workspace boundary. ``limit`` is clamped to the catalog max page size
+        so a caller can never force an unbounded read.
+        """
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ApprovalStoreError("workspace_id must be a non-empty string")
+        bounded_limit = max(1, min(int(limit), _CATALOG_MAX_PAGE_SIZE))
+        catalog_pk = f"{_CATALOG_PK_PREFIX}{workspace_id}{_CATALOG_PK_SUFFIX}"
+        query_kwargs: dict[str, Any] = {
+            "TableName": self._table_name,
+            "KeyConditionExpression": "PK = :pk AND begins_with(SK, :sk_prefix)",
+            "ExpressionAttributeValues": _marshal({":pk": catalog_pk, ":sk_prefix": _CATALOG_SK_PREFIX}),
+            "Limit": bounded_limit,
+            "ConsistentRead": True,
+        }
+        if exclusive_start_key is not None:
+            query_kwargs["ExclusiveStartKey"] = dict(exclusive_start_key)
+        response = self._client.query(**query_kwargs)
+        items = response.get("Items") or []
+        rows = [_unmarshal(item) for item in items]
+        last = response.get("LastEvaluatedKey")
+        last_key = dict(last) if isinstance(last, Mapping) and last else None
+        return CatalogPage(rows=rows, last_evaluated_key=last_key)
+
+    def _catalog_state_update(
+        self, *, workspace_id: str, operation_id: str, state: str, updated_at: str
+    ) -> dict[str, Any]:
+        """A conditional Update of one catalog row's state/updated_at."""
+        catalog_pk = f"{_CATALOG_PK_PREFIX}{workspace_id}{_CATALOG_PK_SUFFIX}"
+        catalog_sk = f"{_CATALOG_SK_PREFIX}{operation_id}"
+        return {
+            "Update": {
+                "TableName": self._table_name,
+                "Key": _marshal({"PK": catalog_pk, "SK": catalog_sk}),
+                "UpdateExpression": "SET #s = :cat_state, updated_at = :cat_updated",
+                "ConditionExpression": "attribute_exists(SK)",
+                "ExpressionAttributeNames": {"#s": "state"},
+                "ExpressionAttributeValues": _marshal({":cat_state": state, ":cat_updated": updated_at}),
+            }
+        }
+
     # -- Low-level helpers ------------------------------------------------
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
@@ -546,6 +661,58 @@ class DynamoDbApprovalStore:
 
 
 # -- Canonical JSON + record builders ----------------------------------------
+
+
+def _operation_created_at(operation: Mapping[str, Any]) -> str:
+    """Return the operation's created_at, falling back to a bounded default."""
+    created_at = operation.get("created_at")
+    if isinstance(created_at, str) and created_at:
+        return created_at
+    return "1970-01-01T00:00:00Z"
+
+
+def _capability_id_of(operation: Mapping[str, Any]) -> str:
+    """Return the operation's capability id from its capability binding."""
+    capability = operation.get("capability")
+    if isinstance(capability, Mapping):
+        capability_id = capability.get("capability_id")
+        if isinstance(capability_id, str) and capability_id:
+            return capability_id
+    return "unknown"
+
+
+def _catalog_item(
+    *,
+    workspace_id: str,
+    operation_id: str,
+    prepared_operation: Mapping[str, Any],
+    state: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    """Build one public-safe workspace catalog row.
+
+    The row carries ONLY the bounded summary fields the list projection needs
+    (operation id, capability, state, created_at, updated_at). It never carries
+    identity, credential, ARN, account, fleet id, or raw provider payload.
+    """
+    created_at = _operation_created_at(prepared_operation)
+    return {
+        "PK": f"{_CATALOG_PK_PREFIX}{workspace_id}{_CATALOG_PK_SUFFIX}",
+        "SK": f"{_CATALOG_SK_PREFIX}{operation_id}",
+        "record_type": "operation_catalog_entry",
+        "contract_version": _CONTRACT_VERSION,
+        "operation_id": operation_id,
+        "workspace_id": workspace_id,
+        "capability_id": _capability_id_of(prepared_operation),
+        "state": state,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def _iso_now(clock_value: datetime) -> str:
+    """Return the clock value as a normalized UTC Z timestamp."""
+    return clock_value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _canonical_json(document: Mapping[str, Any]) -> str:

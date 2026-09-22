@@ -57,6 +57,16 @@ def _parse_timestamp(value: object, field_name: str) -> datetime:
     return _utc(parsed, field_name)
 
 
+def _approval_workspace_id(operation: Mapping[str, Any]) -> str | None:
+    """Return the operation's requester workspace id, or None if absent."""
+    requester = operation.get("requester")
+    if isinstance(requester, Mapping):
+        workspace_id = requester.get("workspace_id")
+        if isinstance(workspace_id, str) and workspace_id:
+            return workspace_id
+    return None
+
+
 def _format_timestamp(value: datetime) -> str:
     return _utc(value, "timestamp").isoformat().replace("+00:00", "Z")
 
@@ -252,6 +262,7 @@ class ApprovalStore(Protocol):
         expected_state: str,
         commit_not_after: datetime,
         approval: Mapping[str, Any],
+        workspace_id: str | None = None,
     ) -> ApprovalCommitOutcome:
         """Conditionally record before the deadline and return the authoritative outcome."""
         ...
@@ -409,6 +420,7 @@ class ApprovalService:
             expected_state="pending_approval",
             commit_not_after=commit_not_after,
             approval=deepcopy(approval),
+            workspace_id=_approval_workspace_id(prepared_operation),
         )
         if outcome is ApprovalCommitOutcome.DEADLINE_EXPIRED:
             raise ApprovalBoundaryError(
