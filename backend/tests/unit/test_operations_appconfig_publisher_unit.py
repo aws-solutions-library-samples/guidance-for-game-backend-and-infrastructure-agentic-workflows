@@ -172,16 +172,19 @@ def test_publish_targets_configured_ids() -> None:
     assert deployment["EnvironmentId"] == "env-1"
 
 
-def test_provider_failure_raises_publisher_error() -> None:
+def test_provider_failure_raises_publisher_error(caplog: pytest.LogCaptureFixture) -> None:
     client = _FakeAppConfig()
 
     def boom(**kwargs: Any) -> dict[str, Any]:
-        raise RuntimeError("appconfig unavailable")
+        raise RuntimeError("provider-secret-detail")
 
     client.create_hosted_configuration_version = boom  # type: ignore[assignment]
     publisher = _publisher(client)
     with pytest.raises(PublisherError):
         publisher.publish(document=_document(enabled=True, prepare=True, dispatch=True, execute=True), hard_down=False)
+    assert "create_hosted_version" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "provider-secret-detail" not in caplog.text
 
 
 def test_repeated_publish_reuses_one_hosted_version_and_one_deployment() -> None:

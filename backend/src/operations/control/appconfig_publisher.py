@@ -22,6 +22,7 @@ from __future__ import annotations
 
 # Standard library
 import json
+import logging
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -29,6 +30,7 @@ from typing import Any, Protocol
 from operations.contracts.control_plane import KILL_SWITCH_SCHEMA_NAME, ControlContractError, validate_control_contract
 
 _CONTENT_TYPE = "application/json"
+_LOGGER = logging.getLogger(__name__)
 _MAX_LIST_PAGES = 20
 _PAGE_SIZE = 50
 _IN_PROGRESS_OR_COMPLETE = frozenset({"VALIDATING", "DEPLOYING", "BAKING", "COMPLETE"})
@@ -124,6 +126,7 @@ class AppConfigKillSwitchPublisher:
         try:
             created = self._client.create_hosted_configuration_version(**request)
         except Exception as exc:  # noqa: BLE001 - reconcile a possibly lost response
+            _log_provider_failure("create_hosted_version", exc)
             reconciled = self._find_hosted_version(label=label, expected_content=content)
             if reconciled is not None:
                 return reconciled
@@ -161,6 +164,7 @@ class AppConfigKillSwitchPublisher:
             raw = response.get("Content") if isinstance(response, Mapping) else None
             content = raw.read() if hasattr(raw, "read") else raw
         except Exception as exc:  # noqa: BLE001
+            _log_provider_failure("get_hosted_version", exc)
             raise PublisherError("could not verify the hosted kill-switch version") from exc
         if not isinstance(content, (bytes, bytearray)) or bytes(content) != expected_content:
             raise PublisherError("the deterministic control label is bound to different content")
@@ -186,6 +190,7 @@ class AppConfigKillSwitchPublisher:
         try:
             self._client.start_deployment(**request)
         except Exception as exc:  # noqa: BLE001 - reconcile a possibly lost response
+            _log_provider_failure("start_deployment", exc)
             reconciled, _ = self._deployment_inventory(label=label, strategy_id=strategy_id)
             if reconciled:
                 return
@@ -215,6 +220,7 @@ class AppConfigKillSwitchPublisher:
                 DeploymentNumber=number,
             )
         except Exception as exc:  # noqa: BLE001
+            _log_provider_failure("get_deployment", exc)
             raise PublisherError("could not verify the matching kill-switch deployment") from exc
         if deployment.get("ConfigurationProfileId") != self._configuration_profile_id:
             raise PublisherError("the matching deployment targets a different configuration profile")
@@ -260,6 +266,7 @@ class AppConfigKillSwitchPublisher:
             try:
                 response = operation(**page_request)
             except Exception as exc:  # noqa: BLE001
+                _log_provider_failure("list_reconciliation", exc)
                 raise PublisherError("AppConfig reconciliation list failed") from exc
             page_items = response.get("Items", []) if isinstance(response, Mapping) else []
             if not isinstance(page_items, list) or any(not isinstance(item, dict) for item in page_items):
@@ -272,6 +279,20 @@ class AppConfigKillSwitchPublisher:
                 raise PublisherError("AppConfig reconciliation returned an invalid continuation token")
             next_token = token
         raise PublisherError("AppConfig reconciliation exceeded the bounded page limit")
+
+
+def _log_provider_failure(stage: str, exc: Exception) -> None:
+    """Log only a bounded provider error code, never provider text or payload."""
+    code: object = None
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping):
+        error = response.get("Error")
+        if isinstance(error, Mapping):
+            code = error.get("Code")
+    safe_code = code if isinstance(code, str) and 0 < len(code) <= 64 else type(exc).__name__
+    if not all(ch.isalnum() or ch in "._-" for ch in safe_code):
+        safe_code = type(exc).__name__
+    _LOGGER.warning("AppConfig publisher stage=%s error_code=%s", stage, safe_code)
 
 
 def _positive_int(value: object) -> int | None:
