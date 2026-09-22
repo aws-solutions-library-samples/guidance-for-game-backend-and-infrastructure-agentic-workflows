@@ -169,21 +169,20 @@ Parameters:
       when Provisioned=true.
 
   AppConfigExtensionLayerArn:
-    # The official AWS AppConfig Agent Lambda extension layer, resolved to the
-    # authoritative regional version by the deploy wrapper from the public SSM
-    # parameter /aws/service/aws-appconfig/lambda-extension/x86/latest. The
-    # AllowedPattern accepts ONLY the official layer ARN shape (layer name
-    # AWS-AppConfig-Extension* owned by the AppConfig service account) or the
-    # public SSM resolve reference, so an arbitrary or attacker-controlled layer
-    # cannot be injected.
+    # The OFFICIAL AWS AppConfig Agent Lambda extension layer. The deploy
+    # wrapper resolves the authoritative regional version from the public SSM
+    # parameter and passes the concrete versioned ARN. CloudFormation rejects a
+    # versionless SSM dynamic reference even when the parameter is overridden,
+    # so the default-unprovisioned stack uses an empty value and the
+    # ProvisionedRequiresInputs rule requires the resolved ARN before resources
+    # can exist. The pattern excludes arbitrary layer names.
     Type: String
-    Default: '{{resolve:ssm:/aws/service/aws-appconfig/lambda-extension/x86/latest}}'
-    AllowedPattern: '^(\{\{resolve:ssm:/aws/service/aws-appconfig/lambda-extension/(x86|arm64)/latest\}\}|arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:layer:AWS-AppConfig-Extension[A-Za-z0-9-]*:\d+)$'
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:layer:AWS-AppConfig-Extension[A-Za-z0-9-]*:\d+$'
     Description: >-
-      ARN of the OFFICIAL AWS AppConfig Agent Lambda extension layer for this
-      Region, or the public SSM resolve reference that yields it. The deploy
-      wrapper reads the authoritative regional version from the public parameter
-      /aws/service/aws-appconfig/lambda-extension/x86/latest and passes it here.
+      Concrete versioned ARN of the OFFICIAL AWS AppConfig Agent Lambda
+      extension layer for this Region. The deploy wrapper resolves it from
+      /aws/service/aws-appconfig/lambda-extension/x86/latest before enabling.
 
   LambdaMemoryMb:
     Type: Number
@@ -267,6 +266,8 @@ Rules:
         AssertDescription: CodeS3Bucket is required when Provisioned=true.
       - Assert: !Not [!Equals [!Ref ControlCodeS3Key, '']]
         AssertDescription: ControlCodeS3Key is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref AppConfigExtensionLayerArn, '']]
+        AssertDescription: AppConfigExtensionLayerArn is required when Provisioned=true.
 
   # Enabling the control API requires the JWT bindings and trusted scope.
   EnabledRequiresBindings:

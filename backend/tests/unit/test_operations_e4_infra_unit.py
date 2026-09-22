@@ -398,10 +398,15 @@ def test_control_function_attaches_appconfig_extension_layer(template):
 def test_extension_layer_parameter_is_pattern_constrained_to_official_layer(template):
     param = template["Parameters"]["AppConfigExtensionLayerArn"]
     pattern = param["AllowedPattern"]
-    # Only the official AppConfig extension layer or the public SSM resolve ref.
+    # The default-unprovisioned stack uses an empty value. The deployment
+    # wrapper resolves and pins the official regional layer ARN before enabling;
+    # a versionless SSM dynamic reference is invalid in CloudFormation.
+    assert param["Default"] == ""
+    assert pattern.startswith("^$|")
     assert "AWS-AppConfig-Extension" in pattern
-    assert "aws-appconfig/lambda-extension" in pattern
-    assert param["Default"].startswith("{{resolve:ssm:/aws/service/aws-appconfig/lambda-extension/")
+    assert "resolve:ssm" not in pattern
+    assertions = template["Rules"]["ProvisionedRequiresInputs"]["Assertions"]
+    assert any("AppConfigExtensionLayerArn" in json.dumps(item) for item in assertions)
 
 
 def test_control_function_injects_appconfig_identifiers(template):
