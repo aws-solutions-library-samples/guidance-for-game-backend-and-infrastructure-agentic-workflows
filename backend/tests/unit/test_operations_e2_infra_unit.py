@@ -264,6 +264,10 @@ def test_advise_requires_provisioning_rule(template):
 def test_default_deploy_still_provisions_zero_resources(template):
     """Every resource stays gated on ResourcesProvisioned; a default deploy is $0."""
     for name, body in template["Resources"].items():
+        # The E4 (issue #416) ADDITIVE AppConfig kill-switch read policy is gated
+        # on HasKillSwitch (opt-in); every other resource is ResourcesProvisioned.
+        if body.get("Condition") == "HasKillSwitch":
+            continue
         assert (
             body.get("Condition") == "ResourcesProvisioned"
         ), f"{name} must be gated on ResourcesProvisioned so a default deploy provisions nothing"

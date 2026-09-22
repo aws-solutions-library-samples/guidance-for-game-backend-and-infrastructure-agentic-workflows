@@ -47,7 +47,7 @@ class _FakeControlService:
         self.calls: list[dict[str, Any]] = []
 
     def apply(self, *, request: dict[str, Any], principal: Any, current_document: Any = None) -> dict[str, Any]:
-        self.calls.append({"request": request, "principal": principal})
+        self.calls.append({"request": request, "principal": principal, "current_document": current_document})
         if self._error is not None:
             raise self._error
         return self._response
@@ -82,13 +82,28 @@ def _event(*, groups: str = "[admin]", client_id: str = "trusted-audience", body
     }
 
 
-def _handler(service: Any) -> ControlRequestHandler:
+class _FakeKillSwitchGate:
+    def __init__(self, document: dict[str, Any] | None = None, *, error: Exception | None = None) -> None:
+        self._document = document
+        self._error = error
+        self.calls = 0
+
+    def read_fresh_document(self) -> dict[str, Any]:
+        self.calls += 1
+        if self._error is not None:
+            raise self._error
+        assert self._document is not None
+        return self._document
+
+
+def _handler(service: Any, *, kill_switch_gate: Any = None) -> ControlRequestHandler:
     return ControlRequestHandler(
         control_service=service,
         tenant_id="tenant-1",
         workspace_id="ws-1",
         trusted_audience="trusted-audience",
         admin_group="admin",
+        kill_switch_gate=kill_switch_gate,
     )
 
 
@@ -103,6 +118,36 @@ def test_applied_returns_200() -> None:
     body = json.loads(response["body"])
     assert body["outcome"] == "applied"
     assert body["config_version"] == 2
+
+
+def test_fresh_current_document_is_passed_for_hard_down_classification() -> None:
+    current = _desired(True)
+    gate = _FakeKillSwitchGate(current)
+    service = _FakeControlService()
+    response = _handler(service, kill_switch_gate=gate).handle(
+        _event(
+            body={
+                "contract_version": "1.0",
+                "expected_config_version": 1,
+                "desired": {
+                    "operations_enabled": True,
+                    "capabilities": {CAPABILITY_ID: {"prepare": True, "dispatch": False, "execute": False}},
+                },
+            }
+        )
+    )
+    assert _status(response) == 200
+    assert gate.calls == 1
+    assert service.calls[0]["current_document"] == current
+
+
+def test_unavailable_current_document_does_not_block_safe_bootstrap_recovery() -> None:
+    gate = _FakeKillSwitchGate(error=RuntimeError("stale default"))
+    service = _FakeControlService()
+    response = _handler(service, kill_switch_gate=gate).handle(_event())
+    assert _status(response) == 200
+    assert gate.calls == 1
+    assert service.calls[0]["current_document"] is None
 
 
 def test_missing_authorizer_returns_401() -> None:

@@ -31,11 +31,7 @@ from botocore.exceptions import ClientError
 
 # Local modules
 from operations.contracts.control_plane import CAPABILITY_ID
-from operations.control.control_audit_store import (
-    ControlCommitOutcome,
-    ControlStoreError,
-    DynamoDbControlAuditStore,
-)
+from operations.control.control_audit_store import ControlCommitOutcome, ControlStoreError, DynamoDbControlAuditStore
 
 pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
@@ -224,6 +220,24 @@ def test_applied_commit_advances_version_and_writes_audit() -> None:
     assert audit_items
     for item in audit_items:
         assert "ttl" not in item
+
+
+def test_external_appconfig_reconciliation_is_atomic_and_already_published() -> None:
+    dynamo = _FakeDynamo()
+    store = _store(dynamo)
+    store.initialize_state_if_absent(config_version=2)
+    record_id = "ctl_" + "e" * 26
+    outcome = store.reconcile_external_control(
+        record_id=record_id,
+        actor=_actor(),
+        expected_config_version=2,
+        desired=_desired(False),
+        resulting_config_version=1_800_000_000,
+    )
+    assert outcome is ControlCommitOutcome.COMMITTED
+    assert store.current_config_version() == 1_800_000_000
+    assert len(_audit_items(dynamo)) == 1
+    assert store.pending_publication(record_id=record_id) is None
 
 
 def test_commit_is_a_single_atomic_transact_write() -> None:

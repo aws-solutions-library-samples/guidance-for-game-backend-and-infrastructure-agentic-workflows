@@ -113,6 +113,33 @@ Parameters:
       Defaults to the Cognito client id when left empty at enable time (the
       wrapper supplies it); an explicit value overrides.
 
+  # E4 (issue #416) ADDITIVE AppConfig kill-switch wiring. All default empty so a
+  # deploy that does not supply them behaves exactly as before: no extension
+  # layer is attached and no AppConfig IAM is granted. When supplied (by the E4
+  # control plane's outputs), the operations Lambda reads the deployment-wide
+  # kill-switch in-process via the official AppConfig extension.
+  AppConfigExtensionLayerArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Official AWS AppConfig Agent Lambda extension layer ARN (resolved to the
+      authoritative regional version by the E4 wrapper). Empty = no extension.
+
+  KillSwitchApplicationId:
+    Type: String
+    Default: ''
+    Description: E4 AppConfig application id for the kill-switch (empty = unwired).
+
+  KillSwitchEnvironmentId:
+    Type: String
+    Default: ''
+    Description: E4 AppConfig environment id for the kill-switch (empty = unwired).
+
+  KillSwitchProfileId:
+    Type: String
+    Default: ''
+    Description: E4 AppConfig configuration profile id for the kill-switch (empty = unwired).
+
   CodeS3Bucket:
     Type: String
     Default: ''
@@ -341,6 +368,13 @@ Conditions:
   IsProd: !Equals [!Ref Environment, prod]
   # An explicit trusted audience overrides the Cognito client id fallback.
   HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
+
+  # E4 additive wiring gates. The layer attaches only when its ARN is supplied;
+  # the AppConfig read IAM + identifier injection engage only when the
+  # kill-switch profile id is supplied. Both default off (empty), keeping the
+  # stack behaviourally identical to a pre-E4 deploy.
+  HasAppConfigLayer: !Not [!Equals [!Ref AppConfigExtensionLayerArn, '']]
+  HasKillSwitch: !Not [!Equals [!Ref KillSwitchProfileId, '']]
 
 Rules:
   # Reject the unsafe combination "observe without provisioning": the runtime
@@ -729,6 +763,29 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
+  # E4 (issue #416) ADDITIVE AppConfig kill-switch READ policy. Created ONLY when
+  # a kill-switch profile id is supplied (HasKillSwitch), so a pre-E4 deploy has
+  # no AppConfig authority at all. It grants EXACTLY the two data-plane read
+  # actions, scoped to the EXACT kill-switch configuration resource. No authoring
+  # or admin action, no wildcard.
+  ObservationKillSwitchReadPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasKillSwitch
+    Properties:
+      PolicyName: AppConfigKillSwitchRead
+      Roles:
+        - !Ref ObservationRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadKillSwitchConfigurationOnly
+            Effect: Allow
+            Action:
+              - 'appconfig:StartConfigurationSession'
+              - 'appconfig:GetLatestConfiguration'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${KillSwitchApplicationId}/environment/${KillSwitchEnvironmentId}/configuration/${KillSwitchProfileId}'
+
   # --------------------------------------------------------------------------- #
   # Lambda: request-scoped observation compute. Code is a real packaged artifact
   # loaded from S3 (built and uploaded by the deploy wrapper under a content-hash
@@ -774,6 +831,14 @@ Resources:
           GBAW_OPERATIONS_CAPACITY_FLOOR: !Ref CapacityFloor
           GBAW_OPERATIONS_CAPACITY_CEILING: !Ref CapacityCeiling
           GBAW_OPERATIONS_CAPACITY_MAX_STEP: !Ref CapacityMaxStep
+          # E4 additive kill-switch identifiers (empty when unwired).
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref KillSwitchApplicationId
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref KillSwitchEnvironmentId
+          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchProfileId
+      # E4 additive: attach the official AppConfig extension layer only when its
+      # ARN is supplied; otherwise no layer (AWS::NoValue).
+      Layers:
+        - !If [HasAppConfigLayer, !Ref AppConfigExtensionLayerArn, !Ref 'AWS::NoValue']
       Code:
         S3Bucket: !Ref CodeS3Bucket
         S3Key: !Ref CodeS3Key

@@ -61,6 +61,7 @@ class ControlRequestHandler:
         workspace_id: str,
         trusted_audience: str,
         admin_group: str,
+        kill_switch_gate: Any = None,
         metrics: Any = None,
     ) -> None:
         for name, value in (
@@ -76,6 +77,7 @@ class ControlRequestHandler:
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
         self._admin_group = admin_group
+        self._kill_switch_gate = kill_switch_gate
         # Optional, best-effort control metrics sink (issue #416). A boundary
         # denial (untrusted client / non-admin) is emitted here because it never
         # reaches the service.
@@ -104,7 +106,12 @@ class ControlRequestHandler:
         try:
             self._require_admin(principal)
             request = _parse_body(event)
-            response = self._control_service.apply(request=request, principal=principal)
+            current_document = self._read_current_document()
+            response = self._control_service.apply(
+                request=request,
+                principal=principal,
+                current_document=current_document,
+            )
         except _ControlDenied as exc:
             if exc.status == 403 and exc.error_code == "AUTHORIZATION_DENIED":
                 self._emit("control.denied")
@@ -117,6 +124,24 @@ class ControlRequestHandler:
 
         status = _OUTCOME_STATUS.get(response.get("outcome", ""), 200)
         return _json_response(status, response)
+
+    def _read_current_document(self) -> dict[str, Any] | None:
+        """Read the current fresh switch for deployment-strategy selection.
+
+        A stale/unavailable document must not prevent an admin from recovering
+        the default-safe bootstrap posture. The control service still enforces
+        the authenticated admin boundary and durable CAS; without a readable
+        baseline it treats only a fully disabled target as an immediate
+        hard-down and sends other changes through the gradual strategy.
+        """
+        gate = self._kill_switch_gate
+        if gate is None:
+            return None
+        try:
+            document = gate.read_fresh_document()
+        except Exception:  # noqa: BLE001 - recovery remains available while reads fail closed
+            return None
+        return document if isinstance(document, dict) else None
 
     # -- identity --------------------------------------------------------
 

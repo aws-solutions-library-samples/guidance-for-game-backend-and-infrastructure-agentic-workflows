@@ -1,0 +1,1328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL E4 operations control plane (issue #416), separate from the E1/E2
+  observation/advise stack and E3 execution stack. It creates a JSON-schema-
+  validated AWS AppConfig kill switch, gradual and immediate deployment
+  strategies, an admin control Lambda/API, expiry sweeper, and alarms. It is
+  default-unprovisioned ($0). ControlMode=disabled preserves resources while
+  throttling the API and making the Lambda fail closed. It reuses the E1/E2
+  table and KMS key, grants no provider write or PassRole, and lets the control
+  role read only its dedicated cursor-signing secret.
+
+# --------------------------------------------------------------------------- #
+# Parameters
+# --------------------------------------------------------------------------- #
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming.
+
+  Provisioned:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Initial-provisioning authority, SEPARATE from the runtime ControlMode kill
+      switch. "false" (the default) creates ZERO E4 resources, so a default new
+      stack costs $0 and holds nothing. "true" provisions the full E4 resource
+      set (AppConfig application/environment/profile/strategies/default version,
+      control Lambda/role, HTTP API, EventBridge expiry sweeper, alarms). Once
+      "true" it MUST stay "true" for the life of the stack: an emergency disable
+      flips ControlMode to "disabled" but keeps Provisioned="true" so every
+      resource stays under CloudFormation with stable names, and a later
+      re-enable is reversible. Setting it back to "false" REMOVES the resources
+      and is a teardown decision, not a disable.
+
+  ControlMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - enabled
+    Description: >-
+      Runtime authority (kill switch) for a PROVISIONED control plane, SEPARATE
+      from the Provisioned flag. "disabled" (the default) is fail-closed on TWO
+      independent levers: (1) the control API stage is throttled to zero so no
+      admin control write is accepted, and (2) GBAW_OPERATIONS_CONTROL_MODE=
+      disabled is injected into the control Lambda so an already-running
+      invocation fails closed before creating any hosted version or starting any
+      deployment. "enabled" is the only enabled mode. An emergency disable sets
+      this to "disabled" while leaving Provisioned="true" (resources and data
+      retained, reversible); it does NOT delete resources or data. This lever is
+      the control-plane API guard and is INDEPENDENT of the AppConfig kill-switch
+      document the control plane writes.
+
+  Environment:
+    Type: String
+    Default: beta
+    AllowedValues:
+      - beta
+      - prod
+    Description: >-
+      Target environment. Maps to the AppConfig Environment name and lengthens
+      the log-retention posture for audit data in prod. E4 keeps no data of its
+      own; it operates on the 06 table for audit records.
+
+  CognitoIssuer:
+    Type: String
+    Default: ''
+    Description: >-
+      JWT issuer URL bound to the control API authorizer (same Cognito user pool
+      issuer as the 06 operations API). Required when ControlMode=enabled.
+
+  CognitoClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      Cognito application client id used as the JWT audience on the control
+      route. Required when ControlMode=enabled.
+
+  OperationsTableName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the E1/E2 operations DynamoDB table (cross-stack reuse; the 06
+      stack exports it as its OperationsTableName output). E4 does not create a
+      table; it appends immutable control-audit records. Required when
+      Provisioned=true.
+
+  OperationsKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:\d{12}:key/.+$'
+    Description: >-
+      ARN of the E1/E2 operations customer-managed KMS key that encrypts the
+      operations table. The control Lambda uses it strictly on DynamoDB's behalf
+      (kms:ViaService pinned to DynamoDB). Required when Provisioned=true.
+
+  TenantId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$'
+    Description: >-
+      Server-side trusted tenant the runtime binds verified principals to
+      (GBAW_OPERATIONS_TENANT_ID). Must match the 06 stack's TenantId so the
+      control Lambda authorizes the same workspace scope. Required when
+      ControlMode=enabled.
+
+  WorkspaceId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$'
+    Description: >-
+      Server-side trusted workspace the runtime binds verified principals to
+      (GBAW_OPERATIONS_WORKSPACE_ID). Must match the 06 stack's WorkspaceId.
+      Required when ControlMode=enabled.
+
+  TrustedAudience:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted audience (Cognito app client id) the runtime enforces
+      (GBAW_OPERATIONS_TRUSTED_AUDIENCE). When empty it defaults to
+      CognitoClientId so the control Lambda's trusted audience matches the JWT
+      authorizer audience.
+
+  OperationsMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - observe
+      - advise
+      - remediate
+      - operate
+    Description: >-
+      The single backend-enforced ADR-0001 deployment ceiling
+      (GBAW_OPERATIONS_MODE), SEPARATE from the ControlMode API kill switch.
+      "disabled" (the default) keeps the deployment read-only. This is the same
+      ceiling the 06/07 stacks inject; the control plane reports it via capability
+      discovery. It is NEVER set to the control on/off lever value, so the global
+      operations mode is not repurposed.
+
+  AppConfigExtensionPort:
+    Type: Number
+    Default: 2772
+    MinValue: 1
+    MaxValue: 65535
+    Description: >-
+      Localhost TCP port the AWS AppConfig Agent Lambda extension listens on for
+      in-process kill-switch reads (GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT).
+      2772 is the official extension default; injected explicitly so the handler
+      and the extension agree.
+
+  CodeS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Explicit, pre-existing S3 bucket holding the packaged control Lambda
+      artifact. Supplied by the deploy wrapper. Required when Provisioned=true.
+
+  ControlCodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Content-hash-addressed S3 key of the packaged control artifact. Required
+      when Provisioned=true.
+
+  AppConfigExtensionLayerArn:
+    # The official AWS AppConfig Agent Lambda extension layer, resolved to the
+    # authoritative regional version by the deploy wrapper from the public SSM
+    # parameter /aws/service/aws-appconfig/lambda-extension/x86/latest. The
+    # AllowedPattern accepts ONLY the official layer ARN shape (layer name
+    # AWS-AppConfig-Extension* owned by the AppConfig service account) or the
+    # public SSM resolve reference, so an arbitrary or attacker-controlled layer
+    # cannot be injected.
+    Type: String
+    Default: '{{resolve:ssm:/aws/service/aws-appconfig/lambda-extension/x86/latest}}'
+    AllowedPattern: '^(\{\{resolve:ssm:/aws/service/aws-appconfig/lambda-extension/(x86|arm64)/latest\}\}|arn:aws[a-zA-Z-]*:lambda:[a-z0-9-]+:\d{12}:layer:AWS-AppConfig-Extension[A-Za-z0-9-]*:\d+)$'
+    Description: >-
+      ARN of the OFFICIAL AWS AppConfig Agent Lambda extension layer for this
+      Region, or the public SSM resolve reference that yields it. The deploy
+      wrapper reads the authoritative regional version from the public parameter
+      /aws/service/aws-appconfig/lambda-extension/x86/latest and passes it here.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 1024
+    Description: Memory for the control Lambda.
+
+  ControlTimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: Control Lambda timeout (bounded).
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Reserved concurrency cap on the control Lambda (denial-of-wallet guard).
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Control API burst limit when enabled (zero when disabled).
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Control API steady rate when enabled (zero when disabled).
+
+# --------------------------------------------------------------------------- #
+# Conditions
+# --------------------------------------------------------------------------- #
+Conditions:
+  # Resource existence gate. Every resource references THIS, driven by the
+  # Provisioned flag (default "false"), so a default deploy provisions nothing
+  # and costs $0. Deliberately DECOUPLED from ControlMode: an emergency disable
+  # sets ControlMode=disabled but keeps Provisioned="true", so resources stay
+  # under CloudFormation and a later re-enable is reversible.
+  ResourcesProvisioned: !Equals [!Ref Provisioned, 'true']
+
+  # Runtime authority (kill switch) for the control API. Does NOT gate resource
+  # existence; it feeds the injected GBAW_OPERATIONS_CONTROL_MODE (lever 2) and
+  # the API-stage throttle (lever 1). Only "enabled" is enabled.
+  ControlEnabled: !Equals [!Ref ControlMode, enabled]
+
+  IsProd: !Equals [!Ref Environment, prod]
+
+  # When TrustedAudience is left empty the control Lambda's trusted audience
+  # falls back to the JWT authorizer audience (CognitoClientId), so a single
+  # input drives both. An explicit value overrides it.
+  HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
+
+Rules:
+  # Reject "enabled without provisioning": runtime authority can only be enabled
+  # when the resources it needs actually exist.
+  EnabledModeRequiresProvisioning:
+    RuleCondition: !Not [!Equals [!Ref ControlMode, disabled]]
+    Assertions:
+      - Assert: !Equals [!Ref Provisioned, 'true']
+        AssertDescription: >-
+          ControlMode=enabled requires Provisioned=true; enabling control
+          authority against a zero-resource stack is rejected.
+
+  # Whenever resources exist, the cross-stack data-plane bindings and the code
+  # artifacts they reference must be non-empty.
+  ProvisionedRequiresInputs:
+    RuleCondition: !Equals [!Ref Provisioned, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OperationsTableName, '']]
+        AssertDescription: OperationsTableName is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref OperationsKmsKeyArn, '']]
+        AssertDescription: OperationsKmsKeyArn is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref CodeS3Bucket, '']]
+        AssertDescription: CodeS3Bucket is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref ControlCodeS3Key, '']]
+        AssertDescription: ControlCodeS3Key is required when Provisioned=true.
+
+  # Enabling the control API requires the JWT bindings and trusted scope.
+  EnabledRequiresBindings:
+    RuleCondition: !Equals [!Ref ControlMode, enabled]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoIssuer, '']]
+        AssertDescription: CognitoIssuer is required when ControlMode=enabled.
+      - Assert: !Not [!Equals [!Ref CognitoClientId, '']]
+        AssertDescription: CognitoClientId is required when ControlMode=enabled.
+      - Assert: !Not [!Equals [!Ref TenantId, '']]
+        AssertDescription: TenantId is required when ControlMode=enabled.
+      - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
+        AssertDescription: WorkspaceId is required when ControlMode=enabled.
+
+# --------------------------------------------------------------------------- #
+# Resources
+# --------------------------------------------------------------------------- #
+Resources:
+  # ------------------------------------------------------------------------- #
+  # AWS AppConfig application / environment / hosted configuration profile.
+  # The profile validates every hosted version against the EXACT self-contained
+  # operations-kill-switch JSON schema (inlined byte-for-byte from the frozen
+  # contract), so AppConfig itself rejects any document that is not a valid
+  # kill-switch.
+  # ------------------------------------------------------------------------- #
+  # ------------------------------------------------------------------------- #
+  # Cursor-signing secret. The read projections sign/verify their pagination
+  # cursors with an HMAC key. The key is GENERATED by CloudFormation (never
+  # authored, printed, or committed), stored encrypted at rest under a dedicated
+  # customer-managed KMS key, and delivered to the runtime ONLY as an ARN. The
+  # control/read/sweeper role gets EXACTLY secretsmanager:GetSecretValue on this
+  # one secret; the value never appears in template outputs or logs.
+  # ------------------------------------------------------------------------- #
+  CursorSigningKmsKey:
+    Type: AWS::KMS::Key
+    Condition: ResourcesProvisioned
+    Properties:
+      Description: !Sub 'CMK encrypting the ${ProjectName} operations cursor-signing secret.'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Account root retains administrative control of the key.
+          - Sid: EnableRootAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # The key may only be exercised for decrypt by principals in THIS
+          # account acting THROUGH Secrets Manager in this region (kms:ViaService
+          # + kms:CallerAccount). It does not name the control role ARN, which
+          # would create a KmsKey -> Role -> Secret -> KmsKey resource cycle; the
+          # role's own IAM policy grants the matching, ViaService-pinned decrypt.
+          - Sid: DecryptViaSecretsManagerOnly
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+                'kms:CallerAccount': !Ref 'AWS::AccountId'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: ManagedBy
+          Value: cloudformation
+
+  CursorSigningKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: ResourcesProvisioned
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-operations-cursor-signing'
+      TargetKeyId: !Ref CursorSigningKmsKey
+
+  CursorSigningSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-cursor-signing-key'
+      Description: >-
+        Generated HMAC key the E4 read projections sign pagination cursors with.
+        Generated by CloudFormation, encrypted with a dedicated CMK, delivered to
+        the runtime only by ARN. The value is never emitted to outputs or logs.
+      KmsKeyId: !Ref CursorSigningKmsKey
+      GenerateSecretString:
+        # A 64-char high-entropy key, well above the backend's 16-char floor. No
+        # punctuation so the raw string is a clean HMAC key.
+        PasswordLength: 64
+        ExcludePunctuation: true
+        RequireEachIncludedType: false
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ControlApplication:
+    Type: AWS::AppConfig::Application
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations'
+      Description: Deployment-wide operations control plane (E4 kill switch).
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # AppConfig auto-rollback monitor role: lets the AppConfig service read the
+  # CloudWatch alarms wired as the environment's Monitors so a gradual
+  # deployment rolls back automatically when an alarm breaches. It grants ONLY
+  # cloudwatch:DescribeAlarms and nothing else.
+  AppConfigMonitorRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-appconfig-monitor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appconfig.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: DescribeMonitorAlarms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeAlarmsForRollback
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:DescribeAlarms'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ControlEnvironmentResource:
+    Type: AWS::AppConfig::Environment
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref ControlApplication
+      Name: !Ref Environment
+      Description: !Sub 'Operations control-plane environment (${Environment}).'
+      # CloudWatch monitor + automatic rollback: a gradual deployment that
+      # breaches the KillSwitchUnavailable alarm during its bake window (the real
+      # backend-emitted signal that the deployed document cannot be read back as
+      # a fresh, valid kill-switch) is rolled back automatically by AppConfig.
+      Monitors:
+        - AlarmArn: !GetAtt KillSwitchUnavailableAlarm.Arn
+          AlarmRoleArn: !GetAtt AppConfigMonitorRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: ManagedBy
+          Value: cloudformation
+
+  KillSwitchConfigurationProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref ControlApplication
+      Name: !Sub '${ProjectName}-operations-kill-switch'
+      # Hosted (AWS AppConfig-managed) store; no external source. LocationUri
+      # "hosted" makes AppConfig own the document lifecycle.
+      LocationUri: hosted
+      Description: >-
+        The single deployment-wide operations kill-switch document, validated on
+        every hosted version by the exact self-contained operations-kill-switch
+        JSON schema.
+      Validators:
+        # The self-contained kill-switch JSON Schema, inlined byte-for-byte from
+        # backend/src/operations/contracts/schemas/v1/operations-kill-switch.schema.json.
+        # It has no external/urn $ref (every $ref is a local #/$defs fragment),
+        # so AppConfig validates it with no reference resolution.
+        - Type: JSON_SCHEMA
+          Content: |
+            {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "$id": "urn:game-agent:operations:contracts:v1:operations-kill-switch",
+              "title": "Operations Kill-Switch AppConfig Document 1.0",
+              "description": "The single deployment-wide operations kill-switch document. It is self-contained and usable directly as an AWS AppConfig JSON Schema validator: every $ref is a local #/$defs fragment (no external/urn reference to resolve), it is a closed object with no unknown fields, and it enumerates exactly the deployment-wide operations_enabled flag plus the single gamelift.capacity-adjustment capability's prepare/dispatch/execute phase booleans, an immutable monotonic config version, and issued_at/not_after freshness. Timestamps are the normalized UTC Z form so lexicographic order equals chronological order. It carries no identity, credential, policy, principal, or provider payload. The default safe document disables everything.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "contract_version",
+                "config_version",
+                "issued_at",
+                "not_after",
+                "operations_enabled",
+                "capabilities"
+              ],
+              "properties": {
+                "contract_version": {
+                  "$ref": "#/$defs/contract_version"
+                },
+                "config_version": {
+                  "description": "Immutable monotonic version of this kill-switch document. A consumer binds a control to an exact config_version so a stale write cannot silently re-enable a phase.",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "issued_at": {
+                  "$ref": "#/$defs/utc_timestamp"
+                },
+                "not_after": {
+                  "description": "Freshness horizon. A consumer treats the document as stale (and fails closed) once the current time is at or after not_after.",
+                  "$ref": "#/$defs/utc_timestamp"
+                },
+                "operations_enabled": {
+                  "description": "The deployment-wide master switch. When false, every capability and every phase is disabled regardless of the per-capability booleans.",
+                  "type": "boolean"
+                },
+                "capabilities": {
+                  "description": "Exactly the one supported capability. No unknown capability may appear.",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "gamelift.capacity-adjustment"
+                  ],
+                  "properties": {
+                    "gamelift.capacity-adjustment": {
+                      "$ref": "#/$defs/capability_phase_switches"
+                    }
+                  }
+                }
+              },
+              "$defs": {
+                "contract_version": {
+                  "description": "Inlined copy of the immutable common contract_version so this document validates directly under AWS AppConfig with no external reference. It is identical to urn:game-agent:operations:contracts:v1:common#/$defs/contract_version.",
+                  "type": "string",
+                  "const": "1.0"
+                },
+                "utc_timestamp": {
+                  "description": "A normalized UTC instant in RFC 3339 / ISO 8601 form with a literal uppercase 'Z' zone and optional fractional seconds: YYYY-MM-DDThh:mm:ss(.sss)Z. Requiring the Z form (never a numeric offset such as +00:00, never a naive local time) guarantees that lexicographic string order equals chronological order, so consumers cannot be tricked by an offset representation. This is a tightening of the common date-time timestamp for this AppConfig document.",
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
+                },
+                "capability_phase_switches": {
+                  "description": "The three ordered lifecycle phase booleans for the capability. Enabling a later phase requires the earlier phase to be enabled; that ordering invariant is enforced semantically, not structurally.",
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "prepare",
+                    "dispatch",
+                    "execute"
+                  ],
+                  "properties": {
+                    "prepare": {
+                      "type": "boolean"
+                    },
+                    "dispatch": {
+                      "type": "boolean"
+                    },
+                    "execute": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # The safe default document: everything disabled. This is the FIRST hosted
+  # version; the control plane creates later versions and deploys them. Its
+  # parsed JSON is field-for-field identical to
+  # backend/tests/fixtures/operations/v1/operations-kill-switch.default-safe.json
+  # EXCEPT the author-stamped issued_at/not_after timestamps (so the raw bytes
+  # differ): here they are a fixed safe already-expired pair so the seeded
+  # default fails closed until the control plane issues a fresh document.
+  DefaultSafeKillSwitchVersion:
+    Type: AWS::AppConfig::HostedConfigurationVersion
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref ControlApplication
+      ConfigurationProfileId: !Ref KillSwitchConfigurationProfile
+      ContentType: application/json
+      Description: Safe default kill-switch document (all disabled, fail-closed).
+      Content: |
+        {
+          "contract_version": "1.0",
+          "config_version": 1,
+          "issued_at": "1970-01-01T00:00:00Z",
+          "not_after": "1970-01-01T00:05:00Z",
+          "operations_enabled": false,
+          "capabilities": {
+            "gamelift.capacity-adjustment": {
+              "prepare": false,
+              "dispatch": false,
+              "execute": false
+            }
+          }
+        }
+
+  # Normal path: a GRADUAL deployment strategy with bake time and a CloudWatch
+  # monitor + automatic rollback (wired on the environment's Monitors). Used for
+  # ordinary enable/tighten changes.
+  GradualDeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-gradual'
+      Description: Normal gradual kill-switch rollout with bake time and monitor rollback.
+      DeploymentDurationInMinutes: 5
+      FinalBakeTimeInMinutes: 5
+      GrowthFactor: 25
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+
+  # Emergency path: an IMMEDIATE hard-down strategy. 100% instantly, no bake,
+  # for the "disable everything now" control action.
+  ImmediateDeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-immediate'
+      Description: Emergency immediate (hard-down) kill-switch rollout, no bake time.
+      DeploymentDurationInMinutes: 0
+      FinalBakeTimeInMinutes: 0
+      GrowthFactor: 100
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+
+  # ------------------------------------------------------------------------- #
+  # Log groups.
+  # ------------------------------------------------------------------------- #
+  ControlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-control'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  SweeperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-control-sweeper'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  ControlAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-operations-control-access'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  ControlAccessLogDeliveryResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: ResourcesProvisioned
+    Properties:
+      PolicyName: !Sub '${ProjectName}-operations-control-access-delivery'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowApiGatewayVendedLogDelivery",
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-control-access:*",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
+                "ArnLike": { "aws:SourceArn": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*" }
+              }
+            }
+          ]
+        }
+
+  # ------------------------------------------------------------------------- #
+  # Control Lambda role: the ONLY component that writes hosted versions and
+  # starts deployments, and only for the EXACT AppConfig resources. It may
+  # append bounded audit items to the operations table and read only its exact
+  # cursor-signing secret. NO provider write and NO PassRole.
+  # ------------------------------------------------------------------------- #
+  ControlRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-control-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AppConfigKillSwitchAuthoring
+          # May create hosted versions and start deployments ONLY for the exact
+          # E4 AppConfig application / environment / profile / strategies. No
+          # create/delete of the application, environment, profile, or strategy;
+          # no access to any other AppConfig application.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CreateHostedVersionForKillSwitchProfileOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:CreateHostedConfigurationVersion'
+                  - 'appconfig:GetHostedConfigurationVersion'
+                  - 'appconfig:ListHostedConfigurationVersions'
+                  - 'appconfig:GetConfigurationProfile'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/configurationprofile/${KillSwitchConfigurationProfile}'
+              - Sid: StartDeploymentToKillSwitchEnvironmentOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:StartDeployment'
+                  - 'appconfig:GetDeployment'
+                  - 'appconfig:ListDeployments'
+                  - 'appconfig:StopDeployment'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/environment/${ControlEnvironmentResource}'
+              - Sid: ReadDeployedKillSwitchConfigurationOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:StartConfigurationSession'
+                  - 'appconfig:GetLatestConfiguration'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/environment/${ControlEnvironmentResource}/configuration/${KillSwitchConfigurationProfile}'
+              - Sid: UseExactDeploymentStrategiesOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:GetDeploymentStrategy'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:deploymentstrategy/${GradualDeploymentStrategy}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:deploymentstrategy/${ImmediateDeploymentStrategy}'
+        - PolicyName: OperationsControlItemActions
+          # The control/read/sweeper role backs the E2 transaction UNDERLYING
+          # single-item actions (PutItem for the immutable, record_hash-bound
+          # control-audit item and the fenced lifecycle write; UpdateItem for the
+          # atomic conditional lifecycle transition), point reads (GetItem for
+          # compare-and-set), and the workspace-scoped catalog Query the read
+          # projections and the expiry sweeper enumerate with. It NEVER gets
+          # TransactWriteItems, Scan, DeleteItem, or any Batch action (denied by
+          # omission). Bounded to the exact table.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TableScopedItemActions
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OperationsTableName}'
+        - PolicyName: OperationsKmsViaDynamoDb
+          # Server-side encryption at rest with the operations CMK, pinned to
+          # DynamoDB via kms:ViaService so it can never be exercised for generic
+          # KMS use. CreateGrant is isolated and guarded by
+          # kms:GrantIsForAWSResource=true.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbCmkDataPlane
+                Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+              - Sid: DynamoDbCmkCreateGrant
+                Effect: Allow
+                Action:
+                  - 'kms:CreateGrant'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                  Bool:
+                    'kms:GrantIsForAWSResource': 'true'
+        - PolicyName: CursorSigningSecretReadOnly
+          # EXACTLY secretsmanager:GetSecretValue on the ONE cursor-signing
+          # secret. No List, Describe, Put, Delete, or any other secret ARN.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadCursorSigningSecretValueOnly
+                Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref CursorSigningSecret
+              - Sid: DecryptCursorSigningSecretViaSecretsManager
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !GetAtt CursorSigningKmsKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+        - PolicyName: OperationsLogsAndMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !GetAtt ControlLogGroup.Arn
+                  - !Sub '${ControlLogGroup.Arn}:*'
+                  - !GetAtt SweeperLogGroup.Arn
+                  - !Sub '${SweeperLogGroup.Arn}:*'
+              - Sid: PublishScopedMetrics
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GameAgent/Operations'
+              - Sid: XRayTraceWrite
+                Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ControlFunction:
+    Type: AWS::Lambda::Function
+    Condition: ResourcesProvisioned
+    DependsOn: ControlLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-control'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.control.control_entry.handler
+      Role: !GetAtt ControlRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref ControlTimeoutSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Layers:
+        # Official AppConfig Agent Lambda extension for low-latency in-process
+        # kill-switch reads (StartConfigurationSession/GetLatestConfiguration).
+        - !Ref AppConfigExtensionLayerArn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          # Lever 2: GBAW_OPERATIONS_CONTROL_MODE is fed the ControlMode kill
+          # switch (disabled|enabled), so an emergency disable makes the handler
+          # fail closed WITHOUT deleting the function. This is DISTINCT from the
+          # ADR-0001 deployment ceiling GBAW_OPERATIONS_MODE below.
+          GBAW_OPERATIONS_CONTROL_MODE: !Ref ControlMode
+          # The single backend-enforced deployment ceiling (never the control
+          # on/off lever value): capability discovery reports it truthfully.
+          GBAW_OPERATIONS_MODE: !Ref OperationsMode
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
+            - HasExplicitTrustedAudience
+            - !Ref TrustedAudience
+            - !Ref CognitoClientId
+          GBAW_OPERATIONS_APPROVER_GROUP: admin
+          # Whether the E4 capability is provisioned (capability discovery flag).
+          GBAW_OPERATIONS_CONTROL_PROVISIONED: !Ref Provisioned
+          # AppConfig identifiers the control plane and the extension read. The
+          # names match the backend contract exactly (no "_ID"/"_PROFILE_ID"
+          # suffix) so the handler resolves them.
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref ControlApplication
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref ControlEnvironmentResource
+          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchConfigurationProfile
+          GBAW_OPERATIONS_APPCONFIG_GRADUAL_STRATEGY_ID: !Ref GradualDeploymentStrategy
+          GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID: !Ref ImmediateDeploymentStrategy
+          # The localhost port the AppConfig Lambda extension serves on.
+          GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT: !Ref AppConfigExtensionPort
+          # The HMAC cursor-signing key is delivered as a Secrets Manager ARN;
+          # the handler reads the value with a scoped GetSecretValue. The secret
+          # VALUE never appears in this template, its outputs, or logs.
+          GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN: !Ref CursorSigningSecret
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref ControlCodeS3Key
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Distinct expiry-sweeper Lambda. It runs the SEPARATE sweeper entrypoint
+  # (operations.control.sweeper_entry.handler), reuses the least-privilege
+  # control role and the same packaged artifact, writes to its OWN log group,
+  # and is invoked only by the scheduled EventBridge rule. Keeping it a distinct
+  # function (not the control API handler) means the periodic sweep never shares
+  # the request-path handler and its bounded expiry-count metric is attributable.
+  # ------------------------------------------------------------------------- #
+  SweeperFunction:
+    Type: AWS::Lambda::Function
+    Condition: ResourcesProvisioned
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-control-sweeper'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.control.sweeper_entry.handler
+      Role: !GetAtt ControlRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref ControlTimeoutSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      LoggingConfig:
+        LogGroup: !Ref SweeperLogGroup
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          # The sweeper fails closed on the SAME two levers as the control fn.
+          GBAW_OPERATIONS_CONTROL_MODE: !Ref ControlMode
+          GBAW_OPERATIONS_MODE: !Ref OperationsMode
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
+            - HasExplicitTrustedAudience
+            - !Ref TrustedAudience
+            - !Ref CognitoClientId
+          GBAW_OPERATIONS_APPROVER_GROUP: admin
+          GBAW_OPERATIONS_CONTROL_PROVISIONED: !Ref Provisioned
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref ControlApplication
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref ControlEnvironmentResource
+          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchConfigurationProfile
+          GBAW_OPERATIONS_APPCONFIG_GRADUAL_STRATEGY_ID: !Ref GradualDeploymentStrategy
+          GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID: !Ref ImmediateDeploymentStrategy
+          GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT: !Ref AppConfigExtensionPort
+          GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN: !Ref CursorSigningSecret
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref ControlCodeS3Key
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-control-plane
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # HTTP API (JWT-authorized) exposing the frozen E4 control routes. Admin
+  # enforcement lives in control-Lambda handler code (E4 core suite).
+  # ------------------------------------------------------------------------- #
+  ControlApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-control'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+        AllowHeaders:
+          - authorization
+          - content-type
+        MaxAge: 300
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-control-plane
+        CostCenter: game-operations
+        ManagedBy: cloudformation
+
+  ControlJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-control-jwt'
+      ApiId: !Ref ControlApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Issuer: !Ref CognitoIssuer
+        Audience:
+          - !Ref CognitoClientId
+
+  ControlIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ControlFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 15000
+
+  # Frozen E4 routes (control_plane.ROUTE_KEYS). All JWT-authorized; admin
+  # enforcement is in handler code.
+  CapabilitiesRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      RouteKey: 'GET /operations/capabilities'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ControlJwtAuthorizer
+      Target: !Sub 'integrations/${ControlIntegration}'
+
+  OperationsListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      RouteKey: 'GET /operations'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ControlJwtAuthorizer
+      Target: !Sub 'integrations/${ControlIntegration}'
+
+  OperationDetailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      RouteKey: 'GET /operations/{operationId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ControlJwtAuthorizer
+      Target: !Sub 'integrations/${ControlIntegration}'
+
+  ControlRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      RouteKey: 'POST /operations/control'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ControlJwtAuthorizer
+      Target: !Sub 'integrations/${ControlIntegration}'
+
+  # The kill-switch STATUS read (config version + per-phase gates). The backend
+  # ControlPlaneRouter dispatches this exact frozen route (control_plane.ROUTE_KEYS
+  # 'kill_switch') ahead of the '/operations/{operationId}' detail catch-all, so
+  # it reaches the ControlFunction rather than being misrouted. JWT-authorized
+  # like every other control route; admin enforcement is in handler code.
+  KillSwitchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      RouteKey: 'GET /operations/control/kill-switch'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ControlJwtAuthorizer
+      Target: !Sub 'integrations/${ControlIntegration}'
+
+  # NOTE: there is also deliberately NO cancel route on THIS control API. Cancel
+  # ('POST /operations/{operationId}/cancel') is a frozen E2 approval-lifecycle
+  # route served by the 06 operations API (its E2 approval handler), not the E4
+  # control plane. It therefore remains on the E2 API; the frontend uses the 06
+  # stack's exported OperationsHttpApiEndpoint for cancel and this stack's
+  # exported OperationsControlApiEndpoint for the E4 control/read surfaces — two
+  # distinct backend base URLs.
+
+  ControlApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: ResourcesProvisioned
+    DependsOn:
+      - ControlAccessLogGroup
+      - ControlAccessLogDeliveryResourcePolicy
+    Properties:
+      ApiId: !Ref ControlApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        # Bare log-group ARN (no ":*") to match API Gateway's stored form and
+        # avoid perpetual drift (same lesson as the 06/07 stages).
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-control-access'
+        Format: >-
+          {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
+      DefaultRouteSettings:
+        # Lever 1: when ControlMode != enabled the gateway throttles to zero, so
+        # no new control write is accepted, WITHOUT deleting the stage.
+        ThrottlingBurstLimit: !If [ControlEnabled, !Ref ThrottlingBurstLimit, 0]
+        ThrottlingRateLimit: !If [ControlEnabled, !Ref ThrottlingRateLimit, 0]
+        DetailedMetricsEnabled: true
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-control-plane
+        ManagedBy: cloudformation
+
+  ControlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ResourcesProvisioned
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ControlFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ControlApi}/*/*'
+
+  # ------------------------------------------------------------------------- #
+  # Periodic EventBridge freshness-expiry sweeper. It re-issues (or re-deploys)
+  # the current kill-switch document before not_after so a fresh document is
+  # always present; if the control plane stops, the last document expires and
+  # consumers fail closed. The sweeper reuses the control Lambda code (a
+  # distinct entrypoint) via its own scheduled invocation.
+  # ------------------------------------------------------------------------- #
+  ExpirySweeperRule:
+    Type: AWS::Events::Rule
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-control-expiry-sweeper'
+      Description: >-
+        Periodic kill-switch freshness sweeper: re-issues the current document
+        before not_after so a live control plane keeps a fresh document and a
+        stopped one fails closed.
+      # A fixed 2-minute cadence is a safe default well inside the 5-minute
+      # default freshness horizon.
+      ScheduleExpression: 'rate(2 minutes)'
+      State: !If [ControlEnabled, ENABLED, DISABLED]
+      Targets:
+        - Id: control-sweeper
+          Arn: !GetAtt SweeperFunction.Arn
+          Input: '{"source":"expiry-sweeper","action":"refresh"}'
+
+  ExpirySweeperInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ResourcesProvisioned
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref SweeperFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ExpirySweeperRule.Arn
+
+  # ------------------------------------------------------------------------- #
+  # E4-OWNED ALARMS in the retained GameAgent/Operations namespace. There are
+  # exactly FIVE, each driven by a metric the backend ACTUALLY emits
+  # (control/metrics.py and execute/metrics.py at the E4 backend contract):
+  #   1. KillSwitchUnavailable                (fail-closed read failure)
+  #   2. ControlVersionConflict               (stale/racing control write)
+  #   3. ControlDenied                        (unauthorized control change)
+  #   4. OperationsExpirySweepExpired         (sweeper expired due operations)
+  #   5. ExecutionHumanReconciliationRequired (executed op needs a human)
+  #
+  # NOT every emitted metric is alarmed. Success/steady-state signals are emitted
+  # as DIAGNOSTIC metrics with NO alarm, because paging on a healthy event gives
+  # false comfort and alarm noise:
+  #   * ControlApplied              — a control change succeeded (diagnostic).
+  #   * ControlPublicationReconciled — a published control document was
+  #     reconciled against the intended posture (diagnostic; a success/no-op
+  #     confirmation, not an actionable failure). Its actionable failure siblings
+  #     ARE alarmed above: a read that fails closed raises KillSwitchUnavailable
+  #     and a rejected racing write raises ControlVersionConflict, so no separate
+  #     reconciliation alarm is warranted.
+  #
+  # There is likewise no emitted signal for a deployment "stuck", "retrying",
+  # "rollback-failed", or a "deployments-started" budget count, so those alarms
+  # are intentionally NOT provisioned rather than fabricated: an alarm on a
+  # never-emitted metric can never fire truthfully and would give false comfort.
+  # Coverage for failure/stuck/unverified conditions upstream of the control
+  # plane is provided by the REUSED E1 (06) and E3 (07) alarms; see the runbook
+  # alarm map in docs/OPERATIONS_E4_CONTROL_PLANE.md.
+  # ------------------------------------------------------------------------- #
+
+  # The real fail-closed signal: a deployed kill-switch document could not be
+  # read back as a fresh, valid document (extension unavailable/malformed/stale).
+  # Wired to the AppConfig environment monitor for automatic rollback.
+  KillSwitchUnavailableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-KillSwitchUnavailable'
+      AlarmDescription: >-
+        A phase failed closed because the kill-switch could not be read as a
+        fresh, valid document (extension unavailable/malformed/stale).
+      Namespace: 'GameAgent/Operations'
+      MetricName: KillSwitchUnavailable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # A compare-and-set conflict: a stale or racing control write was rejected.
+  ControlVersionConflictAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-ControlVersionConflict'
+      AlarmDescription: A control change hit a compare-and-set conflict (stale/racing write).
+      Namespace: 'GameAgent/Operations'
+      MetricName: ControlVersionConflict
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # A control change was denied on authority (non-admin / untrusted caller).
+  ControlDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-ControlDenied'
+      AlarmDescription: A kill-switch control change was denied on authority.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ControlDenied
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # Informational: the periodic sweep expired one or more due operations.
+  OperationsExpirySweepExpiredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-OperationsExpirySweepExpired'
+      AlarmDescription: >-
+        One or more operations were expired by a periodic sweep run
+        (informational; confirms the sweeper is expiring due operations).
+      Namespace: 'GameAgent/Operations'
+      MetricName: OperationsExpirySweepExpired
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # An executed operation needs human reconciliation — an operational concern
+  # the control plane surfaces even though the metric originates in the executor.
+  ExecutionHumanReconciliationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-ExecutionHumanReconciliationRequired'
+      AlarmDescription: An executed operation requires human reconciliation.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ExecutionHumanReconciliationRequired
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# --------------------------------------------------------------------------- #
+# Outputs
+# --------------------------------------------------------------------------- #
+Outputs:
+  Provisioned:
+    Description: Whether this stack provisioned the E4 resource set (false = $0).
+    Value: !Ref Provisioned
+
+  ControlMode:
+    Description: Effective runtime authority (disabled fails closed; enabled enabled).
+    Value: !Ref ControlMode
+
+  ControlApiEndpoint:
+    Condition: ResourcesProvisioned
+    Description: Base URL of the authenticated control HTTP API.
+    Value: !GetAtt ControlApi.ApiEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-OperationsControlApiEndpoint'
+
+  ControlApplicationId:
+    Condition: ResourcesProvisioned
+    Description: AppConfig application id for the operations control plane.
+    Value: !Ref ControlApplication
+    Export:
+      Name: !Sub '${ProjectName}-OperationsControlApplicationId'
+
+  ControlEnvironmentId:
+    Condition: ResourcesProvisioned
+    Description: AppConfig environment id for the operations control plane.
+    Value: !Ref ControlEnvironmentResource
+    Export:
+      Name: !Sub '${ProjectName}-OperationsControlEnvironmentId'
+
+  KillSwitchProfileId:
+    Condition: ResourcesProvisioned
+    Description: AppConfig configuration profile id for the kill-switch document.
+    Value: !Ref KillSwitchConfigurationProfile
+    Export:
+      Name: !Sub '${ProjectName}-OperationsKillSwitchProfileId'
+
+  ControlFunctionArn:
+    Condition: ResourcesProvisioned
+    Description: ARN of the control Lambda.
+    Value: !GetAtt ControlFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsControlFunctionArn'
+
+  ControlRoleArn:
+    Condition: ResourcesProvisioned
+    Description: Dedicated least-privilege control role ARN.
+    Value: !GetAtt ControlRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsControlRoleArn'

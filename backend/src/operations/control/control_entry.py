@@ -135,6 +135,7 @@ def _build_runtime() -> _ControlRuntime:
         workspace_id=obs.workspace_id,
         trusted_audience=obs.trusted_audience,
         admin_group=settings.admin_group,
+        kill_switch_gate=gate,
         metrics=metrics,
     )
     router = ControlPlaneRouter(read_handler=read_handler, control_handler=control_handler)

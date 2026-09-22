@@ -1,0 +1,103 @@
+{
+  "$comment": "Machine-checkable incremental cost model for the OPTIONAL E4 operations CONTROL PLANE (GitHub issue #416). This file is the single source of truth for the E4 incremental cost numbers in docs/operations-e4-cost-notes.md. backend/tests/unit/test_operations_e4_cost_model_unit.py recomputes every scenario total from the formulas below and asserts the published totals here match, so documentation cannot drift from the pricing inputs. backend/tests/unit/test_operations_e4_infra_unit.py additionally reconciles cw_alarms against the actual number of CloudWatch alarms in 08-operations-control-plane.yaml and cw_custom_metrics against the number of E4 control-plane metric names in backend/src/operations/control/metrics.py, so this cost model cannot drift from the deployed template or the emitting code. It does NOT assert any E4 infrastructure is deployed. E4 reuses the 06 DynamoDB table and CMK for audit records, so it adds NO incremental storage or KMS-key charge; the 06 cost model already accounts for those. All account ids/regions here are public-safe.",
+  "schema_version": "1.0",
+  "issue": 416,
+  "design": {
+    "stack": "infrastructure/cloudformation/08-operations-control-plane.yaml",
+    "control_shape": "AWS AppConfig kill-switch (application/environment/hosted profile/strategies) + control Lambda behind an HTTP API + EventBridge freshness sweeper",
+    "notes": "E4 introduces AWS AppConfig for a deployment-wide kill-switch document. AppConfig is billed per configuration retrieved (data-plane GetLatestConfiguration) and there is no charge for the application/environment/profile/strategy resources themselves. The AppConfig Lambda extension caches the document in-process, so consumers poll AppConfig on a bounded cadence rather than per request. The control Lambda and EventBridge sweeper are request/schedule-scoped and scale to zero when idle. No data store or KMS key is created by E4."
+  },
+  "alarms": {
+    "$comment": "The FIVE E4-owned CloudWatch alarms provisioned by 08-operations-control-plane.yaml, each on a metric the backend actually emits. cw_alarms below equals the length of this list, and the infra test asserts it equals the number of AWS::CloudWatch::Alarm resources in the template. Failure/stuck/unverified coverage upstream of the control plane is provided by the REUSED E1 (06) and E3 (07) alarms and is billed under those stacks, not double-counted here.",
+    "e4_owned": [
+      "KillSwitchUnavailable",
+      "ControlVersionConflict",
+      "ControlDenied",
+      "OperationsExpirySweepExpired",
+      "ExecutionHumanReconciliationRequired"
+    ]
+  },
+  "custom_metrics": {
+    "$comment": "The E4 control plane's own CloudWatch custom metrics, emitted by backend/src/operations/control/metrics.py. cw_custom_metrics below equals the length of this list, and the infra test asserts it equals the count of metric-name constants in that module. ExecutionHumanReconciliationRequired is emitted by the E3 executor (execute/metrics.py) and is billed under the E3 cost model, so it is NOT counted here even though E4 adds its alarm. ControlPublicationReconciled is a planned success/no-op diagnostic metric (no alarm); when the backend begins emitting it, add it to this list and bump cw_custom_metrics to keep the recompute honest.",
+    "e4_control_plane": [
+      "ControlApplied",
+      "ControlVersionConflict",
+      "ControlDenied",
+      "KillSwitchUnavailable",
+      "OperationsExpirySweepExpired"
+    ]
+  },
+  "pricing": {
+    "region": "us-west-2",
+    "currency": "USD",
+    "as_of": "2026-09-22",
+    "source": "AWS Price List, per-service us-west-2",
+    "sources": {
+      "appconfig": {
+        "human_url": "https://aws.amazon.com/systems-manager/pricing/",
+        "publication_date": "2026-09-19"
+      },
+      "lambda": {
+        "human_url": "https://aws.amazon.com/lambda/pricing/",
+        "publication_date": "2026-09-19"
+      },
+      "api_gateway": {
+        "human_url": "https://aws.amazon.com/api-gateway/pricing/",
+        "publication_date": "2026-09-11"
+      },
+      "eventbridge": {
+        "human_url": "https://aws.amazon.com/eventbridge/pricing/",
+        "publication_date": "2026-09-18"
+      },
+      "cloudwatch": {
+        "human_url": "https://aws.amazon.com/cloudwatch/pricing/",
+        "publication_date": "2026-09-18"
+      }
+    },
+    "rates": {
+      "appconfig_usd_per_config_received": 2e-07,
+      "appconfig_usd_per_config_received_million": 0.2,
+      "lambda_usd_per_request": 2e-07,
+      "lambda_usd_per_gb_second": 1.66667e-05,
+      "apigw_http_usd_per_million_requests": 1.0,
+      "eventbridge_usd_per_million_invocations": 0.0,
+      "cw_custom_metric_usd_per_metric_month": 0.3,
+      "cw_alarm_usd_per_alarm_month": 0.1
+    }
+  },
+  "assumptions": {
+    "default_unprovisioned": {
+      "$comment": "Provisioned=false: ZERO resources, $0. This is the default.",
+      "monthly_total_usd": 0.0
+    },
+    "enabled_idle": {
+      "$comment": "Provisioned=true, ControlMode=enabled, but no admin control actions taken. Steady-state cost is the five E4 control-plane custom metrics plus the five E4 alarms, plus the AppConfig config retrievals driven by the extension cache-refresh cadence across the E1/E2/E3 consumers and the freshness sweeper. No API requests, no control Lambda invocations beyond the sweeper. cw_custom_metrics equals len(custom_metrics.e4_control_plane) and cw_alarms equals len(alarms.e4_owned); both are reconciled to the template/code by the infra test.",
+      "cw_custom_metrics": 5,
+      "cw_alarms": 5,
+      "sweeper_invocations_per_month": 21600,
+      "sweeper_gb_seconds_per_invocation": 0.05,
+      "appconfig_retrievals_per_month": 216000
+    },
+    "per_control_action": {
+      "$comment": "One admin control action: one control API request, one control Lambda invocation, one AppConfig hosted version + one deployment (the deployment itself is not separately metered; only config retrievals are). Cost is dominated by fixed idle; a single action is fractions of a cent.",
+      "apigw_requests": 1,
+      "lambda_invocations": 1,
+      "lambda_gb_seconds": 0.06
+    },
+    "representative_load": {
+      "$comment": "A busy month of manual control actions.",
+      "control_actions_per_month": 200
+    }
+  },
+  "scenarios": {
+    "default_unprovisioned": {
+      "monthly_total_usd": 0.0
+    },
+    "enabled_idle": {
+      "monthly_total_usd": 2.07
+    },
+    "representative": {
+      "monthly_total_usd": 2.07
+    }
+  }
+}

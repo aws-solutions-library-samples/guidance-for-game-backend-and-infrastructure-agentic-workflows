@@ -48,16 +48,75 @@ def _document(*, enabled: bool, prepare: bool, dispatch: bool, execute: bool, ve
     }
 
 
+class _FakeBody:
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+
+    def read(self) -> bytes:
+        return self._content
+
+
 class _FakeAppConfig:
     def __init__(self) -> None:
         self.created: list[dict[str, Any]] = []
         self.deployments: list[dict[str, Any]] = []
 
+    def list_hosted_configuration_versions(self, **kwargs: Any) -> dict[str, Any]:
+        label = kwargs.get("VersionLabel")
+        items = [
+            {
+                "VersionNumber": index,
+                "VersionLabel": created.get("VersionLabel"),
+                "ContentType": created["ContentType"],
+            }
+            for index, created in enumerate(self.created, start=1)
+            if label is None or created.get("VersionLabel") == label
+        ]
+        return {"Items": items}
+
+    def get_hosted_configuration_version(self, **kwargs: Any) -> dict[str, Any]:
+        version = int(kwargs["VersionNumber"])
+        created = self.created[version - 1]
+        return {"Content": _FakeBody(created["Content"]), "VersionLabel": created.get("VersionLabel")}
+
     def create_hosted_configuration_version(self, **kwargs: Any) -> dict[str, Any]:
+        latest = kwargs.get("LatestVersionNumber")
+        if latest is not None and latest != len(self.created):
+            raise RuntimeError("hosted version conflict")
+        if any(item.get("VersionLabel") == kwargs.get("VersionLabel") for item in self.created):
+            raise RuntimeError("duplicate version label")
         self.created.append(kwargs)
-        return {"VersionNumber": len(self.created)}
+        return {"VersionNumber": len(self.created), "VersionLabel": kwargs.get("VersionLabel")}
+
+    def list_deployments(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "Items": [
+                {
+                    "DeploymentNumber": index,
+                    "ConfigurationProfileId": item["ConfigurationProfileId"],
+                    "ConfigurationVersion": item["ConfigurationVersion"],
+                    "VersionLabel": item["ConfigurationVersion"],
+                    "State": "COMPLETE",
+                }
+                for index, item in reversed(list(enumerate(self.deployments, start=1)))
+            ]
+        }
+
+    def get_deployment(self, **kwargs: Any) -> dict[str, Any]:
+        item = self.deployments[int(kwargs["DeploymentNumber"]) - 1]
+        return {
+            "DeploymentNumber": int(kwargs["DeploymentNumber"]),
+            "ConfigurationProfileId": item["ConfigurationProfileId"],
+            "ConfigurationVersion": item["ConfigurationVersion"],
+            "VersionLabel": item["ConfigurationVersion"],
+            "DeploymentStrategyId": item["DeploymentStrategyId"],
+            "State": "COMPLETE",
+        }
 
     def start_deployment(self, **kwargs: Any) -> dict[str, Any]:
+        latest = kwargs.get("LatestDeploymentNumber")
+        if latest is not None and latest != len(self.deployments):
+            raise RuntimeError("deployment conflict")
         self.deployments.append(kwargs)
         return {"DeploymentNumber": len(self.deployments)}
 
@@ -123,3 +182,61 @@ def test_provider_failure_raises_publisher_error() -> None:
     publisher = _publisher(client)
     with pytest.raises(PublisherError):
         publisher.publish(document=_document(enabled=True, prepare=True, dispatch=True, execute=True), hard_down=False)
+
+
+def test_repeated_publish_reuses_one_hosted_version_and_one_deployment() -> None:
+    client = _FakeAppConfig()
+    publisher = _publisher(client)
+    document = _document(enabled=True, prepare=True, dispatch=True, execute=False, version=17)
+    publisher.publish(document=document, hard_down=False)
+    publisher.publish(document=document, hard_down=False)
+    assert len(client.created) == 1
+    assert client.created[0]["VersionLabel"] == "gbaw-control-v17"
+    assert len(client.deployments) == 1
+
+
+def test_lost_create_response_reconciles_by_deterministic_label() -> None:
+    client = _FakeAppConfig()
+    original = client.create_hosted_configuration_version
+    lost_once = True
+
+    def lose_response(**kwargs: Any) -> dict[str, Any]:
+        nonlocal lost_once
+        response = original(**kwargs)
+        if lost_once:
+            lost_once = False
+            raise RuntimeError("response lost after create")
+        return response
+
+    client.create_hosted_configuration_version = lose_response  # type: ignore[assignment]
+    publisher = _publisher(client)
+    publisher.publish(
+        document=_document(enabled=True, prepare=True, dispatch=False, execute=False, version=18),
+        hard_down=False,
+    )
+    assert len(client.created) == 1
+    assert len(client.deployments) == 1
+
+
+def test_lost_start_response_reconciles_without_second_deployment() -> None:
+    client = _FakeAppConfig()
+    original = client.start_deployment
+    lost_once = True
+
+    def lose_response(**kwargs: Any) -> dict[str, Any]:
+        nonlocal lost_once
+        response = original(**kwargs)
+        if lost_once:
+            lost_once = False
+            raise RuntimeError("response lost after start")
+        return response
+
+    client.start_deployment = lose_response  # type: ignore[assignment]
+    publisher = _publisher(client)
+    publisher.publish(
+        document=_document(enabled=False, prepare=False, dispatch=False, execute=False, version=19),
+        hard_down=True,
+    )
+    assert len(client.created) == 1
+    assert len(client.deployments) == 1
+    assert client.deployments[0]["DeploymentStrategyId"] == "strategy-immediate"

@@ -323,6 +323,86 @@ class DynamoDbControlAuditStore:
 
         return ControlCommitOutcome.COMMITTED
 
+    def reconcile_external_control(
+        self,
+        *,
+        record_id: str,
+        actor: Mapping[str, str],
+        expected_config_version: int,
+        desired: Mapping[str, Any],
+        resulting_config_version: int,
+    ) -> ControlCommitOutcome:
+        """Atomically adopt an already-published break-glass document.
+
+        The direct emergency scripts remain usable when the control API is
+        unhealthy. Their provider action is recorded by CloudTrail/AppConfig.
+        This transaction binds that live posture into the same durable CAS and
+        hash-bound audit stream before a later API change may advance it. The
+        publication marker is committed as already confirmed because this path
+        reconciles a document read from the live AppConfig data plane.
+        """
+        self.record_control_intent(record_id=record_id, actor=actor, desired=desired)
+        audit_record = self._build_audit_record(
+            record_id=record_id,
+            actor=actor,
+            expected_config_version=expected_config_version,
+            resulting_config_version=resulting_config_version,
+            desired=desired,
+            outcome="applied",
+        )
+        state_update = {
+            "Update": {
+                "TableName": self._table_name,
+                "Key": _marshal({"PK": _CONTROL_PK, "SK": _STATE_SK}),
+                "UpdateExpression": "SET config_version = :new_version",
+                "ConditionExpression": "attribute_exists(PK) AND config_version = :expected",
+                "ExpressionAttributeValues": _marshal(
+                    {":new_version": int(resulting_config_version), ":expected": int(expected_config_version)}
+                ),
+            }
+        }
+        audit_put = {
+            "Put": {
+                "TableName": self._table_name,
+                "Item": _marshal(
+                    {
+                        "PK": _CONTROL_PK,
+                        "SK": f"{_OUTCOME_SK_PREFIX}{record_id}",
+                        "record_type": _AUDIT_RECORD_TYPE,
+                        "contract_version": CONTROL_CONTRACT_VERSION,
+                        "record_id": record_id,
+                        "audit_json": _canonical_json(audit_record),
+                    }
+                ),
+                "ConditionExpression": "attribute_not_exists(SK)",
+            }
+        }
+        publication_put = {
+            "Put": {
+                "TableName": self._table_name,
+                "Item": _marshal(
+                    {
+                        "PK": _CONTROL_PK,
+                        "SK": f"{_PUBLICATION_SK_PREFIX}{record_id}",
+                        "record_type": _PUBLICATION_RECORD_TYPE,
+                        "contract_version": CONTROL_CONTRACT_VERSION,
+                        "record_id": record_id,
+                        "config_version": int(resulting_config_version),
+                        "published": True,
+                    }
+                ),
+                "ConditionExpression": "attribute_not_exists(SK)",
+            }
+        }
+        try:
+            self._client.transact_write_items(TransactItems=[state_update, audit_put, publication_put])
+        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
+            if _is_conditional_failure(exc):
+                return ControlCommitOutcome.VERSION_CONFLICT
+            _LOGGER.error("external control reconciliation failed and is retryable")
+            raise ControlStoreError("external control reconciliation failed") from exc
+        return ControlCommitOutcome.COMMITTED
+
     # -- internals -------------------------------------------------------
 
     def _build_audit_record(

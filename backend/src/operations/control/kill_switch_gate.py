@@ -154,7 +154,7 @@ class KillSwitchGate:
 
     def evaluate(self) -> KillSwitchDecision:
         """Read the extension fresh and return an immutable decision, or fail closed."""
-        document = self._load_fresh_document()
+        document = self.read_fresh_document()
         switches = document["capabilities"][self._capability_id]
         return KillSwitchDecision(
             operations_enabled=bool(document["operations_enabled"]),
@@ -162,6 +162,17 @@ class KillSwitchGate:
             _phase_document_flags={phase: bool(switches[phase]) for phase in CONTROL_PHASES},
             _static_authority=self._static_authority,
         )
+
+    def read_fresh_document(self) -> dict[str, Any]:
+        """Return the freshly fetched, validated document.
+
+        The admin control handler uses this only to classify reductions as
+        immediate hard-downs. An unavailable or stale document still raises
+        :class:`KillSwitchUnavailable`; the handler may then continue with the
+        bootstrap recovery path, whose CAS and admin authorization remain
+        independent of this advisory comparison.
+        """
+        return self._load_fresh_document()
 
     def require_phase(self, phase: str) -> KillSwitchDecision:
         """Evaluate and return the decision, or raise :class:`PhaseDenied`.

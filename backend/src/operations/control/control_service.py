@@ -61,6 +61,7 @@ from operations.contracts.control_plane import (
 from operations.control.control_audit_store import ControlCommitOutcome, ControlStoreError
 
 _ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+_DEFAULT_SAFE_CONFIG_VERSION = 1
 
 
 class ControlServiceError(RuntimeError):
@@ -74,7 +75,19 @@ class ControlServiceError(RuntimeError):
 class AuditStorePort(Protocol):
     """CAS control-state + immutable audit store port."""
 
+    def initialize_state_if_absent(self, *, config_version: int) -> None: ...
+
     def current_config_version(self) -> int | None: ...
+
+    def reconcile_external_control(
+        self,
+        *,
+        record_id: str,
+        actor: dict[str, str],
+        expected_config_version: int,
+        desired: dict[str, Any],
+        resulting_config_version: int,
+    ) -> ControlCommitOutcome: ...
 
     def commit_control_decision(
         self,
@@ -148,16 +161,41 @@ class KillSwitchControlService:
         desired = self._validated_desired(request)
         expected_config_version = int(request["expected_config_version"])
 
-        current_version = self._audit_store.current_config_version()
-        resulting_version = expected_config_version + 1
-
-        hard_down = _is_hard_down(desired, current_document)
-        document = self._build_document(desired, resulting_version)
-
         actor = {
             "subject_id": getattr(principal, "subject_id", ""),
             "client_id": getattr(principal, "client_id", ""),
         }
+        current_version = self._audit_store.current_config_version()
+        if current_version is None:
+            # The CloudFormation seed is version 1 and intentionally stale/all-
+            # disabled. Initialize its matching durable CAS state lazily on the
+            # first authenticated admin recovery request. Never trust an
+            # arbitrary caller-supplied version as the bootstrap anchor.
+            if expected_config_version != _DEFAULT_SAFE_CONFIG_VERSION:
+                self._emit("control.version_conflict")
+                return self._response(
+                    outcome="version_conflict",
+                    config_version=_DEFAULT_SAFE_CONFIG_VERSION,
+                    reason_code="VERSION_CONFLICT",
+                )
+            try:
+                self._audit_store.initialize_state_if_absent(config_version=_DEFAULT_SAFE_CONFIG_VERSION)
+                current_version = self._audit_store.current_config_version()
+            except ControlStoreError as exc:
+                raise ControlServiceError("CONTROL_UNAVAILABLE", "control state could not be initialized") from exc
+            if not isinstance(current_version, int):
+                raise ControlServiceError("CONTROL_UNAVAILABLE", "control state could not be initialized")
+
+        if current_document is not None:
+            current_version = self._reconcile_external_document(
+                current_document=current_document,
+                stored_version=current_version,
+                actor=actor,
+            )
+
+        resulting_version = expected_config_version + 1
+        hard_down = _is_hard_down(desired, current_document)
+        document = self._build_document(desired, resulting_version)
         record_id = self._record_id(expected_config_version, desired, actor)
 
         try:
@@ -216,6 +254,54 @@ class KillSwitchControlService:
             reason_code="APPLIED",
             effective=document,
         )
+
+    def _reconcile_external_document(
+        self,
+        *,
+        current_document: dict[str, Any],
+        stored_version: int,
+        actor: dict[str, str],
+    ) -> int:
+        """Atomically adopt a newer direct AppConfig hard-down into CAS state.
+
+        Emergency scripts intentionally bypass the control API so they still
+        work when that API is unhealthy. CloudTrail and AppConfig deployment
+        history record the break-glass action. On the next authenticated admin
+        request, this method records the already-live posture in the control
+        audit ledger and advances the durable version in one transaction before
+        any re-enable can be committed.
+        """
+        try:
+            validate_control_contract(KILL_SWITCH_SCHEMA_NAME, current_document)
+            live_version = int(current_document["config_version"])
+        except (ControlContractError, KeyError, TypeError, ValueError) as exc:
+            raise ControlServiceError("CONTROL_UNAVAILABLE", "current kill-switch document is invalid") from exc
+        if live_version <= stored_version:
+            return stored_version
+
+        live_desired = {
+            "operations_enabled": bool(current_document["operations_enabled"]),
+            "capabilities": {
+                CAPABILITY_ID: {
+                    phase: bool(current_document["capabilities"][CAPABILITY_ID][phase]) for phase in CONTROL_PHASES
+                }
+            },
+        }
+        record_id = self._external_record_id(stored_version, live_desired, live_version, actor)
+        try:
+            outcome = self._audit_store.reconcile_external_control(
+                record_id=record_id,
+                actor=actor,
+                expected_config_version=stored_version,
+                desired=live_desired,
+                resulting_config_version=live_version,
+            )
+        except ControlStoreError as exc:
+            raise ControlServiceError("CONTROL_UNAVAILABLE", "external control state could not be recorded") from exc
+        if outcome is ControlCommitOutcome.COMMITTED:
+            return live_version
+        refreshed = self._audit_store.current_config_version()
+        return refreshed if isinstance(refreshed, int) else stored_version
 
     def _reconcile_pending_publication(
         self, *, record_id: str, desired: dict[str, Any], hard_down: bool
@@ -308,6 +394,27 @@ class KillSwitchControlService:
         except ControlContractError as exc:  # pragma: no cover - server-owned output
             raise ControlServiceError("CONTRACT_OUTPUT_INVALID", "built kill-switch document is invalid") from exc
         return document
+
+    def _external_record_id(
+        self,
+        previous_config_version: int,
+        desired: dict[str, Any],
+        resulting_config_version: int,
+        actor: dict[str, str],
+    ) -> str:
+        fingerprint = json.dumps(
+            {
+                "kind": "external-appconfig-reconciliation",
+                "previous_config_version": previous_config_version,
+                "resulting_config_version": resulting_config_version,
+                "desired": desired,
+                "actor": actor,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
+        return f"ctl_{_hex_to_id_body(digest)}"
 
     def _record_id(self, expected_config_version: int, desired: dict[str, Any], actor: dict[str, str]) -> str:
         fingerprint = json.dumps(
