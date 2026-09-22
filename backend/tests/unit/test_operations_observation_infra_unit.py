@@ -57,9 +57,11 @@ from _combined_tree import (
     HANDLER_DOTTED,
     HANDLER_IMPORT,
     HANDLER_REL,
+    STORE_MODULE_REL,
     materialize_combined_operations_tree,
     module_defines_top_level_handler,
     observe_placeholder_seam_hits,
+    resolve_deployed_store_src,
 )
 
 # Local modules
@@ -666,19 +668,21 @@ _DIRECT_CALL_TO_UNDERLYING_ACTION = {
 }
 
 
-# The store-drive derivation runs in a subprocess with the sibling core
-# worktree's ``backend/src`` FIRST on PYTHONPATH. The deployed E1 store
-# (operations.observation_store.DynamoDbObservationStore) and its whole
-# dependency subtree (operations.observation, operations.contracts.*,
-# operations.settings, operations.identity, operations.validation.*) live in the
-# core worktree, and other tests in this suite import the *infra* worktree's
-# ``operations`` package first -- binding it in ``sys.modules`` to the infra src.
-# A subprocess with a clean interpreter is the faithful, order-independent way to
-# import and drive the real deployed module tree with no cross-worktree module
-# mixing. It drives the store through begin, a conditional replay/get, a stale-
-# lease reclaim (Update+Put), complete (Put+Update), fail (Update+Put), and
-# status (Get) with a leg-capturing fake that raises real botocore ``ClientError``
-# shapes, then prints the derived {leg types, direct calls} as JSON.
+# The store-drive derivation runs in a subprocess with the deployed store's
+# ``backend/src`` FIRST on PYTHONPATH. The store src is resolved for the current
+# checkout (see ``resolve_deployed_store_src``): this branch's own ``backend/src``
+# ships the E1 store (operations.observation_store.DynamoDbObservationStore) and
+# its whole dependency subtree (operations.observation, operations.contracts.*,
+# operations.settings, operations.identity, operations.validation.*), so a normal
+# single combined checkout / CI resolves it with no sibling directories; a sibling
+# core worktree is only a fallback. Other tests in this suite import the
+# ``operations`` package in-process first -- binding it in ``sys.modules`` -- so a
+# subprocess with a clean interpreter is the faithful, order-independent way to
+# import and drive the real deployed module tree with no module mixing. It drives
+# the store through begin, a conditional replay/get, a stale-lease reclaim
+# (Update+Put), complete (Put+Update), fail (Update+Put), and status (Get) with a
+# leg-capturing fake that raises real botocore ``ClientError`` shapes, then prints
+# the derived {leg types, direct calls} as JSON.
 _STORE_DRIVE_SCRIPT = r"""
 import datetime as dt
 import json
@@ -895,29 +899,45 @@ def _underlying_actions_the_store_actually_requires():
     """Drive the *real deployed* E1 store through its full lifecycle and derive
     the exact underlying DynamoDB IAM action set it requires.
 
-    Runs :data:`_STORE_DRIVE_SCRIPT` in a subprocess with the sibling core
-    worktree's ``backend/src`` first on ``PYTHONPATH`` so
-    ``operations.observation_store.DynamoDbObservationStore`` -- the module the
-    CloudFormation Lambda ``Handler`` actually loads -- and its whole dependency
-    subtree import cleanly from core regardless of suite import order. The script
+    Resolves the deployed store's ``backend/src`` for the *current* checkout
+    (:func:`resolve_deployed_store_src` -- this branch's own ``backend/src``
+    first, a sibling core worktree only as fallback) and runs
+    :data:`_STORE_DRIVE_SCRIPT` in a subprocess with that src first on
+    ``PYTHONPATH`` so ``operations.observation_store.DynamoDbObservationStore``
+    -- the module the CloudFormation Lambda ``Handler`` actually loads -- and its
+    whole dependency subtree import cleanly regardless of suite import order and
+    without depending on any sibling worktree. The script
     drives begin (fresh create), a conditional-replay begin resolving a stored
     *succeeded* operation, a stale-lease *reclaim* begin, complete, fail, and
     load_status, capturing every ``TransactWriteItems`` leg type and every direct
     ``get_item`` read. Each transaction leg is mapped to its underlying item
     action and each read to ``dynamodb:GetItem``, so the required set is derived
     from observed store behavior. The E0 persistence sink is never imported."""
+    return _derive_required_actions_from_store_src(resolve_deployed_store_src(PROJECT_ROOT))
+
+
+def _derive_required_actions_from_store_src(store_src):
+    """Drive the store found under ``store_src`` (a ``backend/src`` directory) and
+    return the underlying DynamoDB IAM action set its behavior requires.
+
+    ``store_src`` is put FIRST on the subprocess ``PYTHONPATH`` so the clean
+    interpreter imports the deployed ``operations`` package tree from exactly
+    that checkout, with no dependence on suite import order or on any sibling
+    worktree. A missing store is a hard failure, so the guard can never pass
+    vacuously by silently importing nothing."""
     # Standard library
     import os
     import subprocess
     import sys
 
-    core_src = PROJECT_ROOT.parent / "issue-413-core" / "backend" / "src"
-    assert (
-        core_src / "operations" / "observation_store.py"
-    ).is_file(), f"deployed E1 store not found at {core_src}/operations/observation_store.py"
+    assert store_src is not None, (
+        "deployed E1 store not found: no backend/src carrying "
+        f"{STORE_MODULE_REL} in this checkout or a sibling core worktree"
+    )
+    assert (store_src / STORE_MODULE_REL).is_file(), f"deployed E1 store not found at {store_src}/{STORE_MODULE_REL}"
 
     env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join([str(core_src), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    env["PYTHONPATH"] = os.pathsep.join([str(store_src), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
     proc = subprocess.run(
         [sys.executable, "-c", _STORE_DRIVE_SCRIPT],
         capture_output=True,
@@ -973,6 +993,74 @@ def test_iam_grants_exactly_the_underlying_actions_the_store_transacts(template)
         "dynamodb:TransactWriteItems is not a valid IAM action (cfn-lint W3037); "
         "transactional legs are governed by the underlying item actions"
     )
+
+
+def test_store_src_resolves_to_the_current_checkout_without_any_sibling():
+    """The deployed store must resolve from *this* checkout's own ``backend/src``.
+
+    Regression guard for the removed hardcoded sibling-worktree dependency: this
+    branch already ships the deployed E1 store under its own ``backend/src`` (from
+    the E1 base), so :func:`resolve_deployed_store_src` must return that path.
+    In a normal single combined checkout / CI there is no sibling ``issue-413-core``
+    directory, and the drift guard must still find the store to drive."""
+    resolved = resolve_deployed_store_src(PROJECT_ROOT)
+    assert resolved is not None, "store src did not resolve from the current checkout"
+    assert (
+        resolved == PROJECT_ROOT / "backend" / "src"
+    ), f"store src must resolve to this checkout's backend/src, got {resolved}"
+    assert (resolved / STORE_MODULE_REL).is_file(), f"resolved store src {resolved} does not carry {STORE_MODULE_REL}"
+
+
+def test_drift_guard_runs_non_vacuously_in_an_isolated_single_checkout(tmp_path):
+    """Prove the drift guard still derives the real action set with NO siblings.
+
+    This copies the current checkout's ``backend/src`` (the repo alone) into an
+    isolated temp root that has *no* sibling ``issue-413-core`` directory next to
+    it -- the shape of a normal single combined checkout / CI -- then drives the
+    real deployed store from there. The derivation must run non-vacuously and
+    return exactly the underlying action set the store's real transaction legs
+    and reads require, proving the guard does not depend on any sibling worktree
+    and does not silently pass by importing nothing."""
+    # Standard library
+    import shutil
+
+    # Materialize the repo alone under an isolated root: <iso>/repo/backend/src,
+    # so <iso>/repo has no sibling worktree beside it.
+    isolated_repo = tmp_path / "repo"
+    src_dst = isolated_repo / "backend" / "src"
+    src_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(PROJECT_ROOT / "backend" / "src", src_dst)
+
+    # Sanity: the isolated root has no sibling issue-413-core to fall back to.
+    assert not (
+        isolated_repo.parent / "issue-413-core"
+    ).exists(), "isolated root must have no sibling core worktree for a faithful single-checkout probe"
+
+    resolved = resolve_deployed_store_src(isolated_repo)
+    assert resolved == src_dst, f"isolated resolution must pick the copied src, got {resolved}"
+
+    required = _derive_required_actions_from_store_src(resolved)
+    # Non-vacuous: the store's real begin/complete/fail/reclaim/status lifecycle
+    # yields exactly conditional Puts, fenced Updates, and consistent GetItem reads.
+    assert required == {
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:GetItem",
+    }, f"drift guard derived an unexpected action set in isolation: {sorted(required)}"
+
+
+def test_drift_guard_fails_loudly_when_no_store_is_present(tmp_path):
+    """The guard must never pass vacuously when the deployed store is absent.
+
+    If neither the current checkout nor any sibling carries the store,
+    :func:`resolve_deployed_store_src` returns ``None`` and the derivation must
+    raise rather than silently succeed with an empty action set."""
+    empty_repo = tmp_path / "empty"
+    (empty_repo / "backend" / "src").mkdir(parents=True, exist_ok=True)
+
+    assert resolve_deployed_store_src(empty_repo) is None, "an empty checkout must not resolve a store src"
+    with pytest.raises(AssertionError, match="deployed E1 store not found"):
+        _derive_required_actions_from_store_src(None)
 
 
 def test_dynamodb_grant_is_scoped_to_the_exact_operations_table_arn(template):
