@@ -708,17 +708,39 @@ Resources:
                   - 'appconfig:GetHostedConfigurationVersion'
                   - 'appconfig:ListHostedConfigurationVersions'
                   - 'appconfig:GetConfigurationProfile'
+                # AppConfig authorizes these APIs against BOTH the application
+                # and configuration-profile resources.
                 Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}'
                   - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/configurationprofile/${KillSwitchConfigurationProfile}'
               - Sid: StartDeploymentToKillSwitchEnvironmentOnly
                 Effect: Allow
                 Action:
                   - 'appconfig:StartDeployment'
-                  - 'appconfig:GetDeployment'
+                # StartDeployment authorizes against the application, profile,
+                # environment, and chosen strategy. All are exact E4 resources.
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/configurationprofile/${KillSwitchConfigurationProfile}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/environment/${ControlEnvironmentResource}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:deploymentstrategy/${GradualDeploymentStrategy}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:deploymentstrategy/${ImmediateDeploymentStrategy}'
+              - Sid: ListKillSwitchDeploymentsOnly
+                Effect: Allow
+                Action:
                   - 'appconfig:ListDeployments'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/environment/${ControlEnvironmentResource}'
+              - Sid: InspectOrStopKillSwitchDeploymentsOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:GetDeployment'
                   - 'appconfig:StopDeployment'
                 Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}'
                   - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/environment/${ControlEnvironmentResource}'
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${ControlApplication}/environment/${ControlEnvironmentResource}/deployment/*'
               - Sid: ReadDeployedKillSwitchConfigurationOnly
                 Effect: Allow
                 Action:

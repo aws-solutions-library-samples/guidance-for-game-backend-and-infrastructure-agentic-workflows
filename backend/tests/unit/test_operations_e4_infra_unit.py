@@ -494,9 +494,7 @@ def test_control_role_appconfig_actions_are_exactly_allowed(template):
 
 
 def test_appconfig_authoring_scoped_to_exact_resources(template):
-    """Every AppConfig authoring statement's Resource must reference the exact
-    E4 application/environment/profile/strategy (via !Sub with the exact logical
-    ids), never a wildcard application."""
+    """Every AppConfig statement must stay inside the E4 resource family."""
     for role, policy, statement in _statements(template):
         actions = list(_iter_action_strings(statement.get("Action", [])))
         if not any(a.startswith("appconfig:") for a in actions):
@@ -508,6 +506,30 @@ def test_appconfig_authoring_scoped_to_exact_resources(template):
             f"E4 AppConfig resources: {resource_blob}"
         )
         assert resources != "*"
+
+
+def test_appconfig_control_actions_cover_every_provider_resource(template):
+    statements = {
+        statement.get("Sid"): statement
+        for _role, _policy, statement in _statements(template)
+        if any(action.startswith("appconfig:") for action in _iter_action_strings(statement.get("Action", [])))
+    }
+    hosted = json.dumps(statements["CreateHostedVersionForKillSwitchProfileOnly"]["Resource"])
+    assert 'application/${ControlApplication}"' in hosted
+    assert "configurationprofile/${KillSwitchConfigurationProfile}" in hosted
+
+    start = json.dumps(statements["StartDeploymentToKillSwitchEnvironmentOnly"]["Resource"])
+    for required in (
+        'application/${ControlApplication}"',
+        "configurationprofile/${KillSwitchConfigurationProfile}",
+        "environment/${ControlEnvironmentResource}",
+        "deploymentstrategy/${GradualDeploymentStrategy}",
+        "deploymentstrategy/${ImmediateDeploymentStrategy}",
+    ):
+        assert required in start
+
+    inspect = json.dumps(statements["InspectOrStopKillSwitchDeploymentsOnly"]["Resource"])
+    assert "environment/${ControlEnvironmentResource}/deployment/*" in inspect
 
 
 def test_no_star_star_admin_statement(template):
