@@ -569,3 +569,135 @@ These require **no** credentials and run in the default unit suite:
 ```bash
 cd backend && uv run pytest -m unit -k operations_e1_shakedown
 ```
+
+
+---
+
+# E2 Operations Advise Control Plane — Addendum (issue #414)
+
+> **Status: PLANNED — not yet live-validated.** The E2 *infrastructure,
+> deployment wrapper, and documentation* in this addendum are implemented and
+> covered by parser-verifiable tests, but the advise control plane has **not**
+> been deployed or validated against a live account. Treat E2 as **planned**
+> until a live shakedown confirms it, exactly as E1 was treated before its own
+> validation. The default deployment (`./deploy-all.sh`) still creates **zero**
+> operations resources and costs **$0**; E2 changes nothing about that.
+
+E2 extends the E1 observation control plane **additively** through GitHub issue
+[#414](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/414).
+It edits **no** backend application code: it widens the same CloudFormation
+stack, deploy wrapper, and this runbook. It adds a read-only **prepare** step and
+a **human-approval gate** (approve / reject / cancel) with **no** provider write
+for bounded GameLift. Provisioning stays separate and default-`false`; an
+emergency disable stays reversible.
+
+## OperationsMode vocabulary (widened)
+
+| Value | Meaning |
+| --- | --- |
+| `disabled` | Default. Fail-closed. Creates zero resources. |
+| `observe` | E1: synchronous, read-only GameLift observation. |
+| `advise` | E2: strictly **higher** authority than `observe`. KEEPS the observe routes active AND enables the read-only prepare + human-approval gate. Requires `Provisioned=true`. No provider write. |
+
+`advise` is distinguished from `observe` only by the injected
+`GBAW_OPERATIONS_MODE` value the runtime reads; resource existence stays gated on
+`Provisioned` and the API-stage kill switch on the enabled-mode condition, so an
+emergency `--disable` still keeps every resource and its retained data and a
+later `--enable` is reversible.
+
+## Routes (all JWT, one shared real handler)
+
+Every route below is JWT-authorized and targets the **same** shared integration
+— the one real handler Lambda. There is no second handler and no per-route
+divergent integration.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /operations/observe` | E1 observation (retained). |
+| `GET /operations/{operationId}` | Status read (retained). |
+| `POST /operations/prepare` | E2: read-only preparation of a proposed operation. |
+| `POST /operations/{operationId}/approve` | E2: authorized approver grants approval. |
+| `POST /operations/{operationId}/reject` | E2: authorized approver rejects. |
+| `POST /operations/{operationId}/cancel` | E2: cancel a prepared/pending operation. |
+
+**No approval route is exposed through chat or MCP.** The prepare/approve/reject/
+cancel surface is HTTP + JWT only; the chat and MCP tool surfaces reference none
+of these routes.
+
+## E2 environment / deployment bindings (frozen core names)
+
+These are the **frozen core env names** E2 defines. The stack injects them from
+validated CloudFormation parameters; the core runtime consumes them in a later
+slice.
+
+| Name | CFN parameter | Default | Meaning |
+| --- | --- | --- | --- |
+| `GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL` | `LowRiskSelfApproval` | `false` | Server-owned low-risk self-approval posture. `false` means the preparer can **never** approve their own operation; `true` permits self-approval **only** for the server-defined low-risk action set the core policy recognises. Defaults to disabled. |
+| `GBAW_OPERATIONS_PREPARATION_EXPIRY_S` | `PreparationExpirySeconds` | `900` | Preparation validity window (seconds). A prepared operation not approved within it expires and can no longer be approved. Bounded to at most one day. |
+| `GBAW_OPERATIONS_APPROVAL_EXPIRY_S` | `ApprovalExpirySeconds` | `1800` | Approval validity window (seconds). Matches the core `ApprovalPolicy` default (30 min) and the contract that an approval TTL is > 0 and ≤ one day. |
+
+## E2 CloudWatch metric names (namespace `GameAgent/Operations`)
+
+The four E1 metrics/alarms are **retained**. E2 adds four more alarms in the same
+namespace:
+
+| Metric | Meaning |
+| --- | --- |
+| `PreparationFailures` | Count of failed prepare-operation requests. |
+| `ApprovalFailures` | Count of failed approval-gate requests (approve/reject). |
+| `ApprovalExpired` | Count of approvals or prepared operations that expired before dispatch. |
+| `CancellationConflicts` | Count of cancellation attempts that conflicted with a concurrent state change. |
+
+## IAM boundary (unchanged for bounded GameLift E2)
+
+E2 adds **no** IAM. The role keeps exactly the three GameLift reads
+(`DescribeFleetUtilization`, `DescribeFleetCapacity`, `DescribeScalingPolicies`),
+the three underlying DynamoDB item actions (`PutItem`/`UpdateItem`/`GetItem`), and
+the scoped KMS / log / metric grants. For bounded GameLift E2 there is **no**
+provider write, **no** source-control credential, **no** `iam:PassRole`, **no**
+`states:` action, **no** generic `execute`, and **no** S3 content bucket.
+
+## Deploy (explicit, opt-in) — selecting the mode
+
+```bash
+# Preview only (default): READ-ONLY validate + lint. Creates nothing.
+./scripts/infrastructure/deploy-operations.sh
+
+# Enable E1 observe (unchanged; --mode defaults to observe).
+GBAW_OPERATIONS_MODE=observe   COGNITO_ISSUER=<issuer> COGNITO_CLIENT_ID=<client-id>   TENANT_ID=<tenant> WORKSPACE_ID=<workspace>   GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket>   AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-operations.sh --enable --mode observe
+
+# Enable E2 advise. GBAW_OPERATIONS_MODE MUST match --mode (double opt-in).
+GBAW_OPERATIONS_MODE=advise   COGNITO_ISSUER=<issuer> COGNITO_CLIENT_ID=<client-id>   TENANT_ID=<tenant> WORKSPACE_ID=<workspace>   GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket>   AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-operations.sh --enable --mode advise
+```
+
+The enable is refused unless the `GBAW_OPERATIONS_MODE` environment value
+**matches** the selected `--mode` (belt-and-braces), so an enable can never
+silently escalate or downgrade the runtime authority. The template's `Rules`
+independently reject an enabled mode (observe **or** advise) against an
+unprovisioned (`Provisioned=false`) stack.
+
+The advise-mode settings are server-owned and default safely:
+`GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL=false` (never self-approve),
+`GBAW_OPERATIONS_PREPARATION_EXPIRY_S=900`, `GBAW_OPERATIONS_APPROVAL_EXPIRY_S=1800`.
+Override any of them in the environment before `--enable`.
+
+## Packaging carries the E2 contract schemas
+
+On `--enable` the wrapper's runtime probe additionally loads the E2 contract
+schemas (`prepare-operation-request`, `approval-record`, `prepared-operation`)
+from the staged package, so a package that ships the handler but omits an E2
+schema **fails closed before upload** rather than at the first prepare/approve/
+reject/cancel request.
+
+## Emergency disable (unchanged, rebuild-free)
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-operations.sh --disable
+```
+
+`--disable` still keeps `Provisioned=true` and every resource under
+CloudFormation with stable physical names and retained audit data, reusing every
+current parameter value (including the three E2 settings) via `UsePreviousValue`
+and setting only `OperationsMode=disabled`. It rebuilds no code and runs no
+Docker. A later `--enable --mode observe|advise` is fully reversible.
+

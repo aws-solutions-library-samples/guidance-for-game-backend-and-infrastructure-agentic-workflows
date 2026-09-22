@@ -334,6 +334,10 @@ to `disabled` while keeping resources and data (fixed cost continues); use
 teardown to remove the resources and stop the standing charges. E1 rollout (#413)
 is blocked on this reviewed cost evidence.
 
+#### E2 advise mode (planned, issue #414)
+
+The optional **E2 advise** mode extends E1 **additively** and is **planned** until live validation. It keeps the read-only observation routes and adds read-only prepare and a human-approval gate on the **same** authenticated HTTP API and the **same** real handler: `POST /operations/prepare` and `POST /operations/{operationId}/approve|reject|cancel`, plus the retained `GET /operations/{operationId}` status. Every route is JWT-authorized and **no** approval route is exposed through chat or MCP. E2 adds four CloudWatch alarms (`PreparationFailures`, `ApprovalFailures`, `ApprovalExpired`, `CancellationConflicts`) alongside the retained E1 alarms, and three validated, server-owned settings (`GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL` default `false`, `GBAW_OPERATIONS_PREPARATION_EXPIRY_S`, `GBAW_OPERATIONS_APPROVAL_EXPIRY_S`). It adds **no** IAM beyond the E1 read-only boundary — no provider write, source-control credential, `iam:PassRole`, `states:` action, generic execute, or S3 content bucket for bounded GameLift. Enable it with `--enable --mode advise` and a matching `GBAW_OPERATIONS_MODE=advise` (double opt-in); provisioning stays separate and `--disable` stays reversible. See the E2 addendum in [`docs/OPERATIONS_E1_DEPLOYMENT.md`](OPERATIONS_E1_DEPLOYMENT.md).
+
 **Deploy, disable, and teardown (all explicit and opt-in).** The optional E1
 stack is deployed only by its dedicated wrapper and is never wired into
 `deploy-all.sh`:

@@ -280,9 +280,14 @@ def _observation_function(template):
 # Frozen mode vocabulary and parameters
 # --------------------------------------------------------------------------- #
 def test_operations_mode_vocabulary_is_disabled_or_observe(template):
+    """E1 froze disabled|observe; E2 (issue #414) ADDITIVELY widens the
+    vocabulary to disabled|observe|advise. The default stays the fail-closed
+    ``disabled`` and ``observe`` is retained unchanged."""
     mode = template["Parameters"]["OperationsMode"]
     assert mode["Default"] == "disabled"
-    assert set(mode["AllowedValues"]) == {"disabled", "observe"}
+    allowed = set(mode["AllowedValues"])
+    assert {"disabled", "observe"} <= allowed, "disabled and observe must be retained"
+    assert allowed <= {"disabled", "observe", "advise"}, "E2 widens the vocabulary only to advise"
 
 
 def test_multi_tenant_and_code_artifact_parameters_present(template):
@@ -416,14 +421,13 @@ def test_access_log_destination_arn_matches_api_gateway_stored_form(template):
     stage = next(iter(_resources_of_type(template, "AWS::ApiGatewayV2::Stage").values()))["Properties"]
     destination = stage["AccessLogSettings"]["DestinationArn"]
     assert destination == _EXPECTED_ACCESS_LOG_DESTINATION_ARN, (
-        "AccessLogSettings.DestinationArn must be the bare log-group ARN API "
-        f"Gateway stores, got {destination!r}"
+        "AccessLogSettings.DestinationArn must be the bare log-group ARN API " f"Gateway stores, got {destination!r}"
     )
     # The constructed ARN must end in the exact log-group name the AccessLogGroup
     # resource declares, tying the two together so a rename cannot silently drift.
-    assert destination.endswith(_access_log_group_name(template)), (
-        "DestinationArn must be built from the AccessLogGroup's own LogGroupName"
-    )
+    assert destination.endswith(
+        _access_log_group_name(template)
+    ), "DestinationArn must be built from the AccessLogGroup's own LogGroupName"
 
 
 def test_access_log_destination_arn_is_not_the_getatt_wildcard_form(template):
@@ -460,12 +464,10 @@ def test_api_stage_retains_access_log_group_dependency_and_policy(template):
     # The access-log delivery resource policy must survive the change.
     policies = _resources_of_type(template, "AWS::Logs::ResourcePolicy")
     assert policies, "the CloudWatch Logs access-log delivery resource policy must remain"
-    policy_text = "".join(
-        str(b.get("Properties", {}).get("PolicyDocument", "")) for b in policies.values()
-    )
-    assert "/aws/apigateway/" in policy_text and "operations-access" in policy_text, (
-        "delivery resource policy must still scope the access log group"
-    )
+    policy_text = "".join(str(b.get("Properties", {}).get("PolicyDocument", "")) for b in policies.values())
+    assert (
+        "/aws/apigateway/" in policy_text and "operations-access" in policy_text
+    ), "delivery resource policy must still scope the access log group"
 
 
 def test_lambda_has_reserved_concurrency_and_bounded_timeout(template):
@@ -1583,11 +1585,24 @@ def test_provisioned_parameter_defaults_to_false_and_is_boolean(template):
 
 def test_resource_existence_is_decoupled_from_operations_mode(template):
     """The resource-existence condition must be driven by Provisioned, and the
-    OperationsEnabled (observe) condition must NOT gate any resource — otherwise
-    a disable (mode=disabled) would delete resources."""
+    OperationsEnabled condition must NOT gate any resource — otherwise a
+    disable (mode=disabled) would delete resources. E2 (issue #414) widens
+    OperationsEnabled to an Fn::Or over the enabled modes (observe OR advise),
+    so the check accepts both the E1 equals-shape and the E2 Or-shape."""
     conditions = template["Conditions"]
     assert conditions["ResourcesProvisioned"] == ["Provisioned", "true"]
-    assert conditions["OperationsEnabled"] == ["OperationsMode", "observe"]
+    enabled = conditions["OperationsEnabled"]
+    if enabled == ["OperationsMode", "observe"]:
+        pass  # E1 shape.
+    else:
+        # E2 shape: an Fn::Or list whose legs equal OperationsMode to each
+        # enabled mode; observe MUST be one leg and advise the other.
+        legs = enabled if isinstance(enabled, list) else [enabled]
+        modes = set()
+        for leg in legs:
+            if isinstance(leg, list) and leg[:1] == ["OperationsMode"]:
+                modes.add(leg[1])
+        assert {"observe", "advise"} <= modes, f"OperationsEnabled must admit observe and advise: {enabled!r}"
     for name, body in template["Resources"].items():
         assert body.get("Condition") != "OperationsEnabled", (
             f"{name} is gated on OperationsEnabled; disabling would delete it. "
@@ -1605,16 +1620,27 @@ def test_default_deploy_provisions_zero_resources(template):
 
 
 def test_rule_rejects_observe_without_provisioning(template):
-    """Unsafe combination: OperationsMode=observe with Provisioned=false. A Rule
-    must reject it (observe requires the resources it drives to exist)."""
+    """Unsafe combination: an ENABLED OperationsMode with Provisioned=false. A
+    Rule must reject it (an enabled mode requires the resources it drives to
+    exist). E1 keyed the rule off equals-observe; E2 (issue #414) widens it to
+    Fn::Not[equals disabled] so it fires for observe AND advise. Accept either
+    shape; in both cases the rule must assert Provisioned=true."""
     rules = template["Rules"]
     rule = rules.get("EnabledModeRequiresProvisioning")
     assert rule, "expected an EnabledModeRequiresProvisioning rule"
-    assert rule["RuleCondition"] == ["OperationsMode", "observe"]
+    cond = rule["RuleCondition"]
+    if cond == ["OperationsMode", "observe"]:
+        pass  # E1 shape: equals-observe.
+    else:
+        # E2 shape: Fn::Not[Fn::Equals[OperationsMode, disabled]].
+        joined_cond = json.dumps(cond)
+        assert (
+            "disabled" in joined_cond and "OperationsMode" in joined_cond
+        ), f"enabled-mode rule must fire for any non-disabled mode: {cond!r}"
     asserts = rule["Assertions"]
     # The single assertion requires Provisioned == 'true'.
     joined = json.dumps(asserts)
-    assert "Provisioned" in joined and "true" in joined, "observe-mode rule must assert Provisioned=true"
+    assert "Provisioned" in joined and "true" in joined, "enabled-mode rule must assert Provisioned=true"
 
 
 def test_rule_requires_bindings_whenever_provisioned(template):
@@ -1643,9 +1669,11 @@ def test_handler_kill_switch_injects_operations_mode(template):
 
 
 def test_api_stage_kill_switch_throttles_to_zero_when_not_observe(template):
-    """API-safe kill switch: when OperationsMode is not observe, the HTTP API
-    stage throttles to zero so the gateway itself fails closed — without deleting
-    or renaming the stage. Enabled uses the operator-tuned limits."""
+    """API-safe kill switch: when OperationsMode is not an ENABLED mode
+    (observe or, for E2, advise), the HTTP API stage throttles to zero so the
+    gateway itself fails closed — without deleting or renaming the stage. Any
+    enabled mode uses the operator-tuned limits; the gate is the same
+    OperationsEnabled condition (an Or over the enabled modes)."""
     stage = _stage(template)
     settings = stage["Properties"]["DefaultRouteSettings"]
     burst = settings["ThrottlingBurstLimit"]
