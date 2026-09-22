@@ -53,6 +53,7 @@ function KillSwitchPanelState({
 }: KillSwitchPanelProps) {
   const current = killSwitch.capabilities[CAP_ID];
   const [operationsEnabled, setOperationsEnabled] = useState(killSwitch.operations_enabled);
+  const [expectedConfigVersion, setExpectedConfigVersion] = useState(killSwitch.config_version);
   const [phases, setPhases] = useState<PhaseState>({
     prepare: current.prepare,
     dispatch: current.dispatch,
@@ -69,7 +70,7 @@ function KillSwitchPanelState({
 
   const doSubmit = async () => {
     setStatus({ kind: 'submitting' });
-    const request = buildControlRequest(killSwitch.config_version, {
+    const request = buildControlRequest(expectedConfigVersion, {
       operations_enabled: operationsEnabled,
       capabilities: {
         [CAP_ID]: { prepare: phases.prepare, dispatch: phases.dispatch, execute: phases.execute },
@@ -77,6 +78,9 @@ function KillSwitchPanelState({
     });
     try {
       const response = await onSubmit(request);
+      if (response.outcome === 'version_conflict' || response.outcome === 'applied') {
+        setExpectedConfigVersion(response.config_version);
+      }
       setStatus({ kind: 'done', response });
     } catch {
       setStatus({ kind: 'error' });
@@ -90,7 +94,11 @@ function KillSwitchPanelState({
       <header className="ga-ks-head">
         <h2 className="ga-ks-title">Kill switch</h2>
         <span className="ga-ks-version">
-          Config version {killSwitch.config_version} · valid until{' '}
+          Config version {killSwitch.config_version}
+          {expectedConfigVersion !== killSwitch.config_version && (
+            <> · retry against durable version {expectedConfigVersion}</>
+          )}{' '}
+          · valid until{' '}
           {formatTimestamp(killSwitch.not_after)}
         </span>
       </header>

@@ -76,6 +76,36 @@ describe('KillSwitchPanel', () => {
     expect(request.desired.capabilities['gamelift.capacity-adjustment'].execute).toBe(true);
   });
 
+  it('uses the authoritative conflict version on an explicit retry', async () => {
+    const onSubmit = jest
+      .fn()
+      .mockResolvedValueOnce({
+        contract_version: '1.0',
+        outcome: 'version_conflict',
+        config_version: 8,
+        reason_code: 'VERSION_CONFLICT',
+      })
+      .mockResolvedValueOnce({
+        contract_version: '1.0',
+        outcome: 'applied',
+        config_version: 9,
+        reason_code: 'APPLIED',
+      });
+    render(
+      <KillSwitchPanel killSwitch={killSwitch} capabilities={[capability]} onSubmit={onSubmit} />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /apply changes/i }));
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /confirm/i }));
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/version conflict/i));
+
+    await userEvent.click(screen.getByRole('button', { name: /apply changes/i }));
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: /confirm/i }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(2));
+    expect(onSubmit.mock.calls[0][0].expected_config_version).toBe(7);
+    expect(onSubmit.mock.calls[1][0].expected_config_version).toBe(8);
+  });
+
   it('can cancel the confirmation without submitting', async () => {
     const onSubmit = jest.fn();
     render(

@@ -32,7 +32,8 @@ cannot grant authority.
   - a **kill-switch panel** with the deployment master switch and the single
     capability's prepare/dispatch/execute toggles, a static/dynamic **gate
     panel**, an explicit confirmation dialog (focus managed), a compare-and-set
-    on `config_version`, polite/assertive live regions, and loading/error/empty
+    on `config_version`, an explicit retry against the authoritative durable
+    version after a conflict, polite/assertive live regions, and loading/error/empty
     states.
 
 ## Server-side proxy routes
