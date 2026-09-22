@@ -649,6 +649,15 @@ PARAM_OVERRIDES=(
     "CapacityFloor=${CAPACITY_FLOOR}"
     "CapacityCeiling=${CAPACITY_CEILING}"
     "CapacityMaxStep=${CAPACITY_MAX_STEP}"
+    # E4 (issue #416) ADDITIVE AppConfig kill-switch wiring. Optional and empty by
+    # default, so a deploy that does not set them is behaviourally identical to a
+    # pre-E4 deploy (no extension layer, no AppConfig IAM). Populate from the E4
+    # 08 control-plane stack outputs to let the operations Lambda read the
+    # deployment-wide kill switch in-process.
+    "AppConfigExtensionLayerArn=${GBAW_OPERATIONS_APPCONFIG_EXTENSION_LAYER_ARN:-}"
+    "KillSwitchApplicationId=${GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID:-}"
+    "KillSwitchEnvironmentId=${GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID:-}"
+    "KillSwitchProfileId=${GBAW_OPERATIONS_APPCONFIG_PROFILE_ID:-}"
 )
 
 echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."

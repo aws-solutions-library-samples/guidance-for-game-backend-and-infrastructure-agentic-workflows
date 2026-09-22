@@ -425,6 +425,45 @@ not weaken any Part II invariant; it makes the following concrete:
   KMS strictly via DynamoDB. No `iam:PassRole`, secrets, source-control, generic
   execute, or wildcard appears anywhere in the stack.
 
+## E4 Control-Plane Realization (issue #416)
+
+The optional E4 control plane (`08-operations-control-plane.yaml`, a **separate**
+stack) realizes the deployment-wide kill switch and admin control API. It does
+not weaken any Part I or Part II invariant; it makes the following concrete:
+
+- **The kill switch is enforced by AWS AppConfig, not just by code.** The hosted
+  configuration profile validates every version against a `JSON_SCHEMA` that is
+  **byte-equivalent** to the frozen `operations-kill-switch` contract schema and
+  is fully self-contained (no external `urn:` `$ref`), so AppConfig rejects any
+  malformed or tampered document at author time. The seeded default disables
+  everything and is already expired, so a fresh deploy fails closed.
+- **Least privilege at the authoring edge.** The control role may
+  `CreateHostedConfigurationVersion` / `StartDeployment` / `StopDeployment`
+  **only** for the exact E4 AppConfig application / environment / profile /
+  strategies, and append **bounded** audit items (`PutItem`/`GetItem`) to the 06
+  table via the 06 CMK (KMS strictly via DynamoDB). No `iam:PassRole`, secrets,
+  provider write, unbounded DynamoDB, or generic AppConfig admin appears
+  anywhere in the stack.
+- **Consumers get read-only, scoped data-plane access.** The additive wiring
+  into 06/07 grants the E1/E2/E3 roles **only**
+  `appconfig:StartConfigurationSession` + `appconfig:GetLatestConfiguration`,
+  scoped to the exact kill-switch configuration resource, read in-process via the
+  official AppConfig Lambda extension. The wiring is opt-in: a deploy that does
+  not supply the identifiers attaches no layer and grants no AppConfig authority.
+- **OP-AU5 (emergency disablement) is realized deployment-wide.** A reversible
+  two-lever control-API disable (`ControlMode=disabled`) stops new admin changes;
+  an **immediate** (hard-down) AppConfig strategy backs `disable-all-operations`
+  and per-capability disable scripts that write an all-disabled document at 100%
+  with no bake. None deletes a resource; each is reversible.
+- **Freshness fails closed.** Every document carries a short `not_after`; a
+  periodic EventBridge sweeper re-issues it, so a stopped control plane lets the
+  document expire and consumers fail closed. The **gradual** strategy carries a
+  CloudWatch monitor + automatic rollback wired to the failed/unverified alarms.
+- **Controls carry no identity and are compare-and-set.** A control request
+  carries only the desired booleans and the expected `config_version`; the acting
+  admin is resolved from the verified caller, and a stale write cannot clobber a
+  newer document.
+
 ## Attack Trees
 
 ### Attack Tree: Unauthorized Provider Write
@@ -722,5 +761,6 @@ Append-only ledger (authoritative audit)
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-01-12 | Security Eng | Initial draft |
+| 2.2 | 2026-09-22 | Security Eng | Added the E4 Control-Plane Realization section (issue #416): the separate 08 AppConfig control-plane stack realizes the deployment-wide kill switch — AppConfig-enforced byte-equivalent schema validation, least-privilege authoring scoped to the exact AppConfig resources, opt-in read-only scoped data-plane access for E1/E2/E3 consumers, the reversible two-lever control-API disable plus immediate hard-down disable scripts, freshness fail-closed with a periodic sweeper, and gradual-strategy monitor auto-rollback. No Part I or Part II invariant weakened. |
 | 2.1 | 2026-09-21 | Security Eng | Added the E3 Execution Realization section (issue #415): the separate 07 execution stack realizes the planned executor boundary — direct-invocation prevention via three separate roles (dispatcher/workflow/executor), operation_id-only invocation, no blind retry, the reversible two-lever emergency disable (OP-AU5), and fleet-ARN-scoped least privilege at the write edge. No Part I or Part II invariant weakened. |
 | 2.0 | 2026-09-21 | Security Eng | Split into the deployed read-only chat path (Part I) and the optional, default-disabled operations control plane (Part II). Added trust boundaries O1-O8, per-boundary STRIDE, attack trees, and explicit residual risks for operations APIs, direct approval, immutable prepared operations, replay/stale-approval/cancellation, source-control prepare/executor, remote MCP clients, separate provider-write roles, bounded autonomy, emergency disablement, budget/authority limits, indirect prompt injection, confused deputy, audit integrity, and fail-closed recovery (issue #280). |

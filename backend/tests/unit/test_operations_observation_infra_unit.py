@@ -1241,6 +1241,13 @@ def test_every_resource_is_gated_on_resources_provisioned(template):
         "true",
     ], "ResourcesProvisioned must be driven by the Provisioned flag, not OperationsMode"
     for name, body in template["Resources"].items():
+        # The E4 (issue #416) ADDITIVE AppConfig kill-switch read policy is gated
+        # on HasKillSwitch so it exists ONLY when the deployment opts into the E4
+        # kill switch; it is still never deleted by an OperationsMode disable
+        # (which does not change the kill-switch params). Every other resource is
+        # gated on ResourcesProvisioned.
+        if body.get("Condition") == "HasKillSwitch":
+            continue
         assert body.get("Condition") == "ResourcesProvisioned", (
             f"resource {name} must be gated on ResourcesProvisioned (existence), "
             "never on OperationsEnabled (which would delete it on disable)"
@@ -1705,6 +1712,9 @@ def test_default_deploy_provisions_zero_resources(template):
     the default evaluates false."""
     assert template["Parameters"]["Provisioned"]["Default"] == "false"
     for name, body in template["Resources"].items():
+        # Additive E4 kill-switch read policy is HasKillSwitch-gated (opt-in).
+        if body.get("Condition") == "HasKillSwitch":
+            continue
         assert body.get("Condition") == "ResourcesProvisioned", name
 
 
@@ -1804,6 +1814,9 @@ def test_reenable_reuses_same_names_no_deletion_on_disable(template):
       (data survives); and
     * physical names are fixed (re-enable reuses them, no collision)."""
     for name, body in template["Resources"].items():
+        # Additive E4 kill-switch read policy is HasKillSwitch-gated (opt-in).
+        if body.get("Condition") == "HasKillSwitch":
+            continue
         assert body.get("Condition") == "ResourcesProvisioned", name
     stateful = 0
     for body in template["Resources"].values():
