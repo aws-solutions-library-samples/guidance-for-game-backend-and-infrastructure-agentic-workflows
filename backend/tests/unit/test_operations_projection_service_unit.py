@@ -98,9 +98,9 @@ def _full_operation(oid: str, workspace_id: str = _WORKSPACE) -> dict[str, Any]:
             "display_name": "Secret Person",
         },
         "target": {"fleet_id": "fleet-SECRET-1234", "location": "us-west-2"},
-        "resource_enrollment": {"fleet_arn": "arn:aws:gamelift:us-west-2:111122223333:fleet/x"},
+        "resource_enrollment": {"fleet_arn": "arn:aws:gamelift:us-west-2:123456789012:fleet/x"},
         "authority": {"effective_authority": "advise", "decision": "approval_required", "reason_codes": ["X"]},
-        "raw_provider_payload": {"AccountId": "111122223333", "token": "TOKEN-SECRET"},
+        "raw_provider_payload": {"AccountId": "123456789012", "token": "TOKEN-SECRET"},
     }
 
 
@@ -205,7 +205,7 @@ def test_detail_is_public_safe_and_valid() -> None:
         "secret@example.com",
         "Secret Person",
         "fleet-SECRET-1234",
-        "111122223333",
+        "123456789012",
         "TOKEN-SECRET",
         "arn:aws:gamelift",
     ):

@@ -104,7 +104,7 @@ def _plan() -> Any:
     return VerifiedExecutionPlan(
         intent=intent,
         logical_action_id="act_" + "a" * 64,
-        fleet_arn="arn:aws:gamelift:us-west-2:111122223333:fleet/fleet-1",
+        fleet_arn="arn:aws:gamelift:us-west-2:123456789012:fleet/fleet-1",
         fleet_id="fleet-1",
         location="us-west-2",
         max_writes=1,

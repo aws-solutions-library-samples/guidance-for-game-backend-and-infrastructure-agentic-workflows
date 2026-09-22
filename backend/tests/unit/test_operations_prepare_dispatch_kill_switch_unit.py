@@ -86,7 +86,7 @@ def _dispatcher(gate: Any) -> Any:
     return DispatcherRequestHandler(
         store=_DispatchStore(),
         step_functions=_Sfn(),
-        state_machine_arn="arn:aws:states:us-west-2:111122223333:stateMachine:x",
+        state_machine_arn="arn:aws:states:us-west-2:123456789012:stateMachine:x",
         tenant_id="tenant-1",
         workspace_id="ws-1",
         trusted_audience="trusted-audience",
