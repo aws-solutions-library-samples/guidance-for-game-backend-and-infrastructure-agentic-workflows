@@ -19,21 +19,32 @@ precedent):
 * **Server-owned bounds and deterministic risk.** Enrollment/policy bounds and
   the risk score are computed by trusted server code, not proposed by a caller.
 * **No provider writes, no credentials.** The service only reads.
+
+**Deterministic identity.** ``advice_id`` is derived — not random — from the
+trusted workspace, the exact untrusted proposal intent (idempotency token,
+target, requested triple), the code-selected capability, and the trusted current
+observation revision (id + hash), via RFC 8785 canonicalization + SHA-256. The
+live clock never contributes. Recomputing advice for the same inputs on a later
+clock therefore yields a byte-identical ``advice_id`` (and document), which is
+what makes the downstream prepared operation and ``prepared_hash`` idempotent
+across clocks. An ``advice_id_factory`` may be injected to pin the id in focused
+tests; production uses the deterministic derivation.
 """
 
 from __future__ import annotations
 
 # Standard library
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol
-from uuid import uuid4
 
 # Local modules
 from operations.contracts import CONTRACT_VERSION
+from operations.contracts.canonical import canonicalize
 from operations.contracts.capacity import (
     ADVICE_SCHEMA_NAME,
     CAPABILITY_ID,
@@ -288,7 +299,10 @@ class AdviceService:
         self._state_port = state_port
         self._bounds_port = bounds_port
         self._clock = clock
-        self._advice_id_factory = advice_id_factory or _default_advice_id
+        # An injected factory pins the id for focused tests; production leaves it
+        # unset and derives the id deterministically from the trusted + untrusted
+        # inputs (see _derive_advice_id).
+        self._advice_id_factory = advice_id_factory
 
     def advise(self, request: CapacityProposalRequest, context: AdviceRequestContext) -> dict[str, Any]:
         """Produce one deterministic, validated capacity advice document."""
@@ -334,13 +348,21 @@ class AdviceService:
         )
         risk = calculate_capacity_risk(current=current_capacity, requested=requested, within_bounds=not violations)
 
+        # advice_id is a pure function of the trusted workspace, the exact
+        # untrusted proposal intent, the code-selected capability, and the
+        # trusted current observation revision — never the live clock. So
+        # recomputing advice on a later clock reproduces the same advice_id.
+        advice_id = self._resolve_advice_id(
+            workspace_id=requester_identity["workspace_id"], request=request, current=current
+        )
+
         # Advice is a pure function of (proposal, trusted observation revision):
         # its timestamp is the observation anchor, so recomputing it on a later
         # clock is byte-for-byte identical.
         advised_at = _isoformat(observed_at)
         advice = {
             "advice_contract_version": CONTRACT_VERSION,
-            "advice_id": self._advice_id_factory(),
+            "advice_id": advice_id,
             "phase": PHASE,
             "provider": PROVIDER,
             "capability": {"capability_id": CAPABILITY_ID, "capability_version": CAPABILITY_VERSION},
@@ -385,6 +407,49 @@ class AdviceService:
                 AdviceErrorCode.IDENTITY_CONTEXT_INVALID, "authenticated advice identity is invalid"
             ) from exc
 
+    def _resolve_advice_id(
+        self, *, workspace_id: str, request: CapacityProposalRequest, current: CurrentCapacity
+    ) -> str:
+        """Pin from an injected factory (tests) or derive deterministically."""
+        if self._advice_id_factory is not None:
+            return self._advice_id_factory()
+        return _derive_advice_id(workspace_id=workspace_id, request=request, current=current)
 
-def _default_advice_id() -> str:
-    return f"adv_{uuid4().hex[:26]}"
+
+_ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _hex_to_id_body(digest: str) -> str:
+    """Map a hex SHA-256 digest to the ``[a-z0-9]{26}`` advice-id body."""
+    value = int(digest, 16)
+    body: list[str] = []
+    for _ in range(26):
+        value, index = divmod(value, 36)
+        body.append(_ID_ALPHABET[index])
+    return "".join(reversed(body))
+
+
+def _derive_advice_id(*, workspace_id: str, request: CapacityProposalRequest, current: CurrentCapacity) -> str:
+    """Deterministically derive ``advice_id`` from trusted + untrusted inputs.
+
+    The id binds exactly: the trusted workspace, the exact untrusted proposal
+    intent (idempotency token, target fleet/location, requested triple), the
+    code-selected capability, and the trusted current observation revision
+    (id + hash). It is RFC 8785 (JSON Canonicalization Scheme) canonicalized and
+    SHA-256 hashed, then mapped to the ``adv_[a-z0-9]{26}`` id body. It does not
+    depend on the live clock, so recomputing on a later clock is identical, and
+    any change to the bound inputs changes the id.
+    """
+    components = {
+        "workspace_id": workspace_id,
+        "capability": {"capability_id": CAPABILITY_ID, "capability_version": CAPABILITY_VERSION},
+        "idempotency_token": request.idempotency_token,
+        "target": {"fleet_id": request.fleet_id, "location": request.location},
+        "requested": request.requested.as_dict(),
+        "current_state": {
+            "observation_id": current.observation_id,
+            "observation_hash": current.observation_hash,
+        },
+    }
+    digest = hashlib.sha256(canonicalize(components)).hexdigest()
+    return f"adv_{_hex_to_id_body(digest)}"
