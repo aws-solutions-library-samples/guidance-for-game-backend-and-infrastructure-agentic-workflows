@@ -17,9 +17,12 @@ contract**:
   code-artifact parameters with enabled-mode ``Rules`` validation, and the
   CloudWatch Logs KMS key-policy grant;
 * negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
-  ``GetItem``/``Query``/``TransactWriteItems``; no S3 runtime access, no
-  GameLift write, ``iam:PassRole``, Step Functions,
-  ``UpdateItem``/``DeleteItem``/``PutItem``/``Scan``, or wildcard action);
+  exactly ``PutItem`` -- the only underlying action the store's two conditional
+  transactional Put legs require, per the AWS "Using IAM with DynamoDB
+  transactions" guide; no ineffective/invalid ``TransactWriteItems`` action, no
+  unused ``GetItem``/``Query``, no ``UpdateItem``/``DeleteItem``/``Scan``/
+  ``Batch*``; no S3 runtime access, no GameLift write, ``iam:PassRole``, Step
+  Functions, or wildcard action);
 * the runtime-KMS grant for the customer-managed key: exactly the documented
   DynamoDB data-plane action set (``Encrypt``/``Decrypt``/``ReEncrypt*``/
   ``GenerateDataKey*``/``DescribeKey``) on the specific operations CMK, every
@@ -121,13 +124,19 @@ GAMELIFT_READ_ACTIONS = frozenset(
         "gamelift:DescribeScalingPolicies",
     }
 )
-# DynamoDB runtime actions are limited to what core actually uses: bounded reads
-# and the single transactional write.
+# DynamoDB runtime actions are limited to exactly what the store actually issues.
+# Per the AWS "Using IAM with DynamoDB transactions" guide, permissions for the
+# Put/Update/Delete/Get legs of a TransactWriteItems/TransactGetItems call are
+# governed by the underlying PutItem/UpdateItem/DeleteItem/GetItem permissions --
+# there is no "dynamodb:TransactWriteItems" IAM action (cfn-lint flags it as
+# W3037). The store (operations.validation.e0_persistence.DynamoDbTransactionalSink)
+# issues one TransactWriteItems call with two conditional *Put* legs and no read,
+# update, delete, query, scan, or batch call anywhere -- so the only underlying
+# action it needs is dynamodb:PutItem, scoped to the exact table ARN.
+#   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
 ALLOWED_DYNAMODB_ACTIONS = frozenset(
     {
-        "dynamodb:GetItem",
-        "dynamodb:Query",
-        "dynamodb:TransactWriteItems",
+        "dynamodb:PutItem",
     }
 )
 FORBIDDEN_ACTION_SUBSTRINGS = (
@@ -139,11 +148,18 @@ FORBIDDEN_ACTION_SUBSTRINGS = (
     "gamelift:Stop",
     "iam:PassRole",
     "states:",
+    # The store issues only conditional Put legs. Every other DynamoDB action is
+    # unused by any real current call and MUST NOT be granted -- including the
+    # previously granted-but-unused GetItem/Query, the ineffective/invalid
+    # TransactWriteItems, and the always-denied UpdateItem/DeleteItem/Scan/Batch*.
+    "dynamodb:GetItem",
+    "dynamodb:Query",
+    "dynamodb:TransactWriteItems",
     "dynamodb:UpdateItem",
     "dynamodb:DeleteItem",
-    "dynamodb:PutItem",
     "dynamodb:Scan",
     "dynamodb:BatchWriteItem",
+    "dynamodb:BatchGetItem",
     # The unused content bucket and its runtime access are removed entirely.
     "s3:",
     # NOTE: kms:Encrypt is intentionally NOT forbidden on the runtime role. A
@@ -519,6 +535,132 @@ def test_dynamodb_actions_are_scoped_and_bounded(template):
     assert actions, "expected scoped DynamoDB actions"
     for action in actions:
         assert action in ALLOWED_DYNAMODB_ACTIONS, f"unexpected DynamoDB action: {action}"
+
+
+# The store leg type -> the underlying DynamoDB IAM action that governs it, per
+# the AWS "Using IAM with DynamoDB transactions" guide: transactional Put/Update/
+# Delete/Get are authorized by PutItem/UpdateItem/DeleteItem/GetItem, and a
+# ConditionCheck leg by dynamodb:ConditionCheckItem. There is deliberately NO
+# mapping for a "TransactWriteItems" action because none exists in IAM.
+#   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
+_TRANSACT_LEG_TO_UNDERLYING_ACTION = {
+    "Put": "dynamodb:PutItem",
+    "Update": "dynamodb:UpdateItem",
+    "Delete": "dynamodb:DeleteItem",
+    "Get": "dynamodb:GetItem",
+    "ConditionCheck": "dynamodb:ConditionCheckItem",
+}
+
+
+class _LegCapturingDynamoDbClient:
+    """Captures the ``TransactItems`` a real store run issues, without any I/O.
+
+    Only ``transact_write_items`` is provided: if the store ever grows a read,
+    update, delete, query, scan, or batch call it will raise ``AttributeError``
+    here and this drift test will fail loudly rather than silently under-grant.
+    """
+
+    def __init__(self):
+        self.transact_items = []
+
+    def transact_write_items(self, **kwargs):
+        self.transact_items = kwargs["TransactItems"]
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+
+def _underlying_actions_the_store_actually_requires():
+    """Drive the real store once and derive the exact underlying IAM actions.
+
+    Inspects *every* leg of the actual ``TransactWriteItems`` call the store
+    issues and maps each to the DynamoDB item action that governs it. This binds
+    the IAM contract to observed store behavior, so any future drift in the
+    store's transaction legs (a new Update/Delete/Get leg, or a switch away from
+    Put) changes the required set and fails the coverage assertion below.
+    """
+    # Local modules
+    from operations.validation.e0_persistence import DynamoDbTransactionalSink
+
+    client = _LegCapturingDynamoDbClient()
+    sink = DynamoDbTransactionalSink(
+        client=client,
+        table_name="drift-probe-disposable",
+        persistence_budget_s=1.0,
+    )
+    sink.persist({"operation_id": "op-drift-probe"}, b"{}")
+
+    assert client.transact_items, "store issued no transaction legs to inspect"
+    required = set()
+    for leg in client.transact_items:
+        leg_types = list(leg.keys())
+        assert len(leg_types) == 1, f"a transaction leg must have exactly one type, got {leg_types}"
+        leg_type = leg_types[0]
+        assert (
+            leg_type in _TRANSACT_LEG_TO_UNDERLYING_ACTION
+        ), f"unmapped transaction leg type {leg_type!r}; update the IAM contract"
+        required.add(_TRANSACT_LEG_TO_UNDERLYING_ACTION[leg_type])
+    return required
+
+
+def test_iam_grants_exactly_the_underlying_actions_the_store_transacts(template):
+    """Red-green drift guard tying the template's DynamoDB grant to real store legs.
+
+    The granted DynamoDB actions on the observation role must equal *exactly* the
+    set of underlying item actions the store's actual transaction legs require --
+    no unused GetItem/Query, no ineffective/invalid TransactWriteItems, and never
+    a missing action that would reproduce the live begin_observation
+    AccessDeniedException (GitHub issue #413). If either the store legs or the
+    template drift, this fails.
+    """
+    required = _underlying_actions_the_store_actually_requires()
+    # The store today issues two conditional Put legs, so PutItem is the only
+    # underlying action required. Pin that explicitly so an accidental widening of
+    # the derivation is caught too.
+    assert required == {"dynamodb:PutItem"}, f"unexpected store-required actions: {sorted(required)}"
+
+    granted = {a for a in _all_policy_actions(template) if a.lower().startswith("dynamodb:")}
+    assert granted == required, (
+        "DynamoDB IAM grant must cover exactly the underlying actions the store "
+        f"transacts. required={sorted(required)} granted={sorted(granted)}"
+    )
+    # The invalid action string must be gone (cfn-lint W3037).
+    assert "dynamodb:TransactWriteItems" not in granted, (
+        "dynamodb:TransactWriteItems is not a valid IAM action (cfn-lint W3037); "
+        "transactional legs are governed by the underlying item actions"
+    )
+
+
+def test_dynamodb_grant_is_scoped_to_the_exact_operations_table_arn(template):
+    """Every DynamoDB statement must target only the operations table ARN."""
+    roles = _resources_of_type(template, "AWS::IAM::Role")
+    seen = False
+    for body in roles.values():
+        for inline in body.get("Properties", {}).get("Policies", []) or []:
+            for stmt in inline.get("PolicyDocument", {}).get("Statement", []) or []:
+                actions = set(_iter_action_strings([stmt.get("Action")]))
+                if not actions or not all(a.lower().startswith("dynamodb:") for a in actions):
+                    continue
+                seen = True
+                # The scanner-safe CFN loader renders short-form intrinsics as plain
+                # data, so ``!GetAtt OperationsTable.Arn`` arrives as the scalar
+                # string "OperationsTable.Arn" (and a long-form Fn::GetAtt as a
+                # dict). Accept either shape but require the operations table ARN.
+                resources = _resource_strings(stmt)
+                assert resources, "DynamoDB statement must be resource-scoped, not '*'"
+                for res in resources:
+                    assert res != "*", "DynamoDB statement must not use a wildcard resource"
+                    if isinstance(res, str):
+                        assert (
+                            res == "OperationsTable.Arn"
+                        ), f"DynamoDB resource must be OperationsTable.Arn, got {res!r}"
+                    elif isinstance(res, dict) and "Fn::GetAtt" in res:
+                        target = res["Fn::GetAtt"]
+                        target = target.split(".") if isinstance(target, str) else target
+                        assert (
+                            target[0] == "OperationsTable" and target[1] == "Arn"
+                        ), f"DynamoDB resource must be OperationsTable.Arn, got {target!r}"
+                    else:
+                        raise AssertionError(f"DynamoDB resource must reference the operations table ARN, got {res!r}")
+    assert seen, "expected at least one DynamoDB IAM statement"
 
 
 def _role_kms_statements(template):

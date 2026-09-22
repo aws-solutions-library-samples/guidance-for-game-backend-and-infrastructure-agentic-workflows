@@ -133,13 +133,47 @@ ceiling from ADR 0005.
 | `describe_fleet_capacity` | `gamelift:DescribeFleetCapacity` |
 | `describe_scaling_policies` | `gamelift:DescribeScalingPolicies` |
 
-No other GameLift action is granted. The runtime DynamoDB actions are exactly
-`GetItem`, `Query`, and `TransactWriteItems` — no `Scan`, `UpdateItem`,
-`DeleteItem`, or `PutItem`. No S3 runtime access, `iam:PassRole`, Step Functions,
-or wildcard action appears in any E1 policy. The CMK key policy additionally
-grants the CloudWatch Logs service principal `kms:Decrypt`/`kms:GenerateDataKey`,
-scoped to this account's operations log groups, so the CMK-encrypted Lambda and
-API access log groups work under least privilege.
+No other GameLift action is granted.
+
+### DynamoDB action (exactly `PutItem`) — issue #413
+
+The runtime persists observations with a single `TransactWriteItems` call made
+of **two conditional `Put` legs** (the operation-state item and the append-only
+ledger item), and issues no read, update, delete, query, scan, or batch call —
+see `operations.validation.e0_persistence.DynamoDbTransactionalSink`.
+
+Per the AWS **"Using IAM with DynamoDB transactions"** guide, permissions for
+the `Put`/`Update`/`Delete`/`Get` legs of a `TransactWriteItems` /
+`TransactGetItems` call are governed by the **underlying**
+`PutItem`/`UpdateItem`/`DeleteItem`/`GetItem` permissions. **There is no
+`dynamodb:TransactWriteItems` IAM action** — granting it is ineffective, and
+`cfn-lint` rejects it as **W3037** (`'transactwriteitems' is not one of …`).
+
+So the observation role grants **exactly `dynamodb:PutItem`**, scoped to the
+operations table ARN — the only underlying action the store's two `Put` legs
+require. This is the direct fix for the live `begin_observation` DynamoDB
+`AccessDeniedException` (issue #413): the role previously held the invalid
+`TransactWriteItems` action plus unused `GetItem`/`Query`, but **not** the
+`PutItem` permission that actually authorizes the transaction's `Put` legs. The
+unused `GetItem`/`Query` and the ineffective `TransactWriteItems` are removed;
+`DeleteItem`, `Scan`, `Batch*`, `UpdateItem`, and provider writes remain denied
+by omission.
+
+> Reference: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html>
+
+The store→IAM binding is drift-proofed by
+`test_iam_grants_exactly_the_underlying_actions_the_store_transacts`, which
+drives the real store once, inspects **every** actual transaction leg, maps each
+leg to its underlying item action, and asserts the template grants exactly that
+set — so any future drift in the store's legs or the template fails the build.
+`test_dynamodb_grant_is_scoped_to_the_exact_operations_table_arn` pins the
+resource to the operations table ARN.
+
+No S3 runtime access, `iam:PassRole`, Step Functions, or wildcard action appears
+in any E1 policy. The CMK key policy additionally grants the CloudWatch Logs
+service principal `kms:Decrypt`/`kms:GenerateDataKey`, scoped to this account's
+operations log groups, so the CMK-encrypted Lambda and API access log groups work
+under least privilege.
 
 ### Runtime KMS grant for the customer-managed key (issue #413)
 
@@ -158,13 +192,15 @@ runtime role therefore holds the documented DynamoDB CMK data-plane action set:
 | `kms:DescribeKey` | Resolve key metadata before use |
 | `kms:CreateGrant` | Let DynamoDB hold a grant for background maintenance |
 
-**Root cause fixed here:** the live `begin_observation` call failed with a
-DynamoDB `AccessDeniedException` even though the IAM policy simulator allowed
-`TransactWriteItems`/`GetItem`. The runtime role's KMS grant held only
-`kms:Decrypt` + `kms:GenerateDataKey`, so the CMK-backed write path was denied at
-the KMS layer. The IAM simulator does not model the KMS authorization DynamoDB
-performs on the caller's behalf, which is why the simulator passed while the live
-call failed. The fix grants exactly the documented minimum above — nothing more.
+**Second root cause fixed here (KMS layer):** beyond the DynamoDB action fix
+above, the live `begin_observation` call also had to clear the CMK layer. The
+runtime role's KMS grant originally held only `kms:Decrypt` +
+`kms:GenerateDataKey`, so the CMK-backed write path was denied at the KMS layer
+even once the correct DynamoDB item permission (`PutItem`) was in place. The IAM
+policy simulator does not model the KMS authorization DynamoDB performs on the
+caller's behalf, which is why a simulator run over the DynamoDB actions can pass
+while the live call fails. The fix grants exactly the documented minimum above —
+nothing more.
 
 **Tightly constrained, not broadened.** The grant is scoped so the runtime can
 never use the key for direct, generic KMS calls:
