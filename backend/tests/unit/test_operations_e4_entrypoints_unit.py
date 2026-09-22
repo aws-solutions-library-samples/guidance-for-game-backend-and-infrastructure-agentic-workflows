@@ -82,3 +82,74 @@ def test_settings_resolve_with_full_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert settings.appconfig_profile == "operations-kill-switch"
     assert settings.appconfig_extension_port == 2772
     assert settings.observation.workspace_id == "workspace-default"
+
+
+def test_sweeper_handler_runs_operation_expiry_and_freshness(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Standard library
+    from types import SimpleNamespace
+
+    module = importlib.import_module("operations.control.sweeper_entry")
+
+    class _Metrics:
+        def __init__(self) -> None:
+            self.expired: list[int] = []
+            self.events: list[str] = []
+
+        def put_expiry_sweep_expired(self, count: int) -> None:
+            self.expired.append(count)
+
+        def record(self, event: str) -> None:
+            self.events.append(event)
+
+    metrics = _Metrics()
+    runtime = SimpleNamespace(
+        sweeper=SimpleNamespace(run=lambda: SimpleNamespace(considered=2, expired=1, errors=0, pages=1)),
+        freshness_service=SimpleNamespace(
+            run=lambda: SimpleNamespace(attempted=True, applied=True, outcome="applied", config_version=8)
+        ),
+        metrics=metrics,
+    )
+    monkeypatch.setattr(module, "_runtime", lambda: runtime)
+    result = module.handler({}, None)
+    assert result == {
+        "considered": 2,
+        "expired": 1,
+        "errors": 0,
+        "pages": 1,
+        "freshness_attempted": True,
+        "freshness_applied": True,
+        "freshness_outcome": "applied",
+        "freshness_config_version": 8,
+    }
+    assert metrics.expired == [1]
+
+
+def test_sweeper_refresh_failure_emits_unavailable_and_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Standard library
+    from types import SimpleNamespace
+
+    module = importlib.import_module("operations.control.sweeper_entry")
+
+    class _Metrics:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def put_expiry_sweep_expired(self, count: int) -> None:
+            pass
+
+        def record(self, event: str) -> None:
+            self.events.append(event)
+
+    def fail_refresh() -> None:
+        raise RuntimeError("unavailable")
+
+    metrics = _Metrics()
+    runtime = SimpleNamespace(
+        sweeper=SimpleNamespace(run=lambda: SimpleNamespace(considered=0, expired=0, errors=0, pages=1)),
+        freshness_service=SimpleNamespace(run=fail_refresh),
+        metrics=metrics,
+    )
+    monkeypatch.setattr(module, "_runtime", lambda: runtime)
+    with pytest.raises(RuntimeError):
+        module.handler({}, None)
+    assert metrics.events == ["kill_switch.unavailable"]

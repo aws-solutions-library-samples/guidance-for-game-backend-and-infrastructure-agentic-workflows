@@ -166,15 +166,20 @@ class KillSwitchGate:
         )
 
     def read_fresh_document(self) -> dict[str, Any]:
-        """Return the freshly fetched, validated document.
+        """Return the freshly fetched, validated, non-stale document."""
+        document = self.read_valid_document()
+        self._require_fresh(document)
+        return document
 
-        The admin control handler uses this only to classify reductions as
-        immediate hard-downs. An unavailable or stale document still raises
-        :class:`KillSwitchUnavailable`; the handler may then continue with the
-        bootstrap recovery path, whose CAS and admin authorization remain
-        independent of this advisory comparison.
+    def read_valid_document(self) -> dict[str, Any]:
+        """Return a fetched schema-valid document without applying freshness.
+
+        This narrower primitive exists for the system freshness sweeper, which
+        must be able to reissue an expired but otherwise valid all-disabled or
+        authority-preserving document. Normal authorization always uses
+        :meth:`evaluate`/``read_fresh_document`` and still fails closed on stale.
         """
-        return self._load_fresh_document()
+        return self._load_valid_document()
 
     def require_phase(self, phase: str) -> KillSwitchDecision:
         """Evaluate and return the decision, or raise :class:`PhaseDenied`.
@@ -207,7 +212,7 @@ class KillSwitchGate:
 
     # -- Internals -------------------------------------------------------
 
-    def _load_fresh_document(self) -> dict[str, Any]:
+    def _load_valid_document(self) -> dict[str, Any]:
         try:
             raw = self._extension.fetch_configuration()
         except KillSwitchUnavailable:
@@ -233,7 +238,6 @@ class KillSwitchGate:
         except ControlContractError as exc:
             raise KillSwitchUnavailable("kill-switch document failed its contract") from exc
 
-        self._require_fresh(document)
         return document
 
     def _require_fresh(self, document: dict[str, Any]) -> None:

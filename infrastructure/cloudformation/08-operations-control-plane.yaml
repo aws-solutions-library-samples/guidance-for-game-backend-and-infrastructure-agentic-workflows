@@ -154,6 +154,25 @@ Parameters:
       2772 is the official extension default; injected explicitly so the handler
       and the extension agree.
 
+  KillSwitchFreshnessSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 1800
+    MaxValue: 86400
+    Description: >-
+      Deadman validity horizon stamped into each kill-switch document. The
+      default leaves ample room for the 5-minute gradual rollout and 5-minute
+      bake before an old document expires.
+
+  KillSwitchRefreshBeforeSeconds:
+    Type: Number
+    Default: 1800
+    MinValue: 900
+    MaxValue: 43200
+    Description: >-
+      Remaining validity at which the scheduled sweeper reissues the exact same
+      authority booleans through the audited CAS control service.
+
   CodeS3Bucket:
     Type: String
     Default: ''
@@ -919,6 +938,8 @@ Resources:
           GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID: !Ref ImmediateDeploymentStrategy
           # The localhost port the AppConfig Lambda extension serves on.
           GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT: !Ref AppConfigExtensionPort
+          GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS: !Ref KillSwitchFreshnessSeconds
+          GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS: !Ref KillSwitchRefreshBeforeSeconds
           # The HMAC cursor-signing key is delivered as a Secrets Manager ARN;
           # the handler reads the value with a scoped GetSecretValue. The secret
           # VALUE never appears in this template, its outputs, or logs.
@@ -957,6 +978,8 @@ Resources:
       MemorySize: !Ref LambdaMemoryMb
       Timeout: !Ref ControlTimeoutSeconds
       ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Layers:
+        - !Ref AppConfigExtensionLayerArn
       LoggingConfig:
         LogGroup: !Ref SweeperLogGroup
       TracingConfig:
@@ -982,6 +1005,8 @@ Resources:
           GBAW_OPERATIONS_APPCONFIG_GRADUAL_STRATEGY_ID: !Ref GradualDeploymentStrategy
           GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID: !Ref ImmediateDeploymentStrategy
           GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT: !Ref AppConfigExtensionPort
+          GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS: !Ref KillSwitchFreshnessSeconds
+          GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS: !Ref KillSwitchRefreshBeforeSeconds
           GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN: !Ref CursorSigningSecret
       Code:
         S3Bucket: !Ref CodeS3Bucket

@@ -243,6 +243,14 @@ def test_control_mode_defaults_disabled(template):
     assert set(param["AllowedValues"]) == {"disabled", "enabled"}
 
 
+def test_freshness_defaults_leave_gradual_deployment_margin(template):
+    freshness = template["Parameters"]["KillSwitchFreshnessSeconds"]["Default"]
+    refresh_before = template["Parameters"]["KillSwitchRefreshBeforeSeconds"]["Default"]
+    assert freshness == 3600
+    assert refresh_before == 1800
+    assert freshness - refresh_before >= 720
+
+
 def test_every_resource_is_provisioning_gated(template):
     # A default deploy (Provisioned=false) must create ZERO resources.
     for name, body in template["Resources"].items():
@@ -389,10 +397,11 @@ def test_frozen_routes_present_and_jwt(template):
 # --------------------------------------------------------------------------- #
 # AppConfig Lambda extension layer via validated parameter
 # --------------------------------------------------------------------------- #
-def test_control_function_attaches_appconfig_extension_layer(template):
+def test_control_and_sweeper_attach_appconfig_extension_layer(template):
     # !Ref AppConfigExtensionLayerArn flattens to the string parameter name.
-    layers = template["Resources"]["ControlFunction"]["Properties"]["Layers"]
-    assert "AppConfigExtensionLayerArn" in layers
+    for function_name in ("ControlFunction", "SweeperFunction"):
+        layers = template["Resources"][function_name]["Properties"]["Layers"]
+        assert "AppConfigExtensionLayerArn" in layers
 
 
 def test_extension_layer_parameter_is_pattern_constrained_to_official_layer(template):
@@ -435,8 +444,8 @@ def test_control_function_injects_appconfig_identifiers(template):
     # deployment ceiling parameter, never repurposed to the control on/off lever.
     assert env["GBAW_OPERATIONS_MODE"] == "OperationsMode"
     assert env["GBAW_OPERATIONS_MODE"] != env["GBAW_OPERATIONS_CONTROL_MODE"]
-    # The freshness horizon is a code default (control_service), not an env var.
-    assert "GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS" not in env
+    assert env["GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS"] == "KillSwitchFreshnessSeconds"
+    assert env["GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS"] == "KillSwitchRefreshBeforeSeconds"
 
 
 def test_control_and_sweeper_share_the_control_mode_lever(template):
@@ -529,7 +538,7 @@ def test_appconfig_control_actions_cover_every_provider_resource(template):
         assert required in start
 
     listed = json.dumps(statements["ListKillSwitchDeploymentsOnly"]["Resource"])
-    assert "application/${ControlApplication}\"" in listed
+    assert 'application/${ControlApplication}"' in listed
     assert "environment/${ControlEnvironmentResource}" in listed
 
     inspect = json.dumps(statements["InspectOrStopKillSwitchDeploymentsOnly"]["Resource"])

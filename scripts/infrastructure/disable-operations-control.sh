@@ -96,6 +96,8 @@ aws cloudformation update-stack \
         "ParameterKey=AppConfigExtensionLayerArn,UsePreviousValue=true" \
         "ParameterKey=OperationsMode,UsePreviousValue=true" \
         "ParameterKey=AppConfigExtensionPort,UsePreviousValue=true" \
+        "ParameterKey=KillSwitchFreshnessSeconds,UsePreviousValue=true" \
+        "ParameterKey=KillSwitchRefreshBeforeSeconds,UsePreviousValue=true" \
         "ParameterKey=LambdaMemoryMb,UsePreviousValue=true" \
         "ParameterKey=ControlTimeoutSeconds,UsePreviousValue=true" \
         "ParameterKey=ReservedConcurrency,UsePreviousValue=true" \

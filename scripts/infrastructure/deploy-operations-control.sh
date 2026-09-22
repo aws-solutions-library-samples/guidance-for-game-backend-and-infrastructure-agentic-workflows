@@ -110,6 +110,8 @@ OPERATIONS_TRUSTED_AUDIENCE="${GBAW_OPERATIONS_TRUSTED_AUDIENCE:-}"
 # The EXPLICIT, pre-existing artifact bucket for the Lambda zip. No discovery,
 # no creation.
 GBAW_OPERATIONS_ARTIFACT_BUCKET="${GBAW_OPERATIONS_ARTIFACT_BUCKET:-}"
+KILL_SWITCH_FRESHNESS_SECONDS="${GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS:-3600}"
+KILL_SWITCH_REFRESH_BEFORE_SECONDS="${GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS:-1800}"
 
 AWS_PROFILE="${AWS_PROFILE:-default}"
 AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
@@ -148,6 +150,10 @@ Environment for --enable:
   GBAW_OPERATIONS_ARTIFACT_BUCKET            REQUIRED explicit, pre-existing
                                              artifact bucket. Verified, never
                                              discovered or created.
+  GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS
+                                             Optional deadman horizon (default 3600).
+  GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS
+                                             Optional refresh window (default 1800).
   AWS_PROFILE, AWS_REGION                    Credentials/region, passed
                                              explicitly and verified before any
                                              write.
@@ -278,6 +284,18 @@ fi
 if [ -z "$GBAW_OPERATIONS_ARTIFACT_BUCKET" ]; then
     echo "❌ Refusing to enable: GBAW_OPERATIONS_ARTIFACT_BUCKET (explicit, pre-existing" >&2
     echo "   artifact bucket) is required. This wrapper never discovers or creates a bucket." >&2
+    exit 3
+fi
+case "$KILL_SWITCH_FRESHNESS_SECONDS:$KILL_SWITCH_REFRESH_BEFORE_SECONDS" in
+    *[!0-9:]*|:*|*:)
+        echo "❌ Kill-switch freshness and refresh windows must be positive integers." >&2
+        exit 3
+        ;;
+esac
+if [ "$KILL_SWITCH_FRESHNESS_SECONDS" -lt 1800 ] \
+    || [ "$KILL_SWITCH_REFRESH_BEFORE_SECONDS" -lt 900 ] \
+    || [ $((KILL_SWITCH_FRESHNESS_SECONDS - KILL_SWITCH_REFRESH_BEFORE_SECONDS)) -lt 720 ]; then
+    echo "❌ Kill-switch freshness settings do not leave the required 720-second deployment margin." >&2
     exit 3
 fi
 if [ ! -f "$BACKEND_SRC/$CONTROL_MODULE_PATH" ]; then
@@ -586,6 +604,8 @@ aws cloudformation deploy \
         "CodeS3Bucket=$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
         "ControlCodeS3Key=$S3_KEY" \
         "OperationsMode=$OPERATIONS_MODE" \
-        "AppConfigExtensionLayerArn=$APPCONFIG_EXTENSION_LAYER_ARN"
+        "AppConfigExtensionLayerArn=$APPCONFIG_EXTENSION_LAYER_ARN" \
+        "KillSwitchFreshnessSeconds=$KILL_SWITCH_FRESHNESS_SECONDS" \
+        "KillSwitchRefreshBeforeSeconds=$KILL_SWITCH_REFRESH_BEFORE_SECONDS"
 
 echo "✅ Deployed $STACK_NAME with ControlMode=enabled (AppConfig kill switch live)."

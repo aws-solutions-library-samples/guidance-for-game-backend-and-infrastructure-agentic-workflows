@@ -410,6 +410,8 @@ class ControlPlaneDeploymentSettings:
     appconfig_gradual_strategy_id: str
     appconfig_immediate_strategy_id: str
     provisioned: bool
+    kill_switch_freshness_seconds: int
+    kill_switch_refresh_before_seconds: int
     # The dedicated control-plane availability mode (issue #416), independent of
     # the global GBAW_OPERATIONS_MODE static-execution ceiling. Admin controls
     # remain available to RECOVER operations while static execution is disabled.
@@ -434,6 +436,12 @@ class ControlPlaneDeploymentSettings:
                 raise ValueError(f"{name} must be a non-empty string")
         if not (1 <= self.appconfig_extension_port <= 65535):
             raise ValueError("appconfig_extension_port must be a valid TCP port")
+        if self.kill_switch_freshness_seconds < 1800:
+            raise ValueError("kill_switch_freshness_seconds must be at least 1800")
+        if self.kill_switch_refresh_before_seconds <= 0:
+            raise ValueError("kill_switch_refresh_before_seconds must be positive")
+        if self.kill_switch_freshness_seconds - self.kill_switch_refresh_before_seconds < 720:
+            raise ValueError("kill-switch refresh window must leave at least 720 seconds for deployment")
         if self.control_mode not in CONTROL_MODES:
             raise ValueError(f"GBAW_OPERATIONS_CONTROL_MODE must be one of {CONTROL_MODES}")
         # Exactly one cursor-key source (raw local-test key XOR secret ARN).
@@ -485,6 +493,10 @@ def resolve_control_plane_deployment_settings(
         cursor_signing_key=_optional_or_none(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY"),
         cursor_signing_key_secret_arn=_optional_or_none(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN"),
         provisioned=_bool(source, "GBAW_OPERATIONS_CONTROL_PROVISIONED", True),
+        kill_switch_freshness_seconds=_positive_int(source, "GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS", 3600),
+        kill_switch_refresh_before_seconds=_positive_int(
+            source, "GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS", 1800
+        ),
         control_mode=resolve_control_mode(source),
     )
 

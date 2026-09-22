@@ -77,3 +77,20 @@ def test_control_entry_fails_closed_when_control_mode_disabled(monkeypatch: "pyt
             None,
         )
     module._runtime.cache_clear()  # type: ignore[attr-defined]
+
+
+def test_kill_switch_freshness_defaults_leave_room_for_gradual_deployment() -> None:
+    settings = resolve_control_plane_deployment_settings(dict(_BASE))
+    assert settings.kill_switch_freshness_seconds == 3600
+    assert settings.kill_switch_refresh_before_seconds == 1800
+    # The 5-minute rollout + 5-minute bake must complete before the old
+    # document reaches not_after, with additional scheduling margin.
+    assert settings.kill_switch_freshness_seconds - settings.kill_switch_refresh_before_seconds >= 720
+
+
+def test_kill_switch_refresh_window_must_leave_deployment_margin() -> None:
+    env = dict(_BASE)
+    env["GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS"] = "1800"
+    env["GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS"] = "1200"
+    with pytest.raises(ValueError):
+        resolve_control_plane_deployment_settings(env)

@@ -117,6 +117,7 @@ def _build_runtime() -> _ControlRuntime:
         audit_store=control_audit_store,
         publisher=publisher,
         admin_group=settings.admin_group,
+        freshness_seconds=settings.kill_switch_freshness_seconds,
         metrics=metrics,
     )
 

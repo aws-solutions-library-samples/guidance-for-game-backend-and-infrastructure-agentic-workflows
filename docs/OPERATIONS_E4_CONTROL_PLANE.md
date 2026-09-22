@@ -74,6 +74,15 @@ current document. Its parsed JSON is field-for-field identical to the fixture
 **except** the author-stamped `issued_at`/`not_after` timestamps (so the raw
 bytes differ): the seeded pair is a fixed, safe, already-expired window.
 
+A normal control document is valid for one hour. The scheduled maintenance
+function runs every two minutes and, once 30 minutes or less remain, reissues
+the exact same validated booleans through the normal audited CAS service under
+the fixed `operations.freshness-sweeper` system actor. That advances the
+immutable version and uses the gradual strategy; the 30-minute lead leaves 20
+minutes beyond the configured 5-minute rollout plus 5-minute bake. An
+unreadable or malformed document is never reconstructed from another source: it
+emits `KillSwitchUnavailable` and the invocation fails closed.
+
 Two deployment strategies:
 
 - **gradual** (`game-agent-operations-gradual`) — linear rollout with a bake
@@ -105,6 +114,8 @@ COGNITO_ISSUER=... COGNITO_CLIENT_ID=... \
 GBAW_OPERATIONS_TENANT_ID=... GBAW_OPERATIONS_WORKSPACE_ID=... \
 GBAW_OPERATIONS_TABLE_NAME=... GBAW_OPERATIONS_KMS_KEY_ARN=... \
 GBAW_OPERATIONS_ARTIFACT_BUCKET=... \
+GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS=3600 \
+GBAW_OPERATIONS_KILL_SWITCH_REFRESH_BEFORE_SECONDS=1800 \
 AWS_PROFILE=<profile> AWS_REGION=<region> \
   scripts/infrastructure/deploy-operations-control.sh --enable
 ```
