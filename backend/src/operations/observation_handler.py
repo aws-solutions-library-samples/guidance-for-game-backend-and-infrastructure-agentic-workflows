@@ -29,6 +29,7 @@ from __future__ import annotations
 
 # Standard library
 import json
+import logging
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -93,19 +94,30 @@ class ObservationRequestHandler:
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one API Gateway HTTP API (payload v2) invocation."""
+        # ``stage`` is a single-element list mutated by ``_dispatch`` as it
+        # advances, so the unexpected catch-all can name WHERE the failure
+        # surfaced using only a static, allowlisted literal — never a
+        # request-derived value.
+        stage = ["dispatch"]
         try:
-            return self._dispatch(event)
+            return self._dispatch(event, stage)
         except ObservationBoundaryError as exc:
+            # A typed boundary error is an EXPECTED outcome, not an unexpected
+            # internal failure; it maps to its HTTP status and is never logged
+            # through the unexpected-diagnostic channel.
             return _error_response(exc)
-        except Exception:  # noqa: BLE001 - catch-all: never leak an internal detail
+        except Exception as exc:  # noqa: BLE001 - catch-all: never leak an internal detail
+            _log_unexpected_exception(stage[0], _method(event), exc)
             return _error_response(
                 ObservationBoundaryError(ObservationErrorCode.INTERNAL_ERROR, "observation request failed")
             )
 
-    def _dispatch(self, event: Mapping[str, Any]) -> dict[str, Any]:
+    def _dispatch(self, event: Mapping[str, Any], stage: list[str]) -> dict[str, Any]:
         method = _method(event)
+        stage[0] = "identity"
         principal = self._verified_principal(event)
         if method == "POST":
+            stage[0] = "parse_observe"
             request = self._parse_observe_request(event)
             context = ObservationRequestContext(
                 requester=principal,
@@ -114,11 +126,14 @@ class ObservationRequestHandler:
                 capability_id=self._capability_id,
                 capability_version=self._capability_version,
             )
+            stage[0] = "service_observe"
             observation = self._service.observe(request, context)
             return _json_response(200, observation)
         if method == "GET":
+            stage[0] = "parse_status"
             status_request = self._parse_status_request(event)
             status_context = StatusRequestContext(requester=principal, request_id=_request_id(event))
+            stage[0] = "service_status"
             status = self._service.get_status(status_request, status_context)
             return _json_response(200, _status_body(status))
         raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "unsupported method")
@@ -276,3 +291,137 @@ def _error_response(error: ObservationBoundaryError) -> dict[str, Any]:
         "retryable": error.retryable,
     }
     return _json_response(status, body)
+
+
+# -- Safe diagnostic logging at the handler's unexpected catch-all (#413) ------
+#
+# Live diagnosis of the deployed E1 observe path found the protocol adapter's
+# bare ``except Exception`` maps any unexpected error to a sanitized generic 500
+# and returns, emitting NO signal — the same blind spot #413 root-caused at the
+# store, one layer up. This boundary emits a single BOUNDED, sanitized record
+# naming only: a fixed event name, the request STAGE (an allowlisted literal),
+# the HTTP METHOD (an allowlisted literal), the exception TYPE, and the bounded
+# AWS ``Error.Code`` / transaction cancellation-reason codes when a
+# botocore-shaped exception carries them.
+#
+# It is deliberately stricter than #409's general ``logger.exception`` policy:
+# the handler processes an untrusted event, body, idempotency token, operation
+# id, and path parameter, any of which can appear in an exception MESSAGE or in
+# stack locals. So it emits sanitized METADATA ONLY: never the exception
+# message, ``str(exc)``, the event/body, an id/token/ARN/account, a traceback,
+# or ``exc_info``. Bounded lengths cap any adversarial code a provider returns.
+_MAX_CODE_LEN = 128
+_MAX_REASON_CODES = 16
+
+# The emit uses the Python standard-library ``logging`` module, NOT loguru. This
+# handler ships in the minimal E1 observe Lambda whose dependency closure
+# deliberately excludes loguru; importing it here would break the real package
+# import before deployment (the #409/#413 regression). ``logging`` is always
+# present in the Lambda runtime, so the diagnostic stays Lambda-safe without
+# expanding that closure.
+#
+# The whole record lives in the ``LogRecord`` message string: a CloudWatch/Lambda
+# handler renders ``%(message)s`` and carries no structured ``extra`` mapping, so
+# a datum bound as ``extra`` would be dropped before it reached CloudWatch. Any
+# provider-defined code echoed into that string is reduced to ``[A-Za-z0-9._-]``
+# (anything else becomes ``.``), keeping the record a single, unambiguous line
+# and foreclosing log-forging via an embedded newline, separator, or brace.
+_DIAG_EVENT = "observation_handler_exception"
+_DIAG_FIELD_SEP = " "
+_SAFE_TOKEN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+# The strict allowlist of dispatch stages. Any value outside it collapses to
+# ``"unknown"`` so a stage token is always a fixed literal, never free text.
+_STAGE_ALLOWLIST = frozenset(
+    {
+        "dispatch",
+        "identity",
+        "parse_observe",
+        "service_observe",
+        "parse_status",
+        "service_status",
+    }
+)
+
+# The strict allowlist of HTTP methods. The two routed verbs render verbatim;
+# every other (or empty/hostile) method collapses to ``"OTHER"``.
+_METHOD_ALLOWLIST = frozenset({"POST", "GET"})
+
+# The handler-boundary diagnostic channel (stdlib logging, Lambda-safe).
+_LOGGER = logging.getLogger(__name__)
+
+
+def _safe_token(value: str) -> str:
+    """Reduce a bounded provider token to a single-line, separator-safe form."""
+    return "".join(ch if ch in _SAFE_TOKEN_CHARS else "." for ch in value)
+
+
+def _allowlisted_stage(stage: str) -> str:
+    return stage if stage in _STAGE_ALLOWLIST else "unknown"
+
+
+def _allowlisted_method(method: str) -> str:
+    return method if method in _METHOD_ALLOWLIST else "OTHER"
+
+
+def _aws_error_code(exc: Exception) -> str | None:
+    """The bounded AWS error code from a botocore-shaped exception, or None.
+
+    Reads only ``exc.response["Error"]["Code"]`` (a short, provider-defined
+    token). Never reads the error MESSAGE.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    code = response.get("Error", {}).get("Code")
+    if not isinstance(code, str) or not code:
+        return None
+    return code[:_MAX_CODE_LEN]
+
+
+def _bounded_reason_codes(exc: Exception) -> list[str]:
+    """The bounded, sorted set of transaction cancellation-reason codes.
+
+    Reads only the ``Code`` of each entry in ``CancellationReasons`` (dropping
+    the inert ``"None"`` marker). Never reads any reason ``Message``.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return []
+    reasons = response.get("CancellationReasons")
+    if not isinstance(reasons, list):
+        return []
+    codes = {r.get("Code") for r in reasons if isinstance(r, dict)}
+    bounded = sorted(code[:_MAX_CODE_LEN] for code in codes if isinstance(code, str) and code and code != "None")
+    return bounded[:_MAX_REASON_CODES]
+
+
+def _log_unexpected_exception(stage: str, method: str, exc: Exception) -> None:
+    """Emit a bounded, sanitized diagnostic for an UNEXPECTED handler failure.
+
+    Logs ONLY a fixed event name, the allowlisted dispatch stage, the
+    allowlisted HTTP method, the exception TYPE, and the bounded AWS error /
+    cancellation-reason codes. It never logs the exception message, ``str(exc)``,
+    the request event/body, an idempotency token, an operation/request id, a
+    path parameter, an ARN, an account, provider data, or stack locals, and it
+    never attaches a traceback or ``exc_info``.
+
+    ``stage`` / ``method`` are coerced through strict allowlists to fixed
+    literals and ``exception_type`` is a Python class name, so only the two
+    provider-controlled tokens (the AWS error code and each cancellation-reason
+    code) are passed through :func:`_safe_token`. The record is a fully-formed
+    ``key=value`` string emitted with no ``args`` — ``logging`` never runs
+    ``%``-formatting over it — and no ``exc_info``.
+    """
+    error_code = _aws_error_code(exc)
+    reason_codes = _bounded_reason_codes(exc)
+    fields = [
+        _DIAG_EVENT,
+        "stage=" + _allowlisted_stage(stage),
+        "http_method=" + _allowlisted_method(method),
+        "exception_type=" + _safe_token(type(exc).__name__),
+        "aws_error_code=" + (_safe_token(error_code) if error_code else "none"),
+        "cancellation_reason_codes="
+        + (",".join(_safe_token(code) for code in reason_codes) if reason_codes else "none"),
+    ]
+    _LOGGER.warning(_DIAG_FIELD_SEP.join(fields))
