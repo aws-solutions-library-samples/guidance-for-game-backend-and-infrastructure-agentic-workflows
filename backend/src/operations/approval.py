@@ -401,3 +401,40 @@ class ApprovalService:
             )
 
         return deepcopy(approval)
+
+
+# Local modules
+# -- Lifecycle decisions (reject / cancel / expire) -------------------------
+#
+# The reject/cancel/expiry lifecycle decisions live in
+# :mod:`operations.decisions` to keep this module focused on the grant path,
+# but they are part of the same public approval surface. They are re-exported
+# here so callers import the whole approval domain from one place. The import
+# is at the end of the module so ``operations.decisions`` (which imports the
+# grant-path symbols defined above) resolves without a circular import.
+from operations.decisions import (  # noqa: E402  (deferred to avoid a cycle)
+    DecisionCommitOutcome,
+    DecisionRequest,
+    DecisionRequestContext,
+    DecisionStore,
+    LifecycleDecisionService,
+)
+
+__all__ = [
+    "ApprovalBoundaryError",
+    "ApprovalCommitOutcome",
+    "ApprovalErrorCode",
+    "ApprovalPolicy",
+    "ApprovalPolicyError",
+    "ApprovalPolicyReason",
+    "ApprovalRequest",
+    "ApprovalRequestContext",
+    "ApprovalService",
+    "ApprovalStore",
+    "DecisionCommitOutcome",
+    "DecisionRequest",
+    "DecisionRequestContext",
+    "DecisionStore",
+    "LifecycleDecisionService",
+    "StoredPreparedOperation",
+]
