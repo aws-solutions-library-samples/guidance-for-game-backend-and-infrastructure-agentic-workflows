@@ -381,10 +381,16 @@ def _detail_projection_errors(document: dict[str, Any]) -> list[str]:
         errors.append("verification outcome cannot be not_applicable when it applies")
 
     rollback = document["rollback"]
-    if not rollback["applicable"] and rollback["outcome"] != "not_applicable":
-        errors.append("rollback outcome must be not_applicable when it does not apply")
-    if rollback["applicable"] and rollback["outcome"] == "not_applicable":
-        errors.append("rollback outcome cannot be not_applicable when it applies")
+    # not_recorded is an honest "no rollback was recorded" and is exempt from the
+    # applicable/outcome consistency rule: it means the backend did not record a
+    # rollback and refuses to infer one from state.
+    if rollback["outcome"] != "not_recorded":
+        if not rollback["applicable"] and rollback["outcome"] != "not_applicable":
+            errors.append("rollback outcome must be not_applicable when it does not apply")
+        if rollback["applicable"] and rollback["outcome"] == "not_applicable":
+            errors.append("rollback outcome cannot be not_applicable when it applies")
+    elif rollback["applicable"]:
+        errors.append("rollback outcome not_recorded requires applicable=false")
 
     seen_phases: set[str] = set()
     for index, phase in enumerate(document["phases"]):

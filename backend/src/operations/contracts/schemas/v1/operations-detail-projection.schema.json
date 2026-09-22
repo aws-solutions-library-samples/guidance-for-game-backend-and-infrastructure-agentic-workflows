@@ -49,7 +49,7 @@
       "$ref": "#/$defs/visibility"
     },
     "rollback": {
-      "$ref": "#/$defs/visibility"
+      "$ref": "#/$defs/rollback_visibility"
     },
     "evidence": {
       "description": "A small bounded set of public-safe evidence entries. Each entry is a category plus a bounded free-of-payload summary; it never carries a raw provider response.",
@@ -145,6 +145,30 @@
         },
         "recorded_at": {
           "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        }
+      }
+    },
+    "rollback_visibility": {
+      "description": "Whether a rollback applies to this operation and its recorded outcome. The special outcome not_recorded means the backend has NOT recorded an explicit rollback for this operation and does not infer one from state; it is an honest absence, never a fabricated pending rollback. Exposes only visibility, never provider detail.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicable",
+        "outcome"
+      ],
+      "properties": {
+        "applicable": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "not_applicable",
+            "not_recorded",
+            "pending",
+            "succeeded",
+            "failed"
+          ]
         }
       }
     }

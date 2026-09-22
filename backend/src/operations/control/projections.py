@@ -239,7 +239,7 @@ def _detail_projection(operation_id: str, operation: dict[str, Any], evidence: O
         "updated_at": updated_at,
         "phases": _phase_timeline(state, created_at),
         "verification": _verification_visibility(state),
-        "rollback": _rollback_visibility(state),
+        "rollback": _rollback_visibility(state, ledger=evidence.ledger),
         "evidence": _evidence_entries(evidence),
     }
 
@@ -273,13 +273,44 @@ def _verification_visibility(state: str) -> dict[str, Any]:
     return {"applicable": False, "outcome": "not_applicable"}
 
 
-def _rollback_visibility(state: str) -> dict[str, Any]:
-    # Rollback is a separate inverse operation; the detail view only exposes
-    # whether one applies, never provider detail. A failed execution is the only
-    # state where rollback is presented as applicable-and-pending.
+def _rollback_visibility(state: str, *, ledger: Any = None) -> dict[str, Any]:
+    """Report rollback visibility truthfully from the recorded ledger.
+
+    Rollback is a separate inverse operation. The detail view exposes ONLY
+    whether an explicit rollback was recorded and, if so, its outcome — never
+    provider detail and never an inference. If the operation failed but no
+    rollback event was recorded, the honest answer is ``not_recorded`` (we did
+    not record a rollback and refuse to fabricate an applicable-and-pending
+    one). A healthy, non-rollback operation is ``not_applicable``.
+    """
+    entries = ledger if isinstance(ledger, list) else []
+    outcome = _recorded_rollback_outcome(entries)
+    if outcome is not None:
+        return {"applicable": True, "outcome": outcome}
     if state == "failed":
-        return {"applicable": True, "outcome": "pending"}
+        # A rollback may be warranted, but none is recorded: say so honestly.
+        return {"applicable": False, "outcome": "not_recorded"}
     return {"applicable": False, "outcome": "not_applicable"}
+
+
+def _recorded_rollback_outcome(ledger: list[Any]) -> str | None:
+    """Return the recorded rollback outcome, or ``None`` if none is recorded."""
+    recorded: str | None = None
+    for entry in ledger:
+        if not isinstance(entry, dict):
+            continue
+        event_type = entry.get("event_type")
+        text = event_type.lower() if isinstance(event_type, str) else ""
+        if "rollback" not in text:
+            continue
+        if "succeed" in text or "success" in text or "reconcil" in text:
+            recorded = "succeeded"
+        elif "fail" in text:
+            recorded = "failed"
+        else:
+            # A rollback was started/recorded but has no terminal signal yet.
+            recorded = recorded or "pending"
+    return recorded
 
 
 def _evidence_entries(evidence: OperationEvidence) -> list[dict[str, Any]]:
