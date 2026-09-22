@@ -32,6 +32,7 @@ from functools import lru_cache
 from typing import Any
 
 # Local modules
+from operations.control.gate_bootstrap import build_kill_switch_gate
 from operations.observation import AuthorityInputs, ObservationService
 from operations.observation_handler import ObservationRequestHandler
 from operations.observation_store import DynamoDbObservationStore
@@ -39,9 +40,12 @@ from operations.observe.gamelift_adapter import GameLiftObservationAdapter
 from operations.observe.metrics import CloudWatchObservationMetrics
 from operations.settings import (
     ObservationDeploymentSettings,
+    resolve_kill_switch_extension_settings,
     resolve_observation_deployment_settings,
     resolve_operations_settings,
 )
+
+__all__ = ["handler", "build_kill_switch_gate"]
 
 # The observe capability (playbook) this Lambda serves.
 _CAPABILITY_ID = "gamelift.observe-fleet"
@@ -133,12 +137,21 @@ def _build_handler(settings: ObservationDeploymentSettings) -> Any:
     # Local modules
     from operations.router import OperationsRequestRouter
 
+    # Build the deployment-wide kill-switch gate (issue #416) when the AppConfig
+    # read target is configured. E2 prepare is an advise-authority act, so the
+    # gate's static floor is the deployment mode; the gate can only de-escalate.
+    extension_settings = resolve_kill_switch_extension_settings()
+    kill_switch_gate = build_kill_switch_gate(
+        extension_settings=extension_settings,
+        static_authority=settings.operations.mode,
+    )
     approval_handler = _build_approval_handler(
         settings=settings,
         boundary=boundary,
         dynamodb_client=dynamodb_client,
         cloudwatch_client=cloudwatch_client,
         observation_store=store,
+        kill_switch_gate=kill_switch_gate,
     )
     router = OperationsRequestRouter(
         observation_handler=observation_handler,
@@ -168,6 +181,7 @@ def _build_approval_handler(
     dynamodb_client: Any,
     cloudwatch_client: Any,
     observation_store: Any,
+    kill_switch_gate: Any = None,
 ) -> Any:
     """Construct the E2 approval handler and its service dependencies."""
     # Local modules
@@ -235,6 +249,7 @@ def _build_approval_handler(
         playbook=playbook,
         clock=_utcnow,
         operation_ttl_seconds=ops.preparation_expiry_s,
+        kill_switch_gate=kill_switch_gate,
     )
     orchestrator = PrepareOrchestrator(
         prepare_service=prepare_service,

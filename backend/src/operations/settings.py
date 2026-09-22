@@ -447,3 +447,84 @@ def resolve_control_plane_deployment_settings(
         cursor_signing_key=_required_str(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY"),
         provisioned=_bool(source, "GBAW_OPERATIONS_CONTROL_PROVISIONED", True),
     )
+
+
+# -- E4 kill-switch extension bootstrap (issue #416) --------------------------
+#
+# The three deployable write-capable entrypoints (E2 prepare in the observe
+# Lambda, the E3 dispatcher, the E3 executor) enforce the deployment-wide
+# kill-switch by constructing a real KillSwitchGate over the AppConfig Lambda
+# extension. That gate is built only when the AppConfig read target is
+# configured. To keep a pre-E4 deployment backward compatible, ALL three core
+# identifiers (application/environment/profile) absent means "no gate" (a no-op
+# gate that never denies). Any *partial* configuration fails closed at startup:
+# a half-configured switch must never silently leave the write path ungated.
+
+CONTROL_MODES = ("disabled", "enabled")
+_DEFAULT_CONTROL_MODE = "disabled"
+
+_KILL_SWITCH_CORE_KEYS = (
+    "GBAW_OPERATIONS_APPCONFIG_APPLICATION",
+    "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT",
+    "GBAW_OPERATIONS_APPCONFIG_PROFILE",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class KillSwitchExtensionSettings:
+    """Resolved AppConfig Lambda extension read target for the kill-switch."""
+
+    application: str
+    environment: str
+    profile: str
+    extension_port: int
+
+    def __post_init__(self) -> None:
+        for name in ("application", "environment", "profile"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not (1 <= self.extension_port <= 65535):
+            raise ValueError("extension_port must be a valid TCP port")
+
+
+def resolve_kill_switch_extension_settings(
+    env: Mapping[str, str] | None = None,
+) -> "KillSwitchExtensionSettings | None":
+    """Resolve the optional AppConfig extension read target, failing closed.
+
+    Returns ``None`` when all three core AppConfig identifiers are absent (a
+    pre-E4 deployment); returns a validated settings object when they are all
+    present; and raises on any partial configuration.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    present = [key for key in _KILL_SWITCH_CORE_KEYS if (source.get(key) or "").strip()]
+    if not present:
+        return None
+    if len(present) != len(_KILL_SWITCH_CORE_KEYS):
+        missing = [key for key in _KILL_SWITCH_CORE_KEYS if key not in present]
+        raise ValueError("partial AppConfig kill-switch configuration; missing " + ", ".join(sorted(missing)))
+    return KillSwitchExtensionSettings(
+        application=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_APPLICATION"),
+        environment=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT"),
+        profile=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_PROFILE"),
+        extension_port=_positive_int(source, "GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT", 2772),
+    )
+
+
+def resolve_control_mode(env: Mapping[str, str] | None = None) -> str:
+    """Resolve the dedicated control-plane mode (``enabled``/``disabled``).
+
+    The control mode is deliberately independent of ``GBAW_OPERATIONS_MODE`` so
+    admin controls (list/detail/kill-switch read + the CAS control write) remain
+    available to *recover* operations even while static execution is disabled.
+    Defaults to ``disabled`` and fails closed on any unrecognized value.
+    """
+    source: Mapping[str, str] = os.environ if env is None else env
+    raw = source.get("GBAW_OPERATIONS_CONTROL_MODE")
+    if raw is None or not raw.strip():
+        return _DEFAULT_CONTROL_MODE
+    token = raw.strip().lower()
+    if token not in CONTROL_MODES:
+        raise ValueError(f"GBAW_OPERATIONS_CONTROL_MODE must be one of {CONTROL_MODES}")
+    return token

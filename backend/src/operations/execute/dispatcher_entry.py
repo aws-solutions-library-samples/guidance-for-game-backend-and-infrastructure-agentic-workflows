@@ -64,11 +64,22 @@ def _build_handler() -> Any:
 
     # Local modules
     from operations.approval_store import DynamoDbApprovalStore
+    from operations.control.gate_bootstrap import build_kill_switch_gate
     from operations.execute.dispatcher_handler import DispatcherRequestHandler
-    from operations.settings import resolve_executor_deployment_settings
+    from operations.settings import (
+        resolve_executor_deployment_settings,
+        resolve_kill_switch_extension_settings,
+    )
 
     settings = resolve_executor_deployment_settings()
     obs = settings.observation
+    # Build the deployment-wide kill-switch gate (issue #416) when the AppConfig
+    # read target is configured. Dispatch is an advise-authority act; the gate's
+    # static floor is the deployment mode and it can only de-escalate.
+    kill_switch_gate = build_kill_switch_gate(
+        extension_settings=resolve_kill_switch_extension_settings(),
+        static_authority=obs.mode,
+    )
     config = BotocoreConfig(connect_timeout=2.0, read_timeout=5.0, retries={"mode": "adaptive", "max_attempts": 2})
     session = boto3.Session(region_name=_region())
     dynamodb_client = session.client("dynamodb", config=config)
@@ -83,6 +94,7 @@ def _build_handler() -> Any:
         workspace_id=obs.workspace_id,
         trusted_audience=obs.trusted_audience,
         admin_group=settings.admin_group,
+        kill_switch_gate=kill_switch_gate,
     )
 
 

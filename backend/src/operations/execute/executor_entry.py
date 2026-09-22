@@ -76,6 +76,7 @@ def _build_runtime() -> _ExecutorRuntime:
 
     # Local modules
     from operations.approval_store import DynamoDbApprovalStore
+    from operations.control.gate_bootstrap import build_kill_switch_gate
     from operations.execute.execution_store import DynamoDbExecutionStore
     from operations.execute.executor_service import ExecutorService
     from operations.execute.gamelift_adapter import GameLiftExecutionAdapter
@@ -86,7 +87,10 @@ def _build_runtime() -> _ExecutorRuntime:
         EXECUTOR_ID,
         capacity_playbook_hash,
     )
-    from operations.settings import resolve_executor_deployment_settings
+    from operations.settings import (
+        resolve_executor_deployment_settings,
+        resolve_kill_switch_extension_settings,
+    )
 
     settings = resolve_executor_deployment_settings()
     obs = settings.observation
@@ -118,7 +122,21 @@ def _build_runtime() -> _ExecutorRuntime:
         enrolled_location=settings.enrolled_location,
     )
     verifier = ExecutionVerifier(context=context)
-    service = ExecutorService(verifier=verifier, adapter=adapter, store=execution_store)
+    # Build the deployment-wide kill-switch gate (issue #416) when the AppConfig
+    # read target is configured. The executor is the last line before a provider
+    # write and re-checks the execute phase immediately before UpdateFleetCapacity,
+    # so a switch flipped mid-flight still blocks the write. The gate's static
+    # floor is the deployment mode; it can only de-escalate.
+    kill_switch_gate = build_kill_switch_gate(
+        extension_settings=resolve_kill_switch_extension_settings(),
+        static_authority=obs.mode,
+    )
+    service = ExecutorService(
+        verifier=verifier,
+        adapter=adapter,
+        store=execution_store,
+        kill_switch_gate=kill_switch_gate,
+    )
     return _ExecutorRuntime(
         service=service,
         reload_store=EvidenceExecutionReloadStore(approval_store),
