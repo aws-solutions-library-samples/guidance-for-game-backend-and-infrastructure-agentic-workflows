@@ -181,7 +181,9 @@ class DynamoDbExecutionStore:
         """
         op_pk = f"OP#{operation_id}"
         action_pk = f"EXEC#{logical_action_id}"
-        recorded_at = _system_clock().isoformat().replace("+00:00", "Z")
+        # Use the injected clock (not the module-level system clock) so every
+        # persisted audit timestamp is deterministic and testable.
+        recorded_at = _utc(self._clock(), "clock").isoformat().replace("+00:00", "Z")
         result_doc = deepcopy(dict(result))
 
         result_item = _marshal(

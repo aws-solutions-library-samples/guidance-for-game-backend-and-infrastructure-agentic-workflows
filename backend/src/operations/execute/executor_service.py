@@ -31,6 +31,24 @@ enforces the exact safety contract:
 #. **Atomic record.** Record the provider intent, result, verification, state
    change, and ledger under lease+generation fencing in one transaction.
 
+Every adapter call the service makes after acquiring the fenced lease —
+``describe_capacity`` (the pre-write read, the confirming read after a clear
+rejection, and every post-write verification poll) and ``update_capacity`` — is
+wrapped so that *no* provider exception class can escape ``execute`` and leave a
+held lease with no recorded outcome. Each failure is converted to a bounded,
+public-safe typed outcome and a fenced terminal record:
+
+* A failure of the **pre-write** Describe (rejection, timeout, or a malformed
+  provider response) records ``FAILED`` with **no** write issued — the world is
+  untouched.
+* A failure of a Describe *after a write was issued* (a verification poll, or the
+  confirming read after a clear rejection) can never be proven safe, so it
+  records ``HUMAN_RECONCILIATION_REQUIRED`` (``RESULT_INCONCLUSIVE``) — never a
+  silent pass and never a blind retry.
+
+Raw provider text is never surfaced: adapter errors are reduced to the bounded
+``failure_reason_code`` domain before anything is recorded or returned.
+
 The invocation accepts ONLY ``operation_id`` — the executor relies on the
 IAM-authenticated workflow caller for authorization and never on request content.
 Rollback is a separate inverse E2 prepared+approved operation, never automatic.
@@ -56,11 +74,7 @@ from operations.contracts.execution import (
 )
 from operations.execute.execution_store import ExecutionCommitOutcome, LeaseAcquisition
 from operations.execute.gamelift_adapter import ProviderWriteInconclusive, ProviderWriteRejected
-from operations.execution_verifier import (
-    ExecutionVerificationError,
-    ExecutionVerifier,
-    VerifiedExecutionPlan,
-)
+from operations.execution_verifier import ExecutionVerificationError, ExecutionVerifier, VerifiedExecutionPlan
 
 # Bounded default number of post-action DescribeFleetCapacity polls.
 _DEFAULT_MAX_VERIFY_POLLS = 5
@@ -171,9 +185,6 @@ class ExecutorService:
 
         logical_action_id = plan.logical_action_id
         # Acquire the fenced lease (or replay a recorded terminal result).
-        # Standard library
-        from datetime import timedelta
-
         lease_not_after = self._clock() + timedelta(seconds=self._lease_seconds)
         acquisition = self._store.acquire_execution_lease(
             operation_id=invocation.operation_id,
@@ -187,8 +198,20 @@ class ExecutorService:
         target = dict(plan.intent["parameters"])
         expected = dict(plan.intent["expected_current_capacity"])
 
-        # 3. Describe before any write.
-        current = self._adapter.describe_capacity(fleet_id=plan.fleet_id, location=plan.location)
+        # 3. Describe before any write. A pre-write Describe failure of any class
+        # (rejection, timeout/lost response, or malformed provider response) means
+        # we never touched the provider: record a bounded FAILED with no write.
+        current = self._describe(plan)
+        if current is None:
+            return self._record(
+                plan,
+                acquisition,
+                outcome=OUTCOME_FAILED,
+                write_issued=False,
+                observed=expected,
+                failure_reason="PROVIDER_ERROR",
+                new_state="failed",
+            )
         if current == target:
             # Already at target: reconcile with no write.
             return self._record(plan, acquisition, outcome=OUTCOME_RECONCILED, write_issued=False, observed=current)
@@ -215,7 +238,9 @@ class ExecutorService:
                 maximum=target["maximum"],
             )
         except ProviderWriteInconclusive:
-            # 5. Lost response: Describe before any retry; never blind-retry.
+            # 5. Lost response: Describe before any retry; never blind-retry. If
+            # the confirming Describe/poll cannot conclusively read the target, the
+            # write's effect is unknown → HUMAN_RECONCILIATION_REQUIRED.
             observed, matched = self._poll_until_target(plan, target)
             if matched:
                 return self._record(plan, acquisition, outcome=OUTCOME_SUCCEEDED, write_issued=True, observed=observed)
@@ -224,7 +249,7 @@ class ExecutorService:
                 acquisition,
                 outcome=OUTCOME_HUMAN_RECONCILIATION_REQUIRED,
                 write_issued=True,
-                observed=observed,
+                observed=observed if observed is not None else expected,
                 failure_reason="RESULT_INCONCLUSIVE",
                 new_state="failed",
             )
@@ -232,8 +257,10 @@ class ExecutorService:
             # A clear rejection: the write deterministically did not take effect.
             # A single confirming Describe (not a poll) reads the unchanged state;
             # if it unexpectedly already matches the target the write in fact
-            # landed, so record success, otherwise a provider-error failure.
-            observed = self._adapter.describe_capacity(fleet_id=plan.fleet_id, location=plan.location)
+            # landed, so record success. If that confirming Describe itself fails,
+            # the write was still a clear rejection so the world is unchanged;
+            # record a bounded provider-error FAILED (no write took effect).
+            observed = self._describe(plan)
             if observed == target:
                 return self._record(plan, acquisition, outcome=OUTCOME_SUCCEEDED, write_issued=True, observed=observed)
             return self._record(
@@ -241,16 +268,30 @@ class ExecutorService:
                 acquisition,
                 outcome=OUTCOME_FAILED,
                 write_issued=True,
-                observed=observed,
+                observed=observed if observed is not None else expected,
                 failure_reason=exc.error_code or "PROVIDER_ERROR",
                 new_state="failed",
             )
 
-        # 6. Bounded post-action verification.
+        # 6. Bounded post-action verification. A write WAS issued; if the
+        # verification Describe cannot conclusively observe the target (never
+        # reached it, or every poll failed) we cannot prove the write's effect →
+        # HUMAN_RECONCILIATION_REQUIRED unless we positively confirmed the target.
         observed, matched = self._poll_until_target(plan, target)
         if matched:
             return self._record(
                 plan, acquisition, outcome=OUTCOME_SUCCEEDED, write_issued=write_issued, observed=observed
+            )
+        if observed is None:
+            # Every verification Describe failed: the write's effect is unknown.
+            return self._record(
+                plan,
+                acquisition,
+                outcome=OUTCOME_HUMAN_RECONCILIATION_REQUIRED,
+                write_issued=write_issued,
+                observed=expected,
+                failure_reason="RESULT_INCONCLUSIVE",
+                new_state="failed",
             )
         return self._record(
             plan,
@@ -264,11 +305,35 @@ class ExecutorService:
 
     # -- Internals -------------------------------------------------------
 
-    def _poll_until_target(self, plan: VerifiedExecutionPlan, target: dict[str, int]) -> tuple[dict[str, int], bool]:
-        """Poll DescribeFleetCapacity up to the bounded limit for the target."""
-        observed = target
+    def _describe(self, plan: VerifiedExecutionPlan) -> dict[str, int] | None:
+        """Describe current capacity, converting every adapter failure to ``None``.
+
+        No provider exception class (``ProviderWriteRejected``,
+        ``ProviderWriteInconclusive``, a malformed-response ``ValueError``, or any
+        other unexpected error) is allowed to escape: the caller decides the
+        bounded outcome from the phase. Raw provider text never surfaces.
+        """
+        try:
+            return self._adapter.describe_capacity(fleet_id=plan.fleet_id, location=plan.location)
+        except BaseException:  # noqa: BLE001 - classify to a bounded outcome, never leak
+            return None
+
+    def _poll_until_target(
+        self, plan: VerifiedExecutionPlan, target: dict[str, int]
+    ) -> tuple[dict[str, int] | None, bool]:
+        """Poll DescribeFleetCapacity up to the bounded limit for the target.
+
+        Returns ``(observed, matched)``. ``observed`` is ``None`` when *every*
+        poll failed to read the provider (the write's effect is unconfirmable);
+        otherwise it is the last successfully observed capacity. A describe
+        failure never escapes and never counts as a match.
+        """
+        observed: dict[str, int] | None = None
         for _ in range(self._max_verify_polls):
-            observed = self._adapter.describe_capacity(fleet_id=plan.fleet_id, location=plan.location)
+            read = self._describe(plan)
+            if read is None:
+                continue
+            observed = read
             if observed == target:
                 return observed, True
         return observed, False

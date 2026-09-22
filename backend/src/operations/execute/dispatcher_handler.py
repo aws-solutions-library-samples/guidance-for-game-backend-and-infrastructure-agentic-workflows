@@ -171,11 +171,37 @@ class DispatcherRequestHandler:
     def _start_workflow(self, operation_id: str) -> None:
         # ONLY the operation id crosses to the workflow; nothing executable.
         payload = json.dumps({"operation_id": operation_id}, separators=(",", ":"), sort_keys=True)
-        self._sfn.start_execution(
-            stateMachineArn=self._state_machine_arn,
-            name=_execution_name(operation_id),
-            input=payload,
-        )
+        try:
+            self._sfn.start_execution(
+                stateMachineArn=self._state_machine_arn,
+                name=_execution_name(operation_id),
+                input=payload,
+            )
+        except Exception as exc:  # noqa: BLE001 - classify by bounded error code, never leak
+            if _is_execution_already_exists(exc):
+                # A same-name start of the same operation is Step Functions'
+                # idempotency signal for a Standard workflow: a duplicate dispatch
+                # is a no-op replay of the already-running/complete execution, not
+                # a failure and never a second blind start.
+                return
+            raise
+
+
+# Step Functions Standard idempotency signal for a same-name start. The modeled
+# exception is ``ExecutionAlreadyExists``; some paths surface the full modeled
+# name ``ExecutionAlreadyExistsException``. Match both, from the bounded error
+# code only — the raw provider message is never inspected or surfaced.
+_EXECUTION_ALREADY_EXISTS_CODES = frozenset({"ExecutionAlreadyExists", "ExecutionAlreadyExistsException"})
+
+
+def _is_execution_already_exists(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, Mapping):
+        return False
+    error = response.get("Error")
+    if not isinstance(error, Mapping):
+        return False
+    return error.get("Code") in _EXECUTION_ALREADY_EXISTS_CODES
 
 
 def _execution_name(operation_id: str) -> str:
