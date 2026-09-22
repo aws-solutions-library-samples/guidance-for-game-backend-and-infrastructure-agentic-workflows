@@ -73,6 +73,13 @@ class PrepareErrorCode(str, Enum):
     IDENTITY_CONTEXT_INVALID = "identity_context_invalid"
     AUTHORIZATION_DENIED = "authorization_denied"
     ADVICE_STALE = "advice_stale"
+    # Reserved, wire-stable member. Not currently raised (the prepare boundary
+    # fences on advice hash/expiry and re-derives the prepared_hash), but its
+    # 409 value is owned by the prepare route's status map. Kept for wire
+    # compatibility; pinned by the approval-handler unit tests
+    # ``test_prepare_status_map_owns_current_state_mismatch_as_409`` and
+    # ``test_prepare_handler_maps_current_state_mismatch_error_to_409``.
+    # Do not remove without a contract bump.
     CURRENT_STATE_MISMATCH = "current_state_mismatch"
     CONTRACT_OUTPUT_INVALID = "contract_output_invalid"
 

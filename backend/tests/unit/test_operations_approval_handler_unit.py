@@ -26,9 +26,11 @@ from typing import Any
 import pytest
 
 # Local modules
+from operations import approval_handler as _approval_handler_module
+from operations.advice import AdviceErrorCode
 from operations.approval import ApprovalBoundaryError, ApprovalErrorCode
 from operations.approval_handler import ApprovalRequestHandler
-from operations.prepare import PreparedDecision
+from operations.prepare import PreparedDecision, PrepareErrorCode
 from operations.prepare_orchestrator import PrepareOrchestratorError, PrepareResult
 
 pytestmark = pytest.mark.unit
@@ -348,3 +350,33 @@ def test_successful_prepare_emits_no_failure_metric() -> None:
     handler = _handler(metrics=metrics)
     handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
     assert metrics.events == []
+
+
+# -- Reserved wire-stable error-code ownership ---------------------------------
+#
+# ``CURRENT_STATE_MISMATCH`` is intentionally not raised anywhere in the advice
+# or prepare boundaries today, but both enums declare it as a stable wire value
+# and the prepare route owns its 409 mapping. These tests pin that ownership so
+# the member cannot be silently dropped (which would break wire compatibility)
+# nor lose its status mapping without a deliberate, test-visible change.
+
+
+def test_current_state_mismatch_enum_members_share_the_stable_wire_value() -> None:
+    assert AdviceErrorCode.CURRENT_STATE_MISMATCH.value == "current_state_mismatch"
+    assert PrepareErrorCode.CURRENT_STATE_MISMATCH.value == "current_state_mismatch"
+
+
+def test_prepare_status_map_owns_current_state_mismatch_as_409() -> None:
+    status_map = _approval_handler_module._STATUS_BY_PREPARE_ERROR
+    assert status_map[AdviceErrorCode.CURRENT_STATE_MISMATCH.value] == 409
+    assert status_map[PrepareErrorCode.CURRENT_STATE_MISMATCH.value] == 409
+
+
+def test_prepare_handler_maps_current_state_mismatch_error_to_409() -> None:
+    handler = _handler(
+        orchestrator=FakeOrchestrator(
+            PrepareOrchestratorError("current_state_mismatch", "observed state does not match")
+        )
+    )
+    resp = handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert resp["statusCode"] == 409

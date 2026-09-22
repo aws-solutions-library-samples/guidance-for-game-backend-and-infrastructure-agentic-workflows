@@ -74,6 +74,14 @@ class AdviceErrorCode(str, Enum):
     AUTHORIZATION_DENIED = "authorization_denied"
     CURRENT_STATE_UNAVAILABLE = "current_state_unavailable"
     CURRENT_STATE_STALE = "current_state_stale"
+    # Reserved, wire-stable member. Not currently raised by the advice boundary
+    # (fleet state is validated as UNAVAILABLE/STALE, and hash mismatch is fenced
+    # at prepare/commit), but the prepare route's status map owns a 409 mapping
+    # for its value so a future observed-vs-declared mismatch surfaces coherently.
+    # Kept for wire compatibility; the approval-handler unit tests
+    # ``test_current_state_mismatch_enum_members_share_the_stable_wire_value`` and
+    # ``test_prepare_status_map_owns_current_state_mismatch_as_409`` pin both the
+    # string value and the 409 status. Do not remove without a contract bump.
     CURRENT_STATE_MISMATCH = "current_state_mismatch"
     TARGET_NOT_ENROLLED = "target_not_enrolled"
     CONTRACT_OUTPUT_INVALID = "contract_output_invalid"

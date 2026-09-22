@@ -26,6 +26,7 @@ from operations.approval_store import (
     ApprovalStoreError,
     DynamoDbApprovalStore,
     PersistOutcome,
+    _canonical_json,
 )
 from operations.contracts import load_json
 from operations.contracts.capacity import capacity_prepared_hash
@@ -280,6 +281,101 @@ def test_persist_transient_fault_is_unavailable_not_conflict() -> None:
 
 
 # -- Load ----------------------------------------------------------------
+
+
+def test_persist_rejects_prepared_hash_that_does_not_bind_the_operation() -> None:
+    """The passed prepared_hash MUST equal the operation's own bound hash.
+
+    Discriminating: the operation is otherwise valid and the deadline is open,
+    so the ONLY reason this fails closed is the guard that recomputes/binds the
+    hash before any DynamoDB write. A wrong hash raises ApprovalStoreError and
+    issues no transaction at all.
+    """
+    client = StatefulDynamoClient()
+    store = _store(client)
+    correct_hash = _hash()
+    wrong_hash = "sha256:" + "b" * 64
+    assert wrong_hash != correct_hash
+
+    with pytest.raises(ApprovalStoreError, match="does not bind"):
+        store.persist_prepared_operation(
+            prepared_operation=_operation(),  # embeds correct_hash
+            prepared_hash=wrong_hash,  # caller passes a non-binding hash
+            workspace_id=WORKSPACE,
+            idempotency_token=TOKEN,
+            idempotency_fingerprint=FINGERPRINT,
+            state_change=_state_change(),
+            ledger_event=_ledger_event(),
+            commit_not_after=NOW + timedelta(minutes=15),
+        )
+    # Fail closed BEFORE any write: no transaction was ever issued.
+    assert client.transactions == []
+
+
+def _sized_operation(payload_bytes: int) -> dict[str, Any]:
+    """A valid operation padded so its canonical JSON reaches ~payload_bytes.
+
+    The padding is added under an extra field, then the operation's own bound
+    ``prepared_hash`` is recomputed so the bind guard passes and the ONLY
+    remaining gate is the durable item-size ceiling.
+    """
+    operation = _operation()
+    operation.pop("prepared_hash", None)
+    operation["_size_padding"] = "x" * payload_bytes
+    operation["prepared_hash"] = capacity_prepared_hash(operation)
+    return operation
+
+
+def _persist_operation(store: DynamoDbApprovalStore, operation: dict[str, Any]):
+    return store.persist_prepared_operation(
+        prepared_operation=operation,
+        prepared_hash=operation["prepared_hash"],
+        workspace_id=WORKSPACE,
+        idempotency_token=TOKEN,
+        idempotency_fingerprint=FINGERPRINT,
+        state_change=_state_change(),
+        ledger_event=_ledger_event(),
+        commit_not_after=NOW + timedelta(minutes=15),
+    )
+
+
+def test_persist_accepts_operation_just_below_the_item_size_ceiling() -> None:
+    """A hash-consistent operation whose canonical JSON stays under 400 KB persists.
+
+    Paired with the over-ceiling test below, this pins the exact bound: the same
+    code path succeeds just under the limit and fails closed just over it, so the
+    ceiling — not some unrelated validation — is what discriminates the outcome.
+    """
+    client = StatefulDynamoClient()
+    store = _store(client)
+    # Comfortably below 400 KB even after the surrounding canonical JSON.
+    operation = _sized_operation(300 * 1024)
+    encoded = len(_canonical_json(operation).encode("utf-8"))
+    assert encoded < 400 * 1024
+
+    result = _persist_operation(store, operation)
+    assert result.outcome is PersistOutcome.PERSISTED
+    assert len(client.transactions) == 1
+
+
+def test_persist_rejects_operation_at_or_above_the_item_size_ceiling() -> None:
+    """A hash-consistent operation whose canonical JSON reaches 400 KB fails closed.
+
+    The bind guard passes (the padded operation carries its own recomputed hash),
+    so the size ceiling is the sole discriminating gate. It raises before any
+    DynamoDB write.
+    """
+    client = StatefulDynamoClient()
+    store = _store(client)
+    # Padding alone exceeds the 400 KB ceiling; the encoded item is >= the limit.
+    operation = _sized_operation(400 * 1024 + 1024)
+    encoded = len(_canonical_json(operation).encode("utf-8"))
+    assert encoded >= 400 * 1024
+
+    with pytest.raises(ApprovalStoreError, match="item-size limit"):
+        _persist_operation(store, operation)
+    # Fail closed BEFORE any write: no transaction was ever issued.
+    assert client.transactions == []
 
 
 def test_load_returns_stored_operation_hash_and_state() -> None:
