@@ -14,6 +14,7 @@ dimensionless, and must never break the control flow if it raises.
 from __future__ import annotations
 
 # Standard library
+import pathlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -116,3 +117,16 @@ def test_metric_failure_never_breaks_control() -> None:
     # A raising metrics sink must not break the committed control change.
     result = service.apply(request=_request(), principal=_Principal(frozenset({"admin"})))
     assert result["outcome"] == "applied"
+
+
+def test_all_write_entrypoints_wire_the_appconfig_rollback_signal() -> None:
+    project_root = pathlib.Path(__file__).parents[3]
+    entrypoints = (
+        project_root / "backend/src/operations/observe/lambda_entry.py",
+        project_root / "backend/src/operations/execute/dispatcher_entry.py",
+        project_root / "backend/src/operations/execute/executor_entry.py",
+    )
+    for entrypoint in entrypoints:
+        source = entrypoint.read_text(encoding="utf-8")
+        assert "unavailable_callback=" in source, entrypoint
+        assert 'record("kill_switch.unavailable")' in source, entrypoint

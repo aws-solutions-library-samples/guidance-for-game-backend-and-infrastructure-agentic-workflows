@@ -9,6 +9,7 @@ import type {
   OperationState,
   PhaseName,
   PhaseStatus,
+  RollbackOutcome,
   VisibilityOutcome,
 } from '@/operations/schema';
 
@@ -91,8 +92,9 @@ export const EVIDENCE_CATEGORY_LABELS: Record<EvidenceCategory, string> = {
   state_change: 'State change',
 };
 
-export const VISIBILITY_OUTCOME_LABELS: Record<VisibilityOutcome, string> = {
+export const VISIBILITY_OUTCOME_LABELS: Record<VisibilityOutcome | RollbackOutcome, string> = {
   not_applicable: 'Not applicable',
+  not_recorded: 'Not recorded',
   pending: 'Pending',
   succeeded: 'Succeeded',
   failed: 'Failed',

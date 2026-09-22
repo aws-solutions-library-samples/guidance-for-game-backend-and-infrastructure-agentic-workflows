@@ -77,6 +77,7 @@ def _build_runtime() -> _ExecutorRuntime:
     # Local modules
     from operations.approval_store import DynamoDbApprovalStore
     from operations.control.gate_bootstrap import build_kill_switch_gate
+    from operations.control.metrics import CloudWatchControlMetrics
     from operations.execute.execution_store import DynamoDbExecutionStore
     from operations.execute.executor_service import ExecutorService
     from operations.execute.gamelift_adapter import GameLiftExecutionAdapter
@@ -108,6 +109,7 @@ def _build_runtime() -> _ExecutorRuntime:
     execution_store = DynamoDbExecutionStore(client=dynamodb_client, table_name=obs.table_name)
     adapter = GameLiftExecutionAdapter(gamelift_client)
     metrics = CloudWatchExecutionMetrics(client=cloudwatch_client, namespace=obs.metric_namespace)
+    kill_switch_metrics = CloudWatchControlMetrics(client=cloudwatch_client, namespace=obs.metric_namespace)
 
     context = ExecutionAuthorityContext(
         deployment_mode=obs.mode,
@@ -130,6 +132,7 @@ def _build_runtime() -> _ExecutorRuntime:
     kill_switch_gate = build_kill_switch_gate(
         extension_settings=resolve_kill_switch_extension_settings(),
         static_authority=obs.mode,
+        unavailable_callback=lambda: kill_switch_metrics.record("kill_switch.unavailable"),
     )
     service = ExecutorService(
         verifier=verifier,

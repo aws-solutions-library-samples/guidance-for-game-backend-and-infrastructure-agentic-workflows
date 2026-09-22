@@ -152,6 +152,17 @@ describe('parseOperationDetail', () => {
     expect(parsed.evidence.length).toBeGreaterThan(0);
   });
 
+  it('accepts truthful not_recorded rollback visibility', () => {
+    const doc = loadFixture('operations-detail-projection.valid.json') as {
+      state: string;
+      rollback: { applicable: boolean; outcome: string };
+    };
+    doc.state = 'failed';
+    doc.rollback = { applicable: false, outcome: 'not_recorded' };
+    const parsed = parseOperationDetail(doc);
+    expect(parsed.rollback.outcome).toBe('not_recorded');
+  });
+
   it('rejects an evidence summary longer than 280 chars', () => {
     const doc = loadFixture('operations-detail-projection.valid.json') as {
       evidence: { summary: string }[];

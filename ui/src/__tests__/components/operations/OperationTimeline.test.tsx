@@ -47,6 +47,17 @@ describe('OperationTimeline', () => {
     expect(within(rollbackCard).getByText(/not applicable/i)).toBeInTheDocument();
   });
 
+  it('shows an explicit not-recorded rollback outcome without inferring rollback', () => {
+    const failedWithoutRollback: OperationDetail = {
+      ...detail,
+      state: 'failed',
+      rollback: { applicable: false, outcome: 'not_recorded' },
+    };
+    render(<OperationTimeline detail={failedWithoutRollback} />);
+    const rollback = screen.getByRole('heading', { name: 'Rollback' });
+    expect(within(rollback.parentElement as HTMLElement).getByText(/not recorded/i)).toBeInTheDocument();
+  });
+
   it('renders bounded evidence summaries and no raw payload', () => {
     render(<OperationTimeline detail={detail} />);
     expect(

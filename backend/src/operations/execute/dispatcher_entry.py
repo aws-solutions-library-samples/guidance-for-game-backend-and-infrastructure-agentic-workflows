@@ -65,6 +65,7 @@ def _build_handler() -> Any:
     # Local modules
     from operations.approval_store import DynamoDbApprovalStore
     from operations.control.gate_bootstrap import build_kill_switch_gate
+    from operations.control.metrics import CloudWatchControlMetrics
     from operations.execute.dispatcher_handler import DispatcherRequestHandler
     from operations.settings import (
         resolve_executor_deployment_settings,
@@ -73,17 +74,22 @@ def _build_handler() -> Any:
 
     settings = resolve_executor_deployment_settings()
     obs = settings.observation
-    # Build the deployment-wide kill-switch gate (issue #416) when the AppConfig
-    # read target is configured. Dispatch is an advise-authority act; the gate's
-    # static floor is the deployment mode and it can only de-escalate.
-    kill_switch_gate = build_kill_switch_gate(
-        extension_settings=resolve_kill_switch_extension_settings(),
-        static_authority=obs.mode,
-    )
     config = BotocoreConfig(connect_timeout=2.0, read_timeout=5.0, retries={"mode": "adaptive", "max_attempts": 2})
     session = boto3.Session(region_name=_region())
     dynamodb_client = session.client("dynamodb", config=config)
     sfn_client = session.client("stepfunctions", config=config)
+    cloudwatch_client = session.client("cloudwatch", config=config)
+    kill_switch_metrics = CloudWatchControlMetrics(client=cloudwatch_client, namespace=obs.metric_namespace)
+
+    # Build the deployment-wide kill-switch gate (issue #416) when the AppConfig
+    # read target is configured. Dispatch is an advise-authority act; the gate's
+    # static floor is the deployment mode and it can only de-escalate. A failed
+    # read emits the AppConfig rollback monitor signal before dispatch denies.
+    kill_switch_gate = build_kill_switch_gate(
+        extension_settings=resolve_kill_switch_extension_settings(),
+        static_authority=obs.mode,
+        unavailable_callback=lambda: kill_switch_metrics.record("kill_switch.unavailable"),
+    )
 
     approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=obs.table_name)
     return DispatcherRequestHandler(

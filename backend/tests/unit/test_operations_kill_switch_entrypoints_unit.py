@@ -153,6 +153,27 @@ def test_build_gate_permits_enabled_prepare() -> None:
     assert decision.config_version == 7
 
 
+def test_build_gate_emits_unavailable_callback_on_write_path_failure() -> None:
+    ext = KillSwitchExtensionSettings(
+        application="game-agent-operations",
+        environment="prod",
+        profile="operations-kill-switch",
+        extension_port=2772,
+    )
+    events: list[str] = []
+    gate = build_kill_switch_gate(
+        extension_settings=ext,
+        static_authority="advise",
+        clock=lambda: _NOW,
+        opener=_ScriptedOpener([b"not-json"]),
+        unavailable_callback=lambda: events.append("kill_switch.unavailable"),
+    )
+    assert gate is not None
+    with pytest.raises(PhaseDenied):
+        gate.require_phase("prepare")
+    assert events == ["kill_switch.unavailable"]
+
+
 def test_gate_fails_closed_on_stale_document() -> None:
     stale = {
         "contract_version": "1.0",

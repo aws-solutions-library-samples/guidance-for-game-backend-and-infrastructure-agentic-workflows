@@ -71,12 +71,18 @@ class _StubExtension:
         return self._body
 
 
-def _gate(extension: _StubExtension, *, static_authority: str = "operate") -> KillSwitchGate:
+def _gate(
+    extension: _StubExtension,
+    *,
+    static_authority: str = "operate",
+    unavailable_callback: Any = None,
+) -> KillSwitchGate:
     return KillSwitchGate(
         extension=extension,
         capability_id=CAPABILITY_ID,
         static_authority=static_authority,
         clock=lambda: _NOW,
+        unavailable_callback=unavailable_callback,
     )
 
 
@@ -118,6 +124,29 @@ def test_network_error_fails_closed() -> None:
         gate.evaluate()
     with pytest.raises(PhaseDenied):
         gate.require_phase("prepare")
+
+
+def test_write_path_unavailable_emits_the_rollback_monitor_signal() -> None:
+    events: list[str] = []
+    gate = _gate(
+        _StubExtension(error=OSError("connection refused")),
+        unavailable_callback=lambda: events.append("kill_switch.unavailable"),
+    )
+    with pytest.raises(PhaseDenied):
+        gate.require_phase("execute")
+    assert events == ["kill_switch.unavailable"]
+
+
+def test_intentionally_disabled_phase_does_not_emit_unavailable() -> None:
+    events: list[str] = []
+    document = _fresh_document(capabilities={CAPABILITY_ID: {"prepare": True, "dispatch": False, "execute": False}})
+    gate = _gate(
+        _StubExtension(body=_bytes(document)),
+        unavailable_callback=lambda: events.append("kill_switch.unavailable"),
+    )
+    with pytest.raises(PhaseDenied):
+        gate.require_phase("dispatch")
+    assert events == []
 
 
 def test_malformed_body_fails_closed() -> None:

@@ -95,6 +95,9 @@ export type PhaseStatus = (typeof PHASE_STATUSES)[number];
 export const VISIBILITY_OUTCOMES = ['not_applicable', 'pending', 'succeeded', 'failed'] as const;
 export type VisibilityOutcome = (typeof VISIBILITY_OUTCOMES)[number];
 
+export const ROLLBACK_OUTCOMES = [...VISIBILITY_OUTCOMES, 'not_recorded'] as const;
+export type RollbackOutcome = (typeof ROLLBACK_OUTCOMES)[number];
+
 export const EVIDENCE_CATEGORIES = [
   'authorization',
   'approval',
@@ -218,6 +221,11 @@ export interface Visibility {
   outcome: VisibilityOutcome;
 }
 
+export interface RollbackVisibility {
+  applicable: boolean;
+  outcome: RollbackOutcome;
+}
+
 export interface EvidenceEntry {
   category: EvidenceCategory;
   summary: string;
@@ -233,7 +241,7 @@ export interface OperationDetail {
   updated_at: string;
   phases: PhaseEntry[];
   verification: Visibility;
-  rollback: Visibility;
+  rollback: RollbackVisibility;
   evidence: EvidenceEntry[];
 }
 
@@ -553,6 +561,15 @@ function parseVisibility(value: unknown, path: string): Visibility {
   };
 }
 
+function parseRollbackVisibility(value: unknown, path: string): RollbackVisibility {
+  const o = obj(value, path);
+  requireExactKeys(o, path, ['applicable', 'outcome']);
+  return {
+    applicable: bool(o.applicable, `${path}.applicable`),
+    outcome: enumValue(o.outcome, `${path}.outcome`, ROLLBACK_OUTCOMES),
+  };
+}
+
 function parseEvidence(value: unknown, path: string): EvidenceEntry {
   const o = obj(value, path);
   requireExactKeys(o, path, ['category', 'summary'], ['recorded_at']);
@@ -597,7 +614,7 @@ export function parseOperationDetail(value: unknown): OperationDetail {
       parsePhaseEntry(p, `${path}.phases[${i}]`),
     ),
     verification: parseVisibility(o.verification, `${path}.verification`),
-    rollback: parseVisibility(o.rollback, `${path}.rollback`),
+    rollback: parseRollbackVisibility(o.rollback, `${path}.rollback`),
     evidence: array(o.evidence, `${path}.evidence`, 0, 16).map((e, i) =>
       parseEvidence(e, `${path}.evidence[${i}]`),
     ),

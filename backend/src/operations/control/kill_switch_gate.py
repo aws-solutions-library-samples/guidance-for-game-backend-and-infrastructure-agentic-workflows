@@ -142,6 +142,7 @@ class KillSwitchGate:
         capability_id: str,
         static_authority: str,
         clock: Callable[[], datetime] | None = None,
+        unavailable_callback: Callable[[], None] | None = None,
     ) -> None:
         if not isinstance(capability_id, str) or not capability_id.strip():
             raise ValueError("capability_id must be a non-empty string")
@@ -151,6 +152,7 @@ class KillSwitchGate:
         self._capability_id = capability_id
         self._static_authority = static_authority
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._unavailable_callback = unavailable_callback
 
     def evaluate(self) -> KillSwitchDecision:
         """Read the extension fresh and return an immutable decision, or fail closed."""
@@ -188,6 +190,15 @@ class KillSwitchGate:
         try:
             decision = self.evaluate()
         except KillSwitchUnavailable as exc:
+            # This is the signal monitored by AppConfig during gradual rollout.
+            # Emit only for an unreadable/invalid/stale document, never for an
+            # intentional valid phase disable.
+            callback = self._unavailable_callback
+            if callback is not None:
+                try:
+                    callback()
+                except Exception:  # noqa: BLE001 - metrics must never break the gate
+                    pass
             # Fail closed: an unreadable/invalid/stale switch denies the phase.
             raise PhaseDenied(phase, "kill-switch unavailable") from exc
         if not decision.phase_allowed(phase):

@@ -36,6 +36,7 @@ def build_kill_switch_gate(
     static_authority: str,
     clock: Callable[[], datetime] | None = None,
     opener: Callable[[str, float], Any] | None = None,
+    unavailable_callback: Callable[[], None] | None = None,
 ) -> KillSwitchGate | None:
     """Build the real gate over the real extension client, or ``None`` if absent.
 
@@ -57,4 +58,5 @@ def build_kill_switch_gate(
         capability_id=CAPABILITY_ID,
         static_authority=static_authority,
         clock=clock,
+        unavailable_callback=unavailable_callback,
     )
