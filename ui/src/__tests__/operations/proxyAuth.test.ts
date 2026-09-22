@@ -47,24 +47,59 @@ describe('operationsBackendBaseUrl', () => {
 });
 
 describe('operationsActionBaseUrl', () => {
-  it('prefers the dedicated E2 action base over the control-plane base', () => {
+  it('uses the dedicated E2 action base and ignores the control-plane base', () => {
     process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'https://actions.example.com/prod';
     process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod';
     expect(operationsActionBaseUrl()).toBe('https://actions.example.com/prod');
   });
 
-  it('falls back to the control-plane base when no dedicated action base is set', () => {
+  it('fails closed when the dedicated action base is missing — no fallback to the control base', () => {
+    // The E4 control base is present and would previously have been used as a
+    // silent fallback, misrouting E2 cancellations to the wrong service.
     delete process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL;
     process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod';
-    expect(operationsActionBaseUrl()).toBe('https://ops.example.com/prod');
+    process.env.BACKEND_URL = 'https://shared.example.com';
+    expect(() => operationsActionBaseUrl()).toThrow(BaseUrlError);
+  });
+
+  it('fails closed when the dedicated action base is missing even in the local-dev bypass', () => {
+    // No localhost default: cancellation always requires an explicit action base.
+    process.env.NODE_ENV = 'development';
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
+    delete process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL;
+    delete process.env.GBAW_OPERATIONS_API_BASE_URL;
+    delete process.env.BACKEND_URL;
+    expect(() => operationsActionBaseUrl()).toThrow(BaseUrlError);
+  });
+
+  it('fails closed when the dedicated action base is blank/whitespace', () => {
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = '   ';
+    process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://ops.example.com/prod';
+    expect(() => operationsActionBaseUrl()).toThrow(BaseUrlError);
+  });
+
+  it('fails closed when the dedicated action base is malformed', () => {
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'not a url';
+    expect(() => operationsActionBaseUrl()).toThrow(BaseUrlError);
   });
 
   it('requires https outside the local-dev bypass', () => {
     process.env.NODE_ENV = 'production';
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
-    delete process.env.GBAW_OPERATIONS_API_BASE_URL;
     process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'http://actions.example.com';
     expect(() => operationsActionBaseUrl()).toThrow(BaseUrlError);
+  });
+
+  it('allows a plaintext action base only under the explicit local-dev bypass', () => {
+    process.env.NODE_ENV = 'development';
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'http://localhost:8080';
+    expect(operationsActionBaseUrl()).toBe('http://localhost:8080');
+  });
+
+  it('strips a trailing slash', () => {
+    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'https://actions.example.com/prod/';
+    expect(operationsActionBaseUrl()).toBe('https://actions.example.com/prod');
   });
 });
 

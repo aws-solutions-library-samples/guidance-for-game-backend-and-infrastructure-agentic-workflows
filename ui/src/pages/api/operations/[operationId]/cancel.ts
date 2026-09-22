@@ -11,7 +11,10 @@ const OPERATION_ID_PATTERN = /^op_[a-z0-9]{26}$/;
  *
  * Cancellation is owned by the E2 approval/decision service, not the E4 control
  * plane, so this route forwards to GBAW_OPERATIONS_ACTION_API_BASE_URL (via
- * actionPost) rather than the control-plane base.
+ * actionPost) rather than the control-plane base. That action base has no
+ * fallback: if it is missing/malformed, actionPost fails closed with a bounded
+ * 502 before any upstream request, so cancellation is never silently misrouted
+ * to the control-plane base or a shared/localhost default.
  *
  * Defense in depth on this state-changing request:
  *  - same-origin CSRF check;

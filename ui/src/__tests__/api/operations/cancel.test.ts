@@ -162,3 +162,28 @@ it('does not forward any request body to the E2 action API', async () => {
   // The operation id is a path parameter; there is no identity/credential body.
   expect(init.body === undefined || init.body === 'null' || init.body === '{}').toBe(true);
 });
+
+it('fails closed (502) and never calls upstream when the action base is unset — no control-base fallback', async () => {
+  // Auth passes (local-dev bypass) so this isolates base-URL resolution: no
+  // dedicated action base, but the E4 control base and shared BACKEND_URL ARE
+  // present. The route must NOT silently misroute cancellation to either.
+  delete process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL;
+  process.env.GBAW_OPERATIONS_API_BASE_URL = 'https://control.example.com';
+  process.env.BACKEND_URL = 'https://shared.example.com';
+  mockBackend(200, cancelledStateChange);
+  const { req, res } = cancel(OP_ID);
+  await cancelHandler(req, res);
+  expect(res._getStatusCode()).toBe(502);
+  expect(global.fetch).not.toHaveBeenCalled();
+});
+
+it('fails closed (502) and never calls upstream when the action base is malformed', async () => {
+  process.env.NODE_ENV = 'development';
+  process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
+  process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL = 'not a url';
+  mockBackend(200, cancelledStateChange);
+  const { req, res } = cancel(OP_ID);
+  await cancelHandler(req, res);
+  expect(res._getStatusCode()).toBe(502);
+  expect(global.fetch).not.toHaveBeenCalled();
+});

@@ -93,10 +93,12 @@ local-dev bypass each must be **HTTPS**.
   kill-switch control), falling back to `BACKEND_URL` then
   `http://localhost:8080`.
 - `GBAW_OPERATIONS_ACTION_API_BASE_URL` — the **E2 operations action** API
-  (approval-lifecycle decisions such as cancel), falling back to
-  `GBAW_OPERATIONS_API_BASE_URL`, then `BACKEND_URL`, then
-  `http://localhost:8080`. Set this when the E2 action API is deployed at a
-  different origin than the E4 control plane.
+  (approval-lifecycle decisions such as cancel). This has **no fallback**: it
+  must be explicitly configured, and a missing, blank, or malformed value
+  **fails closed** with a bounded **502** before any upstream request, so
+  cancellation is never silently misrouted to the E4 control-plane base,
+  `BACKEND_URL`, or a localhost default. Must be **HTTPS** outside the local-dev
+  bypass.
 
 ## Never rendered
 

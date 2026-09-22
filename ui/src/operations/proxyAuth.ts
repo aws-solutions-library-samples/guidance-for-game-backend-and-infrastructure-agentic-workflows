@@ -89,20 +89,20 @@ export function operationsBackendBaseUrl(): string {
  * E2 approval/decision service, not the E4 control plane, so it has its own
  * server-only base. Server-side only, never exposed to the browser.
  *
- * Resolution order:
- *  1. GBAW_OPERATIONS_ACTION_API_BASE_URL — the deployed E2 action API stage URL.
- *  2. GBAW_OPERATIONS_API_BASE_URL — co-located deployment fallback.
- *  3. BACKEND_URL — the shared local-dev backend.
- *  4. http://localhost:8080 — the default local backend.
- *
- * The resolved value must be HTTPS outside the local-dev bypass.
+ * This base has NO fallback. GBAW_OPERATIONS_ACTION_API_BASE_URL must be
+ * explicitly configured; a missing, blank, or malformed value fails closed with
+ * a BaseUrlError so cancellation can never be silently misrouted to the E4
+ * control-plane base, the shared BACKEND_URL, or a localhost default. The
+ * resolved value must be HTTPS outside the local-dev bypass.
  */
 export function operationsActionBaseUrl(): string {
-  return resolveBase(
-    process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL,
-    process.env.GBAW_OPERATIONS_API_BASE_URL,
-    process.env.BACKEND_URL,
-  );
+  const raw = process.env.GBAW_OPERATIONS_ACTION_API_BASE_URL?.trim();
+  if (!raw) {
+    throw new BaseUrlError(
+      'GBAW_OPERATIONS_ACTION_API_BASE_URL must be explicitly configured for cancellation',
+    );
+  }
+  return requireSecureBase(raw.replace(/\/+$/, ''));
 }
 
 /** Headers for a forwarded backend request. The access token is the only credential. */
