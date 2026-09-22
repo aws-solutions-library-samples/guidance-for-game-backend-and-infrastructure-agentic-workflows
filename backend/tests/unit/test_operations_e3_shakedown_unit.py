@@ -4,6 +4,13 @@ The E3 shakedown exercises the deployed dispatch boundary over HTTPS. These
 tests use a fake transport to assert the discriminating checks and — critically
 for a public sample — that the emitted summary is sanitized: it never contains
 the endpoint host, a bearer token, an ARN, a fleet id, or a raw operation id.
+
+The admin-dispatch check is write-capable (it can start a real execution), so it
+runs only when the exact out-of-band confirmation is supplied. Tests that
+exercise that check therefore construct the config with the confirmation set;
+the dedicated confirmation-gate suite
+(``test_operations_e3_shakedown_confirmation_unit.py``) proves that a missing or
+wrong confirmation refuses the check and makes no authenticated call.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ import pytest
 # Local modules
 from operations.validation.e1_shakedown import HttpResponse
 from operations.validation.e3_shakedown import (
+    REQUIRED_CONFIRMATION,
     E3ShakedownConfig,
     E3ShakedownHarness,
     summary_is_public_safe,
@@ -53,8 +61,14 @@ class _FakeTransport:
         return self._responses["auth" if authed else "anon"]
 
 
-def _config() -> E3ShakedownConfig:
-    return E3ShakedownConfig(endpoint=_ENDPOINT, operation_id=_OP, admin_bearer=_ADMIN, fleet_id=_FLEET)
+def _config(confirmation: str = REQUIRED_CONFIRMATION) -> E3ShakedownConfig:
+    return E3ShakedownConfig(
+        endpoint=_ENDPOINT,
+        operation_id=_OP,
+        admin_bearer=_ADMIN,
+        fleet_id=_FLEET,
+        confirmation=confirmation,
+    )
 
 
 def test_config_requires_https() -> None:
@@ -74,7 +88,9 @@ def test_valid_admin_dispatch_accepted_check() -> None:
     transport = _FakeTransport(
         {"anon": _resp(401, {"error_code": "IDENTITY_CONTEXT_INVALID"}), "auth": _resp(202, {"state": "dispatched"})}
     )
-    harness = E3ShakedownHarness(_config(), transport)
+    # The admin-dispatch check is write-capable, so it requires the explicit
+    # out-of-band confirmation before it will make the authenticated call.
+    harness = E3ShakedownHarness(_config(confirmation=REQUIRED_CONFIRMATION), transport)
     assert harness.check_admin_dispatch_accepted().passed
 
 
@@ -82,11 +98,12 @@ def test_summary_is_public_safe_and_hides_secrets() -> None:
     transport = _FakeTransport(
         {"anon": _resp(401, {"error_code": "IDENTITY_CONTEXT_INVALID"}), "auth": _resp(202, {"state": "dispatched"})}
     )
-    harness = E3ShakedownHarness(_config(), transport)
+    harness = E3ShakedownHarness(_config(confirmation=REQUIRED_CONFIRMATION), transport)
     summary = harness.run()
     blob = repr(summary)
     assert _ADMIN not in blob
     assert _FLEET not in blob
     assert "abc123.execute-api" not in blob
     assert _OP not in blob  # operation id appears only as a short hash
+    assert REQUIRED_CONFIRMATION not in blob  # confirmation never leaks
     assert summary_is_public_safe(summary)
