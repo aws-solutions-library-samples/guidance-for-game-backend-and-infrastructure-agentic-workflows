@@ -6,11 +6,26 @@ Gateway JWT authorizer context (``requestContext.authorizer.jwt.claims``) that
 API Gateway populates after verifying the Cognito access token — never from the
 request body, headers, or path beyond the opaque operation id.
 
+Identity binding (matching the E1 observation and E2 approval handlers)
+--------------------------------------------------------------------------
+API Gateway forwards the claims of a verified Cognito **access** token. An access
+token identifies the calling app client with the ``client_id`` claim and carries
+**no** ``aud`` claim and **no** ``custom:tenant_id``/``custom:workspace_id``
+claims. Therefore the dispatcher derives from the token only the fields an access
+token actually carries — ``sub``, ``client_id``, ``token_use``, ``exp`` (plus the
+strictly parsed ``cognito:groups``/``scope``) — and binds the ``audience``,
+``tenant_id`` and ``workspace_id`` of the :class:`VerifiedPrincipal` from the
+**server-owned deployment configuration**. The trusted audience is the app client
+id the deployment was configured to accept; the token's ``client_id`` must equal
+it. Any attempt to influence the audience, tenant, or workspace through custom
+claims, the request body, or headers is ignored — those inputs never enter the
+identity binding.
+
 Its contract is deliberately minimal and closed:
 
 #. Extract the verified principal from the authorizer claims (fail 401 if
-   absent/invalid). The principal's tenant/workspace and trusted app client id
-   are re-checked against the deployment.
+   absent/invalid). ``tenant``/``workspace``/``audience`` come from trusted
+   config; the token's ``client_id`` must match the trusted audience (else 403).
 #. Require the server-owned **admin** group (fail 403 otherwise). Execution is an
    admin action; a plain ``users`` caller can never dispatch.
 #. Load the approved, workspace-scoped operation (fail 404 if not visible to the
@@ -122,22 +137,31 @@ class DispatcherRequestHandler:
         claims = _authorizer_claims(event)
         if claims is None:
             raise _DispatchDenied(401, "IDENTITY_CONTEXT_INVALID", "authentication is required")
+
+        # A Cognito *access* token carries ``sub``, ``client_id``, ``token_use``
+        # and ``exp`` — but no ``aud`` and no ``custom:*`` tenant/workspace claims.
+        # We derive ONLY those fields from the verified authorizer context; the
+        # audience, tenant, and workspace are bound from server-owned config.
         subject = claims.get("sub")
         client_id = claims.get("client_id")
         token_use = claims.get("token_use")
         expires_at = _expiry(claims.get("exp"))
-        audience = claims.get("aud")
-        tenant = claims.get("custom:tenant_id")
-        workspace = claims.get("custom:workspace_id")
-        if token_use != "access" or expires_at is None:
+        if (
+            not isinstance(subject, str)
+            or not isinstance(client_id, str)
+            or token_use != "access"
+            or expires_at is None
+        ):
             raise _DispatchDenied(401, "IDENTITY_CONTEXT_INVALID", "authentication is invalid")
+
         try:
             principal = VerifiedPrincipal(
-                subject_id=subject if isinstance(subject, str) else "",
-                client_id=client_id if isinstance(client_id, str) else "",
-                audience=audience if isinstance(audience, str) else "",
-                tenant_id=tenant if isinstance(tenant, str) else "",
-                workspace_id=workspace if isinstance(workspace, str) else "",
+                subject_id=subject,
+                client_id=client_id,
+                # Audience/tenant/workspace are server-owned, never token-derived.
+                audience=self._trusted_audience,
+                tenant_id=self._tenant_id,
+                workspace_id=self._workspace_id,
                 expires_at=expires_at,
                 groups=parse_group_claim(claims.get("cognito:groups")),
                 scopes=parse_scope_claim(claims.get("scope")),
@@ -145,12 +169,11 @@ class DispatcherRequestHandler:
         except (ClaimParseError, ValueError) as exc:
             raise _DispatchDenied(401, "IDENTITY_CONTEXT_INVALID", "authentication is invalid") from exc
 
-        if (
-            principal.tenant_id != self._tenant_id
-            or principal.workspace_id != self._workspace_id
-            or principal.audience != self._trusted_audience
-        ):
-            raise _DispatchDenied(403, "AUTHORIZATION_DENIED", "not authorized for this workspace")
+        # The trusted audience is the app client id the deployment accepts; the
+        # access token's own ``client_id`` must match it. A wrong app client is an
+        # authorization failure and never reaches the admin gate or any store read.
+        if principal.client_id != self._trusted_audience:
+            raise _DispatchDenied(403, "AUTHORIZATION_DENIED", "client is not trusted for this workspace")
         return principal
 
     def _require_admin(self, principal: VerifiedPrincipal) -> None:
@@ -231,6 +254,11 @@ def _operation_id(event: Mapping[str, Any]) -> str:
 
 
 def _authorizer_claims(event: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the JWT claims API Gateway placed in the authorizer context.
+
+    Only the ``requestContext.authorizer.jwt.claims`` shape is trusted. Body,
+    query string, and custom headers are never consulted for identity.
+    """
     request_context = event.get("requestContext")
     if not isinstance(request_context, Mapping):
         return None
