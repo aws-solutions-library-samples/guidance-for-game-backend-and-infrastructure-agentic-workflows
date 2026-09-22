@@ -306,16 +306,26 @@ class ExecutorService:
     # -- Internals -------------------------------------------------------
 
     def _describe(self, plan: VerifiedExecutionPlan) -> dict[str, int] | None:
-        """Describe current capacity, converting every adapter failure to ``None``.
+        """Describe current capacity, converting every provider *error* to ``None``.
 
-        No provider exception class (``ProviderWriteRejected``,
-        ``ProviderWriteInconclusive``, a malformed-response ``ValueError``, or any
-        other unexpected error) is allowed to escape: the caller decides the
-        bounded outcome from the phase. Raw provider text never surfaces.
+        No provider error class (``ProviderWriteRejected``,
+        ``ProviderWriteInconclusive``, a malformed-response ``ValueError``, a
+        ``ClientError``, or any other unexpected ``Exception``) is allowed to
+        escape: the caller decides the bounded outcome from the phase, and raw
+        provider text never surfaces.
+
+        Non-error control-flow signals (``KeyboardInterrupt``, ``SystemExit``,
+        ``GeneratorExit`` and asyncio ``CancelledError``, all direct
+        ``BaseException`` subclasses) are *not* provider outcomes — the process
+        or task is being stopped — so they propagate untouched rather than being
+        recorded as a fabricated provider terminal state.
         """
         try:
             return self._adapter.describe_capacity(fleet_id=plan.fleet_id, location=plan.location)
-        except BaseException:  # noqa: BLE001 - classify to a bounded outcome, never leak
+        except Exception:  # noqa: BLE001 - classify provider errors to a bounded outcome, never leak
+            # BaseException-only signals (KeyboardInterrupt/SystemExit/GeneratorExit/
+            # CancelledError) are not caught here: they propagate so a stopped or
+            # cancelled process is never recorded as a false provider terminal state.
             return None
 
     def _poll_until_target(
