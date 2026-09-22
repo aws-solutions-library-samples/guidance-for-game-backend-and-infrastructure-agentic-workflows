@@ -38,11 +38,17 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
   // available/provisioned. This is a best-effort UX affordance; the proxy
   // routes and backend independently re-check the admin group and every gate.
   useEffect(() => {
-    if (!userInfo?.isAdmin) {
-      setOperatorCapabilities([]);
-      return;
-    }
     let cancelled = false;
+    if (!userInfo?.isAdmin) {
+      // Clear asynchronously (microtask) so we never call setState synchronously
+      // during the effect body; covers an admin -> non-admin transition.
+      Promise.resolve().then(() => {
+        if (!cancelled) setOperatorCapabilities([]);
+      });
+      return () => {
+        cancelled = true;
+      };
+    }
     fetchCapabilities()
       .then((doc) => {
         if (!cancelled) setOperatorCapabilities(doc.capabilities);
