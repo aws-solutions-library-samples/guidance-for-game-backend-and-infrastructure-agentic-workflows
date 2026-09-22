@@ -44,6 +44,18 @@ DEFAULT_CANCELLATION_MARGIN_S = 3.0
 # Observation freshness / DynamoDB TTL horizon for the transient state.
 DEFAULT_OBSERVATION_TTL_S = 1800
 
+# E2 prepare/approval lifecycle windows (issue #414). A prepared operation
+# awaiting approval lives for at most PREPARATION_EXPIRY_S; a granted approval
+# is valid for at most APPROVAL_EXPIRY_S. Both are bounded by the trusted E1
+# observation revision's own expiry at prepare/approve time.
+DEFAULT_PREPARATION_EXPIRY_S = 900
+DEFAULT_APPROVAL_EXPIRY_S = 1800
+
+# Self-approval (the requester approving their own operation) is denied by
+# default; an owner opts in explicitly and it still only ever admits an
+# explicit low-risk capability. Fails closed.
+DEFAULT_LOW_RISK_SELF_APPROVAL = False
+
 # The DynamoDB TTL attribute name is frozen: the table's TimeToLiveSpecification
 # and every written item agree on ``ttl``.
 TTL_ATTRIBUTE = "ttl"
@@ -77,6 +89,23 @@ def _positive_int(env: Mapping[str, str], key: str, default: int) -> int:
     return value
 
 
+_TRUE_TOKENS = frozenset({"true", "1", "yes", "on"})
+_FALSE_TOKENS = frozenset({"false", "0", "no", "off"})
+
+
+def _bool(env: Mapping[str, str], key: str, default: bool) -> bool:
+    """Parse a strict, fail-closed boolean opt-in from the environment."""
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    token = raw.strip().lower()
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    raise ValueError(f"{key} must be a boolean (true/false)")
+
+
 def _required_str(env: Mapping[str, str], key: str) -> str:
     raw = env.get(key)
     if raw is None or not raw.strip():
@@ -100,6 +129,9 @@ class OperationsSettings:
     persistence_budget_s: float
     cancellation_margin_s: float
     observation_ttl_s: int
+    preparation_expiry_s: int = DEFAULT_PREPARATION_EXPIRY_S
+    approval_expiry_s: int = DEFAULT_APPROVAL_EXPIRY_S
+    low_risk_self_approval_enabled: bool = DEFAULT_LOW_RISK_SELF_APPROVAL
 
     def __post_init__(self) -> None:
         if self.mode not in _AUTHORITY_ORDER:
@@ -184,6 +216,13 @@ def resolve_operations_settings(env: Mapping[str, str] | None = None) -> Operati
             source, "GBAW_OPERATIONS_CANCELLATION_MARGIN_S", DEFAULT_CANCELLATION_MARGIN_S
         ),
         observation_ttl_s=_positive_int(source, "GBAW_OPERATIONS_OBSERVATION_TTL_S", DEFAULT_OBSERVATION_TTL_S),
+        preparation_expiry_s=_positive_int(
+            source, "GBAW_OPERATIONS_PREPARATION_EXPIRY_S", DEFAULT_PREPARATION_EXPIRY_S
+        ),
+        approval_expiry_s=_positive_int(source, "GBAW_OPERATIONS_APPROVAL_EXPIRY_S", DEFAULT_APPROVAL_EXPIRY_S),
+        low_risk_self_approval_enabled=_bool(
+            source, "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL", DEFAULT_LOW_RISK_SELF_APPROVAL
+        ),
     )
 
 

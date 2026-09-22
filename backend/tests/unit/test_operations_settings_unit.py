@@ -86,3 +86,48 @@ def test_advise_and_higher_modes_enable_e2(mode: str) -> None:
     assert settings.e2_enabled is True
     assert settings.observe_enabled is True
     assert settings.advise_enabled is True
+
+
+# -- E2 approval settings (issue #414) --------------------------------------
+
+
+def test_e2_settings_defaults_are_fail_closed() -> None:
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "advise"})
+    # Self-approval is denied by default: an owner must opt in explicitly.
+    assert settings.low_risk_self_approval_enabled is False
+    # The two E2 lifecycle expiries default to sensible, positive windows.
+    assert settings.preparation_expiry_s == 900
+    assert settings.approval_expiry_s == 1800
+
+
+def test_e2_low_risk_self_approval_opt_in_is_parsed() -> None:
+    for raw, expected in (("true", True), ("false", False), ("1", True), ("0", False)):
+        settings = resolve_operations_settings(
+            env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL": raw}
+        )
+        assert settings.low_risk_self_approval_enabled is expected
+
+
+def test_e2_low_risk_self_approval_invalid_fails_closed() -> None:
+    with pytest.raises(ValueError):
+        resolve_operations_settings(
+            env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL": "maybe"}
+        )
+
+
+def test_e2_expiries_are_overridable_and_positive() -> None:
+    settings = resolve_operations_settings(
+        env={
+            "GBAW_OPERATIONS_MODE": "advise",
+            "GBAW_OPERATIONS_PREPARATION_EXPIRY_S": "600",
+            "GBAW_OPERATIONS_APPROVAL_EXPIRY_S": "1200",
+        }
+    )
+    assert settings.preparation_expiry_s == 600
+    assert settings.approval_expiry_s == 1200
+
+
+@pytest.mark.parametrize("key", ["GBAW_OPERATIONS_PREPARATION_EXPIRY_S", "GBAW_OPERATIONS_APPROVAL_EXPIRY_S"])
+def test_e2_expiry_invalid_fails_closed(key: str) -> None:
+    with pytest.raises(ValueError):
+        resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "advise", key: "0"})
