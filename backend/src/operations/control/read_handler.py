@@ -10,7 +10,7 @@ E4 surfaces:
   projection.
 
 Like every operations handler it trusts identity ONLY from the API Gateway JWT
-authorizer context and binds the ``tenant``/``workspace``/``audience`` from
+authorizer context, requires the server-owned admin group, and binds the ``tenant``/``workspace``/``audience`` from
 server-owned config; the token's ``client_id`` must equal the trusted audience.
 The workspace is therefore never caller-supplied, so a caller only ever sees its
 own workspace's operations. Responses are the bounded, public-safe projections
@@ -58,6 +58,7 @@ class ControlReadHandler:
         tenant_id: str,
         workspace_id: str,
         trusted_audience: str,
+        admin_group: str,
         kill_switch_gate: Any = None,
         metrics: Any = None,
     ) -> None:
@@ -65,6 +66,7 @@ class ControlReadHandler:
             ("tenant_id", tenant_id),
             ("workspace_id", workspace_id),
             ("trusted_audience", trusted_audience),
+            ("admin_group", admin_group),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
@@ -73,6 +75,7 @@ class ControlReadHandler:
         self._tenant_id = tenant_id
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
+        self._admin_group = admin_group
         # Optional kill-switch gate + control metrics sink for the bounded
         # GET /operations/control/kill-switch read (issue #416). When the gate is
         # absent the reader reports the switch as unavailable and fails closed.
@@ -106,6 +109,7 @@ class ControlReadHandler:
             _LOGGER.error("read identity resolution failed")
             return _error_response(500, "INTERNAL_ERROR", "read failed")
         try:
+            self._require_admin(principal)
             result: dict[str, Any] = action(event, principal)
             return result
         except _ReadDenied as exc:
@@ -168,6 +172,10 @@ class ControlReadHandler:
             pass
 
     # -- identity --------------------------------------------------------
+
+    def _require_admin(self, principal: VerifiedPrincipal) -> None:
+        if self._admin_group not in principal.groups:
+            raise _ReadDenied(403, "AUTHORIZATION_DENIED", "operator access requires the admin group")
 
     def _verified_principal(self, event: Mapping[str, Any]) -> VerifiedPrincipal:
         claims = _authorizer_claims(event)

@@ -1,7 +1,7 @@
 """E4 read handler tests: capabilities / list / detail (issue #416).
 
 :class:`~operations.control.read_handler.ControlReadHandler` is the authenticated
-HTTP boundary for the read-only E4 surfaces. Like every operations handler it
+HTTP boundary for the admin-only E4 surfaces. Like every operations handler it
 binds identity ONLY from the API Gateway JWT authorizer context and resolves the
 workspace from server-owned config, so a caller only ever sees its own
 workspace's operations. It returns validated, bounded, public-safe projections
@@ -50,11 +50,18 @@ def _handler(projection: Any = None, discovery: Any = None) -> ControlReadHandle
         tenant_id="tenant-1",
         workspace_id="ws-1",
         trusted_audience="trusted-audience",
+        admin_group="admin",
     )
 
 
 def _event(
-    method: str, path: str, *, path_params: Any = None, query: Any = None, client_id: str = "trusted-audience"
+    method: str,
+    path: str,
+    *,
+    path_params: Any = None,
+    query: Any = None,
+    client_id: str = "trusted-audience",
+    groups: str = "[admin]",
 ) -> dict[str, Any]:
     return {
         "requestContext": {
@@ -66,7 +73,7 @@ def _event(
                         "client_id": client_id,
                         "token_use": "access",
                         "exp": "9999999999",
-                        "cognito:groups": "[users]",
+                        "cognito:groups": groups,
                     }
                 }
             },
@@ -122,6 +129,13 @@ def test_missing_auth_returns_401() -> None:
 def test_wrong_client_returns_403() -> None:
     response = _handler().handle_list(_event("GET", "/operations", client_id="other"))
     assert response["statusCode"] == 403
+
+
+def test_non_admin_returns_403_before_any_projection_read() -> None:
+    projection = _FakeProjection()
+    response = _handler(projection).handle_list(_event("GET", "/operations", groups="[users]"))
+    assert response["statusCode"] == 403
+    assert projection.list_calls == []
 
 
 def test_invalid_page_size_defaults_safely() -> None:

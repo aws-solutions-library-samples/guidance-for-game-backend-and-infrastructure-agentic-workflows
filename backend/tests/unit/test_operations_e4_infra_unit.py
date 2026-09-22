@@ -528,6 +528,10 @@ def test_appconfig_control_actions_cover_every_provider_resource(template):
     ):
         assert required in start
 
+    listed = json.dumps(statements["ListKillSwitchDeploymentsOnly"]["Resource"])
+    assert "application/${ControlApplication}\"" in listed
+    assert "environment/${ControlEnvironmentResource}" in listed
+
     inspect = json.dumps(statements["InspectOrStopKillSwitchDeploymentsOnly"]["Resource"])
     assert "environment/${ControlEnvironmentResource}/deployment/*" in inspect
 

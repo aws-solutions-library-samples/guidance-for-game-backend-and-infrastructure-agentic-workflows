@@ -126,6 +126,7 @@ def _build_runtime() -> _ControlRuntime:
         tenant_id=obs.tenant_id,
         workspace_id=obs.workspace_id,
         trusted_audience=obs.trusted_audience,
+        admin_group=settings.admin_group,
         kill_switch_gate=gate,
         metrics=metrics,
     )

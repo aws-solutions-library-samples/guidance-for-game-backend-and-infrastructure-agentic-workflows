@@ -104,6 +104,7 @@ def _read_handler(gate: Any, metrics: Any) -> Any:
         tenant_id="tenant-default",
         workspace_id="workspace-default",
         trusted_audience=_TRUSTED,
+        admin_group="admin",
         kill_switch_gate=gate,
         metrics=metrics,
     )
