@@ -69,6 +69,13 @@ EXIT_SHAKEDOWN_FAILED = 4
 
 CONTRACT_VERSION = "1.0"
 
+# The deployment default fail-closed capacity envelope (issue #414): floor 0,
+# ceiling 1, max single step 1. The live harness only ever proposes a bounded
+# single-instance transition within this envelope.
+_CAPACITY_FLOOR = 0
+_CAPACITY_CEILING = 1
+_CAPACITY_MAX_STEP = 1
+
 _FLEET_ID_PATTERN = re.compile(r"^fleet-[a-f0-9-]{1,120}$")
 _LOCATION_PATTERN = re.compile(r"^[a-z0-9-]+$")
 _OBSERVATION_ID_PATTERN = re.compile(r"^obs_[a-z0-9]{26}$")
@@ -93,6 +100,13 @@ class E2ShakedownConfig:
     fleet_id: str
     location: str
     observation_id: str
+    # The current observed desired capacity, clamped to the deployment's
+    # fail-closed [0, 1] envelope. The harness proposes a single bounded step
+    # away from it (0 -> 1 or 1 -> 0), never the old unbounded 12/max20 intent
+    # that a fail-closed deployment would reject as out of bounds. Defaults to
+    # the fully-clamped current state of 1 so the prepared step is a safe
+    # scale-to-zero within [0, 1].
+    current_desired: int = 1
 
     def __post_init__(self) -> None:
         if not self.endpoint.lower().startswith("https://"):
@@ -105,6 +119,10 @@ class E2ShakedownConfig:
             raise ValueError("location is not a valid location")
         if not _OBSERVATION_ID_PATTERN.fullmatch(self.observation_id):
             raise ValueError("observation_id is not a valid observation id")
+        if not isinstance(self.current_desired, int) or isinstance(self.current_desired, bool):
+            raise ValueError("current_desired must be an integer")
+        if not 0 <= self.current_desired <= _CAPACITY_CEILING:
+            raise ValueError("current_desired must be within the fail-closed [0, 1] envelope")
 
 
 @dataclass
@@ -154,6 +172,22 @@ class E2ShakedownRunner:
         raw = json.dumps(body).encode("utf-8") if body is not None else None
         return self._transport(method, self._config.endpoint + path, headers, raw)
 
+    def _bounded_requested(self) -> dict[str, int]:
+        """Return a single bounded step from the current desired capacity.
+
+        The transition stays inside the fail-closed [floor, ceiling] == [0, 1]
+        envelope with |desired-delta| <= max_step == 1: from a current desired
+        of 0 the harness proposes +1 to 1, and from 1 it proposes -1 to 0.
+        minimum/maximum are pinned to the envelope so the request can never
+        exceed the deployment's server-owned bounds.
+        """
+        current = self._config.current_desired
+        target = _CAPACITY_CEILING if current <= _CAPACITY_FLOOR else _CAPACITY_FLOOR
+        # Guarantee a single bounded step even if the envelope ever widens.
+        if abs(target - current) > _CAPACITY_MAX_STEP:
+            target = current + _CAPACITY_MAX_STEP if target > current else current - _CAPACITY_MAX_STEP
+        return {"desired": target, "minimum": _CAPACITY_FLOOR, "maximum": _CAPACITY_CEILING}
+
     def _prepare_body(self) -> dict[str, Any]:
         return {
             "request_contract_version": CONTRACT_VERSION,
@@ -163,7 +197,7 @@ class E2ShakedownRunner:
             "proposal": {
                 "fleet_id": self._config.fleet_id,
                 "location": self._config.location,
-                "requested": {"desired": 12, "minimum": 2, "maximum": 20},
+                "requested": self._bounded_requested(),
             },
         }
 
@@ -292,6 +326,7 @@ def build_config_from_env(args: argparse.Namespace) -> E2ShakedownConfig:
     fleet = _resolve(args.fleet_id, "GBAW_E2_FLEET_ID")
     location = _resolve(args.location, "GBAW_E2_LOCATION")
     observation = _resolve(args.observation_id, "GBAW_E2_OBSERVATION_ID")
+    current_desired_raw = _resolve(args.current_desired, "GBAW_E2_CURRENT_DESIRED")
     missing = [
         name
         for name, value in (
@@ -307,6 +342,13 @@ def build_config_from_env(args: argparse.Namespace) -> E2ShakedownConfig:
     if missing:
         raise ValueError(f"missing required inputs: {', '.join(missing)}")
     assert endpoint and access and approver and fleet and location and observation
+    if current_desired_raw is None or str(current_desired_raw).strip() == "":
+        current_desired = 1
+    else:
+        try:
+            current_desired = int(str(current_desired_raw).strip())
+        except ValueError as exc:
+            raise ValueError("current_desired must be an integer") from exc
     return E2ShakedownConfig(
         endpoint=endpoint,
         access_token=access,
@@ -314,6 +356,7 @@ def build_config_from_env(args: argparse.Namespace) -> E2ShakedownConfig:
         fleet_id=fleet,
         location=location,
         observation_id=observation,
+        current_desired=current_desired,
     )
 
 
@@ -325,6 +368,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--fleet-id", dest="fleet_id")
     parser.add_argument("--location")
     parser.add_argument("--observation-id", dest="observation_id")
+    parser.add_argument("--current-desired", dest="current_desired")
     parser.add_argument("--out")
     return parser.parse_args(argv)
 

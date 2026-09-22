@@ -149,11 +149,12 @@ def _build_handler(settings: ObservationDeploymentSettings) -> Any:
 
 
 # The E2 approval policy identity and playbook binding are code-owned, not
-# request-derived. The playbook hash is a stable, deterministic placeholder for
-# the (not-yet-executed) capacity playbook; E2 performs no provider write.
+# request-derived. The playbook hash is the real RFC 8785 / SHA-256 digest of
+# the complete immutable capacity playbook definition (id/version/profile/
+# capability, retry policy, parameter/precondition bounds, executor binding);
+# any drift in that definition changes the hash. E2 performs no provider write.
 _POLICY_ID = "policy.gamelift.capacity"
 _POLICY_VERSION = "1"
-_PLAYBOOK_HASH = "sha256:" + "0" * 64
 
 
 def _utcnow() -> datetime:
@@ -186,6 +187,13 @@ def _build_approval_handler(
     from operations.decisions import LifecycleDecisionService
     from operations.evidence import E2EvidenceService
     from operations.observe.e2_metrics import CloudWatchApprovalMetrics
+    from operations.playbook_definition import (
+        FUTURE_EXECUTOR_BINDING,
+        PLAYBOOK_ID,
+        PLAYBOOK_VERSION,
+        RETRY_POLICY,
+        capacity_playbook_hash,
+    )
     from operations.prepare import CapacityPlaybook, PrepareService
     from operations.prepare_orchestrator import PrepareOrchestrator
 
@@ -197,9 +205,9 @@ def _build_approval_handler(
         state_port = E1ObservationCapacityStatePort(status_loader=observation_store, observation_id=observation_id)
         bounds_port = DeploymentCapacityBoundsResolver(
             state_port=state_port,
-            floor=0,
-            ceiling=1_000_000,
-            max_step=1_000_000,
+            floor=ops.capacity_floor,
+            ceiling=ops.capacity_ceiling,
+            max_step=ops.capacity_max_step,
             enrollment_id="enrollment.gamelift.capacity",
             enrollment_version="1",
             policy_id=_POLICY_ID,
@@ -214,20 +222,12 @@ def _build_approval_handler(
         )
 
     playbook = CapacityPlaybook(
-        playbook_id="playbook.gamelift-capacity",
-        playbook_version="1.0.0",
-        playbook_hash=_PLAYBOOK_HASH,
+        playbook_id=PLAYBOOK_ID,
+        playbook_version=PLAYBOOK_VERSION,
+        playbook_hash=capacity_playbook_hash(),
         profile=PROFILE,
-        retry_policy={
-            "max_attempts": 3,
-            "base_delay_seconds": 2,
-            "max_delay_seconds": 60,
-            "reconcile_before_retry": True,
-        },
-        future_executor_binding={
-            "executor_id": "executor.gamelift-capacity",
-            "executor_binding_version": "1.0",
-        },
+        retry_policy=dict(RETRY_POLICY),
+        future_executor_binding=dict(FUTURE_EXECUTOR_BINDING),
     )
     prepare_service = PrepareService(
         settings=ops,
@@ -245,14 +245,18 @@ def _build_approval_handler(
         preparation_expiry_s=ops.preparation_expiry_s,
     )
 
-    # A direct JWT-authenticated approver in the trusted audience. Self-approval
-    # is denied by default; only an explicit low-risk opt-in admits the requester
-    # approving their own low-risk operation.
+    # A direct approver must belong to the server-owned Cognito approver group
+    # (default ``admin``); approver authority is bound to a provider-controlled
+    # group, never to the trusted app client id. The ApprovalIdentityBoundary
+    # still binds the trusted app client. A default ``users`` requester cannot
+    # approve. Self-approval is denied by default; only an explicit low-risk
+    # opt-in admits the requester approving their own low-risk operation, and it
+    # still requires the approver group.
     low_risk_actions = frozenset({ACTION}) if ops.low_risk_self_approval_enabled else frozenset()
     policy = ApprovalPolicy(
         policy_id=_POLICY_ID,
         policy_version=_POLICY_VERSION,
-        approver_scopes=frozenset({settings.trusted_audience}),
+        approver_groups=frozenset({ops.approver_group}),
         low_risk_self_approval_actions=low_risk_actions,
     )
     approval_service = ApprovalService(identity_boundary=boundary, policy=policy, store=approval_store, clock=_utcnow)

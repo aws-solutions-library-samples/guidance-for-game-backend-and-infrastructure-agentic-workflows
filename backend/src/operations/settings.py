@@ -56,6 +56,21 @@ DEFAULT_APPROVAL_EXPIRY_S = 1800
 # explicit low-risk capability. Fails closed.
 DEFAULT_LOW_RISK_SELF_APPROVAL = False
 
+# The server-owned Cognito group a direct E2 approver must belong to. This is a
+# *group*, not a scope: a real access token's ``scope`` claim is not the Cognito
+# app client id, so approver authority is bound to a group the identity provider
+# controls (``admin``), never to the trusted app client id. A ``users`` member
+# cannot approve; only an ``admin`` member can.
+DEFAULT_APPROVER_GROUP = "admin"
+
+# Server-owned, fail-closed capacity bounds (issue #414). The default admits
+# only a fully clamped [0, 1] fleet with a single-instance step, so a deployment
+# that forgets to configure real bounds cannot authorize a large capacity swing.
+# These are always at or inside the code-owned playbook parameter envelope.
+DEFAULT_CAPACITY_FLOOR = 0
+DEFAULT_CAPACITY_CEILING = 1
+DEFAULT_CAPACITY_MAX_STEP = 1
+
 # The DynamoDB TTL attribute name is frozen: the table's TimeToLiveSpecification
 # and every written item agree on ``ttl``.
 TTL_ATTRIBUTE = "ttl"
@@ -86,6 +101,25 @@ def _positive_int(env: Mapping[str, str], key: str, default: int) -> int:
         raise ValueError(f"{key} must be a positive integer") from exc
     if value <= 0:
         raise ValueError(f"{key} must be a positive integer")
+    return value
+
+
+def _int_field(env: Mapping[str, str], key: str, default: int, *, minimum: int) -> int:
+    """Parse a strict integer no less than ``minimum``, failing closed.
+
+    Rejects non-integer text (including floats like ``1.5``) so a malformed
+    bound never silently rounds or defaults to a permissive value.
+    """
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    token = raw.strip()
+    try:
+        value = int(token)
+    except ValueError as exc:
+        raise ValueError(f"{key} must be an integer no less than {minimum}") from exc
+    if value < minimum:
+        raise ValueError(f"{key} must be an integer no less than {minimum}")
     return value
 
 
@@ -120,6 +154,13 @@ def _required_identifier(env: Mapping[str, str], key: str) -> str:
     return value
 
 
+def _optional_str(env: Mapping[str, str], key: str, default: str) -> str:
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip()
+
+
 @dataclass(frozen=True, slots=True)
 class OperationsSettings:
     """Resolved, validated operations deployment ceiling and observe budgets."""
@@ -132,10 +173,35 @@ class OperationsSettings:
     preparation_expiry_s: int = DEFAULT_PREPARATION_EXPIRY_S
     approval_expiry_s: int = DEFAULT_APPROVAL_EXPIRY_S
     low_risk_self_approval_enabled: bool = DEFAULT_LOW_RISK_SELF_APPROVAL
+    approver_group: str = DEFAULT_APPROVER_GROUP
+    capacity_floor: int = DEFAULT_CAPACITY_FLOOR
+    capacity_ceiling: int = DEFAULT_CAPACITY_CEILING
+    capacity_max_step: int = DEFAULT_CAPACITY_MAX_STEP
 
     def __post_init__(self) -> None:
         if self.mode not in _AUTHORITY_ORDER:
             raise ValueError(f"GBAW_OPERATIONS_MODE must be one of {OPERATIONS_MODES}")
+        if not isinstance(self.approver_group, str) or not self.approver_group.strip():
+            raise ValueError("approver_group must be a non-empty string")
+        self._validate_capacity_bounds()
+
+    def _validate_capacity_bounds(self) -> None:
+        floor, ceiling, max_step = self.capacity_floor, self.capacity_ceiling, self.capacity_max_step
+        for value, name in ((floor, "capacity_floor"), (ceiling, "capacity_ceiling"), (max_step, "capacity_max_step")):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer")
+        if floor < 0:
+            raise ValueError("capacity_floor must be non-negative")
+        if ceiling < floor:
+            raise ValueError("capacity_ceiling must be no less than capacity_floor")
+        if max_step <= 0:
+            raise ValueError("capacity_max_step must be a positive integer")
+        # A single step can never exceed the reachable span of the bounds; a
+        # larger max_step would be meaningless and could mask a misconfiguration.
+        # A fully clamped floor==ceiling deployment still allows a step of 1 so
+        # the safe default (0/1/1 and 0/0/1) validates.
+        if max_step > max(1, ceiling - floor):
+            raise ValueError("capacity_max_step must not exceed the bound span")
 
     @property
     def operations_enabled(self) -> bool:
@@ -223,6 +289,10 @@ def resolve_operations_settings(env: Mapping[str, str] | None = None) -> Operati
         low_risk_self_approval_enabled=_bool(
             source, "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL", DEFAULT_LOW_RISK_SELF_APPROVAL
         ),
+        approver_group=_optional_str(source, "GBAW_OPERATIONS_APPROVER_GROUP", DEFAULT_APPROVER_GROUP),
+        capacity_floor=_int_field(source, "GBAW_OPERATIONS_CAPACITY_FLOOR", DEFAULT_CAPACITY_FLOOR, minimum=0),
+        capacity_ceiling=_int_field(source, "GBAW_OPERATIONS_CAPACITY_CEILING", DEFAULT_CAPACITY_CEILING, minimum=0),
+        capacity_max_step=_int_field(source, "GBAW_OPERATIONS_CAPACITY_MAX_STEP", DEFAULT_CAPACITY_MAX_STEP, minimum=1),
     )
 
 
