@@ -355,11 +355,24 @@ for schema in SCHEMA_NAMES:
 # The E4 control-plane contract lives in its own additive schema set. Load the
 # kill-switch schema (and its siblings) so a package missing an E4 schema fails
 # the probe closed BEFORE upload.
-from operations.contracts.control_plane import CONTROL_SCHEMA_NAMES, load_control_schema
+from operations.contracts.control_plane import (
+    CONTROL_SCHEMA_NAMES,
+    KILL_SWITCH_ROUTE,
+    ROUTE_KEYS,
+    load_control_schema,
+)
 for schema in CONTROL_SCHEMA_NAMES:
     load_control_schema(schema)
+# The packaged backend must serve the frozen kill-switch STATUS route the 08
+# template provisions. Assert it is in the contract route set the router
+# dispatches, so a package whose contract dropped the route fails closed here
+# BEFORE upload rather than 404-ing the provisioned API Gateway route at runtime.
+expected_kill_switch = "GET %s" % KILL_SWITCH_ROUTE
+assert (
+    ROUTE_KEYS.get("kill_switch") == expected_kill_switch
+), "packaged control contract is missing the kill-switch route %r" % expected_kill_switch
 n = len(SCHEMA_NAMES) + len(CONTROL_SCHEMA_NAMES)
-print("runtime probe ok: control import + %d schemas" % n)
+print("runtime probe ok: control import + %d schemas + kill-switch route" % n)
 PROBE
 )"
 
@@ -381,6 +394,10 @@ else
     fi
     if [ ! -f "$STAGE/operations/contracts/schemas/v1/operations-kill-switch.schema.json" ]; then
         echo "❌ E4 kill-switch contract schema is absent from the package." >&2
+        exit 5
+    fi
+    if ! grep -q 'GET /operations/control/kill-switch' "$STAGE/operations/contracts/control_plane.py"; then
+        echo "❌ Packaged control contract does not serve the kill-switch route." >&2
         exit 5
     fi
     for required in rfc8785 jsonschema referencing rpds; do

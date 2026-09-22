@@ -1072,12 +1072,20 @@ Resources:
       AuthorizerId: !Ref ControlJwtAuthorizer
       Target: !Sub 'integrations/${ControlIntegration}'
 
-  # NOTE: there is deliberately NO 'GET /operations/control/kill-switch' route.
-  # The ControlPlaneRouter (backend) serves only the four routes above; the
-  # kill-switch STATUS (config version + per-phase gates) is read through
-  # 'GET /operations/capabilities', which reads the live document via the
-  # AppConfig Lambda extension. Wiring a separate kill-switch route would fall
-  # into the /operations/{operationId} detail catch-all and fail at the backend.
+  # The kill-switch STATUS read (config version + per-phase gates). The backend
+  # ControlPlaneRouter dispatches this exact frozen route (control_plane.ROUTE_KEYS
+  # 'kill_switch') ahead of the '/operations/{operationId}' detail catch-all, so
+  # it reaches the ControlFunction rather than being misrouted. JWT-authorized
+  # like every other control route; admin enforcement is in handler code.
+  KillSwitchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref ControlApi
+      RouteKey: 'GET /operations/control/kill-switch'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ControlJwtAuthorizer
+      Target: !Sub 'integrations/${ControlIntegration}'
 
   # NOTE: there is also deliberately NO cancel route on THIS control API. Cancel
   # ('POST /operations/{operationId}/cancel') is a frozen E2 approval-lifecycle

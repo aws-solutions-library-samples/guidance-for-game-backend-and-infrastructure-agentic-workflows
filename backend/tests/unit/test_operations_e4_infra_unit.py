@@ -37,9 +37,11 @@ Asserted contract:
 * The official AppConfig Lambda extension layer is attached via a validated
   parameter.
 * Least-privilege IAM: the control role may create hosted versions / start
-  deployments ONLY for the exact AppConfig resources, and write bounded audit
-  items (PutItem/GetItem) only. No provider write, no PassRole, no secrets, no
-  UpdateItem/Delete/Query/Scan.
+  deployments ONLY for the exact AppConfig resources, and touch DynamoDB only
+  through the bounded single-item actions its TransactWriteItems-based control
+  write and read projections need (PutItem/UpdateItem/GetItem/Query). No provider
+  write, no PassRole, no secrets, no Delete/Scan/Batch, and never the invalid
+  dynamodb:TransactWriteItems action.
 * An EventBridge periodic freshness-expiry sweeper targets the control Lambda.
 * Every #416 alarm exists with a truthful metric/statistic and the AppConfig
   monitor is wired to the failed + unverified alarms.
@@ -48,12 +50,21 @@ Asserted contract:
 # Standard library
 import json
 import pathlib
+import sys
 
 # Third-party packages
 import pytest
 
 # Local modules
 from _cfn_yaml import load_cfn_template
+
+# Add the backend src to the path so the frozen control-plane contract is the
+# single source of truth for the expected route set (no hardcoded subset).
+_BACKEND_SRC = str(pathlib.Path(__file__).parents[2] / "src")
+if _BACKEND_SRC not in sys.path:
+    sys.path.insert(0, _BACKEND_SRC)
+# Local modules
+from operations.contracts.control_plane import ROUTE_KEYS  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -68,27 +79,24 @@ KILL_SWITCH_SCHEMA = PROJECT_ROOT / "backend/src/operations/contracts/schemas/v1
 
 METRIC_NAMESPACE = "GameAgent/Operations"
 
-# The frozen E4 control-plane routes (mirrors control_plane.ROUTE_KEYS).
-# The frozen routes the ControlPlaneRouter actually dispatches (router.py). The
-# kill-switch STATUS is read via GET /operations/capabilities (which reads the
-# gate through the AppConfig extension); there is deliberately no separately
-# routed GET /operations/control/kill-switch, because the router would misroute
-# it into the /operations/{operationId} detail catch-all. Wiring such a route to
-# the integration would 400/404 at the backend, so it is not provisioned.
-E4_ROUTE_KEYS = frozenset(
-    {
-        "GET /operations/capabilities",
-        "GET /operations",
-        "GET /operations/{operationId}",
-        "POST /operations/control",
-    }
-)
+# The frozen E4 control-plane route set, derived DIRECTLY from the backend
+# contract (control_plane.ROUTE_KEYS) rather than a hardcoded subset. The
+# ControlPlaneRouter dispatches every one of these, including the kill-switch
+# STATUS read 'GET /operations/control/kill-switch', which the router matches
+# ahead of the '/operations/{operationId}' detail catch-all. The template must
+# provision exactly this set — no more, no fewer — so a contract route can never
+# silently lose its API Gateway route.
+E4_ROUTE_KEYS = frozenset(ROUTE_KEYS.values())
 
-# The exact bounded DynamoDB item actions the control/read/sweeper role needs:
-# the transaction underlying single-item writes (PutItem/UpdateItem), point
-# reads (GetItem) for compare-and-set, and the workspace-scoped catalog Query
-# the read projections and the expiry sweeper enumerate with. NEVER
-# TransactWriteItems, Scan, DeleteItem, or any Batch action.
+# The exact bounded DynamoDB item actions the control/read/sweeper role needs.
+# The backend performs its atomic control-record write with the DynamoDB
+# TransactWriteItems *API call*, but that API authorizes on the UNDERLYING
+# single-item actions of each transaction item — here PutItem and UpdateItem —
+# NOT on a 'dynamodb:TransactWriteItems' action, which is not a valid IAM action
+# and must never appear in a policy. The role also needs point reads (GetItem)
+# for compare-and-set and the workspace-scoped catalog Query the read
+# projections and the expiry sweeper enumerate with. NEVER Scan, DeleteItem, or
+# any Batch action.
 ALLOWED_DYNAMODB_ACTIONS = frozenset(
     {
         "dynamodb:PutItem",
@@ -346,7 +354,10 @@ def test_monitor_role_only_describes_alarms(template):
 # Frozen routes + JWT
 # --------------------------------------------------------------------------- #
 def test_frozen_routes_present_and_jwt(template):
+    # The provisioned route set must equal the frozen contract route set exactly,
+    # derived from control_plane.ROUTE_KEYS — including the kill-switch route.
     assert _route_keys(template) == E4_ROUTE_KEYS
+    assert "GET /operations/control/kill-switch" in E4_ROUTE_KEYS
     for route in _routes(template).values():
         assert route["Properties"]["AuthorizationType"] == "JWT"
 
@@ -637,6 +648,18 @@ def test_deploy_wrapper_exists_and_resolves_extension_layer():
 def test_teardown_and_disable_wrappers_exist():
     assert TEARDOWN_WRAPPER.exists(), f"missing teardown wrapper: {TEARDOWN_WRAPPER}"
     assert DISABLE_WRAPPER.exists(), f"missing disable wrapper: {DISABLE_WRAPPER}"
+
+
+def test_deploy_wrapper_probe_covers_the_kill_switch_route():
+    """The packaging/runtime probe must verify the backend serves the frozen
+    kill-switch route, so a package whose contract dropped it fails closed before
+    upload instead of 404-ing the provisioned API Gateway route at runtime."""
+    body = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # Runtime (container) probe asserts the contract route set carries kill_switch.
+    assert 'ROUTE_KEYS.get("kill_switch")' in body
+    assert "KILL_SWITCH_ROUTE" in body
+    # Structural (no-container) probe greps the packaged contract for the route.
+    assert "GET /operations/control/kill-switch" in body
 
 
 def test_disable_wrapper_is_reversible_lever_flip_only():
