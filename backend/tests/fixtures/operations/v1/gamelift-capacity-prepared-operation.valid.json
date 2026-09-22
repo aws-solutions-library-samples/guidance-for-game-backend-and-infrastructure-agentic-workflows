@@ -55,7 +55,9 @@
       "desired": 10,
       "minimum": 2,
       "maximum": 20
-    }
+    },
+    "observed_at": "2026-09-21T19:11:52Z",
+    "expires_at": "2026-09-21T19:41:52Z"
   },
   "resource_enrollment": {
     "enrollment_id": "enroll.fleet-default",
@@ -98,5 +100,5 @@
     "executor_id": "executor.gamelift-capacity",
     "executor_binding_version": "1.0"
   },
-  "prepared_hash": "sha256:2dad46196946c6375450960d769fb7abe59a1f12a3605e153fb64e58e48cd435"
+  "prepared_hash": "sha256:2217fff5f2634364a933e729ed5d2de25a57171f7d80553b7179333335d22542"
 }

@@ -2,7 +2,7 @@
   "authorization_contract_version": "1.0",
   "decision_id": "authz.op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
   "phase": "advise",
-  "prepared_operation_hash": "sha256:2dad46196946c6375450960d769fb7abe59a1f12a3605e153fb64e58e48cd435",
+  "prepared_operation_hash": "sha256:2217fff5f2634364a933e729ed5d2de25a57171f7d80553b7179333335d22542",
   "principal": {
     "subject_id": "subject.operator-1",
     "client_id": "client.web-console",

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-prepared-operation",
   "title": "GameLift Capacity Adjustment Prepared Operation 1.0",
-  "$comment": "Additive immutable E2 prepared operation for gamelift.capacity-adjustment/1.0. It is the sole trusted, signed-by-hash intent handed forward to a future executor. Untrusted proposal fields never appear verbatim: identity, correlation, policy, enrollment, risk, playbook, capability, authority decision, expiry, and a future executor binding identifier are all server-owned. The prepared_hash binds every field except itself. It reuses the immutable common $defs and is not part of the published source-control write-contract schema set, so it never alters an existing v1 write contract or its playbook hash.",
+  "$comment": "Additive immutable E2 prepared operation for gamelift.capacity-adjustment/1.0. It is the sole trusted, signed-by-hash intent handed forward to a future executor. Untrusted proposal fields never appear verbatim: identity, correlation, policy, enrollment, risk, playbook, capability, authority decision, expiry, and a future executor binding identifier are all server-owned. created_at is the trusted E1 observation revision anchor and expires_at is derived deterministically as min(observation expiry, created_at + preparation TTL), so a retry of the same token+intent+current-state revision on a later clock is byte-for-byte identical; the live clock only decides freshness. The prepared_hash binds every field except itself. It reuses the immutable common $defs and is not part of the published source-control write-contract schema set, so it never alters an existing v1 write contract or its playbook hash.",
   "$defs": {
     "capacity_values": {
       "type": "object",
@@ -179,7 +179,9 @@
       "required": [
         "observation_id",
         "observation_hash",
-        "capacity"
+        "capacity",
+        "observed_at",
+        "expires_at"
       ],
       "properties": {
         "observation_id": {
@@ -191,6 +193,12 @@
         },
         "capacity": {
           "$ref": "#/$defs/capacity_values"
+        },
+        "observed_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        },
+        "expires_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
         }
       }
     },

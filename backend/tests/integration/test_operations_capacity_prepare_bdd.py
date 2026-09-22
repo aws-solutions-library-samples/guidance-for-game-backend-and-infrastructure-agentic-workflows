@@ -93,6 +93,8 @@ def _current(desired=10):
         observation_id="obs_aaaaaaaaaaaaaaaaaaaaaaaaaa",
         observation_hash="sha256:" + f"{desired:064x}",
         capacity=CapacityValues(desired=desired, minimum=2, maximum=20),
+        observed_at=NOW,
+        expires_at=NOW + timedelta(minutes=30),
     )
 
 

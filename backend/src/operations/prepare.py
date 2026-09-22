@@ -17,9 +17,13 @@ authorization/binding half of the E2 prepare layer:
   only itself, and it holds no executor credential and performs no provider
   write. The future executor binding is an identifier only.
 
-Preparation is a pure function of (advice, trusted context, playbook, clock):
-the same inputs always yield the same prepared operation and the same hash, so a
-retry is idempotent by construction.
+Preparation is a pure function of (advice, trusted context, playbook): the
+timestamps are derived from the trusted E1 observation revision anchor carried
+in the advice, so the same inputs always yield the same prepared operation and
+the same hash — a retry on a later clock is byte-for-byte idempotent by
+construction. The live clock only decides whether the anchor/current-state
+revision is still fresh; it never alters the emitted bytes for an otherwise
+identical retry.
 """
 
 from __future__ import annotations
@@ -203,16 +207,32 @@ class PrepareService:
         requester_identity = self._authorize(context)
         self._require_valid_advice(advice)
 
+        # The prepared operation is a pure function of (token, intent, trusted
+        # current-state revision). Its timestamps are derived from the trusted
+        # E1 observation revision anchor carried in the advice, never from the
+        # live clock, so a retry of the same intent on a later clock reproduces
+        # byte-for-byte identical bytes and prepared_hash. The live clock only
+        # decides freshness: it may reject a stale or not-yet-valid anchor, but
+        # it never alters the emitted document for an otherwise identical retry.
+        observed_at = _parse_timestamp(advice["current_state"]["observed_at"])
+        observation_expiry = _parse_timestamp(advice["current_state"]["expires_at"])
         now = _utc(self._clock(), "clock")
-        if _parse_timestamp(advice["advised_at"]) > now:
+        if now < observed_at:
             raise PrepareBoundaryError(PrepareErrorCode.ADVICE_STALE, "advice is not yet valid")
+        if now >= observation_expiry:
+            raise PrepareBoundaryError(PrepareErrorCode.ADVICE_STALE, "advice current-state is no longer fresh")
 
         authority_inputs = context.authority_inputs()
         effective = effective_authority(authority_inputs)
         decision, reason_codes = self._decide(advice, authority_inputs, effective)
 
-        created_at = _isoformat(now)
-        expires_at = _isoformat(now + self._operation_ttl)
+        # created_at is the trusted observation anchor. expires_at is derived
+        # deterministically and is never later than the trusted observation
+        # expiry nor the configured preparation TTL.
+        created_at_dt = observed_at
+        expires_at_dt = min(observation_expiry, created_at_dt + self._operation_ttl)
+        created_at = _isoformat(created_at_dt)
+        expires_at = _isoformat(expires_at_dt)
         operation_id = self._operation_id(advice, idempotency_token, requester_identity)
 
         operation: dict[str, Any] = {
@@ -240,6 +260,8 @@ class PrepareService:
                 "observation_id": advice["current_state"]["observation_id"],
                 "observation_hash": advice["current_state"]["observation_hash"],
                 "capacity": dict(advice["current_state"]["capacity"]),
+                "observed_at": advice["current_state"]["observed_at"],
+                "expires_at": advice["current_state"]["expires_at"],
             },
             "resource_enrollment": dict(advice["bounds"]["enrollment"]),
             "policy": dict(advice["bounds"]["policy"]),
