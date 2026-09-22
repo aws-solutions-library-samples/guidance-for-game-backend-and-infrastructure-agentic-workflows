@@ -91,6 +91,7 @@ class DispatcherRequestHandler:
         workspace_id: str,
         trusted_audience: str,
         admin_group: str,
+        kill_switch_gate: Any = None,
     ) -> None:
         for name, value in (
             ("state_machine_arn", state_machine_arn),
@@ -108,6 +109,10 @@ class DispatcherRequestHandler:
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
         self._admin_group = admin_group
+        # Optional deployment-wide kill-switch gate (issue #416): the dispatch
+        # phase is re-checked before the workflow is started. A None gate is a
+        # no-op so the existing E3 dispatcher behavior is preserved.
+        self._kill_switch_gate = kill_switch_gate
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -121,6 +126,7 @@ class DispatcherRequestHandler:
         try:
             operation_id = _operation_id(event)
             self._require_admin(principal)
+            self._require_dispatch_phase()
             self._load_authorized_operation(operation_id, principal)
             self._start_workflow(operation_id)
         except _DispatchDenied as exc:
@@ -179,6 +185,20 @@ class DispatcherRequestHandler:
     def _require_admin(self, principal: VerifiedPrincipal) -> None:
         if self._admin_group not in principal.groups:
             raise _DispatchDenied(403, "AUTHORIZATION_DENIED", "dispatch requires the admin group")
+
+    def _require_dispatch_phase(self) -> None:
+        """Enforce the kill-switch dispatch phase (fail closed on any denial).
+
+        A None gate is a no-op. When a gate is present a PhaseDenied (disabled
+        phase, or an unavailable/invalid/stale kill-switch) becomes a bounded
+        403 so no workflow is started under a denied switch.
+        """
+        if self._kill_switch_gate is None:
+            return
+        try:
+            self._kill_switch_gate.require_phase("dispatch")
+        except Exception as exc:  # noqa: BLE001 - any denial fails closed
+            raise _DispatchDenied(403, "AUTHORIZATION_DENIED", "dispatch is disabled by the kill-switch") from exc
 
     def _load_authorized_operation(self, operation_id: str, principal: VerifiedPrincipal) -> dict[str, Any]:
         view = self._store.load_dispatch_view(operation_id)

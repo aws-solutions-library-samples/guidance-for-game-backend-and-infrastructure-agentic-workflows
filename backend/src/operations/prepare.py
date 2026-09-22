@@ -202,11 +202,16 @@ class PrepareService:
         playbook: CapacityPlaybook,
         clock: Callable[[], datetime],
         operation_ttl_seconds: int = 900,
+        kill_switch_gate: Any = None,
     ) -> None:
         self._settings = settings
         self._identity_boundary = identity_boundary
         self._playbook = playbook
         self._clock = clock
+        # Optional deployment-wide kill-switch gate (issue #416): the prepare
+        # phase is re-checked before any authorization/binding. A None gate is a
+        # no-op so the existing E2 prepare behavior is preserved.
+        self._kill_switch_gate = kill_switch_gate
         if operation_ttl_seconds <= 0:
             raise ValueError("operation_ttl_seconds must be positive")
         self._operation_ttl = timedelta(seconds=operation_ttl_seconds)
@@ -219,6 +224,7 @@ class PrepareService:
         idempotency_token: str,
     ) -> PreparedOperation:
         """Deterministically prepare one immutable capacity operation."""
+        self._require_prepare_phase()
         requester_identity = self._authorize(context)
         self._require_valid_advice(advice)
 
@@ -334,6 +340,23 @@ class PrepareService:
         )
 
     # -- Internals --------------------------------------------------------
+
+    def _require_prepare_phase(self) -> None:
+        """Enforce the kill-switch prepare phase (fail closed on any denial).
+
+        A None gate is a no-op. When a gate is present a PhaseDenied (disabled
+        phase, or an unavailable/invalid/stale kill-switch document) becomes the
+        bounded AUTHORIZATION_DENIED prepare boundary error so no operation is
+        materialized under a denied switch.
+        """
+        if self._kill_switch_gate is None:
+            return
+        try:
+            self._kill_switch_gate.require_phase("prepare")
+        except Exception as exc:  # noqa: BLE001 - any denial fails closed
+            raise PrepareBoundaryError(
+                PrepareErrorCode.AUTHORIZATION_DENIED, "operations prepare is disabled by the kill-switch"
+            ) from exc
 
     def _authorize(self, context: PrepareRequestContext) -> dict[str, str]:
         if not self._settings.advise_enabled:

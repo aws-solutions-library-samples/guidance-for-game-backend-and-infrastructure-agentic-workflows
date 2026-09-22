@@ -153,6 +153,7 @@ class ExecutorService:
         clock: Callable[[], datetime] = _system_clock,
         max_verify_polls: int = _DEFAULT_MAX_VERIFY_POLLS,
         lease_seconds: int = 30,
+        kill_switch_gate: Any = None,
     ) -> None:
         if max_verify_polls < 1:
             raise ValueError("max_verify_polls must be positive")
@@ -164,6 +165,12 @@ class ExecutorService:
         self._clock = clock
         self._max_verify_polls = max_verify_polls
         self._lease_seconds = lease_seconds
+        # Optional deployment-wide kill-switch gate (issue #416). When present
+        # the executor checks the execute phase TWICE: on entry (before any
+        # verify/Describe/write) and again immediately before UpdateFleetCapacity
+        # (after the pre-write Describe), so a switch flipped mid-flight still
+        # blocks the write. When absent the executor behaves exactly as before.
+        self._kill_switch_gate = kill_switch_gate
 
     def execute(
         self,
@@ -174,6 +181,8 @@ class ExecutorService:
         lease_holder: str,
     ) -> dict[str, Any]:
         """Run one bounded execution attempt and return the recorded result."""
+        # 0. Kill-switch entry check (issue #416): deny before any work.
+        self._require_execute_phase()
         # 1/2. Verify every precondition before anything else (fail closed).
         try:
             plan = self._verifier.verify(prepared_operation=prepared_operation, approval=approval)
@@ -227,7 +236,11 @@ class ExecutorService:
                 new_state="failed",
             )
 
-        # 4. Issue exactly one UpdateFleetCapacity.
+        # 4. Kill-switch pre-write check (issue #416): re-check the execute
+        # phase immediately before the write, AFTER the pre-write Describe, so a
+        # switch flipped during the Describe still blocks UpdateFleetCapacity.
+        self._require_execute_phase()
+        # Issue exactly one UpdateFleetCapacity.
         write_issued = True
         try:
             self._adapter.update_capacity(
@@ -304,6 +317,21 @@ class ExecutorService:
         )
 
     # -- Internals -------------------------------------------------------
+
+    def _require_execute_phase(self) -> None:
+        """Enforce the kill-switch execute phase, failing closed on any denial.
+
+        A ``None`` gate is a no-op (the E3 default). When a gate is present a
+        ``PhaseDenied`` (disabled/denied phase, or an unavailable/invalid/stale
+        kill-switch document) is converted to a bounded ExecutorServiceError so
+        no UpdateFleetCapacity is ever issued under a denied switch.
+        """
+        if self._kill_switch_gate is None:
+            return
+        try:
+            self._kill_switch_gate.require_phase("execute")
+        except Exception as exc:  # noqa: BLE001 - any gate denial fails closed
+            raise ExecutorServiceError("execute phase is disabled by the kill-switch") from exc
 
     def _describe(self, plan: VerifiedExecutionPlan) -> dict[str, int] | None:
         """Describe current capacity, converting every provider *error* to ``None``.
