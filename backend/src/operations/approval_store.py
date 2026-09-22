@@ -64,6 +64,7 @@ from typing import Any
 # Local modules
 from operations.approval import ApprovalCommitOutcome, StoredPreparedOperation
 from operations.decisions import DecisionCommitOutcome
+from operations.evidence import OperationEvidence
 
 _PREPARED_SK = "PREPARED#current"
 _STATE_SNAPSHOT_SK = "STATE#current"
@@ -74,6 +75,11 @@ _IDEM_SK = "MAP#current"
 _CONTRACT_VERSION = "1.0"
 _INITIAL_GENERATION = 1
 _PENDING_APPROVAL = "pending_approval"
+
+# The prepared-operation lifecycle appends at most a small, bounded number of
+# ledger entries (materialization + one terminal transition), so an evidence
+# read walks a short, contiguous LEDGER#<seq> chain rather than issuing a Scan.
+_MAX_LEDGER_SEQUENCE = 32
 
 # The DynamoDB item-size limit. The canonical prepared-operation JSON must
 # serialize below this ceiling; a larger operation fails closed.
@@ -432,6 +438,84 @@ class DynamoDbApprovalStore:
         if not isinstance(prepared_hash, str) or not isinstance(state, str) or not isinstance(document, dict):
             return None
         return StoredPreparedOperation(document, prepared_hash, state)
+
+    # -- Evidence load ----------------------------------------------------
+
+    def load_operation_evidence(self, operation_id: str) -> OperationEvidence | None:
+        """Read the bounded durable evidence for one operation (read-only).
+
+        Returns the immutable prepared operation, its bound ``prepared_hash``,
+        the current state, the approval record when present, and the append-only
+        ledger (each entry reduced to its sequence, event type, and timestamp).
+        Returns ``None`` when the operation does not exist. The read is a bounded
+        set of key lookups plus a bounded ledger walk; it issues no Scan.
+        """
+        # Standard library
+        import json
+
+        op_pk = f"OP#{operation_id}"
+        prepared = self._get(op_pk, _PREPARED_SK)
+        snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
+        if prepared is None or snapshot is None:
+            return None
+        operation_json = prepared.get("operation_json")
+        prepared_hash = prepared.get("prepared_hash")
+        state = snapshot.get("state")
+        if not isinstance(operation_json, str) or not isinstance(prepared_hash, str) or not isinstance(state, str):
+            return None
+        try:
+            document = json.loads(operation_json)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(document, dict):
+            return None
+
+        approval: dict[str, Any] | None = None
+        approval_item = self._get(op_pk, _APPROVAL_SK)
+        if approval_item is not None:
+            approval_json = approval_item.get("approval_json")
+            if isinstance(approval_json, str):
+                try:
+                    parsed = json.loads(approval_json)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    approval = parsed
+
+        ledger = self._load_ledger(op_pk)
+        return OperationEvidence(
+            operation=document,
+            prepared_hash=prepared_hash,
+            state=state,
+            approval=approval,
+            ledger=ledger,
+        )
+
+    def _load_ledger(self, op_pk: str) -> list[dict[str, Any]]:
+        """Walk the bounded, contiguous LEDGER#<seq> chain from sequence 0."""
+        # Standard library
+        import json
+
+        entries: list[dict[str, Any]] = []
+        # A prepared operation transitions at most once beyond its initial
+        # pending_approval materialization, so the ledger is short and bounded.
+        for sequence in range(_MAX_LEDGER_SEQUENCE + 1):
+            item = self._get(op_pk, f"LEDGER#{sequence}")
+            if item is None:
+                break
+            ledger_json = item.get("ledger_json")
+            event_type: Any = None
+            occurred_at: Any = None
+            if isinstance(ledger_json, str):
+                try:
+                    parsed = json.loads(ledger_json)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    event_type = parsed.get("event_type")
+                    occurred_at = parsed.get("occurred_at")
+            entries.append({"sequence": sequence, "event_type": event_type, "occurred_at": occurred_at})
+        return entries
 
     # -- Low-level helpers ------------------------------------------------
 
