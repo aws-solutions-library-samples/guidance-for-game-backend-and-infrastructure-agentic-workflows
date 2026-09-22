@@ -3,7 +3,7 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './tests',
   // Authenticated live tests have their own config and explicit credentials.
-  testIgnore: ['live-shakedown.spec.ts'],
+  testIgnore: ['live-shakedown.spec.ts', 'live-operator.spec.ts'],
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
