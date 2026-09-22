@@ -141,7 +141,11 @@ if [ "$ACTION" = "preview" ]; then
     echo "   To deploy: GBAW_OPERATIONS_MODE=remediate $0 --enable"
     if command -v cfn-lint >/dev/null 2>&1; then
         echo "   Running cfn-lint ..."
-        cfn-lint "$TEMPLATE"
+        # Show warnings (e.g. W1030 on resolved-Ref pattern checks) but fail
+        # ONLY on error-class (E-level) findings. Plain cfn-lint exits 4 on a
+        # warning-only run, which under set -e would abort this read-only
+        # preview before the AWS validate-template call below.
+        cfn-lint --non-zero-exit-code error "$TEMPLATE"
     else
         echo "   cfn-lint not found; skipping lint."
     fi
@@ -212,14 +216,35 @@ echo "   Caller identity: $CALLER_IDENTITY"
 ACCOUNT_ID="$(printf '%s\n' "$CALLER_IDENTITY" | awk '{print $1}')"
 
 echo "🪣 Verifying the explicit artifact bucket exists in this account/region (no discovery/creation) ..."
+# Assert the bucket is owned by THIS verified account (from get-caller-identity),
+# so a name-squatted foreign bucket is refused before any upload. Mirrors the
+# hardened E1/E2 (06) wrapper.
 if ! aws s3api head-bucket \
         "${AWS_PROFILE_ARGS[@]}" \
         --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+        --expected-bucket-owner "$ACCOUNT_ID" \
         --region "$AWS_REGION" >/dev/null 2>&1; then
-    echo "❌ Artifact bucket '$GBAW_OPERATIONS_ARTIFACT_BUCKET' is not reachable in account $ACCOUNT_ID / $AWS_REGION." >&2
+    echo "❌ Artifact bucket '$GBAW_OPERATIONS_ARTIFACT_BUCKET' does not exist, is inaccessible," >&2
+    echo "   or is not owned by account $ACCOUNT_ID in $AWS_REGION." >&2
     echo "   Create/authorize it out of band; this wrapper never creates or discovers a bucket." >&2
     exit 4
 fi
+# Confirm the bucket Region matches the deploy Region (Lambda requires the
+# code bucket in-region). LocationConstraint reports us-east-1 as "None".
+BUCKET_REGION="$(aws s3api get-bucket-location \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+    --expected-bucket-owner "$ACCOUNT_ID" \
+    --output text 2>/dev/null || true)"
+if [ "$BUCKET_REGION" = "None" ] || [ -z "$BUCKET_REGION" ]; then
+    BUCKET_REGION="us-east-1"
+fi
+if [ "$BUCKET_REGION" != "$AWS_REGION" ]; then
+    echo "❌ Artifact bucket '$GBAW_OPERATIONS_ARTIFACT_BUCKET' is in region '$BUCKET_REGION', not the" >&2
+    echo "   deploy region '$AWS_REGION'. Lambda requires the code bucket in-region." >&2
+    exit 4
+fi
+echo "   Bucket verified: owner=$ACCOUNT_ID region=$BUCKET_REGION"
 
 # --------------------------------------------------------------------------- #
 # Deterministic packaging: build ONE staged tree (real operations code + pinned
