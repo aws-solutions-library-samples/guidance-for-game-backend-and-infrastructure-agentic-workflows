@@ -243,13 +243,21 @@ def test_disable_lever_throttles_gateway_to_zero(template):
 def test_disable_lever_is_injected_into_executor_env(template):
     """Lever 2: the executor reads the injected mode and fails closed when
     disabled — the env binding must be present so a disable makes it fail
-    closed without deleting the function."""
+    closed without deleting the function.
+
+    Aligned to the core contract: the single backend-enforced ceiling is
+    GBAW_OPERATIONS_MODE (fed the ExecutionMode kill switch), not the retired
+    GBAW_OPERATIONS_EXECUTION_MODE."""
     functions = _resources_of_type(template, "AWS::Lambda::Function")
     executor = _find_function(functions, "executor")
     env = executor["Properties"]["Environment"]["Variables"]
-    assert env.get("GBAW_OPERATIONS_EXECUTION_MODE") == "ExecutionMode" or "ExecutionMode" in str(
-        env.get("GBAW_OPERATIONS_EXECUTION_MODE")
-    ), "executor must receive the ExecutionMode kill switch so it fails closed when disabled"
+    assert "GBAW_OPERATIONS_EXECUTION_MODE" not in env, (
+        "the retired GBAW_OPERATIONS_EXECUTION_MODE must not be injected; the core"
+        " handler reads GBAW_OPERATIONS_MODE"
+    )
+    assert "ExecutionMode" in str(
+        env.get("GBAW_OPERATIONS_MODE")
+    ), "executor must receive the ExecutionMode kill switch as GBAW_OPERATIONS_MODE"
 
 
 def _find_function(functions, needle):

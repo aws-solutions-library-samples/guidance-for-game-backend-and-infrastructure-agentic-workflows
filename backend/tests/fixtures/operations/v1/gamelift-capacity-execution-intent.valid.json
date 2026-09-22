@@ -1,0 +1,23 @@
+{
+  "execution_contract_version": "1.0",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "prepared_hash": "sha256:62e1b2ff7853fa8dd8817bdcab7ef81a91784709df4624000ec1484bc46a0707",
+  "logical_action_id": "act_6fec1faab817d359ff25fb0732a02c6a1594d98bf30f3814a1ac4c8aac11a63a",
+  "provider": "gamelift",
+  "action": "gamelift.adjust-fleet-capacity",
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+    "location": "us-west-2"
+  },
+  "parameters": {
+    "desired": 14,
+    "minimum": 2,
+    "maximum": 20
+  },
+  "expected_current_capacity": {
+    "desired": 10,
+    "minimum": 2,
+    "maximum": 20
+  }
+}

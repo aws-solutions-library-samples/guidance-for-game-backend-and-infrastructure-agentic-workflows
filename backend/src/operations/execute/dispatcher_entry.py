@@ -1,103 +1,103 @@
 """Deployable AWS Lambda entry point for the E3 dispatcher (issue #415).
 
-The dispatcher is the JWT-authorized entry point behind the execution HTTP API.
-API Gateway verifies the JWT before the request reaches this handler; the
-handler additionally enforces ADMIN authority in code, validates the approved
-operation, and starts the exact Step Functions state machine carrying
-``operation_id`` ONLY.
+This module is the real, deployable handler behind the API Gateway HTTP API
+route that starts one execution workflow. It bootstraps the protocol-neutral
+:class:`~operations.execute.dispatcher_handler.DispatcherRequestHandler` with its
+runtime dependencies:
 
-This slice DEFINES the frozen entrypoint and its FAIL-CLOSED kill-switch
-contract (lever 2 of the reversible emergency disable, mirrored in the API-stage
-throttle that is lever 1): when the injected ``GBAW_OPERATIONS_EXECUTION_MODE``
-is not ``remediate`` the dispatcher refuses before starting any execution and
-without constructing any boto3 client. The E3 core wires the admin-enforced
-validation and ``StartExecution`` behind this entrypoint in a later slice.
+* a read-only :class:`EvidenceDispatchStore` over the E2 approval store's
+  ``load_operation_evidence`` (the durable, workspace-scoped prepared-operation
+  view) — the dispatcher never writes a durable record; and
+* a bounded ``boto3`` Step Functions client used ONLY to ``start_execution`` the
+  Standard workflow with an input of exactly ``{operation_id}``.
+
+The frozen environment contract is resolved and validated once at import time of
+the handler (fail closed), not at module import, so importing this module is
+side-effect free and AWS-free. The module exposes ``handler(event, context)``.
+No provider write, source-control call, generic API/shell/credential access, or
+PassRole occurs here.
 """
 
 from __future__ import annotations
 
 # Standard library
-import json
+import os
+import time
 from collections.abc import Mapping
+from functools import lru_cache
 from typing import Any
 
 # Local modules
-from operations.execute.settings import resolve_execution_settings
-
-# The JWT group that authorizes a direct dispatch. Admin-only, enforced in code
-# on top of the API Gateway JWT authorizer.
-_ADMIN_GROUP = "admin"
+from operations.evidence import OperationEvidence
 
 
-def _response(status: int, body: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        "statusCode": status,
-        "headers": {"content-type": "application/json"},
-        "body": json.dumps(body, separators=(",", ":"), sort_keys=True),
-    }
+class EvidenceDispatchStore:
+    """Project one E2 OperationEvidence into the minimal dispatch view."""
+
+    def __init__(self, evidence_store: Any) -> None:
+        self._evidence_store = evidence_store
+
+    def load_dispatch_view(self, operation_id: str) -> dict[str, Any] | None:
+        evidence: OperationEvidence | None = self._evidence_store.load_operation_evidence(operation_id)
+        if evidence is None:
+            return None
+        operation = evidence.operation
+        requester = operation.get("requester") if isinstance(operation, dict) else None
+        if not isinstance(requester, dict):
+            return None
+        return {
+            "operation_id": operation_id,
+            "state": evidence.state,
+            "tenant_id": requester.get("tenant_id"),
+            "workspace_id": requester.get("workspace_id"),
+        }
 
 
-def _claims(event: Mapping[str, Any]) -> Mapping[str, Any]:
-    ctx = event.get("requestContext", {}) if isinstance(event, Mapping) else {}
-    authorizer = ctx.get("authorizer", {}) if isinstance(ctx, Mapping) else {}
-    jwt = authorizer.get("jwt", {}) if isinstance(authorizer, Mapping) else {}
-    claims = jwt.get("claims", {}) if isinstance(jwt, Mapping) else {}
-    return claims if isinstance(claims, Mapping) else {}
+def _region() -> str:
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
 
-def _operation_id(event: Mapping[str, Any]) -> str:
-    params = event.get("pathParameters", {}) if isinstance(event, Mapping) else {}
-    if isinstance(params, Mapping):
-        return str(params.get("operationId") or "")
-    return ""
+def _build_handler() -> Any:
+    # Third-party packages
+    import boto3
+    from botocore.config import Config as BotocoreConfig
+
+    # Local modules
+    from operations.approval_store import DynamoDbApprovalStore
+    from operations.execute.dispatcher_handler import DispatcherRequestHandler
+    from operations.settings import resolve_executor_deployment_settings
+
+    settings = resolve_executor_deployment_settings()
+    obs = settings.observation
+    config = BotocoreConfig(connect_timeout=2.0, read_timeout=5.0, retries={"mode": "adaptive", "max_attempts": 2})
+    session = boto3.Session(region_name=_region())
+    dynamodb_client = session.client("dynamodb", config=config)
+    sfn_client = session.client("stepfunctions", config=config)
+
+    approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=obs.table_name)
+    return DispatcherRequestHandler(
+        store=EvidenceDispatchStore(approval_store),
+        step_functions=sfn_client,
+        state_machine_arn=settings.state_machine_arn,
+        tenant_id=obs.tenant_id,
+        workspace_id=obs.workspace_id,
+        trusted_audience=obs.trusted_audience,
+        admin_group=settings.admin_group,
+    )
 
 
-def handle_event(event: Mapping[str, Any], *, env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Pure, injectable core of the dispatcher handler.
-
-    Fails closed (503) on the disabled kill switch and denies (403) a non-admin
-    caller before any execution is started. Returns an HTTP-shaped response;
-    never raises for the ordinary denial paths.
-    """
-    settings = resolve_execution_settings(env)
-
-    # Lever 2: fail closed before any work when the kill switch is off.
-    if not settings.enabled:
-        return _response(
-            503, {"error": "execution disabled", "detail": "GBAW_OPERATIONS_EXECUTION_MODE is not remediate"}
-        )
-
-    operation_id = _operation_id(event)
-    if not operation_id:
-        return _response(400, {"error": "operationId path parameter is required"})
-
-    # Admin enforcement in code on top of the API Gateway JWT authorizer.
-    claims = _claims(event)
-    groups_raw = claims.get("cognito:groups", "")
-    groups = _parse_groups(groups_raw)
-    if _ADMIN_GROUP not in groups:
-        return _response(403, {"error": "admin authority required to dispatch execution"})
-
-    # The admin-enforced validation + StartExecution is wired by the E3 core in
-    # a later slice. Until then we fail closed rather than start an unverified
-    # execution.
-    return _response(503, {"error": "dispatch not wired (E3 core pending); failing closed"})
+@lru_cache(maxsize=1)
+def _handler() -> Any:
+    """Resolve settings and build the handler once per container (fail closed)."""
+    return _build_handler()
 
 
-def _parse_groups(raw: Any) -> frozenset[str]:
-    """Parse the ``cognito:groups`` claim, which arrives as a bracketed string
-    (``[admin users]``) or a list depending on the authorizer path. Uses the
-    same strict, non-whitespace-splitting shape the E1/E2 authorizer parser
-    uses so a bracketed single group is not silently split.
-    """
-    if isinstance(raw, (list, tuple, set, frozenset)):
-        return frozenset(str(g).strip() for g in raw if str(g).strip())
-    text = str(raw or "").strip()
-    if text.startswith("[") and text.endswith("]"):
-        text = text[1:-1]
-    return frozenset(g for g in (part.strip() for part in text.split()) if g)
-
-
-def handler(event: Any, context: Any = None) -> dict[str, Any]:  # noqa: ANN401 - Lambda contract
-    """AWS Lambda entry point invoked by the dispatch HTTP API."""
-    return handle_event(event if isinstance(event, Mapping) else {})
+def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
+    """AWS Lambda entry: dispatch one execution workflow start."""
+    request_handler = _handler()
+    started = time.monotonic()
+    try:
+        response: dict[str, Any] = request_handler.handle(event)
+        return response
+    finally:
+        _ = (time.monotonic() - started) * 1000.0

@@ -55,7 +55,7 @@ levers at once, without deleting any resource or data:
 1. **Lever 1 — gateway throttle.** The dispatch API stage `ThrottlingBurstLimit`
    and `ThrottlingRateLimit` drop to `0` when `ExecutionMode != remediate`, so
    API Gateway rejects every new dispatch **before** the integration.
-2. **Lever 2 — injected kill switch.** `GBAW_OPERATIONS_EXECUTION_MODE=disabled`
+2. **Lever 2 — injected kill switch.** `GBAW_OPERATIONS_MODE=disabled`
    is injected into the executor (and dispatcher). The executor **fails closed**
    before constructing any boto3 client or performing any capacity write; the
    dispatcher returns `503`.
@@ -100,10 +100,13 @@ the stack. The DynamoDB transaction legs are governed by the underlying
 requires a **double opt-in** and the cross-stack bindings:
 
 ```bash
-GBAW_OPERATIONS_EXECUTION_MODE=remediate \
+GBAW_OPERATIONS_MODE=remediate \
 COGNITO_ISSUER=https://cognito-idp.us-west-2.amazonaws.com/us-west-2_example \
 COGNITO_CLIENT_ID=<client-id> \
+GBAW_OPERATIONS_TENANT_ID=<tenant> \
+GBAW_OPERATIONS_WORKSPACE_ID=<workspace> \
 GBAW_OPERATIONS_ENROLLED_FLEET_ID=fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555 \
+GBAW_OPERATIONS_ENROLLED_LOCATION=us-west-2 \
 GBAW_OPERATIONS_TABLE_NAME=game-agent-operations \
 GBAW_OPERATIONS_KMS_KEY_ARN=arn:aws:kms:us-west-2:<account>:key/<key-id> \
 GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket> \

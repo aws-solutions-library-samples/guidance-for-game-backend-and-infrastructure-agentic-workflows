@@ -26,13 +26,17 @@ DISABLE = PROJECT_ROOT / "scripts/infrastructure/disable-operations-execution.sh
 TEARDOWN = PROJECT_ROOT / "scripts/infrastructure/teardown-operations-execution.sh"
 
 _CLEARED_ENV = (
-    "GBAW_OPERATIONS_EXECUTION_MODE",
+    "GBAW_OPERATIONS_MODE",
     "COGNITO_ISSUER",
     "COGNITO_CLIENT_ID",
     "GBAW_OPERATIONS_ENROLLED_FLEET_ID",
+    "GBAW_OPERATIONS_ENROLLED_LOCATION",
     "GBAW_OPERATIONS_ARTIFACT_BUCKET",
     "GBAW_OPERATIONS_TABLE_NAME",
     "GBAW_OPERATIONS_KMS_KEY_ARN",
+    "GBAW_OPERATIONS_TENANT_ID",
+    "GBAW_OPERATIONS_WORKSPACE_ID",
+    "GBAW_OPERATIONS_TRUSTED_AUDIENCE",
 )
 
 
@@ -76,7 +80,7 @@ def test_enable_without_remediate_mode_refuses():
 
 
 def test_enable_with_wrong_mode_refuses():
-    result = _run(DEPLOY, "--enable", env_extra={"GBAW_OPERATIONS_EXECUTION_MODE": "observe"})
+    result = _run(DEPLOY, "--enable", env_extra={"GBAW_OPERATIONS_MODE": "observe"})
     assert result.returncode != 0
 
 
@@ -85,12 +89,14 @@ def test_enable_without_enrolled_fleet_refuses():
         DEPLOY,
         "--enable",
         env_extra={
-            "GBAW_OPERATIONS_EXECUTION_MODE": "remediate",
+            "GBAW_OPERATIONS_MODE": "remediate",
             "COGNITO_ISSUER": "https://issuer.example",
             "COGNITO_CLIENT_ID": "client-abc",
             "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
             "GBAW_OPERATIONS_TABLE_NAME": "game-agent-operations",
             "GBAW_OPERATIONS_KMS_KEY_ARN": "arn:aws:kms:us-west-2:000000000000:key/abc",
+            "GBAW_OPERATIONS_TENANT_ID": "tenant-demo",
+            "GBAW_OPERATIONS_WORKSPACE_ID": "workspace-demo",
         },
     )
     assert result.returncode != 0
@@ -102,16 +108,45 @@ def test_enable_without_artifact_bucket_refuses():
         DEPLOY,
         "--enable",
         env_extra={
-            "GBAW_OPERATIONS_EXECUTION_MODE": "remediate",
+            "GBAW_OPERATIONS_MODE": "remediate",
             "COGNITO_ISSUER": "https://issuer.example",
             "COGNITO_CLIENT_ID": "client-abc",
             "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
             "GBAW_OPERATIONS_TABLE_NAME": "game-agent-operations",
             "GBAW_OPERATIONS_KMS_KEY_ARN": "arn:aws:kms:us-west-2:000000000000:key/abc",
+            "GBAW_OPERATIONS_TENANT_ID": "tenant-demo",
+            "GBAW_OPERATIONS_WORKSPACE_ID": "workspace-demo",
         },
     )
     assert result.returncode != 0
     assert "bucket" in (result.stdout + result.stderr).lower()
+
+
+def test_enable_without_tenant_or_workspace_refuses():
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "remediate",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-abc",
+            "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_TABLE_NAME": "game-agent-operations",
+            "GBAW_OPERATIONS_KMS_KEY_ARN": "arn:aws:kms:us-west-2:000000000000:key/abc",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).lower()
+    assert "tenant" in combined or "workspace" in combined
+
+
+def test_deploy_passes_identity_and_location_parameters():
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "TenantId=" in text
+    assert "WorkspaceId=" in text
+    assert "TrustedAudience=" in text
+    assert "EnrolledLocation=" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -161,3 +196,17 @@ def test_disable_keeps_resources_provisioned():
 def test_deploy_targets_the_07_execution_template():
     text = DEPLOY.read_text(encoding="utf-8")
     assert "07-operations-execution.yaml" in text
+
+
+def test_deploy_probe_loads_e3_execution_schemas():
+    """Packaging must load ALL E3 JSON schemas (intent/result/verification) and
+    run an identifier-only invocation contract probe before upload."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "EXECUTION_SCHEMA_NAMES" in text and "load_execution_schema" in text
+    assert "ExecutionInvocation" in text, "probe must exercise the identifier-only contract"
+    for schema in (
+        "gamelift-capacity-execution-intent",
+        "gamelift-capacity-execution-result",
+        "gamelift-capacity-execution-verification",
+    ):
+        assert schema in text, f"packaging must require the E3 schema {schema}"

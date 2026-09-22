@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-execution-result",
+  "title": "GameLift Capacity Adjustment Execution Result 1.0",
+  "$comment": "Additive, normalized, bounded E3 execution result for gamelift.capacity-adjustment/1.0. It records the terminal outcome of at most one logical UpdateFleetCapacity write (or a reconciliation with no write), the provider-write intent hash, and the bounded post-action verification. It carries no ARN, account id, provider token, or raw provider response, and additionalProperties is false everywhere. Reuses the immutable common $defs and is not part of the published write-contract schema set.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_contract_version",
+    "operation_id",
+    "logical_action_id",
+    "intent_hash",
+    "outcome",
+    "provider_write_issued",
+    "verification",
+    "recorded_at"
+  ],
+  "properties": {
+    "execution_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "logical_action_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^act_[a-f0-9]{64}$"
+    },
+    "intent_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "SUCCEEDED",
+        "RECONCILED",
+        "FAILED",
+        "HUMAN_RECONCILIATION_REQUIRED"
+      ],
+      "$comment": "SUCCEEDED: a single UpdateFleetCapacity write drove the fleet to the target and post-action verification matched. RECONCILED: the fleet already matched the hash-bound target so no write was issued. FAILED: the provider write failed deterministically and the fleet remains at the confirmed pre-write state. HUMAN_RECONCILIATION_REQUIRED: the result of a write was unclear (timeout/lost response) and a Describe could not conclusively confirm the outcome; no blind retry is permitted."
+    },
+    "provider_write_issued": {
+      "type": "boolean",
+      "$comment": "True only when exactly one UpdateFleetCapacity call was issued. False for a pure reconciliation. One operation produces at most one logical update."
+    },
+    "failure_reason_code": {
+      "type": "string",
+      "enum": [
+        "PROVIDER_ERROR",
+        "STATE_DRIFT",
+        "VERIFICATION_FAILED",
+        "RESULT_INCONCLUSIVE",
+        "PRECONDITION_FAILED"
+      ],
+      "$comment": "Bounded, public-safe failure classification. Present only for FAILED or HUMAN_RECONCILIATION_REQUIRED outcomes; never a raw provider message."
+    },
+    "verification": {
+      "$ref": "urn:game-agent:operations:contracts:v1:gamelift-capacity-execution-verification"
+    },
+    "recorded_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "FAILED",
+              "HUMAN_RECONCILIATION_REQUIRED"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "failure_reason_code"
+        ]
+      }
+    }
+  ]
+}

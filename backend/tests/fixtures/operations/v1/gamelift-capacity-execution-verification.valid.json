@@ -1,0 +1,18 @@
+{
+  "execution_contract_version": "1.0",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "logical_action_id": "act_6fec1faab817d359ff25fb0732a02c6a1594d98bf30f3814a1ac4c8aac11a63a",
+  "verified_at": "2026-09-21T19:12:10Z",
+  "observed_capacity": {
+    "desired": 14,
+    "minimum": 2,
+    "maximum": 20
+  },
+  "expected_capacity": {
+    "desired": 14,
+    "minimum": 2,
+    "maximum": 20
+  },
+  "matches_target": true,
+  "attempts_observed": 1
+}

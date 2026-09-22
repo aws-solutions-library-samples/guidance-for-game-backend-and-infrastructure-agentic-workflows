@@ -6,7 +6,7 @@
 # This is lever-flipping only: it sets ExecutionMode=disabled while keeping
 # Provisioned=true, so BOTH kill-switch levers engage — the dispatch API stage
 # throttles to zero (no new dispatch) and the injected
-# GBAW_OPERATIONS_EXECUTION_MODE makes the executor fail closed — WITHOUT
+# GBAW_OPERATIONS_MODE makes the executor fail closed — WITHOUT
 # deleting any resource or data. It rebuilds NO code, runs NO Docker, uploads
 # NO artifact, and reuses the stack's existing parameter values. It is fully
 # reversible via deploy-operations-execution.sh --enable.
@@ -95,4 +95,4 @@ aws cloudformation wait stack-update-complete \
     --stack-name "$STACK_NAME"
 
 echo "✅ $STACK_NAME is disabled. Both levers fail closed; resources and data retained."
-echo "   Re-enable is reversible: GBAW_OPERATIONS_EXECUTION_MODE=remediate deploy-operations-execution.sh --enable ..."
+echo "   Re-enable is reversible: GBAW_OPERATIONS_MODE=remediate deploy-operations-execution.sh --enable ..."

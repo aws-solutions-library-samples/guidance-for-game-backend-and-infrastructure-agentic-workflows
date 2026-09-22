@@ -46,7 +46,7 @@ Parameters:
       Runtime authority (kill switch) for a PROVISIONED execution plane, SEPARATE
       from the Provisioned flag. "disabled" (the default) is fail-closed on TWO
       independent levers: (1) the dispatch API stage is throttled to zero so no
-      new dispatch is accepted, and (2) GBAW_OPERATIONS_EXECUTION_MODE=disabled
+      new dispatch is accepted, and (2) GBAW_OPERATIONS_MODE=disabled
       is injected into the executor so an already-running invocation fails closed
       before any provider write. "remediate" is the only enabled mode: it accepts
       dispatch and lets the executor perform the bounded, pre-approved capacity
@@ -107,6 +107,44 @@ Parameters:
       on. It is woven into a fleet-scoped ARN so gamelift:DescribeFleetCapacity /
       gamelift:UpdateFleetCapacity can only touch this one fleet. Required when
       ExecutionMode=remediate.
+
+  EnrolledLocation:
+    Type: String
+    Default: us-west-2
+    AllowedPattern: '^[a-z]{2}-[a-z]+-\d$'
+    Description: >-
+      The EXACT enrolled fleet home Region / location (e.g. us-west-2) the
+      executor re-verifies the operation target against and passes to
+      gamelift:DescribeFleetCapacity / UpdateFleetCapacity. Injected as
+      GBAW_OPERATIONS_ENROLLED_LOCATION. Bound server-side; never taken from the
+      operation payload.
+
+  TenantId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$'
+    Description: >-
+      Server-side trusted tenant the runtime binds verified principals to
+      (GBAW_OPERATIONS_TENANT_ID). Must match the 06 stack's TenantId so the
+      dispatcher authorizes the same workspace scope. Required when
+      ExecutionMode=remediate.
+
+  WorkspaceId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$'
+    Description: >-
+      Server-side trusted workspace the runtime binds verified principals to
+      (GBAW_OPERATIONS_WORKSPACE_ID). Must match the 06 stack's WorkspaceId.
+      Required when ExecutionMode=remediate.
+
+  TrustedAudience:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted audience (Cognito app client id) the runtime enforces
+      (GBAW_OPERATIONS_TRUSTED_AUDIENCE). When empty it defaults to CognitoClientId
+      so the dispatcher's trusted audience matches the JWT authorizer audience.
 
   CodeS3Bucket:
     Type: String
@@ -177,11 +215,16 @@ Conditions:
   ResourcesProvisioned: !Equals [!Ref Provisioned, 'true']
 
   # Runtime authority (kill switch). Does NOT gate resource existence; it feeds
-  # the injected GBAW_OPERATIONS_EXECUTION_MODE (lever 2) and the API-stage
+  # the injected GBAW_OPERATIONS_MODE (lever 2) and the API-stage
   # throttle (lever 1). Only "remediate" is enabled.
   ExecutionEnabled: !Equals [!Ref ExecutionMode, remediate]
 
   IsProd: !Equals [!Ref Environment, prod]
+
+  # When TrustedAudience is left empty the dispatcher's trusted audience
+  # falls back to the JWT authorizer audience (CognitoClientId), so a single
+  # input drives both. An explicit value overrides it.
+  HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
 
 Rules:
   # Reject "remediate without provisioning": runtime authority can only be
@@ -220,18 +263,27 @@ Rules:
         AssertDescription: CognitoClientId is required when ExecutionMode=remediate.
       - Assert: !Not [!Equals [!Ref EnrolledFleetId, '']]
         AssertDescription: EnrolledFleetId is required when ExecutionMode=remediate.
+      - Assert: !Not [!Equals [!Ref TenantId, '']]
+        AssertDescription: TenantId is required when ExecutionMode=remediate.
+      - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
+        AssertDescription: WorkspaceId is required when ExecutionMode=remediate.
 
 # --------------------------------------------------------------------------- #
 # Resources
 # --------------------------------------------------------------------------- #
 Resources:
   # ------------------------------------------------------------------------- #
-  # Log groups: one per function, KMS-encrypted with the reused operations CMK.
+  # Log groups: one per function plus the dispatch-API access log group, all
+  # KMS-encrypted with the reused operations CMK (the 06 stack's CMK key policy
+  # allowlists these three exact log-group ARNs by encryption context). The
+  # Step Functions vended-logs group is managed by the service and is not CMK
+  # encrypted here. All four are RetainExceptOnCreate so audit data is preserved
+  # on teardown/replacement but a rolled-back initial create leaves no orphan.
   # ------------------------------------------------------------------------- #
   DispatcherLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: ResourcesProvisioned
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-dispatch'
@@ -241,7 +293,7 @@ Resources:
   ExecutorLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: ResourcesProvisioned
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-executor'
@@ -251,7 +303,7 @@ Resources:
   StateMachineLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: ResourcesProvisioned
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-operations-execution'
@@ -260,11 +312,42 @@ Resources:
   DispatcherAccessLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: ResourcesProvisioned
-    DeletionPolicy: Retain
+    DeletionPolicy: RetainExceptOnCreate
     UpdateReplacePolicy: Retain
     Properties:
       LogGroupName: !Sub '/aws/apigateway/${ProjectName}-operations-dispatch-access'
       RetentionInDays: !If [IsProd, 90, 14]
+      # KMS-encrypted with the reused operations CMK; the 06 CMK key policy
+      # allowlists this exact log-group ARN by aws:logs:arn encryption context.
+      KmsKeyId: !Ref OperationsKmsKeyArn
+
+  # Grant the CloudWatch Logs vended-log delivery principal permission to write
+  # the dispatch HTTP API access logs into the access log group. Without this
+  # resource policy the API's access-log delivery fails. Scoped to this account
+  # and this API (same pattern as the 06 access-log delivery policy).
+  DispatcherAccessLogDeliveryResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: ResourcesProvisioned
+    DependsOn: DispatcherAccessLogGroup
+    Properties:
+      PolicyName: !Sub '${ProjectName}-operations-dispatch-access-log-delivery'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "ApiGatewayDispatchAccessLogDelivery",
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-dispatch-access:*",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
+                "ArnLike": { "aws:SourceArn": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${DispatchApi}" }
+              }
+            }
+          ]
+        }
 
   # ------------------------------------------------------------------------- #
   # Executor role: the ONLY role in the whole solution allowed to touch the
@@ -395,7 +478,7 @@ Resources:
   # Executor Lambda: the ONLY component that performs the bounded provider write.
   # It is invoked by the state machine with operation_id ONLY; it re-loads the
   # approved operation from the table, re-checks authority, and fails closed when
-  # GBAW_OPERATIONS_EXECUTION_MODE != remediate (lever 2 of the disable).
+  # GBAW_OPERATIONS_MODE != remediate (lever 2 of the disable).
   # ------------------------------------------------------------------------- #
   ExecutorFunction:
     Type: AWS::Lambda::Function
@@ -415,13 +498,35 @@ Resources:
         Mode: Active
       Environment:
         Variables:
-          # Lever 2: injected kill switch. The executor fails closed unless this
-          # is "remediate", so an emergency disable makes it refuse to write
-          # without deleting the function.
-          GBAW_OPERATIONS_EXECUTION_MODE: !Ref ExecutionMode
+          # Aligned to core operations.settings.resolve_executor_deployment_settings.
+          # GBAW_OPERATIONS_MODE is the single backend-enforced ceiling: it is
+          # fed the ExecutionMode kill switch (disabled|remediate), so an
+          # emergency disable makes both handlers fail closed WITHOUT deleting
+          # the function (lever 2 of the reversible disable).
+          GBAW_OPERATIONS_MODE: !Ref ExecutionMode
           GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
           GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
+            - HasExplicitTrustedAudience
+            - !Ref TrustedAudience
+            - !Ref CognitoClientId
+          # Constructed exact ARN (not !Ref) so the executor does not create a
+          # dependency edge on the state machine, which invokes the executor
+          # (that would be a circular dependency). The executor never starts it.
+          GBAW_OPERATIONS_STATE_MACHINE_ARN: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-operations-execution'
+          GBAW_OPERATIONS_CAPABILITY_MAXIMUM: remediate
           GBAW_OPERATIONS_ENROLLED_FLEET_ID: !Ref EnrolledFleetId
+          GBAW_OPERATIONS_ENROLLED_FLEET_ARN: !Sub 'arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:fleet/${EnrolledFleetId}'
+          GBAW_OPERATIONS_ENROLLED_LOCATION: !Ref EnrolledLocation
+          GBAW_OPERATIONS_APPROVER_GROUP: admin
+          # Server-owned, fail-closed capacity bounds: a fully clamped [0, 1]
+          # fleet with a single-instance step. At or inside the code-owned
+          # playbook envelope; a forgotten override cannot authorize a large swing.
+          GBAW_OPERATIONS_CAPACITY_FLOOR: '0'
+          GBAW_OPERATIONS_CAPACITY_CEILING: '1'
+          GBAW_OPERATIONS_CAPACITY_MAX_STEP: '1'
       Code:
         S3Bucket: !Ref CodeS3Bucket
         S3Key: !Ref ExecutorCodeS3Key
@@ -673,10 +778,32 @@ Resources:
         Mode: Active
       Environment:
         Variables:
-          GBAW_OPERATIONS_EXECUTION_MODE: !Ref ExecutionMode
+          # Aligned to core operations.settings.resolve_executor_deployment_settings.
+          # GBAW_OPERATIONS_MODE is the single backend-enforced ceiling: it is
+          # fed the ExecutionMode kill switch (disabled|remediate), so an
+          # emergency disable makes both handlers fail closed WITHOUT deleting
+          # the function (lever 2 of the reversible disable).
+          GBAW_OPERATIONS_MODE: !Ref ExecutionMode
           GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
           GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
+            - HasExplicitTrustedAudience
+            - !Ref TrustedAudience
+            - !Ref CognitoClientId
           GBAW_OPERATIONS_STATE_MACHINE_ARN: !Ref ExecutionStateMachine
+          GBAW_OPERATIONS_CAPABILITY_MAXIMUM: remediate
+          GBAW_OPERATIONS_ENROLLED_FLEET_ID: !Ref EnrolledFleetId
+          GBAW_OPERATIONS_ENROLLED_FLEET_ARN: !Sub 'arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:fleet/${EnrolledFleetId}'
+          GBAW_OPERATIONS_ENROLLED_LOCATION: !Ref EnrolledLocation
+          GBAW_OPERATIONS_APPROVER_GROUP: admin
+          # Server-owned, fail-closed capacity bounds: a fully clamped [0, 1]
+          # fleet with a single-instance step. At or inside the code-owned
+          # playbook envelope; a forgotten override cannot authorize a large swing.
+          GBAW_OPERATIONS_CAPACITY_FLOOR: '0'
+          GBAW_OPERATIONS_CAPACITY_CEILING: '1'
+          GBAW_OPERATIONS_CAPACITY_MAX_STEP: '1'
       Code:
         S3Bucket: !Ref CodeS3Bucket
         S3Key: !Ref DispatcherCodeS3Key
@@ -751,7 +878,11 @@ Resources:
   DispatchApiStage:
     Type: AWS::ApiGatewayV2::Stage
     Condition: ResourcesProvisioned
-    DependsOn: DispatcherAccessLogGroup
+    # The access log group AND its vended-log delivery resource policy must both
+    # exist before the stage streams access logs to the constructed !Sub ARN.
+    DependsOn:
+      - DispatcherAccessLogGroup
+      - DispatcherAccessLogDeliveryResourcePolicy
     Properties:
       ApiId: !Ref DispatchApi
       StageName: '$default'

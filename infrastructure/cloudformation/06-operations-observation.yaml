@@ -452,6 +452,14 @@ Resources:
                 'kms:EncryptionContext:aws:logs:arn':
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-operations-observe'
                   - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access'
+                  # E3 (07-operations-execution.yaml) reuses this CMK to encrypt
+                  # its dispatcher, executor, and dispatch-API access log groups.
+                  # Allowlisted here by exact ARN so the separate 07 stack can
+                  # attach the key to those three groups; the E1/E2 groups above
+                  # are preserved.
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-operations-dispatch'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-operations-executor'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-dispatch-access'
       Tags:
         - Key: Project
           Value: !Ref ProjectName

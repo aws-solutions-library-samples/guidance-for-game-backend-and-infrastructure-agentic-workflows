@@ -60,7 +60,7 @@ PINNED_DEPS=(
 ENVIRONMENT="beta"
 ACTION="preview"   # preview | enable
 # The only enabled runtime authority to request. Selected with --mode and
-# double-confirmed by a MATCHING GBAW_OPERATIONS_EXECUTION_MODE.
+# double-confirmed by a MATCHING GBAW_OPERATIONS_MODE.
 REQUESTED_MODE="remediate"
 COGNITO_ISSUER="${COGNITO_ISSUER:-}"
 COGNITO_CLIENT_ID="${COGNITO_CLIENT_ID:-}"
@@ -69,6 +69,14 @@ ENROLLED_FLEET_ID="${GBAW_OPERATIONS_ENROLLED_FLEET_ID:-}"
 # reuse the SAME table + CMK (no new data store, no new key).
 OPERATIONS_TABLE_NAME="${GBAW_OPERATIONS_TABLE_NAME:-}"
 OPERATIONS_KMS_KEY_ARN="${GBAW_OPERATIONS_KMS_KEY_ARN:-}"
+# Server-side trusted identity binding (must match the 06 stack). Tenant and
+# workspace are required to enable; trusted audience defaults to the JWT
+# audience (CognitoClientId) in the template when left empty, and the enrolled
+# location defaults to the deploy region.
+OPERATIONS_TENANT_ID="${GBAW_OPERATIONS_TENANT_ID:-}"
+OPERATIONS_WORKSPACE_ID="${GBAW_OPERATIONS_WORKSPACE_ID:-}"
+OPERATIONS_TRUSTED_AUDIENCE="${GBAW_OPERATIONS_TRUSTED_AUDIENCE:-}"
+ENROLLED_LOCATION="${GBAW_OPERATIONS_ENROLLED_LOCATION:-$AWS_REGION}"
 # The EXPLICIT, pre-existing artifact bucket for the Lambda zips. No discovery,
 # no creation.
 GBAW_OPERATIONS_ARTIFACT_BUCKET="${GBAW_OPERATIONS_ARTIFACT_BUCKET:-}"
@@ -85,16 +93,20 @@ Usage: deploy-operations-execution.sh [--enable [--mode remediate]]
                 creates nothing.
   --enable      Build/upload the dispatcher + executor artifacts and deploy the
                 07 execution stack with ExecutionMode=remediate. Requires
-                GBAW_OPERATIONS_EXECUTION_MODE=remediate (double opt-in) plus the
+                GBAW_OPERATIONS_MODE=remediate (double opt-in) plus the
                 enabling inputs below.
   --mode        remediate (the only enabled execution mode). Default remediate.
   --environment Target environment (default: beta). "prod" lengthens log
                 retention.
 
 Environment for --enable:
-  GBAW_OPERATIONS_EXECUTION_MODE=remediate   Required confirmation; MUST match
+  GBAW_OPERATIONS_MODE=remediate             Required confirmation; MUST match
                                              the selected --mode.
   COGNITO_ISSUER, COGNITO_CLIENT_ID          JWT issuer + audience (required).
+  GBAW_OPERATIONS_TENANT_ID                  Server-side trusted tenant, matching
+  GBAW_OPERATIONS_WORKSPACE_ID               the 06 stack (both required).
+  GBAW_OPERATIONS_TRUSTED_AUDIENCE           Optional; defaults to CognitoClientId.
+  GBAW_OPERATIONS_ENROLLED_LOCATION          Optional; defaults to AWS_REGION.
   GBAW_OPERATIONS_ENROLLED_FLEET_ID          The EXACT enrolled fleet id
                                              (fleet-...) (required).
   GBAW_OPERATIONS_TABLE_NAME                 06-exported operations table name
@@ -126,7 +138,7 @@ done
 # --------------------------------------------------------------------------- #
 if [ "$ACTION" = "preview" ]; then
     echo "🔎 Preview only (READ-ONLY). Validating and linting the 07 execution template."
-    echo "   To deploy: GBAW_OPERATIONS_EXECUTION_MODE=remediate $0 --enable"
+    echo "   To deploy: GBAW_OPERATIONS_MODE=remediate $0 --enable"
     if command -v cfn-lint >/dev/null 2>&1; then
         echo "   Running cfn-lint ..."
         cfn-lint "$TEMPLATE"
@@ -149,8 +161,8 @@ if [ "$REQUESTED_MODE" != "remediate" ]; then
     echo "❌ Refusing to enable: --mode must be remediate, got '$REQUESTED_MODE'." >&2
     exit 3
 fi
-if [ "${GBAW_OPERATIONS_EXECUTION_MODE:-}" != "remediate" ]; then
-    echo "❌ Refusing to enable: GBAW_OPERATIONS_EXECUTION_MODE must be 'remediate'" >&2
+if [ "${GBAW_OPERATIONS_MODE:-}" != "remediate" ]; then
+    echo "❌ Refusing to enable: GBAW_OPERATIONS_MODE must be 'remediate'" >&2
     echo "   (it must match the selected --mode $REQUESTED_MODE) as a double opt-in." >&2
     exit 3
 fi
@@ -169,6 +181,11 @@ esac
 if [ -z "$OPERATIONS_TABLE_NAME" ] || [ -z "$OPERATIONS_KMS_KEY_ARN" ]; then
     echo "❌ Refusing to enable: GBAW_OPERATIONS_TABLE_NAME and GBAW_OPERATIONS_KMS_KEY_ARN" >&2
     echo "   (the 06-exported table + CMK) are required for cross-stack reuse." >&2
+    exit 3
+fi
+if [ -z "$OPERATIONS_TENANT_ID" ] || [ -z "$OPERATIONS_WORKSPACE_ID" ]; then
+    echo "❌ Refusing to enable: GBAW_OPERATIONS_TENANT_ID and GBAW_OPERATIONS_WORKSPACE_ID" >&2
+    echo "   (the server-side trusted identity binding, matching the 06 stack) are required." >&2
     exit 3
 fi
 if [ -z "$GBAW_OPERATIONS_ARTIFACT_BUCKET" ]; then
@@ -291,7 +308,26 @@ from operations.contracts import validation as v
 from operations.contracts.versions import SCHEMA_NAMES
 for schema in SCHEMA_NAMES:
     v.load_schema(schema)
-print("runtime probe ok: dispatcher + executor import + %d schemas loaded" % len(SCHEMA_NAMES))
+# The E3 execution contract lives in its own additive schema set (intent /
+# result / verification). Load each so a package missing an E3 schema fails the
+# probe closed BEFORE upload.
+from operations.contracts.execution import EXECUTION_SCHEMA_NAMES, load_execution_schema
+for schema in EXECUTION_SCHEMA_NAMES:
+    load_execution_schema(schema)
+# Identifier-only invocation contract probe: the executor accepts a payload of
+# exactly {operation_id} and rejects any extra field or a missing id, so a
+# packaged handler that widened the wire contract fails HERE.
+from operations.execute.executor_service import ExecutionInvocation, ExecutorServiceError
+assert ExecutionInvocation.from_payload({"operation_id": "op_probe_identifier_only"}).operation_id
+for bad in ({}, {"operation_id": "op_probe", "fleet_id": "fleet-x"}, {"fleet_id": "fleet-x"}):
+    try:
+        ExecutionInvocation.from_payload(bad)
+    except ExecutorServiceError:
+        pass
+    else:
+        raise AssertionError("identifier-only invocation contract is not enforced: %r" % (bad,))
+n = len(SCHEMA_NAMES) + len(EXECUTION_SCHEMA_NAMES)
+print("runtime probe ok: dispatcher + executor import + %d schemas + identifier-only contract" % n)
 PROBE
 )"
 
@@ -317,6 +353,15 @@ else
         echo "❌ Runtime contract schema resources are absent from the package." >&2
         exit 5
     fi
+    for e3schema in \
+        gamelift-capacity-execution-intent \
+        gamelift-capacity-execution-result \
+        gamelift-capacity-execution-verification; do
+        if [ ! -f "$STAGE/operations/contracts/schemas/v1/${e3schema}.schema.json" ]; then
+            echo "❌ E3 execution contract schema ${e3schema}.schema.json is absent from the package." >&2
+            exit 5
+        fi
+    done
     for required in rfc8785 jsonschema referencing rpds; do
         if ! find "$STAGE" -maxdepth 2 \( -name "${required}" -o -name "${required}.py" -o -name "${required}*.so" \) | grep -q .; then
             echo "❌ Required runtime dependency '$required' is absent from the package." >&2
@@ -377,6 +422,10 @@ aws cloudformation deploy \
         "OperationsTableName=$OPERATIONS_TABLE_NAME" \
         "OperationsKmsKeyArn=$OPERATIONS_KMS_KEY_ARN" \
         "EnrolledFleetId=$ENROLLED_FLEET_ID" \
+        "EnrolledLocation=$ENROLLED_LOCATION" \
+        "TenantId=$OPERATIONS_TENANT_ID" \
+        "WorkspaceId=$OPERATIONS_WORKSPACE_ID" \
+        "TrustedAudience=$OPERATIONS_TRUSTED_AUDIENCE" \
         "CodeS3Bucket=$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
         "DispatcherCodeS3Key=$DISPATCHER_S3_KEY" \
         "ExecutorCodeS3Key=$EXECUTOR_S3_KEY"
