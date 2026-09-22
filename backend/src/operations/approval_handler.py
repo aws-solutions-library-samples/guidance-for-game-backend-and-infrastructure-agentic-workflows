@@ -94,6 +94,7 @@ class ApprovalServicePort(Protocol):
 class DecisionServicePort(Protocol):
     def reject(self, request: DecisionRequest, context: DecisionRequestContext) -> dict[str, Any]: ...
     def cancel(self, request: DecisionRequest, context: DecisionRequestContext) -> dict[str, Any]: ...
+    def expire_if_due(self, request: DecisionRequest) -> dict[str, Any] | None: ...
 
 
 class EvidenceServicePort(Protocol):
@@ -168,15 +169,19 @@ class ApprovalRequestHandler:
             return self._handle_prepare(event, principal)
         if method == "POST" and route.endswith("/approve"):
             stage[0] = "approve"
+            self._expire_if_due(event)
             return self._handle_approve(event, principal)
         if method == "POST" and route.endswith("/reject"):
             stage[0] = "reject"
+            self._expire_if_due(event)
             return self._handle_reject(event, principal)
         if method == "POST" and route.endswith("/cancel"):
             stage[0] = "cancel"
+            self._expire_if_due(event)
             return self._handle_cancel(event, principal)
         if method == "GET":
             stage[0] = "evidence"
+            self._expire_if_due(event)
             return self._handle_evidence(event, principal)
         raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "unsupported route")
 
@@ -212,6 +217,42 @@ class ApprovalRequestHandler:
         if evidence is None:
             raise ApprovalBoundaryError(ApprovalErrorCode.OPERATION_NOT_FOUND, "operation is unavailable")
         return _json_response(200, evidence)
+
+    def _expire_if_due(self, event: Mapping[str, Any]) -> None:
+        """Lazily transition a DUE operation to ``expired`` before it is treated
+        as active by evidence or a terminal decision (issue #414).
+
+        Expiry is driven by the trusted system clock inside the decision service,
+        needs no caller credential, and is a safe no-op when the operation is not
+        yet due (``None``), is already terminal, or loses a fenced race to another
+        writer (a bounded :class:`ApprovalBoundaryError` we deliberately swallow).
+        The subsequent route then produces the correct post-expiry response — GET
+        surfaces the ``expired`` state, and approve/reject/cancel observe the
+        terminal state and conflict. When the transition WINS we emit the bounded
+        ``ApprovalExpired`` metric; a system-actor ledger entry is written by the
+        decision service's atomic commit. Any unexpected error is swallowed here
+        so opportunistic expiry never breaks the underlying request; a genuine
+        integrity failure will resurface deterministically on the real route.
+        """
+        try:
+            request = DecisionRequest.from_payload({"operation_id": _operation_id(event)})
+        except ApprovalBoundaryError:
+            # An invalid/absent operation id is handled by the real route.
+            return
+        try:
+            outcome = self._decision_service.expire_if_due(request)
+        except ApprovalBoundaryError:
+            # Not eligible (already terminal), a lost race, or otherwise not
+            # expirable right now: a safe no-op. The real route responds.
+            return
+        except Exception:  # noqa: BLE001 - opportunistic expiry must never break a request
+            return
+        if outcome is not None:
+            # The expiry transition won: record the bounded ApprovalExpired metric.
+            try:
+                self._metrics.record("approval.expired")
+            except Exception:  # noqa: BLE001 - metrics must never break a request
+                pass
 
     def _decision_request(self, event: Mapping[str, Any]) -> DecisionRequest:
         operation_id = _operation_id(event)

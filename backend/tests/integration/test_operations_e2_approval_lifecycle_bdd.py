@@ -168,10 +168,16 @@ def _handler(
     floor: int = 0,
     ceiling: int = 1_000_000,
     max_step: int = 1_000_000,
+    clock: Any = None,
 ) -> ApprovalRequestHandler:
+    # The E1 status/advice/prepare pipeline is anchored at the frozen NOW so a
+    # fresh, in-bounds proposal always prepares. Only the approval and lifecycle
+    # decision clock (``clock``) may advance so a test can move past the prepared
+    # operation's expires_at and exercise lazy-on-access expiry.
     ops = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": mode})
     boundary = _boundary()
-    store = DynamoDbApprovalStore(client=client, table_name=TABLE, clock=lambda: NOW)
+    decision_clock = clock or (lambda: NOW)
+    store = DynamoDbApprovalStore(client=client, table_name=TABLE, clock=decision_clock)
     loader = FakeStatusLoader()
 
     def _advice_factory(observation_id: str) -> AdviceService:
@@ -235,13 +241,13 @@ def _handler(
             identity_boundary=boundary,
             policy=policy,
             store=store,
-            clock=lambda: NOW,
+            clock=decision_clock,
             operation_validator=validate_capacity_prepared_operation,
             operation_hasher=capacity_prepared_hash,
             binding_validator=validate_capacity_approval_binding,
         ),
         decision_service=LifecycleDecisionService(
-            identity_boundary=boundary, policy=policy, store=store, clock=lambda: NOW
+            identity_boundary=boundary, policy=policy, store=store, clock=decision_clock
         ),
         evidence_service=E2EvidenceService(store=store, identity_boundary=boundary),
         tenant_id="tenant.default",
@@ -538,3 +544,173 @@ def test_observe_mode_denies_prepare_at_the_authorization_boundary() -> None:
     assert resp["statusCode"] == 403
     body = json.loads(resp["body"])
     assert body["error_code"] == "AUTHORIZATION_DENIED"
+
+
+# -- Lazy-on-access expiry (issue #414 E2) ----------------------------------
+#
+# expire_if_due is wired into the real API flow: a DUE pending/prepared
+# operation is atomically transitioned to expired (system actor + ledger) before
+# GET evidence or approve/reject/cancel can treat it as active. These fake-server
+# scenarios drive the REAL handler + services over the stateful fake with a clock
+# advanced past the prepared operation's expires_at.
+
+# The prepared operation's expiry horizon is preparation_expiry_s (default 900s).
+# Advancing the decision/approval clock past it makes the operation due.
+_PAST_EXPIRY = NOW + timedelta(minutes=16)
+
+
+class _AdvanceableClock:
+    """A clock the test moves forward to cross the operation's expires_at."""
+
+    def __init__(self, at: datetime) -> None:
+        self._at = at
+
+    def set(self, at: datetime) -> None:
+        self._at = at
+
+    def __call__(self) -> datetime:
+        return self._at
+
+
+def test_get_evidence_after_due_transitions_operation_to_expired() -> None:
+    # Prepare at NOW (frozen prepare pipeline), then read evidence with the
+    # decision clock advanced past expiry: the GET must first transition the
+    # operation to expired and then surface the expired state.
+    client = StatefulDynamoClient()
+    clock = _AdvanceableClock(NOW)
+    handler = _handler(client, clock=clock)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    clock.set(_PAST_EXPIRY)
+    resp = handler.handle(
+        _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", "client.approver"), op_id=op_id)
+    )
+    assert resp["statusCode"] == 200
+    evidence = json.loads(resp["body"])
+    assert evidence["state"] == "expired"
+    # A system-actor state-changed ledger entry was written by the atomic commit.
+    ledger_types = [entry.get("event_type") for entry in evidence["ledger"]]
+    assert "operation.state-changed" in ledger_types
+
+
+def test_approval_after_due_does_not_grant_and_returns_bounded_conflict() -> None:
+    # Approval after the operation is due must never grant: the lazy expiry wins
+    # first (op -> expired), then the grant observes a terminal state and returns
+    # a bounded 409, and evidence still reads expired (no grant recorded).
+    client = StatefulDynamoClient()
+    clock = _AdvanceableClock(NOW)
+    handler = _handler(client, clock=clock)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    clock.set(_PAST_EXPIRY)
+    resp = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver", exp_delta_min=60 + 20),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert resp["statusCode"] == 409
+    assert '"decision": "granted"' not in resp["body"]
+
+    # Evidence proves the operation is terminal-expired with no approval recorded.
+    evidence = json.loads(
+        handler.handle(
+            _event(
+                "GET",
+                f"/operations/{op_id}",
+                claims=_claims("user.viewer", "client.approver", exp_delta_min=60 + 20),
+                op_id=op_id,
+            )
+        )["body"]
+    )
+    assert evidence["state"] == "expired"
+    assert evidence["approval"] is None
+
+
+def test_expiry_is_idempotent_single_terminal_state_and_single_transition() -> None:
+    # A second access after expiry must NOT write a second transition: the op is
+    # already terminal, so lazy expiry is a safe no-op and the state stays expired
+    # with exactly one state-changed ledger entry.
+    client = StatefulDynamoClient()
+    clock = _AdvanceableClock(NOW)
+    handler = _handler(client, clock=clock)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    clock.set(_PAST_EXPIRY)
+    first = json.loads(
+        handler.handle(
+            _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", "client.approver"), op_id=op_id)
+        )["body"]
+    )
+    second = json.loads(
+        handler.handle(
+            _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", "client.approver"), op_id=op_id)
+        )["body"]
+    )
+    assert first["state"] == "expired"
+    assert second["state"] == "expired"
+    state_changes = [e for e in second["ledger"] if e.get("event_type") == "operation.state-changed"]
+    assert len(state_changes) == 1
+
+
+def test_cancel_after_due_yields_one_terminal_state_and_conflicts() -> None:
+    # A cancel arriving after the operation is due loses to the lazy expiry: the
+    # op transitions to expired, and the cancel then conflicts (409). The op is
+    # not cancelled — a race between expiry and cancel yields ONE terminal state.
+    client = StatefulDynamoClient()
+    clock = _AdvanceableClock(NOW)
+    handler = _handler(client, clock=clock)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    clock.set(_PAST_EXPIRY)
+    resp = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/cancel",
+            claims=_claims("user.requester", "client.requester", exp_delta_min=60 + 20),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert resp["statusCode"] == 409
+    evidence = json.loads(
+        handler.handle(
+            _event(
+                "GET",
+                f"/operations/{op_id}",
+                claims=_claims("user.viewer", "client.approver", exp_delta_min=60 + 20),
+                op_id=op_id,
+            )
+        )["body"]
+    )
+    assert evidence["state"] == "expired"
+
+
+def test_not_yet_due_operation_is_not_expired_on_access() -> None:
+    # Before the operation is due the lazy expiry is a no-op: evidence still reads
+    # pending_approval and a distinct approver can still grant.
+    client = StatefulDynamoClient()
+    clock = _AdvanceableClock(NOW)
+    handler = _handler(client, clock=clock)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    # Clock unchanged (still NOW, well before expiry).
+    evidence = json.loads(
+        handler.handle(
+            _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", "client.approver"), op_id=op_id)
+        )["body"]
+    )
+    assert evidence["state"] == "pending_approval"
+    grant = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert grant["statusCode"] == 200

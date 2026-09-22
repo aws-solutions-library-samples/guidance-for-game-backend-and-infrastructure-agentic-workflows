@@ -387,3 +387,85 @@ def test_bootstrap_cancel_transitions_terminally_then_conflicts(monkeypatch: pyt
         )
     )
     assert again["statusCode"] == 409
+
+
+# -- Lazy-on-access expiry through the real bootstrap (issue #414) ----------
+
+
+class _AdvanceableClock:
+    """A clock the test moves forward to cross the operation's expires_at."""
+
+    def __init__(self, at: datetime) -> None:
+        self._at = at
+
+    def set(self, at: datetime) -> None:
+        self._at = at
+
+    def __call__(self) -> datetime:
+        return self._at
+
+
+def _build_bootstrap_router_with_clock(
+    monkeypatch: pytest.MonkeyPatch, *, clock: _AdvanceableClock, anchor: datetime
+) -> Any:
+    """Build the deployable handler, driving every bootstrap clock off ``clock``.
+
+    The on-host bootstrap has no clock injection point; it reads ``entry._utcnow``
+    everywhere (prepare/advice/approval/decision). Patching that single source
+    lets the test anchor prepare and then advance past the prepared operation's
+    expires_at to exercise the real bootstrap-wired lazy expiry.
+    """
+    client = StatefulDynamoClient()
+    for key, value in _BOOTSTRAP_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("boto3.Session", _FakeSession(client), raising=False)
+    monkeypatch.setattr(entry, "_region", lambda: "us-west-2")
+    monkeypatch.setattr(entry, "_utcnow", clock)
+    entry._handler.cache_clear()
+    router = entry._handler()
+    entry._handler.cache_clear()
+    _seed_succeeded_observation(client, anchor=anchor)
+    return router
+
+
+def test_bootstrap_get_after_due_transitions_to_expired_and_approval_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Anchor at the real current time so the E1 freshness check (which the
+    # bootstrap wires with the real system clock) accepts the seeded observation.
+    anchor = _now()
+    clock = _AdvanceableClock(anchor)
+    router = _build_bootstrap_router_with_clock(monkeypatch, clock=clock, anchor=anchor)
+    op_id = json.loads(_prepare(router, anchor=anchor)["body"])["operation_id"]
+
+    # Advance the whole bootstrap clock past preparation_expiry_s (default 900s).
+    due = anchor + timedelta(minutes=16)
+    clock.set(due)
+
+    # GET first transitions the due operation to expired, then surfaces it.
+    evidence_resp = router.handle(
+        _event(
+            "GET",
+            f"/operations/{op_id}",
+            claims=_claims("user.viewer", anchor=due, groups="admin"),
+            op_id=op_id,
+        )
+    )
+    assert evidence_resp["statusCode"] == 200, evidence_resp["body"]
+    evidence = json.loads(evidence_resp["body"])
+    assert evidence["state"] == "expired"
+    assert evidence["approval"] is None
+
+    # A distinct admin approval after due must NOT grant — it conflicts (409),
+    # and no grant is recorded.
+    approve_resp = router.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", anchor=due, groups="admin"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert approve_resp["statusCode"] == 409, approve_resp["body"]
+    assert '"decision": "granted"' not in approve_resp["body"]

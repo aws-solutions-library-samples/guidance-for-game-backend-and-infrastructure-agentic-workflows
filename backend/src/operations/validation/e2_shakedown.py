@@ -49,6 +49,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
@@ -75,6 +76,10 @@ CONTRACT_VERSION = "1.0"
 _CAPACITY_FLOOR = 0
 _CAPACITY_CEILING = 1
 _CAPACITY_MAX_STEP = 1
+
+# A hard upper bound on the optional real-time expiry wait so the harness can
+# never block unboundedly (5 minutes).
+_MAX_EXPIRY_WAIT_SECONDS = 300.0
 
 _FLEET_ID_PATTERN = re.compile(r"^fleet-[a-f0-9-]{1,120}$")
 _LOCATION_PATTERN = re.compile(r"^[a-z0-9-]+$")
@@ -107,6 +112,13 @@ class E2ShakedownConfig:
     # the fully-clamped current state of 1 so the prepared step is a safe
     # scale-to-zero within [0, 1].
     current_desired: int = 1
+    # Optional real-time expiry probe. When > 0 the harness prepares a fresh
+    # operation, waits exactly this many seconds (a single bounded interval),
+    # then proves GET/approval observe the operation as expired. Left unset (0)
+    # the expiry probe is skipped so the default run stays fast. This exists
+    # only to exercise lazy-on-access expiry against a deployment configured
+    # with a correspondingly short preparation-expiry window.
+    expiry_wait_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.endpoint.lower().startswith("https://"):
@@ -123,6 +135,10 @@ class E2ShakedownConfig:
             raise ValueError("current_desired must be an integer")
         if not 0 <= self.current_desired <= _CAPACITY_CEILING:
             raise ValueError("current_desired must be within the fail-closed [0, 1] envelope")
+        if isinstance(self.expiry_wait_seconds, bool) or not isinstance(self.expiry_wait_seconds, (int, float)):
+            raise ValueError("expiry_wait_seconds must be a number")
+        if self.expiry_wait_seconds < 0 or self.expiry_wait_seconds > _MAX_EXPIRY_WAIT_SECONDS:
+            raise ValueError(f"expiry_wait_seconds must be within [0, {_MAX_EXPIRY_WAIT_SECONDS}] seconds")
 
 
 @dataclass
@@ -158,10 +174,41 @@ class E2ShakedownReport:
 class E2ShakedownRunner:
     """Drive the deployed E2 approval boundary through the acceptance flow."""
 
-    def __init__(self, *, config: E2ShakedownConfig, transport: Transport) -> None:
+    def __init__(
+        self,
+        *,
+        config: E2ShakedownConfig,
+        transport: Transport,
+        sleeper: Optional[Any] = None,
+    ) -> None:
         self._config = config
         self._transport = transport
         self._token = _new_idempotency_token()
+        # ``sleeper`` is injected only so a test can advance a fake clock instead
+        # of really sleeping; the CLI path uses the real ``time.sleep``.
+        self._sleep = sleeper or time.sleep
+
+    def _prepare_independent_operation(self) -> tuple[Optional[str], Optional[HttpResponse]]:
+        """Prepare a brand-new, independent operation (a fresh idempotency token).
+
+        Returns the minted ``op_`` id (or ``None`` if prepare did not persist an
+        approval_required operation) alongside the raw response for detail.
+        """
+        body = self._prepare_body()
+        body["idempotency_token"] = _new_idempotency_token()
+        response = self._request("POST", "/operations/prepare", bearer=self._config.access_token, body=body)
+        ok, _ = response_is_bounded_and_clean(response)
+        payload = response.json_or_none() if ok else None
+        operation_id = payload.get("operation_id") if isinstance(payload, dict) else None
+        persisted = (
+            ok
+            and response.status == 201
+            and isinstance(operation_id, str)
+            and operation_id.startswith("op_")
+            and isinstance(payload, dict)
+            and payload.get("decision") == "approval_required"
+        )
+        return (operation_id if persisted else None, response)
 
     # -- HTTP helpers -----------------------------------------------------
 
@@ -286,6 +333,63 @@ class E2ShakedownRunner:
         passed = ok and response.status == 409
         return CheckResult("cancel_conflict", passed, "" if passed else f"status={response.status} {reason}")
 
+    def check_requester_cancel_and_replay_conflict(self) -> CheckResult:
+        """On its OWN fresh operation, the requester cancels (200), replay 409."""
+        operation_id, prep = self._prepare_independent_operation()
+        if operation_id is None:
+            status = prep.status if prep is not None else "n/a"
+            return CheckResult("requester_cancel_and_replay_conflict", False, f"prepare failed status={status}")
+        cancel = self._request("POST", f"/operations/{operation_id}/cancel", bearer=self._config.access_token, body={})
+        ok1, reason1 = response_is_bounded_and_clean(cancel)
+        replay = self._request("POST", f"/operations/{operation_id}/cancel", bearer=self._config.access_token, body={})
+        ok2, reason2 = response_is_bounded_and_clean(replay)
+        passed = ok1 and cancel.status == 200 and ok2 and replay.status == 409
+        detail = "" if passed else f"cancel={cancel.status} {reason1}; replay={replay.status} {reason2}"
+        return CheckResult("requester_cancel_and_replay_conflict", passed, detail)
+
+    def check_distinct_admin_reject_and_replay_conflict(self) -> CheckResult:
+        """On its OWN fresh operation, a distinct admin rejects (200), replay 409."""
+        operation_id, prep = self._prepare_independent_operation()
+        if operation_id is None:
+            status = prep.status if prep is not None else "n/a"
+            return CheckResult("distinct_admin_reject_and_replay_conflict", False, f"prepare failed status={status}")
+        reject = self._request(
+            "POST", f"/operations/{operation_id}/reject", bearer=self._config.approver_token, body={}
+        )
+        ok1, reason1 = response_is_bounded_and_clean(reject)
+        replay = self._request(
+            "POST", f"/operations/{operation_id}/reject", bearer=self._config.approver_token, body={}
+        )
+        ok2, reason2 = response_is_bounded_and_clean(replay)
+        passed = ok1 and reject.status == 200 and ok2 and replay.status == 409
+        detail = "" if passed else f"reject={reject.status} {reason1}; replay={replay.status} {reason2}"
+        return CheckResult("distinct_admin_reject_and_replay_conflict", passed, detail)
+
+    def check_realtime_expiry(self) -> CheckResult:
+        """Prepare a fresh op, wait the bounded interval, prove expired.
+
+        Only meaningful against a deployment whose preparation-expiry window is
+        <= ``expiry_wait_seconds``. After the single bounded wait, GET must read
+        state ``expired`` and a distinct-approver grant must conflict (409) —
+        approval after due must never grant.
+        """
+        operation_id, prep = self._prepare_independent_operation()
+        if operation_id is None:
+            status = prep.status if prep is not None else "n/a"
+            return CheckResult("realtime_expiry", False, f"prepare failed status={status}")
+        self._sleep(self._config.expiry_wait_seconds)
+        evidence = self._request("GET", f"/operations/{operation_id}", bearer=self._config.approver_token, body=None)
+        ok1, reason1 = response_is_bounded_and_clean(evidence)
+        payload = evidence.json_or_none() if ok1 else None
+        state = payload.get("state") if isinstance(payload, dict) else None
+        approve = self._request(
+            "POST", f"/operations/{operation_id}/approve", bearer=self._config.approver_token, body={}
+        )
+        ok2, reason2 = response_is_bounded_and_clean(approve)
+        passed = ok1 and evidence.status == 200 and state == "expired" and ok2 and approve.status == 409
+        detail = "" if passed else f"evidence={evidence.status}/{state} {reason1}; approve={approve.status} {reason2}"
+        return CheckResult("realtime_expiry", passed, detail)
+
     # -- Orchestration ----------------------------------------------------
 
     def run(self) -> E2ShakedownReport:
@@ -303,6 +407,15 @@ class E2ShakedownRunner:
             report.checks.append(self.check_evidence(operation_id))
             report.checks.append(self.check_reject_conflict(operation_id))
             report.checks.append(self.check_cancel_conflict(operation_id))
+            # Independent operations: a requester cancellation and a distinct-
+            # admin rejection, each on its OWN fresh operation, both proving the
+            # replayed terminal decision conflicts.
+            report.checks.append(self.check_requester_cancel_and_replay_conflict())
+            report.checks.append(self.check_distinct_admin_reject_and_replay_conflict())
+            # Optional real-time expiry, only when a bounded wait is configured
+            # (keeps the default run fast).
+            if self._config.expiry_wait_seconds > 0:
+                report.checks.append(self.check_realtime_expiry())
         except TransportSecurityError as exc:
             report.checks.append(CheckResult("transport_security", False, str(exc)[:120]))
         return report
@@ -327,6 +440,7 @@ def build_config_from_env(args: argparse.Namespace) -> E2ShakedownConfig:
     location = _resolve(args.location, "GBAW_E2_LOCATION")
     observation = _resolve(args.observation_id, "GBAW_E2_OBSERVATION_ID")
     current_desired_raw = _resolve(args.current_desired, "GBAW_E2_CURRENT_DESIRED")
+    expiry_wait_raw = _resolve(args.expiry_wait_seconds, "GBAW_E2_EXPIRY_WAIT_SECONDS")
     missing = [
         name
         for name, value in (
@@ -349,6 +463,13 @@ def build_config_from_env(args: argparse.Namespace) -> E2ShakedownConfig:
             current_desired = int(str(current_desired_raw).strip())
         except ValueError as exc:
             raise ValueError("current_desired must be an integer") from exc
+    if expiry_wait_raw is None or str(expiry_wait_raw).strip() == "":
+        expiry_wait_seconds = 0.0
+    else:
+        try:
+            expiry_wait_seconds = float(str(expiry_wait_raw).strip())
+        except ValueError as exc:
+            raise ValueError("expiry_wait_seconds must be a number") from exc
     return E2ShakedownConfig(
         endpoint=endpoint,
         access_token=access,
@@ -357,6 +478,7 @@ def build_config_from_env(args: argparse.Namespace) -> E2ShakedownConfig:
         location=location,
         observation_id=observation,
         current_desired=current_desired,
+        expiry_wait_seconds=expiry_wait_seconds,
     )
 
 
@@ -369,6 +491,7 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--location")
     parser.add_argument("--observation-id", dest="observation_id")
     parser.add_argument("--current-desired", dest="current_desired")
+    parser.add_argument("--expiry-wait-seconds", dest="expiry_wait_seconds")
     parser.add_argument("--out")
     return parser.parse_args(argv)
 

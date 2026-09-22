@@ -88,11 +88,17 @@ class FakeApprovalService:
 
 
 class FakeDecisionService:
-    def __init__(self, reject_result=None, cancel_result=None) -> None:
+    def __init__(self, reject_result=None, cancel_result=None, expire_result=None) -> None:
         self._reject = reject_result
         self._cancel = cancel_result
+        # ``expire_result`` models the outcome of the opportunistic lazy-on-access
+        # expiry the handler performs before treating an operation as active:
+        # ``None`` == not due (no-op), a dict == the transition won, an
+        # ApprovalBoundaryError == a race/terminal no-op the handler must swallow.
+        self._expire = expire_result
         self.reject_calls: list[Any] = []
         self.cancel_calls: list[Any] = []
+        self.expire_calls: list[Any] = []
 
     def reject(self, request, context) -> dict[str, Any]:
         self.reject_calls.append(request.operation_id)
@@ -105,6 +111,12 @@ class FakeDecisionService:
         if isinstance(self._cancel, Exception):
             raise self._cancel
         return self._cancel
+
+    def expire_if_due(self, request) -> dict[str, Any] | None:
+        self.expire_calls.append(request.operation_id)
+        if isinstance(self._expire, Exception):
+            raise self._expire
+        return self._expire
 
 
 class FakeEvidenceService:
@@ -380,3 +392,129 @@ def test_prepare_handler_maps_current_state_mismatch_error_to_409() -> None:
     )
     resp = handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
     assert resp["statusCode"] == 409
+
+
+# -- Lazy-on-access expiry wiring (issue #414 E2) ---------------------------
+#
+# ``LifecycleDecisionService.expire_if_due`` must run in the real API flow so a
+# DUE pending/prepared operation is atomically transitioned to ``expired`` (with
+# a system actor + ledger) BEFORE evidence or approve/reject/cancel can treat it
+# as active. When the expiry transition wins, the handler emits the bounded
+# ``ApprovalExpired`` metric. A not-due operation is an untouched no-op; an
+# already-terminal operation (or a lost race) is a safe no-op the handler
+# swallows so the underlying route still yields its own bounded response.
+
+_EXPIRE_STATE_CHANGE = {"new_state": "expired", "previous_state": "pending_approval"}
+
+
+def _op_event(method: str, suffix: str = "") -> dict[str, Any]:
+    path = f"/operations/{OPERATION_ID}{suffix}"
+    return _event(
+        method,
+        path=path,
+        body=None if method == "GET" else {},
+        claims=_claims(),
+        path_params={"operationId": OPERATION_ID},
+    )
+
+
+def test_get_evidence_runs_expiry_before_returning_state() -> None:
+    decision = FakeDecisionService(expire_result=_EXPIRE_STATE_CHANGE)
+    handler = _handler(decision_service=decision)
+    resp = handler.handle(_op_event("GET"))
+    # Expiry was attempted for exactly this operation before evidence was read.
+    assert decision.expire_calls == [OPERATION_ID]
+    # The route still returns its evidence body (200 here from the fake).
+    assert resp["statusCode"] == 200
+
+
+def test_approve_runs_expiry_before_grant() -> None:
+    decision = FakeDecisionService(expire_result=_EXPIRE_STATE_CHANGE)
+    handler = _handler(decision_service=decision)
+    handler.handle(_op_event("POST", "/approve"))
+    assert decision.expire_calls == [OPERATION_ID]
+
+
+def test_reject_runs_expiry_before_decision() -> None:
+    decision = FakeDecisionService(reject_result={"new_state": "rejected"}, expire_result=None)
+    handler = _handler(decision_service=decision)
+    handler.handle(_op_event("POST", "/reject"))
+    assert decision.expire_calls == [OPERATION_ID]
+
+
+def test_cancel_runs_expiry_before_decision() -> None:
+    decision = FakeDecisionService(cancel_result={"new_state": "cancelled"}, expire_result=None)
+    handler = _handler(decision_service=decision)
+    handler.handle(_op_event("POST", "/cancel"))
+    assert decision.expire_calls == [OPERATION_ID]
+
+
+def test_expiry_transition_win_emits_approval_expired_metric() -> None:
+    metrics = FakeMetrics()
+    decision = FakeDecisionService(expire_result=_EXPIRE_STATE_CHANGE)
+    handler = _handler(decision_service=decision, metrics=metrics)
+    handler.handle(_op_event("GET"))
+    assert "approval.expired" in metrics.events
+
+
+def test_not_due_expiry_emits_no_metric_and_leaves_route_untouched() -> None:
+    metrics = FakeMetrics()
+    decision = FakeDecisionService(expire_result=None)
+    handler = _handler(decision_service=decision, metrics=metrics)
+    resp = handler.handle(_op_event("GET"))
+    assert decision.expire_calls == [OPERATION_ID]
+    assert "approval.expired" not in metrics.events
+    assert resp["statusCode"] == 200
+
+
+def test_terminal_operation_expiry_is_a_swallowed_no_op() -> None:
+    # An already-terminal operation makes expire_if_due raise STATE_CONFLICT; the
+    # handler must swallow it (expiry is a safe no-op for terminal ops) so the
+    # underlying route runs and produces its own bounded response, not a 409 from
+    # the opportunistic expiry attempt.
+    metrics = FakeMetrics()
+    decision = FakeDecisionService(
+        cancel_result=ApprovalBoundaryError(ApprovalErrorCode.STATE_CONFLICT, "conflict"),
+        expire_result=ApprovalBoundaryError(ApprovalErrorCode.STATE_CONFLICT, "already terminal"),
+    )
+    handler = _handler(decision_service=decision, metrics=metrics)
+    resp = handler.handle(_op_event("POST", "/cancel"))
+    # The 409 comes from the cancel decision (the real route), and expiry did not
+    # fabricate an ApprovalExpired metric for a terminal no-op.
+    assert resp["statusCode"] == 409
+    assert "approval.expired" not in metrics.events
+    assert decision.cancel_calls == [OPERATION_ID]
+
+
+def test_expiry_not_found_no_op_lets_route_return_404() -> None:
+    # If the operation is gone, the opportunistic expiry OPERATION_NOT_FOUND is
+    # swallowed and the evidence route returns its own bounded 404.
+    decision = FakeDecisionService(expire_result=ApprovalBoundaryError(ApprovalErrorCode.OPERATION_NOT_FOUND, "gone"))
+    handler = _handler(decision_service=decision, evidence_service=FakeEvidenceService(None))
+    resp = handler.handle(_op_event("GET"))
+    assert resp["statusCode"] == 404
+
+
+def test_prepare_route_never_runs_expiry() -> None:
+    # Prepare creates a new operation; there is nothing to expire and the id is
+    # not a path parameter, so the handler must not attempt expiry.
+    decision = FakeDecisionService(expire_result=_EXPIRE_STATE_CHANGE)
+    handler = _handler(decision_service=decision)
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert decision.expire_calls == []
+
+
+def test_approve_after_due_returns_bounded_conflict_after_expiry_wins() -> None:
+    # When expiry wins the transition to expired, a same-request approve must not
+    # grant: the approval service reports APPROVAL_EXPIRED (bounded 409), never a
+    # grant. The metric is emitted for the winning expiry transition.
+    metrics = FakeMetrics()
+    decision = FakeDecisionService(expire_result=_EXPIRE_STATE_CHANGE)
+    handler = _handler(
+        decision_service=decision,
+        approval_service=FakeApprovalService(ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_EXPIRED, "expired")),
+        metrics=metrics,
+    )
+    resp = handler.handle(_op_event("POST", "/approve"))
+    assert resp["statusCode"] == 409
+    assert "approval.expired" in metrics.events
