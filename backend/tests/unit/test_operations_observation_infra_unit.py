@@ -283,13 +283,14 @@ def _observation_function(template):
 # --------------------------------------------------------------------------- #
 def test_operations_mode_vocabulary_is_disabled_or_observe(template):
     """E1 froze disabled|observe; E2 (issue #414) ADDITIVELY widens the
-    vocabulary to disabled|observe|advise. The default stays the fail-closed
+    vocabulary to disabled|observe|advise, and E3 (issue #415) additively adds
+    the higher ``remediate`` safe mode. The default stays the fail-closed
     ``disabled`` and ``observe`` is retained unchanged."""
     mode = template["Parameters"]["OperationsMode"]
     assert mode["Default"] == "disabled"
     allowed = set(mode["AllowedValues"])
     assert {"disabled", "observe"} <= allowed, "disabled and observe must be retained"
-    assert allowed <= {"disabled", "observe", "advise"}, "E2 widens the vocabulary only to advise"
+    assert allowed <= {"disabled", "observe", "advise", "remediate"}, "vocabulary widens only to advise/remediate"
 
 
 def test_multi_tenant_and_code_artifact_parameters_present(template):

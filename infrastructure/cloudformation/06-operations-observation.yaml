@@ -45,6 +45,7 @@ Parameters:
       - disabled
       - observe
       - advise
+      - remediate
     Description: >-
       Runtime authority (kill switch) for a PROVISIONED control plane, SEPARATE
       from the Provisioned flag that controls whether resources exist at all.
@@ -56,7 +57,14 @@ Parameters:
       with NO provider write. Both "observe" and "advise" are ENABLED modes and
       require Provisioned="true". On an already-provisioned stack, an emergency
       disable sets this to "disabled" while leaving Provisioned="true" (resources
-      and data retained, reversible); it does NOT delete resources.
+      and data retained, reversible); it does NOT delete resources. "remediate"
+      (E3, issue #415) is a strictly HIGHER authority than "advise": it KEEPS
+      every advise route active (the human-approval gate that authorizes an
+      operation) and signals that a SEPARATE execution stack
+      (07-operations-execution.yaml) may carry an approved operation out. It adds
+      NO execution surface to THIS stack — the 06 handler holds no states: or
+      lambda:InvokeFunction authority and stays read-only. "observe", "advise",
+      and "remediate" are all ENABLED modes requiring Provisioned="true".
 
   Environment:
     Type: String
@@ -324,6 +332,7 @@ Conditions:
   OperationsEnabled: !Or
     - !Equals [!Ref OperationsMode, observe]
     - !Equals [!Ref OperationsMode, advise]
+    - !Equals [!Ref OperationsMode, remediate]
   # advise (E2) is distinguished from observe by the injected
   # GBAW_OPERATIONS_MODE env value the runtime reads, not by a separate CFN
   # condition: resource existence stays gated only on ResourcesProvisioned and
@@ -1100,6 +1109,17 @@ Outputs:
     Value: !GetAtt ObservationRole.Arn
     Export:
       Name: !Sub '${ProjectName}-OperationsObservationRoleArn'
+
+  OperationsKmsKeyArn:
+    Condition: ResourcesProvisioned
+    Description: >-
+      ARN of the operations customer-managed KMS key. Exported so the SEPARATE
+      E3 execution stack (07-operations-execution.yaml) can reuse the same CMK
+      strictly on DynamoDB's behalf; exporting the ARN grants no key permission
+      by itself.
+    Value: !GetAtt OperationsKmsKey.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsKmsKeyArn'
 
   OperationsMetricNamespace:
     Condition: ResourcesProvisioned

@@ -226,7 +226,12 @@ def _integration_targets(template):
 def test_operations_mode_vocabulary_includes_advise(template):
     mode = template["Parameters"]["OperationsMode"]
     assert mode["Default"] == "disabled", "default must remain fail-closed disabled"
-    assert set(mode["AllowedValues"]) == {"disabled", "observe", "advise"}
+    # advise MUST remain a selectable mode alongside the retained disabled/observe.
+    # E3 (#415) additively grows the vocabulary with the higher "remediate" safe
+    # mode; the E2 invariant is that disabled/observe/advise are all still present.
+    allowed = set(mode["AllowedValues"])
+    assert {"disabled", "observe", "advise"} <= allowed
+    assert allowed <= {"disabled", "observe", "advise", "remediate"}
 
 
 def test_advise_keeps_observe_routes_enabled(template):
