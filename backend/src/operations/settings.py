@@ -32,6 +32,7 @@ _AUTHORITY_ORDER = {mode: index for index, mode in enumerate(OPERATIONS_MODES)}
 
 _DEFAULT_MODE = "disabled"
 _OBSERVE_MODE = "observe"
+_ADVISE_MODE = "advise"
 
 # E0-derived observe-phase budgets (ADR 0005 / issue #412). Three reads at 3.0s,
 # 3.0s persistence + canonical serialization, 3.0s cancellation margin => 15.0s
@@ -113,6 +114,11 @@ class OperationsSettings:
     def observe_enabled(self) -> bool:
         """Whether the deployment ceiling admits the read-only observe phase."""
         return _AUTHORITY_ORDER[self.mode] >= _AUTHORITY_ORDER[_OBSERVE_MODE]
+
+    @property
+    def advise_enabled(self) -> bool:
+        """Whether the deployment ceiling admits the deterministic advise phase."""
+        return _AUTHORITY_ORDER[self.mode] >= _AUTHORITY_ORDER[_ADVISE_MODE]
 
     def authority_ceiling(self, *, requested: str) -> str:
         """Return the lower of the deployment ceiling and a requested authority."""

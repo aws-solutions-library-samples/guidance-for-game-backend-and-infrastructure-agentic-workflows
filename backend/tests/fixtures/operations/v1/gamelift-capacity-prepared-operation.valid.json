@@ -1,0 +1,102 @@
+{
+  "operation_contract_version": "1.0",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "idempotency_token": "idem_abcdefghijklmnopqrstuvwx",
+  "phase": "advise",
+  "profile": "gamelift.capacity-adjustment/1.0",
+  "action": "gamelift.adjust-fleet-capacity",
+  "provider": "gamelift",
+  "created_at": "2026-09-21T19:11:52Z",
+  "expires_at": "2026-09-21T19:26:52Z",
+  "playbook": {
+    "playbook_id": "playbook.gamelift-capacity",
+    "playbook_version": "1.0.0",
+    "playbook_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "capability": {
+    "capability_id": "gamelift.capacity-adjustment",
+    "capability_version": "1.0"
+  },
+  "requester": {
+    "subject_id": "subject.operator-1",
+    "client_id": "client.web-console",
+    "tenant_id": "tenant.default",
+    "workspace_id": "workspace.default"
+  },
+  "correlation": {
+    "correlation_id": "corr.prepare-1",
+    "request_id": "request.prepare-1"
+  },
+  "recommendation": {
+    "source_type": "automation",
+    "source_id": "adv_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+    "location": "us-west-2"
+  },
+  "parameters": {
+    "requested": {
+      "desired": 14,
+      "minimum": 2,
+      "maximum": 20
+    },
+    "change": {
+      "desired": 4,
+      "minimum": 0,
+      "maximum": 0
+    }
+  },
+  "current_state": {
+    "observation_id": "obs_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "observation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "capacity": {
+      "desired": 10,
+      "minimum": 2,
+      "maximum": 20
+    }
+  },
+  "resource_enrollment": {
+    "enrollment_id": "enroll.fleet-default",
+    "enrollment_version": "2026-09-01"
+  },
+  "policy": {
+    "policy_id": "policy.capacity-default",
+    "policy_version": "2026-09-01"
+  },
+  "calculated_risk": {
+    "level": "moderate",
+    "score": 30,
+    "factors": [
+      "desired-magnitude",
+      "scale-up"
+    ]
+  },
+  "authority": {
+    "authority_inputs": {
+      "deployment_mode": "operate",
+      "tenant_policy": "operate",
+      "workspace_policy": "operate",
+      "principal_authority": "remediate",
+      "capability_maximum": "remediate",
+      "operation_risk_policy": "operate"
+    },
+    "effective_authority": "remediate",
+    "decision": "approval_required",
+    "reason_codes": [
+      "APPROVAL_REQUIRED"
+    ]
+  },
+  "retry_policy": {
+    "max_attempts": 3,
+    "base_delay_seconds": 2,
+    "max_delay_seconds": 60,
+    "reconcile_before_retry": true
+  },
+  "future_executor_binding": {
+    "executor_id": "executor.gamelift-capacity",
+    "executor_binding_version": "1.0"
+  },
+  "prepared_hash": "sha256:2dad46196946c6375450960d769fb7abe59a1f12a3605e153fb64e58e48cd435"
+}

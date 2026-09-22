@@ -237,6 +237,47 @@ Application errors have a closed error-code set, a bounded safe message,
 retryability, and correlation. They expose only bounded field paths and state.
 Adapters map these errors to their protocol without changing product meaning.
 
+## Additive Capacity-Adjustment Profile (E2)
+
+The `gamelift.capacity-adjustment/1.0` capability adds an **E2 prepare** layer on
+top of the read-only E1 observation. It is delivered as four additive schemas
+that reuse the immutable `common` `$defs` but are deliberately **not** part of
+the published source-control write-contract set (`SCHEMA_NAMES`) or its playbook
+binding, exactly like the additive `gamelift-observation` contract. Adding them
+therefore cannot change a published v1 write contract or its playbook hash.
+
+| Contract | Version field | Schema |
+|---|---|---|
+| Capacity proposal request (untrusted) | `request_contract_version` | `gamelift-capacity-proposal-request.schema.json` |
+| Capacity advice (deterministic) | `advice_contract_version` | `gamelift-capacity-advice.schema.json` |
+| Capacity authorization decision (trusted) | `authorization_contract_version` | `gamelift-capacity-authorization.schema.json` |
+| Capacity prepared operation (immutable) | `operation_contract_version` | `gamelift-capacity-prepared-operation.schema.json` |
+
+The **untrusted** proposal request carries only bounded target/requested capacity
+intent (`fleet_id`, `location`, desired/min/max) and an idempotency token. It has
+no identity, correlation, policy, enrollment, risk, executor, credential,
+approval, deployment-mode, playbook, or trusted current-state field, and
+`additionalProperties` is false everywhere, so injecting any such field fails
+validation.
+
+A trusted `AdviceService` resolves the requester only from the verified
+principal, loads the current fleet capacity from a trusted E1 observation/status
+port at advice time, applies server-owned enrollment/policy bounds, and computes
+a deterministic change and risk. A trusted `PrepareService` then selects the
+exact playbook/capability in code — never from model text — evaluates the six
+ADR 0001 authority inputs and their deterministic minimum, and produces exactly
+one of `approval_required` or `denied`. A GameLift capacity change is never
+`authorized` outright; a non-denied outcome always requires a direct human
+approval.
+
+The prepared operation is immutable and idempotent: its `prepared_hash` binds
+every other field — the target, the current-state observation id/hash, the exact
+desired/min/max change, the playbook/profile/capability/contract versions, the
+authority inputs/decision, the calculated risk, the requester scope, the expiry,
+and the future executor binding identifier — and excludes only itself. Provider
+writes and executor credentials are structurally absent: there is no
+provider-write parameter and the future executor binding is an identifier only.
+
 ## Compatibility and Publication
 
 Version `1.0` is exact, not a minimum. Consumers MUST use an explicit allowlist

@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-prepared-operation",
+  "title": "GameLift Capacity Adjustment Prepared Operation 1.0",
+  "$comment": "Additive immutable E2 prepared operation for gamelift.capacity-adjustment/1.0. It is the sole trusted, signed-by-hash intent handed forward to a future executor. Untrusted proposal fields never appear verbatim: identity, correlation, policy, enrollment, risk, playbook, capability, authority decision, expiry, and a future executor binding identifier are all server-owned. The prepared_hash binds every field except itself. It reuses the immutable common $defs and is not part of the published source-control write-contract schema set, so it never alters an existing v1 write contract or its playbook hash.",
+  "$defs": {
+    "capacity_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "desired",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "desired": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      }
+    },
+    "capacity_delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "desired",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "desired": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": -1000000,
+          "maximum": 1000000
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "operation_contract_version",
+    "operation_id",
+    "idempotency_token",
+    "phase",
+    "profile",
+    "action",
+    "provider",
+    "created_at",
+    "expires_at",
+    "playbook",
+    "capability",
+    "requester",
+    "correlation",
+    "recommendation",
+    "target",
+    "parameters",
+    "current_state",
+    "resource_enrollment",
+    "policy",
+    "calculated_risk",
+    "authority",
+    "retry_policy",
+    "future_executor_binding",
+    "prepared_hash"
+  ],
+  "properties": {
+    "operation_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "idempotency_token": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/idempotency_token"
+    },
+    "phase": {
+      "type": "string",
+      "const": "advise"
+    },
+    "profile": {
+      "const": "gamelift.capacity-adjustment/1.0"
+    },
+    "action": {
+      "const": "gamelift.adjust-fleet-capacity"
+    },
+    "provider": {
+      "type": "string",
+      "const": "gamelift"
+    },
+    "created_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "expires_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "playbook": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/playbook_ref"
+    },
+    "capability": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/capability_binding"
+    },
+    "requester": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/trusted_identity"
+    },
+    "correlation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"
+    },
+    "recommendation": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/recommendation_source"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "fleet_id",
+        "location"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "const": "gamelift"
+        },
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        }
+      }
+    },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested",
+        "change"
+      ],
+      "properties": {
+        "requested": {
+          "$ref": "#/$defs/capacity_values"
+        },
+        "change": {
+          "$ref": "#/$defs/capacity_delta"
+        }
+      }
+    },
+    "current_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation_id",
+        "observation_hash",
+        "capacity"
+      ],
+      "properties": {
+        "observation_id": {
+          "type": "string",
+          "pattern": "^obs_[a-z0-9]{26}$"
+        },
+        "observation_hash": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+        },
+        "capacity": {
+          "$ref": "#/$defs/capacity_values"
+        }
+      }
+    },
+    "resource_enrollment": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/resource_enrollment"
+    },
+    "policy": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/policy_binding"
+    },
+    "calculated_risk": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/calculated_risk"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authority_inputs",
+        "effective_authority",
+        "decision",
+        "reason_codes"
+      ],
+      "properties": {
+        "authority_inputs": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "deployment_mode",
+            "tenant_policy",
+            "workspace_policy",
+            "principal_authority",
+            "capability_maximum",
+            "operation_risk_policy"
+          ],
+          "properties": {
+            "deployment_mode": {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+            },
+            "tenant_policy": {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+            },
+            "workspace_policy": {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+            },
+            "principal_authority": {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+            },
+            "capability_maximum": {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+            },
+            "operation_risk_policy": {
+              "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+            }
+          }
+        },
+        "effective_authority": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "approval_required",
+            "denied"
+          ]
+        },
+        "reason_codes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "APPROVAL_REQUIRED",
+              "DEPLOYMENT_DISABLED",
+              "INSUFFICIENT_AUTHORITY",
+              "POLICY_DENIED",
+              "TARGET_NOT_ENROLLED",
+              "RISK_LIMIT_EXCEEDED",
+              "WORKSPACE_MISMATCH",
+              "BOUNDS_EXCEEDED"
+            ]
+          }
+        }
+      }
+    },
+    "retry_policy": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/retry_policy"
+    },
+    "future_executor_binding": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/executor_binding"
+    },
+    "prepared_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    }
+  }
+}
