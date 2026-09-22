@@ -179,11 +179,13 @@ def _build_approval_handler(
     from operations.contracts.capacity import ACTION, PROFILE
     from operations.decisions import LifecycleDecisionService
     from operations.evidence import E2EvidenceService
+    from operations.observe.e2_metrics import CloudWatchApprovalMetrics
     from operations.prepare import CapacityPlaybook, PrepareService
     from operations.prepare_orchestrator import PrepareOrchestrator
 
     ops = settings.operations
     approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=settings.table_name)
+    approval_metrics = CloudWatchApprovalMetrics(client=cloudwatch_client, namespace=settings.metric_namespace)
 
     def _advice_service_factory(observation_id: str) -> AdviceService:
         state_port = E1ObservationCapacityStatePort(status_loader=observation_store, observation_id=observation_id)
@@ -261,6 +263,7 @@ def _build_approval_handler(
         tenant_id=settings.tenant_id,
         workspace_id=settings.workspace_id,
         trusted_audience=settings.trusted_audience,
+        metrics=approval_metrics,
     )
 
 
