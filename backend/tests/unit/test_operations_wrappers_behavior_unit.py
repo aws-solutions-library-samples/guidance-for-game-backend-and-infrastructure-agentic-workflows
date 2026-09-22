@@ -9,6 +9,7 @@ that the scripts parse under ``bash -n``.
 # Standard library
 import os
 import pathlib
+import re
 import subprocess
 
 # Third-party packages
@@ -278,3 +279,142 @@ def test_disable_help_describes_data_preserving_no_rebuild():
     combined = result.stdout + result.stderr
     assert "data-preserving" in combined.lower()
     assert "does not rebuild" in combined.lower() or "rebuild" in combined.lower()
+
+
+# --------------------------------------------------------------------------- #
+# E2 (issue #414) server-owned CAPACITY POLICY wrapper behavior.
+#
+# The three capacity-policy settings are server-owned and injected as frozen
+# core env names. The wrapper accepts EXPLICIT bounded overrides ONLY from
+# dedicated environment variables (never from a request body), passes them on
+# enable, and reuses the stack's existing values via UsePreviousValue on an
+# emergency disable. Safe defaults (0/1/1) cap a fresh enable at one instance.
+# --------------------------------------------------------------------------- #
+def test_deploy_capacity_defaults_are_safe_zero_one_one():
+    """The wrapper's capacity defaults match the template safe defaults (0/1/1)
+    so a fresh enable with no override never scales past one instance."""
+    assert re.search(r'CAPACITY_FLOOR="\$\{GBAW_OPERATIONS_CAPACITY_FLOOR:-0\}"', _DEPLOY_TEXT)
+    assert re.search(r'CAPACITY_CEILING="\$\{GBAW_OPERATIONS_CAPACITY_CEILING:-1\}"', _DEPLOY_TEXT)
+    assert re.search(r'CAPACITY_MAX_STEP="\$\{GBAW_OPERATIONS_CAPACITY_MAX_STEP:-1\}"', _DEPLOY_TEXT)
+
+
+def test_deploy_capacity_overrides_come_from_env_not_request_body():
+    """The bounded overrides are read from explicit environment variables. The
+    wrapper never parses a request body / JSON payload for capacity values."""
+    # The three overrides are sourced from GBAW_OPERATIONS_CAPACITY_* env vars.
+    for env_name in (
+        "GBAW_OPERATIONS_CAPACITY_FLOOR",
+        "GBAW_OPERATIONS_CAPACITY_CEILING",
+        "GBAW_OPERATIONS_CAPACITY_MAX_STEP",
+    ):
+        assert env_name in _DEPLOY_TEXT, f"{env_name} must be an accepted explicit override"
+    # No request-body / JSON parsing feeds the capacity values.
+    for forbidden in ("request_body", "REQUEST_BODY", "jq ", "--data", "request.json"):
+        assert forbidden not in _DEPLOY_TEXT, f"capacity overrides must not come from {forbidden}"
+
+
+def test_deploy_enable_passes_capacity_settings_in_overrides():
+    """The enable PARAM_OVERRIDES must pass all three capacity settings so the
+    server-owned bound is applied."""
+    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
+    enable = _DEPLOY_TEXT[idx:]
+    assert '"CapacityFloor=${CAPACITY_FLOOR}"' in enable
+    assert '"CapacityCeiling=${CAPACITY_CEILING}"' in enable
+    assert '"CapacityMaxStep=${CAPACITY_MAX_STEP}"' in enable
+
+
+def test_disable_reuses_capacity_settings_unchanged():
+    """An emergency disable must reuse all three capacity settings via
+    UsePreviousValue so a disabled-but-provisioned advise stack keeps its bound
+    on re-enable."""
+    idx = _DEPLOY_TEXT.index("DISABLE_PARAMS=(")
+    disable = _DEPLOY_TEXT[idx:]
+    for key in ("CapacityFloor", "CapacityCeiling", "CapacityMaxStep"):
+        assert f'"ParameterKey={key},UsePreviousValue=true"' in disable
+
+
+def test_deploy_enable_incoherent_capacity_floor_above_ceiling_refuses():
+    """An explicit override with floor > ceiling is refused before any AWS call.
+    The wrapper enforces the FULL numeric coherent bound the template Rules
+    cannot express with equality-only functions."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_FLOOR": "5",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "3",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined
+
+
+def test_deploy_enable_incoherent_capacity_max_step_too_large_refuses():
+    """max_step larger than (ceiling - floor) is refused before any AWS call."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_FLOOR": "0",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "2",
+            "GBAW_OPERATIONS_CAPACITY_MAX_STEP": "5",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined
+
+
+def test_deploy_enable_zero_max_step_refuses():
+    """A non-positive max_step is refused: the step must be strictly positive."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_FLOOR": "0",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "3",
+            "GBAW_OPERATIONS_CAPACITY_MAX_STEP": "0",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined
+
+
+def test_deploy_enable_non_integer_capacity_refuses():
+    """A non-integer capacity override is refused before any AWS call."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "3.5",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined

@@ -83,6 +83,15 @@ TRUSTED_AUDIENCE="${TRUSTED_AUDIENCE:-}"
 LOW_RISK_SELF_APPROVAL="${GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL:-false}"
 PREPARATION_EXPIRY_SECONDS="${GBAW_OPERATIONS_PREPARATION_EXPIRY_S:-900}"
 APPROVAL_EXPIRY_SECONDS="${GBAW_OPERATIONS_APPROVAL_EXPIRY_S:-1800}"
+# E2 (issue #414) server-owned CAPACITY POLICY defaults. Accepted ONLY as
+# explicit, bounded environment overrides — never parsed from a request body.
+# The SAFE defaults 0/1/1 cap a fresh enable at exactly one instance; raising
+# them is a deliberate, cost-relevant act (explicit stack update + cost
+# review). The full coherent bound (floor <= ceiling, 0 < max_step <=
+# ceiling - floor) is validated below before any AWS call.
+CAPACITY_FLOOR="${GBAW_OPERATIONS_CAPACITY_FLOOR:-0}"
+CAPACITY_CEILING="${GBAW_OPERATIONS_CAPACITY_CEILING:-1}"
+CAPACITY_MAX_STEP="${GBAW_OPERATIONS_CAPACITY_MAX_STEP:-1}"
 # The EXPLICIT, pre-existing artifact bucket for the Lambda zip. There is no
 # discovery and no creation: an enabled deploy requires this to name a bucket
 # that already exists in the target account/region.
@@ -213,6 +222,26 @@ if [ "$ACTION" = "enable" ]; then
         echo "❌ GBAW_OPERATIONS_ARTIFACT_BUCKET is required to enable. This wrapper" >&2
         echo "   never discovers or creates a bucket; set it to a pre-existing bucket." >&2
         exit 6
+    fi
+    # Validate the server-owned capacity band: each value must be a
+    # non-negative integer, and the band must be coherent — floor below
+    # ceiling and 0 < max_step <= (ceiling - floor). CloudFormation Rules
+    # cannot compare numbers, so this is the authoritative arithmetic guard
+    # for any explicit override, and it runs BEFORE any AWS call.
+    _int_re='^[0-9]+$'
+    if ! [[ "$CAPACITY_FLOOR" =~ $_int_re ]] || ! [[ "$CAPACITY_CEILING" =~ $_int_re ]] || ! [[ "$CAPACITY_MAX_STEP" =~ $_int_re ]]; then
+        echo "❌ Refusing to enable: capacity floor/ceiling/max_step must be non-negative integers" >&2
+        echo "   (got floor=$CAPACITY_FLOOR ceiling=$CAPACITY_CEILING max_step=$CAPACITY_MAX_STEP)." >&2
+        exit 3
+    fi
+    if [ "$CAPACITY_FLOOR" -ge "$CAPACITY_CEILING" ]; then
+        echo "❌ Refusing to enable: capacity floor ($CAPACITY_FLOOR) must be strictly below ceiling ($CAPACITY_CEILING)." >&2
+        exit 3
+    fi
+    _capacity_span=$(( CAPACITY_CEILING - CAPACITY_FLOOR ))
+    if [ "$CAPACITY_MAX_STEP" -lt 1 ] || [ "$CAPACITY_MAX_STEP" -gt "$_capacity_span" ]; then
+        echo "❌ Refusing to enable: capacity max_step ($CAPACITY_MAX_STEP) must be > 0 and <= ceiling-floor ($_capacity_span)." >&2
+        exit 3
     fi
     OPERATIONS_MODE="$REQUESTED_MODE"
 fi
@@ -554,6 +583,9 @@ if [ "$ACTION" = "disable" ]; then
         "ParameterKey=LowRiskSelfApproval,UsePreviousValue=true"
         "ParameterKey=PreparationExpirySeconds,UsePreviousValue=true"
         "ParameterKey=ApprovalExpirySeconds,UsePreviousValue=true"
+        "ParameterKey=CapacityFloor,UsePreviousValue=true"
+        "ParameterKey=CapacityCeiling,UsePreviousValue=true"
+        "ParameterKey=CapacityMaxStep,UsePreviousValue=true"
         "ParameterKey=LambdaMemoryMb,UsePreviousValue=true"
         "ParameterKey=ReservedConcurrency,UsePreviousValue=true"
         "ParameterKey=MaxReadRequestUnits,UsePreviousValue=true"
@@ -610,6 +642,9 @@ PARAM_OVERRIDES=(
     "LowRiskSelfApproval=${LOW_RISK_SELF_APPROVAL}"
     "PreparationExpirySeconds=${PREPARATION_EXPIRY_SECONDS}"
     "ApprovalExpirySeconds=${APPROVAL_EXPIRY_SECONDS}"
+    "CapacityFloor=${CAPACITY_FLOOR}"
+    "CapacityCeiling=${CAPACITY_CEILING}"
+    "CapacityMaxStep=${CAPACITY_MAX_STEP}"
 )
 
 echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."
