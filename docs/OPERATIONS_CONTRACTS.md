@@ -274,9 +274,18 @@ The prepared operation is immutable and idempotent: its `prepared_hash` binds
 every other field — the target, the current-state observation id/hash, the exact
 desired/min/max change, the playbook/profile/capability/contract versions, the
 authority inputs/decision, the calculated risk, the requester scope, the expiry,
-and the future executor binding identifier — and excludes only itself. Provider
-writes and executor credentials are structurally absent: there is no
-provider-write parameter and the future executor binding is an identifier only.
+and the future executor binding identifier — and excludes only itself. Its
+timestamps are a deterministic function of the bound current-state revision, not
+the wall clock: `created_at` is the trusted E1 observation revision anchor
+(`current_state.observed_at`) and `expires_at` is derived as the earlier of the
+trusted observation expiry (`current_state.expires_at`) and `created_at` plus the
+configured preparation TTL. The live clock is used only to decide whether that
+anchor/current-state revision is still fresh, so the same token, intent, and
+current-state revision retried later yield byte-for-byte identical timestamps,
+`operation_id`, document bytes, and `prepared_hash`; a changed current-state
+revision yields a distinct hash. Provider writes and executor credentials are
+structurally absent: there is no provider-write parameter and the future executor
+binding is an identifier only.
 
 ## Compatibility and Publication
 

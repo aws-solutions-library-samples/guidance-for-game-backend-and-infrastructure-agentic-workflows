@@ -171,11 +171,27 @@ class CapacityBounds:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CurrentCapacity:
-    """Trusted current fleet capacity loaded from the E1 observation port."""
+    """Trusted current fleet capacity loaded from the E1 observation port.
+
+    ``observed_at`` and ``expires_at`` are the trusted E1 observation revision's
+    own timestamps. They are the deterministic time anchor for advice and the
+    prepared operation: the emitted ``created_at``/``advised_at`` are derived
+    from ``observed_at`` (never the live clock), and ``expires_at`` bounds how
+    long a prepared operation built on this revision may live. The live clock is
+    used only to decide whether the revision is still fresh.
+    """
 
     observation_id: str
     observation_hash: str
     capacity: CapacityValues
+    observed_at: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        observed = _utc(self.observed_at, "observed_at")
+        expires = _utc(self.expires_at, "expires_at")
+        if expires <= observed:
+            raise ValueError("observation expires_at must be strictly after observed_at")
 
 
 class CapacityStatePort(Protocol):
@@ -288,6 +304,19 @@ class AdviceService:
                 retryable=True,
             )
 
+        # The live clock only decides freshness of the trusted current-state
+        # revision; it never contributes to the emitted document bytes. A
+        # revision at or past its own expiry is stale and fails closed.
+        observed_at = _utc(current.observed_at, "observed_at")
+        observation_expiry = _utc(current.expires_at, "expires_at")
+        now = _utc(self._clock(), "clock")
+        if now >= observation_expiry:
+            raise AdviceBoundaryError(
+                AdviceErrorCode.CURRENT_STATE_STALE,
+                "current-capacity observation is no longer fresh",
+                retryable=True,
+            )
+
         bounds = self._bounds_port.resolve_bounds(
             requester=context.requester, fleet_id=request.fleet_id, location=request.location
         )
@@ -305,7 +334,10 @@ class AdviceService:
         )
         risk = calculate_capacity_risk(current=current_capacity, requested=requested, within_bounds=not violations)
 
-        advised_at = _isoformat(_utc(self._clock(), "clock"))
+        # Advice is a pure function of (proposal, trusted observation revision):
+        # its timestamp is the observation anchor, so recomputing it on a later
+        # clock is byte-for-byte identical.
+        advised_at = _isoformat(observed_at)
         advice = {
             "advice_contract_version": CONTRACT_VERSION,
             "advice_id": self._advice_id_factory(),
@@ -317,6 +349,8 @@ class AdviceService:
                 "observation_id": current.observation_id,
                 "observation_hash": current.observation_hash,
                 "capacity": current_capacity,
+                "observed_at": _isoformat(observed_at),
+                "expires_at": _isoformat(observation_expiry),
             },
             "requested": requested,
             "change": change,

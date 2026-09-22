@@ -101,11 +101,19 @@ class FakeBoundsPort:
         return self._bounds
 
 
+# The trusted observation revision anchor. NOW sits inside [OBSERVED_AT,
+# OBSERVED_AT + 30m), so the fixed-clock service paths stay fresh.
+OBSERVED_AT = NOW
+OBS_EXPIRES_AT = NOW + timedelta(minutes=30)
+
+
 def _current(desired=10, minimum=2, maximum=20) -> CurrentCapacity:
     return CurrentCapacity(
         observation_id="obs_aaaaaaaaaaaaaaaaaaaaaaaaaa",
         observation_hash=OBS_HASH,
         capacity=CapacityValues(desired=desired, minimum=minimum, maximum=maximum),
+        observed_at=OBSERVED_AT,
+        expires_at=OBS_EXPIRES_AT,
     )
 
 

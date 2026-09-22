@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-advice",
   "title": "GameLift Capacity Adjustment Advice 1.0",
-  "$comment": "Additive deterministic E2 advice for gamelift.capacity-adjustment/1.0. It is a pure, server-computed reading of one proposal against one trusted current-state observation: the exact desired/min/max change, server-owned bounds outcome, and deterministic risk. It reuses the immutable common $defs, is not in the published source-control write-contract schema set, and carries no free-form model text, executor, or credential field.",
+  "$comment": "Additive deterministic E2 advice for gamelift.capacity-adjustment/1.0. It is a pure, server-computed reading of one proposal against one trusted current-state observation: the exact desired/min/max change, server-owned bounds outcome, and deterministic risk. It reuses the immutable common $defs, is not in the published source-control write-contract schema set, and carries no free-form model text, executor, or credential field. Timestamps (advised_at and current_state.observed_at/expires_at) are the trusted E1 observation revision anchor, so advice is a pure function of (proposal, observation revision) and is byte-identical when recomputed on a later clock.",
   "$defs": {
     "capacity_values": {
       "type": "object",
@@ -125,7 +125,9 @@
       "required": [
         "observation_id",
         "observation_hash",
-        "capacity"
+        "capacity",
+        "observed_at",
+        "expires_at"
       ],
       "properties": {
         "observation_id": {
@@ -137,6 +139,12 @@
         },
         "capacity": {
           "$ref": "#/$defs/capacity_values"
+        },
+        "observed_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        },
+        "expires_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
         }
       }
     },
