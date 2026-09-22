@@ -122,20 +122,50 @@ deploys `Provisioned=true`/`ExecutionMode=remediate`.
 
 ## Live validation plan (separately approved)
 
-The live shakedown exercises exactly two **separately approved** capacity
-operations against the enrolled demo/test fleet, then disables:
+The E3 shakedown harness (`operations.validation.e3_shakedown`) is **not a dry
+run**. Its admin-dispatch check makes a real, admin-authenticated POST to the
+deployed `POST /operations/{operationId}/dispatch` route, which **starts the
+real E3 Step Functions execution and can perform an actual
+`UpdateFleetCapacity`** against the enrolled fleet. It mutates nothing else —
+only that single enrolled fleet, and only within the bounds already prepared for
+the operation — but that one capacity write is real. Its unauthenticated-denial
+and non-admin-denial checks are non-mutating; only the admin-dispatch check
+writes.
+
+Because the admin-dispatch check is write-capable, the harness **refuses** it —
+and makes **no authenticated request at all**, so nothing reaches the deployed
+handler — unless **both** of the following hold:
+
+- **The operation is already directly human-approved.** Every operation is
+  approved through the E2 human-approval gate first (the harness performs no
+  approval and is not itself an approval); the dispatcher enforces admin on top
+  of the JWT authorizer.
+- **An explicit, exact confirmation is supplied out of band.** Set
+  `--confirm-live-dispatch` (or `GBAW_E3_CONFIRM_LIVE_DISPATCH`) to the exact
+  frozen value `EXECUTE-LIVE-DISPATCH`. The value is compared byte-for-byte (no
+  trimming, no case folding); any missing, partial, or altered value is refused.
+  It is an operator input only — it is **never persisted** and **cannot be
+  sourced from a response body**, so an echoing or hostile deployment cannot
+  unlock the write. Missing/wrong confirmation is reported as the
+  `CONFIRMATION_REQUIRED` check outcome with no authenticated call made.
+
+The confirmation, the endpoint, the admin token, the fleet id, and the operation
+id are read only from flags/environment and never appear in the emitted summary
+(identifiers appear only as non-reversible short hashes).
+
+With an approved operation and the confirmation supplied, the live shakedown
+exercises exactly two **separately approved** capacity operations against the
+enrolled demo/test fleet, then disables:
 
 1. **0 → 1** — approve an operation that raises desired capacity from `0` to `1`,
-   dispatch it, and confirm the fleet reaches `1` via
+   dispatch it (with confirmation), and confirm the fleet reaches `1` via
    `gamelift:DescribeFleetCapacity`.
 2. **1 → 0** — approve an operation that lowers desired capacity from `1` back to
-   `0`, dispatch it, and confirm the fleet returns to `0`.
+   `0`, dispatch it (with confirmation), and confirm the fleet returns to `0`.
 
-Each operation is human-approved through the E2 gate first; the dispatcher
-enforces admin on top of the JWT authorizer. After the 1 → 0 operation, run
-`disable-operations-execution.sh --confirm` and confirm both levers fail closed
-(a further dispatch is throttled and the executor denies). No other capacity
-change is performed.
+After the 1 → 0 operation, run `disable-operations-execution.sh --confirm` and
+confirm both levers fail closed (a further dispatch is throttled and the executor
+denies). No other capacity change is performed.
 
 ## Teardown
 
