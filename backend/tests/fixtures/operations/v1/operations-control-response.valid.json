@@ -1,0 +1,20 @@
+{
+  "contract_version": "1.0",
+  "outcome": "applied",
+  "config_version": 8,
+  "reason_code": "APPLIED",
+  "effective": {
+    "contract_version": "1.0",
+    "config_version": 8,
+    "issued_at": "2026-01-15T00:03:00Z",
+    "not_after": "2026-01-15T00:08:00Z",
+    "operations_enabled": true,
+    "capabilities": {
+      "gamelift.capacity-adjustment": {
+        "prepare": true,
+        "dispatch": true,
+        "execute": true
+      }
+    }
+  }
+}

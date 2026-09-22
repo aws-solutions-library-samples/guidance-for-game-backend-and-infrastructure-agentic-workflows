@@ -1,0 +1,202 @@
+{
+  "description": "Frozen, public-safe JSON examples for the additive E4 operations control-plane contracts (issue #416). Every example validates against its v1 schema and is safe to embed verbatim in backend, frontend, and infrastructure agent work. All identifiers, timestamps, and values are synthetic.",
+  "contract_version": "1.0",
+  "routes": {
+    "capabilities": "GET /operations/capabilities",
+    "operations_list": "GET /operations",
+    "operation_detail": "GET /operations/{operationId}",
+    "control": "POST /operations/control",
+    "kill_switch": "GET /operations/control/kill-switch"
+  },
+  "examples": {
+    "operations-kill-switch": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-kill-switch",
+      "value": {
+        "contract_version": "1.0",
+        "config_version": 7,
+        "issued_at": "2026-01-15T00:00:00Z",
+        "not_after": "2026-01-15T00:05:00Z",
+        "operations_enabled": true,
+        "capabilities": {
+          "gamelift.capacity-adjustment": {
+            "prepare": true,
+            "dispatch": true,
+            "execute": false
+          }
+        }
+      }
+    },
+    "operations-kill-switch-default-safe": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-kill-switch",
+      "value": {
+        "contract_version": "1.0",
+        "config_version": 1,
+        "issued_at": "2026-01-15T00:00:00Z",
+        "not_after": "2026-01-15T00:05:00Z",
+        "operations_enabled": false,
+        "capabilities": {
+          "gamelift.capacity-adjustment": {
+            "prepare": false,
+            "dispatch": false,
+            "execute": false
+          }
+        }
+      }
+    },
+    "operations-capability-discovery": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-capability-discovery",
+      "value": {
+        "contract_version": "1.0",
+        "generated_at": "2026-01-15T00:01:00Z",
+        "deployment_mode": "remediate",
+        "operations_enabled": true,
+        "kill_switch_config_version": 7,
+        "capabilities": [
+          {
+            "capability_id": "gamelift.capacity-adjustment",
+            "capability_version": "1.0",
+            "available": true,
+            "provisioned": true,
+            "enabled": true,
+            "effective_authority": "remediate",
+            "phases": {
+              "prepare": true,
+              "dispatch": true,
+              "execute": false
+            },
+            "gates": [
+              {
+                "gate_id": "build.capability-present",
+                "kind": "static",
+                "satisfied": true
+              },
+              {
+                "gate_id": "runtime.kill-switch-enabled",
+                "kind": "dynamic",
+                "satisfied": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "operations-list-request": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-list-request",
+      "value": {
+        "contract_version": "1.0",
+        "page_size": 25,
+        "filter": {
+          "capability_id": "gamelift.capacity-adjustment",
+          "states": [
+            "pending_approval",
+            "approved"
+          ]
+        }
+      }
+    },
+    "operations-list-response": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-list-response",
+      "value": {
+        "contract_version": "1.0",
+        "page_size": 25,
+        "operations": [
+          {
+            "operation_id": "op_00000000000000000000000001",
+            "capability_id": "gamelift.capacity-adjustment",
+            "state": "pending_approval",
+            "created_at": "2026-01-15T00:00:10Z",
+            "updated_at": "2026-01-15T00:00:20Z"
+          }
+        ],
+        "next_cursor": "eyJvcCI6Im9wXzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAxIn0"
+      }
+    },
+    "operations-detail-projection": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-detail-projection",
+      "value": {
+        "contract_version": "1.0",
+        "operation_id": "op_00000000000000000000000001",
+        "capability_id": "gamelift.capacity-adjustment",
+        "state": "succeeded",
+        "created_at": "2026-01-15T00:00:10Z",
+        "updated_at": "2026-01-15T00:02:00Z",
+        "phases": [
+          {
+            "phase": "prepare",
+            "status": "succeeded",
+            "occurred_at": "2026-01-15T00:00:10Z"
+          },
+          {
+            "phase": "verify",
+            "status": "succeeded",
+            "occurred_at": "2026-01-15T00:02:00Z"
+          }
+        ],
+        "verification": {
+          "applicable": true,
+          "outcome": "succeeded"
+        },
+        "rollback": {
+          "applicable": false,
+          "outcome": "not_applicable"
+        },
+        "evidence": [
+          {
+            "category": "approval",
+            "summary": "Human approval granted by an authorized admin.",
+            "recorded_at": "2026-01-15T00:00:40Z"
+          }
+        ]
+      }
+    },
+    "operations-control-request": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-control-request",
+      "value": {
+        "contract_version": "1.0",
+        "expected_config_version": 7,
+        "desired": {
+          "operations_enabled": true,
+          "capabilities": {
+            "gamelift.capacity-adjustment": {
+              "prepare": true,
+              "dispatch": true,
+              "execute": true
+            }
+          }
+        }
+      }
+    },
+    "operations-control-response": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-control-response",
+      "value": {
+        "contract_version": "1.0",
+        "outcome": "applied",
+        "config_version": 8,
+        "reason_code": "APPLIED",
+        "effective": {
+          "contract_version": "1.0",
+          "config_version": 8,
+          "issued_at": "2026-01-15T00:03:00Z",
+          "not_after": "2026-01-15T00:08:00Z",
+          "operations_enabled": true,
+          "capabilities": {
+            "gamelift.capacity-adjustment": {
+              "prepare": true,
+              "dispatch": true,
+              "execute": true
+            }
+          }
+        }
+      }
+    },
+    "operations-control-response-version-conflict": {
+      "schema_id": "urn:game-agent:operations:contracts:v1:operations-control-response",
+      "value": {
+        "contract_version": "1.0",
+        "outcome": "version_conflict",
+        "config_version": 9,
+        "reason_code": "VERSION_CONFLICT"
+      }
+    }
+  }
+}

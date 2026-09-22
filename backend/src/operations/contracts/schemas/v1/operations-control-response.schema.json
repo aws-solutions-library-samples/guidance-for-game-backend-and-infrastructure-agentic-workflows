@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-control-response",
+  "title": "Operations Control Response 1.0",
+  "description": "The result of an admin control request. It reports the outcome (applied, rejected because the expected_config_version was stale, or denied), the resulting config_version when applied, and the effective kill-switch document that is now current. It carries no identity, credential, or provider payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "outcome",
+    "config_version"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "applied",
+        "version_conflict",
+        "denied"
+      ]
+    },
+    "config_version": {
+      "description": "When applied, the new config_version. When version_conflict or denied, the current stored config_version the caller must reconcile against.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "APPLIED",
+        "VERSION_CONFLICT",
+        "PHASE_ORDER_INVALID",
+        "AUTHORITY_DENIED"
+      ]
+    },
+    "effective": {
+      "description": "The kill-switch document that is current after the request. Present when the outcome is applied.",
+      "$ref": "urn:game-agent:operations:contracts:v1:operations-kill-switch"
+    }
+  }
+}

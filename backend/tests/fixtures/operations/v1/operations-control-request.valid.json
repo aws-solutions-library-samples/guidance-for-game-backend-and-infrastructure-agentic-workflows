@@ -1,0 +1,14 @@
+{
+  "contract_version": "1.0",
+  "expected_config_version": 7,
+  "desired": {
+    "operations_enabled": true,
+    "capabilities": {
+      "gamelift.capacity-adjustment": {
+        "prepare": true,
+        "dispatch": true,
+        "execute": true
+      }
+    }
+  }
+}

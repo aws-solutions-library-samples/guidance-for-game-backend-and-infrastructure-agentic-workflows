@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-capability-discovery",
+  "title": "Operations Capability Discovery 1.0",
+  "description": "The server-computed capability discovery projection the UI reads before showing any operations control. It distinguishes availability (the code path exists in this build), provisioning (the deployment created the resources), and enablement (the runtime kill-switch and effective authority permit use), and it distinguishes static gates (fixed at build/deploy time) from dynamic gates (evaluated per request). It carries no identity, credential, ARN, account, or provider payload. A hidden or disabled control is never authorization; the backend re-checks every gate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "generated_at",
+    "deployment_mode",
+    "operations_enabled",
+    "capabilities"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "generated_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "deployment_mode": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+    },
+    "operations_enabled": {
+      "description": "The deployment-wide kill-switch master flag as observed at generation time.",
+      "type": "boolean"
+    },
+    "kill_switch_config_version": {
+      "description": "The config_version of the kill-switch document this discovery was computed against, when a document was present.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/capability_discovery"
+      }
+    }
+  },
+  "$defs": {
+    "capability_discovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability_id",
+        "capability_version",
+        "available",
+        "provisioned",
+        "enabled",
+        "effective_authority",
+        "phases",
+        "gates"
+      ],
+      "properties": {
+        "capability_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "capability_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+$"
+        },
+        "available": {
+          "description": "The capability's code path exists in this build.",
+          "type": "boolean"
+        },
+        "provisioned": {
+          "description": "The deployment created the resources the capability needs.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "The runtime kill-switch and effective authority currently permit the capability.",
+          "type": "boolean"
+        },
+        "effective_authority": {
+          "description": "The deterministic minimum of the ADR 0001 authority inputs for this capability. The UI may display but never raise it.",
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"
+        },
+        "phases": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "prepare",
+            "dispatch",
+            "execute"
+          ],
+          "properties": {
+            "prepare": {
+              "type": "boolean"
+            },
+            "dispatch": {
+              "type": "boolean"
+            },
+            "execute": {
+              "type": "boolean"
+            }
+          }
+        },
+        "gates": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/gate"
+          }
+        }
+      }
+    },
+    "gate": {
+      "description": "One gate that must be satisfied for the capability to be usable, and whether it is fixed at build/deploy time (static) or evaluated per request (dynamic).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gate_id",
+        "kind",
+        "satisfied"
+      ],
+      "properties": {
+        "gate_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "static",
+            "dynamic"
+          ]
+        },
+        "satisfied": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

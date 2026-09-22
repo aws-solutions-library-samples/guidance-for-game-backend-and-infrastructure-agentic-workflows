@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-detail-projection",
+  "title": "Operations Detail Projection 1.0",
+  "description": "A bounded, public-safe projection of one operation for the detail view. It shows the lifecycle phase timeline, the current state, verification visibility, and rollback visibility, plus a small bounded set of evidence entries. It deliberately excludes email, display name, token, ARN, account id, fleet id, and any raw provider payload. It is a read projection, never an authorization.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "operation_id",
+    "capability_id",
+    "state",
+    "created_at",
+    "updated_at",
+    "phases",
+    "verification",
+    "rollback",
+    "evidence"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "capability_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+    },
+    "state": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+    },
+    "created_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "updated_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "phases": {
+      "description": "The ordered lifecycle phase timeline. Each phase shows only its name, status, and coarse timestamp.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/phase_entry"
+      }
+    },
+    "verification": {
+      "$ref": "#/$defs/visibility"
+    },
+    "rollback": {
+      "$ref": "#/$defs/visibility"
+    },
+    "evidence": {
+      "description": "A small bounded set of public-safe evidence entries. Each entry is a category plus a bounded free-of-payload summary; it never carries a raw provider response.",
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 16,
+      "items": {
+        "$ref": "#/$defs/evidence_entry"
+      }
+    }
+  },
+  "$defs": {
+    "phase_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "status"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "prepare",
+            "approve",
+            "dispatch",
+            "execute",
+            "verify",
+            "rollback"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "not_started",
+            "in_progress",
+            "succeeded",
+            "failed",
+            "skipped"
+          ]
+        },
+        "occurred_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        }
+      }
+    },
+    "visibility": {
+      "description": "Whether a lifecycle facet applies to this operation, and if so its outcome. It exposes only visibility, never provider detail.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applicable",
+        "outcome"
+      ],
+      "properties": {
+        "applicable": {
+          "type": "boolean"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "not_applicable",
+            "pending",
+            "succeeded",
+            "failed"
+          ]
+        }
+      }
+    },
+    "evidence_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "summary"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "authorization",
+            "approval",
+            "dispatch",
+            "verification",
+            "rollback",
+            "state_change"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 280
+        },
+        "recorded_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

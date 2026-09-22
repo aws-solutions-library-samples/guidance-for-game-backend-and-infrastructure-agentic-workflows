@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-list-request",
+  "title": "Operations List Request 1.0",
+  "description": "An untrusted request to list operations. It carries only a bounded page size (max 50), an optional opaque cursor, and optional coarse filters. It has no identity, credential, tenant, or free-text field; the backend resolves scope from the verified caller, never from this body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "page_size": {
+      "description": "Maximum number of operations to return. Bounded to 50; the backend clamps and never exceeds it.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50
+    },
+    "cursor": {
+      "$ref": "#/$defs/opaque_cursor"
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "capability_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "states": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 11,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "opaque_cursor": {
+      "description": "An opaque, base64url-encoded continuation token minted by the backend. A client echoes it verbatim and never constructs or parses it. A tampered cursor is rejected.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  }
+}
