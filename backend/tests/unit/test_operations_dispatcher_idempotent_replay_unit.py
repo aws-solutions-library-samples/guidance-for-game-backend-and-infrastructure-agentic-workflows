@@ -12,6 +12,10 @@ failure.
 These red-green tests pin that behavior: an ``ExecutionAlreadyExists`` from
 ``start_execution`` yields the same accepted (202) ``dispatched`` acknowledgement
 as the first dispatch, while a genuine service fault still surfaces as a 500.
+
+The authorizer claims are production-shaped Cognito **access** token claims
+(``client_id`` present, no ``aud``, no ``custom:*``); the trusted audience the
+handler is configured with equals the app client id the token presents.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ from operations.execute.dispatcher_handler import DispatcherRequestHandler
 _EXP = int(datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp())
 _OP = "op_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 _STATE_MACHINE_ARN = "arn:aws:states:us-west-2:123456789012:stateMachine:gbaw-executor"
+_TRUSTED_CLIENT = "client.web-console"
 
 
 def _client_error(code: str) -> Exception:
@@ -74,7 +79,7 @@ def _handler(sfn: Any) -> DispatcherRequestHandler:
         state_machine_arn=_STATE_MACHINE_ARN,
         tenant_id="tenant.default",
         workspace_id="workspace.default",
-        trusted_audience="aud-client",
+        trusted_audience=_TRUSTED_CLIENT,
         admin_group="admin",
     )
 
@@ -87,14 +92,11 @@ def _event() -> dict[str, Any]:
                 "jwt": {
                     "claims": {
                         "sub": "subject.admin-1",
-                        "client_id": "client.web-console",
+                        "client_id": _TRUSTED_CLIENT,
                         "token_use": "access",
-                        "aud": "aud-client",
                         "exp": _EXP,
                         "cognito:groups": "[admin]",
                         "scope": "operations/execute",
-                        "custom:tenant_id": "tenant.default",
-                        "custom:workspace_id": "workspace.default",
                     }
                 }
             },

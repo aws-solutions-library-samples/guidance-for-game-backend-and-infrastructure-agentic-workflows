@@ -7,6 +7,12 @@ starts a Step Functions Standard execution with ONLY ``{operation_id}`` and a
 stable, deterministic execution name — never any executable content, playbook,
 credential, capacity value, or handler-derived payload.
 
+The claims below are production-shaped Cognito **access** token claims: they
+carry ``client_id`` but no ``aud`` and no ``custom:*`` tenant/workspace claims,
+because a real access token carries none of those. The dispatcher binds the
+audience/tenant/workspace from server-owned config and requires the token's
+``client_id`` to equal the trusted audience (the accepted app client id).
+
 These tests assert:
 
 * unauthenticated / missing-claims requests are denied (401), no SFN start;
@@ -34,6 +40,9 @@ from operations.execute.dispatcher_handler import DispatcherRequestHandler
 _EXP = int(datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp())
 _OP = "op_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 _STATE_MACHINE_ARN = "arn:aws:states:us-west-2:123456789012:stateMachine:gbaw-executor"
+# The trusted audience is the app client id an access token presents in
+# ``client_id`` — they are the same value by construction.
+_TRUSTED_CLIENT = "client.web-console"
 
 
 class _FakeSfn:
@@ -71,13 +80,13 @@ def _handler(sfn: _FakeSfn, store: _FakeStore) -> DispatcherRequestHandler:
         state_machine_arn=_STATE_MACHINE_ARN,
         tenant_id="tenant.default",
         workspace_id="workspace.default",
-        trusted_audience="aud-client",
+        trusted_audience=_TRUSTED_CLIENT,
         admin_group="admin",
     )
 
 
 def _event(
-    *, groups: object = "[admin]", claims_present: bool = True, client_id: str = "client.web-console"
+    *, groups: object = "[admin]", claims_present: bool = True, client_id: str = _TRUSTED_CLIENT
 ) -> dict[str, Any]:
     if not claims_present:
         return {"requestContext": {"http": {"method": "POST"}}, "pathParameters": {"operationId": _OP}}
@@ -91,12 +100,9 @@ def _event(
                         "sub": "subject.admin-1",
                         "client_id": client_id,
                         "token_use": "access",
-                        "aud": "aud-client",
                         "exp": _EXP,
                         "cognito:groups": groups,
                         "scope": "operations/execute",
-                        "custom:tenant_id": "tenant.default",
-                        "custom:workspace_id": "workspace.default",
                     }
                 }
             },
@@ -154,3 +160,10 @@ def test_dispatch_execution_name_is_stable() -> None:
     _handler(sfn1, _FakeStore()).handle(_event())
     _handler(sfn2, _FakeStore()).handle(_event())
     assert sfn1.starts[0]["name"] == sfn2.starts[0]["name"]
+
+
+def test_wrong_app_client_denied_no_start() -> None:
+    sfn, store = _FakeSfn(), _FakeStore()
+    resp = _handler(sfn, store).handle(_event(client_id="client.attacker"))
+    assert resp["statusCode"] in {401, 403}
+    assert sfn.starts == []
