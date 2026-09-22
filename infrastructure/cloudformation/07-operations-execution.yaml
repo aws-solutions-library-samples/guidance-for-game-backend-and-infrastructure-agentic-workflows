@@ -1,0 +1,868 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL operations EXECUTION control plane (E3, issue #415). A SEPARATE stack
+  from the E1/E2 observation/advise stack (06-operations-observation.yaml). It
+  adds bounded GameLift capacity remediation behind a dispatcher Lambda ->
+  Step Functions STANDARD state machine -> dedicated executor Lambda chain. It is
+  default-UNPROVISIONED ($0) with a reversible two-lever emergency disable
+  (ExecutionMode=disabled blocks new dispatch AND makes the executor fail closed
+  without deleting any resource or data). It reuses the E1/E2 table + CMK via
+  cross-stack parameters and stands up its own JWT-authenticated dispatch API.
+
+# --------------------------------------------------------------------------- #
+# Parameters
+# --------------------------------------------------------------------------- #
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming.
+
+  Provisioned:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Initial-provisioning authority, SEPARATE from the runtime ExecutionMode
+      kill switch. "false" (the default) creates ZERO E3 resources, so a default
+      new stack costs $0 and holds nothing. "true" provisions the full E3
+      resource set (dispatcher Lambda/role, STANDARD state machine + workflow
+      role, executor Lambda/role, log groups, HTTP API, alarms). Once "true" it
+      MUST stay "true" for the life of the stack: an emergency disable flips
+      ExecutionMode to "disabled" but keeps Provisioned="true" so every resource
+      stays under CloudFormation with stable names, and a later re-enable is
+      reversible. Setting it back to "false" REMOVES the resources and is a
+      teardown decision, not a disable.
+
+  ExecutionMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - remediate
+    Description: >-
+      Runtime authority (kill switch) for a PROVISIONED execution plane, SEPARATE
+      from the Provisioned flag. "disabled" (the default) is fail-closed on TWO
+      independent levers: (1) the dispatch API stage is throttled to zero so no
+      new dispatch is accepted, and (2) GBAW_OPERATIONS_EXECUTION_MODE=disabled
+      is injected into the executor so an already-running invocation fails closed
+      before any provider write. "remediate" is the only enabled mode: it accepts
+      dispatch and lets the executor perform the bounded, pre-approved capacity
+      change. An emergency disable sets this to "disabled" while leaving
+      Provisioned="true" (resources and data retained, reversible); it does NOT
+      delete resources or data.
+
+  Environment:
+    Type: String
+    Default: beta
+    AllowedValues:
+      - beta
+      - prod
+    Description: >-
+      Target environment. "prod" lengthens the log-retention posture for audit
+      data. E3 keeps no data of its own; it operates on the 06 table.
+
+  CognitoIssuer:
+    Type: String
+    Default: ''
+    Description: >-
+      JWT issuer URL bound to the dispatch API authorizer (same Cognito user pool
+      issuer as the 06 operations API). Required when ExecutionMode=remediate.
+
+  CognitoClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      Cognito application client id used as the JWT audience on the dispatch
+      route. Required when ExecutionMode=remediate.
+
+  OperationsTableName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the E1/E2 operations DynamoDB table (cross-stack reuse; the 06
+      stack exports it as its OperationsTableName output). E3 does not create a
+      table; it reads/writes the same operation records. Required when
+      Provisioned=true.
+
+  OperationsKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:\d{12}:key/.+$'
+    Description: >-
+      ARN of the E1/E2 operations customer-managed KMS key that encrypts the
+      operations table. The dispatcher and executor use it strictly on
+      DynamoDB's behalf (kms:ViaService pinned to DynamoDB). Required when
+      Provisioned=true.
+
+  EnrolledFleetId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^fleet-[a-f0-9-]{1,120}$'
+    Description: >-
+      The EXACT enrolled demo/test GameLift fleet id (e.g.
+      fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555) this executor is allowed to act
+      on. It is woven into a fleet-scoped ARN so gamelift:DescribeFleetCapacity /
+      gamelift:UpdateFleetCapacity can only touch this one fleet. Required when
+      ExecutionMode=remediate.
+
+  CodeS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Explicit, pre-existing S3 bucket holding the packaged dispatcher/executor
+      Lambda artifact. Supplied by the deploy wrapper. Required when
+      Provisioned=true.
+
+  DispatcherCodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Content-hash-addressed S3 key of the packaged dispatcher artifact. Required
+      when Provisioned=true.
+
+  ExecutorCodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Content-hash-addressed S3 key of the packaged executor artifact. Required
+      when Provisioned=true.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 1024
+    Description: Memory for the dispatcher and executor Lambdas.
+
+  ExecutorTimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: Executor Lambda timeout (bounded).
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Reserved concurrency cap per function (denial-of-wallet guard).
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Dispatch API burst limit when enabled (zero when disabled).
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 100
+    Description: Dispatch API steady rate when enabled (zero when disabled).
+
+# --------------------------------------------------------------------------- #
+# Conditions
+# --------------------------------------------------------------------------- #
+Conditions:
+  # Resource existence gate. Every resource references THIS, driven by the
+  # Provisioned flag (default "false"), so a default deploy provisions nothing
+  # and costs $0. Deliberately DECOUPLED from ExecutionMode: an emergency disable
+  # sets ExecutionMode=disabled but keeps Provisioned="true", so resources stay
+  # under CloudFormation and a later re-enable is reversible.
+  ResourcesProvisioned: !Equals [!Ref Provisioned, 'true']
+
+  # Runtime authority (kill switch). Does NOT gate resource existence; it feeds
+  # the injected GBAW_OPERATIONS_EXECUTION_MODE (lever 2) and the API-stage
+  # throttle (lever 1). Only "remediate" is enabled.
+  ExecutionEnabled: !Equals [!Ref ExecutionMode, remediate]
+
+  IsProd: !Equals [!Ref Environment, prod]
+
+Rules:
+  # Reject "remediate without provisioning": runtime authority can only be
+  # enabled when the resources it needs actually exist.
+  EnabledModeRequiresProvisioning:
+    RuleCondition: !Not [!Equals [!Ref ExecutionMode, disabled]]
+    Assertions:
+      - Assert: !Equals [!Ref Provisioned, 'true']
+        AssertDescription: >-
+          ExecutionMode=remediate requires Provisioned=true; enabling execution
+          authority against a zero-resource stack is rejected.
+
+  # Whenever resources exist, the cross-stack data-plane bindings and the code
+  # artifacts they reference must be non-empty.
+  ProvisionedRequiresInputs:
+    RuleCondition: !Equals [!Ref Provisioned, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OperationsTableName, '']]
+        AssertDescription: OperationsTableName is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref OperationsKmsKeyArn, '']]
+        AssertDescription: OperationsKmsKeyArn is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref CodeS3Bucket, '']]
+        AssertDescription: CodeS3Bucket is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref DispatcherCodeS3Key, '']]
+        AssertDescription: DispatcherCodeS3Key is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref ExecutorCodeS3Key, '']]
+        AssertDescription: ExecutorCodeS3Key is required when Provisioned=true.
+
+  # Enabling remediate requires the JWT bindings and the exact enrolled fleet.
+  RemediateRequiresBindings:
+    RuleCondition: !Equals [!Ref ExecutionMode, remediate]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoIssuer, '']]
+        AssertDescription: CognitoIssuer is required when ExecutionMode=remediate.
+      - Assert: !Not [!Equals [!Ref CognitoClientId, '']]
+        AssertDescription: CognitoClientId is required when ExecutionMode=remediate.
+      - Assert: !Not [!Equals [!Ref EnrolledFleetId, '']]
+        AssertDescription: EnrolledFleetId is required when ExecutionMode=remediate.
+
+# --------------------------------------------------------------------------- #
+# Resources
+# --------------------------------------------------------------------------- #
+Resources:
+  # ------------------------------------------------------------------------- #
+  # Log groups: one per function, KMS-encrypted with the reused operations CMK.
+  # ------------------------------------------------------------------------- #
+  DispatcherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-dispatch'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !Ref OperationsKmsKeyArn
+
+  ExecutorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-executor'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !Ref OperationsKmsKeyArn
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-operations-execution'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  DispatcherAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-operations-dispatch-access'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # ------------------------------------------------------------------------- #
+  # Executor role: the ONLY role in the whole solution allowed to touch the
+  # GameLift capacity API, and only the two capacity actions, only on the exact
+  # enrolled fleet ARN. Plus the exact underlying DynamoDB item actions (to load
+  # the approved operation and persist the execution outcome to the ledger), KMS
+  # strictly via DynamoDB, and its own logs/metrics. Nothing else.
+  # ------------------------------------------------------------------------- #
+  ExecutorRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-executor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: GameLiftCapacityOnEnrolledFleet
+          # The two bounded capacity actions, scoped to the EXACT enrolled fleet
+          # ARN. Both support resource-level permissions (AWS GameLift service
+          # authorization reference, "fleet" resource type). No other GameLift
+          # verb is present, so create/delete/update-attributes/scaling/start/
+          # stop and every read beyond capacity are denied by omission.
+          # Ref: https://docs.aws.amazon.com/gameliftservers/latest/developerguide/security_iam_service-with-iam.html
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: FleetScopedCapacity
+                Effect: Allow
+                Action:
+                  - 'gamelift:DescribeFleetCapacity'
+                  - 'gamelift:UpdateFleetCapacity'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:fleet/${EnrolledFleetId}'
+        - PolicyName: OperationsTableAccess
+          # The executor loads the approved operation record and writes the
+          # execution result / ledger transition. As with E1/E2, the transaction
+          # legs are governed by the underlying PutItem/UpdateItem/GetItem
+          # permissions (there is no dynamodb:TransactWriteItems IAM action;
+          # granting it is ineffective and cfn-lint flags W3037). Query, Scan,
+          # DeleteItem, Batch*, and ConditionCheckItem stay denied by omission.
+          # Ref: https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TableScopedItemActions
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OperationsTableName}'
+        - PolicyName: OperationsKmsViaDynamoDb
+          # Server-side encryption at rest with the operations CMK requires the
+          # caller to hold the full documented DynamoDB CMK data-plane action set,
+          # pinned to DynamoDB via kms:ViaService so it can never be exercised
+          # for generic KMS use. CreateGrant is isolated and further guarded by
+          # kms:GrantIsForAWSResource=true.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbCmkDataPlane
+                Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+              - Sid: DynamoDbCmkCreateGrant
+                Effect: Allow
+                Action:
+                  - 'kms:CreateGrant'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                  Bool:
+                    'kms:GrantIsForAWSResource': 'true'
+        - PolicyName: OperationsLogsAndMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !GetAtt ExecutorLogGroup.Arn
+                  - !Sub '${ExecutorLogGroup.Arn}:*'
+              - Sid: PublishScopedMetrics
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GameAgent/Operations'
+              - Sid: XRayTraceWrite
+                Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-execution
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Executor Lambda: the ONLY component that performs the bounded provider write.
+  # It is invoked by the state machine with operation_id ONLY; it re-loads the
+  # approved operation from the table, re-checks authority, and fails closed when
+  # GBAW_OPERATIONS_EXECUTION_MODE != remediate (lever 2 of the disable).
+  # ------------------------------------------------------------------------- #
+  ExecutorFunction:
+    Type: AWS::Lambda::Function
+    Condition: ResourcesProvisioned
+    DependsOn: ExecutorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-executor'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.execute.executor_entry.handler
+      Role: !GetAtt ExecutorRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref ExecutorTimeoutSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          # Lever 2: injected kill switch. The executor fails closed unless this
+          # is "remediate", so an emergency disable makes it refuse to write
+          # without deleting the function.
+          GBAW_OPERATIONS_EXECUTION_MODE: !Ref ExecutionMode
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_ENROLLED_FLEET_ID: !Ref EnrolledFleetId
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref ExecutorCodeS3Key
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-execution
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Workflow (state machine) role: may ONLY invoke the exact executor function.
+  # No DynamoDB, no GameLift, no KMS — the workflow threads operation_id and
+  # calls one Lambda.
+  # ------------------------------------------------------------------------- #
+  WorkflowRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-workflow-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: InvokeExecutorOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeExactExecutor
+                Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource:
+                  - !GetAtt ExecutorFunction.Arn
+        - PolicyName: WorkflowLogging
+          # Step Functions STANDARD logging to CloudWatch Logs requires these
+          # account-level log-delivery actions (they do not support resource-
+          # level scoping; this is the documented least-privilege set).
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StepFunctionsLogDelivery
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogDelivery'
+                  - 'logs:GetLogDelivery'
+                  - 'logs:UpdateLogDelivery'
+                  - 'logs:DeleteLogDelivery'
+                  - 'logs:ListLogDeliveries'
+                  - 'logs:PutResourcePolicy'
+                  - 'logs:DescribeResourcePolicies'
+                  - 'logs:DescribeLogGroups'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-execution
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Step Functions STANDARD state machine. It receives {"operation_id": "..."}
+  # ONLY and invokes the executor with that single field. There is NO Retry on
+  # the executor task: a transient executor failure is surfaced, not blindly
+  # retried, so a capacity write is never silently re-attempted.
+  # ------------------------------------------------------------------------- #
+  ExecutionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Condition: ResourcesProvisioned
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-operations-execution'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt WorkflowRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      TracingConfiguration:
+        Enabled: true
+      # operation_id ONLY crosses the wire. No fleet id, capacity number, or
+      # principal claim is threaded through the state machine; the executor
+      # re-loads everything it needs from the table under the operation_id.
+      # NOTE: intentionally NO "Retry" block on the executor task.
+      DefinitionString: !Sub |
+        {
+          "Comment": "E3 bounded remediation execution. operation_id only; no blind retry.",
+          "StartAt": "Execute",
+          "States": {
+            "Execute": {
+              "Type": "Task",
+              "Resource": "arn:${AWS::Partition}:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ExecutorFunction.Arn}",
+                "Payload": {
+                  "operation_id.$": "$.operation_id"
+                }
+              },
+              "ResultSelector": {
+                "operation_id.$": "$.Payload.operation_id",
+                "outcome.$": "$.Payload.outcome"
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ExecutionFailed",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "End": true
+            },
+            "ExecutionFailed": {
+              "Type": "Fail",
+              "Error": "ExecutorFailed",
+              "Cause": "The executor task failed; no automatic retry is attempted."
+            }
+          }
+        }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-execution
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Dispatcher role: reads the approved operation (GetItem only) to validate the
+  # dispatch, uses KMS strictly via DynamoDB for that read, writes its own
+  # logs/metrics, and starts the EXACT state machine. It holds NO GameLift
+  # action and CANNOT directly invoke the executor.
+  # ------------------------------------------------------------------------- #
+  DispatcherRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-dispatch-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StartExactStateMachine
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartExecutionOnExactMachine
+                Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource:
+                  - !Ref ExecutionStateMachine
+        - PolicyName: OperationsTableRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TableGetItemOnly
+                Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OperationsTableName}'
+        - PolicyName: OperationsKmsViaDynamoDb
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbCmkDataPlane
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+        - PolicyName: OperationsLogsAndMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !GetAtt DispatcherLogGroup.Arn
+                  - !Sub '${DispatcherLogGroup.Arn}:*'
+              - Sid: PublishScopedMetrics
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GameAgent/Operations'
+              - Sid: XRayTraceWrite
+                Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-execution
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Dispatcher Lambda: the JWT/admin-enforced entry point. It validates the
+  # approved operation (GetItem), enforces admin in code, then StartExecution on
+  # the exact state machine carrying operation_id ONLY.
+  # ------------------------------------------------------------------------- #
+  DispatcherFunction:
+    Type: AWS::Lambda::Function
+    Condition: ResourcesProvisioned
+    DependsOn: DispatcherLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-dispatch'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.execute.dispatcher_entry.handler
+      Role: !GetAtt DispatcherRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: 15
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          GBAW_OPERATIONS_EXECUTION_MODE: !Ref ExecutionMode
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_STATE_MACHINE_ARN: !Ref ExecutionStateMachine
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref DispatcherCodeS3Key
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-execution
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # HTTP API + JWT authorizer for the single dispatch route. Its OWN API (does
+  # not mutate the 06 API); same Cognito issuer/audience.
+  # ------------------------------------------------------------------------- #
+  DispatchApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-execution'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - authorization
+          - content-type
+        MaxAge: 300
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-execution
+        CostCenter: game-operations
+        ManagedBy: cloudformation
+
+  DispatchJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-execution-jwt'
+      ApiId: !Ref DispatchApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Issuer: !Ref CognitoIssuer
+        Audience:
+          - !Ref CognitoClientId
+
+  DispatchIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref DispatchApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt DispatcherFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 15000
+
+  DispatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref DispatchApi
+      # JWT-authorized; admin enforcement is in dispatcher handler code (E3 core).
+      RouteKey: 'POST /operations/{operationId}/dispatch'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref DispatchJwtAuthorizer
+      Target: !Sub 'integrations/${DispatchIntegration}'
+
+  DispatchApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: ResourcesProvisioned
+    DependsOn: DispatcherAccessLogGroup
+    Properties:
+      ApiId: !Ref DispatchApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        # Bare log-group ARN (no ":*") to match API Gateway's stored form and
+        # avoid perpetual drift (same lesson as the 06 stage).
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-dispatch-access'
+        Format: >-
+          {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
+      DefaultRouteSettings:
+        # Lever 1: when ExecutionMode != remediate the gateway throttles to zero,
+        # so no new dispatch is accepted, WITHOUT deleting the stage.
+        ThrottlingBurstLimit: !If [ExecutionEnabled, !Ref ThrottlingBurstLimit, 0]
+        ThrottlingRateLimit: !If [ExecutionEnabled, !Ref ThrottlingRateLimit, 0]
+        DetailedMetricsEnabled: true
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-execution
+        ManagedBy: cloudformation
+
+  DispatchInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ResourcesProvisioned
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref DispatcherFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${DispatchApi}/*/*/operations/{operationId}/dispatch'
+
+  # ------------------------------------------------------------------------- #
+  # Metrics / alarms in the retained GameAgent/Operations namespace.
+  # ------------------------------------------------------------------------- #
+  DispatchFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-DispatchFailures'
+      Namespace: 'GameAgent/Operations'
+      MetricName: DispatchFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ExecutionFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-ExecutionFailures'
+      Namespace: 'GameAgent/Operations'
+      MetricName: ExecutionFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ExecutionDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-ExecutionDenied'
+      Namespace: 'GameAgent/Operations'
+      MetricName: ExecutionDenied
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# --------------------------------------------------------------------------- #
+# Outputs
+# --------------------------------------------------------------------------- #
+Outputs:
+  Provisioned:
+    Description: Whether this stack provisioned the E3 resource set (false = $0).
+    Value: !Ref Provisioned
+
+  ExecutionMode:
+    Description: Effective runtime authority (disabled fails closed; remediate enabled).
+    Value: !Ref ExecutionMode
+
+  DispatchApiEndpoint:
+    Condition: ResourcesProvisioned
+    Description: Base URL of the authenticated dispatch HTTP API.
+    Value: !GetAtt DispatchApi.ApiEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-OperationsDispatchApiEndpoint'
+
+  ExecutionStateMachineArn:
+    Condition: ResourcesProvisioned
+    Description: ARN of the STANDARD execution state machine.
+    Value: !Ref ExecutionStateMachine
+    Export:
+      Name: !Sub '${ProjectName}-OperationsExecutionStateMachineArn'
+
+  ExecutorFunctionArn:
+    Condition: ResourcesProvisioned
+    Description: ARN of the dedicated executor Lambda.
+    Value: !GetAtt ExecutorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsExecutorFunctionArn'
+
+  ExecutorRoleArn:
+    Condition: ResourcesProvisioned
+    Description: Dedicated least-privilege executor role ARN.
+    Value: !GetAtt ExecutorRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsExecutorRoleArn'
