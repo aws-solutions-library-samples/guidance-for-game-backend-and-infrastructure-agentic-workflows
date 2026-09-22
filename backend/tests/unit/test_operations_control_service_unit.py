@@ -420,6 +420,66 @@ def test_legacy_pending_marker_recovers_from_the_validated_hosted_version() -> N
     assert audit.confirmed == [record_id]
 
 
+def test_stored_pending_document_with_different_authority_fails_closed() -> None:
+    audit = _FakeAuditStore(current=2, outcome=ControlCommitOutcome.VERSION_CONFLICT)
+    publisher = _FakePublisher()
+    service = _service(audit, publisher)
+    probe = _FakeAuditStore(current=1)
+    probe.pending = {}
+    probe.confirmed = []
+    _service(probe, _FakePublisher()).apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    record_id = probe.commits[0]["record_id"]
+    audit.pending = {
+        record_id: {
+            "config_version": 2,
+            "published": False,
+            "document": _current_document(2, enabled=False, prepare=False, dispatch=False, execute=False),
+        }
+    }
+    with pytest.raises(ControlServiceError):
+        service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert publisher.published == []
+
+
+def test_legacy_reconciler_returning_different_authority_fails_closed() -> None:
+    audit = _FakeAuditStore(current=2, outcome=ControlCommitOutcome.VERSION_CONFLICT)
+    publisher = _FakePublisher()
+    publisher.legacy_document = _current_document(2, enabled=False, prepare=False, dispatch=False, execute=False)
+    service = _service(audit, publisher)
+    probe = _FakeAuditStore(current=1)
+    probe.pending = {}
+    probe.confirmed = []
+    _service(probe, _FakePublisher()).apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    record_id = probe.commits[0]["record_id"]
+    audit.pending = {record_id: {"config_version": 2, "published": False}}
+    audit.confirmed = []
+    with pytest.raises(ControlServiceError):
+        service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert audit.confirmed == []
+
+
+def test_legacy_marker_without_reconciler_remains_a_version_conflict() -> None:
+    class _OldPublisher:
+        def __init__(self) -> None:
+            self.published = 0
+
+        def publish(self, **kwargs: Any) -> None:
+            self.published += 1
+
+    audit = _FakeAuditStore(current=2, outcome=ControlCommitOutcome.VERSION_CONFLICT)
+    old_publisher = _OldPublisher()
+    service = _service(audit, old_publisher)
+    probe = _FakeAuditStore(current=1)
+    probe.pending = {}
+    probe.confirmed = []
+    _service(probe, _FakePublisher()).apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    record_id = probe.commits[0]["record_id"]
+    audit.pending = {record_id: {"config_version": 2, "published": False}}
+    response = service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert response["outcome"] == "version_conflict"
+    assert old_publisher.published == 0
+
+
 def test_conflict_without_own_pending_publication_stays_version_conflict() -> None:
     """A genuine concurrent-admin conflict (no pending marker) is unchanged."""
     audit = _FakeAuditStore(current=5, outcome=ControlCommitOutcome.VERSION_CONFLICT)

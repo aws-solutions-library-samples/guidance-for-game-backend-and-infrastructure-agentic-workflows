@@ -442,3 +442,42 @@ def test_no_publication_marker_for_an_unknown_record() -> None:
     store = _store(dynamo)
     store.initialize_state_if_absent(config_version=1)
     assert store.pending_publication(record_id="ctl_" + "z" * 26) is None
+
+
+def test_commit_rejects_invalid_publication_document_before_atomic_write() -> None:
+    dynamo = _FakeDynamo()
+    store = _store(dynamo)
+    store.initialize_state_if_absent(config_version=1)
+    with pytest.raises(ControlStoreError):
+        _commit(store, publication_document={"config_version": 2})
+    assert store.current_config_version() == 1
+    assert _audit_items(dynamo) == []
+
+
+def test_commit_rejects_publication_document_version_mismatch() -> None:
+    dynamo = _FakeDynamo()
+    store = _store(dynamo)
+    store.initialize_state_if_absent(config_version=1)
+    with pytest.raises(ControlStoreError):
+        _commit(store, publication_document=_publication_document(version=3))
+    assert store.current_config_version() == 1
+    assert _audit_items(dynamo) == []
+
+
+def test_pending_publication_rejects_corrupt_document_json() -> None:
+    dynamo = _FakeDynamo()
+    store = _store(dynamo)
+    record_id = "ctl_" + "q" * 26
+    key = ("OPCONTROL#kill-switch", f"CTLPUB#{record_id}")
+    dynamo.items[key] = {
+        "PK": {"S": key[0]},
+        "SK": {"S": key[1]},
+        "record_type": {"S": "control_publication_marker"},
+        "contract_version": {"S": "1.0"},
+        "record_id": {"S": record_id},
+        "config_version": {"N": "2"},
+        "published": {"BOOL": False},
+        "document_json": {"S": "{not-json"},
+    }
+    with pytest.raises(ControlStoreError):
+        store.pending_publication(record_id=record_id)
