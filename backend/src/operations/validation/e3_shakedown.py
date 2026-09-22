@@ -1,4 +1,4 @@
-"""Repeatable, public-safe E3 *deployed* execute-dispatch shakedown harness (#415).
+"""Repeatable, public-safe E3 *deployed* dispatch shakedown harness (#415).
 
 A disposable command-line harness that exercises an **already-deployed** E3
 dispatch boundary end-to-end over HTTPS against its real API Gateway endpoint,
@@ -6,6 +6,17 @@ proving the deployed boundary behaves the way the frozen E3 contract and the
 on-host dispatcher (:mod:`operations.execute.dispatcher_handler`) promise —
 without mutating any AWS resource. It asserts only the *dispatch* boundary; it
 never starts a real capacity write itself.
+
+Frozen dispatch route
+---------------------
+
+The harness POSTs to exactly one frozen route, :data:`DISPATCH_ROUTE_TEMPLATE`
+(``/operations/{operationId}/dispatch``). This is the single source of truth the
+07 execution CloudFormation template's API Gateway ``RouteKey`` and the
+dispatcher handler must all agree on: a mismatch makes a live shakedown 404 for
+every check. ``test_operations_e3_route_contract_unit.py`` reads the 07 template
+as data (when present) and fails on any harness/template route drift *before*
+deployment.
 
 What it asserts (each is one discriminating check):
 
@@ -51,8 +62,19 @@ from operations.validation.e1_shakedown import (
     response_is_bounded_and_clean,
 )
 
+# The single frozen dispatch route the harness POSTs to, in API Gateway
+# ``{operationId}`` path-variable form. The handler, this harness, and the 07
+# execution template's ``RouteKey`` must all agree on this exact path; the
+# cross-contract test guards against drift before deployment.
+DISPATCH_ROUTE_TEMPLATE = "/operations/{operationId}/dispatch"
+
 # Markers that must never appear in the sanitized summary.
 _FORBIDDEN_MARKERS = ("arn:aws:", "fleet-", "execute-api", "Bearer ", "eyJ")
+
+
+def dispatch_path(operation_id: str) -> str:
+    """Return the frozen dispatch path for a concrete operation id."""
+    return DISPATCH_ROUTE_TEMPLATE.replace("{operationId}", operation_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +130,7 @@ class E3ShakedownHarness:
 
     def _dispatch_url(self) -> str:
         base = self._config.endpoint.rstrip("/")
-        return f"{base}/operations/{self._config.operation_id}/execute"
+        return f"{base}{dispatch_path(self._config.operation_id)}"
 
     def _post(self, *, bearer: Optional[str]) -> HttpResponse:
         headers = {"content-type": "application/json"}
@@ -165,7 +187,7 @@ class E3ShakedownHarness:
         if self._config.non_admin_bearer.strip():
             checks.append(self.check_non_admin_dispatch_denied())
         return {
-            "harness": "e3-execute-dispatch",
+            "harness": "e3-dispatch",
             "endpoint_ref": _short_ref("ep", self._config.endpoint),
             "operation_ref": _short_ref("op", self._config.operation_id),
             "fleet_ref": _short_ref("flt", self._config.fleet_id),
@@ -191,7 +213,7 @@ def _build_config(args: argparse.Namespace) -> E3ShakedownConfig:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Public-safe E3 execute-dispatch shakedown")
+    parser = argparse.ArgumentParser(description="Public-safe E3 dispatch shakedown")
     parser.add_argument("--endpoint", default="")
     parser.add_argument("--operation-id", dest="operation_id", default="")
     parser.add_argument("--admin-bearer", dest="admin_bearer", default="")
