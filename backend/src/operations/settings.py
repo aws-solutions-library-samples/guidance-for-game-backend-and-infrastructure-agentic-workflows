@@ -379,3 +379,71 @@ def resolve_executor_deployment_settings(
         enrolled_location=_required_str(source, "GBAW_OPERATIONS_ENROLLED_LOCATION"),
         admin_group=_optional_str(source, "GBAW_OPERATIONS_APPROVER_GROUP", DEFAULT_APPROVER_GROUP),
     )
+
+
+# -- E4 control-plane deployment settings (issue #416) ------------------------
+#
+# The E4 control plane reads the kill-switch on the request path through the AWS
+# AppConfig Lambda extension (localhost endpoint) and publishes changes back to
+# AppConfig. These settings resolve the extension read target, the publisher
+# write target and its two deployment strategies, the admin group, the HMAC
+# cursor signing key, and whether the capability is provisioned. Every field is
+# resolved and validated at load time and fails closed.
+
+
+@dataclass(frozen=True, slots=True)
+class ControlPlaneDeploymentSettings:
+    """The full frozen E4 control-plane deployment contract, fail-closed."""
+
+    observation: ObservationDeploymentSettings
+    admin_group: str
+    appconfig_application: str
+    appconfig_environment: str
+    appconfig_profile: str
+    appconfig_extension_port: int
+    appconfig_gradual_strategy_id: str
+    appconfig_immediate_strategy_id: str
+    cursor_signing_key: str
+    provisioned: bool
+
+    def __post_init__(self) -> None:
+        for name in (
+            "admin_group",
+            "appconfig_application",
+            "appconfig_environment",
+            "appconfig_profile",
+            "appconfig_gradual_strategy_id",
+            "appconfig_immediate_strategy_id",
+            "cursor_signing_key",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not (1 <= self.appconfig_extension_port <= 65535):
+            raise ValueError("appconfig_extension_port must be a valid TCP port")
+        # A short signing key cannot provide meaningful HMAC strength; fail closed.
+        if len(self.cursor_signing_key) < 16:
+            raise ValueError("cursor_signing_key must be at least 16 characters")
+
+    @property
+    def mode(self) -> str:
+        return self.observation.mode
+
+
+def resolve_control_plane_deployment_settings(
+    env: Mapping[str, str] | None = None,
+) -> ControlPlaneDeploymentSettings:
+    """Resolve the full frozen E4 control-plane deployment contract, fail-closed."""
+    source: Mapping[str, str] = os.environ if env is None else env
+    return ControlPlaneDeploymentSettings(
+        observation=resolve_observation_deployment_settings(source),
+        admin_group=_optional_str(source, "GBAW_OPERATIONS_APPROVER_GROUP", DEFAULT_APPROVER_GROUP),
+        appconfig_application=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_APPLICATION"),
+        appconfig_environment=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT"),
+        appconfig_profile=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_PROFILE"),
+        appconfig_extension_port=_positive_int(source, "GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT", 2772),
+        appconfig_gradual_strategy_id=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_GRADUAL_STRATEGY_ID"),
+        appconfig_immediate_strategy_id=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID"),
+        cursor_signing_key=_required_str(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY"),
+        provisioned=_bool(source, "GBAW_OPERATIONS_CONTROL_PROVISIONED", True),
+    )
