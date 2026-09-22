@@ -159,19 +159,6 @@ Parameters:
       2772 is the official extension default; injected explicitly so the handler
       and the extension agree.
 
-  KillSwitchFreshnessSeconds:
-    Type: Number
-    Default: 300
-    MinValue: 60
-    MaxValue: 3600
-    Description: >-
-      not_after horizon (seconds after issued_at) the control Lambda stamps on
-      each kill-switch document it writes, and the window the EventBridge expiry
-      sweeper refreshes within. A short horizon (default 5 min) makes a stale or
-      unrefreshed document fail closed. It is the document horizon the sweeper
-      re-issues within; the handler's own read-freshness is a code default, so
-      this is NOT injected as a handler env var.
-
   CodeS3Bucket:
     Type: String
     Default: ''
@@ -479,7 +466,7 @@ Resources:
         every hosted version by the exact self-contained operations-kill-switch
         JSON schema.
       Validators:
-        # The self-contained kill-switch JSON Schema, byte-equivalent to
+        # The self-contained kill-switch JSON Schema, inlined byte-for-byte from
         # backend/src/operations/contracts/schemas/v1/operations-kill-switch.schema.json.
         # It has no external/urn $ref (every $ref is a local #/$defs fragment),
         # so AppConfig validates it with no reference resolution.
@@ -579,12 +566,12 @@ Resources:
           Value: cloudformation
 
   # The safe default document: everything disabled. This is the FIRST hosted
-  # version; the control plane creates later versions and deploys them. It is
-  # byte-equivalent to
+  # version; the control plane creates later versions and deploys them. Its
+  # parsed JSON is field-for-field identical to
   # backend/tests/fixtures/operations/v1/operations-kill-switch.default-safe.json
-  # (except issued_at/not_after, which are stamped at author time; here they are
-  # a fixed safe already-expired pair so the seeded default fails closed until
-  # the control plane issues a fresh document).
+  # EXCEPT the author-stamped issued_at/not_after timestamps (so the raw bytes
+  # differ): here they are a fixed safe already-expired pair so the seeded
+  # default fails closed until the control plane issues a fresh document.
   DefaultSafeKillSwitchVersion:
     Type: AWS::AppConfig::HostedConfigurationVersion
     Condition: ResourcesProvisioned
@@ -1166,15 +1153,33 @@ Resources:
       SourceArn: !GetAtt ExpirySweeperRule.Arn
 
   # ------------------------------------------------------------------------- #
-  # Alarms in the retained GameAgent/Operations namespace. EVERY alarm below is
-  # driven by a metric the backend ACTUALLY emits (control/metrics.py and
-  # execute/metrics.py at the E4 backend contract): ControlApplied,
-  # ControlVersionConflict, ControlDenied, KillSwitchUnavailable,
-  # OperationsExpirySweepExpired, and ExecutionHumanReconciliationRequired.
-  # There is no emitted signal for a deployment "stuck", "retrying",
+  # E4-OWNED ALARMS in the retained GameAgent/Operations namespace. There are
+  # exactly FIVE, each driven by a metric the backend ACTUALLY emits
+  # (control/metrics.py and execute/metrics.py at the E4 backend contract):
+  #   1. KillSwitchUnavailable                (fail-closed read failure)
+  #   2. ControlVersionConflict               (stale/racing control write)
+  #   3. ControlDenied                        (unauthorized control change)
+  #   4. OperationsExpirySweepExpired         (sweeper expired due operations)
+  #   5. ExecutionHumanReconciliationRequired (executed op needs a human)
+  #
+  # NOT every emitted metric is alarmed. Success/steady-state signals are emitted
+  # as DIAGNOSTIC metrics with NO alarm, because paging on a healthy event gives
+  # false comfort and alarm noise:
+  #   * ControlApplied              — a control change succeeded (diagnostic).
+  #   * ControlPublicationReconciled — a published control document was
+  #     reconciled against the intended posture (diagnostic; a success/no-op
+  #     confirmation, not an actionable failure). Its actionable failure siblings
+  #     ARE alarmed above: a read that fails closed raises KillSwitchUnavailable
+  #     and a rejected racing write raises ControlVersionConflict, so no separate
+  #     reconciliation alarm is warranted.
+  #
+  # There is likewise no emitted signal for a deployment "stuck", "retrying",
   # "rollback-failed", or a "deployments-started" budget count, so those alarms
   # are intentionally NOT provisioned rather than fabricated: an alarm on a
   # never-emitted metric can never fire truthfully and would give false comfort.
+  # Coverage for failure/stuck/unverified conditions upstream of the control
+  # plane is provided by the REUSED E1 (06) and E3 (07) alarms; see the runbook
+  # alarm map in docs/OPERATIONS_E4_CONTROL_PLANE.md.
   # ------------------------------------------------------------------------- #
 
   # The real fail-closed signal: a deployed kill-switch document could not be

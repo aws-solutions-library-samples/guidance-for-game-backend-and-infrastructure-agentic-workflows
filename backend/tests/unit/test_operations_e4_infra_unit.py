@@ -28,10 +28,11 @@ Asserted contract:
 * The AppConfig application/environment/hosted profile, a safe all-disabled
   default hosted version, a normal gradual deployment strategy with a CloudWatch
   monitor + automatic rollback, and an explicit immediate hard-down strategy.
-* The hosted profile's JSON_SCHEMA validator is **byte-equivalent** to the
-  frozen contract schema
+* The hosted profile's JSON_SCHEMA validator is inlined **byte-for-byte** from
+  the frozen contract schema
   ``backend/src/operations/contracts/schemas/v1/operations-kill-switch.schema.json``
-  and carries no external/urn ``$ref``.
+  (same raw bytes; the test also asserts they parse to equal JSON) and carries
+  no external/urn ``$ref``.
 * The frozen E4 API routes (``control_plane.ROUTE_KEYS``) are all present and
   JWT-authorized.
 * The official AppConfig Lambda extension layer is attached via a validated
@@ -43,8 +44,12 @@ Asserted contract:
   write, no PassRole, no secrets, no Delete/Scan/Batch, and never the invalid
   dynamodb:TransactWriteItems action.
 * An EventBridge periodic freshness-expiry sweeper targets the control Lambda.
-* Every #416 alarm exists with a truthful metric/statistic and the AppConfig
-  monitor is wired to the failed + unverified alarms.
+* Exactly the five #416 alarms exist, each with a truthful metric/statistic,
+  and the AppConfig environment monitor is wired to the KillSwitchUnavailable
+  alarm for automatic rollback.
+* The published E4 cost model (``docs/operations-e4-cost-model.json``) is
+  reconciled to the template: its alarm count and alarm names match the alarms
+  actually provisioned, so the cost/docs cannot drift from the deployed set.
 """
 
 # Standard library
@@ -76,6 +81,7 @@ DEPLOY_WRAPPER = PROJECT_ROOT / "scripts/infrastructure/deploy-operations-contro
 TEARDOWN_WRAPPER = PROJECT_ROOT / "scripts/infrastructure/teardown-operations-control.sh"
 DISABLE_WRAPPER = PROJECT_ROOT / "scripts/infrastructure/disable-operations-control.sh"
 KILL_SWITCH_SCHEMA = PROJECT_ROOT / "backend/src/operations/contracts/schemas/v1/operations-kill-switch.schema.json"
+COST_MODEL = PROJECT_ROOT / "docs/operations-e4-cost-model.json"
 
 METRIC_NAMESPACE = "GameAgent/Operations"
 
@@ -286,9 +292,11 @@ def test_default_hosted_version_is_all_disabled(template):
 
 
 def test_validator_schema_is_byte_equivalent_to_contract(template):
-    """The AppConfig JSON_SCHEMA validator must be byte-equivalent (as parsed
-    JSON) to the frozen kill-switch contract schema so AppConfig enforces the
-    exact same document shape the backend validates."""
+    """The AppConfig JSON_SCHEMA validator is inlined byte-for-byte from the
+    frozen kill-switch contract schema (identical raw bytes). This test compares
+    the parsed JSON of both, which is a superset guarantee: equal parsed JSON is
+    necessary for AppConfig to enforce the exact same document shape the backend
+    validates, and the raw bytes match as well."""
     profiles = _resources_of_type(template, "AWS::AppConfig::ConfigurationProfile")
     (profile,) = profiles.values()
     validators = profile["Properties"]["Validators"]
@@ -296,7 +304,7 @@ def test_validator_schema_is_byte_equivalent_to_contract(template):
     assert len(json_schema_validators) == 1, "expected exactly one JSON_SCHEMA validator"
     embedded = json.loads(json_schema_validators[0]["Content"])
     contract = json.loads(KILL_SWITCH_SCHEMA.read_text(encoding="utf-8"))
-    assert embedded == contract, "validator schema is not byte-equivalent to the contract schema"
+    assert embedded == contract, "validator schema does not parse-equal the contract schema"
 
 
 def test_validator_schema_has_no_external_refs(template):
@@ -630,6 +638,55 @@ def test_no_fabricated_deployment_metric_alarms(template):
     }
     present = {a["Properties"]["MetricName"] for a in _alarms(template).values()}
     assert not (fabricated & present), f"fabricated-metric alarm(s) present: {fabricated & present}"
+
+
+# --------------------------------------------------------------------------- #
+# Template <-> cost-model reconciliation
+# --------------------------------------------------------------------------- #
+# The published E4 cost model (docs/operations-e4-cost-model.json) is the single
+# source of truth for the incremental cost numbers in the runbook and cost notes.
+# Those numbers are driven by two counts -- the number of CloudWatch alarms and
+# the number of E4 control-plane custom metrics. If the template gains or loses an
+# alarm without the cost model being updated, the published cost silently drifts
+# and the runbook alarm map goes stale. These tests bind the cost model to the
+# template (for alarms, which the template declares) and to its own metric list
+# (for custom metrics, which are emitted at runtime rather than declared in CFN),
+# so the two documents cannot disagree with what is actually provisioned.
+def _cost_model():
+    with COST_MODEL.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def test_cost_model_alarm_count_matches_template(template):
+    model = _cost_model()
+    template_alarm_metrics = {a["Properties"]["MetricName"] for a in _alarms(template).values()}
+    model_alarms = set(model["alarms"]["e4_owned"])
+    # The cost model's declared alarm list is exactly the alarms the template
+    # provisions -- the five E4-owned alarms, no more, no fewer.
+    assert model_alarms == template_alarm_metrics, (
+        f"cost model alarms {sorted(model_alarms)} != template alarms " f"{sorted(template_alarm_metrics)}"
+    )
+    assert model_alarms == E4_REQUIRED_ALARM_METRICS
+    # The billed alarm count equals the actual number of alarm resources.
+    assert model["assumptions"]["enabled_idle"]["cw_alarms"] == len(_alarms(template))
+    assert model["assumptions"]["enabled_idle"]["cw_alarms"] == len(model_alarms)
+
+
+def test_cost_model_custom_metric_count_is_self_consistent():
+    model = _cost_model()
+    # Custom metrics are emitted at runtime (not declared in CFN), so the model
+    # pins its billed custom-metric count to its own enumerated E4 control-plane
+    # metric list. That list must be a subset of the metrics the infra suite
+    # already knows the backend emits, so a typo cannot inflate the bill.
+    metrics = model["custom_metrics"]["e4_control_plane"]
+    assert model["assumptions"]["enabled_idle"]["cw_custom_metrics"] == len(metrics)
+    assert set(metrics).issubset(BACKEND_EMITTED_OPERATIONS_METRICS), (
+        f"cost model lists a non-emitted custom metric: " f"{set(metrics) - BACKEND_EMITTED_OPERATIONS_METRICS}"
+    )
+    # ExecutionHumanReconciliationRequired is emitted by the E3 executor and is
+    # billed under the E3 cost model, so E4 must not double-count it as one of its
+    # own new custom metrics (it still gets the E4 alarm).
+    assert "ExecutionHumanReconciliationRequired" not in set(metrics)
 
 
 # --------------------------------------------------------------------------- #

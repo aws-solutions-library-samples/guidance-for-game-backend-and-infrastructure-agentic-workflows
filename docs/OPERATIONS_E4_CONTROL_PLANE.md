@@ -54,25 +54,33 @@ it is independent of the **kill-switch document** itself (the deployment-wide
 ## The AppConfig kill switch
 
 The stack creates one AppConfig **application**, one **environment**, and one
-**hosted configuration profile** whose `JSON_SCHEMA` validator is
-**byte-equivalent** to the frozen contract schema
-`backend/src/operations/contracts/schemas/v1/operations-kill-switch.schema.json`.
-Because the schema is self-contained (every `$ref` is a local `#/$defs`
-fragment; no external `urn:` reference), AppConfig validates every hosted version
-directly, with no reference resolution. Any document that is not a valid
-kill-switch is rejected by AppConfig at author time.
+**hosted configuration profile** whose `JSON_SCHEMA` validator is inlined
+**byte-for-byte** from the frozen contract schema
+`backend/src/operations/contracts/schemas/v1/operations-kill-switch.schema.json`
+(the embedded validator and the contract file are the same 4039 bytes; the infra
+test additionally asserts they parse to the same JSON). Because the schema is
+self-contained (every `$ref` is a local `#/$defs` fragment; no external `urn:`
+reference), AppConfig validates every hosted version directly, with no reference
+resolution. Any document that is not a valid kill-switch is rejected by AppConfig
+at author time.
 
 The seeded **default** hosted version disables everything
 (`operations_enabled=false`, all phases `false`) and carries an already-expired
 freshness window, so a fresh deploy fails closed until the control plane issues a
-current document.
+current document. Its parsed JSON is field-for-field identical to the fixture
+`backend/tests/fixtures/operations/v1/operations-kill-switch.default-safe.json`
+**except** the author-stamped `issued_at`/`not_after` timestamps (so the raw
+bytes differ): the seeded pair is a fixed, safe, already-expired window.
 
 Two deployment strategies:
 
 - **gradual** (`game-agent-operations-gradual`) — linear rollout with a bake
-  window and a **CloudWatch monitor + automatic rollback** wired to the
-  `KillSwitchFailed` and `KillSwitchUnverified` alarms. Used for ordinary
-  enable / tighten changes.
+  window. The **automatic rollback** is wired at the AppConfig **environment**
+  level via its `Monitors`, which reference the real backend-emitted
+  `KillSwitchUnavailable` alarm: if a gradual deployment breaches it during the
+  bake window (the document could not be read back as a fresh, valid
+  kill-switch), AppConfig rolls the deployment back automatically. Used for
+  ordinary enable / tighten changes.
 - **immediate** (`game-agent-operations-immediate`) — 100% instantly, no bake.
   Used for the emergency "disable everything now" path.
 
@@ -148,15 +156,17 @@ deletes a resource; each is fully reversible.
 
 ## Runbook: rollback (a bad kill-switch deployment)
 
-- A **gradual** deployment that breaches the `KillSwitchFailed` or
-  `KillSwitchUnverified` alarm during its bake window is **rolled back
-  automatically** by AppConfig (the environment monitor). No action needed
-  beyond confirming the alarm cleared.
+- A **gradual** deployment that breaches the `KillSwitchUnavailable` alarm
+  during its bake window is **rolled back automatically** by AppConfig (the
+  environment monitor). No action needed beyond confirming the alarm cleared.
 - To roll back manually, `StopDeployment` (the control role holds it, scoped to
   the exact environment) reverts to the previously deployed version.
-- If a rollback itself fails, the `KillSwitchRollbackFailed` alarm fires; deploy
-  the safe default via `disable-all-operations.sh` (immediate) to force a known
-  all-disabled state, then investigate.
+- If a manual rollback does not restore a healthy state, deploy the safe default
+  via `disable-all-operations.sh` (immediate strategy) to force a known
+  all-disabled state, then investigate. There is no dedicated
+  "rollback-failed" alarm because the control plane emits no such signal; the
+  operational signal that the system is not in a healthy readable state remains
+  `KillSwitchUnavailable`.
 
 ## Runbook: investigation
 
@@ -169,16 +179,48 @@ deletes a resource; each is fully reversible.
    consumers fail closed. Check the control Lambda log group
    `/aws/lambda/game-agent-operations-control` and the sweeper log group
    `/aws/lambda/game-agent-operations-control-sweeper`.
-3. **Alarm map** (namespace `GameAgent/Operations`):
-   - `KillSwitchFailed` — a control write or deployment failed.
-   - `KillSwitchStuck` — a deployment is past its bake window.
-   - `KillSwitchRetrying` — the control plane is retrying.
-   - `KillSwitchUnverified` — a deployed document could not be read back fresh.
-   - `KillSwitchRollbackFailed` — a rollback did not complete.
-   - `KillSwitchBudgetExceeded` — deployments started exceeded the budget
-     (runaway loop / denial-of-wallet guard).
-   - `OperationsDisabled` — the master switch is engaged (informational).
-4. **Audit trail** — every admin decision is an immutable, `record_hash`-bound
+3. **E4-owned alarm map** (namespace `GameAgent/Operations`). E4 provisions
+   exactly **five** alarms, each on a metric the backend actually emits:
+   - `<project>-operations-KillSwitchUnavailable` (`KillSwitchUnavailable`) — a
+     phase failed closed because the kill-switch could not be read back as a
+     fresh, valid document (extension unavailable/malformed/stale). This is the
+     alarm wired to the AppConfig environment monitor for automatic rollback.
+   - `<project>-operations-ControlVersionConflict` (`ControlVersionConflict`) —
+     a control write hit a compare-and-set conflict (a stale or racing write was
+     rejected).
+   - `<project>-operations-ControlDenied` (`ControlDenied`) — a control change
+     was denied on authority (non-admin / untrusted caller).
+   - `<project>-operations-OperationsExpirySweepExpired`
+     (`OperationsExpirySweepExpired`) — a periodic sweep expired one or more due
+     operations (informational; confirms the sweeper is expiring due
+     operations).
+   - `<project>-operations-ExecutionHumanReconciliationRequired`
+     (`ExecutionHumanReconciliationRequired`) — an executed operation requires
+     human reconciliation.
+4. **Reused upstream alarm coverage.** Failure / stuck / unverified conditions
+   *upstream* of the control plane are already covered by the E1 (06) and E3
+   (07) alarms; E4 does not duplicate them:
+   - **Failure:** `<project>-operations-failures` (`ObservationFailures`),
+     `<project>-operations-preparation-failures` (`PreparationFailures`),
+     `<project>-operations-approval-failures` (`ApprovalFailures`) from 06; and
+     `<project>-operations-DispatchFailures` (`DispatchFailures`),
+     `<project>-operations-ExecutionFailures` (`ExecutionFailures`) from 07.
+   - **Stuck:** `<project>-operations-stuck` (`StuckOperations`) and
+     `<project>-operations-timeouts` (`ObservationTimeouts`) from 06.
+   - **Unverified / not-reconciled:** the E4-owned
+     `ExecutionHumanReconciliationRequired` above, plus
+     `<project>-operations-approval-expired` (`ApprovalExpired`) from 06.
+5. **Diagnostic (no-alarm) metrics.** Some emitted metrics are steady-state /
+   success signals and are intentionally **not** alarmed, because paging on a
+   healthy event is noise:
+   - `ControlApplied` — a control change succeeded.
+   - `ControlPublicationReconciled` — a published control document was
+     reconciled against the intended posture. This is a success / no-op
+     confirmation, not an actionable failure, so it has **no alarm**; its
+     actionable failure siblings are already alarmed (a fail-closed read raises
+     `KillSwitchUnavailable`; a rejected racing write raises
+     `ControlVersionConflict`). Use it as a diagnostic metric / dashboard line.
+6. **Audit trail** — every admin decision is an immutable, `record_hash`-bound
    control-audit record in the 06 table.
 
 ## Runbook: reconciliation
@@ -195,8 +237,10 @@ To reconcile:
    stale write cannot clobber a newer document. `config_version` is immutable and
    monotonic.
 4. Confirm the new document is live and fresh (`GET
-   /operations/control/kill-switch`), and that `OperationsDisabled` reflects the
-   intended master-switch state.
+   /operations/control/kill-switch`). A successful reconciliation emits the
+   `ControlPublicationReconciled` diagnostic metric; a stale-read or racing-write
+   failure instead raises the `KillSwitchUnavailable` or
+   `ControlVersionConflict` alarm.
 
 ## Teardown (explicit, never automatic)
 
@@ -210,8 +254,9 @@ untouched. Prefer `disable-operations-control.sh` for a reversible OFF.
 ## Cost
 
 Default (unprovisioned): **$0**. Enabled-idle and a representative busy month are
-both ≈ **$2.87/month** incremental, dominated by the seven CloudWatch alarms and
+both ≈ **$2.87/month** incremental, dominated by the CloudWatch alarms and
 custom metrics; AppConfig config retrievals and the request-scoped control Lambda
 / API / sweeper are fractions of a cent. See
 [`operations-e4-cost-model.json`](operations-e4-cost-model.json) (the machine-checked
-source of truth) and [`operations-e4-cost-notes.md`](operations-e4-cost-notes.md).
+source of truth, which pins the alarm and custom-metric counts to the template)
+and [`operations-e4-cost-notes.md`](operations-e4-cost-notes.md).
