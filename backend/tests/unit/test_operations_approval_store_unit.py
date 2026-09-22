@@ -30,6 +30,7 @@ from operations.approval_store import (
 from operations.contracts import load_json
 from operations.contracts.capacity import capacity_prepared_hash
 from operations.decisions import DecisionCommitOutcome
+from operations.evidence import OperationEvidence
 
 FIXTURES = __import__("pathlib").Path(__file__).parents[1] / "fixtures" / "operations" / "v1"
 NOW = datetime(2026, 9, 21, 19, 15, tzinfo=timezone.utc)
@@ -400,3 +401,46 @@ def test_record_terminal_decision_deadline_expired() -> None:
     )
 
     assert outcome is DecisionCommitOutcome.DEADLINE_EXPIRED
+
+
+# -- Evidence load -----------------------------------------------------------
+
+
+def test_load_operation_evidence_returns_bounded_state_and_ledger() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+
+    evidence = store.load_operation_evidence(OPERATION_ID)
+
+    assert isinstance(evidence, OperationEvidence)
+    assert evidence.state == "pending_approval"
+    assert evidence.prepared_hash == _hash()
+    assert evidence.operation["operation_id"] == OPERATION_ID
+    assert evidence.approval is None
+    assert [e["sequence"] for e in evidence.ledger] == [0]
+
+
+def test_load_operation_evidence_includes_approval_after_grant() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+    store.record_granted_approval(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        commit_not_after=NOW + timedelta(minutes=5),
+        approval=_approval(),
+    )
+
+    evidence = store.load_operation_evidence(OPERATION_ID)
+
+    assert evidence.state == "approved"
+    assert evidence.approval is not None
+    assert evidence.approval["decision"] == "granted"
+    assert [e["sequence"] for e in evidence.ledger] == [0, 1]
+
+
+def test_load_operation_evidence_missing_returns_none() -> None:
+    client = StatefulDynamoClient()
+    assert _store(client).load_operation_evidence(OPERATION_ID) is None
