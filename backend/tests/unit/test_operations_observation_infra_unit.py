@@ -18,8 +18,16 @@ contract**:
   CloudWatch Logs KMS key-policy grant;
 * negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
   ``GetItem``/``Query``/``TransactWriteItems``; no S3 runtime access, no
-  ``kms:Encrypt``, no GameLift write, ``iam:PassRole``, Step Functions,
+  GameLift write, ``iam:PassRole``, Step Functions,
   ``UpdateItem``/``DeleteItem``/``PutItem``/``Scan``, or wildcard action);
+* the runtime-KMS grant for the customer-managed key: exactly the documented
+  DynamoDB data-plane action set (``Encrypt``/``Decrypt``/``ReEncrypt*``/
+  ``GenerateDataKey*``/``DescribeKey``) on the specific operations CMK, every
+  statement pinned to DynamoDB via ``kms:ViaService`` (``dynamodb.*.amazonaws.com``),
+  with ``kms:CreateGrant`` isolated in its own statement guarded by
+  ``kms:GrantIsForAWSResource=true`` -- never a wildcard resource, never generic
+  direct KMS use, and never a missing action (the live begin_observation
+  ``AccessDeniedException`` from a grant that held only Decrypt+GenerateDataKey);
 * the removal of the unused S3 content bucket, its env binding, and its output;
 * the removal of the unused request-deadline env var (it survives only as the
   Lambda ``Timeout`` parameter, never as a runtime env binding);
@@ -138,10 +146,40 @@ FORBIDDEN_ACTION_SUBSTRINGS = (
     "dynamodb:BatchWriteItem",
     # The unused content bucket and its runtime access are removed entirely.
     "s3:",
-    # Encrypt is unnecessary; the runtime uses envelope encryption via
-    # GenerateDataKey and reads via Decrypt.
-    "kms:Encrypt",
+    # NOTE: kms:Encrypt is intentionally NOT forbidden on the runtime role. A
+    # DynamoDB table encrypted with a customer managed key requires the *caller*
+    # to hold the full data-plane KMS action set (Encrypt/Decrypt/ReEncrypt*/
+    # GenerateDataKey*/DescribeKey) plus a resource-scoped CreateGrant; a role
+    # missing kms:Encrypt is exactly what produced the live begin_observation
+    # DynamoDB AccessDeniedException (GitHub issue #413). See the runtime-KMS
+    # contract tests below for the tightly bounded shape this grant must take.
 )
+
+# The exact identity-based KMS actions a principal needs on a customer-managed
+# key to read from and write to a DynamoDB table encrypted with that key, per
+# the AWS "DynamoDB encryption at rest usage notes" guide
+# (https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/encryption.usagenotes.html).
+# kms:Encrypt was the action missing from the live runtime role, which is what
+# failed begin_observation with a DynamoDB AccessDeniedException even though the
+# IAM policy simulator allowed TransactWriteItems/GetItem.
+REQUIRED_RUNTIME_KMS_DATA_ACTIONS = frozenset(
+    {
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncrypt*",
+        "kms:GenerateDataKey*",
+        "kms:DescribeKey",
+    }
+)
+# CreateGrant is required but MUST live in its own statement, constrained so the
+# runtime can only create grants on behalf of the AWS resource (DynamoDB), never
+# arbitrary grants. kms:GrantIsForAWSResource=true is the documented guard, per
+# the AWS KMS condition-keys guide
+# (https://docs.aws.amazon.com/kms/latest/developerguide/conditions-kms.html).
+RUNTIME_KMS_CREATE_GRANT_ACTION = "kms:CreateGrant"
+# Every runtime-role KMS statement must be pinned to DynamoDB via kms:ViaService
+# so the key can never be used for direct, generic KMS calls by the runtime.
+DYNAMODB_VIA_SERVICE_PATTERN = "dynamodb."
 
 # The transitive runtime-dependency closure the core handler imports at load
 # time (rfc8785 for canonical JSON; jsonschema + referencing for contract
@@ -483,11 +521,128 @@ def test_dynamodb_actions_are_scoped_and_bounded(template):
         assert action in ALLOWED_DYNAMODB_ACTIONS, f"unexpected DynamoDB action: {action}"
 
 
-def test_kms_actions_are_minimal(template):
-    actions = [a for a in _all_policy_actions(template) if a.lower().startswith("kms:")]
-    # Runtime policy uses only decrypt + envelope generation; no Encrypt.
-    for action in actions:
-        assert action in {"kms:Decrypt", "kms:GenerateDataKey"}, f"unexpected KMS action: {action}"
+def _role_kms_statements(template):
+    """Every IAM *role* inline-policy statement that grants only KMS actions.
+
+    This isolates the runtime execution role's KMS grant (the ``OperationsKmsUse``
+    policy on ``ObservationRole``) from the CloudWatch Logs grant, which lives on
+    the KMS *key policy* of the ``AWS::KMS::Key`` resource, not on any role. The
+    two are asserted by separate tests and must never be conflated.
+    """
+    statements = []
+    roles = _resources_of_type(template, "AWS::IAM::Role")
+    for body in roles.values():
+        for inline in body.get("Properties", {}).get("Policies", []) or []:
+            doc = inline.get("PolicyDocument", {})
+            for stmt in doc.get("Statement", []) or []:
+                actions = set(_iter_action_strings([stmt.get("Action")]))
+                if actions and all(a.lower().startswith("kms:") for a in actions):
+                    statements.append(stmt)
+    return statements
+
+
+def _statement_condition_values(stmt, needle):
+    """Every condition value whose condition key contains ``needle`` (case-insensitive)."""
+    values = []
+    for _operator, mapping in (stmt.get("Condition", {}) or {}).items():
+        for cond_key, cond_val in mapping.items():
+            if needle.lower() in cond_key.lower():
+                if isinstance(cond_val, list):
+                    values.extend(cond_val)
+                else:
+                    values.append(cond_val)
+    return values
+
+
+def _resource_strings(stmt):
+    resource = stmt.get("Resource")
+    return [resource] if isinstance(resource, str) else list(resource or [])
+
+
+def test_runtime_kms_grant_covers_the_documented_dynamodb_cmk_action_set(template):
+    """RED against the live begin_observation failure: the runtime role held only
+    kms:Decrypt + kms:GenerateDataKey, so DynamoDB customer-managed-key access
+    raised AccessDeniedException even though the IAM simulator allowed
+    TransactWriteItems/GetItem. A DynamoDB CMK caller needs the full documented
+    data-plane action set (Encrypt/Decrypt/ReEncrypt*/GenerateDataKey*/DescribeKey)
+    plus CreateGrant. This asserts every required action is present across the
+    runtime role's KMS statements."""
+    statements = _role_kms_statements(template)
+    assert statements, "expected the runtime role to carry KMS statements"
+    granted = set()
+    for stmt in statements:
+        assert stmt.get("Effect") == "Allow", "runtime KMS statements must be Allow"
+        granted |= set(_iter_action_strings([stmt.get("Action")]))
+    missing = REQUIRED_RUNTIME_KMS_DATA_ACTIONS - granted
+    assert not missing, f"runtime KMS grant is missing DynamoDB CMK actions: {sorted(missing)}"
+    assert RUNTIME_KMS_CREATE_GRANT_ACTION in granted, "runtime KMS grant must include kms:CreateGrant"
+
+
+def test_runtime_kms_grant_has_no_unexpected_actions(template):
+    """The grant must be tightly bounded: only the documented DynamoDB CMK
+    data-plane actions plus CreateGrant. No wildcard, no service wildcard, and no
+    generic KMS action beyond the documented minimum."""
+    allowed = REQUIRED_RUNTIME_KMS_DATA_ACTIONS | {RUNTIME_KMS_CREATE_GRANT_ACTION}
+    for stmt in _role_kms_statements(template):
+        for action in _iter_action_strings([stmt.get("Action")]):
+            assert action != "*", "wildcard action not allowed on the runtime KMS grant"
+            assert action != "kms:*", "generic kms:* not allowed on the runtime KMS grant"
+            assert action in allowed, f"unexpected runtime KMS action: {action}"
+
+
+def test_runtime_kms_data_statement_is_pinned_to_dynamodb_via_service(template):
+    """Every runtime KMS data-plane statement must be constrained by
+    kms:ViaService to dynamodb.*.amazonaws.com, so the runtime can only exercise
+    the key through DynamoDB and never for direct, generic KMS use."""
+    data_statements = [
+        stmt
+        for stmt in _role_kms_statements(template)
+        if RUNTIME_KMS_CREATE_GRANT_ACTION not in set(_iter_action_strings([stmt.get("Action")]))
+    ]
+    assert data_statements, "expected a DynamoDB data-plane KMS statement on the runtime role"
+    for stmt in data_statements:
+        via = _statement_condition_values(stmt, "kms:ViaService")
+        assert via, "runtime KMS data statement must set a kms:ViaService condition"
+        for value in via:
+            assert DYNAMODB_VIA_SERVICE_PATTERN in value and value.endswith(
+                "amazonaws.com"
+            ), f"kms:ViaService must scope to dynamodb.*.amazonaws.com, got {value!r}"
+        for resource in _resource_strings(stmt):
+            assert resource != "*", "runtime KMS data statement must not use a wildcard resource"
+            assert not resource.endswith(":*"), f"runtime KMS resource too broad: {resource}"
+
+
+def test_runtime_kms_create_grant_is_isolated_and_resource_guarded(template):
+    """CreateGrant must live in its OWN statement, guarded by
+    kms:GrantIsForAWSResource=true (so the runtime can only create grants on
+    behalf of the AWS resource, never arbitrary grants) and additionally pinned
+    to DynamoDB via kms:ViaService. It must never be a wildcard resource and must
+    never be merged into the data-plane statement."""
+    statements = _role_kms_statements(template)
+    grant_statements = [
+        stmt
+        for stmt in statements
+        if RUNTIME_KMS_CREATE_GRANT_ACTION in set(_iter_action_strings([stmt.get("Action")]))
+    ]
+    assert grant_statements, "expected a dedicated kms:CreateGrant statement"
+    for stmt in grant_statements:
+        stmt_actions = set(_iter_action_strings([stmt.get("Action")]))
+        assert stmt_actions == {
+            RUNTIME_KMS_CREATE_GRANT_ACTION
+        }, f"CreateGrant must be isolated in its own statement, got {sorted(stmt_actions)}"
+        guard = _statement_condition_values(stmt, "kms:GrantIsForAWSResource")
+        assert guard, "CreateGrant statement must require kms:GrantIsForAWSResource"
+        normalized = {str(v).lower() for v in guard}
+        assert normalized == {"true"}, f"kms:GrantIsForAWSResource must be true, got {guard}"
+        via = _statement_condition_values(stmt, "kms:ViaService")
+        assert via, "CreateGrant statement must also set kms:ViaService for DynamoDB"
+        for value in via:
+            assert DYNAMODB_VIA_SERVICE_PATTERN in value and value.endswith(
+                "amazonaws.com"
+            ), f"CreateGrant kms:ViaService must scope to dynamodb.*.amazonaws.com, got {value!r}"
+        for resource in _resource_strings(stmt):
+            assert resource != "*", "CreateGrant must not use a wildcard resource"
+            assert not resource.endswith(":*"), f"CreateGrant resource too broad: {resource}"
 
 
 # --------------------------------------------------------------------------- #
@@ -834,14 +989,18 @@ def test_kms_logs_grant_uses_regional_service_principal(template):
         ), f"logs principal must be Region-qualified, got {services}"
 
 
-def test_execution_role_kms_grant_still_excludes_encrypt(template):
-    """E1 preservation: adding Encrypt to the *key policy* for the logs service
-    must NOT leak kms:Encrypt into the Lambda execution *role* — the runtime
-    still uses only Decrypt + envelope GenerateDataKey."""
-    role_actions = [a for a in _all_policy_actions(template) if a.lower().startswith("kms:")]
+def test_execution_role_kms_grant_stays_bounded_to_the_dynamodb_cmk_minimum(template):
+    """E1 boundary preservation: the runtime role's KMS grant must be exactly the
+    documented DynamoDB CMK data-plane set plus the isolated CreateGrant -- no
+    more. The role now legitimately holds kms:Encrypt (a DynamoDB CMK caller
+    needs it), but the CloudWatch Logs key-policy grant must NOT leak any extra
+    generic KMS action onto the execution *role*, and the role must never carry a
+    wildcard KMS action."""
+    role_actions = {a for a in _all_policy_actions(template) if a.lower().startswith("kms:")}
     assert role_actions, "expected scoped KMS actions on the execution role"
-    for action in role_actions:
-        assert action in {"kms:Decrypt", "kms:GenerateDataKey"}, f"unexpected role KMS action: {action}"
+    allowed = REQUIRED_RUNTIME_KMS_DATA_ACTIONS | {RUNTIME_KMS_CREATE_GRANT_ACTION}
+    unexpected = role_actions - allowed
+    assert not unexpected, f"execution role carries KMS actions beyond the documented minimum: {sorted(unexpected)}"
 
 
 def test_stateful_resources_are_rollback_safe_not_plain_retain(template):

@@ -427,9 +427,12 @@ Resources:
   # --------------------------------------------------------------------------- #
   # IAM: dedicated, least-privilege observation execution role.
   # Exactly three GameLift reads; DynamoDB limited to the reads and single
-  # transactional write core uses; KMS decrypt + envelope generation only;
-  # namespace-scoped PutMetricData. No S3, no GameLift writes, no iam:PassRole,
-  # no Step Functions, no UpdateItem/DeleteItem/PutItem/Scan, no wildcard action.
+  # transactional write core uses; the documented DynamoDB customer-managed-key
+  # data-plane action set pinned to DynamoDB via kms:ViaService, with CreateGrant
+  # isolated and guarded by kms:GrantIsForAWSResource=true; namespace-scoped
+  # PutMetricData. No S3, no GameLift writes, no iam:PassRole, no Step Functions,
+  # no UpdateItem/DeleteItem/PutItem/Scan, no direct/generic KMS use, no wildcard
+  # action.
   # --------------------------------------------------------------------------- #
   ObservationRole:
     Type: AWS::IAM::Role
@@ -468,16 +471,52 @@ Resources:
                 Resource:
                   - !GetAtt OperationsTable.Arn
         - PolicyName: OperationsKmsUse
+          # DynamoDB encrypts this table with the operations customer-managed
+          # key (CMK). Server-side encryption at rest with a CMK requires the
+          # *caller's* role to hold the full documented DynamoDB CMK data-plane
+          # action set -- Encrypt, Decrypt, ReEncrypt*, GenerateDataKey*, and
+          # DescribeKey -- plus a resource-scoped CreateGrant. A role holding only
+          # Decrypt + GenerateDataKey is exactly what raised the live
+          # begin_observation DynamoDB AccessDeniedException (GitHub issue #413),
+          # even though the IAM simulator allowed TransactWriteItems/GetItem.
+          #
+          # Both statements are pinned to DynamoDB via kms:ViaService so this
+          # grant can never be exercised for direct, generic KMS use; the key can
+          # only be touched through DynamoDB on this caller's behalf. CreateGrant
+          # is isolated in its own statement and further guarded by
+          # kms:GrantIsForAWSResource=true so the runtime can only create grants
+          # on behalf of the AWS resource (DynamoDB), never arbitrary grants.
+          #
+          # Refs:
+          #   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/encryption.usagenotes.html
+          #   https://docs.aws.amazon.com/kms/latest/developerguide/conditions-kms.html
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: EnvelopeEncryptAuditData
+              - Sid: DynamoDbCmkDataPlane
                 Effect: Allow
                 Action:
+                  - 'kms:Encrypt'
                   - 'kms:Decrypt'
-                  - 'kms:GenerateDataKey'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
                 Resource:
                   - !GetAtt OperationsKmsKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+              - Sid: DynamoDbCmkCreateGrant
+                Effect: Allow
+                Action:
+                  - 'kms:CreateGrant'
+                Resource:
+                  - !GetAtt OperationsKmsKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                  Bool:
+                    'kms:GrantIsForAWSResource': 'true'
         - PolicyName: OperationsLogsAndMetrics
           PolicyDocument:
             Version: '2012-10-17'

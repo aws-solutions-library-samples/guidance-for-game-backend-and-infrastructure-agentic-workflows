@@ -135,12 +135,72 @@ ceiling from ADR 0005.
 
 No other GameLift action is granted. The runtime DynamoDB actions are exactly
 `GetItem`, `Query`, and `TransactWriteItems` — no `Scan`, `UpdateItem`,
-`DeleteItem`, or `PutItem`. KMS is limited to `Decrypt` and `GenerateDataKey`
-(no `Encrypt`). No S3 runtime access, `iam:PassRole`, Step Functions, or
-wildcard action appears in any E1 policy. The CMK key policy additionally grants
-the CloudWatch Logs service principal `kms:Decrypt`/`kms:GenerateDataKey`,
+`DeleteItem`, or `PutItem`. No S3 runtime access, `iam:PassRole`, Step Functions,
+or wildcard action appears in any E1 policy. The CMK key policy additionally
+grants the CloudWatch Logs service principal `kms:Decrypt`/`kms:GenerateDataKey`,
 scoped to this account's operations log groups, so the CMK-encrypted Lambda and
 API access log groups work under least privilege.
+
+### Runtime KMS grant for the customer-managed key (issue #413)
+
+The operations DynamoDB table is encrypted at rest with the operations
+customer-managed key (CMK). With a CMK, the **caller's** IAM role — not just the
+DynamoDB service — must be authorized to use the key, because DynamoDB calls KMS
+on the caller's behalf when it generates and unwraps the per-table data key. The
+runtime role therefore holds the documented DynamoDB CMK data-plane action set:
+
+| Action | Why DynamoDB needs it from the caller |
+| --- | --- |
+| `kms:Encrypt` | Encrypt data/table keys when persisting items |
+| `kms:Decrypt` | Decrypt the table key to read items |
+| `kms:ReEncrypt*` | Re-wrap data keys on key rotation / key change |
+| `kms:GenerateDataKey*` | Generate the envelope data keys for the table |
+| `kms:DescribeKey` | Resolve key metadata before use |
+| `kms:CreateGrant` | Let DynamoDB hold a grant for background maintenance |
+
+**Root cause fixed here:** the live `begin_observation` call failed with a
+DynamoDB `AccessDeniedException` even though the IAM policy simulator allowed
+`TransactWriteItems`/`GetItem`. The runtime role's KMS grant held only
+`kms:Decrypt` + `kms:GenerateDataKey`, so the CMK-backed write path was denied at
+the KMS layer. The IAM simulator does not model the KMS authorization DynamoDB
+performs on the caller's behalf, which is why the simulator passed while the live
+call failed. The fix grants exactly the documented minimum above — nothing more.
+
+**Tightly constrained, not broadened.** The grant is scoped so the runtime can
+never use the key for direct, generic KMS calls:
+
+- Both KMS statements are pinned to DynamoDB with
+  `kms:ViaService = dynamodb.<region>.amazonaws.com` (via
+  `!Sub 'dynamodb.${AWS::Region}.amazonaws.com'`), so the key is only usable
+  *through DynamoDB* on this caller's behalf.
+- Every statement targets only the specific operations CMK ARN — never `*`.
+- `kms:CreateGrant` is isolated in its **own** statement, additionally guarded by
+  `kms:GrantIsForAWSResource = true`, so the runtime can only create grants on
+  behalf of the AWS resource (DynamoDB), never arbitrary grants to arbitrary
+  grantees.
+- The CloudWatch Logs key-policy grant is **unchanged**: this fix touches only
+  the runtime execution role, not the logs service-principal grant on the key
+  policy, and does not add any direct/generic KMS use.
+
+**Public AWS references:**
+
+- DynamoDB encryption at rest usage notes (customer-managed-key model, caller
+  key usage):
+  <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/encryption.usagenotes.html>
+- AWS KMS condition keys (`kms:ViaService`, `kms:GrantIsForAWSResource`):
+  <https://docs.aws.amazon.com/kms/latest/developerguide/conditions-kms.html>
+
+**Regression coverage.** `backend/tests/unit/test_operations_observation_infra_unit.py`
+parses the template as data and enforces this contract structurally (no AWS
+calls). The KMS tests fail against the pre-fix policy and reject regressions:
+`test_runtime_kms_grant_covers_the_documented_dynamodb_cmk_action_set` (rejects a
+missing action), `test_runtime_kms_grant_has_no_unexpected_actions` (rejects
+wildcard / generic KMS actions), `test_runtime_kms_data_statement_is_pinned_to_dynamodb_via_service`
+(rejects a missing `kms:ViaService` or a wildcard resource),
+`test_runtime_kms_create_grant_is_isolated_and_resource_guarded` (rejects a
+merged or unconstrained `CreateGrant`), and
+`test_execution_role_kms_grant_stays_bounded_to_the_dynamodb_cmk_minimum`
+(rejects any action beyond the documented minimum leaking onto the role).
 
 ## Deploy (explicit, opt-in)
 
@@ -281,9 +341,13 @@ that assert, without any AWS call:
   multi-tenant/code-artifact parameters with enabled-mode `Rules`, the S3
   Code artifact wiring, and the CloudWatch Logs KMS key-policy grant;
 - negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
-  `GetItem`/`Query`/`TransactWriteItems`; no S3, `kms:Encrypt`, GameLift write,
-  `iam:PassRole`, Step Functions, `UpdateItem`/`DeleteItem`/`PutItem`/`Scan`, or
-  wildcard action); and
+  `GetItem`/`Query`/`TransactWriteItems`; no S3, GameLift write, `iam:PassRole`,
+  Step Functions, `UpdateItem`/`DeleteItem`/`PutItem`/`Scan`, or wildcard action);
+- the runtime KMS grant for the customer-managed key: exactly the documented
+  DynamoDB CMK data-plane action set plus an isolated `kms:CreateGrant`, every
+  statement pinned to DynamoDB via `kms:ViaService` and `CreateGrant` guarded by
+  `kms:GrantIsForAWSResource=true`, on the specific CMK ARN — no wildcard
+  resource, no generic direct KMS use, no missing action (issue #413); and
 - shell safety of the wrappers (`set -euo pipefail`, explicit opt-in, read-only
   preview, caller-identity verification, teardown never automatic and with no
   data-erasing flag).
