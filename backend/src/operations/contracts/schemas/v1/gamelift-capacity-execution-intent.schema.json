@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-execution-intent",
+  "title": "GameLift Capacity Adjustment Execution Intent 1.0",
+  "$comment": "Additive, server-owned E3 provider-write intent for gamelift.capacity-adjustment/1.0. It is derived deterministically from one immutable E2 prepared operation and carries ONLY the exact UpdateFleetCapacity parameters (desired/min/max), the target fleet id and location, the prepared operation id, the prepared_hash it binds to, the hash-bound expected current capacity the executor must confirm via DescribeFleetCapacity before any write, and a stable logical_action_id that is independent of any execution attempt. It has no identity, credential, provider response, ARN, account id, executor binding secret, or executable content, and additionalProperties is false everywhere. It reuses the immutable common $defs and is not part of the published source-control write-contract schema set, so it never alters an existing v1 write contract or its playbook hash.",
+  "$defs": {
+    "capacity_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "desired",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "desired": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_contract_version",
+    "operation_id",
+    "prepared_hash",
+    "logical_action_id",
+    "provider",
+    "action",
+    "target",
+    "parameters",
+    "expected_current_capacity"
+  ],
+  "properties": {
+    "execution_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "prepared_hash": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    },
+    "logical_action_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^act_[a-f0-9]{64}$",
+      "$comment": "Stable, deterministic, attempt-independent logical action identifier. It is the canonical digest of (operation_id, prepared_hash) so every retry of the same operation carries the same logical_action_id; a retry counter never enters it. One operation produces at most one logical update under this id."
+    },
+    "provider": {
+      "type": "string",
+      "const": "gamelift"
+    },
+    "action": {
+      "type": "string",
+      "const": "gamelift.adjust-fleet-capacity"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "fleet_id",
+        "location"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "const": "gamelift"
+        },
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        }
+      }
+    },
+    "parameters": {
+      "$ref": "#/$defs/capacity_values",
+      "$comment": "The exact desired/minimum/maximum instance counts passed to UpdateFleetCapacity. This is the prepared operation's parameters.requested verbatim."
+    },
+    "expected_current_capacity": {
+      "$ref": "#/$defs/capacity_values",
+      "$comment": "The hash-bound expected current capacity from the prepared operation's current_state.capacity. DescribeFleetCapacity MUST equal this before any write; otherwise the world has drifted from the approved plan and no write is issued."
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-execution-verification",
+  "title": "GameLift Capacity Adjustment Execution Verification 1.0",
+  "$comment": "Additive, bounded E3 post-action verification for gamelift.capacity-adjustment/1.0. It records the normalized DescribeFleetCapacity reading observed after (or in lieu of) a single write, and whether it matches the hash-bound expected target. It carries no ARN, account id, provider token, or raw provider response. Reuses the immutable common $defs and is not part of the published write-contract schema set.",
+  "$defs": {
+    "capacity_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "desired",
+        "minimum",
+        "maximum"
+      ],
+      "properties": {
+        "desired": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "minimum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "maximum": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        }
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "execution_contract_version",
+    "operation_id",
+    "logical_action_id",
+    "verified_at",
+    "observed_capacity",
+    "expected_capacity",
+    "matches_target",
+    "attempts_observed"
+  ],
+  "properties": {
+    "execution_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "operation_id": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+    },
+    "logical_action_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^act_[a-f0-9]{64}$"
+    },
+    "verified_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "observed_capacity": {
+      "$ref": "#/$defs/capacity_values"
+    },
+    "expected_capacity": {
+      "$ref": "#/$defs/capacity_values"
+    },
+    "matches_target": {
+      "type": "boolean"
+    },
+    "attempts_observed": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 32,
+      "$comment": "Number of bounded post-action DescribeFleetCapacity polls performed. Bounded so verification can never loop unboundedly."
+    }
+  }
+}

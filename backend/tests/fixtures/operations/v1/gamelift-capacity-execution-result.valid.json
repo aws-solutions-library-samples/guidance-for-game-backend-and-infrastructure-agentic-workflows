@@ -1,0 +1,27 @@
+{
+  "execution_contract_version": "1.0",
+  "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "logical_action_id": "act_6fec1faab817d359ff25fb0732a02c6a1594d98bf30f3814a1ac4c8aac11a63a",
+  "intent_hash": "sha256:25d7b0e6eb4745f0d0672eca923e3d2c93af75114b4e679b0998e80b5d90487e",
+  "outcome": "SUCCEEDED",
+  "provider_write_issued": true,
+  "verification": {
+    "execution_contract_version": "1.0",
+    "operation_id": "op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "logical_action_id": "act_6fec1faab817d359ff25fb0732a02c6a1594d98bf30f3814a1ac4c8aac11a63a",
+    "verified_at": "2026-09-21T19:12:10Z",
+    "observed_capacity": {
+      "desired": 14,
+      "minimum": 2,
+      "maximum": 20
+    },
+    "expected_capacity": {
+      "desired": 14,
+      "minimum": 2,
+      "maximum": 20
+    },
+    "matches_target": true,
+    "attempts_observed": 1
+  },
+  "recorded_at": "2026-09-21T19:12:11Z"
+}
