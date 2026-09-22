@@ -66,6 +66,12 @@ def _build_runtime() -> _ControlRuntime:
 
     settings = resolve_control_plane_deployment_settings()
     obs = settings.observation
+    if not settings.control_enabled:
+        # Fail closed: the control plane serves only when GBAW_OPERATIONS_CONTROL_MODE
+        # is enabled. This is independent of GBAW_OPERATIONS_MODE, so an operator can
+        # keep admin controls available to recover operations while static
+        # execution is disabled.
+        raise RuntimeError("operations control plane is not enabled (GBAW_OPERATIONS_CONTROL_MODE)")
 
     config = BotocoreConfig(connect_timeout=2.0, read_timeout=5.0, retries={"mode": "adaptive", "max_attempts": 2})
     session = boto3.Session(region_name=_region())

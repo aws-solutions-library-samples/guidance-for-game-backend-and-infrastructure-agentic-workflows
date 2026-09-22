@@ -64,6 +64,11 @@ DEFAULT_LOW_RISK_SELF_APPROVAL = False
 # cannot approve; only an ``admin`` member can.
 DEFAULT_APPROVER_GROUP = "admin"
 
+# The dedicated control-plane availability mode (issue #416), independent of
+# the global operations-mode ceiling.
+CONTROL_MODES = ("disabled", "enabled")
+_DEFAULT_CONTROL_MODE = "disabled"
+
 # Server-owned, fail-closed capacity bounds (issue #414). The default admits
 # only a fully clamped [0, 1] fleet with a single-instance step, so a deployment
 # that forgets to configure real bounds cannot authorize a large capacity swing.
@@ -405,6 +410,10 @@ class ControlPlaneDeploymentSettings:
     appconfig_gradual_strategy_id: str
     appconfig_immediate_strategy_id: str
     provisioned: bool
+    # The dedicated control-plane availability mode (issue #416), independent of
+    # the global GBAW_OPERATIONS_MODE static-execution ceiling. Admin controls
+    # remain available to RECOVER operations while static execution is disabled.
+    control_mode: str = _DEFAULT_CONTROL_MODE
     # Exactly one cursor-key source must be configured. In production the HMAC
     # signing key is a Secrets Manager secret referenced by ARN and resolved at
     # bootstrap; the raw key is a local-test-only convenience. Never both.
@@ -425,6 +434,8 @@ class ControlPlaneDeploymentSettings:
                 raise ValueError(f"{name} must be a non-empty string")
         if not (1 <= self.appconfig_extension_port <= 65535):
             raise ValueError("appconfig_extension_port must be a valid TCP port")
+        if self.control_mode not in CONTROL_MODES:
+            raise ValueError(f"GBAW_OPERATIONS_CONTROL_MODE must be one of {CONTROL_MODES}")
         # Exactly one cursor-key source (raw local-test key XOR secret ARN).
         raw = self.cursor_signing_key
         arn = self.cursor_signing_key_secret_arn
@@ -451,6 +462,11 @@ class ControlPlaneDeploymentSettings:
     def mode(self) -> str:
         return self.observation.mode
 
+    @property
+    def control_enabled(self) -> bool:
+        """Whether admin controls are available (independent of execution)."""
+        return self.control_mode == "enabled"
+
 
 def resolve_control_plane_deployment_settings(
     env: Mapping[str, str] | None = None,
@@ -469,6 +485,7 @@ def resolve_control_plane_deployment_settings(
         cursor_signing_key=_optional_or_none(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY"),
         cursor_signing_key_secret_arn=_optional_or_none(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN"),
         provisioned=_bool(source, "GBAW_OPERATIONS_CONTROL_PROVISIONED", True),
+        control_mode=resolve_control_mode(source),
     )
 
 
@@ -518,9 +535,6 @@ def load_cursor_signing_key(
 # identifiers (application/environment/profile) absent means "no gate" (a no-op
 # gate that never denies). Any *partial* configuration fails closed at startup:
 # a half-configured switch must never silently leave the write path ungated.
-
-CONTROL_MODES = ("disabled", "enabled")
-_DEFAULT_CONTROL_MODE = "disabled"
 
 _KILL_SWITCH_CORE_KEYS = (
     "GBAW_OPERATIONS_APPCONFIG_APPLICATION",
