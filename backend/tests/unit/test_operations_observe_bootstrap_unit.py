@@ -127,3 +127,53 @@ def test_bounded_config_uses_read_budget(monkeypatch: pytest.MonkeyPatch) -> Non
     config = entry._bounded_config(settings)
     assert config.read_timeout == settings.operations.per_read_budget_s
     assert config.connect_timeout <= 2.0
+
+
+# --- E2 wiring through the single entry point (issue #414) ---------------
+
+
+def test_e2_enabled_bootstrap_builds_router_over_both_surfaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local modules
+    import operations.observe.lambda_entry as entry
+    from operations.router import OperationsRequestRouter
+
+    class FakeSession:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def client(self, name: str, **kwargs: Any) -> Any:
+            return object()
+
+    env = dict(_COMPLETE_ENV, GBAW_OPERATIONS_MODE="advise")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("boto3.Session", FakeSession, raising=False)
+    monkeypatch.setattr(entry, "_region", lambda: "us-west-2")
+    entry._handler.cache_clear()
+    handler = entry._handler()
+    assert isinstance(handler, OperationsRequestRouter)
+    assert getattr(handler, "_metrics_sink", None) is not None
+    entry._handler.cache_clear()
+
+
+def test_observe_mode_bootstrap_stays_e1_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local modules
+    import operations.observe.lambda_entry as entry
+    from operations.observation_handler import ObservationRequestHandler
+
+    class FakeSession:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def client(self, name: str, **kwargs: Any) -> Any:
+            return object()
+
+    for key, value in _COMPLETE_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("boto3.Session", FakeSession, raising=False)
+    monkeypatch.setattr(entry, "_region", lambda: "us-west-2")
+    entry._handler.cache_clear()
+    handler = entry._handler()
+    # E2 disabled at the observe ceiling: the deployable handler is exactly E1.
+    assert isinstance(handler, ObservationRequestHandler)
+    entry._handler.cache_clear()

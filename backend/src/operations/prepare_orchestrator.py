@@ -102,14 +102,18 @@ class PrepareOrchestrator:
     def __init__(
         self,
         *,
-        advice_service: AdviceService,
         prepare_service: PrepareService,
         store: Any,
         clock: Callable[[], datetime],
         deployment_mode: str,
+        advice_service: AdviceService | None = None,
+        advice_service_factory: Callable[[str], AdviceService] | None = None,
         preparation_expiry_s: int = 900,
     ) -> None:
+        if advice_service is None and advice_service_factory is None:
+            raise ValueError("one of advice_service or advice_service_factory is required")
         self._advice_service = advice_service
+        self._advice_service_factory = advice_service_factory
         self._prepare_service = prepare_service
         self._store = store
         self._clock = clock
@@ -128,8 +132,9 @@ class PrepareOrchestrator:
     ) -> PrepareResult:
         """Parse, advise, prepare, and (when approval-required) persist once."""
         observation_id, proposal = self._parse_body(body)
+        advice_service = self._resolve_advice_service(observation_id)
 
-        advice = self._advise(proposal, requester, request_id=request_id, correlation_id=correlation_id)
+        advice = self._advise(advice_service, proposal, requester, request_id=request_id, correlation_id=correlation_id)
         prepared = self._prepare(advice, proposal, requester, request_id=request_id, correlation_id=correlation_id)
 
         if prepared.decision is PreparedDecision.DENIED:
@@ -172,8 +177,16 @@ class PrepareOrchestrator:
             raise PrepareOrchestratorError("contract_invalid", "prepare request is invalid") from exc
         return observation_id, proposal
 
+    def _resolve_advice_service(self, observation_id: str) -> AdviceService:
+        """Build a per-request advice service bound to the observation id."""
+        if self._advice_service_factory is not None:
+            return self._advice_service_factory(observation_id)
+        assert self._advice_service is not None
+        return self._advice_service
+
     def _advise(
         self,
+        advice_service: AdviceService,
         proposal: CapacityProposalRequest,
         requester: VerifiedPrincipal,
         *,
@@ -193,7 +206,7 @@ class PrepareOrchestrator:
             ),
         )
         try:
-            return self._advice_service.advise(proposal, context)
+            return advice_service.advise(proposal, context)
         except AdviceBoundaryError as exc:
             raise PrepareOrchestratorError(exc.error_code.value, str(exc), retryable=exc.retryable) from exc
 
