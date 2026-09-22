@@ -397,6 +397,21 @@ def test_frozen_routes_present_and_jwt(template):
 # --------------------------------------------------------------------------- #
 # AppConfig Lambda extension layer via validated parameter
 # --------------------------------------------------------------------------- #
+def test_deploy_wrappers_pin_reviewed_sdk_and_control_probes_lock_member() -> None:
+    wrapper_paths = (
+        PROJECT_ROOT / "scripts/infrastructure/deploy-operations.sh",
+        PROJECT_ROOT / "scripts/infrastructure/deploy-operations-execution.sh",
+        DEPLOY_WRAPPER,
+    )
+    for wrapper_path in wrapper_paths:
+        wrapper = wrapper_path.read_text(encoding="utf-8")
+        assert "boto3==1.43.32" in wrapper, wrapper_path
+        assert "botocore==1.43.55" in wrapper, wrapper_path
+    control_wrapper = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    assert 'operation_model("StartDeployment")' in control_wrapper
+    assert '"LatestDeploymentNumber"' in control_wrapper
+
+
 def test_control_and_sweeper_attach_appconfig_extension_layer(template):
     # !Ref AppConfigExtensionLayerArn flattens to the string parameter name.
     for function_name in ("ControlFunction", "SweeperFunction"):

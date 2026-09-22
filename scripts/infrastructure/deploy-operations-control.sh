@@ -74,11 +74,13 @@ LAMBDA_PLATFORM="manylinux2014_x86_64"
 LAMBDA_BUILD_IMAGE="public.ecr.aws/lambda/python:3.13-x86_64"
 
 # Transitive runtime-dependency closure, pinned EXACTLY at the versions frozen
-# in backend/uv.lock (same closure as the observe/advise/execute handlers; the
-# control plane reuses the contract validator and canonical JSON). boto3/botocore
-# are provided by the Lambda runtime and excluded. rpds-py is the only native
-# member.
+# in backend/uv.lock. boto3/botocore are packaged explicitly rather than
+# trusting the Lambda runtime copy: E4 relies on the StartDeployment
+# LatestDeploymentNumber optimistic-lock member, which older runtime service
+# models reject before making the API call. rpds-py is the only native member.
 PINNED_DEPS=(
+    "boto3==1.43.32"
+    "botocore==1.43.55"
     "rfc8785==0.1.4"
     "jsonschema==4.26.0"
     "jsonschema-specifications==2025.9.1"
@@ -447,6 +449,11 @@ import importlib, sys
 sys.path.insert(0, "/var/task")
 m = importlib.import_module("operations.control.control_entry")
 assert callable(m.handler), "control_entry handler is not callable"
+# E4 provider idempotency depends on this recently added optimistic-lock member;
+# verify the packaged SDK model, not the older Lambda runtime copy.
+from botocore.session import Session
+start_deployment = Session().get_service_model("appconfig").operation_model("StartDeployment")
+assert "LatestDeploymentNumber" in start_deployment.input_shape.members, "packaged AppConfig model is too old"
 # The control plane reuses the contract validator; force every versioned schema
 # to be read from the package so a schema-less artifact fails the probe closed.
 from operations.contracts import validation as v

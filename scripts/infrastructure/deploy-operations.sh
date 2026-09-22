@@ -63,10 +63,11 @@ LAMBDA_BUILD_IMAGE="public.ecr.aws/lambda/python:3.13-x86_64"
 # Transitive runtime-dependency closure, pinned EXACTLY at the versions frozen in
 # backend/uv.lock. rfc8785 provides canonical JSON; jsonschema + referencing (and
 # their deps attrs / rpds-py / jsonschema-specifications) back contract
-# validation. boto3/botocore are provided by the Lambda runtime and are excluded.
-# rpds-py is the only native (non-pure-python) member; its manylinux x86_64 wheel
-# is required.
+# validation. boto3/botocore are packaged explicitly so every operations Lambda
+# uses the same reviewed service models. rpds-py is the only native member.
 PINNED_DEPS=(
+    "boto3==1.43.32"
+    "botocore==1.43.55"
     "rfc8785==0.1.4"
     "jsonschema==4.26.0"
     "jsonschema-specifications==2025.9.1"

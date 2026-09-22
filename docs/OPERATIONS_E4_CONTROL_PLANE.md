@@ -132,7 +132,11 @@ The wrapper resolves the **official** AppConfig extension layer to the
 ARN is the official layer shape, and passes it as `AppConfigExtensionLayerArn`.
 It verifies an explicit, owned profile/account/region and the explicit artifact
 bucket before any write, builds a **deterministic** content-hash-addressed zip,
-and fails closed if the frozen control handler module is absent.
+and fails closed if the frozen control handler module is absent. The operations
+Lambda artifacts package the lockfile-pinned boto3/botocore service models
+instead of relying on the older runtime copy; the control runtime probe verifies
+that `StartDeployment.LatestDeploymentNumber` exists before upload, because that
+optimistic lock prevents a lost response from starting a duplicate deployment.
 
 The first authenticated admin change lazily initializes durable control CAS
 state at the frozen safe seed's `config_version=1`. Any other bootstrap version
