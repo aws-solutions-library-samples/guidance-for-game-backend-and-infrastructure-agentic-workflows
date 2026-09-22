@@ -21,6 +21,7 @@ from typing import Any
 # Third-party packages
 import pytest
 
+# Local modules
 from operations.control.kill_switch_gate import PhaseDenied
 
 pytestmark = [pytest.mark.unit, pytest.mark.fast]
@@ -81,6 +82,7 @@ class _Sfn:
 
 
 def _dispatcher(gate: Any) -> Any:
+    # Local modules
     from operations.execute.dispatcher_handler import DispatcherRequestHandler
 
     return DispatcherRequestHandler(
@@ -122,8 +124,10 @@ def test_dispatch_no_gate_preserves_behavior() -> None:
 
 
 def _prepare_service(gate):
+    # Standard library
     from datetime import datetime, timezone
 
+    # Local modules
     from operations.identity import ApprovalIdentityBoundary
     from operations.prepare import CapacityPlaybook, PrepareService
     from operations.settings import OperationsSettings
@@ -142,6 +146,7 @@ def _prepare_service(gate):
         approver_client_ids=frozenset({"client-1"}),
         trusted_audiences=frozenset({"aud-1"}),
     )
+    # Local modules
     from operations.contracts.capacity import PROFILE
 
     playbook = CapacityPlaybook(
@@ -162,6 +167,7 @@ def _prepare_service(gate):
 
 
 def test_prepare_denied_when_prepare_phase_off() -> None:
+    # Local modules
     from operations.prepare import PrepareBoundaryError, PrepareErrorCode
 
     gate = _GateStub(permit=False)
@@ -179,8 +185,10 @@ def test_prepare_denied_when_prepare_phase_off() -> None:
 
 
 def _ctx():
+    # Standard library
     from datetime import datetime, timezone
 
+    # Local modules
     from operations.identity import VerifiedPrincipal
     from operations.prepare import PrepareRequestContext
 

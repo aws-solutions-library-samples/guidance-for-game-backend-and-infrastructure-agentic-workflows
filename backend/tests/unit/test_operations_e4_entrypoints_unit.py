@@ -74,6 +74,7 @@ def test_sweeper_entry_fails_closed_on_missing_env(monkeypatch: pytest.MonkeyPat
 
 
 def test_settings_resolve_with_full_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local modules
     from operations.settings import resolve_control_plane_deployment_settings
 
     settings = resolve_control_plane_deployment_settings(_BASE_ENV)

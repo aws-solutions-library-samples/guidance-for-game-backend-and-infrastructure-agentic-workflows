@@ -31,13 +31,13 @@ from typing import Any
 import pytest
 
 # Local modules
-from operations.control.control_audit_store import ControlCommitOutcome, ControlStoreError
-from operations.control.control_service import ControlServiceError, KillSwitchControlService
 from operations.contracts.control_plane import (
     CAPABILITY_ID,
     CONTROL_RESPONSE_SCHEMA_NAME,
     validate_control_contract,
 )
+from operations.control.control_audit_store import ControlCommitOutcome, ControlStoreError
+from operations.control.control_service import ControlServiceError, KillSwitchControlService
 
 pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
@@ -66,6 +66,23 @@ class _FakeAuditStore:
         if self.raise_on_commit is not None:
             raise self.raise_on_commit
         return self._outcome
+
+    # -- publication reconciliation (optional port) ----------------------
+    # ``pending`` maps record_id -> {"config_version": int, "published": False}
+    # for a committed-but-unconfirmed decision. ``confirmed`` records the ids the
+    # service confirmed after a successful publish.
+    pending: dict[str, dict[str, Any]]
+    confirmed: list[str]
+
+    def pending_publication(self, *, record_id: str) -> dict[str, Any] | None:
+        return getattr(self, "pending", {}).get(record_id)
+
+    def confirm_publication(self, *, record_id: str) -> None:
+        if not hasattr(self, "confirmed"):
+            self.confirmed = []
+        self.confirmed.append(record_id)
+        pending = getattr(self, "pending", {})
+        pending.pop(record_id, None)
 
 
 class _FakePublisher:
@@ -212,3 +229,65 @@ def test_expected_version_must_match_desired_request() -> None:
     # A malformed request (missing desired) fails closed.
     with pytest.raises(ControlServiceError):
         service.apply(request={"contract_version": "1.0", "expected_config_version": 1}, principal=_admin())
+
+
+# -- publisher lost-response reconciliation ---------------------------------
+
+
+def test_successful_apply_confirms_the_publication() -> None:
+    """After AppConfig acknowledges the publish, the service confirms it."""
+    audit = _FakeAuditStore(current=1)
+    audit.pending = {}
+    audit.confirmed = []
+    publisher = _FakePublisher()
+    service = _service(audit, publisher)
+    response = service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert response["outcome"] == "applied"
+    # Exactly one publication was confirmed, and it matches the committed record.
+    assert len(audit.confirmed) == 1
+    assert audit.confirmed[0] == audit.commits[0]["record_id"]
+
+
+def test_conflict_with_own_pending_publication_reconciles_to_applied() -> None:
+    """A retry after a lost publish response re-publishes and reports applied.
+
+    The prior attempt committed the CAS (version already advanced) but its
+    publish response was lost, so this retry's commit returns VERSION_CONFLICT.
+    Because the store still holds an UNCONFIRMED publication marker for THIS
+    record_id, the service re-drives the idempotent publish, confirms it, and
+    reports the now-live document as applied — never a bare version_conflict that
+    would hide an un-published, version-advanced decision.
+    """
+    audit = _FakeAuditStore(current=2, outcome=ControlCommitOutcome.VERSION_CONFLICT)
+    publisher = _FakePublisher()
+    service = _service(audit, publisher)
+    # Compute the deterministic record_id the service will derive for this request
+    # by running one commit against a COMMITTED store, then reuse it as pending.
+    probe = _FakeAuditStore(current=1)
+    probe.pending = {}
+    probe.confirmed = []
+    _service(probe, _FakePublisher()).apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    record_id = probe.commits[0]["record_id"]
+    audit.pending = {record_id: {"config_version": 2, "published": False}}
+    audit.confirmed = []
+
+    response = service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert response["outcome"] == "applied"
+    assert response["config_version"] == 2
+    # The reconcile re-published the document and confirmed it.
+    assert publisher.published, "reconcile must re-drive the publish"
+    assert audit.confirmed == [record_id]
+
+
+def test_conflict_without_own_pending_publication_stays_version_conflict() -> None:
+    """A genuine concurrent-admin conflict (no pending marker) is unchanged."""
+    audit = _FakeAuditStore(current=5, outcome=ControlCommitOutcome.VERSION_CONFLICT)
+    audit.pending = {}
+    audit.confirmed = []
+    publisher = _FakePublisher()
+    service = _service(audit, publisher)
+    response = service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert response["outcome"] == "version_conflict"
+    assert response["config_version"] == 5
+    assert not publisher.published
+    assert not audit.confirmed

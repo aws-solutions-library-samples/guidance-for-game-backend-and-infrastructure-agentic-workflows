@@ -195,6 +195,7 @@ def test_terminal_decision_updates_catalog_projection() -> None:
     oid = "op_" + "c" * 26
     _persist(store, dynamo, operation_id=oid, created_at="2026-01-01T12:00:00Z")
 
+    # Local modules
     from operations.decisions import DecisionCommitOutcome
 
     outcome = store.record_terminal_decision(
@@ -222,6 +223,7 @@ def test_terminal_decision_without_workspace_skips_catalog_update() -> None:
     oid = "op_" + "d" * 26
     _persist(store, dynamo, operation_id=oid, created_at="2026-01-01T12:00:00Z")
 
+    # Local modules
     from operations.decisions import DecisionCommitOutcome
 
     outcome = store.record_terminal_decision(

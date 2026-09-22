@@ -84,6 +84,7 @@ def _event(path: str = KILL_SWITCH_ROUTE) -> dict[str, Any]:
 
 
 def _read_handler(gate: Any, metrics: Any) -> Any:
+    # Local modules
     from operations.control.read_handler import ControlReadHandler
 
     class _Projection:
@@ -133,6 +134,7 @@ def test_kill_switch_read_fails_closed_and_emits_metric_when_unavailable() -> No
 
 
 def test_router_dispatches_kill_switch_route() -> None:
+    # Local modules
     from operations.control.router import ControlPlaneRouter
 
     class _Read:

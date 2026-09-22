@@ -1,16 +1,20 @@
-"""Control store uses only PutItem+UpdateItem+GetItem, never TransactWriteItems.
+"""Control store CAS uses one atomic TransactWriteItems over granted actions.
 
-The E4 control audit store's IAM policy grants only ``dynamodb:PutItem``,
+The E4 control audit store's IAM policy grants ``dynamodb:PutItem``,
 ``dynamodb:UpdateItem``, ``dynamodb:GetItem`` (and ``Query`` for the read path).
-The CAS commit MUST therefore be expressed as a conditional ``UpdateItem`` on the
-state item plus a separate ``PutItem`` for the immutable outcome record — never a
-``TransactWriteItems`` call, which would require an IAM action the deployment
-does not grant and would fail at runtime with AccessDenied.
+``TransactWriteItems`` is NOT itself an IAM action: a transaction is authorized
+against the underlying per-item actions on the target table. The control CAS
+commit is therefore one atomic ``TransactWriteItems`` composed of a conditional
+``Update`` (authorized by ``dynamodb:UpdateItem``) for the state advance and a
+conditional ``Put`` (authorized by ``dynamodb:PutItem``) for the immutable
+outcome record — both already granted, so the transaction never fails with
+AccessDenied. Committing the two legs atomically is what guarantees the
+``config_version`` can never advance without its outcome audit record.
 
-These tests use a fake DynamoDB client that RAISES if ``transact_write_items`` is
-ever called, so a regression to a transaction is caught immediately, while still
-proving the CAS advance, the version-conflict race, and the never-Scan / never-
-transact guarantees.
+These tests use a fake DynamoDB client that RAISES if a bare ``update_item`` /
+``put_item`` write is used for the commit (which would be a non-atomic
+regression) or if ``scan`` is ever called, while proving the transaction is
+composed only of the granted underlying Update/Put actions.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from typing import Any
 
 # Third-party packages
 import pytest
+from botocore.exceptions import ClientError
 
 # Local modules
 from operations.contracts.control_plane import CAPABILITY_ID
@@ -34,60 +39,105 @@ pytestmark = [pytest.mark.unit, pytest.mark.fast]
 _NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 _TABLE = "operations-table"
 
+# The underlying per-item DynamoDB actions the control store's IAM policy grants.
+# A TransactWriteItems is authorized against these; there is no separate
+# dynamodb:TransactWriteItems permission to grant.
+_GRANTED_TRANSACT_ACTIONS = {"Update", "Put"}
 
-def _conditional_error() -> Exception:
-    exc = Exception("ConditionalCheckFailed")
-    exc.response = {"Error": {"Code": "ConditionalCheckFailedException"}}  # type: ignore[attr-defined]
-    return exc
+
+def _transaction_cancelled(reason_codes: list[str]) -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException", "Message": "Transaction cancelled"},
+            "CancellationReasons": [{"Code": code} for code in reason_codes],
+        },
+        "TransactWriteItems",
+    )
 
 
-class _NoTransactDynamo:
-    """A fake DynamoDB client that only supports PutItem/UpdateItem/GetItem."""
+class _TransactDynamo:
+    """A fake DynamoDB client whose only write path is atomic TransactWriteItems."""
 
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
-        self.actions: list[str] = []
+        # Every distinct transact leg operation observed across all commits.
+        self.transact_leg_ops: set[str] = set()
+        self.transact_calls = 0
 
     def put_item(self, *, TableName: str, Item: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        self.actions.append("put_item")
+        # Only the pre-decision intent record and one-time state initialization
+        # are plain PutItem; the CAS commit itself must go through the transaction.
         key = (Item["PK"]["S"], Item["SK"]["S"])
         cond = kwargs.get("ConditionExpression", "")
         if "attribute_not_exists" in cond and key in self.items:
-            raise _conditional_error()
+            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException", "Message": "exists"}}, "PutItem")
         self.items[key] = Item
         return {}
 
-    def update_item(self, *, TableName: str, Key: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
-        self.actions.append("update_item")
-        key = (Key["PK"]["S"], Key["SK"]["S"])
-        existing = self.items.get(key)
-        values = kwargs.get("ExpressionAttributeValues", {})
-        cond = kwargs.get("ConditionExpression", "")
-        if "attribute_exists" in cond and existing is None:
-            raise _conditional_error()
-        if ":expected" in values:
-            current = existing.get("config_version", {}).get("N") if existing else None
-            if current != values[":expected"]["N"]:
-                raise _conditional_error()
-        new_item = dict(existing) if existing else {"PK": Key["PK"], "SK": Key["SK"]}
-        if ":new_version" in values:
-            new_item["config_version"] = values[":new_version"]
-        self.items[key] = new_item
-        return {}
-
     def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
-        self.actions.append("get_item")
         item = self.items.get((Key["PK"]["S"], Key["SK"]["S"]))
         return {"Item": item} if item else {}
 
-    def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("control store must not use TransactWriteItems")
+    def update_item(self, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("control CAS commit must be one atomic TransactWriteItems, not a bare UpdateItem")
+
+    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+        self.transact_calls += 1
+        reasons: list[str] = []
+        for entry in TransactItems:
+            op = next(iter(entry))
+            self.transact_leg_ops.add(op)
+            if op == "Update":
+                reasons.append(self._eval_update(entry["Update"]))
+            elif op == "Put":
+                reasons.append(self._eval_put(entry["Put"]))
+            else:  # pragma: no cover - defensive
+                raise AssertionError(f"unsupported transact leg: {op}")
+        if any(code != "None" for code in reasons):
+            raise _transaction_cancelled(reasons)
+        for entry in TransactItems:
+            if "Update" in entry:
+                self._apply_update(entry["Update"])
+            elif "Put" in entry:
+                item = entry["Put"]["Item"]
+                self.items[(item["PK"]["S"], item["SK"]["S"])] = item
+        return {}
+
+    def _eval_update(self, upd: dict[str, Any]) -> str:
+        key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
+        existing = self.items.get(key)
+        values = upd.get("ExpressionAttributeValues", {})
+        cond = upd.get("ConditionExpression", "")
+        if "attribute_exists" in cond and existing is None:
+            return "ConditionalCheckFailed"
+        if ":expected" in values:
+            current = existing.get("config_version", {}).get("N") if existing else None
+            if current != values[":expected"]["N"]:
+                return "ConditionalCheckFailed"
+        return "None"
+
+    def _eval_put(self, put: dict[str, Any]) -> str:
+        item = put["Item"]
+        key = (item["PK"]["S"], item["SK"]["S"])
+        cond = put.get("ConditionExpression", "")
+        if "attribute_not_exists" in cond and key in self.items:
+            return "ConditionalCheckFailed"
+        return "None"
+
+    def _apply_update(self, upd: dict[str, Any]) -> None:
+        key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
+        existing = self.items.get(key)
+        values = upd.get("ExpressionAttributeValues", {})
+        new_item = dict(existing) if existing else {"PK": upd["Key"]["PK"], "SK": upd["Key"]["SK"]}
+        if ":new_version" in values:
+            new_item["config_version"] = values[":new_version"]
+        self.items[key] = new_item
 
     def scan(self, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("control store must never Scan")
 
 
-def _store(dynamo: _NoTransactDynamo) -> DynamoDbControlAuditStore:
+def _store(dynamo: _TransactDynamo) -> DynamoDbControlAuditStore:
     return DynamoDbControlAuditStore(client=dynamo, table_name=_TABLE, clock=lambda: _NOW)
 
 
@@ -115,43 +165,41 @@ def _commit(store: DynamoDbControlAuditStore, **overrides: Any) -> ControlCommit
     return store.commit_control_decision(**kwargs)
 
 
-def test_commit_advances_without_transaction() -> None:
-    dynamo = _NoTransactDynamo()
+def _audit(dynamo: _TransactDynamo) -> list[dict[str, Any]]:
+    return [item for item in dynamo.items.values() if item.get("record_type", {}).get("S") == "control_audit_record"]
+
+
+def test_commit_uses_one_transaction_of_granted_actions() -> None:
+    dynamo = _TransactDynamo()
     store = _store(dynamo)
     store.initialize_state_if_absent(config_version=1)
     outcome = _commit(store)
     assert outcome is ControlCommitOutcome.COMMITTED
     assert store.current_config_version() == 2
-    # Only the three permitted underlying actions were ever used.
-    assert set(dynamo.actions) <= {"put_item", "update_item", "get_item"}
-    assert "update_item" in dynamo.actions  # the CAS advance
+    # The commit is exactly one atomic transaction.
+    assert dynamo.transact_calls == 1
+    # Its legs use only the underlying granted actions (Update + Put); there is
+    # no separate dynamodb:TransactWriteItems permission required.
+    assert dynamo.transact_leg_ops <= _GRANTED_TRANSACT_ACTIONS
+    assert dynamo.transact_leg_ops == _GRANTED_TRANSACT_ACTIONS
     # An immutable outcome audit record exists and never carries a ttl.
-    audit = [
-        item
-        for (_pk, _sk), item in dynamo.items.items()
-        if item.get("record_type", {}).get("S") == "control_audit_record"
-    ]
+    audit = _audit(dynamo)
     assert audit and all("ttl" not in item for item in audit)
 
 
 def test_stale_version_is_conflict_and_writes_no_audit() -> None:
-    dynamo = _NoTransactDynamo()
+    dynamo = _TransactDynamo()
     store = _store(dynamo)
     store.initialize_state_if_absent(config_version=3)
     outcome = _commit(store, expected_config_version=1, resulting_config_version=2)
     assert outcome is ControlCommitOutcome.VERSION_CONFLICT
     assert store.current_config_version() == 3  # unchanged
     # A conflicting decision must NOT leave a committed outcome audit record.
-    audit = [
-        item
-        for (_pk, _sk), item in dynamo.items.items()
-        if item.get("record_type", {}).get("S") == "control_audit_record"
-    ]
-    assert not audit
+    assert not _audit(dynamo)
 
 
 def test_two_concurrent_writers_only_one_wins() -> None:
-    dynamo = _NoTransactDynamo()
+    dynamo = _TransactDynamo()
     store = _store(dynamo)
     store.initialize_state_if_absent(config_version=1)
     first = _commit(store, record_id="ctl_" + "a" * 26, expected_config_version=1, resulting_config_version=2)

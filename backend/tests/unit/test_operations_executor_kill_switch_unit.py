@@ -39,6 +39,7 @@ class _GateStub:
 
     def require_phase(self, phase: str) -> Any:
         self.calls += 1
+        # Local modules
         from operations.control.kill_switch_gate import PhaseDenied
 
         if not self._permit:
@@ -50,6 +51,7 @@ class _GateStub:
 
 def _build_service(gate: Any) -> Any:
     """Build an ExecutorService with a permissive verifier/adapter/store + gate."""
+    # Local modules
     from operations.execute.executor_service import ExecutionInvocation, ExecutorService
 
     # Minimal stubs: the verifier returns a plan; the adapter records writes.
@@ -73,11 +75,13 @@ def _build_service(gate: Any) -> Any:
 
     class _Store:
         def acquire_execution_lease(self, **kwargs: Any) -> Any:
+            # Local modules
             from operations.execute.execution_store import LeaseAcquisition
 
             return LeaseAcquisition(generation=1, recorded_result=None)
 
         def record_execution_result(self, **kwargs: Any) -> Any:
+            # Local modules
             from operations.execute.execution_store import ExecutionCommitOutcome
 
             return ExecutionCommitOutcome.RECORDED
@@ -94,6 +98,7 @@ def _build_service(gate: Any) -> Any:
 
 
 def _plan() -> Any:
+    # Local modules
     from operations.execution_verifier import VerifiedExecutionPlan
 
     intent = {
@@ -116,6 +121,7 @@ def _prepared_and_approval() -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def test_entry_gate_denial_blocks_write() -> None:
+    # Local modules
     from operations.execute.executor_service import ExecutorServiceError
 
     gate = _GateStub(permit=False)
@@ -128,6 +134,7 @@ def test_entry_gate_denial_blocks_write() -> None:
 
 
 def test_pre_write_gate_denial_blocks_write_after_describe() -> None:
+    # Local modules
     from operations.execute.executor_service import ExecutorServiceError
 
     # Permit entry (call 1), deny the pre-write check (call 2).

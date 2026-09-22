@@ -17,13 +17,16 @@ Flow
    advanced ``config_version`` (current + 1) and a fresh
    ``issued_at``/``not_after`` horizon, and validated against the immutable
    ``operations-kill-switch`` contract.
-#. **Commit (CAS + audit).** The change is committed through the control audit
-   store with a compare-and-set on ``expected_config_version``. The store writes
-   an immutable intent record, advances the state with a conditional UpdateItem,
-   and writes the immutable outcome audit record with a separate PutItem (no
-   TransactWriteItems). A stale/racing write fails the
+#. **Commit (atomic CAS + audit).** The change is committed through the control
+   audit store with a compare-and-set on ``expected_config_version``. The store
+   writes an immutable intent record, then advances the state and writes the
+   immutable outcome audit record together in ONE atomic ``TransactWriteItems``
+   call (authorized by the underlying ``dynamodb:UpdateItem`` and
+   ``dynamodb:PutItem`` actions the store already holds — there is no separate
+   ``dynamodb:TransactWriteItems`` permission). A stale/racing write fails the
    CAS and returns ``version_conflict`` — no document is published. A transient
-   store failure fails closed (raises).
+   store failure fails closed (raises), and because the commit is atomic a retry
+   recovers the whole decision without ever advancing the version without audit.
 #. **Publish.** Only after a committed CAS is the document published to AppConfig,
    selecting the *immediate* strategy for a hard-down (any reduction relative to
    the current document) and the *gradual* strategy for a normal change. A
@@ -83,6 +86,13 @@ class AuditStorePort(Protocol):
         outcome: str,
         resulting_config_version: int,
     ) -> ControlCommitOutcome: ...
+
+    # Optional publisher lost-response reconciliation. A store that predates
+    # these is tolerated: the service treats missing methods as "no pending
+    # publication to reconcile" and behaves exactly as before.
+    def pending_publication(self, *, record_id: str) -> dict[str, Any] | None: ...
+
+    def confirm_publication(self, *, record_id: str) -> None: ...
 
 
 class PublisherPort(Protocol):
@@ -163,6 +173,17 @@ class KillSwitchControlService:
             raise ControlServiceError("CONTROL_UNAVAILABLE", "control change could not be recorded") from exc
 
         if outcome is ControlCommitOutcome.VERSION_CONFLICT:
+            # A conflict may be a genuine concurrent-admin race, OR it may be a
+            # retry of THIS exact decision whose earlier publish response was
+            # lost after the CAS had already committed. If the store still holds
+            # an unconfirmed publication marker for this record_id, reconcile by
+            # re-driving the idempotent publish and confirming it — reporting the
+            # now-live document as applied rather than a bare version_conflict
+            # that would hide a version-advanced, unpublished decision. The CAS
+            # is never re-run here, so this cannot weaken the compare-and-set.
+            reconciled = self._reconcile_pending_publication(record_id=record_id, desired=desired, hard_down=hard_down)
+            if reconciled is not None:
+                return reconciled
             self._emit("control.version_conflict")
             return self._response(
                 outcome="version_conflict",
@@ -170,15 +191,23 @@ class KillSwitchControlService:
                 reason_code="VERSION_CONFLICT",
             )
 
-        # Committed: publish the now-authoritative document. A publish failure
-        # after the CAS committed is surfaced (the caller retries); we never
-        # report success for a document that did not go live.
+        # Committed: the state advance and its outcome audit record are durably
+        # persisted (one atomic transaction), together with an unconfirmed
+        # publication marker. Publish the now-authoritative document. A publish
+        # failure after the CAS committed is surfaced (the caller retries); we
+        # never report success for a document that did not go live.
         try:
             self._publisher.publish(document=document, hard_down=hard_down)
         except Exception as exc:  # noqa: BLE001 - bounded, fail closed
             raise ControlServiceError(
                 "CONTROL_PUBLISH_FAILED", "control change was recorded but not published"
             ) from exc
+
+        # AppConfig acknowledged the publish: confirm the durable marker so a
+        # later retry does not needlessly re-publish. Confirmation is best-effort
+        # and idempotent; a failure here still leaves a reconcilable pending
+        # marker rather than a false "applied", so it must not mask the success.
+        self._confirm_publication(record_id)
 
         self._emit("control.applied")
         return self._response(
@@ -187,6 +216,58 @@ class KillSwitchControlService:
             reason_code="APPLIED",
             effective=document,
         )
+
+    def _reconcile_pending_publication(
+        self, *, record_id: str, desired: dict[str, Any], hard_down: bool
+    ) -> dict[str, Any] | None:
+        """Re-publish and confirm an own committed-but-unpublished decision.
+
+        Returns an ``applied`` response when the store holds an unconfirmed
+        publication marker for ``record_id`` (a lost-response retry), or ``None``
+        when there is nothing of ours to reconcile (a genuine conflict). The
+        stored ``config_version`` from the marker is authoritative — the document
+        is rebuilt at that version and re-published idempotently.
+        """
+        pending = self._pending_publication(record_id)
+        if pending is None:
+            return None
+        config_version = pending.get("config_version")
+        if not isinstance(config_version, int):
+            return None
+        document = self._build_document(desired, config_version)
+        try:
+            self._publisher.publish(document=document, hard_down=hard_down)
+        except Exception as exc:  # noqa: BLE001 - bounded, fail closed
+            raise ControlServiceError(
+                "CONTROL_PUBLISH_FAILED", "control change was recorded but not published"
+            ) from exc
+        self._confirm_publication(record_id)
+        self._emit("control.publication_reconciled")
+        return self._response(
+            outcome="applied",
+            config_version=config_version,
+            reason_code="APPLIED",
+            effective=document,
+        )
+
+    def _pending_publication(self, record_id: str) -> dict[str, Any] | None:
+        getter = getattr(self._audit_store, "pending_publication", None)
+        if getter is None:
+            return None
+        try:
+            result = getter(record_id=record_id)
+        except Exception:  # noqa: BLE001 - reconciliation is best-effort, never fatal
+            return None
+        return result if isinstance(result, dict) else None
+
+    def _confirm_publication(self, record_id: str) -> None:
+        confirmer = getattr(self._audit_store, "confirm_publication", None)
+        if confirmer is None:
+            return
+        try:
+            confirmer(record_id=record_id)
+        except Exception:  # noqa: BLE001 - confirmation is best-effort, idempotent
+            pass
 
     # -- internals -------------------------------------------------------
 

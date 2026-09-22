@@ -81,36 +81,21 @@ class StatefulDynamoClient:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
 
     def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+        # All-or-nothing: evaluate every leg's condition first, apply none if any
+        # fails. Update legs are dispatched by their OWN expressions rather than
+        # assuming a state fence, so the E4 catalog Update leg (which binds
+        # :cat_state / :cat_updated, never :expected) is handled correctly.
         for entry in TransactItems:
-            if "Put" in entry:
-                put = entry["Put"]
-                item = put["Item"]
-                key = (item["PK"]["S"], item["SK"]["S"])
-                cond = put.get("ConditionExpression", "")
-                if ("attribute_not_exists(PK)" in cond or "attribute_not_exists(SK)" in cond) and key in self.items:
-                    raise _transaction_canceled("ConditionalCheckFailed")
-            if "Update" in entry:
-                upd = entry["Update"]
-                key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
-                existing = self.items.get(key)
-                values = upd["ExpressionAttributeValues"]
-                if (
-                    existing is None
-                    or existing.get("state", {}).get("S") != values[":expected"]["S"]
-                    or existing.get("prepared_hash", {}).get("S") != values[":hash"]["S"]
-                    or int(existing.get("sequence", {}).get("N", "-1")) != int(values[":prev_seq"]["N"])
-                ):
-                    raise _transaction_canceled("ConditionalCheckFailed")
+            if "Put" in entry and not _put_condition_holds(entry["Put"], self.items):
+                raise _transaction_canceled("ConditionalCheckFailed")
+            if "Update" in entry and not _update_condition_holds(entry["Update"], self.items):
+                raise _transaction_canceled("ConditionalCheckFailed")
         for entry in TransactItems:
             if "Put" in entry:
                 item = entry["Put"]["Item"]
                 self.items[(item["PK"]["S"], item["SK"]["S"])] = item
             if "Update" in entry:
-                upd = entry["Update"]
-                key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
-                values = upd["ExpressionAttributeValues"]
-                self.items[key]["state"] = {"S": values[":new"]["S"]}
-                self.items[key]["sequence"] = {"N": values[":seq"]["N"]}
+                _apply_update(entry["Update"], self.items)
         return {}
 
     def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
@@ -367,6 +352,39 @@ def test_requester_self_approval_is_denied_but_distinct_approver_grants() -> Non
         )
     )
     assert replay["statusCode"] == 409
+
+
+def test_terminal_grant_advances_the_workspace_catalog_projection() -> None:
+    """A terminal grant applies the E4 catalog Update leg, not just tolerates it.
+
+    The commit's TransactWriteItems carries the state fence Update AND a second
+    workspace-catalog Update leg (binding :cat_state / :cat_updated). This proves
+    the catalog projection row's state advances to ``approved`` on a grant — i.e.
+    the fake dispatched the catalog leg by its own expression and applied it,
+    rather than crashing on the fence-only ``:expected`` assumption.
+    """
+    client = StatefulDynamoClient()
+    handler = _handler(client)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    catalog_key = ("WS#workspace.default#CATALOG", f"OP#{op_id}")
+    # At prepare, the catalog row exists and is pending_approval.
+    assert client.items[catalog_key]["state"]["S"] == "pending_approval"
+
+    grant = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert grant["statusCode"] == 200
+    # The catalog projection advanced via the dispatched catalog Update leg.
+    assert client.items[catalog_key]["state"]["S"] == "approved"
+    # updated_at was refreshed by the same leg's SET assignment.
+    assert "updated_at" in client.items[catalog_key]
 
 
 def test_get_returns_bounded_workspace_scoped_evidence() -> None:
@@ -714,3 +732,64 @@ def test_not_yet_due_operation_is_not_expired_on_access() -> None:
         )
     )
     assert grant["statusCode"] == 200
+
+
+# -- generic transact-leg dispatch (issue #416, E4 catalog Update leg) --------
+
+_SET_ASSIGNMENT = __import__("re").compile(r"([#\w]+)\s*=\s*(:[\w]+)")
+
+
+def _set_clause(expression: str) -> str:
+    # Standard library
+    import re as _re
+
+    match = _re.search(
+        r"\bSET\b(.*?)(?:\bREMOVE\b|\bADD\b|\bDELETE\b|$)",
+        expression,
+        flags=_re.IGNORECASE | _re.DOTALL,
+    )
+    return match.group(1) if match else ""
+
+
+def _put_condition_holds(put: dict, items: dict) -> bool:
+    item = put["Item"]
+    key = (item["PK"]["S"], item["SK"]["S"])
+    cond = put.get("ConditionExpression", "")
+    if ("attribute_not_exists(PK)" in cond or "attribute_not_exists(SK)" in cond) and key in items:
+        return False
+    if "attribute_exists(SK)" in cond and key not in items:
+        return False
+    return True
+
+
+def _update_condition_holds(upd: dict, items: dict) -> bool:
+    key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
+    existing = items.get(key)
+    cond = upd.get("ConditionExpression", "")
+    names = upd.get("ExpressionAttributeNames", {})
+    values = upd.get("ExpressionAttributeValues", {})
+    if "attribute_exists" in cond and existing is None:
+        return False
+    # Enforce every "<attr> = :value" equality the condition declares, using only
+    # the placeholders this leg actually binds (the catalog leg binds none of the
+    # fence placeholders, so it is checked purely on existence).
+    for name_token, value_token in _SET_ASSIGNMENT.findall(cond):
+        if value_token not in values:
+            continue
+        attr = names.get(name_token, name_token)
+        if existing is None or existing.get(attr) != values[value_token]:
+            return False
+    return True
+
+
+def _apply_update(upd: dict, items: dict) -> None:
+    key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
+    existing = dict(items.get(key, {"PK": upd["Key"]["PK"], "SK": upd["Key"]["SK"]}))
+    names = upd.get("ExpressionAttributeNames", {})
+    values = upd.get("ExpressionAttributeValues", {})
+    for name_token, value_token in _SET_ASSIGNMENT.findall(_set_clause(upd.get("UpdateExpression", ""))):
+        if value_token not in values:
+            continue
+        attr = names.get(name_token, name_token)
+        existing[attr] = values[value_token]
+    items[key] = existing

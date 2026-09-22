@@ -54,6 +54,7 @@ class _GateStub:
 
     def evaluate(self) -> Any:
         if self._unavailable:
+            # Local modules
             from operations.control.kill_switch_gate import KillSwitchUnavailable
 
             raise KillSwitchUnavailable("down")

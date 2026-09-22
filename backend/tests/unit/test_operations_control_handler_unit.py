@@ -28,9 +28,9 @@ from typing import Any
 import pytest
 
 # Local modules
+from operations.contracts.control_plane import CAPABILITY_ID
 from operations.control.control_audit_store import ControlCommitOutcome
 from operations.control.control_handler import ControlRequestHandler
-from operations.contracts.control_plane import CAPABILITY_ID
 
 pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
@@ -176,6 +176,7 @@ def test_response_body_carries_no_identity() -> None:
 
 
 def test_authority_denied_maps_to_403() -> None:
+    # Local modules
     from operations.control.control_service import ControlServiceError
 
     service = _FakeControlService(error=ControlServiceError("AUTHORIZATION_DENIED", "denied"))
