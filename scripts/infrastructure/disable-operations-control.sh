@@ -93,7 +93,9 @@ aws cloudformation update-stack \
         "ParameterKey=TrustedAudience,UsePreviousValue=true" \
         "ParameterKey=CodeS3Bucket,UsePreviousValue=true" \
         "ParameterKey=ControlCodeS3Key,UsePreviousValue=true" \
-        "ParameterKey=AppConfigExtensionLayerArn,UsePreviousValue=true"
+        "ParameterKey=AppConfigExtensionLayerArn,UsePreviousValue=true" \
+        "ParameterKey=OperationsMode,UsePreviousValue=true" \
+        "ParameterKey=AppConfigExtensionPort,UsePreviousValue=true"
 
 echo "   Waiting for the update to complete ..."
 aws cloudformation wait stack-update-complete \

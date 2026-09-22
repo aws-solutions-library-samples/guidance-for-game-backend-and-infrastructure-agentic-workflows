@@ -156,10 +156,12 @@ def test_extension_layer_attached_only_when_supplied(label):
 def test_appconfig_identifiers_injected(label):
     template = _load(TEMPLATES[label])
     injected = _appconfig_env_vars(template)
+    # Backend contract names (no "_ID"/"_PROFILE_ID" suffix): the observe/execute
+    # handlers resolve the kill-switch identifiers under these exact names.
     required = {
-        "GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID",
-        "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID",
-        "GBAW_OPERATIONS_APPCONFIG_PROFILE_ID",
+        "GBAW_OPERATIONS_APPCONFIG_APPLICATION",
+        "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT",
+        "GBAW_OPERATIONS_APPCONFIG_PROFILE",
     }
     missing = required - injected
     assert not missing, f"{label} does not inject AppConfig identifiers: {missing}"

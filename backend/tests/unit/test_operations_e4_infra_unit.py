@@ -69,18 +69,34 @@ KILL_SWITCH_SCHEMA = PROJECT_ROOT / "backend/src/operations/contracts/schemas/v1
 METRIC_NAMESPACE = "GameAgent/Operations"
 
 # The frozen E4 control-plane routes (mirrors control_plane.ROUTE_KEYS).
+# The frozen routes the ControlPlaneRouter actually dispatches (router.py). The
+# kill-switch STATUS is read via GET /operations/capabilities (which reads the
+# gate through the AppConfig extension); there is deliberately no separately
+# routed GET /operations/control/kill-switch, because the router would misroute
+# it into the /operations/{operationId} detail catch-all. Wiring such a route to
+# the integration would 400/404 at the backend, so it is not provisioned.
 E4_ROUTE_KEYS = frozenset(
     {
         "GET /operations/capabilities",
         "GET /operations",
         "GET /operations/{operationId}",
         "POST /operations/control",
-        "GET /operations/control/kill-switch",
     }
 )
 
-# The exact bounded DynamoDB audit item actions the control role needs.
-ALLOWED_DYNAMODB_ACTIONS = frozenset({"dynamodb:PutItem", "dynamodb:GetItem"})
+# The exact bounded DynamoDB item actions the control/read/sweeper role needs:
+# the transaction underlying single-item writes (PutItem/UpdateItem), point
+# reads (GetItem) for compare-and-set, and the workspace-scoped catalog Query
+# the read projections and the expiry sweeper enumerate with. NEVER
+# TransactWriteItems, Scan, DeleteItem, or any Batch action.
+ALLOWED_DYNAMODB_ACTIONS = frozenset(
+    {
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+    }
+)
 
 # The exact AppConfig authoring actions the control role needs.
 ALLOWED_APPCONFIG_ACTIONS = frozenset(
@@ -99,7 +115,6 @@ ALLOWED_APPCONFIG_ACTIONS = frozenset(
 # source control, no unbounded DynamoDB, no generic AppConfig admin.
 E4_FORBIDDEN_ACTION_SUBSTRINGS = (
     "iam:PassRole",
-    "secretsmanager:",
     "ssm:GetParameter",
     "codecommit:",
     "codeconnections:",
@@ -108,13 +123,13 @@ E4_FORBIDDEN_ACTION_SUBSTRINGS = (
     "codepipeline:",
     "gamelift:",
     "states:",
-    "dynamodb:UpdateItem",
     "dynamodb:DeleteItem",
-    "dynamodb:Query",
     "dynamodb:Scan",
     "dynamodb:BatchWriteItem",
     "dynamodb:BatchGetItem",
     "dynamodb:ConditionCheckItem",
+    "dynamodb:TransactWriteItems",
+    "dynamodb:TransactGetItems",
     "appconfig:CreateApplication",
     "appconfig:DeleteApplication",
     "appconfig:CreateEnvironment",
@@ -302,15 +317,16 @@ def test_validator_schema_has_no_external_refs(template):
 # --------------------------------------------------------------------------- #
 # Monitor + automatic rollback
 # --------------------------------------------------------------------------- #
-def test_environment_monitors_wire_failed_and_unverified_alarms(template):
+def test_environment_monitors_wire_real_rollback_alarms(template):
     env = _resources_of_type(template, "AWS::AppConfig::Environment")
     (env_body,) = env.values()
     monitors = env_body["Properties"]["Monitors"]
     assert monitors, "gradual deployment has no CloudWatch monitor -> no auto-rollback"
-    # !GetAtt Alarm.Arn flattens to the string "Alarm.Arn".
+    # !GetAtt Alarm.Arn flattens to the string "Alarm.Arn". The monitor watches
+    # alarms driven by metrics the backend ACTUALLY emits: a kill switch that
+    # cannot be read back fresh (KillSwitchUnavailable) triggers auto-rollback.
     monitored = {m["AlarmArn"] for m in monitors}
-    assert "KillSwitchFailedAlarm.Arn" in monitored
-    assert "KillSwitchUnverifiedAlarm.Arn" in monitored
+    assert "KillSwitchUnavailableAlarm.Arn" in monitored
     for m in monitors:
         assert "AlarmRoleArn" in m
 
@@ -355,11 +371,42 @@ def test_extension_layer_parameter_is_pattern_constrained_to_official_layer(temp
 
 def test_control_function_injects_appconfig_identifiers(template):
     env = _control_function_env(template)
-    assert env["GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID"] == "ControlApplication"
-    assert env["GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID"] == "ControlEnvironmentResource"
-    assert env["GBAW_OPERATIONS_APPCONFIG_PROFILE_ID"] == "KillSwitchConfigurationProfile"
-    # Kill switch lever 2.
+    # Backend contract (operations.settings.resolve_control_plane_deployment_settings)
+    # reads the AppConfig identifiers under names WITHOUT the "_ID"/"_PROFILE_ID"
+    # suffix. The template must emit exactly these names or the handler fails
+    # closed at load.
+    assert env["GBAW_OPERATIONS_APPCONFIG_APPLICATION"] == "ControlApplication"
+    assert env["GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT"] == "ControlEnvironmentResource"
+    assert env["GBAW_OPERATIONS_APPCONFIG_PROFILE"] == "KillSwitchConfigurationProfile"
+    assert env["GBAW_OPERATIONS_APPCONFIG_GRADUAL_STRATEGY_ID"] == "GradualDeploymentStrategy"
+    assert env["GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID"] == "ImmediateDeploymentStrategy"
+    # The AppConfig Lambda extension listens on a localhost port the handler GETs.
+    assert env["GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT"] == "AppConfigExtensionPort"
+    # The signing key is delivered as a Secrets Manager ARN (the agreed fix), not
+    # a plaintext value in the template, and never appears in outputs/logs.
+    assert env["GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN"] == "CursorSigningSecret"
+    assert "GBAW_OPERATIONS_CURSOR_SIGNING_KEY" not in env, "signing key must not be a plaintext env value"
+    # Whether the capability is provisioned (bool).
+    assert env["GBAW_OPERATIONS_CONTROL_PROVISIONED"] == "Provisioned"
+    # Kill switch lever 2 (control-plane on/off), distinct from the ADR-0001
+    # deployment ceiling GBAW_OPERATIONS_MODE.
     assert env["GBAW_OPERATIONS_CONTROL_MODE"] == "ControlMode"
+    # The single backend-enforced ceiling MUST be present and MUST be the
+    # deployment ceiling parameter, never repurposed to the control on/off lever.
+    assert env["GBAW_OPERATIONS_MODE"] == "OperationsMode"
+    assert env["GBAW_OPERATIONS_MODE"] != env["GBAW_OPERATIONS_CONTROL_MODE"]
+    # The freshness horizon is a code default (control_service), not an env var.
+    assert "GBAW_OPERATIONS_KILL_SWITCH_FRESHNESS_SECONDS" not in env
+
+
+def test_control_and_sweeper_share_the_control_mode_lever(template):
+    """Both the control and the sweeper Lambda run with CONTROL_MODE=enabled/the
+    ControlMode lever so an emergency disable fails BOTH closed without deleting
+    resources; neither repurposes the global operations ceiling."""
+    for fn_name in ("ControlFunction", "SweeperFunction"):
+        env = template["Resources"][fn_name]["Properties"]["Environment"]["Variables"]
+        assert env["GBAW_OPERATIONS_CONTROL_MODE"] == "ControlMode"
+        assert env["GBAW_OPERATIONS_MODE"] == "OperationsMode"
 
 
 # --------------------------------------------------------------------------- #
@@ -372,9 +419,33 @@ def test_no_forbidden_actions_anywhere(template):
             assert forbidden not in action, f"forbidden action surface present: {action}"
 
 
-def test_control_role_dynamodb_is_bounded_audit_only(template):
+def test_control_role_dynamodb_is_bounded_to_transaction_underlying_actions(template):
     ddb_actions = {a for a in _all_policy_actions(template) if a.startswith("dynamodb:")}
     assert ddb_actions == ALLOWED_DYNAMODB_ACTIONS
+    # Explicitly assert the invalid/over-broad actions are absent.
+    for banned in (
+        "dynamodb:TransactWriteItems",
+        "dynamodb:Scan",
+        "dynamodb:DeleteItem",
+        "dynamodb:BatchWriteItem",
+    ):
+        assert banned not in ddb_actions
+
+
+def test_control_role_secret_access_is_exactly_getsecretvalue_scoped(template):
+    """The role may read ONLY the cursor-signing secret's value, nothing else in
+    Secrets Manager, and no other secret ARN."""
+    secret_statements = []
+    for _role, _policy, statement in _statements(template):
+        actions = list(_iter_action_strings(statement.get("Action", [])))
+        if any(a.startswith("secretsmanager:") for a in actions):
+            secret_statements.append((actions, statement.get("Resource")))
+    assert secret_statements, "control role has no scoped secret read for the signing key"
+    for actions, resource in secret_statements:
+        assert set(actions) == {"secretsmanager:GetSecretValue"}, actions
+        blob = json.dumps(resource)
+        assert "CursorSigningSecret" in blob, blob
+        assert resource != "*"
 
 
 def test_control_role_appconfig_actions_are_exactly_allowed(template):
@@ -415,57 +486,139 @@ def test_no_star_star_admin_statement(template):
 # --------------------------------------------------------------------------- #
 # EventBridge expiry sweeper
 # --------------------------------------------------------------------------- #
-def test_expiry_sweeper_targets_control_function(template):
+def test_sweeper_is_a_distinct_function_with_the_sweeper_entrypoint(template):
+    """The expiry sweeper is its OWN Lambda on operations.control.sweeper_entry.handler
+    (NOT the control API handler), with its own log group, and it reuses the
+    least-privilege control role."""
+    sweeper = template["Resources"]["SweeperFunction"]["Properties"]
+    assert sweeper["Handler"] == "operations.control.sweeper_entry.handler"
+    control = template["Resources"]["ControlFunction"]["Properties"]
+    assert control["Handler"] == "operations.control.control_entry.handler"
+    assert sweeper["Handler"] != control["Handler"]
+    # Its own dedicated log group (no orphan/unused log group left behind).
+    assert "SweeperLogGroup" in template["Resources"]
+    assert template["Resources"]["SweeperLogGroup"]["Type"] == "AWS::Logs::LogGroup"
+
+
+def test_expiry_sweeper_targets_the_sweeper_function(template):
     rules = _resources_of_type(template, "AWS::Events::Rule")
     assert rules, "missing EventBridge freshness-expiry sweeper"
     (rule,) = rules.values()
     props = rule["Properties"]
     assert props["ScheduleExpression"].startswith("rate(")
     targets = props["Targets"]
-    # !GetAtt ControlFunction.Arn flattens to "ControlFunction.Arn".
-    assert any(t["Arn"] == "ControlFunction.Arn" for t in targets)
+    # The rule must target the DISTINCT sweeper function, not the control API fn.
+    assert any(t["Arn"] == "SweeperFunction.Arn" for t in targets)
+    assert not any(t["Arn"] == "ControlFunction.Arn" for t in targets)
     # Sweeper is disabled when the control plane is disabled (fail-closed).
-    # !If [ControlEnabled, ENABLED, DISABLED] -> ["ControlEnabled","ENABLED","DISABLED"].
     assert props["State"] == ["ControlEnabled", "ENABLED", "DISABLED"]
 
 
-def test_sweeper_has_invoke_permission(template):
+def test_sweeper_has_invoke_permission_on_the_sweeper_function(template):
     perms = _resources_of_type(template, "AWS::Lambda::Permission")
-    principals = {p["Properties"]["Principal"] for p in perms.values()}
-    assert "events.amazonaws.com" in principals
+    events_perms = [p for p in perms.values() if p["Properties"]["Principal"] == "events.amazonaws.com"]
+    assert events_perms, "missing EventBridge invoke permission for the sweeper"
+    for perm in events_perms:
+        assert perm["Properties"]["FunctionName"] == "SweeperFunction"
+
+
+def test_no_orphan_log_group(template):
+    """Every provisioned log group is referenced by a function (no unused group)."""
+    log_groups = set(_resources_of_type(template, "AWS::Logs::LogGroup"))
+    referenced = set()
+    for fn in _resources_of_type(template, "AWS::Lambda::Function").values():
+        # DependsOn / Environment references flatten to logical-id strings.
+        blob = json.dumps(fn)
+        for lg in log_groups:
+            if lg in blob:
+                referenced.add(lg)
+    # Access log group is referenced by the API stage, not a function.
+    for stage in _resources_of_type(template, "AWS::ApiGatewayV2::Stage").values():
+        blob = json.dumps(stage)
+        for lg in log_groups:
+            if lg in blob or lg.replace("Group", "") in blob:
+                referenced.add(lg)
+    unused = log_groups - referenced - {"ControlAccessLogGroup"}
+    assert not unused, f"orphan/unused log group(s): {unused}"
 
 
 # --------------------------------------------------------------------------- #
 # Alarms: every #416 control-plane alarm, truthful metric/statistic
 # --------------------------------------------------------------------------- #
-def test_all_416_alarms_present_with_truthful_metrics(template):
+# Every E4 alarm MUST reference a metric the backend actually emits. Backend
+# emitters (verified against operations/**/metrics.py at the backend contract):
+#   control/metrics.py     -> ControlApplied, ControlVersionConflict,
+#                             ControlDenied, KillSwitchUnavailable,
+#                             OperationsExpirySweepExpired
+#   execute/metrics.py     -> ExecutionFailures, ExecutionHumanReconciliationRequired
+# There is NO emitted signal for "retrying", "rollback-failed", or a
+# "deployments-started" budget count, so those alarms are NOT provisioned
+# (fabricating a metric would create an alarm that can never fire truthfully).
+BACKEND_EMITTED_OPERATIONS_METRICS = frozenset(
+    {
+        "ControlApplied",
+        "ControlVersionConflict",
+        "ControlDenied",
+        "KillSwitchUnavailable",
+        "OperationsExpirySweepExpired",
+        "ExecutionFailures",
+        "ExecutionHumanReconciliationRequired",
+        "ObservationFailures",
+        "ObservationTimeouts",
+        "StuckOperations",
+        "ObservationRequestLatency",
+        "ExecutionRequestLatency",
+        "ExecutionReconciled",
+        "ExecutionProviderWrites",
+        "PreparationFailures",
+        "ApprovalFailures",
+        "ApprovalExpired",
+        "CancellationConflicts",
+    }
+)
+
+# The E4 stack's own required alarms (all on backend-emitted metrics).
+E4_REQUIRED_ALARM_METRICS = frozenset(
+    {
+        "KillSwitchUnavailable",
+        "ControlVersionConflict",
+        "ControlDenied",
+        "OperationsExpirySweepExpired",
+        "ExecutionHumanReconciliationRequired",
+    }
+)
+
+
+def test_all_416_alarms_reference_only_backend_emitted_metrics(template):
     alarms = _alarms(template)
     by_metric = {a["Properties"]["MetricName"]: a["Properties"] for a in alarms.values()}
-    required = {
+    # Every alarm's metric must be a real emitted signal -- no fabrication.
+    for metric in by_metric:
+        assert metric in BACKEND_EMITTED_OPERATIONS_METRICS, f"alarm on non-emitted metric: {metric}"
+    # The required E4 alarms are all present.
+    assert E4_REQUIRED_ALARM_METRICS.issubset(
+        set(by_metric)
+    ), f"missing #416 alarms: {E4_REQUIRED_ALARM_METRICS - set(by_metric)}"
+    for metric, props in by_metric.items():
+        assert props["Namespace"] == METRIC_NAMESPACE
+        assert props.get("Statistic") in {"Sum", "Maximum"}
+        assert "ExtendedStatistic" not in props, f"{metric} misuses a percentile"
+
+
+def test_no_fabricated_deployment_metric_alarms(template):
+    """The template must not resurrect the fabricated deployment-lifecycle
+    metrics that the backend never emits."""
+    fabricated = {
         "KillSwitchFailed",
         "KillSwitchStuck",
         "KillSwitchRetrying",
         "KillSwitchUnverified",
         "KillSwitchRollbackFailed",
-        "KillSwitchDeploymentsStarted",  # budget-exceeded
+        "KillSwitchDeploymentsStarted",
         "OperationsDisabled",
     }
-    assert required.issubset(set(by_metric)), f"missing #416 alarms: {required - set(by_metric)}"
-    for metric, props in by_metric.items():
-        assert props["Namespace"] == METRIC_NAMESPACE
-        if metric == "OperationsDisabled":
-            assert props.get("Statistic") == "Maximum"
-        else:
-            assert props.get("Statistic") in {"Sum", "Maximum"}
-        assert "ExtendedStatistic" not in props, f"{metric} misuses a percentile"
-
-
-def test_budget_alarm_uses_threshold_parameter(template):
-    alarms = _alarms(template)
-    budget = [a for a in alarms.values() if a["Properties"]["MetricName"] == "KillSwitchDeploymentsStarted"][0]
-    # !Ref DeploymentBudgetThreshold -> "DeploymentBudgetThreshold".
-    assert budget["Properties"]["Threshold"] == "DeploymentBudgetThreshold"
-    assert budget["Properties"]["ComparisonOperator"] == "GreaterThanThreshold"
+    present = {a["Properties"]["MetricName"] for a in _alarms(template).values()}
+    assert not (fabricated & present), f"fabricated-metric alarm(s) present: {fabricated & present}"
 
 
 # --------------------------------------------------------------------------- #

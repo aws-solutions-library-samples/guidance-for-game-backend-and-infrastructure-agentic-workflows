@@ -832,9 +832,9 @@ Resources:
           GBAW_OPERATIONS_CAPACITY_CEILING: !Ref CapacityCeiling
           GBAW_OPERATIONS_CAPACITY_MAX_STEP: !Ref CapacityMaxStep
           # E4 additive kill-switch identifiers (empty when unwired).
-          GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID: !Ref KillSwitchApplicationId
-          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID: !Ref KillSwitchEnvironmentId
-          GBAW_OPERATIONS_APPCONFIG_PROFILE_ID: !Ref KillSwitchProfileId
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref KillSwitchApplicationId
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref KillSwitchEnvironmentId
+          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchProfileId
       # E4 additive: attach the official AppConfig extension layer only when its
       # ARN is supplied; otherwise no layer (AWS::NoValue).
       Layers:

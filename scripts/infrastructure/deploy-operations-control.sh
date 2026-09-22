@@ -76,6 +76,11 @@ COGNITO_CLIENT_ID="${COGNITO_CLIENT_ID:-}"
 OPERATIONS_TABLE_NAME="${GBAW_OPERATIONS_TABLE_NAME:-}"
 OPERATIONS_KMS_KEY_ARN="${GBAW_OPERATIONS_KMS_KEY_ARN:-}"
 # Server-side trusted identity binding (must match the 06 stack).
+# ADR-0001 deployment ceiling (GBAW_OPERATIONS_MODE), passed to the control
+# stack so capability discovery reports the true ceiling. DISTINCT from the
+# control on/off lever; defaults to the fail-closed 'disabled'. Set it to match
+# the ceiling the 06/07 stacks run at.
+OPERATIONS_MODE="${GBAW_OPERATIONS_MODE:-disabled}"
 OPERATIONS_TENANT_ID="${GBAW_OPERATIONS_TENANT_ID:-}"
 OPERATIONS_WORKSPACE_ID="${GBAW_OPERATIONS_WORKSPACE_ID:-}"
 OPERATIONS_TRUSTED_AUDIENCE="${GBAW_OPERATIONS_TRUSTED_AUDIENCE:-}"
@@ -109,6 +114,9 @@ Environment for --enable:
   GBAW_OPERATIONS_TENANT_ID                  Server-side trusted tenant, matching
   GBAW_OPERATIONS_WORKSPACE_ID               the 06 stack (both required).
   GBAW_OPERATIONS_TRUSTED_AUDIENCE           Optional; defaults to CognitoClientId.
+  GBAW_OPERATIONS_MODE                       Optional ADR-0001 deployment ceiling
+                                             (disabled|observe|advise|remediate|
+                                             operate); defaults to disabled.
   GBAW_OPERATIONS_TABLE_NAME                 06-exported operations table name
                                              (required).
   GBAW_OPERATIONS_KMS_KEY_ARN                06-exported operations CMK ARN
@@ -431,6 +439,7 @@ aws cloudformation deploy \
         "TrustedAudience=$OPERATIONS_TRUSTED_AUDIENCE" \
         "CodeS3Bucket=$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
         "ControlCodeS3Key=$S3_KEY" \
+        "OperationsMode=$OPERATIONS_MODE" \
         "AppConfigExtensionLayerArn=$APPCONFIG_EXTENSION_LAYER_ARN"
 
 echo "✅ Deployed $STACK_NAME with ControlMode=enabled (AppConfig kill switch live)."
