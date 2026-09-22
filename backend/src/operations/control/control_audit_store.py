@@ -8,9 +8,10 @@ never-expiring audit records:
 * a *control intent* record, written before a decision is attempted, capturing
   the acting admin (subject/client identifiers only) and the desired boolean
   state; and
-* a *control outcome* record, written in the SAME atomic transaction that
-  advances the state item, capturing before/after ``config_version`` and the
-  decision outcome.
+* a *control outcome* record, written with a separate idempotent ``PutItem``
+  immediately after the conditional ``UpdateItem`` that advances the state item,
+  capturing before/after ``config_version`` and the decision outcome. The state
+  advance is the atomic compare-and-set; no ``TransactWriteItems`` is used.
 
 The decision commit is a compare-and-set on ``expected_config_version``: the
 state item advances only if its stored ``config_version`` still equals the
@@ -160,9 +161,10 @@ class DynamoDbControlAuditStore:
         """CAS-advance the state and write the immutable outcome audit record.
 
         The state item advances only if its stored ``config_version`` equals
-        ``expected_config_version``. On a stale version the whole transaction is
-        cancelled and :attr:`ControlCommitOutcome.VERSION_CONFLICT` is returned;
-        neither the state nor the audit record is written.
+        ``expected_config_version`` (a conditional ``UpdateItem``). On a stale
+        version the conditional check fails and
+        :attr:`ControlCommitOutcome.VERSION_CONFLICT` is returned; neither the
+        state nor the outcome audit record is written.
         """
         # Always record the immutable pre-decision intent first (idempotent).
         self.record_control_intent(record_id=record_id, actor=actor, desired=desired)
@@ -176,21 +178,39 @@ class DynamoDbControlAuditStore:
             outcome=outcome,
         )
 
-        state_update = {
-            "Update": {
-                "TableName": self._table_name,
-                "Key": _marshal({"PK": _CONTROL_PK, "SK": _STATE_SK}),
-                "UpdateExpression": "SET config_version = :new_version",
-                "ConditionExpression": "attribute_exists(PK) AND config_version = :expected",
-                "ExpressionAttributeValues": _marshal(
+        # CAS-advance the state item with a conditional UpdateItem. Only IAM
+        # actions PutItem/UpdateItem/GetItem are granted to the control store, so
+        # this is deliberately NOT a TransactWriteItems call (which would require
+        # an ungranted action and fail with AccessDenied at runtime). The state
+        # advance is the atomic compare-and-set that decides the outcome: if it
+        # succeeds, the immutable outcome audit record is written with a separate
+        # idempotent PutItem; if the version moved on, the conditional check
+        # fails and no audit outcome record is written.
+        try:
+            self._client.update_item(
+                TableName=self._table_name,
+                Key=_marshal({"PK": _CONTROL_PK, "SK": _STATE_SK}),
+                UpdateExpression="SET config_version = :new_version",
+                ConditionExpression="attribute_exists(PK) AND config_version = :expected",
+                ExpressionAttributeValues=_marshal(
                     {":new_version": int(resulting_config_version), ":expected": int(expected_config_version)}
                 ),
-            }
-        }
-        audit_put = {
-            "Put": {
-                "TableName": self._table_name,
-                "Item": _marshal(
+            )
+        except Exception as exc:  # noqa: BLE001 - classify a pure conditional race
+            if _is_conditional_failure(exc):
+                # The stored version moved on: a genuine CAS conflict, never a
+                # silent success and never a fabricated audit outcome record.
+                return ControlCommitOutcome.VERSION_CONFLICT
+            _LOGGER.error("control state advance failed and is retryable")
+            raise ControlStoreError("control decision commit failed") from exc
+
+        # The state advanced. Persist the immutable, hash-bound outcome record
+        # with an idempotent conditional PutItem. A duplicate record_id (a retry
+        # after the state already advanced) is a no-op, not an error.
+        try:
+            self._client.put_item(
+                TableName=self._table_name,
+                Item=_marshal(
                     {
                         "PK": _CONTROL_PK,
                         "SK": f"{_OUTCOME_SK_PREFIX}{record_id}",
@@ -200,18 +220,15 @@ class DynamoDbControlAuditStore:
                         "audit_json": _canonical_json(audit_record),
                     }
                 ),
-                "ConditionExpression": "attribute_not_exists(SK)",
-            }
-        }
-        try:
-            self._client.transact_write_items(TransactItems=[state_update, audit_put])
-        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
+                ConditionExpression="attribute_not_exists(SK)",
+            )
+        except Exception as exc:  # noqa: BLE001
             if _is_conditional_failure(exc):
-                # The stored version moved on (or the audit SK exists): a genuine
-                # CAS conflict, never a silent success.
-                return ControlCommitOutcome.VERSION_CONFLICT
-            _LOGGER.error("control decision commit failed and is retryable")
-            raise ControlStoreError("control decision commit failed") from exc
+                # The outcome record already exists for this record_id: the
+                # decision is already recorded and committed. Idempotent.
+                return ControlCommitOutcome.COMMITTED
+            _LOGGER.error("control outcome audit write failed and is retryable")
+            raise ControlStoreError("control audit outcome write failed") from exc
 
         return ControlCommitOutcome.COMMITTED
 

@@ -58,32 +58,26 @@ class _FakeDynamo:
         item = self.items.get((Key["PK"]["S"], Key["SK"]["S"]))
         return {"Item": item} if item else {}
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
-        staged: dict[tuple[str, str], dict[str, Any]] = {}
-        for entry in TransactItems:
-            if "Put" in entry:
-                item = entry["Put"]["Item"]
-                key = (item["PK"]["S"], item["SK"]["S"])
-                cond = entry["Put"].get("ConditionExpression", "")
-                if "attribute_not_exists" in cond and (key in self.items or key in staged):
-                    raise _transaction_canceled()
-                staged[key] = item
-            elif "Update" in entry:
-                upd = entry["Update"]
-                key = (upd["Key"]["PK"]["S"], upd["Key"]["SK"]["S"])
-                values = upd.get("ExpressionAttributeValues", {})
-                existing = self.items.get(key) or staged.get(key)
-                # CAS: current config_version must equal :expected.
-                if ":expected" in values:
-                    current = existing.get("config_version", {}).get("N") if existing else None
-                    if current != values[":expected"]["N"]:
-                        raise _transaction_canceled()
-                new_item = dict(existing) if existing else {"PK": upd["Key"]["PK"], "SK": upd["Key"]["SK"]}
-                if ":new_version" in values:
-                    new_item["config_version"] = values[":new_version"]
-                staged[key] = new_item
-        self.items.update(staged)
+    def update_item(self, *, TableName: str, Key: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        key = (Key["PK"]["S"], Key["SK"]["S"])
+        existing = self.items.get(key)
+        values = kwargs.get("ExpressionAttributeValues", {})
+        cond = kwargs.get("ConditionExpression", "")
+        if "attribute_exists" in cond and existing is None:
+            raise _conditional_error()
+        # CAS: current config_version must equal :expected.
+        if ":expected" in values:
+            current = existing.get("config_version", {}).get("N") if existing else None
+            if current != values[":expected"]["N"]:
+                raise _conditional_error()
+        new_item = dict(existing) if existing else {"PK": Key["PK"], "SK": Key["SK"]}
+        if ":new_version" in values:
+            new_item["config_version"] = values[":new_version"]
+        self.items[key] = new_item
         return {}
+
+    def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:  # pragma: no cover
+        raise AssertionError("control store must not use TransactWriteItems")
 
     def scan(self, **kwargs: Any) -> dict[str, Any]:  # pragma: no cover
         self.scans += 1
@@ -93,15 +87,6 @@ class _FakeDynamo:
 def _conditional_error() -> Exception:
     exc = Exception("ConditionalCheckFailed")
     exc.response = {"Error": {"Code": "ConditionalCheckFailedException"}}  # type: ignore[attr-defined]
-    return exc
-
-
-def _transaction_canceled() -> Exception:
-    exc = Exception("TransactionCanceled")
-    exc.response = {  # type: ignore[attr-defined]
-        "Error": {"Code": "TransactionCanceledException"},
-        "CancellationReasons": [{"Code": "ConditionalCheckFailed"}],
-    }
     return exc
 
 
@@ -223,7 +208,7 @@ def test_provider_unavailable_is_not_a_false_conflict() -> None:
         exc.response = {"Error": {"Code": "ProvisionedThroughputExceededException"}}  # type: ignore[attr-defined]
         raise exc
 
-    dynamo.transact_write_items = boom  # type: ignore[assignment]
+    dynamo.update_item = boom  # type: ignore[assignment]
     store = _store(dynamo)
     store.items = {}  # ensure state read path
     dynamo.items[("OPCONTROL#kill-switch", "STATE#current")] = {
