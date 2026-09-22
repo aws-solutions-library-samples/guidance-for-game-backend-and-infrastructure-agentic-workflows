@@ -120,6 +120,18 @@ class OperationsSettings:
         """Whether the deployment ceiling admits the deterministic advise phase."""
         return _AUTHORITY_ORDER[self.mode] >= _AUTHORITY_ORDER[_ADVISE_MODE]
 
+    @property
+    def e2_enabled(self) -> bool:
+        """Whether the deployment ceiling admits the E2 prepare/approval surface.
+
+        The E2 prepare/approval lifecycle (issue #414) is gated by the same
+        ``advise`` ceiling as the deterministic advise phase: ``advise`` and
+        every higher mode enable E1 observe *and* E2, while ``disabled`` and a
+        bare ``observe`` ceiling deny it. E2 performs no provider write; the
+        higher ``remediate``/``operate`` ceilings gate later phases, not E2.
+        """
+        return _AUTHORITY_ORDER[self.mode] >= _AUTHORITY_ORDER[_ADVISE_MODE]
+
     def authority_ceiling(self, *, requested: str) -> str:
         """Return the lower of the deployment ceiling and a requested authority."""
         if requested not in _AUTHORITY_ORDER:
@@ -152,6 +164,10 @@ class ObservationDeploymentSettings:
     @property
     def observe_enabled(self) -> bool:
         return self.operations.observe_enabled
+
+    @property
+    def e2_enabled(self) -> bool:
+        return self.operations.e2_enabled
 
 
 def resolve_operations_settings(env: Mapping[str, str] | None = None) -> OperationsSettings:
