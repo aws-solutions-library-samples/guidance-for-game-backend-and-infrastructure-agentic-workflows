@@ -83,6 +83,7 @@
     "authority",
     "retry_policy",
     "future_executor_binding",
+    "required_execution_authority",
     "prepared_hash"
   ],
   "properties": {
@@ -289,6 +290,11 @@
     },
     "future_executor_binding": {
       "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/executor_binding"
+    },
+    "required_execution_authority": {
+      "type": "string",
+      "const": "remediate",
+      "$comment": "Immutable, hash-bound minimum execution authority a future E3 executor MUST independently re-verify (mode/policy >= remediate) before any provider write. E2 prepare/approval runs at advise authority and never elevates this; tampering with it changes prepared_hash and fails const validation."
     },
     "prepared_hash": {
       "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"

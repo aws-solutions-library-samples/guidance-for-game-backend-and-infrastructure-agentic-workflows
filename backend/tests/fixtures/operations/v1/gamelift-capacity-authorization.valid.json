@@ -2,7 +2,7 @@
   "authorization_contract_version": "1.0",
   "decision_id": "authz.op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
   "phase": "advise",
-  "prepared_operation_hash": "sha256:2217fff5f2634364a933e729ed5d2de25a57171f7d80553b7179333335d22542",
+  "prepared_operation_hash": "sha256:62e1b2ff7853fa8dd8817bdcab7ef81a91784709df4624000ec1484bc46a0707",
   "principal": {
     "subject_id": "subject.operator-1",
     "client_id": "client.web-console",
@@ -22,6 +22,7 @@
   "reason_codes": [
     "APPROVAL_REQUIRED"
   ],
+  "required_execution_authority": "remediate",
   "policy_version": "2026-09-01",
   "evaluated_at": "2026-09-21T19:11:52Z",
   "expires_at": "2026-09-21T19:26:52Z",

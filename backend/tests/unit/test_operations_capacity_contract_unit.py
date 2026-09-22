@@ -252,6 +252,7 @@ def test_prepared_hash_excludes_only_itself() -> None:
         ("requester", "workspace_id"),
         ("expires_at",),
         ("future_executor_binding", "executor_id"),
+        ("required_execution_authority",),
     ],
 )
 def test_prepared_hash_changes_when_any_bound_field_changes(path: tuple[str, ...]) -> None:
@@ -309,6 +310,67 @@ def test_disabled_deployment_requires_denied_decision() -> None:
     authz["effective_authority"] = "disabled"
     with pytest.raises(CapacityContractError):
         validate_capacity_contract(AUTHORIZATION_SCHEMA_NAME, authz)
+
+
+@pytest.mark.unit
+def test_prepared_operation_requires_required_execution_authority() -> None:
+    operation = _fixture(PREPARED_OPERATION_SCHEMA_NAME)
+    del operation["required_execution_authority"]
+    operation["prepared_hash"] = capacity_prepared_hash(operation)
+    with pytest.raises(CapacityContractError):
+        validate_capacity_contract(PREPARED_OPERATION_SCHEMA_NAME, operation)
+
+
+@pytest.mark.unit
+def test_prepared_operation_rejects_non_remediate_required_execution_authority() -> None:
+    # The value is const=remediate in schema and re-checked semantically, so a
+    # rehashed operation that lowers it still fails: the advise E2 phase can
+    # never elevate — or lower — the execution authority a future E3 re-verifies.
+    operation = _fixture(PREPARED_OPERATION_SCHEMA_NAME)
+    operation["required_execution_authority"] = "advise"
+    operation["prepared_hash"] = capacity_prepared_hash(operation)
+    with pytest.raises(CapacityContractError):
+        validate_capacity_contract(PREPARED_OPERATION_SCHEMA_NAME, operation)
+
+
+@pytest.mark.unit
+def test_non_denied_decision_is_allowed_at_advise_authority() -> None:
+    # Regression: the advise-authority E2 phase yields approval_required, not a
+    # denial, when effective authority is exactly advise.
+    authz = _fixture(AUTHORIZATION_SCHEMA_NAME)
+    authz["authority_inputs"] = {
+        "deployment_mode": "advise",
+        "tenant_policy": "advise",
+        "workspace_policy": "advise",
+        "principal_authority": "advise",
+        "capability_maximum": "advise",
+        "operation_risk_policy": "advise",
+    }
+    authz["effective_authority"] = "advise"
+    authz["decision"] = "approval_required"
+    authz["reason_codes"] = ["APPROVAL_REQUIRED"]
+    validate_capacity_contract(AUTHORIZATION_SCHEMA_NAME, authz)
+
+
+@pytest.mark.unit
+def test_authorization_requires_remediate_execution_authority() -> None:
+    authz = _fixture(AUTHORIZATION_SCHEMA_NAME)
+    authz["required_execution_authority"] = "advise"
+    with pytest.raises(CapacityContractError):
+        validate_capacity_contract(AUTHORIZATION_SCHEMA_NAME, authz)
+
+
+@pytest.mark.unit
+def test_binding_fails_on_required_execution_authority_mismatch() -> None:
+    operation = _fixture(PREPARED_OPERATION_SCHEMA_NAME)
+    authz = _fixture(AUTHORIZATION_SCHEMA_NAME)
+    # A valid-looking authorization whose immutable execution authority disagrees
+    # with the prepared operation must fail the binding (both are const=remediate
+    # so this is defense in depth against a future contract change).
+    authz = deepcopy(authz)
+    authz["required_execution_authority"] = "operate"
+    with pytest.raises(CapacityContractError):
+        validate_prepared_operation_binding(operation, authz)
 
 
 # -- Binding -----------------------------------------------------------------

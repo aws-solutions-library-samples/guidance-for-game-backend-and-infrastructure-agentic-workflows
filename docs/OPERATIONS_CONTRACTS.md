@@ -266,15 +266,28 @@ port at advice time, applies server-owned enrollment/policy bounds, and computes
 a deterministic change and risk. A trusted `PrepareService` then selects the
 exact playbook/capability in code — never from model text — evaluates the six
 ADR 0001 authority inputs and their deterministic minimum, and produces exactly
-one of `approval_required` or `denied`. A GameLift capacity change is never
-`authorized` outright; a non-denied outcome always requires a direct human
-approval.
+one of `approval_required` or `denied`. Preparing and approving are **advise**-
+authority acts — they bind an intent and record a human approval but never touch
+a provider — so a non-denied outcome only requires the six authority inputs to
+clear `advise`; `observe` and `disabled` still deny (`INSUFFICIENT_AUTHORITY` /
+`DEPLOYMENT_DISABLED`). A GameLift capacity change is never `authorized` outright;
+a non-denied outcome always requires a direct human approval.
+
+Every prepared operation and its authorization carry an immutable, hash-bound
+`required_execution_authority` (always `remediate`). This is the execution
+authority a **future E3 executor MUST independently re-verify** (deployment mode
+and policy at or above `remediate`) before any provider write. The advise-
+authority E2 phase never satisfies or elevates it, and approving an operation
+does not raise it. Because it is inside the hashed material, tampering with it
+changes `prepared_hash` and fails validation (it is also `const: "remediate"` in
+schema).
 
 The prepared operation is immutable and idempotent: its `prepared_hash` binds
 every other field — the target, the current-state observation id/hash, the exact
 desired/min/max change, the playbook/profile/capability/contract versions, the
-authority inputs/decision, the calculated risk, the requester scope, the expiry,
-and the future executor binding identifier — and excludes only itself. Its
+authority inputs/decision, the `required_execution_authority`, the calculated
+risk, the requester scope, the expiry, and the future executor binding
+identifier — and excludes only itself. Its
 timestamps are a deterministic function of the bound current-state revision, not
 the wall clock: `created_at` is the trusted E1 observation revision anchor
 (`current_state.observed_at`) and `expires_at` is derived as the earlier of the

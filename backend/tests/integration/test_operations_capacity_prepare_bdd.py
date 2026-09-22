@@ -35,12 +35,7 @@ from operations.contracts.capacity import (
     validate_prepared_operation_binding,
 )
 from operations.identity import ApprovalIdentityBoundary, VerifiedPrincipal
-from operations.prepare import (
-    CapacityPlaybook,
-    PreparedDecision,
-    PrepareRequestContext,
-    PrepareService,
-)
+from operations.prepare import CapacityPlaybook, PreparedDecision, PrepareRequestContext, PrepareService
 from operations.settings import resolve_operations_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.localhost]
@@ -235,3 +230,76 @@ def test_scenario_current_state_change_changes_prepared_hash() -> None:
     prepared_high = _prepare_service().prepare(advice_high, _prepare_context(), idempotency_token=TOKEN)
     # Then the current-state binding produces distinct prepared hashes
     assert prepared_low.prepared_hash != prepared_high.prepared_hash
+
+
+def test_scenario_advise_mode_prepares_for_approval_not_denied() -> None:
+    # Regression for the live E2 denial: with OperationsMode=advise and all six
+    # preparation ceilings >= advise, prepare must produce approval_required, not
+    # a denied decision. Before the fix the effective authority (advise) was
+    # gated against remediate and the whole E2 phase was unreachable.
+    advice = _advice_service(_current(), _bounds()).advise(_proposal(), _advice_context())
+    prepared = _prepare_service(deployment_mode="advise").prepare(
+        advice, _prepare_context(deployment_mode="advise"), idempotency_token=TOKEN
+    )
+    assert prepared.decision is PreparedDecision.APPROVAL_REQUIRED
+    assert prepared.operation["authority"]["effective_authority"] == "advise"
+    assert prepared.operation["authority"]["reason_codes"] == ["APPROVAL_REQUIRED"]
+    # It is never authorized outright and carries the immutable, hash-bound
+    # execution authority a future E3 executor must re-verify before any write.
+    assert prepared.operation["authority"]["decision"] == "approval_required"
+    assert prepared.operation["required_execution_authority"] == "remediate"
+    assert prepared.authorization["required_execution_authority"] == "remediate"
+    validate_capacity_contract(PREPARED_OPERATION_SCHEMA_NAME, prepared.operation)
+    validate_capacity_contract(AUTHORIZATION_SCHEMA_NAME, prepared.authorization)
+    validate_prepared_operation_binding(prepared.operation, prepared.authorization)
+
+
+def test_scenario_observe_mode_denies_for_insufficient_authority() -> None:
+    # E1 observe authority is below the advise prepare-phase minimum, so the
+    # operation is denied — approval never elevates execution authority.
+    advice = _advice_service(_current(), _bounds()).advise(_proposal(), _advice_context())
+    prepared = _prepare_service(deployment_mode="advise").prepare(
+        advice, _prepare_context(deployment_mode="observe"), idempotency_token=TOKEN
+    )
+    assert prepared.decision is PreparedDecision.DENIED
+    assert prepared.operation["authority"]["reason_codes"] == ["INSUFFICIENT_AUTHORITY"]
+
+
+def test_scenario_required_execution_authority_is_hash_bound_and_immutable() -> None:
+    # Tampering with the immutable execution authority both changes the bound
+    # prepared_hash and fails schema/semantic validation.
+    advice = _advice_service(_current(), _bounds()).advise(_proposal(), _advice_context())
+    prepared = _prepare_service(deployment_mode="advise").prepare(
+        advice, _prepare_context(deployment_mode="advise"), idempotency_token=TOKEN
+    )
+    tampered = dict(prepared.operation)
+    tampered["required_execution_authority"] = "advise"
+    with pytest.raises(Exception):
+        validate_capacity_contract(PREPARED_OPERATION_SCHEMA_NAME, tampered)
+
+
+def test_scenario_advise_mode_default_bounds_denies_for_bounds_not_authority() -> None:
+    # Under the server-owned default fail-closed bounds (floor=0, ceiling=1,
+    # max_step=1) an advise-mode preparation reaches the bounds evaluation: the
+    # effective authority is advise (never the old remediate gate) and the denial
+    # is BOUNDS_EXCEEDED, not INSUFFICIENT_AUTHORITY.
+    default_bounds = CapacityBounds(
+        floor=0,
+        ceiling=1,
+        max_step=1,
+        enrollment_id="enroll.fleet-default",
+        enrollment_version="2026-09-01",
+        policy_id="policy.capacity-default",
+        policy_version="2026-09-01",
+        target_enrolled=True,
+    )
+    advice = _advice_service(_current(), default_bounds).advise(_proposal(), _advice_context())
+    prepared = _prepare_service(deployment_mode="advise").prepare(
+        advice, _prepare_context(deployment_mode="advise"), idempotency_token=TOKEN
+    )
+    assert prepared.decision is PreparedDecision.DENIED
+    reasons = prepared.operation["authority"]["reason_codes"]
+    assert "BOUNDS_EXCEEDED" in reasons
+    assert "INSUFFICIENT_AUTHORITY" not in reasons
+    assert prepared.operation["authority"]["effective_authority"] == "advise"
+    assert prepared.operation["required_execution_authority"] == "remediate"
