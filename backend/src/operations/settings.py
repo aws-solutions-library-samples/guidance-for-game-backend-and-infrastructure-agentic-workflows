@@ -25,6 +25,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
 # ADR 0001 authority lattice; lower is more restrictive.
 OPERATIONS_MODES = ("disabled", "observe", "advise", "remediate", "operate")
@@ -403,8 +404,12 @@ class ControlPlaneDeploymentSettings:
     appconfig_extension_port: int
     appconfig_gradual_strategy_id: str
     appconfig_immediate_strategy_id: str
-    cursor_signing_key: str
     provisioned: bool
+    # Exactly one cursor-key source must be configured. In production the HMAC
+    # signing key is a Secrets Manager secret referenced by ARN and resolved at
+    # bootstrap; the raw key is a local-test-only convenience. Never both.
+    cursor_signing_key: str | None = None
+    cursor_signing_key_secret_arn: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -414,16 +419,33 @@ class ControlPlaneDeploymentSettings:
             "appconfig_profile",
             "appconfig_gradual_strategy_id",
             "appconfig_immediate_strategy_id",
-            "cursor_signing_key",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
         if not (1 <= self.appconfig_extension_port <= 65535):
             raise ValueError("appconfig_extension_port must be a valid TCP port")
-        # A short signing key cannot provide meaningful HMAC strength; fail closed.
-        if len(self.cursor_signing_key) < 16:
+        # Exactly one cursor-key source (raw local-test key XOR secret ARN).
+        raw = self.cursor_signing_key
+        arn = self.cursor_signing_key_secret_arn
+        has_raw = isinstance(raw, str) and bool(raw.strip())
+        has_arn = isinstance(arn, str) and bool(arn.strip())
+        if has_raw and has_arn:
+            raise ValueError(
+                "configure exactly one of GBAW_OPERATIONS_CURSOR_SIGNING_KEY (local test) "
+                "or GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN (production), not both"
+            )
+        if not has_raw and not has_arn:
+            raise ValueError(
+                "configure a cursor signing key source: "
+                "GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN (production) or "
+                "GBAW_OPERATIONS_CURSOR_SIGNING_KEY (local test)"
+            )
+        # A short raw signing key cannot provide meaningful HMAC strength.
+        if has_raw and len(raw) < 16:  # type: ignore[arg-type]
             raise ValueError("cursor_signing_key must be at least 16 characters")
+        if has_arn and not arn.startswith("arn:aws:secretsmanager:"):  # type: ignore[union-attr]
+            raise ValueError("cursor_signing_key_secret_arn must be a Secrets Manager ARN")
 
     @property
     def mode(self) -> str:
@@ -444,9 +466,46 @@ def resolve_control_plane_deployment_settings(
         appconfig_extension_port=_positive_int(source, "GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT", 2772),
         appconfig_gradual_strategy_id=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_GRADUAL_STRATEGY_ID"),
         appconfig_immediate_strategy_id=_required_str(source, "GBAW_OPERATIONS_APPCONFIG_IMMEDIATE_STRATEGY_ID"),
-        cursor_signing_key=_required_str(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY"),
+        cursor_signing_key=_optional_or_none(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY"),
+        cursor_signing_key_secret_arn=_optional_or_none(source, "GBAW_OPERATIONS_CURSOR_SIGNING_KEY_SECRET_ARN"),
         provisioned=_bool(source, "GBAW_OPERATIONS_CONTROL_PROVISIONED", True),
     )
+
+
+def _optional_or_none(env: Mapping[str, str], key: str) -> str | None:
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip()
+
+
+def load_cursor_signing_key(
+    settings: "ControlPlaneDeploymentSettings",
+    *,
+    secretsmanager_client: Any,
+) -> str:
+    """Resolve the cursor HMAC signing key, failing closed.
+
+    In production the key is stored in AWS Secrets Manager and referenced by ARN;
+    it is read once at bootstrap from the exact secret id and never logged. The
+    raw ``GBAW_OPERATIONS_CURSOR_SIGNING_KEY`` is a local-test-only convenience.
+    A missing/short/unreadable secret fails closed (raises); the ARN path
+    requires a Secrets Manager client.
+    """
+    raw = settings.cursor_signing_key
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    arn = settings.cursor_signing_key_secret_arn
+    if not (isinstance(arn, str) and arn.strip()):
+        raise ValueError("no cursor signing key source is configured")
+    if secretsmanager_client is None:
+        raise ValueError("a Secrets Manager client is required to read the cursor signing key secret")
+    response = secretsmanager_client.get_secret_value(SecretId=arn)
+    secret = response.get("SecretString") if isinstance(response, Mapping) else None
+    if not isinstance(secret, str) or len(secret) < 16:
+        # Never log or echo the secret value; only its adequacy is reported.
+        raise ValueError("cursor signing key secret is missing or too short")
+    return secret
 
 
 # -- E4 kill-switch extension bootstrap (issue #416) --------------------------

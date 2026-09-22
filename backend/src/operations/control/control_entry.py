@@ -62,7 +62,7 @@ def _build_runtime() -> _ControlRuntime:
     from operations.control.projections import OperationsProjectionService
     from operations.control.read_handler import ControlReadHandler
     from operations.control.router import ControlPlaneRouter
-    from operations.settings import resolve_control_plane_deployment_settings
+    from operations.settings import load_cursor_signing_key, resolve_control_plane_deployment_settings
 
     settings = resolve_control_plane_deployment_settings()
     obs = settings.observation
@@ -85,10 +85,14 @@ def _build_runtime() -> _ControlRuntime:
     )
     gate = KillSwitchGate(extension=extension, capability_id=CAPABILITY_ID, static_authority=obs.mode)
 
+    secretsmanager_client = (
+        session.client("secretsmanager", config=config) if settings.cursor_signing_key_secret_arn is not None else None
+    )
+    cursor_signing_key = load_cursor_signing_key(settings, secretsmanager_client=secretsmanager_client)
     projection_service = OperationsProjectionService(
         catalog_store=approval_store,
         evidence_store=approval_store,
-        cursor_key=settings.cursor_signing_key.encode("utf-8"),
+        cursor_key=cursor_signing_key.encode("utf-8"),
     )
     discovery_service = CapabilityDiscoveryService(
         kill_switch_gate=gate,
