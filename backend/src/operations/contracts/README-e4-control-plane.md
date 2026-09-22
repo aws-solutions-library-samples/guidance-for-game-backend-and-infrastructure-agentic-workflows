@@ -38,8 +38,14 @@ All schema `$id`s are `urn:game-agent:operations:contracts:v1:<name>`.
 ## Kill-switch document
 
 The kill-switch schema is authored to be usable **directly as an AWS AppConfig
-JSON Schema validator**. It is a closed object (`additionalProperties: false`
-everywhere) that carries exactly:
+JSON Schema validator**. It is fully self-contained: every `$ref` is a local
+`#/$defs` fragment (the `contract_version` and the normalized UTC-`Z` timestamp
+definitions are inlined rather than pointing at the `common` document), so
+AppConfig can validate it with no external reference to resolve. `issued_at` and
+`not_after` are constrained to the normalized UTC `Z` form
+(`YYYY-MM-DDThh:mm:ss(.sss)Z`), so lexicographic order equals chronological
+order. It is a closed object (`additionalProperties: false` everywhere) that
+carries exactly:
 
 - `operations_enabled` — the deployment-wide master switch;
 - `capabilities."gamelift.capacity-adjustment"` — the single capability's
