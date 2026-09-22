@@ -263,6 +263,38 @@ def capacity_prepared_hash(prepared_operation: dict[str, Any]) -> str:
     return canonical_sha256(material)
 
 
+def validate_capacity_prepared_operation(prepared_operation: dict[str, Any]) -> None:
+    """Validate one stored capacity prepared operation (single-arg adapter)."""
+    validate_capacity_contract(PREPARED_OPERATION_SCHEMA_NAME, prepared_operation)
+
+
+def validate_capacity_approval_binding(approval: dict[str, Any], prepared_operation: dict[str, Any]) -> None:
+    """Verify one granted approval binds one exact stored capacity operation.
+
+    Unlike the generic ``validate_approval_binding`` (which hashes the whole
+    document), the capacity operation carries its own ``prepared_hash`` binding
+    every field except itself, so the approval's ``prepared_operation_hash`` must
+    equal ``capacity_prepared_hash`` — the document minus its own hash.
+    """
+    # Local modules
+    from operations.contracts.validation import validate_contract
+
+    validate_contract("approval-record", approval)
+    validate_capacity_contract(PREPARED_OPERATION_SCHEMA_NAME, prepared_operation)
+
+    errors: list[str] = []
+    if approval["decision"] != "granted":
+        errors.append("approval decision is not granted")
+    if approval["operation_id"] != prepared_operation["operation_id"]:
+        errors.append("approval operation_id does not match the prepared operation")
+    if approval["prepared_operation_hash"] != capacity_prepared_hash(prepared_operation):
+        errors.append("approval hash does not match the canonical prepared operation")
+    if approval["policy_version"] != prepared_operation["policy"]["policy_version"]:
+        errors.append("approval policy_version does not match the prepared operation")
+    if errors:
+        raise CapacityContractError("capacity-approval-binding", errors)
+
+
 # -- Semantic validation ----------------------------------------------------
 
 

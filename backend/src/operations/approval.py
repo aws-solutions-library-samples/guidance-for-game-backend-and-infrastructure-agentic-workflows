@@ -61,6 +61,21 @@ def _format_timestamp(value: datetime) -> str:
     return _utc(value, "timestamp").isoformat().replace("+00:00", "Z")
 
 
+def _default_validate(prepared_operation: dict) -> None:
+    """Default operation validator: the generic prepared-operation contract."""
+    validate_prepared_operation(prepared_operation)
+
+
+def _default_binding_validate(approval: dict, prepared_operation: dict) -> None:
+    """Default binding check: the generic approval-binding contract."""
+    validate_approval_binding(approval, prepared_operation)
+
+
+def _default_hash(prepared_operation: dict) -> str:
+    """Default bound hash: the canonical SHA-256 of the whole document."""
+    return canonical_sha256(prepared_operation)
+
+
 def _new_approval_id() -> str:
     return f"approval:{uuid4().hex}"
 
@@ -253,12 +268,18 @@ class ApprovalService:
         store: ApprovalStore,
         clock: Callable[[], datetime] = _system_clock,
         approval_id_factory: Callable[[], str] = _new_approval_id,
+        operation_validator: Callable[[dict[str, Any]], None] = _default_validate,
+        operation_hasher: Callable[[dict[str, Any]], str] = _default_hash,
+        binding_validator: Callable[[dict[str, Any], dict[str, Any]], None] = _default_binding_validate,
     ) -> None:
         self._identity_boundary = identity_boundary
         self._policy = policy
         self._store = store
         self._clock = clock
         self._approval_id_factory = approval_id_factory
+        self._operation_validator = operation_validator
+        self._operation_hasher = operation_hasher
+        self._binding_validator = binding_validator
 
     def grant(self, request: ApprovalRequest, context: ApprovalRequestContext) -> dict[str, Any]:
         """Validate, bind, and conditionally record one operation approval."""
@@ -280,8 +301,8 @@ class ApprovalService:
 
         prepared_operation = stored.copy_prepared_operation()
         try:
-            validate_prepared_operation(prepared_operation)
-        except ContractValidationError as exc:
+            self._operation_validator(prepared_operation)
+        except (ContractValidationError, ValueError) as exc:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.APPROVAL_INVALID,
                 "stored operation is invalid",
@@ -293,7 +314,7 @@ class ApprovalService:
                 "stored operation integrity check failed",
             )
 
-        prepared_operation_hash = canonical_sha256(prepared_operation)
+        prepared_operation_hash = self._operation_hasher(prepared_operation)
         if stored.prepared_operation_hash != prepared_operation_hash:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.OPERATION_HASH_MISMATCH,
@@ -375,7 +396,7 @@ class ApprovalService:
         }
 
         try:
-            validate_approval_binding(approval, prepared_operation)
+            self._binding_validator(approval, prepared_operation)
         except (ContractValidationError, ValueError) as exc:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.APPROVAL_INVALID,
