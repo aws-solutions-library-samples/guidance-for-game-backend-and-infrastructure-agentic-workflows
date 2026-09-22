@@ -262,3 +262,89 @@ def test_unknown_route_is_rejected() -> None:
         )
     )
     assert resp["statusCode"] in (400, 404)
+
+
+# -- E2 metrics emission on failure paths (issue #414) ----------------------
+
+
+class FakeMetrics:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def record(self, event: str) -> None:
+        self.events.append(event)
+
+
+def test_prepare_conflict_emits_preparation_failure_metric() -> None:
+    metrics = FakeMetrics()
+    handler = _handler(
+        orchestrator=FakeOrchestrator(PrepareOrchestratorError("idempotency_conflict", "conflict")),
+        metrics=metrics,
+    )
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert "preparation.failed" in metrics.events
+
+
+def test_approve_denied_emits_approval_failure_metric() -> None:
+    metrics = FakeMetrics()
+    handler = _handler(
+        approval_service=FakeApprovalService(ApprovalBoundaryError(ApprovalErrorCode.AUTHORIZATION_DENIED, "denied")),
+        metrics=metrics,
+    )
+    handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/approve",
+            body={},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
+    assert "approval.failed" in metrics.events
+    assert "approval.expired" not in metrics.events
+
+
+def test_approve_expired_emits_expired_metric() -> None:
+    metrics = FakeMetrics()
+    handler = _handler(
+        approval_service=FakeApprovalService(ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_EXPIRED, "expired")),
+        metrics=metrics,
+    )
+    handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/approve",
+            body={},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
+    assert "approval.expired" in metrics.events
+
+
+def test_cancel_state_conflict_emits_cancellation_conflict_metric() -> None:
+    metrics = FakeMetrics()
+    handler = _handler(
+        decision_service=FakeDecisionService(
+            reject_result={"new_state": "rejected"},
+            cancel_result=ApprovalBoundaryError(ApprovalErrorCode.STATE_CONFLICT, "conflict"),
+        ),
+        metrics=metrics,
+    )
+    handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/cancel",
+            body={},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
+    assert "cancellation.conflict" in metrics.events
+
+
+def test_successful_prepare_emits_no_failure_metric() -> None:
+    metrics = FakeMetrics()
+    handler = _handler(metrics=metrics)
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert metrics.events == []

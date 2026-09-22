@@ -99,6 +99,17 @@ class EvidenceServicePort(Protocol):
     def load_evidence(self, *, operation_id: str, requester: VerifiedPrincipal) -> dict[str, Any] | None: ...
 
 
+class ApprovalMetricsPort(Protocol):
+    """Bounded, identifier-free E2 metrics sink (see e2_metrics)."""
+
+    def record(self, event: str) -> None: ...
+
+
+class _NullApprovalMetrics:
+    def record(self, event: str) -> None:  # noqa: D401 - no-op default sink
+        return None
+
+
 class HandlerConfigError(RuntimeError):
     """The handler was constructed without a required trusted binding."""
 
@@ -116,9 +127,11 @@ class ApprovalRequestHandler:
         tenant_id: str,
         workspace_id: str,
         trusted_audience: str,
+        metrics: ApprovalMetricsPort | None = None,
     ) -> None:
         if not tenant_id or not workspace_id or not trusted_audience:
             raise HandlerConfigError("tenant_id, workspace_id, and trusted_audience are required")
+        self._metrics = metrics or _NullApprovalMetrics()
         self._orchestrator = orchestrator
         self._approval_service = approval_service
         self._decision_service = decision_service
@@ -133,10 +146,13 @@ class ApprovalRequestHandler:
         try:
             return self._dispatch(event, stage)
         except ApprovalBoundaryError as exc:
+            self._emit_failure_metric(stage[0], exc.error_code)
             return _approval_error_response(exc)
         except PrepareOrchestratorError as exc:
+            self._emit_prepare_failure_metric(stage[0])
             return _prepare_error_response(exc)
         except Exception as exc:  # noqa: BLE001 - never leak an internal detail
+            self._emit_prepare_failure_metric(stage[0])
             _log_unexpected_exception(stage[0], _method(event), exc)
             return _error_response(500, "INTERNAL_ERROR", "operation request failed", False)
 
@@ -253,6 +269,30 @@ class ApprovalRequestHandler:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.IDENTITY_CONTEXT_INVALID, "verified caller context is invalid"
             ) from exc
+
+    def _emit_failure_metric(self, stage: str, error_code: ApprovalErrorCode) -> None:
+        """Emit the bounded E2 failure metric for one typed approval error."""
+        try:
+            if stage == "prepare":
+                self._metrics.record("preparation.failed")
+            elif stage == "cancel" and error_code == ApprovalErrorCode.STATE_CONFLICT:
+                self._metrics.record("cancellation.conflict")
+            elif stage in ("approve", "reject", "cancel"):
+                if error_code == ApprovalErrorCode.APPROVAL_EXPIRED:
+                    self._metrics.record("approval.expired")
+                else:
+                    self._metrics.record("approval.failed")
+        except Exception:  # noqa: BLE001 - metrics must never break a request
+            pass
+
+    def _emit_prepare_failure_metric(self, stage: str) -> None:
+        try:
+            if stage == "prepare":
+                self._metrics.record("preparation.failed")
+            elif stage in ("approve", "reject", "cancel"):
+                self._metrics.record("approval.failed")
+        except Exception:  # noqa: BLE001 - metrics must never break a request
+            pass
 
 
 # -- Response bodies ---------------------------------------------------------
