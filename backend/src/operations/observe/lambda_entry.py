@@ -176,7 +176,13 @@ def _build_approval_handler(
     from operations.approval_store import DynamoDbApprovalStore
     from operations.capacity_bounds import DeploymentCapacityBoundsResolver
     from operations.capacity_state import E1ObservationCapacityStatePort
-    from operations.contracts.capacity import ACTION, PROFILE
+    from operations.contracts.capacity import (
+        ACTION,
+        PROFILE,
+        capacity_prepared_hash,
+        validate_capacity_approval_binding,
+        validate_capacity_prepared_operation,
+    )
     from operations.decisions import LifecycleDecisionService
     from operations.evidence import E2EvidenceService
     from operations.observe.e2_metrics import CloudWatchApprovalMetrics
@@ -209,7 +215,7 @@ def _build_approval_handler(
 
     playbook = CapacityPlaybook(
         playbook_id="playbook.gamelift-capacity",
-        playbook_version="1.0",
+        playbook_version="1.0.0",
         playbook_hash=_PLAYBOOK_HASH,
         profile=PROFILE,
         retry_policy={
