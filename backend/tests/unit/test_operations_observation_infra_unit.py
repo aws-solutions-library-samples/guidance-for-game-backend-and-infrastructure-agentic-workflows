@@ -17,12 +17,13 @@ contract**:
   code-artifact parameters with enabled-mode ``Rules`` validation, and the
   CloudWatch Logs KMS key-policy grant;
 * negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
-  exactly ``PutItem`` -- the only underlying action the store's two conditional
-  transactional Put legs require, per the AWS "Using IAM with DynamoDB
-  transactions" guide; no ineffective/invalid ``TransactWriteItems`` action, no
-  unused ``GetItem``/``Query``, no ``UpdateItem``/``DeleteItem``/``Scan``/
-  ``Batch*``; no S3 runtime access, no GameLift write, ``iam:PassRole``, Step
-  Functions, or wildcard action);
+  exactly ``PutItem``/``UpdateItem``/``GetItem`` -- the underlying actions the
+  deployed E1 ``operations.observation_store.DynamoDbObservationStore`` requires
+  for its conditional Put legs, fenced Update legs, and consistent GetItem reads,
+  per the AWS "Using IAM with DynamoDB transactions" guide; no ineffective/
+  invalid ``TransactWriteItems`` action, no unused ``Query``/``Scan``/
+  ``DeleteItem``/``Batch*``/``ConditionCheckItem``; no S3 runtime access, no
+  GameLift write, ``iam:PassRole``, Step Functions, or wildcard action);
 * the runtime-KMS grant for the customer-managed key: exactly the documented
   DynamoDB data-plane action set (``Encrypt``/``Decrypt``/``ReEncrypt*``/
   ``GenerateDataKey*``/``DescribeKey``) on the specific operations CMK, every
@@ -125,18 +126,26 @@ GAMELIFT_READ_ACTIONS = frozenset(
     }
 )
 # DynamoDB runtime actions are limited to exactly what the store actually issues.
-# Per the AWS "Using IAM with DynamoDB transactions" guide, permissions for the
-# Put/Update/Delete/Get legs of a TransactWriteItems/TransactGetItems call are
+# The deployed E1 store is operations.observation_store.DynamoDbObservationStore
+# (NOT the E0 operations.validation.e0_persistence sink -- that persistence sink
+# is a separate E0 concern and is deliberately never imported for this runtime
+# IAM invariant). The store issues, across its lifecycle, TransactWriteItems
+# calls whose legs are conditional *Put* legs AND fenced *Update* legs, plus
+# strongly-consistent GetItem reads (idempotency/replay resolution, result
+# loads, and status). Per the AWS "Using IAM with DynamoDB transactions" guide,
+# permissions for the Put/Update/Delete/Get legs of a TransactWriteItems call are
 # governed by the underlying PutItem/UpdateItem/DeleteItem/GetItem permissions --
 # there is no "dynamodb:TransactWriteItems" IAM action (cfn-lint flags it as
-# W3037). The store (operations.validation.e0_persistence.DynamoDbTransactionalSink)
-# issues one TransactWriteItems call with two conditional *Put* legs and no read,
-# update, delete, query, scan, or batch call anywhere -- so the only underlying
-# action it needs is dynamodb:PutItem, scoped to the exact table ARN.
+# W3037). So the exact underlying action set the role needs is PutItem (Put
+# legs), UpdateItem (fenced snapshot Update legs), and GetItem (the consistent
+# reads), each scoped to the exact table ARN. No Query, Scan, DeleteItem,
+# Batch*, or ConditionCheckItem is ever issued.
 #   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
 ALLOWED_DYNAMODB_ACTIONS = frozenset(
     {
         "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:GetItem",
     }
 )
 FORBIDDEN_ACTION_SUBSTRINGS = (
@@ -148,18 +157,19 @@ FORBIDDEN_ACTION_SUBSTRINGS = (
     "gamelift:Stop",
     "iam:PassRole",
     "states:",
-    # The store issues only conditional Put legs. Every other DynamoDB action is
-    # unused by any real current call and MUST NOT be granted -- including the
-    # previously granted-but-unused GetItem/Query, the ineffective/invalid
-    # TransactWriteItems, and the always-denied UpdateItem/DeleteItem/Scan/Batch*.
-    "dynamodb:GetItem",
+    # The store issues conditional Put legs, fenced Update legs, and consistent
+    # GetItem reads -- so PutItem/UpdateItem/GetItem are the ALLOWED set (above)
+    # and are deliberately absent here. Every other DynamoDB action is unused by
+    # any real call and MUST NOT be granted -- including the ineffective/invalid
+    # TransactWriteItems (no such IAM action; cfn-lint W3037) and the always-
+    # denied Query/Scan/DeleteItem/Batch*/ConditionCheckItem.
     "dynamodb:Query",
     "dynamodb:TransactWriteItems",
-    "dynamodb:UpdateItem",
     "dynamodb:DeleteItem",
     "dynamodb:Scan",
     "dynamodb:BatchWriteItem",
     "dynamodb:BatchGetItem",
+    "dynamodb:ConditionCheckItem",
     # The unused content bucket and its runtime access are removed entirely.
     "s3:",
     # NOTE: kms:Encrypt is intentionally NOT forbidden on the runtime role. A
@@ -551,53 +561,287 @@ _TRANSACT_LEG_TO_UNDERLYING_ACTION = {
     "ConditionCheck": "dynamodb:ConditionCheckItem",
 }
 
+# A GetItem read is not a transaction leg, so it maps directly to the item action
+# that governs it (dynamodb:GetItem). The store's consistent reads
+# (idempotency/replay resolution, result loads, status) go through this call.
+_DIRECT_CALL_TO_UNDERLYING_ACTION = {
+    "get_item": "dynamodb:GetItem",
+}
 
-class _LegCapturingDynamoDbClient:
-    """Captures the ``TransactItems`` a real store run issues, without any I/O.
 
-    Only ``transact_write_items`` is provided: if the store ever grows a read,
-    update, delete, query, scan, or batch call it will raise ``AttributeError``
-    here and this drift test will fail loudly rather than silently under-grant.
-    """
+# The store-drive derivation runs in a subprocess with the sibling core
+# worktree's ``backend/src`` FIRST on PYTHONPATH. The deployed E1 store
+# (operations.observation_store.DynamoDbObservationStore) and its whole
+# dependency subtree (operations.observation, operations.contracts.*,
+# operations.settings, operations.identity, operations.validation.*) live in the
+# core worktree, and other tests in this suite import the *infra* worktree's
+# ``operations`` package first -- binding it in ``sys.modules`` to the infra src.
+# A subprocess with a clean interpreter is the faithful, order-independent way to
+# import and drive the real deployed module tree with no cross-worktree module
+# mixing. It drives the store through begin, a conditional replay/get, a stale-
+# lease reclaim (Update+Put), complete (Put+Update), fail (Update+Put), and
+# status (Get) with a leg-capturing fake that raises real botocore ``ClientError``
+# shapes, then prints the derived {leg types, direct calls} as JSON.
+_STORE_DRIVE_SCRIPT = r"""
+import datetime as dt
+import json
 
+from botocore.exceptions import ClientError
+
+from operations.observation_store import (
+    _IDEM_SK,
+    _RESULT_SK,
+    _STATE_SNAPSHOT_SK,
+    DynamoDbObservationStore,
+)
+
+
+def make_transaction_canceled_error():
+    # A real botocore ClientError with the exact wire shape a genuine, pure
+    # ConditionalCheckFailed transaction cancel carries: Error.Code is
+    # TransactionCanceledException and CancellationReasons is the positional list
+    # the store's classifier reads from exc.response (never a fabricated
+    # cancellation_reasons attribute). This routes the store to its idempotency/
+    # state-resolution (replay/reclaim) branches so those legs and reads are
+    # observable.
+    return ClientError(
+        {
+            "Error": {"Code": "TransactionCanceledException", "Message": "conditional check failed"},
+            "CancellationReasons": [
+                {"Code": "ConditionalCheckFailed"},
+                {"Code": "None"},
+                {"Code": "None"},
+                {"Code": "None"},
+            ],
+        },
+        "TransactWriteItems",
+    )
+
+
+class LegCapturingObservationClient:
+    # Records every underlying action the real store issues -- TransactWriteItems
+    # legs (by type) and direct get_item reads -- with no I/O. transact_write_items
+    # optionally raises a real conditional ClientError (so the store follows its
+    # replay/reclaim branches); get_item returns scripted marshalled items so the
+    # resolve/status read paths are reached. An unscripted call (query/scan/delete/
+    # batch) raises AttributeError and fails the drift guard loudly.
     def __init__(self):
-        self.transact_items = []
+        self.transact_leg_types = set()
+        self.direct_calls = set()
+        self._transact_raises = []
+        self._get_item_responses = []
+
+    def script_transact(self, raises):
+        self._transact_raises.append(raises)
+
+    def script_get_item(self, item):
+        self._get_item_responses.append(item)
 
     def transact_write_items(self, **kwargs):
-        self.transact_items = kwargs["TransactItems"]
+        for leg in kwargs["TransactItems"]:
+            leg_types = list(leg.keys())
+            assert len(leg_types) == 1, "a transaction leg must have exactly one type: %r" % (leg_types,)
+            self.transact_leg_types.add(leg_types[0])
+        raises = self._transact_raises.pop(0) if self._transact_raises else False
+        if raises:
+            raise make_transaction_canceled_error()
         return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+    def get_item(self, **kwargs):
+        self.direct_calls.add("get_item")
+        item = self._get_item_responses.pop(0) if self._get_item_responses else None
+        return {"Item": item} if item is not None else {}
+
+
+def marshal(item):
+    out = {}
+    for k, v in item.items():
+        if isinstance(v, bool):
+            out[k] = {"BOOL": v}
+        elif isinstance(v, str):
+            out[k] = {"S": v}
+        elif isinstance(v, int):
+            out[k] = {"N": str(v)}
+        elif v is None:
+            out[k] = {"NULL": True}
+    return out
+
+
+client = LegCapturingObservationClient()
+frozen_now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+store = DynamoDbObservationStore(
+    client=client,
+    table_name="drift-probe-disposable",
+    clock=lambda: frozen_now,
+)
+
+future = frozen_now + dt.timedelta(seconds=60)
+ttl_epoch = int((frozen_now + dt.timedelta(hours=1)).timestamp())
+op_id = "op-drift-probe"
+ws = "ws-drift"
+
+# 1) begin: fresh create -> one TransactWriteItems of conditional Put legs.
+store.begin_observation(
+    operation_id=op_id,
+    idempotency_fingerprint="fp-1",
+    workspace_id=ws,
+    idempotency_token="tok-1",
+    lease_holder="holder-1",
+    commit_not_after=future,
+    lease_not_after=future,
+    ttl_epoch_s=ttl_epoch,
+    intent={"kind": "observe"},
+)
+
+# 2) begin again: transact fails ConditionalCheck, so _resolve_existing reads
+#    (GetItem) the mapping + snapshot + result and replays a SUCCEEDED operation.
+idem_mapping = marshal(
+    {"PK": "WS#%s#IDEM#tok-1" % ws, "SK": _IDEM_SK, "operation_id": op_id, "idempotency_fingerprint": "fp-1"}
+)
+succeeded_snapshot = marshal(
+    {
+        "PK": "OP#%s" % op_id,
+        "SK": _STATE_SNAPSHOT_SK,
+        "operation_id": op_id,
+        "workspace_id": ws,
+        "state": "succeeded",
+        "sequence": 1,
+        "generation": 1,
+    }
+)
+result_item = marshal(
+    {
+        "PK": "OP#%s" % op_id,
+        "SK": _RESULT_SK,
+        "operation_id": op_id,
+        "observation_json": "{}",
+        "observation_hash": "deadbeef",
+    }
+)
+client.script_transact(True)
+client.script_get_item(idem_mapping)
+client.script_get_item(succeeded_snapshot)
+client.script_get_item(result_item)
+store.begin_observation(
+    operation_id=op_id,
+    idempotency_fingerprint="fp-1",
+    workspace_id=ws,
+    idempotency_token="tok-1",
+    lease_holder="holder-1",
+    commit_not_after=future,
+    lease_not_after=future,
+    ttl_epoch_s=ttl_epoch,
+    intent={"kind": "observe"},
+)
+
+# 3) begin again on a stale-lease OBSERVING op -> fenced reclaim: a second
+#    TransactWriteItems of an Update (fencing) + a Put (recovery ledger).
+expired_snapshot = marshal(
+    {
+        "PK": "OP#%s" % op_id,
+        "SK": _STATE_SNAPSHOT_SK,
+        "operation_id": op_id,
+        "workspace_id": ws,
+        "state": "observing",
+        "sequence": 0,
+        "generation": 1,
+        "lease_holder": "holder-1",
+        "lease_not_after": int(frozen_now.timestamp()) - 1,
+        "ttl": ttl_epoch,
+    }
+)
+client.script_transact(True)  # the create attempt collides
+client.script_get_item(idem_mapping)  # _resolve_existing: mapping
+client.script_get_item(expired_snapshot)  # _resolve_existing: snapshot (stale)
+client.script_transact(False)  # the reclaim transaction succeeds
+store.begin_observation(
+    operation_id=op_id,
+    idempotency_fingerprint="fp-1",
+    workspace_id=ws,
+    idempotency_token="tok-1",
+    lease_holder="holder-2",
+    commit_not_after=future,
+    lease_not_after=future,
+    ttl_epoch_s=ttl_epoch,
+    intent={"kind": "observe"},
+)
+
+# 4) complete: Put(result) + Update(snapshot) + Put(transition) + Put(ledger).
+store.complete_observation(
+    operation_id=op_id,
+    workspace_id=ws,
+    lease_holder="holder-1",
+    commit_not_after=future,
+    ttl_epoch_s=ttl_epoch,
+    observation={"ok": 1},
+)
+
+# 5) fail: Update(snapshot) + Put(transition) + Put(ledger).
+store.fail_observation(
+    operation_id=op_id,
+    workspace_id=ws,
+    lease_holder="holder-1",
+    reason_code="drift_probe",
+    ttl_epoch_s=ttl_epoch,
+)
+
+# 6) load_status: a GetItem read of the snapshot (+ result on succeeded).
+client.script_get_item(succeeded_snapshot)
+client.script_get_item(result_item)
+store.load_status(operation_id=op_id, workspace_id=ws)
+
+print(json.dumps({"legs": sorted(client.transact_leg_types), "calls": sorted(client.direct_calls)}))
+"""
 
 
 def _underlying_actions_the_store_actually_requires():
-    """Drive the real store once and derive the exact underlying IAM actions.
+    """Drive the *real deployed* E1 store through its full lifecycle and derive
+    the exact underlying DynamoDB IAM action set it requires.
 
-    Inspects *every* leg of the actual ``TransactWriteItems`` call the store
-    issues and maps each to the DynamoDB item action that governs it. This binds
-    the IAM contract to observed store behavior, so any future drift in the
-    store's transaction legs (a new Update/Delete/Get leg, or a switch away from
-    Put) changes the required set and fails the coverage assertion below.
-    """
-    # Local modules
-    from operations.validation.e0_persistence import DynamoDbTransactionalSink
+    Runs :data:`_STORE_DRIVE_SCRIPT` in a subprocess with the sibling core
+    worktree's ``backend/src`` first on ``PYTHONPATH`` so
+    ``operations.observation_store.DynamoDbObservationStore`` -- the module the
+    CloudFormation Lambda ``Handler`` actually loads -- and its whole dependency
+    subtree import cleanly from core regardless of suite import order. The script
+    drives begin (fresh create), a conditional-replay begin resolving a stored
+    *succeeded* operation, a stale-lease *reclaim* begin, complete, fail, and
+    load_status, capturing every ``TransactWriteItems`` leg type and every direct
+    ``get_item`` read. Each transaction leg is mapped to its underlying item
+    action and each read to ``dynamodb:GetItem``, so the required set is derived
+    from observed store behavior. The E0 persistence sink is never imported."""
+    # Standard library
+    import os
+    import subprocess
+    import sys
 
-    client = _LegCapturingDynamoDbClient()
-    sink = DynamoDbTransactionalSink(
-        client=client,
-        table_name="drift-probe-disposable",
-        persistence_budget_s=1.0,
+    core_src = PROJECT_ROOT.parent / "issue-413-core" / "backend" / "src"
+    assert (
+        core_src / "operations" / "observation_store.py"
+    ).is_file(), f"deployed E1 store not found at {core_src}/operations/observation_store.py"
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(core_src), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    proc = subprocess.run(
+        [sys.executable, "-c", _STORE_DRIVE_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
     )
-    sink.persist({"operation_id": "op-drift-probe"}, b"{}")
+    assert proc.returncode == 0, f"store-drive subprocess failed:\nstdout={proc.stdout}\nstderr={proc.stderr}"
+    observed = json.loads(proc.stdout.strip().splitlines()[-1])
 
-    assert client.transact_items, "store issued no transaction legs to inspect"
+    assert observed["legs"], "store issued no transaction legs to inspect"
+    assert observed["calls"], "store issued no direct item calls to inspect"
     required = set()
-    for leg in client.transact_items:
-        leg_types = list(leg.keys())
-        assert len(leg_types) == 1, f"a transaction leg must have exactly one type, got {leg_types}"
-        leg_type = leg_types[0]
+    for leg_type in observed["legs"]:
         assert (
             leg_type in _TRANSACT_LEG_TO_UNDERLYING_ACTION
         ), f"unmapped transaction leg type {leg_type!r}; update the IAM contract"
         required.add(_TRANSACT_LEG_TO_UNDERLYING_ACTION[leg_type])
+    for call in observed["calls"]:
+        assert call in _DIRECT_CALL_TO_UNDERLYING_ACTION, f"unmapped direct call {call!r}; update the IAM contract"
+        required.add(_DIRECT_CALL_TO_UNDERLYING_ACTION[call])
     return required
 
 
@@ -605,22 +849,27 @@ def test_iam_grants_exactly_the_underlying_actions_the_store_transacts(template)
     """Red-green drift guard tying the template's DynamoDB grant to real store legs.
 
     The granted DynamoDB actions on the observation role must equal *exactly* the
-    set of underlying item actions the store's actual transaction legs require --
-    no unused GetItem/Query, no ineffective/invalid TransactWriteItems, and never
-    a missing action that would reproduce the live begin_observation
-    AccessDeniedException (GitHub issue #413). If either the store legs or the
-    template drift, this fails.
+    set of underlying item actions the deployed E1 store's actual transaction legs
+    and reads require -- no unused Query/Scan/Batch, no ineffective/invalid
+    TransactWriteItems, and never a *missing* action (PutItem-only was exactly the
+    under-grant that would have left the store's Update legs and GetItem reads
+    unauthorized). If either the store behavior or the template drift, this fails.
     """
     required = _underlying_actions_the_store_actually_requires()
-    # The store today issues two conditional Put legs, so PutItem is the only
-    # underlying action required. Pin that explicitly so an accidental widening of
-    # the derivation is caught too.
-    assert required == {"dynamodb:PutItem"}, f"unexpected store-required actions: {sorted(required)}"
+    # The deployed store issues conditional Put legs, fenced Update legs, and
+    # consistent GetItem reads, so the required set is exactly these three. Pin it
+    # explicitly so both an accidental widening AND an accidental narrowing of the
+    # derivation are caught.
+    assert required == {
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:GetItem",
+    }, f"unexpected store-required actions: {sorted(required)}"
 
     granted = {a for a in _all_policy_actions(template) if a.lower().startswith("dynamodb:")}
     assert granted == required, (
         "DynamoDB IAM grant must cover exactly the underlying actions the store "
-        f"transacts. required={sorted(required)} granted={sorted(granted)}"
+        f"transacts and reads. required={sorted(required)} granted={sorted(granted)}"
     )
     # The invalid action string must be gone (cfn-lint W3037).
     assert "dynamodb:TransactWriteItems" not in granted, (
