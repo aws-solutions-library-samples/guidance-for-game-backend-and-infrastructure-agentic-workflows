@@ -42,6 +42,7 @@ from operations.approval import (
     ApprovalRequest,
     ApprovalRequestContext,
 )
+from operations.claims import parse_group_claim, parse_scope_claim
 from operations.contracts import CONTRACT_VERSION
 from operations.contracts.canonical import CanonicalizationError, canonicalize
 from operations.decisions import DecisionRequest, DecisionRequestContext
@@ -262,8 +263,8 @@ class ApprovalRequestHandler:
                 tenant_id=self._tenant_id,
                 workspace_id=self._workspace_id,
                 expires_at=expires_at,
-                groups=_string_set(claims.get("cognito:groups")),
-                scopes=_string_set(claims.get("scope")),
+                groups=parse_group_claim(claims.get("cognito:groups")),
+                scopes=parse_scope_claim(claims.get("scope")),
             )
         except ValueError as exc:
             raise ApprovalBoundaryError(
@@ -370,16 +371,6 @@ def _expiry(value: object) -> datetime | None:
     if isinstance(value, str) and value.isdigit():
         return datetime.fromtimestamp(int(value), tz=timezone.utc)
     return None
-
-
-def _string_set(value: object) -> frozenset[str]:
-    if isinstance(value, str):
-        parts = value.split()
-    elif isinstance(value, (list, tuple)):
-        parts = [item for item in value if isinstance(item, str)]
-    else:
-        return frozenset()
-    return frozenset(item for item in parts if item and len(item) <= 256)
 
 
 def _json_response(status: int, body: Mapping[str, Any]) -> dict[str, Any]:
