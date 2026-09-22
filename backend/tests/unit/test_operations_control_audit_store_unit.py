@@ -167,6 +167,16 @@ def _desired(enabled: bool = True) -> dict[str, Any]:
     }
 
 
+def _publication_document(version: int = 2, enabled: bool = True) -> dict[str, Any]:
+    return {
+        "contract_version": "1.0",
+        "config_version": version,
+        "issued_at": "2026-01-01T12:00:00Z",
+        "not_after": "2026-01-01T13:00:00Z",
+        **_desired(enabled),
+    }
+
+
 def _actor() -> dict[str, str]:
     return {"subject_id": "admin-1", "client_id": "client-1"}
 
@@ -179,6 +189,7 @@ def _commit(store: DynamoDbControlAuditStore, **overrides: Any) -> Any:
         "desired": _desired(),
         "outcome": "applied",
         "resulting_config_version": 2,
+        "publication_document": _publication_document(),
     }
     kwargs.update(overrides)
     return store.commit_control_decision(**kwargs)
@@ -404,11 +415,13 @@ def test_commit_records_a_durable_unconfirmed_publication_marker() -> None:
     assert len(markers) == 1
     assert markers[0]["published"]["BOOL"] is False
     assert markers[0]["config_version"]["N"] == "2"
+    assert "document_json" in markers[0]
     # The marker commits in the SAME atomic transaction as the CAS + audit.
     assert dynamo.transact_calls == 1
     # It is queryable and reported as pending.
     pending = store.pending_publication(record_id=record_id)
     assert pending is not None and pending["config_version"] == 2 and pending["published"] is False
+    assert pending["document"] == _publication_document()
 
 
 def test_confirm_publication_marks_marker_published_and_idempotent() -> None:

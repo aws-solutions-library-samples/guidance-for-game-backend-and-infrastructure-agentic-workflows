@@ -98,12 +98,20 @@ class _FakeAuditStore:
 class _FakePublisher:
     def __init__(self) -> None:
         self.published: list[dict[str, Any]] = []
+        self.reconciled: list[dict[str, Any]] = []
+        self.legacy_document: dict[str, Any] | None = None
         self.raise_on_publish: Exception | None = None
 
     def publish(self, *, document: dict[str, Any], hard_down: bool) -> None:
         self.published.append({"document": document, "hard_down": hard_down})
         if self.raise_on_publish is not None:
             raise self.raise_on_publish
+
+    def reconcile_existing(self, **kwargs: Any) -> dict[str, Any]:
+        self.reconciled.append(kwargs)
+        if self.legacy_document is None:
+            raise RuntimeError("no legacy document")
+        return self.legacy_document
 
 
 def _service(audit: Any, publisher: Any) -> KillSwitchControlService:
@@ -182,6 +190,7 @@ def test_normal_enable_commits_and_publishes_gradual() -> None:
     assert response["config_version"] == 2
     assert audit.commits[0]["expected_config_version"] == 1
     assert audit.commits[0]["resulting_config_version"] == 2
+    assert audit.commits[0]["publication_document"] == publisher.published[0]["document"]
     assert publisher.published[0]["hard_down"] is False
 
 
@@ -350,14 +359,64 @@ def test_conflict_with_own_pending_publication_reconciles_to_applied() -> None:
     probe.confirmed = []
     _service(probe, _FakePublisher()).apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
     record_id = probe.commits[0]["record_id"]
-    audit.pending = {record_id: {"config_version": 2, "published": False}}
+    pending_document = _current_document(
+        2,
+        enabled=True,
+        prepare=True,
+        dispatch=True,
+        execute=True,
+    )
+    audit.pending = {
+        record_id: {
+            "config_version": 2,
+            "published": False,
+            "document": pending_document,
+        }
+    }
     audit.confirmed = []
 
     response = service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
     assert response["outcome"] == "applied"
     assert response["config_version"] == 2
-    # The reconcile re-published the document and confirmed it.
-    assert publisher.published, "reconcile must re-drive the publish"
+    # The exact durably stored bytes are republished; retry time never changes
+    # issued_at/not_after under the same deterministic provider label.
+    assert publisher.published[0]["document"] == pending_document
+    assert audit.confirmed == [record_id]
+
+
+def test_legacy_pending_marker_recovers_from_the_validated_hosted_version() -> None:
+    audit = _FakeAuditStore(current=2, outcome=ControlCommitOutcome.VERSION_CONFLICT)
+    publisher = _FakePublisher()
+    publisher.legacy_document = _current_document(
+        2,
+        enabled=True,
+        prepare=True,
+        dispatch=True,
+        execute=True,
+    )
+    service = _service(audit, publisher)
+    probe = _FakeAuditStore(current=1)
+    probe.pending = {}
+    probe.confirmed = []
+    _service(probe, _FakePublisher()).apply(
+        request=_request(_desired(True, True, True, True), 1),
+        principal=_admin(),
+    )
+    record_id = probe.commits[0]["record_id"]
+    audit.pending = {record_id: {"config_version": 2, "published": False}}
+    audit.confirmed = []
+
+    response = service.apply(request=_request(_desired(True, True, True, True), 1), principal=_admin())
+    assert response["outcome"] == "applied"
+    assert response["effective"] == publisher.legacy_document
+    assert publisher.reconciled == [
+        {
+            "config_version": 2,
+            "desired": _desired(True, True, True, True),
+            "hard_down": False,
+        }
+    ]
+    assert publisher.published == []
     assert audit.confirmed == [record_id]
 
 

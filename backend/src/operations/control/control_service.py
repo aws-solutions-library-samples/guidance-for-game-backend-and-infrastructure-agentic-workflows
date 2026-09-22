@@ -98,6 +98,7 @@ class AuditStorePort(Protocol):
         desired: dict[str, Any],
         outcome: str,
         resulting_config_version: int,
+        publication_document: dict[str, Any] | None = None,
     ) -> ControlCommitOutcome: ...
 
     # Optional publisher lost-response reconciliation. A store that predates
@@ -112,6 +113,14 @@ class PublisherPort(Protocol):
     """AppConfig kill-switch publisher port."""
 
     def publish(self, *, document: dict[str, Any], hard_down: bool) -> None: ...
+
+    def reconcile_existing(
+        self,
+        *,
+        config_version: int,
+        desired: dict[str, Any],
+        hard_down: bool,
+    ) -> dict[str, Any]: ...
 
 
 class KillSwitchControlService:
@@ -206,6 +215,7 @@ class KillSwitchControlService:
                 desired=desired,
                 outcome="applied",
                 resulting_config_version=resulting_version,
+                publication_document=document,
             )
         except ControlStoreError as exc:
             raise ControlServiceError("CONTROL_UNAVAILABLE", "control change could not be recorded") from exc
@@ -311,8 +321,9 @@ class KillSwitchControlService:
         Returns an ``applied`` response when the store holds an unconfirmed
         publication marker for ``record_id`` (a lost-response retry), or ``None``
         when there is nothing of ours to reconcile (a genuine conflict). The
-        stored ``config_version`` from the marker is authoritative — the document
-        is rebuilt at that version and re-published idempotently.
+        stored ``config_version`` and exact ``document`` are authoritative. Old
+        markers that predate exact-document persistence are recovered only by
+        reading and validating the deterministic hosted AppConfig version.
         """
         pending = self._pending_publication(record_id)
         if pending is None:
@@ -320,9 +331,31 @@ class KillSwitchControlService:
         config_version = pending.get("config_version")
         if not isinstance(config_version, int):
             return None
-        document = self._build_document(desired, config_version)
+        document = pending.get("document")
         try:
-            self._publisher.publish(document=document, hard_down=hard_down)
+            if isinstance(document, dict):
+                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+                if document.get("config_version") != config_version or not _document_matches_desired(document, desired):
+                    raise ControlServiceError(
+                        "CONTROL_PUBLISH_FAILED", "pending control document does not match its decision"
+                    )
+                self._publisher.publish(document=document, hard_down=hard_down)
+            else:
+                reconciler = getattr(self._publisher, "reconcile_existing", None)
+                if reconciler is None:
+                    return None
+                document = reconciler(
+                    config_version=config_version,
+                    desired=desired,
+                    hard_down=hard_down,
+                )
+                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+                if not _document_matches_desired(document, desired):
+                    raise ControlServiceError(
+                        "CONTROL_PUBLISH_FAILED", "hosted control document does not match its decision"
+                    )
+        except ControlServiceError:
+            raise
         except Exception as exc:  # noqa: BLE001 - bounded, fail closed
             raise ControlServiceError(
                 "CONTROL_PUBLISH_FAILED", "control change was recorded but not published"
@@ -447,6 +480,17 @@ class KillSwitchControlService:
             response["effective"] = effective
         validate_control_contract(CONTROL_RESPONSE_SCHEMA_NAME, response)
         return response
+
+
+def _document_matches_desired(document: dict[str, Any], desired: dict[str, Any]) -> bool:
+    try:
+        if bool(document["operations_enabled"]) != bool(desired["operations_enabled"]):
+            return False
+        actual = document["capabilities"][CAPABILITY_ID]
+        expected = desired["capabilities"][CAPABILITY_ID]
+        return all(bool(actual[phase]) == bool(expected[phase]) for phase in CONTROL_PHASES)
+    except (KeyError, TypeError):
+        return False
 
 
 def _is_hard_down(desired: dict[str, Any], current_document: dict[str, Any] | None) -> bool:

@@ -243,3 +243,52 @@ def test_lost_start_response_reconciles_without_second_deployment() -> None:
     assert len(client.created) == 1
     assert len(client.deployments) == 1
     assert client.deployments[0]["DeploymentStrategyId"] == "strategy-immediate"
+
+
+def test_legacy_pending_marker_reconciles_the_existing_validated_hosted_version() -> None:
+    client = _FakeAppConfig()
+    document = _document(enabled=True, prepare=True, dispatch=False, execute=False, version=23)
+    content = __import__("json").dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    client.create_hosted_configuration_version(
+        ApplicationId="app-1",
+        ConfigurationProfileId="profile-1",
+        Content=content,
+        ContentType="application/json",
+        VersionLabel="gbaw-control-v23",
+    )
+    publisher = _publisher(client)
+    recovered = publisher.reconcile_existing(
+        config_version=23,
+        desired={
+            "operations_enabled": True,
+            "capabilities": {CAPABILITY_ID: {"prepare": True, "dispatch": False, "execute": False}},
+        },
+        hard_down=False,
+    )
+    assert recovered == document
+    assert len(client.created) == 1
+    assert len(client.deployments) == 1
+
+
+def test_legacy_reconciliation_refuses_hosted_content_with_different_authority() -> None:
+    client = _FakeAppConfig()
+    document = _document(enabled=True, prepare=True, dispatch=True, execute=False, version=24)
+    content = __import__("json").dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    client.create_hosted_configuration_version(
+        ApplicationId="app-1",
+        ConfigurationProfileId="profile-1",
+        Content=content,
+        ContentType="application/json",
+        VersionLabel="gbaw-control-v24",
+    )
+    publisher = _publisher(client)
+    with pytest.raises(PublisherError):
+        publisher.reconcile_existing(
+            config_version=24,
+            desired={
+                "operations_enabled": False,
+                "capabilities": {CAPABILITY_ID: {"prepare": False, "dispatch": False, "execute": False}},
+            },
+            hard_down=True,
+        )
+    assert client.deployments == []

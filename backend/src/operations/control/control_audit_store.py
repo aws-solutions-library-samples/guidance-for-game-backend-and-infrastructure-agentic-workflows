@@ -51,6 +51,7 @@ from typing import Any
 from operations.contracts.control_plane import (
     CONTROL_AUDIT_RECORD_SCHEMA_NAME,
     CONTROL_CONTRACT_VERSION,
+    KILL_SWITCH_SCHEMA_NAME,
     ControlContractError,
     control_audit_record_hash,
     validate_control_contract,
@@ -147,10 +148,24 @@ class DynamoDbControlAuditStore:
         if marker.get("published") is True:
             return None
         config_version = marker.get("config_version")
-        return {
+        result: dict[str, Any] = {
             "config_version": config_version if isinstance(config_version, int) else None,
             "published": False,
         }
+        raw_document = marker.get("document_json")
+        if raw_document is not None:
+            # Standard library
+            import json
+
+            try:
+                document = json.loads(raw_document)
+                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+            except (ValueError, TypeError, ControlContractError) as exc:
+                raise ControlStoreError("pending publication document is invalid") from exc
+            if not isinstance(document, dict):
+                raise ControlStoreError("pending publication document is invalid")
+            result["document"] = document
+        return result
 
     def confirm_publication(self, *, record_id: str) -> None:
         """Mark the publication for ``record_id`` confirmed (idempotent).
@@ -222,6 +237,7 @@ class DynamoDbControlAuditStore:
         desired: Mapping[str, Any],
         outcome: str,
         resulting_config_version: int,
+        publication_document: Mapping[str, Any] | None = None,
     ) -> ControlCommitOutcome:
         """CAS-advance the state and write the immutable outcome audit record.
 
@@ -289,20 +305,30 @@ class DynamoDbControlAuditStore:
         # AppConfig acknowledges the publish, so a lost publish response leaves a
         # reconcilable pending marker instead of a decision that falsely claims
         # the document is live.
+        # Persist the exact validated document in the marker. Rebuilding it on a
+        # later retry would change issued_at/not_after while reusing the same
+        # deterministic AppConfig VersionLabel, which cannot be reconciled.
+        publication_item: dict[str, Any] = {
+            "PK": _CONTROL_PK,
+            "SK": f"{_PUBLICATION_SK_PREFIX}{record_id}",
+            "record_type": _PUBLICATION_RECORD_TYPE,
+            "contract_version": CONTROL_CONTRACT_VERSION,
+            "record_id": record_id,
+            "config_version": int(resulting_config_version),
+            "published": False,
+        }
+        if publication_document is not None:
+            try:
+                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, dict(publication_document))
+            except ControlContractError as exc:
+                raise ControlStoreError("publication document failed its contract") from exc
+            if publication_document.get("config_version") != resulting_config_version:
+                raise ControlStoreError("publication document version does not match the control decision")
+            publication_item["document_json"] = _canonical_json(publication_document)
         publication_put = {
             "Put": {
                 "TableName": self._table_name,
-                "Item": _marshal(
-                    {
-                        "PK": _CONTROL_PK,
-                        "SK": f"{_PUBLICATION_SK_PREFIX}{record_id}",
-                        "record_type": _PUBLICATION_RECORD_TYPE,
-                        "contract_version": CONTROL_CONTRACT_VERSION,
-                        "record_id": record_id,
-                        "config_version": int(resulting_config_version),
-                        "published": False,
-                    }
-                ),
+                "Item": _marshal(publication_item),
                 "ConditionExpression": "attribute_not_exists(SK)",
             }
         }

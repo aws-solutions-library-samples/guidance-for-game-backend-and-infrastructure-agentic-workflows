@@ -27,7 +27,13 @@ from collections.abc import Mapping
 from typing import Any, Protocol
 
 # Local modules
-from operations.contracts.control_plane import KILL_SWITCH_SCHEMA_NAME, ControlContractError, validate_control_contract
+from operations.contracts.control_plane import (
+    CAPABILITY_ID,
+    CONTROL_PHASES,
+    KILL_SWITCH_SCHEMA_NAME,
+    ControlContractError,
+    validate_control_contract,
+)
 
 _CONTENT_TYPE = "application/json"
 _LOGGER = logging.getLogger(__name__)
@@ -105,6 +111,35 @@ class AppConfigKillSwitchPublisher:
         self._ensure_hosted_version(label=label, content=content)
         self._ensure_deployment(label=label, strategy_id=strategy_id)
 
+    def reconcile_existing(
+        self,
+        *,
+        config_version: int,
+        desired: dict[str, Any],
+        hard_down: bool,
+    ) -> dict[str, Any]:
+        """Recover a legacy marker from its deterministic hosted version.
+
+        Markers written before exact-document persistence carry only the control
+        version. Recovery never rebuilds timestamps or creates another hosted
+        version: it loads the immutable labelled provider object, validates the
+        full contract and exact authority booleans, then idempotently starts or
+        finds its deployment.
+        """
+        label = f"gbaw-control-v{int(config_version)}"
+        items = self._list_hosted_versions(version_label=label)
+        if len(items) != 1:
+            raise PublisherError("legacy publication does not have exactly one hosted version")
+        version_number = _positive_int(items[0].get("VersionNumber"))
+        if version_number is None:
+            raise PublisherError("legacy hosted version has no valid version number")
+        document = self._read_hosted_document(version_number=version_number, label=label)
+        if document.get("config_version") != config_version or not _document_matches_desired(document, desired):
+            raise PublisherError("legacy hosted version does not match the committed decision")
+        strategy_id = self._immediate_strategy_id if hard_down else self._gradual_strategy_id
+        self._ensure_deployment(label=label, strategy_id=strategy_id)
+        return document
+
     def _ensure_hosted_version(self, *, label: str, content: bytes) -> int:
         existing = self._find_hosted_version(label=label, expected_content=content)
         if existing is not None:
@@ -171,6 +206,32 @@ class AppConfigKillSwitchPublisher:
         response_label = response.get("VersionLabel") if isinstance(response, Mapping) else None
         if response_label is not None and response_label != label:
             raise PublisherError("the hosted kill-switch version label does not match")
+
+    def _read_hosted_document(self, *, version_number: int, label: str) -> dict[str, Any]:
+        try:
+            response = self._client.get_hosted_configuration_version(
+                ApplicationId=self._application_id,
+                ConfigurationProfileId=self._configuration_profile_id,
+                VersionNumber=version_number,
+            )
+            raw = response.get("Content") if isinstance(response, Mapping) else None
+            content = raw.read() if hasattr(raw, "read") else raw
+        except Exception as exc:  # noqa: BLE001
+            _log_provider_failure("get_hosted_version", exc)
+            raise PublisherError("could not read the hosted kill-switch version") from exc
+        if not isinstance(content, (bytes, bytearray)):
+            raise PublisherError("the hosted kill-switch version has invalid content")
+        response_label = response.get("VersionLabel") if isinstance(response, Mapping) else None
+        if response_label is not None and response_label != label:
+            raise PublisherError("the hosted kill-switch version label does not match")
+        try:
+            document = json.loads(bytes(content))
+            validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+        except (ValueError, TypeError, ControlContractError) as exc:
+            raise PublisherError("the hosted kill-switch version failed its contract") from exc
+        if not isinstance(document, dict):
+            raise PublisherError("the hosted kill-switch version is not an object")
+        return document
 
     def _ensure_deployment(self, *, label: str, strategy_id: str) -> None:
         existing, latest = self._deployment_inventory(label=label, strategy_id=strategy_id)
@@ -279,6 +340,17 @@ class AppConfigKillSwitchPublisher:
                 raise PublisherError("AppConfig reconciliation returned an invalid continuation token")
             next_token = token
         raise PublisherError("AppConfig reconciliation exceeded the bounded page limit")
+
+
+def _document_matches_desired(document: dict[str, Any], desired: dict[str, Any]) -> bool:
+    try:
+        if bool(document["operations_enabled"]) != bool(desired["operations_enabled"]):
+            return False
+        actual = document["capabilities"][CAPABILITY_ID]
+        expected = desired["capabilities"][CAPABILITY_ID]
+        return all(bool(actual[phase]) == bool(expected[phase]) for phase in CONTROL_PHASES)
+    except (KeyError, TypeError):
+        return False
 
 
 def _log_provider_failure(stage: str, exc: Exception) -> None:

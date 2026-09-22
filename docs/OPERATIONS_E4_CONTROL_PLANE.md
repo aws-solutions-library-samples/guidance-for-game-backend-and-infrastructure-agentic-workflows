@@ -144,12 +144,18 @@ is rejected. This is how the intentionally stale, all-disabled seed is safely
 recovered without treating an unreadable switch as enabled.
 
 Each normal control document uses a deterministic AppConfig `VersionLabel`.
-Hosted-version creation and deployment start use AppConfig's
-`LatestVersionNumber` and `LatestDeploymentNumber` optimistic locks, then
-bounded list/get reconciliation verifies exact content, deployment strategy,
-and state. A lost provider response therefore reuses the same hosted version or
-deployment; if the existing side effect cannot be proven, the change fails
-closed instead of issuing a duplicate.
+The exact validated JSON, including its immutable `issued_at` and `not_after`,
+is committed in the publication marker in the same DynamoDB transaction as the
+CAS and audit record. A retry republishes those exact bytes; it never rebuilds
+timestamps under an existing label. Hosted-version creation and deployment
+start use AppConfig's `LatestVersionNumber` and `LatestDeploymentNumber`
+optimistic locks, then bounded list/get reconciliation verifies exact content,
+deployment strategy, and state. A legacy marker created before exact-document
+persistence may recover only from the immutable deterministic hosted version
+after validating its full contract and authority booleans. A lost provider
+response therefore reuses the same hosted version or deployment; if the
+existing side effect cannot be proven, the change fails closed instead of
+issuing a duplicate.
 
 ## Runbook: emergency disable (reversible)
 
