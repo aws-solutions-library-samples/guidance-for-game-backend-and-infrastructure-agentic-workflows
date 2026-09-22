@@ -135,37 +135,54 @@ ceiling from ADR 0005.
 
 No other GameLift action is granted.
 
-### DynamoDB action (exactly `PutItem`) — issue #413
+### DynamoDB actions (exactly `PutItem` + `UpdateItem` + `GetItem`) — issue #413
 
-The runtime persists observations with a single `TransactWriteItems` call made
-of **two conditional `Put` legs** (the operation-state item and the append-only
-ledger item), and issues no read, update, delete, query, scan, or batch call —
-see `operations.validation.e0_persistence.DynamoDbTransactionalSink`.
+The deployed E1 store is `operations.observation_store.DynamoDbObservationStore`
+— the module the Lambda `Handler` actually loads. (It is **not** the E0
+`operations.validation.e0_persistence` sink; that persistence sink is a separate
+E0 concern and is deliberately not part of this runtime IAM invariant.) Across
+its two-phase lifecycle the store issues:
+
+- **`begin_observation`** — one `TransactWriteItems` of four conditional `Put`
+  legs (idempotency mapping, state snapshot, initial transition, initial ledger).
+- **idempotency/replay resolution and `load_status`** — strongly-consistent
+  `GetItem` reads (the mapping, the snapshot, and the stored result).
+- **stale-lease reclaim** — one `TransactWriteItems` of an `Update` leg (fencing
+  generation + lease) and a `Put` leg (recovery ledger).
+- **`complete_observation`** — one `TransactWriteItems` of a `Put` (result), an
+  `Update` (snapshot advance), and two `Put` legs (transition + ledger).
+- **`fail_observation`** — one `TransactWriteItems` of an `Update` (snapshot) and
+  two `Put` legs (transition + ledger).
 
 Per the AWS **"Using IAM with DynamoDB transactions"** guide, permissions for
-the `Put`/`Update`/`Delete`/`Get` legs of a `TransactWriteItems` /
-`TransactGetItems` call are governed by the **underlying**
-`PutItem`/`UpdateItem`/`DeleteItem`/`GetItem` permissions. **There is no
-`dynamodb:TransactWriteItems` IAM action** — granting it is ineffective, and
-`cfn-lint` rejects it as **W3037** (`'transactwriteitems' is not one of …`).
+the `Put`/`Update`/`Delete`/`Get` legs of a `TransactWriteItems` call are
+governed by the **underlying** `PutItem`/`UpdateItem`/`DeleteItem`/`GetItem`
+permissions. **There is no `dynamodb:TransactWriteItems` IAM action** — granting
+it is ineffective, and `cfn-lint` rejects it as **W3037**
+(`'transactwriteitems' is not one of …`).
 
-So the observation role grants **exactly `dynamodb:PutItem`**, scoped to the
-operations table ARN — the only underlying action the store's two `Put` legs
-require. This is the direct fix for the live `begin_observation` DynamoDB
-`AccessDeniedException` (issue #413): the role previously held the invalid
-`TransactWriteItems` action plus unused `GetItem`/`Query`, but **not** the
-`PutItem` permission that actually authorizes the transaction's `Put` legs. The
-unused `GetItem`/`Query` and the ineffective `TransactWriteItems` are removed;
-`DeleteItem`, `Scan`, `Batch*`, `UpdateItem`, and provider writes remain denied
-by omission.
+So the observation role grants **exactly `dynamodb:PutItem`, `dynamodb:UpdateItem`,
+and `dynamodb:GetItem`**, scoped to the operations table ARN — the exact
+underlying action set the store's `Put` legs, fenced `Update` legs, and
+consistent `GetItem` reads require. This corrects an earlier fix that granted
+**only `PutItem`**: that under-grant left the store's `Update` legs
+(reclaim/complete/fail) and its `GetItem` reads (idempotency/replay/status)
+unauthorized, so `complete_observation`, `fail_observation`, stale-lease
+recovery, and status lookups would have failed with `AccessDeniedException` even
+though `begin`'s pure-`Put` transaction succeeded. `Query`, `Scan`, `DeleteItem`,
+`Batch*`, `ConditionCheckItem`, and provider writes remain denied by omission.
 
 > Reference: <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html>
 
 The store→IAM binding is drift-proofed by
 `test_iam_grants_exactly_the_underlying_actions_the_store_transacts`, which
-drives the real store once, inspects **every** actual transaction leg, maps each
-leg to its underlying item action, and asserts the template grants exactly that
-set — so any future drift in the store's legs or the template fails the build.
+imports and drives the real `DynamoDbObservationStore` through begin, a
+conditional replay/get, a stale-lease reclaim (`Update`+`Put`), complete
+(`Update`+`Put`), fail (`Update`+`Put`), and status (`Get`) with a leg-capturing
+fake using real `ClientError` shapes; it maps **every** captured transaction leg
+and direct read to its underlying item action and asserts the template grants
+exactly that derived set — so any future drift in the store's legs/reads or the
+template fails the build.
 `test_dynamodb_grant_is_scoped_to_the_exact_operations_table_arn` pins the
 resource to the operations table ARN.
 
@@ -196,7 +213,7 @@ runtime role therefore holds the documented DynamoDB CMK data-plane action set:
 above, the live `begin_observation` call also had to clear the CMK layer. The
 runtime role's KMS grant originally held only `kms:Decrypt` +
 `kms:GenerateDataKey`, so the CMK-backed write path was denied at the KMS layer
-even once the correct DynamoDB item permission (`PutItem`) was in place. The IAM
+even once the correct DynamoDB item permissions (`PutItem`/`UpdateItem`/`GetItem`) were in place. The IAM
 policy simulator does not model the KMS authorization DynamoDB performs on the
 caller's behalf, which is why a simulator run over the DynamoDB actions can pass
 while the live call fails. The fix grants exactly the documented minimum above —
@@ -377,8 +394,10 @@ that assert, without any AWS call:
   multi-tenant/code-artifact parameters with enabled-mode `Rules`, the S3
   Code artifact wiring, and the CloudWatch Logs KMS key-policy grant;
 - negative IAM invariants (exactly three GameLift reads; DynamoDB limited to
-  `GetItem`/`Query`/`TransactWriteItems`; no S3, GameLift write, `iam:PassRole`,
-  Step Functions, `UpdateItem`/`DeleteItem`/`PutItem`/`Scan`, or wildcard action);
+  exactly `PutItem`/`UpdateItem`/`GetItem` — the deployed store's underlying
+  actions; no ineffective/invalid `TransactWriteItems`, no
+  `Query`/`Scan`/`DeleteItem`/`Batch*`/`ConditionCheckItem`; no S3, GameLift
+  write, `iam:PassRole`, Step Functions, or wildcard action);
 - the runtime KMS grant for the customer-managed key: exactly the documented
   DynamoDB CMK data-plane action set plus an isolated `kms:CreateGrant`, every
   statement pinned to DynamoDB via `kms:ViaService` and `CreateGrant` guarded by
