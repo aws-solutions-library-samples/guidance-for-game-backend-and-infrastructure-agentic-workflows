@@ -19,8 +19,9 @@ Flow
    ``operations-kill-switch`` contract.
 #. **Commit (CAS + audit).** The change is committed through the control audit
    store with a compare-and-set on ``expected_config_version``. The store writes
-   an immutable intent record and, in one atomic transaction, advances the state
-   and writes the immutable outcome audit record. A stale/racing write fails the
+   an immutable intent record, advances the state with a conditional UpdateItem,
+   and writes the immutable outcome audit record with a separate PutItem (no
+   TransactWriteItems). A stale/racing write fails the
    CAS and returns ``version_conflict`` — no document is published. A transient
    store failure fails closed (raises).
 #. **Publish.** Only after a committed CAS is the document published to AppConfig,
@@ -101,6 +102,7 @@ class KillSwitchControlService:
         admin_group: str,
         clock: Callable[[], datetime] | None = None,
         freshness_seconds: int = 600,
+        metrics: Any = None,
     ) -> None:
         if not isinstance(admin_group, str) or not admin_group.strip():
             raise ValueError("admin_group must be a non-empty string")
@@ -111,6 +113,18 @@ class KillSwitchControlService:
         self._admin_group = admin_group
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._freshness = timedelta(seconds=freshness_seconds)
+        # Optional, dimensionless control-plane metrics sink (issue #416). Every
+        # emit is best-effort and must never break the control flow.
+        self._metrics = metrics
+
+    def _emit(self, event_name: str) -> None:
+        sink = self._metrics
+        if sink is None:
+            return
+        try:
+            sink.record(event_name)
+        except Exception:  # noqa: BLE001 - metrics must never break control
+            pass
 
     def apply(
         self,
@@ -149,6 +163,7 @@ class KillSwitchControlService:
             raise ControlServiceError("CONTROL_UNAVAILABLE", "control change could not be recorded") from exc
 
         if outcome is ControlCommitOutcome.VERSION_CONFLICT:
+            self._emit("control.version_conflict")
             return self._response(
                 outcome="version_conflict",
                 config_version=current_version if isinstance(current_version, int) else expected_config_version,
@@ -165,6 +180,7 @@ class KillSwitchControlService:
                 "CONTROL_PUBLISH_FAILED", "control change was recorded but not published"
             ) from exc
 
+        self._emit("control.applied")
         return self._response(
             outcome="applied",
             config_version=resulting_version,
@@ -177,6 +193,7 @@ class KillSwitchControlService:
     def _require_admin(self, principal: Any) -> None:
         groups: frozenset[str] = getattr(principal, "groups", frozenset())
         if self._admin_group not in groups:
+            self._emit("control.denied")
             raise ControlServiceError("AUTHORIZATION_DENIED", "control requires the admin group")
 
     def _validated_desired(self, request: dict[str, Any]) -> dict[str, Any]:

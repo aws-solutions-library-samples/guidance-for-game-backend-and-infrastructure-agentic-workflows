@@ -29,6 +29,7 @@ from operations.contracts import CONTRACT_VERSION
 from operations.contracts.control_plane import (
     CAPABILITIES_ROUTE,
     CONTROL_ROUTE,
+    KILL_SWITCH_ROUTE,
     OPERATIONS_LIST_ROUTE,
 )
 
@@ -39,6 +40,8 @@ class ReadHandlerPort(Protocol):
     def handle_list(self, event: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def handle_detail(self, event: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def handle_kill_switch(self, event: Mapping[str, Any]) -> dict[str, Any]: ...
 
 
 class ControlHandlerPort(Protocol):
@@ -62,11 +65,14 @@ class ControlPlaneRouter:
         if method == "GET":
             if route == CAPABILITIES_ROUTE:
                 return self._read_handler.handle_capabilities(event)
+            if route == KILL_SWITCH_ROUTE:
+                return self._read_handler.handle_kill_switch(event)
             if route == OPERATIONS_LIST_ROUTE:
                 return self._read_handler.handle_list(event)
             # A GET under /operations/<id> is a detail lookup — but never for the
-            # reserved control sub-path, which is POST-only.
-            if route.startswith("/operations/") and route != CONTROL_ROUTE:
+            # reserved control sub-paths (control is POST-only; kill-switch is
+            # matched above), so a reserved path is never read as an operation id.
+            if route.startswith("/operations/") and route not in (CONTROL_ROUTE, KILL_SWITCH_ROUTE):
                 return self._read_handler.handle_detail(event)
 
         return _not_found()

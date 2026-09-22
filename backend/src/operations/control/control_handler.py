@@ -61,6 +61,7 @@ class ControlRequestHandler:
         workspace_id: str,
         trusted_audience: str,
         admin_group: str,
+        metrics: Any = None,
     ) -> None:
         for name, value in (
             ("tenant_id", tenant_id),
@@ -75,11 +76,26 @@ class ControlRequestHandler:
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
         self._admin_group = admin_group
+        # Optional, best-effort control metrics sink (issue #416). A boundary
+        # denial (untrusted client / non-admin) is emitted here because it never
+        # reaches the service.
+        self._metrics = metrics
+
+    def _emit(self, event_name: str) -> None:
+        sink = self._metrics
+        if sink is None:
+            return
+        try:
+            sink.record(event_name)
+        except Exception:  # noqa: BLE001 - metrics must never break control
+            pass
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         try:
             principal = self._verified_principal(event)
         except _ControlDenied as exc:
+            if exc.status == 403 and exc.error_code == "AUTHORIZATION_DENIED":
+                self._emit("control.denied")
             return _error_response(exc.status, exc.error_code, exc.safe_message)
         except Exception:  # noqa: BLE001 - never leak internals
             _LOGGER.error("control identity resolution failed")
@@ -90,6 +106,8 @@ class ControlRequestHandler:
             request = _parse_body(event)
             response = self._control_service.apply(request=request, principal=principal)
         except _ControlDenied as exc:
+            if exc.status == 403 and exc.error_code == "AUTHORIZATION_DENIED":
+                self._emit("control.denied")
             return _error_response(exc.status, exc.error_code, exc.safe_message)
         except ControlServiceError as exc:
             return _error_response(_service_status(exc), exc.error_code, "control could not be applied")

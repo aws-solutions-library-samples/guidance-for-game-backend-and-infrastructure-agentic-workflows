@@ -29,6 +29,8 @@ from typing import Any, Protocol
 # Local modules
 from operations.claims import ClaimParseError, parse_group_claim, parse_scope_claim
 from operations.contracts import CONTRACT_VERSION, MAX_PAGE_SIZE
+from operations.contracts.control_plane import CONTROL_PHASES
+from operations.control.kill_switch_gate import KillSwitchUnavailable
 from operations.identity import VerifiedPrincipal
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +58,8 @@ class ControlReadHandler:
         tenant_id: str,
         workspace_id: str,
         trusted_audience: str,
+        kill_switch_gate: Any = None,
+        metrics: Any = None,
     ) -> None:
         for name, value in (
             ("tenant_id", tenant_id),
@@ -69,6 +73,11 @@ class ControlReadHandler:
         self._tenant_id = tenant_id
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
+        # Optional kill-switch gate + control metrics sink for the bounded
+        # GET /operations/control/kill-switch read (issue #416). When the gate is
+        # absent the reader reports the switch as unavailable and fails closed.
+        self._kill_switch_gate = kill_switch_gate
+        self._metrics = metrics
 
     def handle_capabilities(self, event: Mapping[str, Any]) -> dict[str, Any]:
         return self._guarded(event, self._capabilities)
@@ -78,6 +87,9 @@ class ControlReadHandler:
 
     def handle_detail(self, event: Mapping[str, Any]) -> dict[str, Any]:
         return self._guarded(event, self._detail)
+
+    def handle_kill_switch(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        return self._guarded(event, self._kill_switch)
 
     # -- guarded dispatch ------------------------------------------------
 
@@ -122,6 +134,38 @@ class ControlReadHandler:
         if detail is None:
             raise _ReadDenied(404, "OPERATION_NOT_FOUND", "operation is unavailable")
         return _json_response(200, detail)
+
+    def _kill_switch(self, event: Mapping[str, Any], principal: VerifiedPrincipal) -> dict[str, Any]:
+        """Return the bounded current kill-switch state, failing closed.
+
+        Reads the switch fresh through the gate. On any unavailable/invalid/stale
+        document it emits the ``kill_switch.unavailable`` control metric and
+        returns a bounded 503, never leaking provider detail.
+        """
+        if self._kill_switch_gate is None:
+            self._emit("kill_switch.unavailable")
+            raise _ReadDenied(503, "KILL_SWITCH_UNAVAILABLE", "kill-switch is unavailable")
+        try:
+            decision = self._kill_switch_gate.evaluate()
+        except KillSwitchUnavailable:
+            self._emit("kill_switch.unavailable")
+            raise _ReadDenied(503, "KILL_SWITCH_UNAVAILABLE", "kill-switch is unavailable")
+        body = {
+            "contract_version": CONTRACT_VERSION,
+            "operations_enabled": bool(decision.operations_enabled),
+            "config_version": int(decision.config_version),
+            "phases": {phase: bool(decision.phase_allowed(phase)) for phase in CONTROL_PHASES},
+        }
+        return _json_response(200, body)
+
+    def _emit(self, event_name: str) -> None:
+        sink = self._metrics
+        if sink is None:
+            return
+        try:
+            sink.record(event_name)
+        except Exception:  # noqa: BLE001 - metrics must never break a read
+            pass
 
     # -- identity --------------------------------------------------------
 

@@ -58,6 +58,7 @@ def _build_runtime() -> _ControlRuntime:
     from operations.control.control_handler import ControlRequestHandler
     from operations.control.control_service import KillSwitchControlService
     from operations.control.kill_switch_gate import KillSwitchGate
+    from operations.control.metrics import CloudWatchControlMetrics
     from operations.control.projections import OperationsProjectionService
     from operations.control.read_handler import ControlReadHandler
     from operations.control.router import ControlPlaneRouter
@@ -70,6 +71,8 @@ def _build_runtime() -> _ControlRuntime:
     session = boto3.Session(region_name=_region())
     dynamodb_client = session.client("dynamodb", config=config)
     appconfig_control = session.client("appconfig", config=config)
+    cloudwatch_client = session.client("cloudwatch", config=config)
+    metrics = CloudWatchControlMetrics(client=cloudwatch_client, namespace=obs.metric_namespace)
 
     approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=obs.table_name)
     control_audit_store = DynamoDbControlAuditStore(client=dynamodb_client, table_name=obs.table_name)
@@ -104,6 +107,7 @@ def _build_runtime() -> _ControlRuntime:
         audit_store=control_audit_store,
         publisher=publisher,
         admin_group=settings.admin_group,
+        metrics=metrics,
     )
 
     read_handler = ControlReadHandler(
@@ -112,6 +116,8 @@ def _build_runtime() -> _ControlRuntime:
         tenant_id=obs.tenant_id,
         workspace_id=obs.workspace_id,
         trusted_audience=obs.trusted_audience,
+        kill_switch_gate=gate,
+        metrics=metrics,
     )
     control_handler = ControlRequestHandler(
         control_service=control_service,
@@ -119,6 +125,7 @@ def _build_runtime() -> _ControlRuntime:
         workspace_id=obs.workspace_id,
         trusted_audience=obs.trusted_audience,
         admin_group=settings.admin_group,
+        metrics=metrics,
     )
     router = ControlPlaneRouter(read_handler=read_handler, control_handler=control_handler)
     return _ControlRuntime(router=router)
