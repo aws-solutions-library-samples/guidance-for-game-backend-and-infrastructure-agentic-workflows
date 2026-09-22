@@ -393,6 +393,38 @@ threat below is an attempt to violate one of them.
 | OP-ID1 | Automation/workload identity impersonates a human principal | Automation, workflow, and executor identities are distinct from human requester/approver; an automation identity is not authorization; a human-approval gate remains for writes | Over-broad automation preauthorization (OP-AU4) | E4 |
 | OP-ID2 | Human-principal confusion (requester vs approver vs subject vs client) | Subject and client are distinct even in one decision; `requester` and `approver` are separate verified values; separation-of-duties enforced by policy | — | E3 |
 
+## E3 Execution Realization (issue #415)
+
+The optional E3 execution control plane (`07-operations-execution.yaml`, a
+**separate** stack) realizes the previously-planned executor boundary. It does
+not weaken any Part II invariant; it makes the following concrete:
+
+- **OP-X1 (direct executor invocation) is prevented structurally.** Three
+  separate roles enforce the only legal path
+  dispatcher → Step Functions STANDARD state machine → executor: the dispatcher
+  role can `states:StartExecution` on the exact state machine but **cannot**
+  `lambda:InvokeFunction` the executor; only the **workflow** role can invoke
+  the executor, and only that exact function. The chat / general API / model /
+  E1 / E2 roles hold no execute authority and cannot assume or invoke the
+  executor.
+- **operation_id is neither a credential nor authorization.** Dispatch carries
+  **`operation_id` only**; the state machine threads no fleet id, capacity
+  number, or principal claim. The executor re-loads the approved operation from
+  the table under `operation_id` and re-checks authority, so guessing an id
+  (OP-X2) grants nothing.
+- **No blind retry.** The state machine attaches no `Retry` to the executor
+  task; a transient failure is surfaced, never silently re-attempted, so a
+  bounded capacity write is never blindly repeated.
+- **OP-AU5 (emergency disablement) is a reversible two-lever kill switch.**
+  `ExecutionMode=disabled` (the default) throttles the dispatch API stage to
+  zero (lever 1) **and** injects the mode so the executor fails closed (lever 2),
+  without deleting any resource or data. Re-enable is reversible.
+- **Least privilege at the write edge.** The executor holds only
+  `gamelift:DescribeFleetCapacity` + `gamelift:UpdateFleetCapacity`, scoped to
+  the **exact enrolled fleet ARN**, plus the underlying DynamoDB item actions and
+  KMS strictly via DynamoDB. No `iam:PassRole`, secrets, source-control, generic
+  execute, or wildcard appears anywhere in the stack.
+
 ## Attack Trees
 
 ### Attack Tree: Unauthorized Provider Write
@@ -690,4 +722,5 @@ Append-only ledger (authoritative audit)
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0 | 2026-01-12 | Security Eng | Initial draft |
+| 2.1 | 2026-09-21 | Security Eng | Added the E3 Execution Realization section (issue #415): the separate 07 execution stack realizes the planned executor boundary — direct-invocation prevention via three separate roles (dispatcher/workflow/executor), operation_id-only invocation, no blind retry, the reversible two-lever emergency disable (OP-AU5), and fleet-ARN-scoped least privilege at the write edge. No Part I or Part II invariant weakened. |
 | 2.0 | 2026-09-21 | Security Eng | Split into the deployed read-only chat path (Part I) and the optional, default-disabled operations control plane (Part II). Added trust boundaries O1-O8, per-boundary STRIDE, attack trees, and explicit residual risks for operations APIs, direct approval, immutable prepared operations, replay/stale-approval/cancellation, source-control prepare/executor, remote MCP clients, separate provider-write roles, bounded autonomy, emergency disablement, budget/authority limits, indirect prompt injection, confused deputy, audit integrity, and fail-closed recovery (issue #280). |

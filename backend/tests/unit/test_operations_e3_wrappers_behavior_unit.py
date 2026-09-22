@@ -105,7 +105,7 @@ def test_enable_without_artifact_bucket_refuses():
             "GBAW_OPERATIONS_EXECUTION_MODE": "remediate",
             "COGNITO_ISSUER": "https://issuer.example",
             "COGNITO_CLIENT_ID": "client-abc",
-            "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-1111-2222-3333-444455556666",
+            "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
             "GBAW_OPERATIONS_TABLE_NAME": "game-agent-operations",
             "GBAW_OPERATIONS_KMS_KEY_ARN": "arn:aws:kms:us-west-2:000000000000:key/abc",
         },

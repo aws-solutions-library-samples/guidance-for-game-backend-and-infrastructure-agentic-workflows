@@ -33,7 +33,7 @@ DISABLED_ENV = {
     "GBAW_OPERATIONS_EXECUTION_MODE": "disabled",
     "GBAW_OPERATIONS_TABLE_NAME": "game-agent-operations",
     "GBAW_OPERATIONS_METRIC_NAMESPACE": "GameAgent/Operations",
-    "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-1111-2222-3333-444455556666",
+    "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
     "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:123456789012:stateMachine:game-agent-operations-execution",
 }
 
