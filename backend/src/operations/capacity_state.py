@@ -68,7 +68,8 @@ def _int_field(mapping: object, name: str) -> int | None:
     value = mapping.get(name)
     if isinstance(value, bool) or not isinstance(value, int):
         return None
-    return value
+    resolved: int = value
+    return resolved
 
 
 class E1ObservationCapacityStatePort:

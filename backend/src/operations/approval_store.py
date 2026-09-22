@@ -552,7 +552,8 @@ def _canonical_json(document: Mapping[str, Any]) -> str:
     # Third-party packages
     import rfc8785
 
-    return rfc8785.dumps(dict(document)).decode("utf-8")
+    canonical: str = rfc8785.dumps(dict(document)).decode("utf-8")
+    return canonical
 
 
 def _approval_state_change(operation_id: str, prepared_hash: str, approval: Mapping[str, Any]) -> dict[str, Any]:
