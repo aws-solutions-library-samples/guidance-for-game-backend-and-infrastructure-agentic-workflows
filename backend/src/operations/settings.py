@@ -309,3 +309,73 @@ def resolve_observation_deployment_settings(
         workspace_id=_required_identifier(source, "GBAW_OPERATIONS_WORKSPACE_ID"),
         trusted_audience=_required_str(source, "GBAW_OPERATIONS_TRUSTED_AUDIENCE"),
     )
+
+
+# -- E3 execute-phase deployment settings (issue #415) ------------------------
+#
+# The executor must run at or above ``remediate`` (both the deployment mode and
+# the capability maximum) before it may issue a provider write. The default
+# ``capability_maximum`` is ``remediate``: the executor never grants itself
+# ``operate``. The enrolled fleet id/ARN/location are the server-owned binding
+# the executor re-verifies the operation target against; the ARN is never taken
+# from the operation. The state machine ARN is the Standard workflow the
+# dispatcher starts with only ``{operation_id}``.
+_EXECUTE_MODE = "remediate"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutorDeploymentSettings:
+    """The full frozen E3 deployment contract the execute Lambdas bootstrap from.
+
+    It embeds the observe deployment settings (table, metrics, tenant/workspace,
+    trusted audience, authority ceiling) and adds the E3-specific bindings. Every
+    field is resolved and validated at load time and fails closed.
+    """
+
+    observation: ObservationDeploymentSettings
+    state_machine_arn: str
+    capability_maximum: str
+    enrolled_fleet_id: str
+    enrolled_fleet_arn: str
+    enrolled_location: str
+    admin_group: str
+
+    def __post_init__(self) -> None:
+        if self.capability_maximum not in _AUTHORITY_ORDER:
+            raise ValueError(f"capability_maximum must be one of {OPERATIONS_MODES}")
+        for name in (
+            "state_machine_arn",
+            "enrolled_fleet_id",
+            "enrolled_fleet_arn",
+            "enrolled_location",
+            "admin_group",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if not self.enrolled_fleet_arn.startswith("arn:aws:gamelift:"):
+            raise ValueError("enrolled_fleet_arn must be a GameLift fleet ARN")
+
+    @property
+    def execute_enabled(self) -> bool:
+        """Whether the deployment ceiling AND capability admit a provider write."""
+        return (
+            _AUTHORITY_ORDER[self.observation.mode] >= _AUTHORITY_ORDER[_EXECUTE_MODE]
+            and _AUTHORITY_ORDER[self.capability_maximum] >= _AUTHORITY_ORDER[_EXECUTE_MODE]
+        )
+
+
+def resolve_executor_deployment_settings(
+    env: Mapping[str, str] | None = None,
+) -> ExecutorDeploymentSettings:
+    """Resolve the full frozen E3 deployment contract, failing closed."""
+    source: Mapping[str, str] = os.environ if env is None else env
+    return ExecutorDeploymentSettings(
+        observation=resolve_observation_deployment_settings(source),
+        state_machine_arn=_required_str(source, "GBAW_OPERATIONS_STATE_MACHINE_ARN"),
+        capability_maximum=_optional_str(source, "GBAW_OPERATIONS_CAPABILITY_MAXIMUM", _EXECUTE_MODE),
+        enrolled_fleet_id=_required_str(source, "GBAW_OPERATIONS_ENROLLED_FLEET_ID"),
+        enrolled_fleet_arn=_required_str(source, "GBAW_OPERATIONS_ENROLLED_FLEET_ARN"),
+        enrolled_location=_required_str(source, "GBAW_OPERATIONS_ENROLLED_LOCATION"),
+        admin_group=_optional_str(source, "GBAW_OPERATIONS_APPROVER_GROUP", DEFAULT_APPROVER_GROUP),
+    )
