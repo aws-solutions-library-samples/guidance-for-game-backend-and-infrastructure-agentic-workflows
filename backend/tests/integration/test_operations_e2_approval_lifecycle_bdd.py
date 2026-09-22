@@ -425,3 +425,61 @@ def test_expired_credential_cannot_approve() -> None:
         )
     )
     assert resp["statusCode"] in (401, 409)
+
+
+# -- Adapter parity + direct-Lambda identity denial (issue #414) ------------
+
+
+def test_handler_prepare_matches_direct_orchestrator_outcome() -> None:
+    # Driving prepare through the HTTP handler yields the same operation id and
+    # prepared hash as invoking the orchestrator directly with the same trusted
+    # principal and body — the adapter adds no behavior beyond transport.
+    # Local modules
+    from operations.identity import VerifiedPrincipal
+
+    client_a = StatefulDynamoClient()
+    handler = _handler(client_a)
+    via_handler = json.loads(_prepare(handler)["body"])
+
+    # Direct orchestrator over a SEPARATE store, same inputs.
+    client_b = StatefulDynamoClient()
+    direct_handler = _handler(client_b)
+    principal = VerifiedPrincipal(
+        subject_id="user.requester",
+        client_id="client.requester",
+        audience=AUDIENCE,
+        tenant_id="tenant.default",
+        workspace_id="workspace.default",
+        expires_at=NOW + timedelta(hours=1),
+    )
+    direct = direct_handler._orchestrator.prepare(
+        _prepare_body(), principal, request_id="apigw.req-1", correlation_id="apigw.req-1"
+    )
+    assert via_handler["operation_id"] == direct.operation["operation_id"]
+    assert via_handler["prepared_hash"] == direct.prepared_hash
+    assert via_handler["decision"] == direct.decision.value
+
+
+def test_direct_lambda_invocation_without_authorizer_is_denied() -> None:
+    handler = _handler(StatefulDynamoClient())
+    # A direct/unattributed invocation carries no verified authorizer context.
+    event = {
+        "requestContext": {"http": {"method": "POST", "path": "/operations/prepare"}},
+        "body": json.dumps(_prepare_body()),
+    }
+    resp = handler.handle(event)
+    assert resp["statusCode"] == 401
+    assert "op_" not in resp["body"]
+
+
+def test_identity_injected_in_body_is_never_trusted() -> None:
+    handler = _handler(StatefulDynamoClient())
+    body = _prepare_body()
+    body["requester"] = {"subject_id": "attacker", "workspace_id": "workspace.evil"}
+    resp = handler.handle(
+        _event("POST", "/operations/prepare", claims=_claims("user.requester", "client.requester"), body=body)
+    )
+    # The injected identity field is rejected as a contract violation (400),
+    # never used to attribute or authorize the request.
+    assert resp["statusCode"] == 400
+    assert "workspace.evil" not in resp["body"]
