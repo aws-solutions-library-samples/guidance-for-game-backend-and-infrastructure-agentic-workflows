@@ -514,6 +514,11 @@ class DynamoDbApprovalStore:
                 if isinstance(parsed, dict):
                     event_type = parsed.get("event_type")
                     occurred_at = parsed.get("occurred_at")
+            # ``sequence`` reported here is the physical ``LEDGER#<n>`` sort-key
+            # index (0 for the initial materialization, 1 for the terminal
+            # decision), NOT the ledger event payload's own contract ``sequence``
+            # field (which the ledger-event schema floors at 1). The two are
+            # intentionally distinct; evidence ordering follows the physical key.
             entries.append({"sequence": sequence, "event_type": event_type, "occurred_at": occurred_at})
         return entries
 

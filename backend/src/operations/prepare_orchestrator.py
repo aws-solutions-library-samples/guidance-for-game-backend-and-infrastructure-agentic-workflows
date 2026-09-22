@@ -354,6 +354,13 @@ def _prepared_state_change(prepared: PreparedOperation) -> dict[str, Any]:
 
 def _prepared_ledger_event(prepared: PreparedOperation) -> dict[str, Any]:
     operation = prepared.operation
+    # ``sequence`` here is the *ledger-event contract* field, which the
+    # ``ledger-event`` schema constrains to ``minimum: 1`` — it is the 1-based
+    # domain event ordinal, NOT the store's physical ``LEDGER#<n>`` sort-key
+    # index. This first materialization event is stored at the ``LEDGER#0`` key
+    # (see ``approval_store``) yet correctly carries contract sequence ``1``; the
+    # two counters are deliberately distinct and MUST NOT be conflated. The
+    # evidence read reports the physical key index (0, 1, ...), never this field.
     return {
         "ledger_contract_version": CONTRACT_VERSION,
         "event_id": f"event.prepared.{operation['operation_id']}",
