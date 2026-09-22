@@ -1,6 +1,11 @@
 #!/bin/bash
-# Game Agent - OPTIONAL E1 operations observation control plane deploy wrapper
-# (GitHub issue #413).
+# Game Agent - OPTIONAL E1/E2 operations control plane deploy wrapper
+# (GitHub issues #413 E1 observe, #414 E2 advise).
+#
+# E2 adds an explicit --mode observe|advise: advise keeps the observe routes
+# active AND enables the read-only prepare + human-approval gate. Enabling any
+# mode still requires the matching GBAW_OPERATIONS_MODE double opt-in and
+# Provisioned=true; --disable remains an emergency, rebuild-free path.
 #
 # This wrapper is DELIBERATELY NOT called by deploy.sh / deploy-all.sh. A normal
 # deployment creates zero E1 resources. Even when this wrapper runs, it refuses
@@ -64,11 +69,20 @@ PINNED_DEPS=(
 
 ENVIRONMENT="beta"
 ACTION="preview"   # preview | enable | disable
+# E2 (issue #414): the enabled runtime authority to request. "observe" (E1)
+# or "advise" (E2, prepare + human-approval gate). Selected with --mode and
+# double-confirmed by a MATCHING GBAW_OPERATIONS_MODE (see the enable gate).
+REQUESTED_MODE="observe"
 COGNITO_ISSUER="${COGNITO_ISSUER:-}"
 COGNITO_CLIENT_ID="${COGNITO_CLIENT_ID:-}"
 TENANT_ID="${TENANT_ID:-}"
 WORKSPACE_ID="${WORKSPACE_ID:-}"
 TRUSTED_AUDIENCE="${TRUSTED_AUDIENCE:-}"
+# E2 (issue #414) server-owned advise settings. Self-approval defaults OFF so
+# a fresh enable never self-approves; expiry windows match the core defaults.
+LOW_RISK_SELF_APPROVAL="${GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL:-false}"
+PREPARATION_EXPIRY_SECONDS="${GBAW_OPERATIONS_PREPARATION_EXPIRY_S:-900}"
+APPROVAL_EXPIRY_SECONDS="${GBAW_OPERATIONS_APPROVAL_EXPIRY_S:-1800}"
 # The EXPLICIT, pre-existing artifact bucket for the Lambda zip. There is no
 # discovery and no creation: an enabled deploy requires this to name a bucket
 # that already exists in the target account/region.
@@ -81,13 +95,17 @@ AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
 
 usage() {
     cat <<'USAGE'
-Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod]
+Usage: deploy-operations.sh [--enable [--mode observe|advise] | --disable]
+                            [--environment beta|prod]
 
   (no flag)     Preview only (READ-ONLY): validates and lints the template and
                 creates nothing. No change set is created.
   --enable      Build/upload the operations Lambda artifact and deploy the stack
-                with OperationsMode=observe. Requires GBAW_OPERATIONS_MODE=observe
-                in the environment plus the enabling inputs below.
+                with the selected enabled OperationsMode (default observe).
+                Requires GBAW_OPERATIONS_MODE to MATCH the selected --mode
+                (double opt-in) plus the enabling inputs below.
+  --mode        observe (E1, read-only observation) or advise (E2, additionally
+                the read-only prepare + human-approval gate). Default observe.
   --disable     Emergency, data-preserving disable of an EXISTING provisioned
                 stack: keeps Provisioned=true and every resource under
                 CloudFormation (stable physical names, retained data), reuses all
@@ -98,7 +116,8 @@ Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod]
                 deletion protection and longer log retention.
 
 Environment for --enable:
-  GBAW_OPERATIONS_MODE=observe        Required confirmation.
+  GBAW_OPERATIONS_MODE=<mode>         Required confirmation; MUST match the
+                                      selected --mode (observe or advise).
   COGNITO_ISSUER, COGNITO_CLIENT_ID   JWT issuer + audience (required).
   TENANT_ID, WORKSPACE_ID             Server-side trusted bindings (required).
   TRUSTED_AUDIENCE                    Optional; defaults to COGNITO_CLIENT_ID.
@@ -115,6 +134,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --enable)  ACTION="enable" ;;
         --disable) ACTION="disable" ;;
+        --mode) shift; REQUESTED_MODE="${1:-observe}" ;;
         --environment) shift; ENVIRONMENT="${1:-beta}" ;;
         -h|--help) usage; exit 0 ;;
         *) echo "❌ Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -167,9 +187,18 @@ OPERATIONS_MODE="disabled"
 CODE_S3_KEY=""
 
 if [ "$ACTION" = "enable" ]; then
-    # Belt-and-braces opt-in: require the environment value AND the flag.
-    if [ "${GBAW_OPERATIONS_MODE:-disabled}" != "observe" ]; then
-        echo "❌ Refusing to enable: set GBAW_OPERATIONS_MODE=observe to confirm." >&2
+    # The requested runtime authority must be an ENABLED mode.
+    if [ "$REQUESTED_MODE" != "observe" ] && [ "$REQUESTED_MODE" != "advise" ]; then
+        echo "❌ Refusing to enable: --mode must be observe or advise, got '$REQUESTED_MODE'." >&2
+        exit 3
+    fi
+    # Belt-and-braces double opt-in: the environment value AND the flag, and
+    # GBAW_OPERATIONS_MODE MUST MATCH the requested --mode. A mismatch (e.g.
+    # --mode advise with GBAW_OPERATIONS_MODE=observe) is refused so an enable
+    # can never silently escalate or downgrade the runtime authority.
+    if [ "${GBAW_OPERATIONS_MODE:-disabled}" != "$REQUESTED_MODE" ]; then
+        echo "❌ Refusing to enable: set GBAW_OPERATIONS_MODE=$REQUESTED_MODE to confirm" >&2
+        echo "   (it must match the selected --mode $REQUESTED_MODE)." >&2
         exit 3
     fi
     if [ -z "$COGNITO_ISSUER" ] || [ -z "$COGNITO_CLIENT_ID" ]; then
@@ -185,7 +214,7 @@ if [ "$ACTION" = "enable" ]; then
         echo "   never discovers or creates a bucket; set it to a pre-existing bucket." >&2
         exit 6
     fi
-    OPERATIONS_MODE="observe"
+    OPERATIONS_MODE="$REQUESTED_MODE"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -358,7 +387,15 @@ try:
     v.validate_contract("prepared-operation", {})
 except v.ContractValidationError:
     pass
-print("runtime probe ok: handler import + %d schemas loaded" % len(SCHEMA_NAMES))
+# E2 (issue #414): the advise-mode routes (POST /operations/prepare and
+# POST /operations/{operationId}/approve|reject|cancel) validate against these
+# contract schemas at runtime. Load each explicitly so a package that ships
+# the handler but OMITS an E2 schema fails the probe here, before upload,
+# instead of at the first prepare/approve/reject/cancel request.
+for e2_schema in ("prepare-operation-request", "approval-record", "prepared-operation"):
+    assert e2_schema in SCHEMA_NAMES, "E2 schema %s absent from package" % e2_schema
+    v.load_schema(e2_schema)
+print("runtime probe ok: handler import + %d schemas loaded (incl. E2 prepare/approve)" % len(SCHEMA_NAMES))
 PROBE
 )"
 
@@ -514,6 +551,9 @@ if [ "$ACTION" = "disable" ]; then
         "ParameterKey=PersistenceBudgetSeconds,UsePreviousValue=true"
         "ParameterKey=CancellationMarginSeconds,UsePreviousValue=true"
         "ParameterKey=ObservationTtlSeconds,UsePreviousValue=true"
+        "ParameterKey=LowRiskSelfApproval,UsePreviousValue=true"
+        "ParameterKey=PreparationExpirySeconds,UsePreviousValue=true"
+        "ParameterKey=ApprovalExpirySeconds,UsePreviousValue=true"
         "ParameterKey=LambdaMemoryMb,UsePreviousValue=true"
         "ParameterKey=ReservedConcurrency,UsePreviousValue=true"
         "ParameterKey=MaxReadRequestUnits,UsePreviousValue=true"
@@ -567,6 +607,9 @@ PARAM_OVERRIDES=(
     "TrustedAudience=${TRUSTED_AUDIENCE}"
     "CodeS3Bucket=${CODE_S3_BUCKET:-}"
     "CodeS3Key=${CODE_S3_KEY}"
+    "LowRiskSelfApproval=${LOW_RISK_SELF_APPROVAL}"
+    "PreparationExpirySeconds=${PREPARATION_EXPIRY_SECONDS}"
+    "ApprovalExpirySeconds=${APPROVAL_EXPIRY_SECONDS}"
 )
 
 echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."

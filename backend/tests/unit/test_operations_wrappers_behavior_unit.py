@@ -216,6 +216,62 @@ def test_enable_path_provisions_resources():
     assert '"OperationsMode=${OPERATIONS_MODE}"' in enable
 
 
+# --------------------------------------------------------------------------- #
+# E2 (issue #414) advise-mode wrapper behavior: explicit --mode with a MATCHING
+# GBAW_OPERATIONS_MODE double opt-in. These run only the refusal paths, which
+# exit before any aws call, so they never touch AWS.
+# --------------------------------------------------------------------------- #
+def test_deploy_enable_advise_without_matching_mode_env_refuses():
+    """--mode advise requires GBAW_OPERATIONS_MODE=advise to match; a mismatched
+    (or observe) env value is refused so an enable never silently escalates."""
+    result = _run(DEPLOY, "--enable", "--mode", "advise", env_extra={"GBAW_OPERATIONS_MODE": "observe"})
+    assert result.returncode == 3
+    assert "Refusing to enable" in result.stdout + result.stderr
+
+
+def test_deploy_enable_observe_with_advise_env_refuses():
+    """The reverse mismatch (--mode observe, env advise) is equally refused."""
+    result = _run(DEPLOY, "--enable", "--mode", "observe", env_extra={"GBAW_OPERATIONS_MODE": "advise"})
+    assert result.returncode == 3
+
+
+def test_deploy_enable_invalid_mode_refuses():
+    """--mode must be observe or advise; any other value fails closed."""
+    result = _run(DEPLOY, "--enable", "--mode", "operate", env_extra={"GBAW_OPERATIONS_MODE": "operate"})
+    assert result.returncode == 3
+    assert "observe or advise" in (result.stdout + result.stderr)
+
+
+def test_deploy_enable_advise_matching_mode_reaches_input_validation():
+    """With --mode advise and a MATCHING GBAW_OPERATIONS_MODE=advise, the mode
+    double opt-in passes and the wrapper proceeds to the enabling-input checks
+    (Cognito/tenant), still refusing (no creds/inputs) before any aws call."""
+    result = _run(DEPLOY, "--enable", "--mode", "advise", env_extra={"GBAW_OPERATIONS_MODE": "advise"})
+    assert result.returncode == 3
+    combined = (result.stdout + result.stderr).upper()
+    # It got past the mode gate: the failure is now the missing Cognito input.
+    assert "COGNITO" in combined
+
+
+def test_deploy_enable_passes_e2_settings_in_overrides():
+    """The enable PARAM_OVERRIDES must pass the three E2 settings so the
+    advise-mode runtime posture is applied."""
+    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
+    enable = _DEPLOY_TEXT[idx:]
+    assert '"LowRiskSelfApproval=${LOW_RISK_SELF_APPROVAL}"' in enable
+    assert '"PreparationExpirySeconds=${PREPARATION_EXPIRY_SECONDS}"' in enable
+    assert '"ApprovalExpirySeconds=${APPROVAL_EXPIRY_SECONDS}"' in enable
+
+
+def test_disable_reuses_e2_settings_unchanged():
+    """An emergency disable must reuse the three E2 settings via UsePreviousValue
+    so a disabled-but-provisioned advise stack keeps its posture on re-enable."""
+    idx = _DEPLOY_TEXT.index("DISABLE_PARAMS=(")
+    disable = _DEPLOY_TEXT[idx:]
+    for key in ("LowRiskSelfApproval", "PreparationExpirySeconds", "ApprovalExpirySeconds"):
+        assert f'"ParameterKey={key},UsePreviousValue=true"' in disable
+
+
 def test_disable_help_describes_data_preserving_no_rebuild():
     result = _run(DEPLOY, "--help")
     assert result.returncode == 0

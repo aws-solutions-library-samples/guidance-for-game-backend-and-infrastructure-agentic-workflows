@@ -44,15 +44,19 @@ Parameters:
     AllowedValues:
       - disabled
       - observe
+      - advise
     Description: >-
       Runtime authority (kill switch) for a PROVISIONED control plane, SEPARATE
       from the Provisioned flag that controls whether resources exist at all.
       "disabled" (the default) is fail-closed: injected as GBAW_OPERATIONS_MODE
-      so the handler and API reject every operation. "observe" is the only
-      enabled mode for E1: synchronous, read-only GameLift observation. On an
-      already-provisioned stack, an emergency disable sets this to "disabled"
-      while leaving Provisioned="true" (resources and data retained, reversible);
-      it does NOT delete resources. "observe" requires Provisioned="true".
+      so the handler and API reject every operation. "observe" is the E1 mode:
+      synchronous, read-only GameLift observation. "advise" (E2, issue #414) is
+      a strictly HIGHER authority that KEEPS the observe routes active AND enables
+      the read-only prepare + human-approval gate (prepare/approve/reject/cancel)
+      with NO provider write. Both "observe" and "advise" are ENABLED modes and
+      require Provisioned="true". On an already-provisioned stack, an emergency
+      disable sets this to "disabled" while leaving Provisioned="true" (resources
+      and data retained, reversible); it does NOT delete resources.
 
   Environment:
     Type: String
@@ -169,6 +173,49 @@ Parameters:
       (1800 s = 30 min). The audit ledger and idempotency mapping are retained
       for the full audit window and are not TTL-managed.
 
+  # ------------------------------------------------------------------------- #
+  # E2 (issue #414) advise-mode settings. Server-owned and validated. The env
+  # names below are the FROZEN core names the runtime consumes in a later slice;
+  # the infra injects exactly these so operator/owner posture takes effect.
+  # ------------------------------------------------------------------------- #
+  LowRiskSelfApproval:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Server-owned low-risk self-approval posture (E2), injected as
+      GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL. "false" (the default) means the
+      preparer can NEVER approve their own operation: approval always requires a
+      distinct authorized approver. "true" permits self-approval ONLY for the
+      server-defined low-risk action set the core policy recognises; it never
+      widens the approver authority beyond that set. Defaulting to "false" keeps
+      a fresh deploy from ever self-approving.
+
+  PreparationExpirySeconds:
+    Type: Number
+    Default: 900
+    MinValue: 1
+    MaxValue: 86400
+    Description: >-
+      Preparation validity window in seconds (E2), injected as
+      GBAW_OPERATIONS_PREPARATION_EXPIRY_S. A prepared operation that is not
+      approved before this window elapses expires and can no longer be approved,
+      so a stale prepared operation fails closed. Bounded to at most one day.
+
+  ApprovalExpirySeconds:
+    Type: Number
+    Default: 1800
+    MinValue: 1
+    MaxValue: 86400
+    Description: >-
+      Approval validity window in seconds (E2), injected as
+      GBAW_OPERATIONS_APPROVAL_EXPIRY_S. Matches the core ApprovalPolicy default
+      (1800 s = 30 min) and the contract that an approval TTL is greater than
+      zero and no more than one day. A recorded approval past this window is
+      expired and cannot dispatch.
+
   LambdaMemoryMb:
     Type: Number
     Default: 512
@@ -220,7 +267,17 @@ Conditions:
   # Runtime authority (kill switch). Does NOT gate resource existence; it only
   # feeds the injected GBAW_OPERATIONS_MODE so a provisioned-but-disabled stack
   # fails closed at the handler/API.
-  OperationsEnabled: !Equals [!Ref OperationsMode, observe]
+  # An ENABLED mode is observe OR advise (E2). The stage throttle references this
+  # single condition, so advise keeps the observe routes open and only "disabled"
+  # throttles the gateway to zero (fail closed) — the kill switch is unchanged.
+  OperationsEnabled: !Or
+    - !Equals [!Ref OperationsMode, observe]
+    - !Equals [!Ref OperationsMode, advise]
+  # advise (E2) is distinguished from observe by the injected
+  # GBAW_OPERATIONS_MODE env value the runtime reads, not by a separate CFN
+  # condition: resource existence stays gated only on ResourcesProvisioned and
+  # the kill switch only on OperationsEnabled, so a disabled-but-provisioned
+  # stack keeps the routes and their retained data.
   IsProd: !Equals [!Ref Environment, prod]
   # An explicit trusted audience overrides the Cognito client id fallback.
   HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
@@ -231,12 +288,17 @@ Rules:
   # This is what makes --enable require Provisioned=true and prevents an
   # observe-mode deploy against a zero-resource stack.
   EnabledModeRequiresProvisioning:
-    RuleCondition: !Equals [!Ref OperationsMode, observe]
+    # Fire for EITHER enabled mode (observe or advise, E2). Enabling runtime
+    # authority of any kind against a zero-resource (unprovisioned) stack is
+    # rejected, so --enable --mode advise requires Provisioned=true exactly as
+    # --mode observe does.
+    RuleCondition: !Not [!Equals [!Ref OperationsMode, disabled]]
     Assertions:
       - Assert: !Equals [!Ref Provisioned, 'true']
         AssertDescription: >-
-          OperationsMode=observe requires Provisioned=true; enabling runtime
-          authority against a zero-resource (unprovisioned) stack is rejected.
+          An enabled OperationsMode (observe or advise) requires Provisioned=true;
+          enabling runtime authority against a zero-resource (unprovisioned)
+          stack is rejected.
 
   # Whenever resources exist (Provisioned=true) the bindings those resources
   # reference — the JWT issuer/audience on the authorizer, the trusted
@@ -614,6 +676,10 @@ Resources:
           GBAW_OPERATIONS_PERSISTENCE_BUDGET_S: !Ref PersistenceBudgetSeconds
           GBAW_OPERATIONS_CANCELLATION_MARGIN_S: !Ref CancellationMarginSeconds
           GBAW_OPERATIONS_OBSERVATION_TTL_S: !Ref ObservationTtlSeconds
+          # E2 (issue #414) advise-mode settings — frozen core env names.
+          GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL: !Ref LowRiskSelfApproval
+          GBAW_OPERATIONS_PREPARATION_EXPIRY_S: !Ref PreparationExpirySeconds
+          GBAW_OPERATIONS_APPROVAL_EXPIRY_S: !Ref ApprovalExpirySeconds
       Code:
         S3Bucket: !Ref CodeS3Bucket
         S3Key: !Ref CodeS3Key
@@ -694,6 +760,53 @@ Resources:
     Properties:
       ApiId: !Ref HttpApi
       RouteKey: 'GET /operations/{operationId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  # ------------------------------------------------------------------------- #
+  # E2 (issue #414) advise-mode routes. Each is JWT-authorized and targets the
+  # SAME shared ObservationIntegration (the single real handler Lambda) — there
+  # is no second handler and no per-route divergent integration. The prepare
+  # route is read-only preparation; approve/reject/cancel drive the human-
+  # approval gate. NONE of these is exposed through chat or MCP.
+  # ------------------------------------------------------------------------- #
+  PrepareRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /operations/prepare'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  ApproveRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /operations/{operationId}/approve'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  RejectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /operations/{operationId}/reject'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  CancelRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /operations/{operationId}/cancel'
       AuthorizationType: JWT
       AuthorizerId: !Ref JwtAuthorizer
       Target: !Sub 'integrations/${ObservationIntegration}'
@@ -809,6 +922,71 @@ Resources:
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
 
+  # ------------------------------------------------------------------------- #
+  # E2 (issue #414) alarms on the four frozen advise-mode metrics. The E1 alarms
+  # above are RETAINED unchanged. All alarms share the GameAgent/Operations
+  # namespace.
+  # ------------------------------------------------------------------------- #
+  PreparationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-preparation-failures'
+      AlarmDescription: Prepare-operation requests are failing.
+      Namespace: 'GameAgent/Operations'
+      MetricName: PreparationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ApprovalFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-approval-failures'
+      AlarmDescription: Approval-gate requests (approve/reject) are failing.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ApprovalFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ApprovalExpiredAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-approval-expired'
+      AlarmDescription: Approvals or prepared operations expired before dispatch.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ApprovalExpired
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  CancellationConflictsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-cancellation-conflicts'
+      AlarmDescription: Cancellation attempts conflicted with a concurrent state change.
+      Namespace: 'GameAgent/Operations'
+      MetricName: CancellationConflicts
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
 Outputs:
   Provisioned:
     Description: >-
@@ -820,7 +998,9 @@ Outputs:
   OperationsMode:
     Description: >-
       Effective runtime authority (kill switch) for this stack. "disabled" fails
-      closed; "observe" serves read-only observation. Independent of Provisioned.
+      closed; "observe" serves read-only observation; "advise" (E2) additionally
+      serves the read-only prepare + human-approval gate. Independent of
+      Provisioned.
     Value: !Ref OperationsMode
 
   HttpApiEndpoint:

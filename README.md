@@ -117,7 +117,9 @@ The following table provides a sample cost breakdown for deploying this Guidance
 ### Optional operations control plane (E1)
 
 The optional E1 operations control plane is **default-unprovisioned and adds no
-incremental cost** to the numbers above. A default deployment leaves
+incremental cost** to the numbers above.
+
+> **E2 (advise) — planned, not yet live-validated.** An optional E2 *advise* mode (GitHub issue #414) extends E1 **additively**: it keeps the read-only observation routes and adds a read-only **prepare** step and a **human-approval gate** (approve / reject / cancel), with **no** provider write for bounded GameLift. Its infrastructure, deploy wrapper, and runbook are implemented and test-covered, but E2 has **not** been deployed or validated against a live account, so it is **planned** until a live shakedown confirms it. E2 changes nothing about the default-unprovisioned **$0.00** state and adds **no** new IAM beyond the E1 read-only boundary. See [`docs/OPERATIONS_E1_DEPLOYMENT.md`](docs/OPERATIONS_E1_DEPLOYMENT.md) (E2 addendum). A default deployment leaves
 `Provisioned=false`, so it creates **zero** resources, costs **$0.00**, and holds
 no data. Nothing in the table changes unless an owner explicitly **provisions and
 enables** operations. Note that *disabling* an already-provisioned stack is
