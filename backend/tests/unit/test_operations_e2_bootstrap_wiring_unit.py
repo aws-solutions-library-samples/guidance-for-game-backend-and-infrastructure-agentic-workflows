@@ -8,7 +8,10 @@ assert the security-critical wiring the on-host handler will actually use:
 * the prepared operation's playbook hash is the real definition digest, not the
   all-zero placeholder;
 * the capacity bounds resolver is injected with the server-owned fail-closed
-  settings, not hardcoded million-instance limits.
+  settings, not hardcoded million-instance limits; and
+* the approval service is injected with the capacity-specific validator,
+  hasher, and binding (not the generic source-control defaults), so it can
+  validate and hash the stored capacity operation it is asked to approve.
 """
 
 from __future__ import annotations
@@ -96,3 +99,68 @@ def test_bootstrap_bounds_reflect_configured_settings(monkeypatch: pytest.Monkey
     advice_service = factory("obs_aaaaaaaaaaaaaaaaaaaaaaaaaa")
     bounds_port = advice_service._bounds_port
     assert (bounds_port._floor, bounds_port._ceiling, bounds_port._max_step) == (2, 10, 3)
+
+
+def test_bootstrap_injects_capacity_validation_hash_and_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Regression for the live E2 defect (#414): the bootstrap must inject the
+    # three capacity-specific functions into ApprovalService. Without them the
+    # service falls back to the generic source-control contract and rejects
+    # every stored capacity operation as APPROVAL_INVALID. The generic module
+    # defaults must remain the fallback for other callers (#419), so assert the
+    # injected callables are the capacity functions and are NOT the defaults.
+    # Local modules
+    from operations.approval import (
+        _default_binding_validate,
+        _default_hash,
+        _default_validate,
+    )
+    from operations.contracts.capacity import (
+        capacity_prepared_hash,
+        validate_capacity_approval_binding,
+        validate_capacity_prepared_operation,
+    )
+
+    router = _build_router(monkeypatch)
+    approval_service = router._approval_handler._approval_service
+
+    assert approval_service._operation_validator is validate_capacity_prepared_operation
+    assert approval_service._operation_hasher is capacity_prepared_hash
+    assert approval_service._binding_validator is validate_capacity_approval_binding
+
+    assert approval_service._operation_validator is not _default_validate
+    assert approval_service._operation_hasher is not _default_hash
+    assert approval_service._binding_validator is not _default_binding_validate
+
+
+def test_generic_approval_service_defaults_remain_backward_compatible() -> None:
+    # #419 backward-compatibility guard: constructing ApprovalService without the
+    # capacity hooks must still bind the generic source-control validator,
+    # hasher, and binding, so the generic approval path is unaffected by the E2
+    # capacity injection.
+    # Local modules
+    from operations.approval import (
+        ApprovalPolicy,
+        ApprovalService,
+        _default_binding_validate,
+        _default_hash,
+        _default_validate,
+    )
+    from operations.identity import ApprovalIdentityBoundary
+
+    boundary = ApprovalIdentityBoundary(
+        tenant_id="tenant.default",
+        workspace_id="workspace.default",
+        requester_client_ids=frozenset({"operations-api"}),
+        approver_client_ids=frozenset({"operations-api"}),
+        trusted_audiences=frozenset({"operations-api"}),
+    )
+    policy = ApprovalPolicy(
+        policy_id="policy.source-control",
+        policy_version="1",
+        approver_groups=frozenset({"admin"}),
+    )
+    service = ApprovalService(identity_boundary=boundary, policy=policy, store=object())
+
+    assert service._operation_validator is _default_validate
+    assert service._operation_hasher is _default_hash
+    assert service._binding_validator is _default_binding_validate

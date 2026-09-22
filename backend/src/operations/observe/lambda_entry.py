@@ -259,7 +259,21 @@ def _build_approval_handler(
         approver_groups=frozenset({ops.approver_group}),
         low_risk_self_approval_actions=low_risk_actions,
     )
-    approval_service = ApprovalService(identity_boundary=boundary, policy=policy, store=approval_store, clock=_utcnow)
+    # Inject the capacity-specific validator, hasher, and binding so the
+    # deployable ApprovalService validates and hashes the stored capacity
+    # prepared operation exactly as it was prepared. Without these it would
+    # fall back to the generic source-control contract and reject every
+    # stored capacity operation as APPROVAL_INVALID ('stored operation is
+    # invalid'). The generic defaults remain in place for other callers (#419).
+    approval_service = ApprovalService(
+        identity_boundary=boundary,
+        policy=policy,
+        store=approval_store,
+        clock=_utcnow,
+        operation_validator=validate_capacity_prepared_operation,
+        operation_hasher=capacity_prepared_hash,
+        binding_validator=validate_capacity_approval_binding,
+    )
     decision_service = LifecycleDecisionService(
         identity_boundary=boundary, policy=policy, store=approval_store, clock=_utcnow
     )
