@@ -1,0 +1,44 @@
+{
+  "contract_version": "1.0",
+  "generated_at": "2026-01-15T00:01:00Z",
+  "deployment_mode": "remediate",
+  "operations_enabled": true,
+  "kill_switch_config_version": 7,
+  "capabilities": [
+    {
+      "capability_id": "gamelift.capacity-adjustment",
+      "capability_version": "1.0",
+      "available": true,
+      "provisioned": true,
+      "enabled": true,
+      "effective_authority": "remediate",
+      "phases": {
+        "prepare": true,
+        "dispatch": true,
+        "execute": false
+      },
+      "gates": [
+        {
+          "gate_id": "build.capability-present",
+          "kind": "static",
+          "satisfied": true
+        },
+        {
+          "gate_id": "deploy.resources-provisioned",
+          "kind": "static",
+          "satisfied": true
+        },
+        {
+          "gate_id": "runtime.kill-switch-enabled",
+          "kind": "dynamic",
+          "satisfied": true
+        },
+        {
+          "gate_id": "runtime.effective-authority",
+          "kind": "dynamic",
+          "satisfied": true
+        }
+      ]
+    }
+  ]
+}

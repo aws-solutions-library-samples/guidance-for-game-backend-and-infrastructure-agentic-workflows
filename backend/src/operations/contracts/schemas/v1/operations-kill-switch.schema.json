@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-kill-switch",
+  "title": "Operations Kill-Switch AppConfig Document 1.0",
+  "description": "The single deployment-wide operations kill-switch document. It is authored to be usable directly as an AWS AppConfig JSON Schema validator: it is a closed object with no unknown fields, it enumerates exactly the deployment-wide operations_enabled flag plus the single gamelift.capacity-adjustment capability's prepare/dispatch/execute phase booleans, an immutable monotonic config version, and issued_at/not_after freshness. It carries no identity, credential, policy, principal, or provider payload. The default safe document disables everything.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "config_version",
+    "issued_at",
+    "not_after",
+    "operations_enabled",
+    "capabilities"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "config_version": {
+      "description": "Immutable monotonic version of this kill-switch document. A consumer binds a control to an exact config_version so a stale write cannot silently re-enable a phase.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "issued_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "not_after": {
+      "description": "Freshness horizon. A consumer treats the document as stale (and fails closed) once the current time is at or after not_after.",
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "operations_enabled": {
+      "description": "The deployment-wide master switch. When false, every capability and every phase is disabled regardless of the per-capability booleans.",
+      "type": "boolean"
+    },
+    "capabilities": {
+      "description": "Exactly the one supported capability. No unknown capability may appear.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gamelift.capacity-adjustment"
+      ],
+      "properties": {
+        "gamelift.capacity-adjustment": {
+          "$ref": "#/$defs/capability_phase_switches"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "capability_phase_switches": {
+      "description": "The three ordered lifecycle phase booleans for the capability. Enabling a later phase requires the earlier phase to be enabled; that ordering invariant is enforced semantically, not structurally.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prepare",
+        "dispatch",
+        "execute"
+      ],
+      "properties": {
+        "prepare": {
+          "type": "boolean"
+        },
+        "dispatch": {
+          "type": "boolean"
+        },
+        "execute": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

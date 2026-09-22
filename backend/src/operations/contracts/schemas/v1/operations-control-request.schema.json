@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-control-request",
+  "title": "Operations Control Request 1.0",
+  "description": "An admin request to change the operations kill-switch. It carries ONLY the desired deployment-wide and per-phase booleans plus the expected config_version the change is based on. It never carries identity, credential, principal, policy, or provider payload: the backend resolves the acting admin from the verified caller and enforces authority independently. The expected_config_version makes the change a compare-and-set so a stale write cannot clobber a newer document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "expected_config_version",
+    "desired"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "expected_config_version": {
+      "description": "The config_version the admin believes is current. The backend rejects the change if the stored document has moved on (compare-and-set).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "desired": {
+      "$ref": "#/$defs/desired_state"
+    }
+  },
+  "$defs": {
+    "desired_state": {
+      "description": "The complete desired boolean state. Only booleans: no identity, credential, or policy.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operations_enabled",
+        "capabilities"
+      ],
+      "properties": {
+        "operations_enabled": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "gamelift.capacity-adjustment"
+          ],
+          "properties": {
+            "gamelift.capacity-adjustment": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "prepare",
+                "dispatch",
+                "execute"
+              ],
+              "properties": {
+                "prepare": {
+                  "type": "boolean"
+                },
+                "dispatch": {
+                  "type": "boolean"
+                },
+                "execute": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

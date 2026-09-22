@@ -1,0 +1,23 @@
+{
+  "contract_version": "1.0",
+  "record_id": "ctl_00000000000000000000000001",
+  "recorded_at": "2026-01-15T00:03:00Z",
+  "actor": {
+    "subject_id": "admin-subject-0001",
+    "client_id": "operations-console"
+  },
+  "outcome": "applied",
+  "previous_config_version": 7,
+  "resulting_config_version": 8,
+  "desired": {
+    "operations_enabled": true,
+    "capabilities": {
+      "gamelift.capacity-adjustment": {
+        "prepare": true,
+        "dispatch": true,
+        "execute": true
+      }
+    }
+  },
+  "record_hash": "sha256:d0034a6a2ec3794ac0f665a698730b4dd78625be895b3d9ee5e25955e399c154"
+}

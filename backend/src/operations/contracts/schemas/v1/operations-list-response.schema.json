@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-list-response",
+  "title": "Operations List Response 1.0",
+  "description": "A bounded page of operation summaries (at most 50) plus an optional opaque next cursor. Each summary is a public-safe projection: it shows the operation id, capability, lifecycle state, and coarse timestamps, and excludes email, display name, token, ARN, account id, fleet id, and any raw provider payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "page_size",
+    "operations"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "page_size": {
+      "description": "The effective page size the backend applied; never greater than 50.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/operation_summary"
+      }
+    },
+    "next_cursor": {
+      "description": "Opaque continuation token for the next page. Absent when there are no more results.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  },
+  "$defs": {
+    "operation_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "capability_id",
+        "state",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_id"
+        },
+        "capability_id": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"
+        },
+        "state": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/operation_state"
+        },
+        "created_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        },
+        "updated_at": {
+          "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

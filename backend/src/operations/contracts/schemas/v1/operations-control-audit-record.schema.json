@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:operations-control-audit-record",
+  "title": "Operations Control Audit Record 1.0",
+  "description": "An immutable, append-only record of one admin control decision. It binds the before/after config_version, the outcome, the acting principal reference (subject/client identifiers only, never email or display name), and a record_hash that covers every other field (excluding only itself). It carries no credential, token, ARN, account id, or provider payload.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "record_id",
+    "recorded_at",
+    "actor",
+    "outcome",
+    "previous_config_version",
+    "resulting_config_version",
+    "desired",
+    "record_hash"
+  ],
+  "properties": {
+    "contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^ctl_[a-z0-9]{26}$"
+    },
+    "recorded_at": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+    },
+    "actor": {
+      "description": "The acting admin as verifier-derived identifiers only. No email, display name, token, or ARN.",
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/principal_ref"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "applied",
+        "version_conflict",
+        "denied"
+      ]
+    },
+    "previous_config_version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "resulting_config_version": {
+      "description": "The config_version after the decision. Equals previous_config_version when the outcome is not applied.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "desired": {
+      "description": "The desired boolean state the admin requested, captured verbatim for audit. Booleans only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operations_enabled",
+        "capabilities"
+      ],
+      "properties": {
+        "operations_enabled": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "gamelift.capacity-adjustment"
+          ],
+          "properties": {
+            "gamelift.capacity-adjustment": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "prepare",
+                "dispatch",
+                "execute"
+              ],
+              "properties": {
+                "prepare": {
+                  "type": "boolean"
+                },
+                "dispatch": {
+                  "type": "boolean"
+                },
+                "execute": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "record_hash": {
+      "description": "Tagged SHA-256 over the RFC 8785 canonicalization of this record with record_hash removed. It binds every other field and makes tampering detectable.",
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"
+    }
+  }
+}

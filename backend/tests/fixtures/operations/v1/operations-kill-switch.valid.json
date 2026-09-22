@@ -1,0 +1,14 @@
+{
+  "contract_version": "1.0",
+  "config_version": 7,
+  "issued_at": "2026-01-15T00:00:00Z",
+  "not_after": "2026-01-15T00:05:00Z",
+  "operations_enabled": true,
+  "capabilities": {
+    "gamelift.capacity-adjustment": {
+      "prepare": true,
+      "dispatch": true,
+      "execute": false
+    }
+  }
+}

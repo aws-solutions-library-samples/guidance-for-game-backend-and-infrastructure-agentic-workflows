@@ -1,0 +1,13 @@
+{
+  "contract_version": "1.0",
+  "page_size": 25,
+  "cursor": "eyJvcCI6Im9wXzAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAxIn0",
+  "filter": {
+    "capability_id": "gamelift.capacity-adjustment",
+    "states": [
+      "pending_approval",
+      "approved",
+      "dispatched"
+    ]
+  }
+}
