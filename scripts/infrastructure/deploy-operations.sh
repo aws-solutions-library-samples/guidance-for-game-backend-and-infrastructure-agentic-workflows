@@ -175,7 +175,11 @@ if [ "$ACTION" = "preview" ]; then
     echo "   To deploy: GBAW_OPERATIONS_MODE=observe $0 --enable"
     if command -v cfn-lint >/dev/null 2>&1; then
         echo "   Running cfn-lint ..."
-        cfn-lint "$TEMPLATE"
+        # Show warnings (e.g. W1030 on resolved-Ref pattern checks) but fail
+        # ONLY on error-class (E-level) findings. Plain cfn-lint exits 4 on a
+        # warning-only run, which under set -e would abort this read-only
+        # preview before the AWS validate-template call below.
+        cfn-lint --non-zero-exit-code error "$TEMPLATE"
     else
         echo "   cfn-lint not found; skipping lint."
     fi
