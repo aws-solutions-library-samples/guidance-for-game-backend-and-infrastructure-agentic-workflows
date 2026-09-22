@@ -32,6 +32,8 @@ import hashlib
 import os
 import pathlib
 import subprocess
+import sys
+import textwrap
 import zipfile
 
 # Third-party packages
@@ -233,3 +235,99 @@ def test_host_native_wheel_guard_rejects_non_linux_x86(tmp_path):
         if any(tag in p.name for tag in ("macosx", "arm64", "aarch64", "win_", "darwin", "_i686"))
     ]
     assert bad, "the guard must detect a host/non-x86_64 native wheel"
+
+
+# --------------------------------------------------------------------------- #
+# The E1 Lambda store boundary imports WITHOUT loguru (issue #413 regression)
+# --------------------------------------------------------------------------- #
+# ``loguru`` is a full-backend dependency but is deliberately ABSENT from the
+# minimal E1 observe Lambda's runtime closure (see ``REQUIRED_TOP_LEVEL``). The
+# store's diagnostic boundary once did ``from loguru import logger`` at module
+# scope, so importing the packaged handler chain raised ``ModuleNotFoundError:
+# loguru`` in the deployed Lambda before it served a single request. These tests
+# prove the boundary now imports cleanly under stdlib ``logging`` alone, and pin
+# the invariant that no operations module reintroduces a top-level loguru import.
+BACKEND_SRC = PROJECT_ROOT / "backend" / "src"
+OPERATIONS_TREE = BACKEND_SRC / "operations"
+
+
+def _import_under_blocked_loguru(module: str) -> subprocess.CompletedProcess:
+    """Import ``module`` in a subprocess where ``import loguru`` fails, mirroring
+    the minimal E1 Lambda closure that ships no loguru. The child adds a
+    ``sys.meta_path`` finder that raises ``ModuleNotFoundError`` for loguru (and
+    any submodule), then imports the target; exit 0 == imported without loguru."""
+    program = textwrap.dedent(f"""
+        import importlib
+        import sys
+
+        class _BlockLoguru:
+            def find_spec(self, name, path=None, target=None):
+                if name == "loguru" or name.startswith("loguru."):
+                    raise ModuleNotFoundError("No module named 'loguru'", name="loguru")
+                return None
+
+        # Belt and suspenders: block a pre-imported loguru too.
+        for _n in [n for n in sys.modules if n == "loguru" or n.startswith("loguru.")]:
+            del sys.modules[_n]
+        sys.meta_path.insert(0, _BlockLoguru())
+
+        importlib.import_module({module!r})
+
+        # Prove the import really ran with loguru unavailable.
+        assert "loguru" not in sys.modules, "loguru was imported despite the block"
+        print("IMPORT_OK")
+        """)
+    env = dict(os.environ)
+    # The child imports ``operations.*`` from backend/src by path.
+    env["PYTHONPATH"] = os.pathsep.join([str(BACKEND_SRC), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    return subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(BACKEND_SRC),
+    )
+
+
+def test_observation_store_imports_without_loguru():
+    """The store boundary — the only operations module that ever imported loguru
+    — imports cleanly when loguru is unavailable, as it is in the E1 Lambda."""
+    result = _import_under_blocked_loguru("operations.observation_store")
+    assert result.returncode == 0, (
+        "operations.observation_store must import without loguru (E1 Lambda closure "
+        f"excludes it).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "IMPORT_OK" in result.stdout
+
+
+def test_lambda_entry_module_imports_without_loguru():
+    """The deployable E1 handler module (``operations.observe.lambda_entry``, the
+    frozen CloudFormation ``Handler``) imports its whole transitive chain — which
+    includes the store boundary — without loguru present."""
+    result = _import_under_blocked_loguru("operations.observe.lambda_entry")
+    assert result.returncode == 0, (
+        "operations.observe.lambda_entry must import without loguru so the deployed "
+        f"Lambda can start.\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert "IMPORT_OK" in result.stdout
+
+
+def test_no_operations_module_imports_loguru_at_top_level():
+    """No module under ``operations/`` may carry a top-level loguru import. This
+    is the structural invariant that keeps the minimal E1 Lambda closure honest:
+    a single ``from loguru import logger`` anywhere in the packaged tree would
+    reintroduce the deploy-time ``ModuleNotFoundError``. Checked by scanning the
+    tracked source text (line-oriented, ignoring comments) rather than importing,
+    so it holds even for modules with heavy import-time side effects."""
+    offenders = []
+    for py in sorted(OPERATIONS_TREE.rglob("*.py")):
+        for lineno, raw in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+            line = raw.strip()
+            if line.startswith("#"):
+                continue
+            if line.startswith("import loguru") or line.startswith("from loguru"):
+                offenders.append(f"{py.relative_to(PROJECT_ROOT)}:{lineno}: {line}")
+    assert offenders == [], (
+        "no operations module may import loguru (it is outside the E1 Lambda "
+        "dependency closure); found:\n" + "\n".join(offenders)
+    )

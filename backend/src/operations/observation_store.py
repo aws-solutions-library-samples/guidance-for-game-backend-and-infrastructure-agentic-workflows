@@ -61,12 +61,10 @@ from __future__ import annotations
 
 # Standard library
 import json
+import logging
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any
-
-# Third-party packages
-from loguru import logger
 
 # Local modules
 from operations.contracts.canonical import canonical_sha256
@@ -797,16 +795,24 @@ def _bounded_reason_codes(exc: Exception) -> list[str]:
     return bounded[:_MAX_REASON_CODES]
 
 
-# The message field-separator and the safe alphabet for provider-controlled
-# tokens. The production stdout sink renders ``{message}`` ONLY (see
-# utils/logger.py) — it drops ``{extra}`` and serializes nothing — so the
-# diagnostic MUST live inside the message string to survive to CloudWatch.
-# Provider-defined codes are echoed into that string, so each token is reduced
-# to ``[A-Za-z0-9._-]`` (anything else becomes ``.``). That keeps the record a
-# single, unambiguous line and forecloses log-forging via an embedded newline,
-# separator, or brace in an adversarial code.
+# The store diagnostic uses the Python standard-library ``logging`` module, NOT
+# loguru. This boundary ships in the minimal E1 observe Lambda, whose dependency
+# closure deliberately excludes loguru; importing it here broke the real package
+# import before deployment. ``logging`` is always present in the Lambda runtime,
+# so the diagnostic stays Lambda-safe without expanding that closure.
+#
+# The whole record lives in the ``LogRecord`` message string: a CloudWatch/Lambda
+# handler renders ``%(message)s`` and carries no structured ``extra`` mapping, so
+# a datum bound as ``extra`` would be dropped before it reached CloudWatch (the
+# #413 diagnostic loss). Provider-defined codes are echoed into that string, so
+# each token is reduced to ``[A-Za-z0-9._-]`` (anything else becomes ``.``). That
+# keeps the record a single, unambiguous line and forecloses log-forging via an
+# embedded newline, separator, or brace in an adversarial code.
 _DIAG_FIELD_SEP = " "
 _SAFE_TOKEN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+
+# The store-boundary diagnostic channel (stdlib logging, Lambda-safe).
+_LOGGER = logging.getLogger(__name__)
 
 
 def _safe_token(value: str) -> str:
@@ -823,8 +829,8 @@ def _log_store_exception(operation: str, exc: Exception, *, classification: str)
     never attaches a traceback or ``exc_info`` (see the boundary note above).
 
     The fields are embedded directly into a fixed ``key=value`` message string
-    rather than bound as ``extra``: the production stdout sink formats
-    ``{message}`` ONLY, so anything carried in ``extra``/``serialize`` is
+    rather than passed as ``logging`` args or ``extra``: a Lambda/CloudWatch
+    handler renders ``%(message)s`` only, so anything carried in ``extra`` is
     silently dropped before it reaches CloudWatch (the diagnostic loss #413
     root-caused). ``exception_type`` is a Python class name and ``operation`` /
     ``classification`` are static literals we pass, so only the two
@@ -843,9 +849,10 @@ def _log_store_exception(operation: str, exc: Exception, *, classification: str)
         + (",".join(_safe_token(code) for code in reason_codes) if reason_codes else "none"),
     ]
     message = _DIAG_FIELD_SEP.join(fields)
-    # No positional/keyword args -> loguru does not run ``str.format`` on the
-    # message, so a literal brace in a (already brace-free) token is inert.
-    logger.warning(message)
+    # Pass the fully-formed message with no ``args`` so ``logging`` never runs
+    # ``%``-formatting over it; a literal ``%`` in a (sanitized) token is inert.
+    # No ``exc_info`` -> no traceback and no stack locals reach the handler.
+    _LOGGER.warning(message)
 
 
 def _marshal(item: dict[str, Any]) -> dict[str, dict[str, Any]]:

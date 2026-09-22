@@ -28,25 +28,34 @@ locals. So this boundary MUST NOT emit the exception message, ``str(exc)``, a
 traceback, or ``exc_info``; it emits sanitized metadata only. These tests prove
 that with secret-bearing fake exceptions (no leak) and real botocore errors
 (useful codes present).
+
+Lambda-safe emit: the boundary logs through the Python standard-library
+``logging`` module, NOT loguru. This store ships in the minimal E1 observe
+Lambda whose dependency closure deliberately excludes loguru; importing loguru
+here broke the real package import before deployment. These tests capture the
+emitted ``LogRecord`` through a production-SHAPED stdlib handler (``%(message)s``
+with framework-metadata prefix, no structured ``extra``), so a passing assertion
+means the datum survives the deployed handler to CloudWatch.
 """
 
 from __future__ import annotations
 
 # Standard library
 import io
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Third-party packages
 import pytest
 from botocore.exceptions import ClientError
-from loguru import logger
 
 # Local modules
 from operations.observation import (
     ObservationBeginOutcome,
     ObservationCompleteOutcome,
 )
+from operations.observation_store import _LOGGER as STORE_LOGGER
 from operations.observation_store import DynamoDbObservationStore
 
 pytestmark = pytest.mark.unit
@@ -75,37 +84,49 @@ def _observation() -> dict[str, Any]:
     }
 
 
-# The EXACT production stdout format string from backend/src/utils/logger.py.
-# The production sink renders ``{message}`` ONLY: it carries no ``{extra}`` and
-# does not serialize the record. Asserting against ``{extra}`` (as an earlier
-# version of these tests did) hides the #413 diagnostic loss, because fields
-# bound via ``logger.bind``/``extra`` render into ``{extra}`` in the test but
-# are silently dropped by the real sink. Every test below reads the buffer
-# produced by THIS format, so a passing assertion means the datum survives to
-# CloudWatch in production.
-_PRODUCTION_STDOUT_FORMAT = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}"
+# A production-SHAPED Python standard-library ``logging`` format. The store
+# diagnostic is emitted through stdlib ``logging`` (NOT loguru), because it ships
+# in the minimal E1 observe Lambda whose dependency closure excludes loguru. A
+# Lambda/CloudWatch handler renders the record's message and prefixes only
+# framework metadata (timestamp, level, logger name); it carries NO structured
+# ``extra`` mapping. This format mirrors that shape: ``%(message)s`` preceded by
+# metadata and separated by " | " so tests can split the message off the prefix
+# exactly as they did for the real sink. A datum only "survives to CloudWatch"
+# if it lands in ``%(message)s`` — a field passed via ``extra`` would render
+# nowhere here, which is precisely the #413 diagnostic loss these tests guard.
+_PRODUCTION_STDLIB_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 
 
 class _ProductionSink:
-    """A loguru sink configured EXACTLY like the production stdout handler:
-    the real ``{message}``-only format (no ``{extra}``, no ``serialize``) with
-    ``backtrace=False, diagnose=False`` per utils/logger.py."""
+    """A stdlib ``logging`` handler shaped like the deployed Lambda/CloudWatch
+    handler: a ``%(message)s`` line prefixed by framework metadata and NO
+    ``extra`` rendering. It attaches to the store's own logger, captures every
+    record it emits into a buffer, and (like the deployed handler) never renders
+    a traceback unless ``exc_info`` is set on the record.
+
+    The handler is attached directly to the store logger with ``propagate``
+    disabled for the duration, so the capture is deterministic and independent
+    of any root-logger configuration pytest or the runtime may install."""
 
     def __init__(self) -> None:
         self._buffer = io.StringIO()
-        self._sink_id = logger.add(
-            self._buffer,
-            level="DEBUG",
-            format=_PRODUCTION_STDOUT_FORMAT,
-            backtrace=False,
-            diagnose=False,
-        )
+        self._handler = logging.StreamHandler(self._buffer)
+        self._handler.setLevel(logging.DEBUG)
+        self._handler.setFormatter(logging.Formatter(_PRODUCTION_STDLIB_FORMAT))
+        self._prev_level = STORE_LOGGER.level
+        self._prev_propagate = STORE_LOGGER.propagate
 
     def __enter__(self) -> "io.StringIO":
+        STORE_LOGGER.addHandler(self._handler)
+        STORE_LOGGER.setLevel(logging.DEBUG)
+        STORE_LOGGER.propagate = False
         return self._buffer
 
     def __exit__(self, *_exc: object) -> None:
-        logger.remove(self._sink_id)
+        STORE_LOGGER.removeHandler(self._handler)
+        STORE_LOGGER.setLevel(self._prev_level)
+        STORE_LOGGER.propagate = self._prev_propagate
+        self._handler.close()
 
 
 class _SecretBearingError(Exception):
@@ -367,18 +388,17 @@ def test_get_boundary_logs_and_reraises_useful_codes() -> None:
 def test_diagnostic_survives_message_only_production_sink() -> None:
     """RED-GREEN GUARD for #413.
 
-    The production stdout sink renders ``{message}`` ONLY — it carries no
-    ``{extra}`` and does not serialize the record (see utils/logger.py). The
-    original fix bound the diagnostic fields via ``logger.bind(...)`` (i.e. into
-    ``extra``) and logged the static string ``"dynamodb_store_exception"`` as the
-    message, so in production every useful field was dropped and only that inert
-    literal survived.
+    A Lambda/CloudWatch stdlib ``logging`` handler renders ``%(message)s`` and
+    carries NO structured ``extra`` mapping. A field passed to ``logging`` via
+    ``extra=`` (or as a ``%``-arg) would render nowhere in this shape, so in
+    production every such field would be dropped and only an inert literal
+    ``"dynamodb_store_exception"`` message would survive.
 
-    This test pins the datum to the MESSAGE. It fails against the pre-fix
-    implementation (whose message is the bare literal, with the codes only in
-    ``extra`` that this real-format sink discards) and passes only once the
-    operation, exception type, AWS error code, and cancellation reason codes are
-    embedded in the message string itself.
+    This test pins the datum to the MESSAGE. It fails against any implementation
+    that keeps the codes out of the message string (bare literal + ``extra``) and
+    passes only once the operation, exception type, AWS error code, and
+    cancellation reason codes are embedded in the message string itself, emitted
+    through stdlib ``logging`` (never loguru — which is absent from the Lambda).
     """
     client = _client_raising(_transaction_canceled("ThrottlingError"))
     with _ProductionSink() as buffer:
@@ -386,9 +406,9 @@ def test_diagnostic_survives_message_only_production_sink() -> None:
         output = buffer.getvalue()
 
     assert begin.outcome is ObservationBeginOutcome.PROVIDER_UNAVAILABLE
-    # The full record must survive the message-only sink. Pin each field to the
-    # portion of the line BEFORE any (nonexistent) extra rendering: split off the
-    # message segment after the last " | " the production format inserts.
+    # The full record must survive the message-only handler. Split the message
+    # segment off the framework-metadata prefix at the last " | " the production
+    # stdlib format inserts; there is no (structured) extra rendering to hide in.
     assert " | " in output
     message_segment = output.rsplit(" | ", 1)[-1]
     assert "dynamodb_store_exception" in message_segment
@@ -396,15 +416,15 @@ def test_diagnostic_survives_message_only_production_sink() -> None:
     assert "exception_type=ClientError" in message_segment
     assert "aws_error_code=TransactionCanceledException" in message_segment
     assert "ThrottlingError" in message_segment  # bounded cancellation reason code
-    # And the message-only sink still leaks nothing.
+    # And the message-only handler still leaks nothing.
     assert _SECRET not in output
     assert "Traceback (most recent call last)" not in output
 
 
 def test_diagnostic_line_has_no_leaky_extra_or_serialize() -> None:
-    """The production format emits no ``{extra}`` mapping and no JSON serialize
-    blob. Guard that the record is a single plain line carrying the fields in the
-    message, not a dict/JSON structure that the real sink would drop."""
+    """The production stdlib format emits no structured ``extra`` mapping and no
+    JSON blob. Guard that the record is a single plain line carrying the fields in
+    the message, not a dict/JSON structure a ``%(message)s`` handler would drop."""
     client = _client_raising(_validation_error())
     with _ProductionSink() as buffer:
         _begin(_store(client))
