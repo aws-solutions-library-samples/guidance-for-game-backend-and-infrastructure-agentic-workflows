@@ -221,14 +221,48 @@ if [ "$ACTION" = "enable" ]; then
     STAGE="$BUILD_DIR/stage"
     mkdir -p "$STAGE"
 
-    echo "📦 Staging operations code ..."
-    # Ship the operations package (its in-repo dependencies are the operations
-    # subtree). Exclude caches and tests. A tar pipe copies the tree portably and
-    # dereferences any symlinks, avoiding pass-through copy tools that refuse to
-    # write through a symlinked temp prefix.
+    echo "📦 Staging operations code and runtime resources ..."
+    # Ship the operations package: its Python modules AND the non-code runtime
+    # resources the handler loads at runtime. The contract validator resolves its
+    # versioned JSON Schemas via importlib.resources
+    # (operations.contracts.schemas.v1.*), so a .py-only package would omit them
+    # and every contract load would raise FileNotFoundError in the Lambda. We
+    # therefore stage *.py plus the versioned schema resources (and any other
+    # in-package JSON resource under operations/**), while excluding caches, test
+    # trees, and docs so no non-runtime file inflates or destabilizes the zip.
+    # A tar pipe copies the tree portably and dereferences any symlinks, avoiding
+    # pass-through copy tools that refuse to write through a symlinked temp prefix.
     ( cd "$BACKEND_SRC" && \
-      find operations -type f -name '*.py' -not -path '*/__pycache__/*' -print0 \
+      find operations -type f \
+        \( -name '*.py' -o -name '*.json' \) \
+        -not -path '*/__pycache__/*' \
+        -not -path '*/tests/*' -not -path '*/test/*' \
+        -not -path '*/docs/*' \
+        -print0 \
         | tar --null -cf - --files-from=- ) | ( cd "$STAGE" && tar -xf - )
+
+    # Fail closed if the versioned contract schema resources did not make it into
+    # the stage: the handler's contract load reads
+    # operations/contracts/schemas/v1/*.schema.json at runtime, and a package
+    # missing them would deploy a handler that raises FileNotFoundError on the
+    # first validated request. Require at least one, and require the whole
+    # versioned set the validator binds.
+    SCHEMA_STAGE_DIR="$STAGE/operations/contracts/schemas/v1"
+    STAGED_SCHEMAS="$(find "$SCHEMA_STAGE_DIR" -type f -name '*.schema.json' 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${STAGED_SCHEMAS:-0}" -eq 0 ]; then
+        echo "❌ Refusing to enable: no versioned contract schemas were staged under" >&2
+        echo "   operations/contracts/schemas/v1. The runtime contract validator loads" >&2
+        echo "   these JSON resources; a schema-less package raises FileNotFoundError." >&2
+        exit 5
+    fi
+    SOURCE_SCHEMAS="$(find "$BACKEND_SRC/operations/contracts/schemas/v1" -type f -name '*.schema.json' 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${STAGED_SCHEMAS:-0}" -ne "${SOURCE_SCHEMAS:-0}" ]; then
+        echo "❌ Refusing to enable: staged contract schema count ($STAGED_SCHEMAS) does not" >&2
+        echo "   match the source set ($SOURCE_SCHEMAS). The runtime schema resources are" >&2
+        echo "   incompletely packaged; contract validation would fail closed at runtime." >&2
+        exit 5
+    fi
+    echo "   Staged $STAGED_SCHEMAS versioned contract schema resource(s)."
 
     # ----------------------------------------------------------------------- #
     # Install the pinned dependency closure for the LAMBDA target ABI (Linux /
@@ -297,6 +331,37 @@ if [ "$ACTION" = "enable" ]; then
     # structural probe that fails closed if the frozen handler module or any
     # pinned dependency's top-level package is absent from the built artifact.
     # ----------------------------------------------------------------------- #
+    # The runtime probe does more than import the handler: it drives a
+    # representative contract load so a package that ships the handler and its
+    # dependency closure but OMITS the versioned JSON Schemas fails HERE, before
+    # upload, instead of at the first validated request in production. It builds
+    # the schema registry (which read_text()s every operations/contracts/schemas
+    # /v1/*.schema.json via importlib.resources) and validates a minimal document,
+    # accepting the expected typed ContractValidationError while treating a
+    # missing-resource error (FileNotFoundError / ModuleNotFoundError) as fatal.
+    RUNTIME_PROBE_PY="$(cat <<'PROBE'
+import importlib, sys
+sys.path.insert(0, "/var/task")
+m = importlib.import_module("operations.observe.lambda_entry")
+assert callable(m.handler), "handler is not callable"
+from operations.contracts import validation as v
+from operations.contracts.versions import SCHEMA_NAMES
+# Force every versioned schema resource to be read from the package. A missing
+# JSON resource raises FileNotFoundError here and fails the probe closed.
+reg = v._schema_registry()
+for name in SCHEMA_NAMES:
+    v.load_schema(name)
+# Exercise the public validation path end to end. A schema/semantic rejection is
+# the CORRECT outcome for a deliberately-empty document; only a missing runtime
+# resource (import/file error) must fail the probe.
+try:
+    v.validate_contract("prepared-operation", {})
+except v.ContractValidationError:
+    pass
+print("runtime probe ok: handler import + %d schemas loaded" % len(SCHEMA_NAMES))
+PROBE
+)"
+
     echo "🧪 Import-probing the packaged handler on a clean Linux/x86 runtime ..."
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         docker run --rm --platform linux/amd64 \
@@ -304,14 +369,24 @@ if [ "$ACTION" = "enable" ]; then
             --entrypoint python3 \
             "$LAMBDA_BUILD_IMAGE" \
             -E -s -c \
-            "import sys; sys.path.insert(0, '/var/task'); import importlib; m = importlib.import_module('$HANDLER_IMPORT'); assert callable(m.handler)" \
-            || { echo "❌ Packaged handler failed to import on the Lambda runtime image; refusing to deploy." >&2; exit 5; }
-        echo "   Import probe passed on $LAMBDA_BUILD_IMAGE."
+            "$RUNTIME_PROBE_PY" \
+            || { echo "❌ Packaged handler failed its runtime probe on the Lambda image; refusing to deploy." >&2; exit 5; }
+        echo "   Runtime probe passed on $LAMBDA_BUILD_IMAGE (handler import + contract schema load)."
     else
         echo "   No container runtime available; running a structural fail-closed probe."
         # The frozen handler module must be present in the built artifact.
         if [ ! -f "$STAGE/$HANDLER_MODULE_PATH" ]; then
             echo "❌ Frozen handler module $HANDLER_MODULE_PATH missing from the package." >&2
+            exit 5
+        fi
+        # The versioned contract schema resources the handler loads at runtime
+        # must be present. Without a container we cannot execute the load, but we
+        # can assert the resources the load reads are packaged, so a .py-only
+        # package still fails closed here rather than at the first request.
+        if ! find "$STAGE/operations/contracts/schemas/v1" -type f -name '*.schema.json' 2>/dev/null | grep -q .; then
+            echo "❌ Runtime contract schema resources are absent from the package" >&2
+            echo "   (operations/contracts/schemas/v1/*.schema.json). The handler's contract" >&2
+            echo "   load would raise FileNotFoundError at runtime." >&2
             exit 5
         fi
         # Every required top-level runtime dependency must be present so the
@@ -322,7 +397,7 @@ if [ "$ACTION" = "enable" ]; then
                 exit 5
             fi
         done
-        echo "   Structural probe passed (handler + required dependencies present)."
+        echo "   Structural probe passed (handler + required dependencies + schema resources present)."
     fi
 
     ARTIFACT="$BUILD_DIR/operations-observe.zip"
