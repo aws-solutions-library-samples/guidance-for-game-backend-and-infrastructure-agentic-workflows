@@ -65,13 +65,33 @@ METRIC_NAMESPACE = "GameAgent/Operations"
 # authorized, admin-enforced in handler code.
 E3_ROUTE_KEYS = frozenset({"POST /operations/{operationId}/dispatch"})
 
-# The two GameLift capacity actions the executor needs, both fleet-scopable.
+# The two GameLift capacity actions the executor needs. They do NOT share a
+# resource-authorization shape, so they cannot live in one fleet-ARN-scoped
+# statement:
+#   * gamelift:DescribeFleetCapacity (Read) does NOT support resource-level
+#     permissions -- the AWS GameLift Servers service-authorization reference
+#     lists an empty "Resource types" cell for it. Scoping it to a fleet ARN
+#     yields implicitDeny in the IAM policy simulator, which is the live
+#     PROVIDER_ERROR the executor hit before any write. It must be granted on
+#     Resource "*".
+#   * gamelift:UpdateFleetCapacity (Write) DOES support the "fleet" resource
+#     type, so it is scoped to the exact enrolled fleet ARN and nothing else.
+# Ref: https://docs.aws.amazon.com/service-authorization/latest/reference/list_gamelift.html
 GAMELIFT_EXECUTOR_ACTIONS = frozenset(
     {
         "gamelift:DescribeFleetCapacity",
         "gamelift:UpdateFleetCapacity",
     }
 )
+
+# gamelift:DescribeFleetCapacity has no resource-level support; it is
+# unavoidably granted on Resource "*". This is the only wildcard resource the
+# executor's GameLift access may use, and only for this exact read action.
+GAMELIFT_WILDCARD_READ_ACTIONS = frozenset({"gamelift:DescribeFleetCapacity"})
+
+# gamelift:UpdateFleetCapacity supports the "fleet" resource type and MUST be
+# pinned to the exact enrolled fleet ARN.
+GAMELIFT_FLEET_SCOPED_WRITE_ACTIONS = frozenset({"gamelift:UpdateFleetCapacity"})
 
 # The exact underlying DynamoDB item actions the executor needs (no
 # TransactWriteItems IAM action exists; the transaction legs are governed by the
@@ -435,19 +455,107 @@ def test_executor_gamelift_actions_are_exactly_the_two_capacity_actions(template
     ), f"executor GameLift must be exactly the two capacity actions, got {sorted(gamelift)}"
 
 
-def test_executor_gamelift_is_scoped_to_exact_fleet_arn(template):
+def _gamelift_statements(template):
+    """Yield executor-role statements that grant any gamelift: action."""
     name, _body = _role_named(template, "executor")
     for _r, _p, s in _statements(template):
         if _r != name:
             continue
         actions = list(_iter_action_strings(s.get("Action", [])))
         if any(a.lower().startswith("gamelift:") for a in actions):
-            resource = s.get("Resource")
-            assert resource not in ("*", ["*"]), "GameLift capacity actions must be fleet-ARN scoped, not '*'"
-            text = str(resource)
-            assert (
-                "fleet/" in text or "EnrolledFleet" in text
-            ), "GameLift capacity actions must reference the enrolled fleet ARN"
+            yield s, [a for a in actions if a.lower().startswith("gamelift:")]
+
+
+def _resource_is_wildcard(resource):
+    return resource in ("*", ["*"])
+
+
+def _resource_is_fleet_arn(resource):
+    text = str(resource)
+    return "fleet/" in text or "EnrolledFleet" in text
+
+
+def test_executor_describe_capacity_is_on_wildcard_resource(template):
+    """gamelift:DescribeFleetCapacity has no resource-level support (empty
+    Resource types cell in the service-authorization reference). Scoping it to a
+    fleet ARN is implicitDeny in the IAM simulator -- the live PROVIDER_ERROR.
+    It MUST be granted on Resource "*" and MUST NOT be fleet-ARN scoped."""
+    matches = [(s, acts) for s, acts in _gamelift_statements(template) if "gamelift:DescribeFleetCapacity" in acts]
+    assert matches, "executor must grant gamelift:DescribeFleetCapacity"
+    for s, acts in matches:
+        assert _resource_is_wildcard(s.get("Resource")), (
+            "DescribeFleetCapacity lacks resource-level support and must be on "
+            f"Resource '*', got {s.get('Resource')!r}"
+        )
+        assert not _resource_is_fleet_arn(
+            s.get("Resource")
+        ), "DescribeFleetCapacity must NOT be fleet-ARN scoped (implicitDeny)"
+
+
+def test_executor_update_capacity_is_scoped_to_exact_fleet_arn(template):
+    """gamelift:UpdateFleetCapacity supports the 'fleet' resource type and MUST
+    be pinned to the exact enrolled fleet ARN -- never '*'."""
+    matches = [(s, acts) for s, acts in _gamelift_statements(template) if "gamelift:UpdateFleetCapacity" in acts]
+    assert matches, "executor must grant gamelift:UpdateFleetCapacity"
+    for s, acts in matches:
+        resource = s.get("Resource")
+        assert not _resource_is_wildcard(resource), "UpdateFleetCapacity must be fleet-ARN scoped, not '*'"
+        assert _resource_is_fleet_arn(resource), "UpdateFleetCapacity must reference the exact enrolled fleet ARN"
+
+
+def test_executor_read_and_write_capacity_are_in_separate_statements(template):
+    """The read (wildcard) and write (fleet-scoped) capacity actions must live
+    in DIFFERENT statements: no single statement may pair them, or the write
+    action would inherit the read's wildcard resource (over-broad) or the read
+    action would inherit the write's fleet ARN (implicitDeny)."""
+    for s, acts in _gamelift_statements(template):
+        has_read = "gamelift:DescribeFleetCapacity" in acts
+        has_write = "gamelift:UpdateFleetCapacity" in acts
+        assert not (has_read and has_write), (
+            "Describe (Resource '*') and Update (fleet ARN) must not share a " f"statement; found both in one: {acts}"
+        )
+
+
+def test_executor_only_describe_capacity_uses_wildcard_resource(template):
+    """The ONLY gamelift action allowed a wildcard resource is the read that has
+    no resource-level support. Any other gamelift action on '*' is a defect."""
+    for s, acts in _gamelift_statements(template):
+        if _resource_is_wildcard(s.get("Resource")):
+            assert set(acts) <= GAMELIFT_WILDCARD_READ_ACTIONS, (
+                "only gamelift:DescribeFleetCapacity may use Resource '*', " f"got {acts}"
+            )
+
+
+def test_executor_gamelift_policy_matches_simulator_expectation(template):
+    """Policy-simulator expectation, encoded as the authoritative table this fix
+    is derived from. For each capacity action, assert the executor grants it at
+    exactly the resource shape the IAM simulator proved: DescribeFleetCapacity
+    allowed only on '*' (fleet ARN -> implicitDeny); UpdateFleetCapacity allowed
+    on the exact fleet ARN."""
+    # action -> (allowed_on_wildcard, allowed_on_fleet_arn)
+    SIMULATOR_EXPECTATION = {
+        "gamelift:DescribeFleetCapacity": {"wildcard": True, "fleet_arn": False},
+        "gamelift:UpdateFleetCapacity": {"wildcard": False, "fleet_arn": True},
+    }
+    granted: dict[str, set[str]] = {}  # action -> resource shapes it is granted on
+    for s, acts in _gamelift_statements(template):
+        resource = s.get("Resource")
+        shape = (
+            "wildcard"
+            if _resource_is_wildcard(resource)
+            else "fleet_arn" if _resource_is_fleet_arn(resource) else "other"
+        )
+        for a in acts:
+            granted.setdefault(a, set()).add(shape)
+    for action, expect in SIMULATOR_EXPECTATION.items():
+        shapes = granted.get(action, set())
+        assert shapes, f"executor must grant {action}"
+        if expect["wildcard"]:
+            assert "wildcard" in shapes, f"{action} must be granted on Resource '*'"
+            assert "fleet_arn" not in shapes, f"{action} must not be fleet-ARN scoped (implicitDeny)"
+        if expect["fleet_arn"]:
+            assert "fleet_arn" in shapes, f"{action} must be granted on the exact fleet ARN"
+            assert "wildcard" not in shapes, f"{action} must not be granted on Resource '*' (over-broad)"
 
 
 def test_executor_dynamodb_actions_are_bounded(template):

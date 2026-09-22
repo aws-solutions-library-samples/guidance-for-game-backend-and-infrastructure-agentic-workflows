@@ -370,19 +370,42 @@ Resources:
             Action: 'sts:AssumeRole'
       Policies:
         - PolicyName: GameLiftCapacityOnEnrolledFleet
-          # The two bounded capacity actions, scoped to the EXACT enrolled fleet
-          # ARN. Both support resource-level permissions (AWS GameLift service
-          # authorization reference, "fleet" resource type). No other GameLift
-          # verb is present, so create/delete/update-attributes/scaling/start/
-          # stop and every read beyond capacity are denied by omission.
-          # Ref: https://docs.aws.amazon.com/gameliftservers/latest/developerguide/security_iam_service-with-iam.html
+          # The two bounded capacity actions. They do NOT share a resource-
+          # authorization shape, so they are split into a read statement and a
+          # write statement rather than paired in one fleet-scoped statement.
+          #
+          #   * gamelift:DescribeFleetCapacity (Read) has NO resource-level
+          #     support: the AWS GameLift Servers service-authorization
+          #     reference lists an empty "Resource types" cell for it. Scoping
+          #     it to a fleet ARN makes the IAM policy simulator return
+          #     implicitDeny -- the live FAILED/PROVIDER_ERROR the executor hit
+          #     before any write. It is therefore UNAVOIDABLY granted on
+          #     Resource "*". This wildcard is on a single read-only action that
+          #     exposes only capacity counts; it grants no mutation and no
+          #     access to any other fleet attribute.
+          #   * gamelift:UpdateFleetCapacity (Write) DOES support the "fleet"
+          #     resource type, so it stays pinned to the EXACT enrolled fleet
+          #     ARN -- the mutating action can touch this one fleet and no other.
+          #
+          # No other GameLift verb is present, so create/delete/update-
+          # attributes/scaling/start/stop and every read beyond capacity are
+          # denied by omission.
+          # Ref: https://docs.aws.amazon.com/service-authorization/latest/reference/list_gamelift.html
+          #      (DescribeFleetCapacity: no resource types; UpdateFleetCapacity:
+          #       fleet, containerFleet)
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: FleetScopedCapacity
+              # Read: no resource-level support -> must be Resource "*".
+              - Sid: DescribeFleetCapacityWildcardRead
                 Effect: Allow
                 Action:
                   - 'gamelift:DescribeFleetCapacity'
+                Resource: '*'
+              # Write: fleet resource type -> pinned to the exact enrolled fleet.
+              - Sid: UpdateFleetCapacityOnEnrolledFleet
+                Effect: Allow
+                Action:
                   - 'gamelift:UpdateFleetCapacity'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:fleet/${EnrolledFleetId}'
