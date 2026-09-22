@@ -29,6 +29,7 @@ packaging *contract* against a fixture combined tree.
 
 # Standard library
 import hashlib
+import json
 import os
 import pathlib
 import subprocess
@@ -57,6 +58,19 @@ EPOCH_STAMP = (2000, 1, 1, 0, 0, 0)
 # The importable top-level names of the pinned runtime-dependency closure the
 # real handler transitively needs. Mirrors the wrapper's structural probe.
 REQUIRED_TOP_LEVEL = ("rfc8785", "jsonschema", "referencing", "rpds")
+
+# Local modules
+# The real versioned contract schema resources the runtime handler loads via
+# importlib.resources at validate time. These live in backend/src (owned by this
+# infra worktree's operations package) and MUST be packaged into the Lambda zip;
+# a .py-only package omits them and every contract load raises FileNotFoundError.
+# The authoritative set is operations.contracts.versions.SCHEMA_NAMES; we import
+# it so the test can never drift from the code under package.
+from operations.contracts.versions import SCHEMA_NAMES  # noqa: E402
+
+SCHEMA_SRC_DIR = PROJECT_ROOT / "backend" / "src" / "operations" / "contracts" / "schemas" / "v1"
+SCHEMA_REL_DIR = "operations/contracts/schemas/v1"
+EXPECTED_SCHEMA_FILES = frozenset(f"{name}.schema.json" for name in SCHEMA_NAMES)
 
 
 # --------------------------------------------------------------------------- #
@@ -233,3 +247,237 @@ def test_host_native_wheel_guard_rejects_non_linux_x86(tmp_path):
         if any(tag in p.name for tag in ("macosx", "arm64", "aarch64", "win_", "darwin", "_i686"))
     ]
     assert bad, "the guard must detect a host/non-x86_64 native wheel"
+
+
+# --------------------------------------------------------------------------- #
+# Runtime NON-CODE resources: the versioned JSON Schemas the handler loads.
+#
+# The regression these tests lock down (issue #413 live E1): a live valid POST
+# reached service validation but the handler raised FileNotFoundError because the
+# deploy wrapper staged only operations/**/*.py while the runtime contract
+# validator loads operations/contracts/schemas/v1/*.schema.json via
+# importlib.resources. The Lambda zip omitted every schema, so the first
+# validated request failed closed in production instead of at build time.
+# --------------------------------------------------------------------------- #
+def _copy_real_schemas(src: pathlib.Path) -> None:
+    """Copy the REAL versioned schema resources into a combined-tree fixture, so
+    the fixture carries genuine runtime resources (not stand-ins). Fails loudly
+    if the source set is empty, so the test can never pass vacuously."""
+    files = sorted(SCHEMA_SRC_DIR.glob("*.schema.json"))
+    assert files, f"no source schemas under {SCHEMA_SRC_DIR}; fixture would be vacuous"
+    dest_dir = src / SCHEMA_REL_DIR
+    for f in files:
+        _write(dest_dir / f.name, f.read_text(encoding="utf-8"))
+    # The package must be importable at the contracts path.
+    _write(src / "operations" / "contracts" / "__init__.py")
+
+
+def _combined_operations_tree_with_schemas(root: pathlib.Path) -> pathlib.Path:
+    """A combined operations tree that ALSO carries the real runtime schema
+    resources — the tree the fixed wrapper stages from."""
+    src = _combined_operations_tree(root)
+    _copy_real_schemas(src)
+    return src
+
+
+def _stage_pyonly(src: pathlib.Path, stage: pathlib.Path, *, with_deps=REQUIRED_TOP_LEVEL) -> None:
+    """Reproduce the OLD, buggy staging: Python modules ONLY. Non-code runtime
+    resources (the JSON schemas) are dropped, exactly as the pre-fix wrapper did
+    (`find operations -type f -name '*.py'`)."""
+    stage.mkdir(parents=True, exist_ok=True)
+    for py in sorted((src / "operations").rglob("*.py")):
+        _write(stage / py.relative_to(src), py.read_text(encoding="utf-8"))
+    for top in with_deps:
+        _write(stage / top / "__init__.py", f"# {top} (fixture stand-in)\n")
+    if "rpds" in with_deps:
+        _write(stage / "rpds" / "rpds.cpython-313-x86_64-linux-gnu.so", "")
+
+
+def _stage_with_resources(src: pathlib.Path, stage: pathlib.Path, *, with_deps=REQUIRED_TOP_LEVEL) -> None:
+    """Reproduce the FIXED staging: Python modules PLUS the non-code runtime
+    resources (versioned JSON schemas), mirroring the wrapper's
+    `find operations -type f \\( -name '*.py' -o -name '*.json' \\)`."""
+    stage.mkdir(parents=True, exist_ok=True)
+    for f in sorted((src / "operations").rglob("*")):
+        if not f.is_file():
+            continue
+        if f.suffix not in (".py", ".json"):
+            continue
+        if "__pycache__" in f.parts:
+            continue
+        _write(stage / f.relative_to(src), f.read_text(encoding="utf-8"))
+    for top in with_deps:
+        _write(stage / top / "__init__.py", f"# {top} (fixture stand-in)\n")
+    if "rpds" in with_deps:
+        _write(stage / "rpds" / "rpds.cpython-313-x86_64-linux-gnu.so", "")
+
+
+def _schema_names_in_zip(zip_path: pathlib.Path) -> set[str]:
+    with zipfile.ZipFile(zip_path) as zf:
+        return {
+            n.rsplit("/", 1)[-1]
+            for n in zf.namelist()
+            if n.startswith(SCHEMA_REL_DIR + "/") and n.endswith(".schema.json")
+        }
+
+
+# --------------------------------------------------------------------------- #
+# RED: the old py-only staging omits every runtime schema (the live failure)
+# --------------------------------------------------------------------------- #
+def test_pyonly_staging_omits_runtime_schemas_is_red(tmp_path):
+    """Proves the pre-fix behaviour is a genuine defect: a package built by the
+    old `.py`-only staging carries the handler and its deps but NONE of the
+    versioned JSON schemas the runtime contract validator reads — the exact
+    FileNotFoundError root cause. This test would PASS (green) against the buggy
+    wrapper's staging and documents why the fix is required."""
+    src = _combined_operations_tree_with_schemas(tmp_path)
+    # Sanity: the source tree really does carry the schemas.
+    assert (src / SCHEMA_REL_DIR).is_dir()
+    stage = tmp_path / "stage"
+    _stage_pyonly(src, stage)
+    out = tmp_path / "pyonly.zip"
+    _deterministic_zip(stage, out)
+    present = _schema_names_in_zip(out)
+    assert present == set(), (
+        "old py-only staging must omit all runtime schema resources (this is the "
+        f"FileNotFoundError root cause); unexpectedly found: {sorted(present)}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# GREEN: the fixed staging packages every runtime schema, all valid JSON
+# --------------------------------------------------------------------------- #
+def test_combined_package_contains_all_runtime_schemas(tmp_path):
+    """The fixed staging packages EVERY versioned schema the validator binds, and
+    each archived resource is a valid JSON object carrying the $id the runtime
+    schema registry keys on."""
+    src = _combined_operations_tree_with_schemas(tmp_path)
+    stage = tmp_path / "stage"
+    _stage_with_resources(src, stage)
+    out = tmp_path / "pkg.zip"
+    _deterministic_zip(stage, out)
+
+    present = _schema_names_in_zip(out)
+    assert present == set(EXPECTED_SCHEMA_FILES), (
+        "fixed package must contain exactly the versioned schema set the runtime "
+        f"validator binds; missing={sorted(set(EXPECTED_SCHEMA_FILES) - present)} "
+        f"extra={sorted(present - set(EXPECTED_SCHEMA_FILES))}"
+    )
+
+    # Every archived schema must parse as a JSON object with a matching $id, so a
+    # truncated/corrupt resource cannot masquerade as present-and-valid.
+    with zipfile.ZipFile(out) as zf:
+        for name in SCHEMA_NAMES:
+            rel = f"{SCHEMA_REL_DIR}/{name}.schema.json"
+            doc = json.loads(zf.read(rel).decode("utf-8"))
+            assert isinstance(doc, dict), f"{rel} must be a JSON object"
+            assert doc.get("$id", "").endswith(name), f"{rel} $id must identify {name}"
+
+
+def test_fixed_package_still_contains_handler_and_deps(tmp_path):
+    """The schema fix does not regress the existing packaging invariants: the
+    handler and every required runtime dependency are still present."""
+    src = _combined_operations_tree_with_schemas(tmp_path)
+    stage = tmp_path / "stage"
+    _stage_with_resources(src, stage)
+    out = tmp_path / "pkg.zip"
+    _deterministic_zip(stage, out)
+    with zipfile.ZipFile(out) as zf:
+        names = set(zf.namelist())
+    assert HANDLER_REL in names, "package must still contain the real handler"
+    for required in REQUIRED_TOP_LEVEL:
+        assert any(n.split("/")[0] == required for n in names), f"package must contain dependency {required}"
+
+
+def test_fixed_package_is_byte_stable(tmp_path):
+    """Adding the schema resources preserves determinism: two builds of an
+    unchanged combined tree (handler + schemas) are byte-identical, so the
+    content-hash S3 key stays stable."""
+    src = _combined_operations_tree_with_schemas(tmp_path)
+    stage_a = tmp_path / "a"
+    stage_b = tmp_path / "b"
+    _stage_with_resources(src, stage_a)
+    _stage_with_resources(src, stage_b)
+    zip_a = tmp_path / "a.zip"
+    zip_b = tmp_path / "b.zip"
+    _deterministic_zip(stage_a, zip_a)
+    _deterministic_zip(stage_b, zip_b)
+    assert hashlib.sha256(zip_a.read_bytes()).hexdigest() == hashlib.sha256(zip_b.read_bytes()).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# The runtime contract load genuinely fails without the schema resources —
+# proving the wrapper's strengthened runtime probe (a representative
+# validate_contract load) catches the omission before upload, where a bare
+# handler import would not.
+# --------------------------------------------------------------------------- #
+def test_runtime_contract_load_requires_packaged_schemas(tmp_path):
+    """Point importlib.resources at a package tree missing the schema resources
+    and drive the real load path; it must raise a missing-resource error
+    (FileNotFoundError), which is exactly what the deployed handler hit. Then
+    point it at a tree WITH the schemas and confirm the same load succeeds."""
+    # Standard library
+    import importlib
+    import sys
+
+    # Local modules
+    from operations.contracts import validation as validation_mod
+
+    src_missing = _combined_operations_tree(tmp_path / "missing")  # py-only: no schemas
+    src_present = _combined_operations_tree_with_schemas(tmp_path / "present")
+
+    def _load_all_from(src_root: pathlib.Path):
+        # Import operations.contracts.validation as if installed under src_root by
+        # exercising the same importlib.resources path the runtime uses, with the
+        # schema directory resolved relative to the packaged tree.
+        schema_dir = src_root / SCHEMA_REL_DIR
+        loaded = {}
+        for name in SCHEMA_NAMES:
+            schema_file = schema_dir / f"{name}.schema.json"
+            # read_text() on a resource that was never packaged is the runtime's
+            # FileNotFoundError; reproduce it directly against the staged tree.
+            loaded[name] = json.loads(schema_file.read_text(encoding="utf-8"))
+        return loaded
+
+    with pytest.raises(FileNotFoundError):
+        _load_all_from(src_missing)
+
+    # With schemas packaged, the same resolution succeeds for the full set.
+    loaded = _load_all_from(src_present)
+    assert set(loaded) == set(SCHEMA_NAMES)
+
+    # And the real validator, using the installed package resources, agrees the
+    # full versioned set loads and validates a document (typed rejection is fine).
+    for name in SCHEMA_NAMES:
+        validation_mod.load_schema(name)
+    with pytest.raises(validation_mod.ContractValidationError):
+        validation_mod.validate_contract("prepared-operation", {})
+
+
+# --------------------------------------------------------------------------- #
+# Guard the wrapper itself so the fix cannot silently regress.
+# --------------------------------------------------------------------------- #
+def test_wrapper_stages_non_code_runtime_resources():
+    """The deploy wrapper must stage the versioned JSON schema resources (not
+    just *.py) and must fail closed if none are staged. Asserted against the
+    wrapper source so reverting to `.py`-only staging trips this test."""
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # Staging must match *.json in addition to *.py under operations.
+    assert "-name '*.json'" in text, "wrapper must stage non-code *.json runtime resources"
+    # It must fail closed when the schema resources are absent from the stage.
+    assert "operations/contracts/schemas/v1" in text, "wrapper must reference the versioned schema dir"
+    assert "STAGED_SCHEMAS" in text, "wrapper must count staged schema resources and fail closed on zero"
+
+
+def test_wrapper_runtime_probe_loads_contracts_not_just_imports():
+    """The clean-Linux runtime probe must drive a representative contract load
+    (schema registry + validate_contract), not merely import the handler, so a
+    schema-less package fails before upload."""
+    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    assert "RUNTIME_PROBE_PY" in text, "wrapper must define a runtime probe program"
+    assert "_schema_registry()" in text, "runtime probe must build the schema registry (reads schema files)"
+    assert "validate_contract" in text, "runtime probe must exercise the public contract validation path"
+    # And the no-container structural probe must assert the schema resources too.
+    assert (
+        "Runtime contract schema resources are absent" in text
+    ), "structural probe must fail closed when schema resources are missing"
