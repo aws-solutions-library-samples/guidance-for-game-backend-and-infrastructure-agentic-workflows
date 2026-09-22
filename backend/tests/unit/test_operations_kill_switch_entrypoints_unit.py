@@ -173,7 +173,7 @@ def test_gate_fails_closed_on_stale_document() -> None:
 def test_executor_dynamic_flip_between_read_and_update_blocks_write() -> None:
     """A switch enabled on entry but disabled before the write blocks the write."""
     # Local modules
-    from tests.unit._kill_switch_executor_harness import run_executor_with_gate
+    from unit._kill_switch_executor_harness import run_executor_with_gate
 
     # First read (entry check): execute enabled. Second read (pre-write check,
     # after the Describe): execute disabled. The real gate reads fresh each time.

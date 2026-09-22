@@ -19,6 +19,7 @@ import pytest
 from operations.control.metrics import (
     METRIC_CONTROL_APPLIED,
     METRIC_CONTROL_DENIED,
+    METRIC_CONTROL_PUBLICATION_RECONCILED,
     METRIC_CONTROL_VERSION_CONFLICT,
     METRIC_EXPIRY_SWEEP_EXPIRED,
     METRIC_KILL_SWITCH_UNAVAILABLE,
@@ -47,14 +48,30 @@ def test_records_named_events() -> None:
     metrics.record("control.applied")
     metrics.record("control.version_conflict")
     metrics.record("control.denied")
+    metrics.record("control.publication_reconciled")
     metrics.record("kill_switch.unavailable")
     names = [put["MetricData"][0]["MetricName"] for put in client.puts]
     assert names == [
         METRIC_CONTROL_APPLIED,
         METRIC_CONTROL_VERSION_CONFLICT,
         METRIC_CONTROL_DENIED,
+        METRIC_CONTROL_PUBLICATION_RECONCILED,
         METRIC_KILL_SWITCH_UNAVAILABLE,
     ]
+
+
+def test_publication_reconciled_is_a_bounded_count_metric() -> None:
+    # Lost-response reconciliation must be observable: the event maps to a single
+    # bounded Count metric with value 1.0 and no dimensions.
+    client = _FakeCloudWatch()
+    _metrics(client).record("control.publication_reconciled")
+    assert len(client.puts) == 1
+    datum = client.puts[0]["MetricData"][0]
+    assert datum["MetricName"] == METRIC_CONTROL_PUBLICATION_RECONCILED
+    assert datum["Value"] == 1.0
+    assert datum["Unit"] == "Count"
+    assert "Dimensions" not in datum
+    assert METRIC_CONTROL_PUBLICATION_RECONCILED == "ControlPublicationReconciled"
 
 
 def test_unknown_event_is_ignored() -> None:

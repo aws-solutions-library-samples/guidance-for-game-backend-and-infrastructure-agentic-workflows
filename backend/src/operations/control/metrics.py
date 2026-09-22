@@ -9,6 +9,8 @@ workspace id, or config value can never leak through a metric.
 * ``ControlApplied`` — an admin control change was applied (config advanced).
 * ``ControlVersionConflict`` — a compare-and-set conflict (stale/racing write).
 * ``ControlDenied`` — a control change was denied on authority.
+* ``ControlPublicationReconciled`` — a committed-but-unpublished decision was
+  re-published and confirmed on a lost-response retry (the reconciliation path).
 * ``KillSwitchUnavailable`` — the kill-switch could not be read as a fresh, valid
   document (extension unavailable/malformed/stale); a phase failed closed.
 * ``OperationsExpirySweepExpired`` — the number of operations expired in one
@@ -24,6 +26,7 @@ from typing import Any, Protocol
 METRIC_CONTROL_APPLIED = "ControlApplied"
 METRIC_CONTROL_VERSION_CONFLICT = "ControlVersionConflict"
 METRIC_CONTROL_DENIED = "ControlDenied"
+METRIC_CONTROL_PUBLICATION_RECONCILED = "ControlPublicationReconciled"
 METRIC_KILL_SWITCH_UNAVAILABLE = "KillSwitchUnavailable"
 METRIC_EXPIRY_SWEEP_EXPIRED = "OperationsExpirySweepExpired"
 
@@ -31,6 +34,7 @@ _EVENT_METRICS = {
     "control.applied": METRIC_CONTROL_APPLIED,
     "control.version_conflict": METRIC_CONTROL_VERSION_CONFLICT,
     "control.denied": METRIC_CONTROL_DENIED,
+    "control.publication_reconciled": METRIC_CONTROL_PUBLICATION_RECONCILED,
     "kill_switch.unavailable": METRIC_KILL_SWITCH_UNAVAILABLE,
 }
 
