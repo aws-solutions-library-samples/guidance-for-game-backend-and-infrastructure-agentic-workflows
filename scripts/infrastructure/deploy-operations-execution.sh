@@ -59,6 +59,11 @@ LAMBDA_BUILD_IMAGE="public.ecr.aws/lambda/python:3.13-x86_64"
 PINNED_DEPS=(
     "boto3==1.43.32"
     "botocore==1.43.55"
+    "jmespath==1.0.1"
+    "s3transfer==0.19.0"
+    "python-dateutil==2.9.0.post0"
+    "urllib3==2.7.0"
+    "six==1.17.0"
     "rfc8785==0.1.4"
     "jsonschema==4.26.0"
     "jsonschema-specifications==2025.9.1"
@@ -355,6 +360,7 @@ if command -v uv >/dev/null 2>&1; then
         --only-binary :all: \
         --target "$STAGE" \
         --no-cache \
+        --no-deps \
         "${PINNED_DEPS[@]}"
 else
     python3 -m pip install \
@@ -365,6 +371,7 @@ else
         --only-binary=:all: \
         --no-compile \
         --target "$STAGE" \
+        --no-deps \
         "${PINNED_DEPS[@]}"
 fi
 

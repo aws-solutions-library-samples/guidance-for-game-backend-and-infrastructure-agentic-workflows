@@ -403,10 +403,20 @@ def test_deploy_wrappers_pin_reviewed_sdk_and_control_probes_lock_member() -> No
         PROJECT_ROOT / "scripts/infrastructure/deploy-operations-execution.sh",
         DEPLOY_WRAPPER,
     )
+    locked_sdk_closure = (
+        "boto3==1.43.32",
+        "botocore==1.43.55",
+        "jmespath==1.0.1",
+        "s3transfer==0.19.0",
+        "python-dateutil==2.9.0.post0",
+        "urllib3==2.7.0",
+        "six==1.17.0",
+    )
     for wrapper_path in wrapper_paths:
         wrapper = wrapper_path.read_text(encoding="utf-8")
-        assert "boto3==1.43.32" in wrapper, wrapper_path
-        assert "botocore==1.43.55" in wrapper, wrapper_path
+        for requirement in locked_sdk_closure:
+            assert requirement in wrapper, f"{wrapper_path} misses {requirement}"
+        assert "--no-deps" in wrapper, wrapper_path
     control_wrapper = DEPLOY_WRAPPER.read_text(encoding="utf-8")
     assert 'operation_model("StartDeployment")' in control_wrapper
     assert '"LatestDeploymentNumber"' in control_wrapper
