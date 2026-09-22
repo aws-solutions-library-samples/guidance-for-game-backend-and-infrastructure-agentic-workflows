@@ -373,6 +373,101 @@ def test_http_api_has_access_logs_and_throttling(template):
     assert default_route.get("ThrottlingRateLimit")
 
 
+# --------------------------------------------------------------------------- #
+# Access-log DestinationArn drift contract (issue 413).
+#
+# ``!GetAtt <LogGroup>.Arn`` returns a CloudWatch Logs log-group ARN with a
+# trailing ``:*`` (the log-stream wildcard). API Gateway normalizes the value
+# it stores on the stage's AccessLogSettings.DestinationArn to the bare
+# log-group ARN *without* ``:*``. CloudFormation then compares the template's
+# GetAtt form (``...:*``) against the API's stored form (no ``:*``) on every
+# drift-detection run and reports the stage perpetually MODIFIED — pure noise
+# that masks real drift. The fix supplies the exact ARN API Gateway keeps, so
+# the rendered template value is byte-identical to the live value.
+#
+# The parsed template represents ``!GetAtt AccessLogGroup.Arn`` as the scalar
+# string "AccessLogGroup.Arn" and ``!Sub 'arn:...'`` as its literal scalar
+# (see backend/tests/_cfn_yaml.py), which is exactly what these tests inspect.
+# --------------------------------------------------------------------------- #
+
+# The bare log-group ARN API Gateway stores for the access log destination:
+# partition/region/account are CloudFormation pseudo-parameters and the name is
+# the same one AccessLogGroup declares. Crucially there is NO trailing ":*".
+_EXPECTED_ACCESS_LOG_DESTINATION_ARN = (
+    "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}"
+    ":log-group:/aws/apigateway/${ProjectName}-operations-access"
+)
+
+
+def _access_log_group_name(template):
+    """The literal LogGroupName the AccessLogGroup resource declares."""
+    groups = _resources_of_type(template, "AWS::Logs::LogGroup")
+    for body in groups.values():
+        name = body.get("Properties", {}).get("LogGroupName", "")
+        if "apigateway" in name and "operations-access" in name:
+            return name
+    raise AssertionError("AccessLogGroup with an apigateway operations-access name not found")
+
+
+def test_access_log_destination_arn_matches_api_gateway_stored_form(template):
+    """RED-GREEN drift guard: the stage's DestinationArn must be the exact bare
+    log-group ARN API Gateway stores (no ``:*``), so live drift detection sees
+    the rendered value and the API-normalized value as identical."""
+    stage = next(iter(_resources_of_type(template, "AWS::ApiGatewayV2::Stage").values()))["Properties"]
+    destination = stage["AccessLogSettings"]["DestinationArn"]
+    assert destination == _EXPECTED_ACCESS_LOG_DESTINATION_ARN, (
+        "AccessLogSettings.DestinationArn must be the bare log-group ARN API "
+        f"Gateway stores, got {destination!r}"
+    )
+    # The constructed ARN must end in the exact log-group name the AccessLogGroup
+    # resource declares, tying the two together so a rename cannot silently drift.
+    assert destination.endswith(_access_log_group_name(template)), (
+        "DestinationArn must be built from the AccessLogGroup's own LogGroupName"
+    )
+
+
+def test_access_log_destination_arn_is_not_the_getatt_wildcard_form(template):
+    """The GetAtt Arn form (which resolves to a ``:*``-suffixed ARN) is exactly
+    what causes the perpetual-drift report and must never come back."""
+    stage = next(iter(_resources_of_type(template, "AWS::ApiGatewayV2::Stage").values()))["Properties"]
+    destination = stage["AccessLogSettings"]["DestinationArn"]
+    # A short-form ``!GetAtt AccessLogGroup.Arn`` parses to this bare scalar.
+    assert destination != "AccessLogGroup.Arn", (
+        "DestinationArn must not use !GetAtt AccessLogGroup.Arn — it renders a "
+        "log-group ARN ending in ':*' that API Gateway strips, causing drift"
+    )
+    # Guard both the parsed short form and any literal that still ends in ':*'.
+    assert not destination.endswith(":*"), (
+        "DestinationArn must not end in ':*'; API Gateway stores it without the "
+        "log-stream wildcard, so a ':*' form drifts on every detection run"
+    )
+    assert "Fn::GetAtt" not in destination, "DestinationArn must not be a GetAtt intrinsic"
+
+
+def test_api_stage_retains_access_log_group_dependency_and_policy(template):
+    """Switching DestinationArn off ``!GetAtt`` drops the implicit dependency on
+    the log group, so the stage must keep an explicit one, and the vended-log
+    delivery resource policy must still be present."""
+    stages = _resources_of_type(template, "AWS::ApiGatewayV2::Stage")
+    stage_name, stage_body = next(iter(stages.items()))
+    depends_on = stage_body.get("DependsOn", [])
+    if isinstance(depends_on, str):
+        depends_on = [depends_on]
+    assert "AccessLogGroup" in depends_on, (
+        f"{stage_name} must DependsOn AccessLogGroup so the log group exists "
+        "before the stage references it by constructed ARN"
+    )
+    # The access-log delivery resource policy must survive the change.
+    policies = _resources_of_type(template, "AWS::Logs::ResourcePolicy")
+    assert policies, "the CloudWatch Logs access-log delivery resource policy must remain"
+    policy_text = "".join(
+        str(b.get("Properties", {}).get("PolicyDocument", "")) for b in policies.values()
+    )
+    assert "/aws/apigateway/" in policy_text and "operations-access" in policy_text, (
+        "delivery resource policy must still scope the access log group"
+    )
+
+
 def test_lambda_has_reserved_concurrency_and_bounded_timeout(template):
     fn = _observation_function(template)
     assert fn["Handler"] == HANDLER

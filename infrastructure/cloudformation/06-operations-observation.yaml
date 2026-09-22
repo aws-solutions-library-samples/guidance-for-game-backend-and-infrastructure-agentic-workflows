@@ -701,12 +701,24 @@ Resources:
   ApiStage:
     Type: AWS::ApiGatewayV2::Stage
     Condition: ResourcesProvisioned
+    # !GetAtt AccessLogGroup.Arn would provide an implicit dependency on the log
+    # group, but the DestinationArn below is a constructed !Sub ARN (see note),
+    # so declare the dependency explicitly: the log group must exist before the
+    # stage streams access logs to it.
+    DependsOn: AccessLogGroup
     Properties:
       ApiId: !Ref HttpApi
       StageName: '$default'
       AutoDeploy: true
       AccessLogSettings:
-        DestinationArn: !GetAtt AccessLogGroup.Arn
+        # API Gateway stores the access-log DestinationArn as the BARE log-group
+        # ARN, without the ":*" log-stream wildcard that !GetAtt <LogGroup>.Arn
+        # returns. Supplying the GetAtt form makes CloudFormation drift detection
+        # report this stage MODIFIED on every run (expected "...:*" vs the API's
+        # stored "..."). Construct the exact ARN API Gateway keeps from the
+        # pseudo-parameters and the AccessLogGroup's own name so the rendered
+        # value is byte-identical to the live value and no drift is reported.
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access'
         Format: >-
           {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
       DefaultRouteSettings:

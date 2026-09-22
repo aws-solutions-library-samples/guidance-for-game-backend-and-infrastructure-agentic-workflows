@@ -379,6 +379,32 @@ left intact. This wrapper never erases audit data. Removing retained audit data
 is a **separate, explicit, manual future step** performed by hand after
 confirming the data is no longer needed.
 
+## Access-log DestinationArn drift note (issue #413)
+
+The API stage streams access logs to a dedicated CloudWatch Logs group. Its
+`AccessLogSettings.DestinationArn` is set with a constructed `!Sub` ARN rather
+than `!GetAtt AccessLogGroup.Arn`, because the two forms are **not** byte-equal
+after deploy:
+
+- `!GetAtt <LogGroup>.Arn` renders the log-group ARN **with** a trailing `:*`
+  (the log-stream wildcard):
+  `arn:aws:logs:<region>:<account>:log-group:/aws/apigateway/<name>:*`.
+- API Gateway **normalizes** the value it stores on the stage to the **bare**
+  log-group ARN **without** `:*`:
+  `arn:aws:logs:<region>:<account>:log-group:/aws/apigateway/<name>`.
+
+CloudFormation drift detection compares the template's rendered value against
+the API's stored value, so the `:*` form makes the stage report **MODIFIED**
+(`/AccessLogSettings/DestinationArn`) on every drift run — pure noise that
+masks real drift. The template therefore supplies the exact bare ARN API
+Gateway keeps, built from `${AWS::Partition}`/`${AWS::Region}`/`${AWS::AccountId}`
+and the same `LogGroupName` the `AccessLogGroup` resource declares. Because the
+constructed ARN no longer carries the implicit `!GetAtt` dependency, the stage
+declares `DependsOn: AccessLogGroup` explicitly, and the vended-log delivery
+resource policy (`delivery.logs.amazonaws.com`) is unchanged. Drift-contract
+unit tests assert the rendered form matches the API-stored form and fail if the
+`!GetAtt` wildcard form (or any `:*`-suffixed value) ever returns.
+
 ## Verification without deploying
 
 The template and wrappers are covered by parser- and scanner-verifiable tests
