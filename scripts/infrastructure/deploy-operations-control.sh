@@ -20,6 +20,21 @@
 # SSM parameter and passes it as AppConfigExtensionLayerArn. If the frozen
 # control handler module is absent from the package, the wrapper fails closed.
 #
+# The 08 template embeds the AppConfig kill-switch JSON-schema validator
+# byte-for-byte, so its body EXCEEDS CloudFormation's 51,200-byte inline limit.
+# Two consequences are handled here without ever uploading on the read path:
+#   * PREVIEW (read-only) always lints + locally parses. It calls the service
+#     validate-template with --template-body ONLY when the template is within
+#     the inline limit; for an over-limit template it clearly reports that
+#     service validation is DEFERRED to the write-gated deploy, and uploads
+#     nothing.
+#   * The gated --enable deploy hands the template to CloudFormation THROUGH the
+#     already-verified, owner/region-checked artifact bucket
+#     (aws cloudformation deploy --s3-bucket ... --s3-prefix ...). Before the
+#     stack mutation it service-validates the uploaded template via
+#     --template-url. A deterministic content-hash key and an explicit cleanup
+#     of that template object keep S3 tidy.
+#
 # It NEVER mutates AWS on the preview path and requires an explicit, verified
 # profile/account/region before any write.
 #
@@ -31,8 +46,16 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 AWS_REGION="${AWS_REGION:-us-west-2}"
 PROJECT_NAME="game-agent"
 STACK_NAME="${PROJECT_NAME}-operations-control-plane"
-TEMPLATE="$PROJECT_ROOT/infrastructure/cloudformation/08-operations-control-plane.yaml"
-BACKEND_SRC="$PROJECT_ROOT/backend/src"
+# The template and backend source roots. Both accept a test-only override so the
+# size-aware preview and the local module gate can be exercised in isolation;
+# unset in every real deployment (the defaults below are used).
+TEMPLATE="${GBAW_OPERATIONS_CONTROL_TEMPLATE:-$PROJECT_ROOT/infrastructure/cloudformation/08-operations-control-plane.yaml}"
+BACKEND_SRC="${GBAW_OPERATIONS_CONTROL_BACKEND_SRC:-$PROJECT_ROOT/backend/src}"
+
+# CloudFormation's hard limit for an inline template body (validate-template
+# --template-body and deploy without --s3-bucket). A body larger than this MUST
+# reach the service through S3 (--template-url / deploy --s3-bucket).
+CFN_INLINE_TEMPLATE_LIMIT_BYTES=51200
 
 # The frozen control handler module this stack deploys. It is import-probed and
 # packaged.
@@ -96,8 +119,9 @@ usage() {
 Usage: deploy-operations-control.sh [--enable [--mode enabled]]
                                     [--environment beta|prod]
 
-  (no flag)     Preview only (READ-ONLY): validates and lints the template and
-                creates nothing.
+  (no flag)     Preview only (READ-ONLY): lints and locally parses the template
+                and, when within CloudFormation's inline limit, service-validates
+                it. Creates nothing and uploads nothing.
   --enable      Build/upload the control artifact, resolve the official
                 AppConfig extension layer, and deploy the 08 control-plane stack
                 with ControlMode=enabled. Requires
@@ -142,27 +166,86 @@ while [ "$#" -gt 0 ]; do
 done
 
 # --------------------------------------------------------------------------- #
-# Preview: read-only validate + lint. Never mutates AWS.
+# Portable byte-size of a file (macOS `stat -f%z`, GNU `stat -c%s`, or `wc -c`).
+# --------------------------------------------------------------------------- #
+file_size_bytes() {
+    local f="$1"
+    if stat -f%z "$f" >/dev/null 2>&1; then
+        stat -f%z "$f"
+    elif stat -c%s "$f" >/dev/null 2>&1; then
+        stat -c%s "$f"
+    else
+        wc -c < "$f" | tr -d ' '
+    fi
+}
+
+# --------------------------------------------------------------------------- #
+# Preview: read-only lint + local parse, then a SIZE-AWARE service validation.
+# Never mutates AWS and never uploads to S3.
 # --------------------------------------------------------------------------- #
 if [ "$ACTION" = "preview" ]; then
-    echo "🔎 Preview only (READ-ONLY). Validating and linting the 08 control-plane template."
+    echo "🔎 Preview only (READ-ONLY). Linting and parsing the 08 control-plane template."
     echo "   To deploy: GBAW_OPERATIONS_CONTROL_MODE=enabled $0 --enable"
     if command -v cfn-lint >/dev/null 2>&1; then
         echo "   Running cfn-lint ..."
         # Show warnings (e.g. W1030 on resolved-Ref pattern checks) but fail
         # ONLY on error-class (E-level) findings, so a warning-only run does not
-        # abort this read-only preview under set -e before the AWS
+        # abort this read-only preview under set -e before the (optional) AWS
         # validate-template call below.
         cfn-lint --non-zero-exit-code error "$TEMPLATE"
     else
         echo "   cfn-lint not found; skipping lint."
     fi
-    echo "   Running template service validation (read-only) ..."
-    aws cloudformation validate-template \
-        "${AWS_PROFILE_ARGS[@]}" \
-        --template-body "file://$TEMPLATE" \
-        --region "$AWS_REGION" >/dev/null
-    echo "✅ Preview complete. Template validated; no resources were created."
+    # A local, service-independent parse so preview catches malformed templates
+    # even when the body is too large to send to validate-template.
+    echo "   Locally parsing the template (no AWS) ..."
+    python3 - "$TEMPLATE" <<'PARSE' || { echo "❌ Template failed local parse." >&2; exit 6; }
+import sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    text = fh.read()
+try:
+    import yaml  # type: ignore
+
+    class _CfnLoader(yaml.SafeLoader):
+        pass
+
+    # CloudFormation intrinsic short forms (!Ref, !Sub, !GetAtt, ...) are not
+    # plain YAML; register them as opaque scalars/sequences so a real template
+    # parses without a full CFN resolver.
+    def _passthrough(loader, tag_suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    _CfnLoader.add_multi_constructor("!", _passthrough)
+    yaml.load(text, Loader=_CfnLoader)
+except ImportError:
+    # No PyYAML available: fall back to a JSON parse when the template is JSON,
+    # otherwise accept the read (cfn-lint already parsed it structurally).
+    import json
+    stripped = text.lstrip()
+    if stripped[:1] in "{[":
+        json.loads(text)
+PARSE
+    TEMPLATE_BYTES="$(file_size_bytes "$TEMPLATE")"
+    if [ "$TEMPLATE_BYTES" -le "$CFN_INLINE_TEMPLATE_LIMIT_BYTES" ]; then
+        echo "   Template is ${TEMPLATE_BYTES} bytes (<= ${CFN_INLINE_TEMPLATE_LIMIT_BYTES}); running service validation (read-only) ..."
+        aws cloudformation validate-template \
+            "${AWS_PROFILE_ARGS[@]}" \
+            --template-body "file://$TEMPLATE" \
+            --region "$AWS_REGION" >/dev/null
+        echo "✅ Preview complete. Template linted, parsed, and service-validated; no resources were created."
+    else
+        echo "   Template is ${TEMPLATE_BYTES} bytes (> ${CFN_INLINE_TEMPLATE_LIMIT_BYTES}-byte inline limit)."
+        echo "   ⏭️  Service validate-template is DEFERRED to the write-gated --enable deploy,"
+        echo "      which sends the template to CloudFormation through the verified artifact"
+        echo "      bucket (validate-template --template-url) before any stack mutation."
+        echo "      Preview stays strictly read-only and uploads NOTHING."
+        echo "✅ Preview complete (read-only). Linted + parsed; service validation deferred; no resources were created."
+    fi
     exit 0
 fi
 
@@ -430,16 +513,62 @@ aws s3api put-object \
     --region "$AWS_REGION" >/dev/null
 
 # --------------------------------------------------------------------------- #
-# Deploy the stack. Provisioned=true + ControlMode=enabled + the verified
-# bindings + the resolved extension layer. This is the only mutating
-# CloudFormation call.
+# The 08 template exceeds CloudFormation's 51,200-byte inline limit, so it MUST
+# reach the service through S3. Upload it to the SAME verified artifact bucket
+# under a deterministic content-hash key, service-validate it via --template-url
+# BEFORE any stack mutation, and (regardless of outcome) delete that transient
+# template object so S3 stays tidy. The deploy then references the bucket with
+# --s3-bucket/--s3-prefix so the CLI re-uploads and hands CloudFormation the
+# template by URL rather than inline.
 # --------------------------------------------------------------------------- #
-echo "🚀 Deploying $STACK_NAME (Provisioned=true, ControlMode=enabled) ..."
+TEMPLATE_HASH="$(shasum -a 256 "$TEMPLATE" | awk '{print $1}')"
+TEMPLATE_S3_PREFIX="operations-control/templates"
+TEMPLATE_S3_KEY="${TEMPLATE_S3_PREFIX}/${TEMPLATE_HASH}.yaml"
+TEMPLATE_URL="https://s3.${AWS_REGION}.amazonaws.com/${GBAW_OPERATIONS_ARTIFACT_BUCKET}/${TEMPLATE_S3_KEY}"
+
+# Cleanup policy: always delete the transient validation template object on exit
+# (success, validation failure, or deploy failure). The deploy's own
+# --s3-bucket/--s3-prefix upload is managed by the CLI; this cleanup covers the
+# object THIS wrapper uploads for pre-mutation validation. Chained onto the
+# existing BUILD_DIR cleanup trap.
+cleanup_control() {
+    rm -rf "$BUILD_DIR"
+    aws s3api delete-object \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+        --key "$TEMPLATE_S3_KEY" \
+        --region "$AWS_REGION" >/dev/null 2>&1 || true
+}
+trap cleanup_control EXIT
+
+echo "⬆️  Uploading template for service validation to s3://$GBAW_OPERATIONS_ARTIFACT_BUCKET/$TEMPLATE_S3_KEY ..."
+aws s3api put-object \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+    --key "$TEMPLATE_S3_KEY" \
+    --body "$TEMPLATE" \
+    --region "$AWS_REGION" >/dev/null
+
+echo "🔎 Service-validating the template via --template-url BEFORE any stack mutation ..."
+aws cloudformation validate-template \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --template-url "$TEMPLATE_URL" \
+    --region "$AWS_REGION" >/dev/null
+
+# --------------------------------------------------------------------------- #
+# Deploy the stack. Provisioned=true + ControlMode=enabled + the verified
+# bindings + the resolved extension layer. --s3-bucket/--s3-prefix make the CLI
+# hand the (over-limit) template to CloudFormation through S3 rather than inline.
+# This is the only mutating CloudFormation call.
+# --------------------------------------------------------------------------- #
+echo "🚀 Deploying $STACK_NAME (Provisioned=true, ControlMode=enabled) via S3-backed template ..."
 aws cloudformation deploy \
     "${AWS_PROFILE_ARGS[@]}" \
     --region "$AWS_REGION" \
     --stack-name "$STACK_NAME" \
     --template-file "$TEMPLATE" \
+    --s3-bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+    --s3-prefix "$TEMPLATE_S3_PREFIX" \
     --capabilities CAPABILITY_NAMED_IAM \
     --no-fail-on-empty-changeset \
     --parameter-overrides \
