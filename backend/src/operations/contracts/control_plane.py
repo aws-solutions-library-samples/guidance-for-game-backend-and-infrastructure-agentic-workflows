@@ -41,6 +41,7 @@ import base64
 import binascii
 import hmac
 from copy import deepcopy
+from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any
@@ -195,6 +196,11 @@ def control_audit_record_hash(record: dict[str, Any]) -> str:
 
 _CURSOR_SEPARATOR = "."
 
+# The opaque cursor wire bound. The list schemas cap the cursor string at this
+# length; the codec re-checks it on both encode and decode so an attacker cannot
+# force an unbounded base64 decode or HMAC over an oversized blob.
+CURSOR_MAX_LENGTH = 512
+
 
 def _b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
@@ -223,8 +229,8 @@ def encode_cursor(position: dict[str, Any], *, key: bytes) -> str:
         raise CursorError(f"cursor position is not canonicalizable: {exc}") from exc
     signature = hmac.new(key, payload, "sha256").digest()
     token = f"{_b64url_encode(payload)}{_CURSOR_SEPARATOR}{_b64url_encode(signature)}"
-    if len(token) > 512:
-        raise CursorError("encoded cursor exceeds the 512-character bound")
+    if len(token) > CURSOR_MAX_LENGTH:
+        raise CursorError(f"encoded cursor exceeds the {CURSOR_MAX_LENGTH}-character bound")
     return token
 
 
@@ -239,9 +245,13 @@ def decode_cursor(cursor: str, *, key: bytes) -> dict[str, Any]:
         raise CursorError("cursor signing key must be non-empty")
     if not isinstance(cursor, str) or _CURSOR_SEPARATOR not in cursor:
         raise CursorError("cursor is missing its signature segment")
+    if len(cursor) > CURSOR_MAX_LENGTH:
+        raise CursorError(f"cursor exceeds the {CURSOR_MAX_LENGTH}-character wire bound")
     payload_segment, _, signature_segment = cursor.partition(_CURSOR_SEPARATOR)
     if not payload_segment or not signature_segment:
         raise CursorError("cursor has an empty segment")
+    if len(payload_segment) > CURSOR_MAX_LENGTH or len(signature_segment) > CURSOR_MAX_LENGTH:
+        raise CursorError(f"cursor segment exceeds the {CURSOR_MAX_LENGTH}-character wire bound")
     payload = _b64url_decode(payload_segment)
     provided_signature = _b64url_decode(signature_segment)
     expected_signature = hmac.new(key, payload, "sha256").digest()
@@ -254,6 +264,24 @@ def decode_cursor(cursor: str, *, key: bytes) -> dict[str, Any]:
     if not isinstance(position, dict):
         raise CursorError("cursor payload is not a JSON object")
     return position
+
+
+# -- Normalized UTC instant parsing ----------------------------------------
+#
+# Control-plane timestamps are constrained by the schemas to the normalized UTC
+# ``Z`` form (``YYYY-MM-DDThh:mm:ss(.sss)Z``), so lexicographic order already
+# equals chronological order. Freshness comparisons still parse to a
+# timezone-aware instant rather than comparing strings, so equal moments written
+# with different fractional precision (``...00Z`` vs ``...00.000Z``) compare
+# equal and any future timestamp form cannot reintroduce lexicographic ambiguity.
+
+
+def _instant(value: str) -> datetime:
+    """Parse a normalized UTC ``Z`` timestamp into a timezone-aware instant."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 # -- Semantic validators ---------------------------------------------------
@@ -270,7 +298,7 @@ def _phase_switches_ordered(switches: dict[str, bool]) -> bool:
 
 def _kill_switch_errors(document: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    if document["not_after"] <= document["issued_at"]:
+    if _instant(document["not_after"]) <= _instant(document["issued_at"]):
         errors.append("not_after must be strictly after issued_at")
 
     capabilities = document["capabilities"]
@@ -336,14 +364,14 @@ def _list_response_errors(document: dict[str, Any]) -> list[str]:
         if operation_id in seen:
             errors.append(f"operations[{index}] duplicates operation_id {operation_id}")
         seen.add(operation_id)
-        if summary["updated_at"] < summary["created_at"]:
+        if _instant(summary["updated_at"]) < _instant(summary["created_at"]):
             errors.append(f"operations[{index}] updated_at precedes created_at")
     return errors
 
 
 def _detail_projection_errors(document: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    if document["updated_at"] < document["created_at"]:
+    if _instant(document["updated_at"]) < _instant(document["created_at"]):
         errors.append("updated_at precedes created_at")
 
     verification = document["verification"]

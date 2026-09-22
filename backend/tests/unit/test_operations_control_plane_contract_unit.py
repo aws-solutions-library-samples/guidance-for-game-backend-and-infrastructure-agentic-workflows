@@ -424,3 +424,113 @@ def test_agent_examples_all_validate_and_match_routes():
     for key, entry in examples["examples"].items():
         schema_name = _SCHEMA_ID_TO_NAME[entry["schema_id"]]
         validate_control_contract(schema_name, entry["value"])
+
+
+# -- Review-fix: kill-switch schema is self-contained for direct AppConfig use --
+
+
+def _iter_refs(node: Any):
+    """Yield every ``$ref`` string anywhere in a JSON Schema document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str):
+                yield value
+            else:
+                yield from _iter_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _iter_refs(item)
+
+
+def test_kill_switch_schema_has_no_external_refs():
+    """The kill-switch schema must not reference any other document.
+
+    AWS AppConfig validates a document against a single JSON Schema with no
+    resolver/registry, so any ``urn:``/cross-document ``$ref`` is unresolvable.
+    Every ``$ref`` must be a local ``#/...`` fragment.
+    """
+    schema = load_control_schema(KILL_SWITCH_SCHEMA_NAME)
+    refs = list(_iter_refs(schema))
+    assert refs, "expected the schema to use at least one internal $ref"
+    for ref in refs:
+        assert ref.startswith("#/"), f"external/non-local $ref is not AppConfig-resolvable: {ref}"
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["operations-kill-switch.valid.json", "operations-kill-switch.default-safe.json"],
+)
+def test_kill_switch_validates_with_bare_validator_no_registry(fixture_name):
+    """The valid and default fixtures validate under ``Draft202012Validator(schema)``.
+
+    This is exactly how AppConfig runs: the schema alone, with no registry and
+    no external ref resolution. If any ``$ref`` were external this would raise
+    ``RefResolutionError`` / ``Unresolvable`` instead of returning cleanly.
+    """
+    schema = load_control_schema(KILL_SWITCH_SCHEMA_NAME)
+    document = load_json(FIXTURES / fixture_name)
+    validator = Draft202012Validator(schema)
+    errors = sorted(validator.iter_errors(document), key=str)
+    assert errors == [], [error.message for error in errors]
+
+
+# -- Review-fix: E4 timestamp comparison is instant-based, schema forces UTC Z --
+
+
+def test_kill_switch_schema_rejects_non_utc_z_timestamp():
+    """Timestamps must be the normalized UTC ``Z`` form so lexicographic ==
+    chronological ordering. A numeric offset (e.g. ``+00:00``) is rejected."""
+    document = _fixture(KILL_SWITCH_SCHEMA_NAME)
+    document["issued_at"] = "2026-01-15T00:00:00+00:00"
+    with pytest.raises(ControlContractError):
+        validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+
+
+def test_kill_switch_schema_rejects_lowercase_z_and_naive_timestamp():
+    for bad in ("2026-01-15T00:00:00", "2026-01-15 00:00:00Z", "2026-01-15T00:00:00z"):
+        document = _fixture(KILL_SWITCH_SCHEMA_NAME)
+        document["issued_at"] = bad
+        with pytest.raises(ControlContractError):
+            validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+
+
+def test_kill_switch_freshness_uses_instant_not_lexicographic_compare():
+    """not_after must be a strictly later *instant* than issued_at.
+
+    Equal instants written with different fractional precision (``...00.000Z``
+    vs ``...00Z``) are the same moment and must be rejected. Written this way,
+    ``not_after`` is lexicographically GREATER than ``issued_at`` (``.``/``0``
+    beats ``Z``), so a naive string ``<=`` compare would wrongly accept it; only
+    an instant-based compare catches the equal-moment case."""
+    document = _fixture(KILL_SWITCH_SCHEMA_NAME)
+    document["issued_at"] = "2026-01-15T00:00:00Z"
+    document["not_after"] = "2026-01-15T00:00:00.000Z"
+    with pytest.raises(ControlContractError):
+        validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+
+
+def test_kill_switch_accepts_fractional_second_precision():
+    document = _fixture(KILL_SWITCH_SCHEMA_NAME)
+    document["issued_at"] = "2026-01-15T00:00:00.250Z"
+    document["not_after"] = "2026-01-15T00:05:00.000Z"
+    validate_control_contract(KILL_SWITCH_SCHEMA_NAME, document)
+
+
+# -- Review-fix: decode_cursor length guards before decode/HMAC ----------------
+
+
+def test_decode_cursor_rejects_over_wire_bound_before_hmac():
+    """A cursor longer than the 512-char wire bound is rejected by an explicit
+    length guard, before any base64 decode or HMAC, so an attacker cannot force
+    an unbounded decode/HMAC over a huge blob."""
+    with pytest.raises(CursorError) as excinfo:
+        decode_cursor("a" * 5000 + ".sig", key=_CURSOR_KEY)
+    assert "512" in str(excinfo.value)
+
+
+def test_decode_cursor_rejects_over_bound_segment():
+    """No single base64url segment may exceed the wire bound either."""
+    huge = "A" * 600
+    with pytest.raises(CursorError) as excinfo:
+        decode_cursor(huge + ".sig", key=_CURSOR_KEY)
+    assert "512" in str(excinfo.value)

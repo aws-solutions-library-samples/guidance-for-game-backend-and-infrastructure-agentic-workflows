@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:game-agent:operations:contracts:v1:operations-kill-switch",
   "title": "Operations Kill-Switch AppConfig Document 1.0",
-  "description": "The single deployment-wide operations kill-switch document. It is authored to be usable directly as an AWS AppConfig JSON Schema validator: it is a closed object with no unknown fields, it enumerates exactly the deployment-wide operations_enabled flag plus the single gamelift.capacity-adjustment capability's prepare/dispatch/execute phase booleans, an immutable monotonic config version, and issued_at/not_after freshness. It carries no identity, credential, policy, principal, or provider payload. The default safe document disables everything.",
+  "description": "The single deployment-wide operations kill-switch document. It is self-contained and usable directly as an AWS AppConfig JSON Schema validator: every $ref is a local #/$defs fragment (no external/urn reference to resolve), it is a closed object with no unknown fields, and it enumerates exactly the deployment-wide operations_enabled flag plus the single gamelift.capacity-adjustment capability's prepare/dispatch/execute phase booleans, an immutable monotonic config version, and issued_at/not_after freshness. Timestamps are the normalized UTC Z form so lexicographic order equals chronological order. It carries no identity, credential, policy, principal, or provider payload. The default safe document disables everything.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,7 +15,7 @@
   ],
   "properties": {
     "contract_version": {
-      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+      "$ref": "#/$defs/contract_version"
     },
     "config_version": {
       "description": "Immutable monotonic version of this kill-switch document. A consumer binds a control to an exact config_version so a stale write cannot silently re-enable a phase.",
@@ -24,11 +24,11 @@
       "maximum": 9007199254740991
     },
     "issued_at": {
-      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+      "$ref": "#/$defs/utc_timestamp"
     },
     "not_after": {
       "description": "Freshness horizon. A consumer treats the document as stale (and fails closed) once the current time is at or after not_after.",
-      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"
+      "$ref": "#/$defs/utc_timestamp"
     },
     "operations_enabled": {
       "description": "The deployment-wide master switch. When false, every capability and every phase is disabled regardless of the per-capability booleans.",
@@ -49,6 +49,17 @@
     }
   },
   "$defs": {
+    "contract_version": {
+      "description": "Inlined copy of the immutable common contract_version so this document validates directly under AWS AppConfig with no external reference. It is identical to urn:game-agent:operations:contracts:v1:common#/$defs/contract_version.",
+      "type": "string",
+      "const": "1.0"
+    },
+    "utc_timestamp": {
+      "description": "A normalized UTC instant in RFC 3339 / ISO 8601 form with a literal uppercase 'Z' zone and optional fractional seconds: YYYY-MM-DDThh:mm:ss(.sss)Z. Requiring the Z form (never a numeric offset such as +00:00, never a naive local time) guarantees that lexicographic string order equals chronological order, so consumers cannot be tricked by an offset representation. This is a tightening of the common date-time timestamp for this AppConfig document.",
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
+    },
     "capability_phase_switches": {
       "description": "The three ordered lifecycle phase booleans for the capability. Enabling a later phase requires the earlier phase to be enabled; that ordering invariant is enforced semantically, not structurally.",
       "type": "object",
