@@ -40,6 +40,11 @@ HANDLER_REL = "operations/observe/lambda_entry.py"
 HANDLER_IMPORT = "operations.observe.lambda_entry"
 HANDLER_DOTTED = "operations.observe.lambda_entry.handler"
 
+# The deployed E1 store module (relative to ``backend/src``). This is the module
+# the CloudFormation Lambda's dependency closure loads, and the module the IAM
+# drift guard drives to derive the DynamoDB actions the store actually requires.
+STORE_MODULE_REL = "operations/observation_store.py"
+
 # Signatures that mark an infra-style *placeholder* handler (never present in
 # core's real, deployable module). Any tracked observe source carrying one of
 # these means the deleted infra placeholder/register_observer seam was
@@ -148,6 +153,35 @@ def combined_tree_handler_source(repo_root: pathlib.Path) -> pathlib.Path | None
     on_disk = repo_root / "backend" / "src" / HANDLER_REL
     if on_disk.is_file():
         return on_disk
+    return None
+
+
+def resolve_deployed_store_src(repo_root: pathlib.Path) -> pathlib.Path | None:
+    """Return the ``backend/src`` that contains the deployed E1 store module, or
+    ``None`` if it cannot be located.
+
+    Resolution order mirrors :func:`materialize_combined_operations_tree` so the
+    IAM drift guard binds to the *same* deployed module the packaging contract
+    does, and works in every real context:
+
+    1. ``repo_root`` itself already carries the store under ``backend/src`` — the
+       normal single **combined** checkout / CI, with no sibling directories.
+       This branch's own ``backend/src`` ships the store, so this is the primary
+       path; and
+    2. a sibling ``logs/issue-413-core`` worktree still carries it — the split
+       two-worktree developer layout, kept as a fallback only.
+
+    Returning the current checkout first makes the drift guard independent of any
+    sibling worktree: in normal CI there are no siblings and this still resolves
+    the real, current-checkout store, so the guard executes non-vacuously.
+    """
+    candidates = [
+        repo_root / "backend" / "src",
+        repo_root.parent / "issue-413-core" / "backend" / "src",
+    ]
+    for src in candidates:
+        if (src / STORE_MODULE_REL).is_file():
+            return src
     return None
 
 
