@@ -700,4 +700,3 @@ CloudFormation with stable physical names and retained audit data, reusing every
 current parameter value (including the three E2 settings) via `UsePreviousValue`
 and setting only `OperationsMode=disabled`. It rebuilds no code and runs no
 Docker. A later `--enable --mode observe|advise` is fully reversible.
-
