@@ -71,3 +71,18 @@ def test_construct_rejects_unknown_mode() -> None:
             cancellation_margin_s=3.0,
             observation_ttl_s=1800,
         )
+
+
+def test_e2_disabled_and_observe_modes_deny_e2() -> None:
+    for mode in ("disabled", "observe"):
+        settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": mode})
+        assert settings.e2_enabled is False
+
+
+@pytest.mark.parametrize("mode", ["advise", "remediate", "operate"])
+def test_advise_and_higher_modes_enable_e2(mode: str) -> None:
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": mode})
+    # The advise ceiling enables E1 observe AND the E2 prepare/approval surface.
+    assert settings.e2_enabled is True
+    assert settings.observe_enabled is True
+    assert settings.advise_enabled is True
