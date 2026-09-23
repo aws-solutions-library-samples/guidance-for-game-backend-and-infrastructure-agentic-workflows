@@ -103,6 +103,23 @@ def test_list_passes_cursor() -> None:
     assert projection.list_calls[0]["cursor"] == "abc123"
 
 
+def test_invalid_cursor_maps_to_bounded_400() -> None:
+    # Local modules
+    from operations.control.projections import ProjectionError
+
+    class _InvalidCursorProjection(_FakeProjection):
+        def list_operations(self, **kwargs: Any) -> dict[str, Any]:
+            raise ProjectionError("list cursor is invalid")
+
+    response = _handler(_InvalidCursorProjection()).handle_list(
+        _event("GET", "/operations", query={"cursor": "tampered"})
+    )
+    assert response["statusCode"] == 400
+    body = json.loads(response["body"])
+    assert body["error_code"] == "CONTRACT_INVALID"
+    assert "tampered" not in response["body"]
+
+
 def test_detail_returns_projection() -> None:
     projection = _FakeProjection()
     response = _handler(projection).handle_detail(

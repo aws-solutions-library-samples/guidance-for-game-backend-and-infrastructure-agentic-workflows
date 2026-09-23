@@ -31,6 +31,7 @@ from operations.claims import ClaimParseError, parse_group_claim, parse_scope_cl
 from operations.contracts import CONTRACT_VERSION, MAX_PAGE_SIZE
 from operations.contracts.control_plane import CONTROL_PHASES
 from operations.control.kill_switch_gate import KillSwitchUnavailable
+from operations.control.projections import ProjectionError
 from operations.identity import VerifiedPrincipal
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,6 +115,8 @@ class ControlReadHandler:
             return result
         except _ReadDenied as exc:
             return _error_response(exc.status, exc.error_code, exc.safe_message)
+        except ProjectionError:
+            return _error_response(400, "CONTRACT_INVALID", "read request is invalid")
         except Exception:  # noqa: BLE001 - never leak internals
             _LOGGER.error("read failed unexpectedly")
             return _error_response(500, "INTERNAL_ERROR", "read failed")
