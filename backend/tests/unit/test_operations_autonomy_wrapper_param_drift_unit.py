@@ -29,6 +29,8 @@ pytestmark = pytest.mark.unit
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 TEMPLATE = PROJECT_ROOT / "infrastructure/cloudformation/09-operations-autonomy.yaml"
 DEPLOY = PROJECT_ROOT / "scripts/infrastructure/deploy-operations-autonomy.sh"
+DISABLE = PROJECT_ROOT / "scripts/infrastructure/disable-operations-autonomy.sh"
+EXECUTION_TEMPLATE = PROJECT_ROOT / "infrastructure/cloudformation/07-operations-execution.yaml"
 
 
 def _declared_parameters() -> set[str]:
@@ -37,13 +39,41 @@ def _declared_parameters() -> set[str]:
 
 
 def _wrapper_parameter_keys() -> set[str]:
-    """Extract the ParameterKeys the wrapper passes via --parameter-overrides."""
+    """Extract the ParameterKeys the 09 deploy passes via --parameter-overrides.
+
+    Scoped to the ``aws cloudformation deploy`` (09) --parameter-overrides block
+    so the separate 07 update-stack block (which uses ParameterKey=/ParameterValue=
+    syntax) is not conflated with the 09 overrides.
+    """
     text = DEPLOY.read_text(encoding="utf-8")
-    # Each override line looks like:  "SomeKey=$SOME_VAR" \
+    # Isolate the 09 deploy --parameter-overrides block: from the first
+    # "--parameter-overrides" after an "aws cloudformation deploy" up to the next
+    # blank line / non-continuation.
+    start = text.index("aws cloudformation deploy")
+    overrides_at = text.index("--parameter-overrides", start)
+    tail = text[overrides_at:]
+    # The override block is the run of backslash-continued "Key=$VAR" lines.
     keys: set[str] = set()
-    for match in re.finditer(r'"([A-Za-z][A-Za-z0-9]*)=\$', text):
-        keys.add(match.group(1))
+    for line in tail.splitlines()[1:]:
+        stripped = line.strip()
+        match = re.match(r'"([A-Za-z][A-Za-z0-9]*)=\$', stripped)
+        if match:
+            keys.add(match.group(1))
+        elif not stripped.endswith("\\") and keys:
+            # End of the continued override block.
+            break
     return keys
+
+
+def _disable_parameter_keys(path: pathlib.Path) -> set[str]:
+    """Extract ParameterKey=NAME names from a disable wrapper's update-stack calls."""
+    text = path.read_text(encoding="utf-8")
+    return set(re.findall(r"ParameterKey=([A-Za-z][A-Za-z0-9]*)", text))
+
+
+def _execution_parameters() -> set[str]:
+    template = load_cfn_template(EXECUTION_TEMPLATE.read_text(encoding="utf-8"))
+    return set(template["Parameters"].keys())
 
 
 def _operate_required_parameters() -> set[str]:
@@ -91,3 +121,48 @@ def test_wrapper_supplies_every_operate_required_parameter() -> None:
     # every operate-required parameter the template's Rules enforce.
     missing = required - passed
     assert not missing, f"wrapper omits operate-required template parameters: {sorted(missing)}"
+
+
+# --------------------------------------------------------------------------- #
+# Findings 7 & 8: disable closes the 07 pre-write hook; disable's 09 params match
+# the current template.
+# --------------------------------------------------------------------------- #
+def test_disable_wrapper_09_params_are_all_declared() -> None:
+    declared = _declared_parameters()
+    passed = _disable_parameter_keys(DISABLE)
+    # The disable wrapper also touches the 07 stack, so restrict to keys the 09
+    # template declares by intersecting with the union of 09+07 declared params.
+    execution = _execution_parameters()
+    undeclared = passed - (declared | execution)
+    assert not undeclared, f"disable wrapper references undeclared parameters: {sorted(undeclared)}"
+
+
+def test_disable_wrapper_does_not_pass_removed_undeclared_keys() -> None:
+    passed = _disable_parameter_keys(DISABLE)
+    for stale in ("AppConfigApplicationId", "AppConfigEnvironmentId", "AutonomySwitchProfileId"):
+        assert stale not in passed, f"disable wrapper still references undeclared parameter {stale}"
+
+
+def test_disable_closes_the_07_prewrite_hook() -> None:
+    text = DISABLE.read_text(encoding="utf-8").replace(" ", "")
+    # Disable must update the 07 execution stack, flipping AutonomyMode=disabled.
+    assert "operations-execution" in text, "disable must reference the 07 execution stack"
+    assert "AutonomyMode,ParameterValue=disabled" in text, "disable must flip 07 AutonomyMode=disabled"
+
+
+def test_disable_07_update_reuses_all_other_07_parameters_dynamically() -> None:
+    """The 07 AutonomyMode flip must reuse every OTHER 07 parameter (else
+    update-stack would reset them to defaults). Rather than hardcode 07's
+    parameter list (drift-prone), the disable wrapper reads the LIVE 07 stack's
+    parameter keys and re-supplies them all as UsePreviousValue except
+    AutonomyMode."""
+    text = DISABLE.read_text(encoding="utf-8")
+    # It queries the live 07 parameters and builds the list dynamically.
+    assert "Stacks[0].Parameters[].ParameterKey" in text, (
+        "disable must read the live 07 parameter keys to reuse them"
+    )
+    assert "UsePreviousValue=true" in text, "disable must reuse 07 params via UsePreviousValue"
+    # And it must NOT hardcode a 07 param list that would drift (only AutonomyMode
+    # and ProjectName may appear literally in the 07 close path is not required,
+    # but the dynamic loop must key off AutonomyMode explicitly).
+    assert 'ParameterKey=AutonomyMode,ParameterValue=disabled' in text.replace(" ", "")

@@ -103,7 +103,16 @@ case "$argline" in
     "cloudformation deploy"*|"cloudformation update-stack"*|"cloudformation delete-stack"*)
         : > {deploy_sentinel!s}
         exit 0 ;;
+    "cloudformation describe-stacks"*"ParameterKey"*)
+        echo "AutonomyMode\tProjectName\tExecutorCodeS3Key"
+        exit 0 ;;
+    "cloudformation describe-stacks"*"Outputs"*)
+        echo "auto-app-id"
+        exit 0 ;;
     "cloudformation describe-stacks"*)
+        exit 0 ;;
+    "stepfunctions describe-state-machine"*)
+        echo "STANDARD"
         exit 0 ;;
     "cloudformation wait"*)
         exit 0 ;;
@@ -314,6 +323,50 @@ def test_deploy_integrates_by_calling_07_execution_workflow():
     text = DEPLOY.read_text(encoding="utf-8")
     assert "07-operations-execution" in text or "EXECUTION_STATE_MACHINE_ARN" in text.upper()
     assert "gamelift:" not in text, "the autonomy wrapper must never grant a GameLift action"
+
+
+def _fake_aws_express(validate_body, upload, deploy):
+    """A fake aws whose 07 state machine is EXPRESS (must be refused)."""
+    base = _fake_aws(validate_body, upload, deploy)
+    return base.replace(
+        '"stepfunctions describe-state-machine"*)\n        echo "STANDARD"',
+        '"stepfunctions describe-state-machine"*)\n        echo "EXPRESS"',
+    )
+
+
+def test_enable_refuses_a_non_standard_07_workflow(fakes, tmp_path):
+    """Finding 8: an EXPRESS (non-STANDARD) 07 workflow must abort before deploy."""
+    _make_exe(fakes["bindir"] / "cfn-lint", _fake_ok())
+    _make_exe(fakes["bindir"] / "python3", _fake_ok())
+    _make_exe(
+        fakes["bindir"] / "aws",
+        _fake_aws_express(fakes["validate_body"], fakes["upload"], fakes["deploy"]),
+    )
+    backend_src = _stub_backend_src(tmp_path)
+    result = _run(DEPLOY, "--enable", fakes=fakes, env_extra=_enable_env(backend_src=backend_src))
+    assert result.returncode != 0, "a non-STANDARD 07 workflow must be refused"
+    assert not fakes["deploy"].exists(), "must abort before the 09 deploy"
+
+
+def test_deploy_verifies_07_is_standard_same_account_region():
+    """Finding 8: the deploy wrapper must verify the exact 07 workflow is a
+    STANDARD Step Functions state machine in this account/region before enabling."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "stepfunctions describe-state-machine" in text, "must describe the 07 state machine"
+    assert "STANDARD" in text, "must require the 07 workflow to be STANDARD"
+    # Account + region of the ARN are checked against the deploy account/region.
+    assert "SM_REGION" in text and "SM_ACCOUNT" in text
+
+
+def test_deploy_enables_the_07_executor_prewrite_hook():
+    """Finding 7: after deploying 09, the wrapper must update the 07 executor to
+    AutonomyMode=operate and bind the autonomy AppConfig ids so the pre-write
+    hook is actually enabled — reusing every other 07 value."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "operations-execution" in text, "deploy must update the 07 execution stack"
+    assert "AutonomyMode,ParameterValue=operate" in text.replace(" ", ""), "must set 07 AutonomyMode=operate"
+    assert "Stacks[0].Parameters[].ParameterKey" in text, "must reuse 07 params dynamically"
+    assert "AutonomySwitchProfileId" in text, "must bind the autonomy switch profile id on 07"
 
 
 def test_deploy_activation_requires_explicit_enable_and_token_in_source():

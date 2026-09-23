@@ -41,6 +41,7 @@ AWS_REGION="${AWS_REGION:-us-west-2}"
 PROJECT_NAME="game-agent"
 STACK_NAME="${PROJECT_NAME}-operations-autonomy"
 EVALUATOR_FUNCTION_NAME="${PROJECT_NAME}-operations-autonomy-evaluator"
+EXECUTION_STACK_NAME="${PROJECT_NAME}-operations-execution"
 # The 09 autonomy template; overridable ONLY for tests (over/under-limit fixtures).
 TEMPLATE="${GBAW_OPERATIONS_AUTONOMY_TEMPLATE:-$PROJECT_ROOT/infrastructure/cloudformation/09-operations-autonomy.yaml}"
 BACKEND_SRC="${GBAW_OPERATIONS_AUTONOMY_BACKEND_SRC:-$PROJECT_ROOT/backend/src}"
@@ -353,6 +354,38 @@ if ! CALLER_IDENTITY="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --r
 fi
 echo "   Caller identity: $CALLER_IDENTITY"
 ACCOUNT_ID="$(printf '%s\n' "$CALLER_IDENTITY" | awk '{print $1}')"
+
+# --------------------------------------------------------------------------- #
+# Finding 8: VERIFY the exact 07 E3 workflow the evaluator will start — it must
+# live in THIS account and region and be a Standard (never Express) Step
+# Functions state machine, because bounded autonomy reuses the reviewed E3
+# Standard workflow with an identifier only. We DISCOVER nothing: the ARN is
+# supplied; we only confirm it is the exact reviewed workflow.
+# --------------------------------------------------------------------------- #
+echo "🔎 Verifying the exact 07 E3 Standard workflow (same account/region, STANDARD type) ..."
+# arn:aws:states:<region>:<account>:stateMachine:<name>
+SM_REGION="$(printf '%s' "$EXECUTION_STATE_MACHINE_ARN" | awk -F: '{print $4}')"
+SM_ACCOUNT="$(printf '%s' "$EXECUTION_STATE_MACHINE_ARN" | awk -F: '{print $5}')"
+if [ "$SM_REGION" != "$AWS_REGION" ]; then
+    echo "❌ Refusing to enable: the 07 workflow region '$SM_REGION' is not the deploy region '$AWS_REGION'." >&2
+    exit 6
+fi
+if [ "$SM_ACCOUNT" != "$ACCOUNT_ID" ]; then
+    echo "❌ Refusing to enable: the 07 workflow account '$SM_ACCOUNT' is not this account '$ACCOUNT_ID'." >&2
+    exit 6
+fi
+SM_TYPE="$(aws stepfunctions describe-state-machine \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --region "$AWS_REGION" \
+    --state-machine-arn "$EXECUTION_STATE_MACHINE_ARN" \
+    --query 'type' \
+    --output text 2>/dev/null || true)"
+if [ "$SM_TYPE" != "STANDARD" ]; then
+    echo "❌ Refusing to enable: the 07 workflow is type '$SM_TYPE', not STANDARD." >&2
+    echo "   Bounded autonomy reuses the reviewed E3 STANDARD workflow; refusing to start a non-Standard one." >&2
+    exit 6
+fi
+echo "   07 workflow verified: STANDARD in $ACCOUNT_ID/$AWS_REGION."
 
 echo "🪣 Verifying the explicit artifact bucket exists in this account/region (no discovery/creation) ..."
 if ! aws s3api head-bucket \
@@ -695,6 +728,83 @@ if [ "$DEPLOYED_CODE_SHA256" != "$EXPECTED_CODE_SHA256" ]; then
     exit 7
 fi
 echo "   Deployed CodeSha256 verified: $DEPLOYED_CODE_SHA256"
+
+# --------------------------------------------------------------------------- #
+# Finding 7: UPDATE the 07 executor so its pre-write autonomy hook is actually
+# enabled and bound. The 09 evaluator only STARTS the workflow; the executor's
+# own pre-write hook (in 07) is the gate that re-checks the autonomy switch and
+# durable window before the single provider write. We flip the 07 stack to
+# AutonomyMode=operate and thread the SAME server-owned autonomy bindings plus
+# the 09-created autonomy AppConfig ids, reusing every other 07 value. The 07
+# template's wiring is additive and gated on AutonomyMode=operate, so this is
+# the reviewed path — not a second executor.
+# --------------------------------------------------------------------------- #
+echo "🔗 Reading the 09 autonomy AppConfig ids to bind the 07 executor pre-write hook ..."
+AUTONOMY_APP_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='AutonomyApplicationId'].OutputValue" --output text 2>/dev/null || true)"
+AUTONOMY_ENV_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='AutonomyEnvironmentId'].OutputValue" --output text 2>/dev/null || true)"
+AUTONOMY_PROFILE_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='AutonomySwitchProfileId'].OutputValue" --output text 2>/dev/null || true)"
+
+echo "🔗 Enabling the 07 executor pre-write autonomy hook (AutonomyMode=operate) ..."
+# Build the 07 parameter list dynamically from the LIVE stack (drift-proof):
+# reuse every current 07 value except the autonomy ones we set explicitly.
+EXEC_PARAM_KEYS="$(aws cloudformation describe-stacks \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query 'Stacks[0].Parameters[].ParameterKey' \
+    --output text 2>/dev/null || true)"
+if [ -z "$EXEC_PARAM_KEYS" ]; then
+    echo "❌ Refusing: the 07 execution stack '$EXECUTION_STACK_NAME' was not found; deploy 07 first." >&2
+    exit 6
+fi
+declare -A EXEC_SET
+EXEC_SET[AutonomyMode]="ParameterKey=AutonomyMode,ParameterValue=operate"
+EXEC_SET[AutonomyStateMachineArn]="ParameterKey=AutonomyStateMachineArn,ParameterValue=$EXECUTION_STATE_MACHINE_ARN"
+EXEC_SET[AutonomySwitchProfileId]="ParameterKey=AutonomySwitchProfileId,ParameterValue=$AUTONOMY_PROFILE_ID"
+EXEC_SET[AutonomyApplicationId]="ParameterKey=AutonomyApplicationId,ParameterValue=$AUTONOMY_APP_ID"
+EXEC_SET[AutonomyEnvironmentId]="ParameterKey=AutonomyEnvironmentId,ParameterValue=$AUTONOMY_ENV_ID"
+EXEC_SET[AutonomyPolicyId]="ParameterKey=AutonomyPolicyId,ParameterValue=$AUTONOMY_POLICY_ID"
+EXEC_SET[AutonomyPolicyVersion]="ParameterKey=AutonomyPolicyVersion,ParameterValue=$AUTONOMY_POLICY_VERSION"
+EXEC_SET[AutonomyPolicyHash]="ParameterKey=AutonomyPolicyHash,ParameterValue=$AUTONOMY_POLICY_HASH"
+EXEC_SET[AutonomyStateId]="ParameterKey=AutonomyStateId,ParameterValue=$AUTONOMY_STATE_ID"
+EXEC_SET[AutonomySubject]="ParameterKey=AutonomySubject,ParameterValue=$AUTONOMY_SUBJECT"
+EXEC_SET[AutonomyClient]="ParameterKey=AutonomyClient,ParameterValue=$AUTONOMY_CLIENT"
+EXEC_PARAMS=()
+for key in $EXEC_PARAM_KEYS; do
+    if [ -n "${EXEC_SET[$key]:-}" ]; then
+        EXEC_PARAMS+=("${EXEC_SET[$key]}")
+    else
+        EXEC_PARAMS+=("ParameterKey=${key},UsePreviousValue=true")
+    fi
+done
+aws cloudformation update-stack \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --use-previous-template \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --parameters "${EXEC_PARAMS[@]}" 2>/tmp/enable-07.err || {
+        if grep -q "No updates are to be performed" /tmp/enable-07.err 2>/dev/null; then
+            echo "   07 executor already bound to this autonomy configuration (no change)."
+        else
+            echo "❌ Failed to enable the 07 executor pre-write hook." >&2
+            cat /tmp/enable-07.err >&2 || true
+            rm -f /tmp/enable-07.err
+            exit 6
+        fi
+    }
+aws cloudformation wait stack-update-complete \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" 2>/dev/null || true
+rm -f /tmp/enable-07.err
+echo "   07 executor pre-write autonomy hook enabled and bound."
 
 echo "✅ Deployed $STACK_NAME with AutonomyMode=operate. The evaluator starts only the exact E3 workflow $EXECUTION_STATE_MACHINE_ARN."
 echo "   Emergency disable (reversible, deletes nothing): disable-operations-autonomy.sh --confirm"
