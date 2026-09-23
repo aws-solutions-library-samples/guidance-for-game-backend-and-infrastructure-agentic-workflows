@@ -1,11 +1,11 @@
 {
-  "$comment": "Machine-checkable incremental cost model for the OPTIONAL E4 operations CONTROL PLANE (GitHub issue #416). This file is the single source of truth for the E4 incremental cost numbers in docs/operations-e4-cost-notes.md. backend/tests/unit/test_operations_e4_cost_model_unit.py recomputes every scenario total from the formulas below and asserts the published totals here match, so documentation cannot drift from the pricing inputs. backend/tests/unit/test_operations_e4_infra_unit.py additionally reconciles cw_alarms against the actual number of CloudWatch alarms in 08-operations-control-plane.yaml and cw_custom_metrics against the number of E4 control-plane metric names in backend/src/operations/control/metrics.py, so this cost model cannot drift from the deployed template or the emitting code. It does NOT assert any E4 infrastructure is deployed. E4 reuses the 06 DynamoDB table and CMK for audit records, so it adds NO incremental storage or KMS-key charge; the 06 cost model already accounts for those. All account ids/regions here are public-safe.",
+  "$comment": "Machine-checkable incremental cost model for the OPTIONAL E4 operations CONTROL PLANE (GitHub issue #416). This file is the single source of truth for docs/operations-e4-cost-notes.md. Tests recompute totals and reconcile alarms, custom metrics, the cursor-signing KMS key, and Secrets Manager secret against the template. It does not assert that E4 is deployed. Values and identifiers are public-safe.",
   "schema_version": "1.0",
   "issue": 416,
   "design": {
     "stack": "infrastructure/cloudformation/08-operations-control-plane.yaml",
     "control_shape": "AWS AppConfig kill-switch (application/environment/hosted profile/strategies) + control Lambda behind an HTTP API + EventBridge freshness sweeper",
-    "notes": "E4 introduces AWS AppConfig for a deployment-wide kill-switch document. AppConfig is billed per configuration retrieved (data-plane GetLatestConfiguration) and there is no charge for the application/environment/profile/strategy resources themselves. The AppConfig Lambda extension caches the document in-process, so consumers poll AppConfig on a bounded cadence rather than per request. The control Lambda and EventBridge sweeper are request/schedule-scoped and scale to zero when idle. No data store or KMS key is created by E4."
+    "notes": "E4 introduces AWS AppConfig, one control Lambda, one scheduled sweeper Lambda, an HTTP API, five alarms, six potential control metrics, one Secrets Manager cursor-signing secret, and one customer-managed KMS key for that secret. It reuses the 06 operations table and its KMS key for audit records, so it adds no operations-table storage key."
   },
   "alarms": {
     "$comment": "The FIVE E4-owned CloudWatch alarms provisioned by 08-operations-control-plane.yaml, each on a metric the backend actually emits. cw_alarms below equals the length of this list, and the infra test asserts it equals the number of AWS::CloudWatch::Alarm resources in the template. Failure/stuck/unverified coverage upstream of the control plane is provided by the REUSED E1 (06) and E3 (07) alarms and is billed under those stacks, not double-counted here.",
@@ -18,13 +18,14 @@
     ]
   },
   "custom_metrics": {
-    "$comment": "The E4 control plane's own CloudWatch custom metrics, emitted by backend/src/operations/control/metrics.py. cw_custom_metrics below equals the length of this list, and the infra test asserts it equals the count of metric-name constants in that module. ExecutionHumanReconciliationRequired is emitted by the E3 executor (execute/metrics.py) and is billed under the E3 cost model, so it is NOT counted here even though E4 adds its alarm. ControlPublicationReconciled is a planned success/no-op diagnostic metric (no alarm); when the backend begins emitting it, add it to this list and bump cw_custom_metrics to keep the recompute honest.",
+    "$comment": "The six E4 control-plane CloudWatch metric names that can be emitted by backend/src/operations/control/metrics.py. cw_custom_metrics below equals this list. ExecutionHumanReconciliationRequired is emitted and billed by E3, so E4 counts only its alarm. ControlPublicationReconciled is an emitted success/no-op diagnostic with no alarm.",
     "e4_control_plane": [
       "ControlApplied",
       "ControlVersionConflict",
       "ControlDenied",
       "KillSwitchUnavailable",
-      "OperationsExpirySweepExpired"
+      "OperationsExpirySweepExpired",
+      "ControlPublicationReconciled"
     ]
   },
   "pricing": {
@@ -62,7 +63,9 @@
       "apigw_http_usd_per_million_requests": 1.0,
       "eventbridge_usd_per_million_invocations": 0.0,
       "cw_custom_metric_usd_per_metric_month": 0.3,
-      "cw_alarm_usd_per_alarm_month": 0.1
+      "cw_alarm_usd_per_alarm_month": 0.1,
+      "kms_usd_per_key_month": 1.0,
+      "secretsmanager_usd_per_secret_month": 0.4
     }
   },
   "assumptions": {
@@ -72,8 +75,10 @@
     },
     "enabled_idle": {
       "$comment": "Provisioned=true, ControlMode=enabled, but no admin control actions taken. Steady-state cost is the five E4 control-plane custom metrics plus the five E4 alarms, plus the AppConfig config retrievals driven by the extension cache-refresh cadence across the E1/E2/E3 consumers and the freshness sweeper. No API requests, no control Lambda invocations beyond the sweeper. cw_custom_metrics equals len(custom_metrics.e4_control_plane) and cw_alarms equals len(alarms.e4_owned); both are reconciled to the template/code by the infra test.",
-      "cw_custom_metrics": 5,
+      "cw_custom_metrics": 6,
       "cw_alarms": 5,
+      "kms_keys": 1,
+      "secretsmanager_secrets": 1,
       "sweeper_invocations_per_month": 21600,
       "sweeper_gb_seconds_per_invocation": 0.05,
       "appconfig_retrievals_per_month": 216000
@@ -94,10 +99,10 @@
       "monthly_total_usd": 0.0
     },
     "enabled_idle": {
-      "monthly_total_usd": 2.07
+      "monthly_total_usd": 3.77
     },
     "representative": {
-      "monthly_total_usd": 2.07
+      "monthly_total_usd": 3.77
     }
   }
 }

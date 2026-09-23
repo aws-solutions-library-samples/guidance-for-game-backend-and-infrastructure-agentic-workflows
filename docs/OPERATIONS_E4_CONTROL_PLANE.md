@@ -318,9 +318,8 @@ untouched. Prefer `disable-operations-control.sh` for a reversible OFF.
 ## Cost
 
 Default (unprovisioned): **$0**. Enabled-idle and a representative busy month are
-both ≈ **$2.87/month** incremental, dominated by the CloudWatch alarms and
-custom metrics; AppConfig config retrievals and the request-scoped control Lambda
-/ API / sweeper are fractions of a cent. See
+both ≈ **$3.77/month** incremental, dominated by CloudWatch plus the
+cursor-signing secret and its KMS key. See
 [`operations-e4-cost-model.json`](operations-e4-cost-model.json) (the machine-checked
 source of truth, which pins the alarm and custom-metric counts to the template)
 and [`operations-e4-cost-notes.md`](operations-e4-cost-notes.md).

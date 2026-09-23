@@ -741,21 +741,33 @@ def test_cost_model_alarm_count_matches_template(template):
     assert model["assumptions"]["enabled_idle"]["cw_alarms"] == len(model_alarms)
 
 
+def test_cost_model_security_resource_counts_match_template(template):
+    model = _cost_model()
+    idle = model["assumptions"]["enabled_idle"]
+    assert idle["kms_keys"] == len(_resources_of_type(template, "AWS::KMS::Key"))
+    assert idle["secretsmanager_secrets"] == len(_resources_of_type(template, "AWS::SecretsManager::Secret"))
+
+
 def test_cost_model_custom_metric_count_is_self_consistent():
     model = _cost_model()
-    # Custom metrics are emitted at runtime (not declared in CFN), so the model
-    # pins its billed custom-metric count to its own enumerated E4 control-plane
-    # metric list. That list must be a subset of the metrics the infra suite
-    # already knows the backend emits, so a typo cannot inflate the bill.
-    metrics = model["custom_metrics"]["e4_control_plane"]
+    metrics = set(model["custom_metrics"]["e4_control_plane"])
+    control_source = PROJECT_ROOT / "backend/src/operations/control/metrics.py"
+    module = ast.parse(control_source.read_text(encoding="utf-8"), filename=str(control_source))
+    emitted = {
+        node.value.value
+        for node in module.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+        and any(
+            isinstance(target, ast.Name) and target.id.startswith("METRIC_")
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+    }
     assert model["assumptions"]["enabled_idle"]["cw_custom_metrics"] == len(metrics)
-    assert set(metrics).issubset(_backend_emitted_operations_metrics()), (
-        f"cost model lists a non-emitted custom metric: " f"{set(metrics) - BACKEND_EMITTED_OPERATIONS_METRICS}"
-    )
-    # ExecutionHumanReconciliationRequired is emitted by the E3 executor and is
-    # billed under the E3 cost model, so E4 must not double-count it as one of its
-    # own new custom metrics (it still gets the E4 alarm).
-    assert "ExecutionHumanReconciliationRequired" not in set(metrics)
+    assert metrics == emitted, f"cost model/control emitter mismatch: {metrics ^ emitted}"
+    # E3 owns this metric's data charge; E4 owns only its alarm.
+    assert "ExecutionHumanReconciliationRequired" not in metrics
 
 
 # --------------------------------------------------------------------------- #

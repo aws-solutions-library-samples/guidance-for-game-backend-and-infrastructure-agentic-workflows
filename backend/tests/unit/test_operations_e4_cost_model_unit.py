@@ -52,7 +52,9 @@ def _idle_total(model: dict, rates: dict) -> float:
         * rates["lambda_usd_per_gb_second"]
     )
     appconfig = a["appconfig_retrievals_per_month"] * rates["appconfig_usd_per_config_received"]
-    return metrics + alarms + sweeper + appconfig
+    kms = a["kms_keys"] * rates["kms_usd_per_key_month"]
+    secrets = a["secretsmanager_secrets"] * rates["secretsmanager_usd_per_secret_month"]
+    return metrics + alarms + sweeper + appconfig + kms + secrets
 
 
 def _action_total(model: dict, rates: dict, actions: int) -> float:
