@@ -76,6 +76,13 @@ def test_newer_durable_per_phase_disable_blocks_that_phase() -> None:
         gate.require_phase("dispatch", deployed_decision=_Decision(7))
 
 
+def test_equal_version_durable_disable_is_still_enforced() -> None:
+    durable = _document(7, enabled=False, prepare=False, dispatch=False, execute=False)
+    gate = DynamoDbDurableControlGate(client=_Dynamo(_item(durable)), table_name="operations")
+    with pytest.raises(DurablePhaseDenied):
+        gate.require_phase("execute", deployed_decision=_Decision(7))
+
+
 def test_older_durable_intent_does_not_override_newer_deployed_document() -> None:
     durable = _document(6, enabled=False, prepare=False, dispatch=False, execute=False)
     gate = DynamoDbDurableControlGate(client=_Dynamo(_item(durable)), table_name="operations")
@@ -90,6 +97,18 @@ def test_legacy_state_without_document_preserves_extension_decision() -> None:
     }
     gate = DynamoDbDurableControlGate(client=_Dynamo(item), table_name="operations")
     gate.require_phase("execute", deployed_decision=_Decision(7))
+
+
+def test_malformed_durable_document_fails_closed() -> None:
+    item = {
+        "PK": {"S": "OPCONTROL#kill-switch"},
+        "SK": {"S": "STATE#current"},
+        "config_version": {"N": "8"},
+        "document_json": {"S": "{not-json"},
+    }
+    gate = DynamoDbDurableControlGate(client=_Dynamo(item), table_name="operations")
+    with pytest.raises(DurableControlUnavailable):
+        gate.require_phase("execute", deployed_decision=_Decision(7))
 
 
 def test_state_document_version_mismatch_fails_closed() -> None:
