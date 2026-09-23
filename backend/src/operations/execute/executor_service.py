@@ -52,6 +52,24 @@ Raw provider text is never surfaced: adapter errors are reduced to the bounded
 The invocation accepts ONLY ``operation_id`` — the executor relies on the
 IAM-authenticated workflow caller for authorization and never on request content.
 Rollback is a separate inverse E2 prepared+approved operation, never automatic.
+
+E5 bounded-autonomy additive wiring (#439)
+------------------------------------------
+Two optional, additive seams let the E5 autonomous path reuse this exact write
+core — the sole GameLift writer — without changing v1 behavior:
+
+* :meth:`ExecutorService.execute_verified` accepts a pre-built
+  :class:`~operations.execution_verifier.VerifiedExecutionPlan` (produced by the
+  independent :class:`~operations.autonomy_execution_verifier.AutonomyExecutionVerifier`)
+  and runs the identical lease / Describe-before-write / write-once / verify /
+  atomic-record pipeline, bypassing only the v1 approval verifier.
+* An optional ``pre_write_hook`` runs immediately before the single
+  ``UpdateFleetCapacity`` — AFTER the existing E4 second kill-switch/durable
+  check — so the autonomous path can re-check the *separate* autonomy switch and
+  atomic reservation ownership one last time. When it raises, the write is
+  refused with a bounded ``FAILED`` (``PRECONDITION_FAILED``) and no
+  ``UpdateFleetCapacity`` is issued. When absent (the v1 default), behavior is
+  byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -155,6 +173,7 @@ class ExecutorService:
         lease_seconds: int = 30,
         kill_switch_gate: Any = None,
         durable_control_gate: Any = None,
+        pre_write_hook: Callable[[VerifiedExecutionPlan], None] | None = None,
     ) -> None:
         if max_verify_polls < 1:
             raise ValueError("max_verify_polls must be positive")
@@ -173,6 +192,10 @@ class ExecutorService:
         # blocks the write. When absent the executor behaves exactly as before.
         self._kill_switch_gate = kill_switch_gate
         self._durable_control_gate = durable_control_gate
+        # Optional E5 immediate pre-write hook (#439): runs AFTER the E4 second
+        # check and IMMEDIATELY BEFORE UpdateFleetCapacity. Absent by default so
+        # the v1 human-approved path is unchanged.
+        self._pre_write_hook = pre_write_hook
 
     def execute(
         self,
@@ -182,7 +205,12 @@ class ExecutorService:
         approval: Mapping[str, Any],
         lease_holder: str,
     ) -> dict[str, Any]:
-        """Run one bounded execution attempt and return the recorded result."""
+        """Run one bounded v1 execution attempt and return the recorded result.
+
+        The v1 human-approval path: re-verify every precondition against the
+        reloaded prepared operation and stored granted approval, then run the
+        shared write core. This public signature is unchanged.
+        """
         # 0. Kill-switch entry check (issue #416): deny before any work.
         self._require_execute_phase()
         # 1/2. Verify every precondition before anything else (fail closed).
@@ -194,6 +222,41 @@ class ExecutorService:
         if prepared_operation["operation_id"] != invocation.operation_id:
             raise ExecutorServiceError("operation identity mismatch")
 
+        return self._run(invocation, plan=plan, lease_holder=lease_holder)
+
+    def execute_verified(
+        self,
+        invocation: ExecutionInvocation,
+        *,
+        plan: VerifiedExecutionPlan,
+        lease_holder: str,
+    ) -> dict[str, Any]:
+        """Run the shared write core over a PRE-VERIFIED plan (E5 autonomous path).
+
+        The plan has already been produced by the independent
+        :class:`~operations.autonomy_execution_verifier.AutonomyExecutionVerifier`,
+        which re-verified every server-owned precondition (binding, authorization,
+        registered identities, deployed authority, decision freshness, the
+        separate autonomy switch, and atomic reservation ownership). This method
+        performs no v1 approval verification; it re-confirms only that the plan's
+        operation identity equals the (untrusted) invocation id, then runs the
+        identical entry kill-switch check + Describe-before-write / write-once /
+        verify / atomic-record pipeline as the sole GameLift writer.
+        """
+        # 0. Kill-switch entry check (issue #416): deny before any work.
+        self._require_execute_phase()
+        if plan.intent.get("operation_id") != invocation.operation_id:
+            raise ExecutorServiceError("operation identity mismatch")
+        return self._run(invocation, plan=plan, lease_holder=lease_holder)
+
+    def _run(
+        self,
+        invocation: ExecutionInvocation,
+        *,
+        plan: VerifiedExecutionPlan,
+        lease_holder: str,
+    ) -> dict[str, Any]:
+        """The shared write core: lease, Describe-before-write, write-once, verify, record."""
         logical_action_id = plan.logical_action_id
         # Acquire the fenced lease (or replay a recorded terminal result).
         lease_not_after = self._clock() + timedelta(seconds=self._lease_seconds)
@@ -242,6 +305,23 @@ class ExecutorService:
         # phase immediately before the write, AFTER the pre-write Describe, so a
         # switch flipped during the Describe still blocks UpdateFleetCapacity.
         self._require_execute_phase()
+        # 4b. E5 immediate pre-write hook (#439): re-check the SEPARATE autonomy
+        # switch and atomic reservation ownership AFTER the E4 second check and
+        # IMMEDIATELY BEFORE the write. Any failure refuses the write with a
+        # bounded FAILED and no UpdateFleetCapacity. Absent on the v1 path.
+        if self._pre_write_hook is not None:
+            try:
+                self._pre_write_hook(plan)
+            except Exception:  # noqa: BLE001 - any pre-write denial fails closed, no write
+                return self._record(
+                    plan,
+                    acquisition,
+                    outcome=OUTCOME_FAILED,
+                    write_issued=False,
+                    observed=expected,
+                    failure_reason="PRECONDITION_FAILED",
+                    new_state="failed",
+                )
         # Issue exactly one UpdateFleetCapacity.
         write_issued = True
         try:
