@@ -1,0 +1,151 @@
+# E5 Bounded-Autonomy — Activation & Rollback Runbook (Issue #440, Track C)
+
+> **Scope.** This runbook covers standing up, validating, and tearing down the
+> **optional, reviewed** E5 bounded-autonomy stack. E5 autonomy is
+> **default-disabled and default-zero**: the canonical `deploy-all.sh`
+> deployment creates **no** autonomy resources, grants **no** provider-write
+> permission, and mints **no** executor credential. Nothing in this runbook is
+> part of the default deployment.
+>
+> **Never** add autonomy write permission to the chat runtime (see `AGENTS.md`
+> "Repository Reality" / "Important Boundaries"). E5 is a separate control
+> plane, activated only through an optional stack wrapper an operator reviews
+> and applies deliberately.
+
+## 0. Invariants this runbook must never violate
+
+- **Main deployment remains `deploy-all.sh` only.** Optional stack wrappers may
+  deploy reviewed E5; the main path never does.
+- **Separate AppConfig autonomy switch.** E5 is gated by its own AppConfig
+  document (`operations.autonomy_switch`), disabled by default and independent of
+  the E4 kill-switch. **Enabling E4 never enables autonomy.** The frozen E4
+  control-plane schema is **not** edited, extended, or re-hashed by E5.
+- **No provider-write permission or executor credential on any autonomy
+  component.** Only the existing durable, authenticated Standard workflow may
+  invoke the existing narrow executor, and then only with an `operation_id`.
+- **No self-hosted runners.** Any CI that touches E5 uses hosted runners only.
+- **Emergency disable blocks both evaluation and the immediate pre-write.** The
+  composite gate re-checks emergency disablement immediately before the single
+  provider write.
+- **Bounds are `0/1/1`.** The authorized demo fleet starts and ends at
+  `desired=0 / minimum=0 / maximum=1`; live validation restores zero.
+
+## 1. Preconditions (all required before activation)
+
+1. The reviewed optional E5 stack wrapper has been read and approved. It layers
+   on top of the base deployment; it does not modify stacks `00`–`08`.
+2. The AppConfig **autonomy switch** document is present and can be published
+   independently of the E4 kill-switch document.
+3. The demo fleet is enrolled for the target workspace, in the target
+   **profile/region**, and its current capacity is exactly `0/0/1`.
+4. Alarms are green and there is no CloudFormation drift on the base stacks.
+5. Least-privilege / ReadOnly credentials are used for every read step; the
+   single write path is the executor's own scoped role, reached only via the
+   authenticated Standard workflow.
+
+## 2. Activation
+
+> Perform each step with the least-privilege credential that suffices. Prefer
+> describe/list/read operations; the only write is the executor's own capacity
+> update, reached only through the authenticated workflow.
+
+1. **Deploy the optional E5 stack wrapper** (reviewed) into the target account.
+   This creates the autonomy runtime resources (evaluator, reservation store,
+   Step Functions state machine, audit ledger, alarms) **disabled**. It grants
+   no new provider-write permission to any non-executor component.
+2. **Publish the AppConfig autonomy switch** enabling the autonomy primary flag
+   and the `autonomous_write` capability flag, with a fresh
+   `issued_at`/`not_after` window carrying an explicit UTC offset. Leave the E4
+   kill-switch document unchanged.
+3. **Confirm the composite gate reads fresh-enabled** from every source:
+   `GBAW_OPERATIONS_AUTONOMY_ENABLED` on, static mode exactly `operate`, the
+   separate autonomy switch enabled, and the E4 `dispatch`/`execute` phases and
+   durable intent permitting.
+4. **Run the live shakedown** (see §3). It refuses unless every preflight
+   condition holds and both confirmations are supplied.
+
+## 3. Live validation (`e5_shakedown`)
+
+The harness (`backend/src/operations/validation/e5_shakedown.py`) drives the
+whole lifecycle against the already-deployed optional stack and **refuses the
+entire run** — making no authenticated request — unless **all** of:
+
+- the exact forward confirmation `EXECUTE-LIVE-AUTONOMY-0-TO-1` **and** the
+  distinct inverse confirmation `EXECUTE-LIVE-AUTONOMY-INVERSE-1-TO-0` are
+  supplied out of band (never sourced from a response body);
+- operator **profile/region/fleet** exactly match server enrollment;
+- **starting capacity is exactly `0/0/1`**;
+- **static + E4 + separate-autonomy** gates are each fresh-enabled;
+- **alarms and drift** are both safe.
+
+```bash
+# Read-only preflight facts and short-lived tokens are supplied out of band;
+# nothing is persisted or echoed. Endpoint/tokens/ids are never logged.
+python -m operations.validation.e5_shakedown \
+  --endpoint "$GBAW_E5_ENDPOINT" \
+  --admin-bearer "$GBAW_E5_ADMIN_BEARER" \
+  --fleet-id "$GBAW_E5_FLEET_ID" \
+  --observation-id "$GBAW_E5_OBSERVATION_ID" \
+  --operation-id "$GBAW_E5_OPERATION_ID" \
+  --profile "$GBAW_E5_PROFILE" --enrolled-profile "$GBAW_E5_ENROLLED_PROFILE" \
+  --region "$GBAW_E5_REGION" --enrolled-region "$GBAW_E5_ENROLLED_REGION" \
+  --enrolled-fleet-id "$GBAW_E5_ENROLLED_FLEET_ID" \
+  --starting-desired 0 --starting-minimum 0 --starting-maximum 1 \
+  --static-gate-fresh-enabled true --e4-gate-fresh-enabled true \
+  --autonomy-switch-fresh-enabled true \
+  --alarms-safe true --drift-safe true \
+  --confirm-forward "$GBAW_E5_CONFIRM_FORWARD" \
+  --confirm-inverse "$GBAW_E5_CONFIRM_INVERSE"
+```
+
+Exit codes: `0` accepted, `1` a check failed, `2` summary failed public-safety
+(never emitted), `3` refused at preflight (no request made).
+
+The harness performs, in order, one **trusted E1 observation**, an
+evaluator-authorized **`0 -> 1`** write, then verifies the write was
+**audited**, **atomically reserved**, ran through **Step Functions**, and that
+the CloudTrail write is attributed to the **executor principal only**;
+verifies **capacity is 1**; proves an **immediate retry is denied** by
+cooldown/frequency/concurrency; performs a **separately-confirmed inverse
+`1 -> 0`**; verifies **capacity is 0**; **disables autonomy**; and proves a
+**forced evaluator/executor attempt cannot write**. It also runs the negative
+controls: **IAM-negative**, **alarms-safe**, **drift-safe**, **exact-artifact**,
+and **audit-complete**. Any ambiguous result (e.g. a capacity read missing an
+integer `desired`) fails **closed**.
+
+## 4. Rollback / teardown
+
+Rollback is always safe to perform and leaves the fleet at rest.
+
+1. **Disable the autonomy switch** — publish the AppConfig autonomy document
+   with the primary/`autonomous_write` flags off (or let its window lapse). The
+   composite gate then fails closed on the next evaluation and immediate
+   pre-write. This is the emergency disable; it requires no stack change.
+2. **Confirm capacity is `0/0/1`.** If a write left the demo fleet at `1`, drive
+   the inverse `1 -> 0` through the authenticated workflow (or via the shakedown
+   inverse step) and confirm `desired=0`.
+3. **Verify no forced write is possible** — a forced evaluator/executor attempt
+   returns a denial and performs no write (`forced_evaluator_executor_cannot_write`).
+4. **(Full teardown)** Delete the optional E5 stack wrapper. Because it is layered
+   and separate, deleting it does not touch stacks `00`–`08`, the E4 schema, or
+   the chat runtime. Confirm zero autonomy resources remain and the account is
+   back to the **default-zero** posture.
+
+## 5. Ambiguous-result / abort handling
+
+- If the shakedown returns exit `3` (refused), **no request was made**; fix the
+  failing preflight fact and re-run. Do not bypass any refusal.
+- If any check reports `AMBIGUOUS_RESULT` or a check fails, **stop**, disable the
+  autonomy switch (§4.1), restore the fleet to `0/0/1`, and investigate before
+  retrying. Never "retry through" an ambiguous capacity read.
+- Treat every write as real. The demo fleet is the only authorized target and
+  the only permitted change is within the `0/1/1` window.
+
+## 6. Post-run checklist
+
+- [ ] Autonomy switch disabled (default-zero posture restored).
+- [ ] Demo fleet at `desired=0 / minimum=0 / maximum=1`.
+- [ ] Audit ledger contains the executor-attributed write and the inverse.
+- [ ] Alarms green, no drift.
+- [ ] Sanitized shakedown summary archived (contains only short hashes and
+      booleans/observed codes — no endpoint, token, fleet, or account id).
