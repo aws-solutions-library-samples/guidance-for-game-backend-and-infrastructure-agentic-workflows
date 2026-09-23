@@ -47,6 +47,9 @@ PROFILE = "demo-operator"
 OBS_ID = "obs_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 OP_ID = "op_bbbbbbbbbbbbbbbbbbbbbbbbbb"
 
+# Tests never wait on the bounded teardown poll; inject a no-op sleep.
+_NO_SLEEP = lambda *_: None  # noqa: E731
+
 
 def _safe_preflight(**overrides: Any) -> sd.E5Preflight:
     base = dict(
@@ -159,6 +162,11 @@ class FakeDeployedE5:
             self.autonomy_enabled = False
             return _resp(200, {"autonomy_enabled": False})
 
+        if path == "/operations/autonomy/disable" and method == "GET":
+            # The guaranteed teardown RE-READS the disable state; report the live
+            # posture so a confirmed disable is observable.
+            return _resp(200, {"autonomy_enabled": self.autonomy_enabled})
+
         if path == f"/operations/autonomy/{OP_ID}/force-write" and method == "POST":
             # Forced evaluator/executor attempt after disable: must never write.
             if not self.autonomy_enabled:
@@ -214,7 +222,7 @@ def test_each_preflight_condition_can_refuse(overrides: dict[str, Any], expected
 
 def test_harness_refuses_entire_run_without_confirmation() -> None:
     fake = FakeDeployedE5()
-    harness = sd.E5ShakedownHarness(_config(confirmation=""), fake)
+    harness = sd.E5ShakedownHarness(_config(confirmation=""), fake, sleep=_NO_SLEEP)
     summary = harness.run()
     assert summary["accepted"] is False
     assert summary["refused"] is True
@@ -226,7 +234,7 @@ def test_harness_refuses_entire_run_without_confirmation() -> None:
 def test_harness_refuses_run_when_preflight_unsafe() -> None:
     fake = FakeDeployedE5()
     cfg = _config(preflight=_safe_preflight(starting_desired=1, drift_safe=False))
-    harness = sd.E5ShakedownHarness(cfg, fake)
+    harness = sd.E5ShakedownHarness(cfg, fake, sleep=_NO_SLEEP)
     summary = harness.run()
     assert summary["refused"] is True
     assert "STARTING_CAPACITY_NOT_0_0_1" in summary["refusal_codes"]
@@ -238,7 +246,7 @@ def test_inverse_requires_its_own_confirmation() -> None:
     # Forward confirmation present but the inverse (1->0) confirmation missing:
     # the run is refused before any request because the inverse is mandatory.
     fake = FakeDeployedE5()
-    harness = sd.E5ShakedownHarness(_config(inverse_confirmation=""), fake)
+    harness = sd.E5ShakedownHarness(_config(inverse_confirmation=""), fake, sleep=_NO_SLEEP)
     summary = harness.run()
     assert summary["refused"] is True
     assert "INVERSE_CONFIRMATION_REQUIRED" in summary["refusal_codes"]
@@ -259,7 +267,7 @@ def _named(summary: dict[str, Any], name: str) -> dict[str, Any]:
 
 def test_full_lifecycle_accepts_and_restores_zero() -> None:
     fake = FakeDeployedE5()
-    harness = sd.E5ShakedownHarness(_config(), fake)
+    harness = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP)
     summary = harness.run()
     assert summary["refused"] is False
     assert summary["accepted"] is True
@@ -273,7 +281,7 @@ def test_full_lifecycle_accepts_and_restores_zero() -> None:
 
 def test_lifecycle_runs_expected_checks_in_order() -> None:
     fake = FakeDeployedE5()
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     order = [c["name"] for c in summary["checks"]]
     assert order == [
         "unauthenticated_denied",
@@ -297,7 +305,7 @@ def test_lifecycle_runs_expected_checks_in_order() -> None:
 
 def test_immediate_retry_denied_reports_limit_reason() -> None:
     fake = FakeDeployedE5()
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     retry = _named(summary, "immediate_retry_denied_by_limits")
     assert retry["passed"]
     assert retry["observed_error_code"] in sd.LIMIT_REASON_CODES
@@ -305,7 +313,7 @@ def test_immediate_retry_denied_reports_limit_reason() -> None:
 
 def test_executor_only_write_attribution_checked() -> None:
     fake = FakeDeployedE5()
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     assert _named(summary, "write_audited_reserved_sfn_executor_only")["passed"]
 
 
@@ -317,7 +325,7 @@ def test_executor_only_write_attribution_checked() -> None:
 def test_write_not_executor_attributed_fails_check() -> None:
     fake = FakeDeployedE5()
     fake.executor_write_actor = "evaluator"  # a non-executor principal wrote
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     assert _named(summary, "write_audited_reserved_sfn_executor_only")["passed"] is False
     assert summary["accepted"] is False
 
@@ -332,7 +340,7 @@ def test_forced_write_after_disable_that_succeeds_fails_check() -> None:
                 return _resp(200, {"wrote": True, "capacity": {"desired": 1}})
             return super().__call__(method, url, headers, body)
 
-    summary = sd.E5ShakedownHarness(_config(), LeakyFake()).run()
+    summary = sd.E5ShakedownHarness(_config(), LeakyFake(), sleep=_NO_SLEEP).run()
     assert _named(summary, "forced_evaluator_executor_cannot_write")["passed"] is False
     assert summary["accepted"] is False
 
@@ -345,7 +353,7 @@ def test_ambiguous_capacity_result_fails_closed() -> None:
                 return _resp(200, {"capacity": {}})  # missing desired -> ambiguous
             return super().__call__(method, url, headers, body)
 
-    summary = sd.E5ShakedownHarness(_config(), AmbiguousFake()).run()
+    summary = sd.E5ShakedownHarness(_config(), AmbiguousFake(), sleep=_NO_SLEEP).run()
     assert summary["accepted"] is False
     ambiguous = _named(summary, "capacity_is_one")
     assert ambiguous["observed_error_code"] == "AMBIGUOUS_RESULT"
@@ -354,14 +362,14 @@ def test_ambiguous_capacity_result_fails_closed() -> None:
 def test_audit_incomplete_fails_check() -> None:
     fake = FakeDeployedE5()
     fake.audit_complete = False
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     assert _named(summary, "audit_complete")["passed"] is False
 
 
 def test_artifact_mismatch_fails_check() -> None:
     fake = FakeDeployedE5()
     fake.artifact_matches = False
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     assert _named(summary, "exact_artifact")["passed"] is False
 
 
@@ -372,7 +380,7 @@ def test_artifact_mismatch_fails_check() -> None:
 
 def test_summary_is_public_safe_and_hides_identifiers() -> None:
     fake = FakeDeployedE5()
-    summary = sd.E5ShakedownHarness(_config(), fake).run()
+    summary = sd.E5ShakedownHarness(_config(), fake, sleep=_NO_SLEEP).run()
     assert sd.summary_is_public_safe(summary)
     blob = json.dumps(summary)
     for secret in (ENDPOINT, ADMIN, FORCED, FLEET, PROFILE, OBS_ID, OP_ID):
@@ -421,7 +429,7 @@ class _RaiseAfterScaleTransport(FakeDeployedE5):
 
 def test_post_scale_exception_still_restores_and_disables() -> None:
     transport = _RaiseAfterScaleTransport()
-    harness = sd.E5ShakedownHarness(_config(), transport)
+    harness = sd.E5ShakedownHarness(_config(), transport, sleep=_NO_SLEEP)
     summary = harness.run()
     # The fleet must have been restored to 0 despite the mid-lifecycle failure.
     assert transport.desired == 0, "the harness must restore 1->0 in a finally block"
@@ -437,7 +445,7 @@ def test_no_restore_needed_when_never_scaled() -> None:
     provider write (nothing to restore)."""
     cfg = _config(confirmation="")  # refused: no confirmation
     transport = FakeDeployedE5()
-    harness = sd.E5ShakedownHarness(cfg, transport)
+    harness = sd.E5ShakedownHarness(cfg, transport, sleep=_NO_SLEEP)
     summary = harness.run()
     assert summary["refused"] is True
     # No write ever happened, so desired stayed 0 and no evaluate call was made.
@@ -467,3 +475,124 @@ def test_adapter_command_contract_is_documented() -> None:
     assert "dynamodb" in joined
     assert "cloudtrail" in joined
     assert "gamelift" in joined
+
+
+# --------------------------------------------------------------------------- #
+# #440 review (cleanup): the guaranteed teardown must NEVER skip the inverse
+# solely because a capacity read raised, and it must WAIT and RE-READ the
+# disable state rather than fire-and-forget a single disable POST.
+# --------------------------------------------------------------------------- #
+
+
+class CapacityReadRaisesThenRecovers:
+    """A transport whose capacity GET raises the first time it is read during
+    teardown, modelling an ambiguous/erroring read. Everything else behaves like
+    the healthy fake so the run reaches teardown. The inverse (evaluate down) is
+    recorded so a test can prove teardown still attempted it."""
+
+    def __init__(self) -> None:
+        self.desired = 1  # left scaled up
+        self.autonomy_enabled = True
+        self.capacity_reads = 0
+        self.inverse_attempts = 0
+        self.disable_reads = 0
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append((method, url))
+        auth = (headers or {}).get("authorization", "") or (headers or {}).get("Authorization", "")
+        path = url[len(ENDPOINT) :]
+        payload = json.loads(body.decode("utf-8")) if body else {}
+        if not auth:
+            return _resp(401, {"error_code": "IDENTITY_CONTEXT_INVALID"})
+        if path == "/operations/observe":
+            return _resp(201, {"trusted": True, "capacity": {"desired": self.desired}})
+        if path.endswith("/evaluate"):
+            direction = payload.get("direction")
+            if direction == "down":
+                self.inverse_attempts += 1
+                self.desired = 0
+                return _resp(200, {"decision": "authorized", "capacity": {"desired": 0}})
+            self.desired = 1
+            return _resp(
+                200,
+                {
+                    "decision": "authorized",
+                    "reason_codes": ["APPROVED_AUTONOMOUS"],
+                    "audit_recorded": True,
+                    "reservation_granted": True,
+                    "step_functions_started": True,
+                    "cloudtrail_write_actor": "executor",
+                    "artifact_matches_expected": True,
+                    "capacity": {"desired": 1},
+                },
+            )
+        if path.endswith("/capacity"):
+            self.capacity_reads += 1
+            # The FIRST teardown-time capacity read raises; a naive teardown would
+            # then skip the inverse. It must not.
+            if self.capacity_reads == 1:
+                raise RuntimeError("ambiguous capacity read")
+            return _resp(200, {"capacity": {"desired": self.desired}})
+        if path == "/operations/autonomy/disable":
+            self.autonomy_enabled = False
+            return _resp(200, {"autonomy_enabled": False})
+        if path.endswith("/force-write"):
+            return _resp(409, {"error_code": "AUTONOMY_DISABLED", "wrote": False})
+        return _resp(404, {"error_code": "NOT_FOUND"})
+
+
+def test_teardown_does_not_skip_inverse_when_capacity_read_raises() -> None:
+    """If the teardown capacity read raises, the guaranteed restore must still
+    attempt the separately-confirmed inverse (1->0), not skip it."""
+    fake = CapacityReadRaisesThenRecovers()
+    harness = sd.E5ShakedownHarness(_config(), fake, sleep=lambda *_: None)
+    result = harness._guaranteed_restore_and_disable(scaled_up=True)
+    assert fake.inverse_attempts >= 1, "teardown must attempt the inverse even when a capacity read raised"
+    # And it reached the disable.
+    assert fake.autonomy_enabled is False, "teardown must still disable autonomy"
+    assert result.name == "guaranteed_restore"
+
+
+class DisableNeverConfirms:
+    """A transport whose disable POST returns 200 but whose disable STATE never
+    flips (autonomy_enabled stays True on re-read), modelling a disable that did
+    not take effect. A fire-and-forget teardown would wrongly report success."""
+
+    def __init__(self) -> None:
+        self.desired = 0
+        self.autonomy_enabled = True
+        self.disable_state_reads = 0
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append((method, url))
+        auth = (headers or {}).get("authorization", "") or (headers or {}).get("Authorization", "")
+        path = url[len(ENDPOINT) :]
+        if not auth:
+            return _resp(401, {"error_code": "IDENTITY_CONTEXT_INVALID"})
+        if path.endswith("/capacity"):
+            return _resp(200, {"capacity": {"desired": self.desired}})
+        if path.endswith("/evaluate"):
+            return _resp(200, {"decision": "authorized", "capacity": {"desired": self.desired}})
+        if path == "/operations/autonomy/disable":
+            if method == "POST":
+                # POST claims success but the state does NOT flip.
+                return _resp(200, {"autonomy_enabled": True})
+            # GET re-read of the disable state.
+            self.disable_state_reads += 1
+            return _resp(200, {"autonomy_enabled": True})
+        return _resp(404, {"error_code": "NOT_FOUND"})
+
+
+def test_teardown_waits_and_rereads_disable_state() -> None:
+    """The guaranteed teardown must WAIT and RE-READ the disable state; a disable
+    whose state never confirms disabled must fail the teardown check, not pass on
+    the POST's optimistic 200."""
+    fake = DisableNeverConfirms()
+    harness = sd.E5ShakedownHarness(_config(), fake, sleep=lambda *_: None)
+    result = harness._guaranteed_restore_and_disable(scaled_up=False)
+    # It must have re-read the disable state at least once.
+    assert fake.disable_state_reads >= 1, "teardown must re-read the disable state, not fire-and-forget"
+    # And because the state never confirmed disabled, the teardown must NOT pass.
+    assert result.passed is False, "an unconfirmed disable must fail the guaranteed teardown check"

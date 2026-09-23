@@ -486,7 +486,14 @@ class ScriptedLifecycleRunner:
         if key == "cloudwatch describe-alarms":
             return self._json({"MetricAlarms": [{"StateValue": "OK"}] * 4})
         if key == "appconfig get-configuration":
-            return self._json({"enabled": True, "expired": False})
+            # get-configuration writes the document BODY to the positional
+            # OutputFile; reflect the live enabled state so a disable re-read
+            # observes the flip.
+            # Standard library
+            import pathlib as _pl
+
+            _pl.Path(argv[-1]).write_text(json.dumps({"enabled": self.enabled, "expired": False}), encoding="utf-8")
+            return self._json({"ConfigurationVersion": "1"})
         if key == "appconfig start-deployment":
             self.enabled = False
             return self._json({"DeploymentNumber": 1})
@@ -544,7 +551,7 @@ def test_command_transport_drives_full_harness_to_accepted() -> None:
         confirmation=REQUIRED_CONFIRMATION,
         inverse_confirmation=REQUIRED_INVERSE_CONFIRMATION,
     )
-    summary = E5ShakedownHarness(shakedown_cfg, transport).run()
+    summary = E5ShakedownHarness(shakedown_cfg, transport, sleep=lambda *_: None).run()
     failed = [c for c in summary["checks"] if not c["passed"]]
     assert summary["accepted"] is True, f"harness not accepted; failing checks: {[c['name'] for c in failed]}"
     assert summary["refused"] is False
@@ -553,3 +560,179 @@ def test_command_transport_drives_full_harness_to_accepted() -> None:
         if argv[1:3] == ["lambda", "invoke"] and "--payload" in argv:
             ev = json.loads(argv[argv.index("--payload") + 1])
             assert "direction" not in ev
+
+
+# --------------------------------------------------------------------------- #
+# #440 review (Finding 8, continued): the AppConfig get-configuration read MUST
+# include the required OutputFile positional arg (the CLI refuses without it and
+# writes the document body to that file, not stdout), and the measured preflight
+# must MEASURE the static mode / E4 & E5 switch freshness / drift / enrollment /
+# capacity from the provider rather than pass through operator-supplied booleans.
+# --------------------------------------------------------------------------- #
+
+
+def test_appconfig_get_configuration_includes_required_outfile() -> None:
+    """`aws appconfig get-configuration` requires a positional output file; the
+    adapter must pass one (a safe temp path) or the CLI fails at runtime."""
+    recorded: dict[str, list[str]] = {}
+
+    def runner(argv: list[str]) -> CommandResult:
+        if argv[1:3] == ["appconfig", "get-configuration"]:
+            recorded["argv"] = argv
+            # Simulate the CLI writing the document to the OutputFile positional.
+            outfile = argv[-1]
+            pathlib.Path(outfile).write_text(json.dumps({"enabled": True, "expired": False}), encoding="utf-8")
+            # Stdout carries only metadata (no document body).
+            return CommandResult(returncode=0, stdout=json.dumps({"ConfigurationVersion": "1"}), stderr="")
+        return CommandResult(returncode=0, stdout="{}", stderr="")
+
+    adapter = CommandAdapter(_config(), runner=runner)
+    result = adapter.observed_autonomy_switch_fresh_enabled()
+    argv = recorded.get("argv")
+    assert argv is not None, "the autonomy-switch read must issue appconfig get-configuration"
+    # The final positional token must be an output file path, not a flag/None.
+    outfile = argv[-1]
+    assert not outfile.startswith("--"), f"get-configuration must end with a positional OutputFile, got {outfile!r}"
+    assert outfile, "OutputFile must be non-empty"
+    # And the document body is read from the OutputFile, yielding the enabled flag.
+    assert result is True
+
+
+def test_measured_preflight_measures_gates_drift_enrollment_not_supplied() -> None:
+    """The measured preflight must OVERRIDE the static mode, E4 freshness, drift,
+    and enrollment facts with provider measurements, so an operator that ASSERTS
+    everything safe while the provider disagrees still refuses closed. Here every
+    provider read reports UNSAFE while the operator supplied all-True."""
+    # Local modules
+    from operations.validation.e5_shakedown import E5Preflight, _measure_preflight
+
+    supplied = E5Preflight(
+        profile="p",
+        region="us-west-2",
+        fleet_id="fleet-x",
+        enrolled_profile="p",
+        enrolled_region="us-west-2",
+        enrolled_fleet_id="fleet-x",
+        starting_desired=0,
+        starting_minimum=0,
+        starting_maximum=1,
+        static_gate_fresh_enabled=True,
+        e4_gate_fresh_enabled=True,
+        autonomy_switch_fresh_enabled=True,
+        alarms_safe=True,
+        drift_safe=True,
+    )
+
+    # Standard library
+    import dataclasses
+
+    cfg = dataclasses.replace(
+        _config(),
+        kill_switch_application_id="ks-app",
+        kill_switch_environment_id="ks-env",
+        kill_switch_profile_id="ks-prof",
+        autonomy_stack_name="game-agent-operations-autonomy",
+    )
+
+    def runner(argv: list[str]) -> CommandResult:
+        key = f"{argv[1]} {argv[2]}"
+        if key == "gamelift describe-fleet-capacity":
+            return CommandResult(
+                0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
+            )
+        if key == "cloudwatch describe-alarms":
+            return CommandResult(0, json.dumps({"MetricAlarms": [{"StateValue": "OK"}] * 4}), "")
+        if key == "appconfig get-configuration":
+            # BOTH the E5 autonomy switch and the E4 kill switch read as stale.
+            pathlib.Path(argv[-1]).write_text(json.dumps({"enabled": False, "expired": True}), encoding="utf-8")
+            return CommandResult(0, json.dumps({"ConfigurationVersion": "1"}), "")
+        if key == "lambda get-function-configuration":
+            # Static mode is NOT operate.
+            return CommandResult(
+                0, json.dumps({"Environment": {"Variables": {"GBAW_OPERATIONS_STATIC_DEPLOYMENT_MODE": "advise"}}}), ""
+            )
+        if key == "gamelift describe-fleet-attributes":
+            # Fleet is not ACTIVE (enrollment unsafe).
+            return CommandResult(0, json.dumps({"FleetAttributes": [{"Status": "ERROR"}]}), "")
+        if key == "cloudformation describe-stacks":
+            # Stack is DRIFTED.
+            return CommandResult(0, json.dumps({"Stacks": [{"DriftInformation": {"StackDriftStatus": "DRIFTED"}}]}), "")
+        return CommandResult(0, "{}", "")
+
+    adapter = CommandAdapter(cfg, runner=runner)
+    measured = _measure_preflight(adapter, supplied)
+    # Every measured fact overrides the supplied True and the run must refuse.
+    assert measured.static_gate_fresh_enabled is False
+    assert measured.e4_gate_fresh_enabled is False
+    assert measured.autonomy_switch_fresh_enabled is False
+    assert measured.drift_safe is False
+    refusals = set(measured.refusals())
+    assert {
+        "STATIC_GATE_NOT_FRESH_ENABLED",
+        "E4_GATE_NOT_FRESH_ENABLED",
+        "AUTONOMY_SWITCH_NOT_FRESH_ENABLED",
+        "DRIFT_NOT_SAFE",
+    } <= refusals
+
+
+def test_measured_preflight_static_e4_drift_enrollment_all_safe_passes() -> None:
+    """When every provider read is SAFE, the measured facts do not add refusals."""
+    # Local modules
+    from operations.validation.e5_shakedown import E5Preflight, _measure_preflight
+
+    supplied = E5Preflight(
+        profile="p",
+        region="us-west-2",
+        fleet_id="fleet-x",
+        enrolled_profile="p",
+        enrolled_region="us-west-2",
+        enrolled_fleet_id="fleet-x",
+        starting_desired=0,
+        starting_minimum=0,
+        starting_maximum=1,
+        static_gate_fresh_enabled=True,
+        e4_gate_fresh_enabled=True,
+        autonomy_switch_fresh_enabled=True,
+        alarms_safe=True,
+        drift_safe=True,
+    )
+
+    # Standard library
+    import dataclasses
+
+    cfg = dataclasses.replace(
+        _config(),
+        kill_switch_application_id="ks-app",
+        kill_switch_environment_id="ks-env",
+        kill_switch_profile_id="ks-prof",
+        autonomy_stack_name="game-agent-operations-autonomy",
+    )
+
+    def runner(argv: list[str]) -> CommandResult:
+        key = f"{argv[1]} {argv[2]}"
+        if key == "gamelift describe-fleet-capacity":
+            return CommandResult(
+                0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
+            )
+        if key == "cloudwatch describe-alarms":
+            return CommandResult(0, json.dumps({"MetricAlarms": [{"StateValue": "OK"}] * 4}), "")
+        if key == "appconfig get-configuration":
+            pathlib.Path(argv[-1]).write_text(json.dumps({"enabled": True, "expired": False}), encoding="utf-8")
+            return CommandResult(0, json.dumps({"ConfigurationVersion": "1"}), "")
+        if key == "lambda get-function-configuration":
+            return CommandResult(
+                0, json.dumps({"Environment": {"Variables": {"GBAW_OPERATIONS_STATIC_DEPLOYMENT_MODE": "operate"}}}), ""
+            )
+        if key == "gamelift describe-fleet-attributes":
+            return CommandResult(0, json.dumps({"FleetAttributes": [{"Status": "ACTIVE"}]}), "")
+        if key == "cloudformation describe-stacks":
+            return CommandResult(0, json.dumps({"Stacks": [{"DriftInformation": {"StackDriftStatus": "IN_SYNC"}}]}), "")
+        return CommandResult(0, "{}", "")
+
+    adapter = CommandAdapter(cfg, runner=runner)
+    measured = _measure_preflight(adapter, supplied)
+    assert measured.static_gate_fresh_enabled is True
+    assert measured.e4_gate_fresh_enabled is True
+    assert measured.autonomy_switch_fresh_enabled is True
+    assert measured.drift_safe is True
+    assert measured.refusals() == []

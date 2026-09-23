@@ -92,6 +92,14 @@ class CommandAdapterConfig:
     # requested capacity triple, forms the exact closed evaluator event. Defaulted
     # so a purely-structural adapter (no live run) can still be constructed.
     observation_operation_id: str = ""
+    # The E4 (08) kill-switch AppConfig coordinate. Measured for freshness so the
+    # preflight refuses on a stale/absent kill switch rather than trusting an
+    # operator boolean. Defaulted for structural construction.
+    kill_switch_application_id: str = ""
+    kill_switch_environment_id: str = ""
+    kill_switch_profile_id: str = ""
+    # The 09 autonomy CloudFormation stack, measured for drift. Defaulted.
+    autonomy_stack_name: str = ""
 
 
 class CommandAdapter:
@@ -243,20 +251,161 @@ class CommandAdapter:
 
         Reads the deployed autonomy-switch configuration and requires it to parse
         as an enabled, non-expired document. Any ambiguity fails closed.
+
+        ``aws appconfig get-configuration`` REQUIRES a positional ``OutputFile``:
+        the CLI writes the configuration BODY to that file and prints only
+        metadata to stdout, so the document is read back from the file, not from
+        ``_run_json``. The file is created inside a private temp directory and
+        removed after the read (no secret is echoed).
         """
-        argv = self._base("appconfig", "get-configuration")
-        argv += [
-            "--application",
+        return self._read_appconfig_document(
             self._config.autonomy_application_id,
-            "--environment",
             self._config.autonomy_environment_id,
-            "--configuration",
             self._config.autonomy_switch_profile_id,
-            "--client-id",
-            "e5-shakedown-preflight",
-        ]
-        data = self._run_json(argv)
-        return bool(data.get("enabled")) and not bool(data.get("expired", True))
+            client_id="e5-shakedown-preflight",
+            require_enabled=True,
+        )
+
+    def _read_appconfig_document(
+        self,
+        application_id: str,
+        environment_id: str,
+        profile_id: str,
+        *,
+        client_id: str,
+        require_enabled: bool,
+    ) -> bool:
+        """Fetch an AppConfig document to a temp OutputFile and test its enabled/
+        non-expired flags. Returns False on any ambiguity (fail closed)."""
+        # Standard library
+        import json as _json
+        import os
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix="e5-appconfig-")
+        outfile = os.path.join(tmpdir, "configuration.json")
+        try:
+            argv = self._base("appconfig", "get-configuration")
+            argv += [
+                "--application",
+                application_id,
+                "--environment",
+                environment_id,
+                "--configuration",
+                profile_id,
+                "--client-id",
+                client_id,
+                # REQUIRED positional OutputFile: the document body is written here.
+                outfile,
+            ]
+            result = self._runner(argv)
+            if result.returncode != 0:
+                return False  # a failed read fails closed
+            try:
+                with open(outfile, "r", encoding="utf-8") as handle:
+                    document = _json.load(handle)
+            except (OSError, ValueError):
+                return False
+            if not isinstance(document, dict):
+                return False
+            fresh = not bool(document.get("expired", True))
+            if not require_enabled:
+                return fresh
+            return bool(document.get("enabled")) and fresh
+        finally:
+            try:
+                os.remove(outfile)
+            except OSError:
+                pass
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+
+    # -- additional measured preflight reads (#440 Finding 8) --------------- #
+
+    def observed_e4_kill_switch_fresh(self) -> bool:
+        """True only if the E4 (08) kill-switch document is fresh (non-expired).
+
+        The kill switch does not need to be 'enabled' to be safe — a fresh,
+        readable kill-switch document means the fail-closed lever is live. A
+        stale/absent read fails closed. Uses the required OutputFile positional.
+        """
+        if not (
+            self._config.kill_switch_application_id
+            and self._config.kill_switch_environment_id
+            and self._config.kill_switch_profile_id
+        ):
+            return False
+        return self._read_appconfig_document(
+            self._config.kill_switch_application_id,
+            self._config.kill_switch_environment_id,
+            self._config.kill_switch_profile_id,
+            client_id="e5-shakedown-preflight-killswitch",
+            require_enabled=False,
+        )
+
+    def observed_static_mode_operate(self) -> bool:
+        """True only if the deployed evaluator's static deployment mode is operate.
+
+        Reads the evaluator function configuration and inspects the server-owned
+        static mode environment variable. Anything other than an explicit
+        ``operate`` (including an unreadable configuration) fails closed.
+        """
+        argv = self._base("lambda", "get-function-configuration")
+        argv += ["--function-name", self._config.evaluator_function_name]
+        try:
+            data = self._run_json(argv)
+        except CommandError:
+            return False
+        environment = data.get("Environment") if isinstance(data, dict) else None
+        variables = environment.get("Variables") if isinstance(environment, dict) else None
+        if not isinstance(variables, dict):
+            return False
+        mode = variables.get("GBAW_OPERATIONS_STATIC_DEPLOYMENT_MODE") or variables.get(
+            "GBAW_OPERATIONS_AUTONOMY_STATIC_MODE"
+        )
+        return mode == "operate"
+
+    def observed_fleet_enrolled_active(self) -> bool:
+        """True only if the enrolled fleet is observed ACTIVE (enrollment proof).
+
+        Reads the fleet attributes and requires an ACTIVE status. A missing/other
+        status or an unreadable fleet fails closed.
+        """
+        argv = self._base("gamelift", "describe-fleet-attributes")
+        argv += ["--fleet-ids", self._config.enrolled_fleet_id]
+        try:
+            data = self._run_json(argv)
+        except CommandError:
+            return False
+        attributes = data.get("FleetAttributes") if isinstance(data, dict) else None
+        if not isinstance(attributes, list) or not attributes:
+            return False
+        first = attributes[0]
+        return isinstance(first, dict) and first.get("Status") == "ACTIVE"
+
+    def observed_no_stack_drift(self) -> bool:
+        """True only if the 09 autonomy stack is observed IN_SYNC (no drift).
+
+        Reads the last-detected stack drift status. Anything other than
+        ``IN_SYNC`` (DRIFTED / UNKNOWN / NOT_CHECKED / unreadable) fails closed so
+        an out-of-band change to the reviewed stack refuses the run.
+        """
+        if not self._config.autonomy_stack_name:
+            return False
+        argv = self._base("cloudformation", "describe-stacks")
+        argv += ["--stack-name", self._config.autonomy_stack_name]
+        try:
+            data = self._run_json(argv)
+        except CommandError:
+            return False
+        stacks = data.get("Stacks") if isinstance(data, dict) else None
+        if not isinstance(stacks, list) or not stacks:
+            return False
+        drift = stacks[0].get("DriftInformation") if isinstance(stacks[0], dict) else None
+        status = drift.get("StackDriftStatus") if isinstance(drift, dict) else None
+        return status == "IN_SYNC"
 
 
 # Ordering of the ADAPTER_COMMAND_CONTRACT keys to the HTTP-shaped paths the
@@ -359,7 +508,7 @@ class CommandTransport:
         if _PATH_CAPACITY.match(path):
             return self._capacity()
         if _PATH_DISABLE.match(path):
-            return self._disable()
+            return self._disable(method)
         if _PATH_FORCE_WRITE.match(path):
             return self._force_write(payload)
         raise ImaginaryRouteError(f"unmapped autonomy path: {path}")
@@ -493,8 +642,14 @@ class CommandTransport:
             200, {"capacity": {"desired": caps["desired"], "minimum": caps["minimum"], "maximum": caps["maximum"]}}
         )
 
-    def _disable(self) -> HttpResponse:
-        """Deploy the disabled autonomy switch and report the disabled state."""
+    def _disable(self, method: str) -> HttpResponse:
+        """POST deploys the disabled autonomy switch; GET RE-READS the live switch
+        state so the guaranteed teardown can WAIT and confirm the disable took
+        effect. A switch that reads fresh-AND-enabled is still enabled; anything
+        else (disabled, stale, absent) is treated as disabled/confirmed."""
+        if method.upper() == "GET":
+            still_enabled = self._adapter.observed_autonomy_switch_fresh_enabled()
+            return _http(200, {"autonomy_enabled": bool(still_enabled)})
         self._adapter.deploy_disabled_autonomy_switch("1")
         return _http(200, {"autonomy_enabled": False})
 

@@ -117,6 +117,13 @@ REQUIRED_START_DESIRED = 0
 REQUIRED_START_MINIMUM = 0
 REQUIRED_START_MAXIMUM = 1
 
+# Bounded teardown reconcile/disable poll. The guaranteed teardown re-reads and
+# reconciles up to this many attempts, sleeping between attempts, before it
+# gives up and records a FAILED teardown. Kept small and injectable (via the
+# harness ``sleep``) so it is bounded and test-fast.
+_TEARDOWN_MAX_ATTEMPTS = 3
+_TEARDOWN_POLL_SECONDS = 2.0
+
 # The evaluator reason codes that legitimately deny an *immediate retry*. The
 # retry check passes only when the deny reason is one of these (a limit), not a
 # transient/ambiguous error. These mirror the frozen #438 contract's
@@ -282,9 +289,22 @@ class CheckResult:
 class E5ShakedownHarness:
     """Drive the discriminating E5 autonomy-lifecycle checks against a deployed stack."""
 
-    def __init__(self, config: E5ShakedownConfig, transport: Transport) -> None:
+    def __init__(
+        self,
+        config: E5ShakedownConfig,
+        transport: Transport,
+        sleep: Optional[Any] = None,
+    ) -> None:
         self._config = config
         self._transport = transport
+        # Injectable so tests drive the bounded reconcile/disable poll without a
+        # real wall-clock wait. Production uses time.sleep.
+        if sleep is None:
+            # Standard library
+            import time
+
+            sleep = time.sleep
+        self._sleep = sleep
 
     # -- transport helpers -------------------------------------------------- #
 
@@ -565,48 +585,102 @@ class E5ShakedownHarness:
 
         return self._sanitized_summary(checks=checks, refused=False, refusal_codes=[])
 
-    def _guaranteed_restore_and_disable(self, scaled_up: bool) -> CheckResult:
-        """Best-effort, exception-safe restore of the fleet to 0 and disable.
-
-        Always attempts to read the current capacity; if it is not already 0 (or
-        the read is unavailable), it issues the separately-confirmed inverse
-        1 -> 0 and then disables autonomy. Any failure here is recorded as a
-        FAILED check rather than raised, so the summary always surfaces whether
-        the guaranteed teardown succeeded. Requires the inverse confirmation to
-        have been supplied (it is a precondition of the whole run)."""
-        restored = True
-        disabled = True
-        detail = "no scale-up occurred; nothing to restore" if not scaled_up else ""
+    def _read_desired_or_ambiguous(self) -> tuple[Optional[int], bool]:
+        """Return (desired, read_ok). A read that RAISES or is ambiguous returns
+        (None, False) WITHOUT skipping the caller's reconcile — an ambiguous read
+        is treated as 'not confirmed zero', never as 'already restored'."""
         try:
-            # Re-read capacity; restore only if not already zero.
-            current = self._desired_or_none(
+            desired = self._desired_or_none(
                 self._request(
                     "GET",
                     f"/operations/autonomy/{self._config.operation_id}/capacity",
                     bearer=self._config.admin_bearer,
                 )
             )
-            if current != 0:
-                inverse = self._evaluate("down", bearer=self._config.admin_bearer)
-                restored = self._body(inverse).get("decision") == "authorized"
-                after = self._desired_or_none(
-                    self._request(
-                        "GET",
-                        f"/operations/autonomy/{self._config.operation_id}/capacity",
-                        bearer=self._config.admin_bearer,
-                    )
-                )
-                restored = restored and after == 0
-                if not restored:
-                    detail = "guaranteed inverse 1->0 did not restore the fleet to zero"
-        except Exception as exc:  # noqa: BLE001 - teardown must never re-raise
-            restored = False
-            detail = f"guaranteed restore failed: {type(exc).__name__}"
+            return desired, True
+        except Exception:  # noqa: BLE001 - an erroring read is ambiguous, not fatal
+            return None, False
+
+    def _confirm_capacity_zero(self) -> bool:
+        """Poll the capacity, reconciling with a bounded inverse until the fleet
+        is CONFIRMED at desired=0 or the attempts are exhausted.
+
+        The inverse is attempted whenever the capacity is not confirmed zero —
+        INCLUDING when the read raised or was ambiguous. The read never being
+        clean does not skip the inverse; it only means we keep trying within the
+        bounded budget. Any exception is swallowed so teardown never re-raises."""
+        for attempt in range(_TEARDOWN_MAX_ATTEMPTS):
+            desired, _read_ok = self._read_desired_or_ambiguous()
+            if desired == 0:
+                return True
+            # Not confirmed zero (ambiguous OR > 0): attempt the bounded inverse
+            # through the trusted adapter, then loop to re-read and reconcile.
+            try:
+                self._evaluate("down", bearer=self._config.admin_bearer)
+            except Exception:  # noqa: BLE001 - teardown must never re-raise
+                pass
+            if attempt + 1 < _TEARDOWN_MAX_ATTEMPTS:
+                self._sleep(_TEARDOWN_POLL_SECONDS)
+        # Final confirming read after the last inverse.
+        desired, _ = self._read_desired_or_ambiguous()
+        return desired == 0
+
+    def _read_autonomy_disabled(self) -> Optional[bool]:
+        """Re-read the live disable state (07/09/AppConfig-backed). Returns True
+        when confirmed disabled, False when still enabled, None when ambiguous."""
+        try:
+            response = self._request("GET", "/operations/autonomy/disable", bearer=self._config.admin_bearer)
+        except Exception:  # noqa: BLE001 - an erroring read is ambiguous
+            return None
+        body = self._body(response)
+        value = body.get("autonomy_enabled")
+        if value is True:
+            return False
+        if value is False:
+            return True
+        return None
+
+    def _confirm_autonomy_disabled(self) -> bool:
+        """Issue disable, then WAIT and RE-READ the disable state until it is
+        CONFIRMED disabled or the bounded attempts are exhausted. A POST that
+        optimistically returns 200 is NOT trusted; only a re-read that reports
+        ``autonomy_enabled is False`` confirms the disable."""
         try:
             self._request("POST", "/operations/autonomy/disable", bearer=self._config.admin_bearer)
-        except Exception as exc:  # noqa: BLE001 - teardown must never re-raise
-            disabled = False
-            detail = (detail + "; " if detail else "") + f"disable failed: {type(exc).__name__}"
+        except Exception:  # noqa: BLE001 - teardown must never re-raise
+            pass
+        for attempt in range(_TEARDOWN_MAX_ATTEMPTS):
+            state = self._read_autonomy_disabled()
+            if state is True:
+                return True
+            # Still enabled or ambiguous: wait and re-read (and re-issue disable
+            # on a still-enabled read) within the bounded budget.
+            if state is False:
+                try:
+                    self._request("POST", "/operations/autonomy/disable", bearer=self._config.admin_bearer)
+                except Exception:  # noqa: BLE001
+                    pass
+            if attempt + 1 < _TEARDOWN_MAX_ATTEMPTS:
+                self._sleep(_TEARDOWN_POLL_SECONDS)
+        return self._read_autonomy_disabled() is True
+
+    def _guaranteed_restore_and_disable(self, scaled_up: bool) -> CheckResult:
+        """Exception-safe restore of the fleet to 0 and confirmed disable.
+
+        Reconciles capacity to a CONFIRMED zero via a bounded poll+inverse loop
+        (never skipping the inverse just because a read raised or was ambiguous),
+        then issues disable and WAITS/RE-READS the disable state until confirmed.
+        Any failure is recorded as a FAILED check rather than raised, so the
+        summary always surfaces whether the guaranteed teardown succeeded."""
+        restored = self._confirm_capacity_zero()
+        disabled = self._confirm_autonomy_disabled()
+        detail = ""
+        if not restored:
+            detail = "guaranteed reconcile did not confirm the fleet restored to zero"
+        if not disabled:
+            detail = (detail + "; " if detail else "") + "disable was not confirmed on re-read"
+        if restored and disabled and not scaled_up:
+            detail = "no scale-up occurred; fleet confirmed at zero and autonomy confirmed disabled"
         return CheckResult(name="guaranteed_restore", passed=restored and disabled, detail=detail)
 
     def _preflight_echo_check(self, name: str, value: bool) -> CheckResult:
@@ -720,6 +794,13 @@ def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig"
         # It is the ONLY event-carried coordinate; the requested capacity triple
         # is derived from the lifecycle direction, never from the event body.
         observation_operation_id=config.observation_id,
+        # The E4 (08) kill-switch coordinate, measured for freshness so the
+        # preflight refuses on a stale/absent kill switch.
+        kill_switch_application_id=_val("appconfig_application_id"),
+        kill_switch_environment_id=_val("appconfig_environment_id"),
+        kill_switch_profile_id=_val("appconfig_profile_id"),
+        # The 09 autonomy stack, measured for drift.
+        autonomy_stack_name=_val("autonomy_stack_name", f"{project}-operations-autonomy"),
     )
     return CommandAdapter(adapter_config, runner=subprocess_runner)
 
@@ -744,8 +825,18 @@ def _measure_preflight(adapter: CommandAdapter, supplied: E5Preflight) -> E5Pref
         starting_maximum = caps["maximum"]
     alarms_safe = adapter.observed_alarms_safe()
     autonomy_switch_fresh_enabled = adapter.observed_autonomy_switch_fresh_enabled()
-    # Drift and the static/E4 gates are AND-ed with the supplied values: a
-    # measurement can only make the preflight MORE conservative, never less.
+    # #440 Finding 8: every measurable preflight fact is READ from the provider
+    # and AND-ed with the supplied value, so a measurement can only make the
+    # preflight MORE conservative, never less. No fact below is trusted from the
+    # operator boolean alone: the static deployment mode, the E4 kill-switch
+    # freshness, the E5 autonomy-switch freshness, drift, and enrollment are all
+    # measured. Identity (profile/region/fleet) stays operator-declared and is
+    # still cross-checked by E5Preflight.refusals(); the enrollment measurement
+    # additionally requires the fleet to be observed ACTIVE.
+    static_mode_operate = adapter.observed_static_mode_operate()
+    e4_kill_switch_fresh = adapter.observed_e4_kill_switch_fresh()
+    no_stack_drift = adapter.observed_no_stack_drift()
+    fleet_enrolled_active = adapter.observed_fleet_enrolled_active()
     return E5Preflight(
         profile=supplied.profile,
         region=supplied.region,
@@ -756,11 +847,11 @@ def _measure_preflight(adapter: CommandAdapter, supplied: E5Preflight) -> E5Pref
         starting_desired=starting_desired,
         starting_minimum=starting_minimum,
         starting_maximum=starting_maximum,
-        static_gate_fresh_enabled=supplied.static_gate_fresh_enabled,
-        e4_gate_fresh_enabled=supplied.e4_gate_fresh_enabled,
+        static_gate_fresh_enabled=static_mode_operate and supplied.static_gate_fresh_enabled,
+        e4_gate_fresh_enabled=e4_kill_switch_fresh and supplied.e4_gate_fresh_enabled,
         autonomy_switch_fresh_enabled=autonomy_switch_fresh_enabled and supplied.autonomy_switch_fresh_enabled,
         alarms_safe=alarms_safe,
-        drift_safe=supplied.drift_safe,
+        drift_safe=no_stack_drift and fleet_enrolled_active and supplied.drift_safe,
     )
 
 
