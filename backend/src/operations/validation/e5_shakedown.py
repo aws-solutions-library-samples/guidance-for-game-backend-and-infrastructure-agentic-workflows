@@ -799,8 +799,13 @@ def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig"
         kill_switch_application_id=_val("appconfig_application_id"),
         kill_switch_environment_id=_val("appconfig_environment_id"),
         kill_switch_profile_id=_val("appconfig_profile_id"),
-        # The 09 autonomy stack, measured for drift.
+        # The 09 autonomy stack, measured for FRESH drift (detect-stack-drift).
         autonomy_stack_name=_val("autonomy_stack_name", f"{project}-operations-autonomy"),
+        # The 07 Standard state-machine ARN the evaluator starts; required to
+        # build the exact dispatched executionArn from the deterministic name.
+        autonomy_state_machine_arn=_val("autonomy_state_machine_arn"),
+        # The enrolled fleet's LOCATION; capacity is read scoped to it.
+        enrolled_location=_val("enrolled_location") or config.preflight.enrolled_region or config.preflight.region,
     )
     return CommandAdapter(adapter_config, runner=subprocess_runner)
 
