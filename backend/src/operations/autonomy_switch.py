@@ -22,7 +22,7 @@ Why a separate document, parsed in code
   body, an unknown field, a wrong document/capability version, or a stale
   document (outside ``issued_at``/``not_after``) as :class:`AutonomySwitchUnavailable`.
   The only permit is a fresh, valid document that explicitly enables both the
-  master flag and the exact capability's ``autonomous_write`` flag.
+  primary flag and the exact capability's ``autonomous_write`` flag.
 
 This module holds no credential and performs no provider write. It reads one
 localhost AppConfig-extension endpoint (through the same narrow
@@ -92,7 +92,7 @@ def validate_autonomy_switch_document(document: object) -> None:
 
     Raises :class:`ValueError` on any deviation: not an object, an unknown or
     missing top-level field, a wrong document version, a non-integer/negative
-    ``config_version``, a non-string/empty timestamp, a non-boolean master flag,
+    ``config_version``, a non-string/empty timestamp, a non-boolean primary flag,
     a non-object ``capabilities`` map, or any capability entry that is not a
     closed ``{"autonomous_write": bool}`` object. This is deliberately separate
     from — and never mutates or re-hashes — E4's frozen control-plane schema.
@@ -143,7 +143,7 @@ def validate_autonomy_switch_document(document: object) -> None:
 class AutonomySwitchDecision:
     """An immutable snapshot of one fresh autonomy-switch evaluation.
 
-    ``autonomy_allowed`` folds the deployment-wide ``autonomy_enabled`` master
+    ``autonomy_allowed`` folds the deployment-wide ``autonomy_enabled`` primary
     flag together with the specific capability's ``autonomous_write`` flag into a
     single boolean. A document that does not carry the gate's capability entry
     cannot enable it.
@@ -197,7 +197,7 @@ class AutonomySwitchGate:
     def require_enabled(self) -> AutonomySwitchDecision:
         """Return the decision only if autonomy is permitted, else fail closed.
 
-        Every deny path — a disabled master flag, a disabled/absent capability,
+        Every deny path — a disabled primary flag, a disabled/absent capability,
         or an unreadable/invalid/stale document — surfaces as a single
         :class:`AutonomySwitchUnavailable` so a composite gate has exactly one
         deny signal to catch.
