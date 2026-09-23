@@ -365,7 +365,7 @@ class CommandAdapter:
         mode = variables.get("GBAW_OPERATIONS_STATIC_DEPLOYMENT_MODE") or variables.get(
             "GBAW_OPERATIONS_AUTONOMY_STATIC_MODE"
         )
-        return mode == "operate"
+        return bool(mode == "operate")
 
     def observed_fleet_enrolled_active(self) -> bool:
         """True only if the enrolled fleet is observed ACTIVE (enrollment proof).
@@ -405,7 +405,7 @@ class CommandAdapter:
             return False
         drift = stacks[0].get("DriftInformation") if isinstance(stacks[0], dict) else None
         status = drift.get("StackDriftStatus") if isinstance(drift, dict) else None
-        return status == "IN_SYNC"
+        return bool(status == "IN_SYNC")
 
 
 # Ordering of the ADAPTER_COMMAND_CONTRACT keys to the HTTP-shaped paths the
