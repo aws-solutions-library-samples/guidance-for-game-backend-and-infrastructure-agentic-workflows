@@ -1,0 +1,830 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  OPTIONAL operations bounded-AUTONOMY plane (E5, issue #440). A SEPARATE stack
+  from the E1/E2 observation (06), E3 execution (07), and E4 control (08) stacks.
+  It adds a durable, identifier-only autonomy EVALUATOR Lambda that, when
+  explicitly enabled, turns a closed evaluation event into ONE durable dispatch
+  by starting the EXISTING E3 Standard state machine with an operation_id ALONE.
+  The single provider write stays with the existing E3 executor, invoked solely
+  by that authenticated state machine; this stack never creates a second
+  executor or a provider-write role. It is default-UNPROVISIONED ($0) and its
+  runtime authority is a SEPARATE AppConfig autonomy switch that is DISABLED by
+  default. A reversible emergency disable (AutonomyMode=disabled) keeps the
+  EventBridge evaluation source DISABLED and injects
+  GBAW_OPERATIONS_AUTONOMY_ENABLED=false so evaluation and the immediate
+  pre-write autonomy hook fail closed WITHOUT deleting any resource or data. It
+  reuses the 06 table + CMK and the 07 state machine via cross-stack parameters.
+
+# --------------------------------------------------------------------------- #
+# Parameters
+# --------------------------------------------------------------------------- #
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming.
+
+  Provisioned:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Initial-provisioning authority, SEPARATE from the runtime AutonomyMode
+      switch. "false" (the default) creates ZERO E5 resources, so a default new
+      stack costs $0 and holds nothing. "true" provisions the full E5 resource
+      set (evaluator Lambda/role, DLQ, log group, separate AppConfig autonomy
+      application/environment/profile + default-disabled document, EventBridge
+      evaluation rule, alarms). Once "true" it MUST stay "true" for the life of
+      the stack: an emergency disable flips AutonomyMode to "disabled" but keeps
+      Provisioned="true" so every resource stays under CloudFormation with stable
+      names and a later re-enable is reversible. Setting it back to "false"
+      REMOVES the resources and is a teardown decision, not a disable.
+
+  AutonomyMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - operate
+    Description: >-
+      Runtime authority (kill switch) for a PROVISIONED autonomy plane, SEPARATE
+      from the Provisioned flag. "disabled" (the default) is fail-closed on TWO
+      independent levers: (1) the EventBridge evaluation rule is DISABLED so no
+      evaluation is scheduled, and (2) GBAW_OPERATIONS_AUTONOMY_ENABLED=false is
+      injected into the evaluator so an already-running invocation fails closed
+      at startup before any durable state advance or dispatch. "operate" is the
+      only enabled mode. An emergency disable sets this to "disabled" while
+      leaving Provisioned="true" (resources and data retained, reversible); it
+      does NOT delete resources or data.
+
+  Environment:
+    Type: String
+    Default: beta
+    AllowedValues:
+      - beta
+      - prod
+    Description: >-
+      Target environment. "prod" lengthens the log-retention posture for audit
+      data and names the AppConfig environment. E5 keeps no data of its own; it
+      advances durable accounting state on the reused 06 table.
+
+  OperationsTableName:
+    Type: String
+    Default: ''
+    Description: >-
+      Name of the E1/E2 operations DynamoDB table (cross-stack reuse; the 06
+      stack exports it). E5 does not create a table; it persists the immutable
+      evidence bundle and reserves the rolling window state on this same table.
+      Required when Provisioned=true.
+
+  OperationsKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:\d{12}:key/.+$'
+    Description: >-
+      ARN of the E1/E2 operations customer-managed KMS key that encrypts the
+      operations table. The evaluator uses it STRICTLY on DynamoDB's behalf
+      (kms:ViaService pinned to DynamoDB). Required when Provisioned=true.
+
+  ExecutionStateMachineArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:states:[a-z0-9-]+:\d{12}:stateMachine:.+$'
+    Description: >-
+      ARN of the EXISTING E3 (07) Standard execution state machine. The evaluator
+      starts THIS exact state machine (states:StartExecution) with an
+      operation_id ALONE; it never creates its own state machine and never
+      invokes the executor directly. Required when AutonomyMode=operate.
+
+  AppConfigExtensionLayerArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Official AWS AppConfig Agent Lambda extension layer ARN (resolved to the
+      authoritative regional version by the reviewed E5 wrapper). Empty = no
+      extension attached. Required when AutonomyMode=operate.
+
+  AutonomyPolicyId:
+    Type: String
+    Default: ''
+    Description: >-
+      The server-owned autonomy policy id the evaluator binds exactly (#438
+      contract). Never taken from the event or a model. Required when
+      AutonomyMode=operate.
+
+  AutonomyPolicyVersion:
+    Type: String
+    Default: ''
+    Description: The exact autonomy policy version. Required when AutonomyMode=operate.
+
+  AutonomyPolicyHash:
+    Type: String
+    Default: ''
+    Description: >-
+      The exact autonomy policy hash the evaluator re-validates the stored policy
+      against (fail closed on mismatch). Required when AutonomyMode=operate.
+
+  AutonomyStateId:
+    Type: String
+    Default: ''
+    Description: >-
+      The durable rolling window-state id the evaluator reserves budget/frequency/
+      concurrency against. Required when AutonomyMode=operate.
+
+  AutonomySubject:
+    Type: String
+    Default: ''
+    Description: >-
+      The trusted automation subject the runtime binds server-side (never from
+      the event). Required when AutonomyMode=operate.
+
+  AutonomyClient:
+    Type: String
+    Default: ''
+    Description: >-
+      The trusted automation client the runtime binds server-side (never from the
+      event). Required when AutonomyMode=operate.
+
+  TenantId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$'
+    Description: >-
+      Server-side trusted tenant the runtime binds (GBAW_OPERATIONS_TENANT_ID).
+      Must match the 06/07 stacks. Required when AutonomyMode=operate.
+
+  WorkspaceId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$'
+    Description: >-
+      Server-side trusted workspace the runtime binds (GBAW_OPERATIONS_WORKSPACE_ID).
+      Must match the 06/07 stacks. Required when AutonomyMode=operate.
+
+  TrustedAudience:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted audience (GBAW_OPERATIONS_TRUSTED_AUDIENCE). Must match
+      the 06/07 stacks. Required when AutonomyMode=operate.
+
+  EnrolledFleetId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^fleet-[a-f0-9-]{1,120}$'
+    Description: >-
+      The EXACT enrolled demo/test GameLift fleet id the autonomy plane operates
+      within (0/1/1 clamp). Bound server-side; never from the event. Required
+      when AutonomyMode=operate. Note: the evaluator holds NO gamelift permission;
+      this is threaded only so the durable pre-verification binds the fleet.
+
+  EnrolledFleetArn:
+    Type: String
+    Default: ''
+    Description: >-
+      The EXACT enrolled fleet ARN. Bound server-side. Required when
+      AutonomyMode=operate.
+
+  EnrolledLocation:
+    Type: String
+    Default: us-west-2
+    AllowedPattern: '^[a-z]{2}-[a-z]+-\d$'
+    Description: >-
+      The EXACT enrolled fleet home Region / location. Bound server-side; never
+      from the event.
+
+  CapabilityMaximum:
+    Type: String
+    Default: operate
+    AllowedValues:
+      - operate
+    Description: >-
+      The executor capability maximum the evaluator settings require (EXACTLY
+      "operate"). Fixed here because bounded autonomy requires operate authority;
+      a lower ceiling can never admit an autonomous write and would refuse at
+      startup.
+
+  CodeS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      Explicit, pre-existing S3 bucket holding the packaged evaluator Lambda
+      artifact (supplied by the reviewed wrapper). Required when Provisioned=true.
+
+  EvaluatorCodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Content-hash-addressed S3 key of the packaged evaluator artifact. Required
+      when Provisioned=true.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 1024
+    Description: Memory for the evaluator Lambda.
+
+  EvaluatorTimeoutSeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: Evaluator Lambda timeout (bounded).
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+    Description: >-
+      Reserved concurrency cap on the evaluator (denial-of-wallet guard). A cap
+      of 1 also bounds concurrent evaluation to a single in-flight run.
+
+  AppConfigExtensionPort:
+    Type: Number
+    Default: 2772
+    MinValue: 1
+    MaxValue: 65535
+    Description: Localhost port the official AppConfig extension listens on.
+
+# --------------------------------------------------------------------------- #
+# Conditions
+# --------------------------------------------------------------------------- #
+Conditions:
+  # Resource existence gate. Every resource references THIS, driven by the
+  # Provisioned flag (default "false"), so a default deploy provisions nothing
+  # and costs $0. DECOUPLED from AutonomyMode: an emergency disable sets
+  # AutonomyMode=disabled but keeps Provisioned="true", so resources stay under
+  # CloudFormation and a later re-enable is reversible.
+  ResourcesProvisioned: !Equals [!Ref Provisioned, 'true']
+
+  # Runtime authority (kill switch). Does NOT gate resource existence; it drives
+  # the EventBridge rule state (lever 1) and the injected
+  # GBAW_OPERATIONS_AUTONOMY_ENABLED flag (lever 2). Only "operate" is enabled.
+  AutonomyOperate: !Equals [!Ref AutonomyMode, operate]
+
+  IsProd: !Equals [!Ref Environment, prod]
+
+Rules:
+  # Reject "operate without provisioning": runtime authority can only be enabled
+  # when the resources it needs actually exist.
+  OperateRequiresProvisioning:
+    RuleCondition: !Not [!Equals [!Ref AutonomyMode, disabled]]
+    Assertions:
+      - Assert: !Equals [!Ref Provisioned, 'true']
+        AssertDescription: >-
+          AutonomyMode=operate requires Provisioned=true; enabling autonomy
+          authority against a zero-resource stack is rejected.
+
+  # Whenever resources exist, the cross-stack data-plane bindings and the code
+  # artifacts they reference must be non-empty.
+  ProvisionedRequiresInputs:
+    RuleCondition: !Equals [!Ref Provisioned, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref OperationsTableName, '']]
+        AssertDescription: OperationsTableName is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref OperationsKmsKeyArn, '']]
+        AssertDescription: OperationsKmsKeyArn is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref CodeS3Bucket, '']]
+        AssertDescription: CodeS3Bucket is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref EvaluatorCodeS3Key, '']]
+        AssertDescription: EvaluatorCodeS3Key is required when Provisioned=true.
+
+  # Enabling operate requires the exact state machine, the extension layer, the
+  # policy binding, the durable state id, the trusted subject/client, and the
+  # enrolled fleet bindings.
+  OperateRequiresBindings:
+    RuleCondition: !Equals [!Ref AutonomyMode, operate]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref ExecutionStateMachineArn, '']]
+        AssertDescription: ExecutionStateMachineArn is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AppConfigExtensionLayerArn, '']]
+        AssertDescription: AppConfigExtensionLayerArn is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyPolicyId, '']]
+        AssertDescription: AutonomyPolicyId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyPolicyVersion, '']]
+        AssertDescription: AutonomyPolicyVersion is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyPolicyHash, '']]
+        AssertDescription: AutonomyPolicyHash is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyStateId, '']]
+        AssertDescription: AutonomyStateId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomySubject, '']]
+        AssertDescription: AutonomySubject is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyClient, '']]
+        AssertDescription: AutonomyClient is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref TenantId, '']]
+        AssertDescription: TenantId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
+        AssertDescription: WorkspaceId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref EnrolledFleetId, '']]
+        AssertDescription: EnrolledFleetId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref EnrolledFleetArn, '']]
+        AssertDescription: EnrolledFleetArn is required when AutonomyMode=operate.
+
+# --------------------------------------------------------------------------- #
+# Resources
+# --------------------------------------------------------------------------- #
+Resources:
+  # ------------------------------------------------------------------------- #
+  # Log group + DLQ. The evaluator log group is CMK-encrypted with the reused
+  # operations CMK. Both are RetainExceptOnCreate so audit data is preserved on
+  # teardown/replacement but a rolled-back initial create leaves no orphan.
+  # ------------------------------------------------------------------------- #
+  EvaluatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-autonomy-evaluator'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !Ref OperationsKmsKeyArn
+
+  EvaluatorDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Condition: ResourcesProvisioned
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: !Sub '${ProjectName}-operations-autonomy-evaluator-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-autonomy
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Separate AppConfig AUTONOMY switch. This is a DISTINCT application/environment/
+  # profile from the E4 (08) kill switch: enabling E4 never enables autonomy.
+  # The seeded default document is DISABLED on every axis and already expired so
+  # it fails closed until the reviewed control plane issues a fresh document. The
+  # document is validated in-code by operations.autonomy_switch, so no JSON schema
+  # validator is inlined (and E4's frozen kill-switch schema is never touched).
+  # ------------------------------------------------------------------------- #
+  AutonomyApplication:
+    Type: AWS::AppConfig::Application
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-autonomy'
+      Description: Separate AppConfig application for the bounded-autonomy switch.
+
+  AutonomyEnvironment:
+    Type: AWS::AppConfig::Environment
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref AutonomyApplication
+      Name: !Ref Environment
+      Description: !Sub 'Operations autonomy environment (${Environment}).'
+      Monitors:
+        - AlarmArn: !GetAtt AutonomyUnavailableAlarm.Arn
+          AlarmRoleArn: !GetAtt AppConfigMonitorRole.Arn
+
+  AutonomySwitchProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref AutonomyApplication
+      Name: !Sub '${ProjectName}-operations-autonomy-switch'
+      LocationUri: hosted
+      Description: >-
+        The separate bounded-autonomy switch document, DISABLED by default and
+        validated in code (operations.autonomy_switch); independent of the E4
+        kill switch.
+
+  DefaultDisabledAutonomyVersion:
+    Type: AWS::AppConfig::HostedConfigurationVersion
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref AutonomyApplication
+      ConfigurationProfileId: !Ref AutonomySwitchProfile
+      ContentType: application/json
+      Description: Safe default autonomy switch document (disabled, fail-closed).
+      # autonomy_enabled=false and autonomous_write=false on the one capability;
+      # already-expired freshness window so a live read never treats it as fresh
+      # until the reviewed control plane issues a fresh, explicitly-enabled doc.
+      Content: |
+        {
+          "autonomy_switch_version": "1.0",
+          "config_version": 1,
+          "issued_at": "1970-01-01T00:00:00Z",
+          "not_after": "1970-01-01T00:05:00Z",
+          "autonomy_enabled": false,
+          "capabilities": {
+            "gamelift.capacity-adjustment": {
+              "autonomous_write": false
+            }
+          }
+        }
+
+  AutonomyGradualDeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-autonomy-gradual'
+      Description: Gradual autonomy switch rollout with bake time and monitor rollback.
+      DeploymentDurationInMinutes: 5
+      FinalBakeTimeInMinutes: 5
+      GrowthFactor: 25
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+
+  AutonomyImmediateDeploymentStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-autonomy-immediate'
+      Description: Emergency immediate (hard-down) autonomy switch rollout, no bake time.
+      DeploymentDurationInMinutes: 0
+      FinalBakeTimeInMinutes: 0
+      GrowthFactor: 100
+      GrowthType: LINEAR
+      ReplicateTo: NONE
+
+  # AppConfig monitor role: lets AppConfig read the CloudWatch alarm state during
+  # a gradual deployment bake so a breach rolls the deployment back automatically.
+  AppConfigMonitorRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-autonomy-monitor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appconfig.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ReadAutonomyAlarm
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeAutonomyAlarm
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:DescribeAlarms'
+                Resource: '*'
+
+  # ------------------------------------------------------------------------- #
+  # Evaluator role: least privilege. It advances DURABLE accounting state and
+  # starts the EXISTING E3 Standard workflow with an identifier. It holds NO
+  # gamelift permission, NO lambda:InvokeFunction, NO iam:PassRole, and no
+  # wildcard write. Exactly: the operations table (bounded single-item actions),
+  # the CMK strictly via DynamoDB, the exact AppConfig autonomy data plane read,
+  # the exact E3 state machine StartExecution, and its own logs/metrics/X-Ray/DLQ.
+  # ------------------------------------------------------------------------- #
+  EvaluatorRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-autonomy-evaluator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OperationsTableAccess
+          # Persist the immutable evidence bundle (conditional PutItem), reserve
+          # the rolling window state (UpdateItem), and read policy/observation/
+          # window state (GetItem/Query). The TransactWriteItems API authorizes on
+          # these underlying single-item actions; the invalid
+          # dynamodb:TransactWriteItems IAM action is never present. Scan,
+          # DeleteItem, and Batch* stay denied by omission.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: TableScopedItemActions
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Query'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OperationsTableName}'
+        - PolicyName: OperationsKmsViaDynamoDb
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbCmkDataPlane
+                Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+              - Sid: DynamoDbCmkCreateGrant
+                Effect: Allow
+                Action:
+                  - 'kms:CreateGrant'
+                Resource:
+                  - !Ref OperationsKmsKeyArn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                  Bool:
+                    'kms:GrantIsForAWSResource': 'true'
+        - PolicyName: AutonomyAppConfigRead
+          # EXACTLY the two AppConfig data-plane read actions, scoped to the
+          # SEPARATE autonomy configuration resource (never the E4 kill switch).
+          # No authoring/admin action, no wildcard.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadAutonomySwitchConfigurationOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:StartConfigurationSession'
+                  - 'appconfig:GetLatestConfiguration'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AutonomyApplication}/environment/${AutonomyEnvironment}/configuration/${AutonomySwitchProfile}'
+        - PolicyName: StartExactExecutionStateMachine
+          # Start ONLY the exact existing E3 Standard state machine. This is the
+          # sole cross-component authority: the evaluator hands the workflow an
+          # operation_id and the workflow (not the evaluator) invokes the single
+          # executor. No states:* wildcard, no other state machine.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: StartExecutionOnExactStateMachine
+                Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource:
+                  - !Ref ExecutionStateMachineArn
+        - PolicyName: EvaluatorLogsMetricsAndDlq
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !GetAtt EvaluatorLogGroup.Arn
+                  - !Sub '${EvaluatorLogGroup.Arn}:*'
+              - Sid: PublishScopedMetrics
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GameAgent/Operations'
+              - Sid: XRayTraceWrite
+                Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+              - Sid: SendToOwnDeadLetterQueue
+                Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource:
+                  - !GetAtt EvaluatorDeadLetterQueue.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-autonomy
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # Evaluator Lambda: the deployable #439 runtime bootstrap. It constructs (from
+  # env only) DynamoDB/AppConfig/StepFunctions/CloudWatch clients — NEVER a
+  # GameLift client and NEVER a Lambda-invoke client. The disable levers are the
+  # DISABLED EventBridge source and the injected AUTONOMY_ENABLED=false flag.
+  # ------------------------------------------------------------------------- #
+  EvaluatorFunction:
+    Type: AWS::Lambda::Function
+    Condition: ResourcesProvisioned
+    DependsOn: EvaluatorLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-autonomy-evaluator'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.autonomy_runtime.evaluator_entry.handler
+      Role: !GetAtt EvaluatorRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref EvaluatorTimeoutSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      TracingConfig:
+        Mode: Active
+      DeadLetterConfig:
+        TargetArn: !GetAtt EvaluatorDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          # Lever 2: the autonomy enable flag. false (default) makes the evaluator
+          # fail closed at startup (resolve_autonomy_evaluator_settings refuses)
+          # BEFORE any durable state advance or dispatch — WITHOUT deleting the
+          # function. Only AutonomyMode=operate injects 'true'.
+          GBAW_OPERATIONS_AUTONOMY_ENABLED: !If [AutonomyOperate, 'true', 'false']
+          # Bounded autonomy requires the static mode to be EXACTLY 'operate' and
+          # the executor capability maximum to be EXACTLY 'operate'; the settings
+          # resolver refuses otherwise. The AUTONOMY_ENABLED flag + disabled event
+          # source are the disable levers, not this ceiling.
+          GBAW_OPERATIONS_MODE: operate
+          GBAW_OPERATIONS_CAPABILITY_MAXIMUM: !Ref CapabilityMaximum
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !Ref TrustedAudience
+          # The E3 executor deployment settings the resolver also validates.
+          GBAW_OPERATIONS_STATE_MACHINE_ARN: !Ref ExecutionStateMachineArn
+          GBAW_OPERATIONS_ENROLLED_FLEET_ID: !Ref EnrolledFleetId
+          GBAW_OPERATIONS_ENROLLED_FLEET_ARN: !Ref EnrolledFleetArn
+          GBAW_OPERATIONS_ENROLLED_LOCATION: !Ref EnrolledLocation
+          # Autonomy-specific identifiers (issue #439/#440 evaluator contract).
+          GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN: !Ref ExecutionStateMachineArn
+          GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE: !Ref AutonomySwitchProfile
+          GBAW_OPERATIONS_AUTONOMY_POLICY_ID: !Ref AutonomyPolicyId
+          GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION: !Ref AutonomyPolicyVersion
+          GBAW_OPERATIONS_AUTONOMY_POLICY_HASH: !Ref AutonomyPolicyHash
+          GBAW_OPERATIONS_AUTONOMY_STATE_ID: !Ref AutonomyStateId
+          GBAW_OPERATIONS_AUTONOMY_SUBJECT: !Ref AutonomySubject
+          GBAW_OPERATIONS_AUTONOMY_CLIENT: !Ref AutonomyClient
+          # Shared AppConfig read target. The autonomy switch is its OWN profile;
+          # the kill-switch profile is threaded so the E4 durable/cached execute
+          # gate the evaluator composes can read the SAME kill switch the executor
+          # reads. Both are scoped reads only.
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref AutonomyApplication
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref AutonomyEnvironment
+          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref AutonomySwitchProfile
+          GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT: !Ref AppConfigExtensionPort
+      Layers:
+        - !If [AutonomyOperate, !Ref AppConfigExtensionLayerArn, !Ref 'AWS::NoValue']
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref EvaluatorCodeS3Key
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-autonomy
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ------------------------------------------------------------------------- #
+  # EventBridge evaluation rule. DISABLED unless AutonomyMode=operate (lever 1),
+  # so a default (or emergency-disabled) deploy schedules NO evaluation. When
+  # enabled it periodically invokes the evaluator with a closed, source-owned
+  # event; identity/policy/limits are NEVER read from the event.
+  # ------------------------------------------------------------------------- #
+  EvaluationRule:
+    Type: AWS::Events::Rule
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-autonomy-evaluation'
+      Description: >-
+        Periodic bounded-autonomy evaluation trigger. DISABLED unless
+        AutonomyMode=operate so a default/disabled deploy runs no evaluation.
+      ScheduleExpression: 'rate(5 minutes)'
+      State: !If [AutonomyOperate, ENABLED, DISABLED]
+      Targets:
+        - Id: autonomy-evaluator
+          Arn: !GetAtt EvaluatorFunction.Arn
+          # The rule carries no identity/policy/limits — the evaluator owns those
+          # server-side. A concrete evaluation event is produced by the reviewed
+          # observation pipeline; this scheduled probe is a closed liveness tick.
+          Input: '{"source":"autonomy-evaluation"}'
+          DeadLetterConfig:
+            Arn: !GetAtt EvaluatorDeadLetterQueue.Arn
+
+  EvaluationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ResourcesProvisioned
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref EvaluatorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EvaluationRule.Arn
+
+  # ------------------------------------------------------------------------- #
+  # Alarms in the retained GameAgent/Operations namespace. Each is driven by a
+  # backend-emitted autonomy signal; a default (disabled) plane emits none, so
+  # TreatMissingData=notBreaching keeps them quiet until autonomy runs.
+  # ------------------------------------------------------------------------- #
+  # The real fail-closed signal: the separate autonomy switch could not be read
+  # as a fresh, valid document. Wired to the AppConfig environment monitor so a
+  # gradual autonomy-switch deployment that breaches it rolls back automatically.
+  AutonomyUnavailableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-AutonomySwitchUnavailable'
+      AlarmDescription: >-
+        Autonomy failed closed because the separate autonomy switch could not be
+        read as a fresh, valid document (extension unavailable/malformed/stale).
+      Namespace: 'GameAgent/Operations'
+      MetricName: AutonomySwitchUnavailable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # A dispatch that could not be confirmed (ambiguous StartExecution) — the
+  # caller failed closed without recording a confirmed dispatch.
+  AutonomyDispatchFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-AutonomyDispatchFailures'
+      AlarmDescription: An autonomy dispatch failed ambiguously and failed closed.
+      Namespace: 'GameAgent/Operations'
+      MetricName: AutonomyDispatchFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # The evaluator Lambda wrote to its dead-letter queue — an unprocessed
+  # evaluation event needs human attention.
+  AutonomyDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-AutonomyDeadLetter'
+      AlarmDescription: The autonomy evaluator sent a message to its dead-letter queue.
+      Namespace: 'AWS/SQS'
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EvaluatorDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# --------------------------------------------------------------------------- #
+# Outputs
+# --------------------------------------------------------------------------- #
+Outputs:
+  Provisioned:
+    Description: Whether this stack provisioned the E5 resource set (false = $0).
+    Value: !Ref Provisioned
+
+  AutonomyMode:
+    Description: Effective runtime authority (disabled fails closed; operate enabled).
+    Value: !Ref AutonomyMode
+
+  AutonomyApplicationId:
+    Condition: ResourcesProvisioned
+    Description: Separate AppConfig application id for the autonomy switch.
+    Value: !Ref AutonomyApplication
+    Export:
+      Name: !Sub '${ProjectName}-OperationsAutonomyApplicationId'
+
+  AutonomyEnvironmentId:
+    Condition: ResourcesProvisioned
+    Description: AppConfig environment id for the autonomy switch.
+    Value: !Ref AutonomyEnvironment
+    Export:
+      Name: !Sub '${ProjectName}-OperationsAutonomyEnvironmentId'
+
+  AutonomySwitchProfileId:
+    Condition: ResourcesProvisioned
+    Description: Separate AppConfig configuration profile id for the autonomy switch.
+    Value: !Ref AutonomySwitchProfile
+    Export:
+      Name: !Sub '${ProjectName}-OperationsAutonomySwitchProfileId'
+
+  EvaluatorFunctionArn:
+    Condition: ResourcesProvisioned
+    Description: ARN of the autonomy evaluator Lambda.
+    Value: !GetAtt EvaluatorFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsAutonomyEvaluatorFunctionArn'
+
+  EvaluatorRoleArn:
+    Condition: ResourcesProvisioned
+    Description: Dedicated least-privilege evaluator role ARN (no provider write).
+    Value: !GetAtt EvaluatorRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsAutonomyEvaluatorRoleArn'

@@ -222,9 +222,12 @@ def test_provisioned_defaults_false(template):
 
 def test_every_resource_is_gated_on_resources_provisioned(template):
     for name, body in template["Resources"].items():
-        # The E4 (issue #416) ADDITIVE AppConfig kill-switch read policy is gated
-        # on HasKillSwitch (opt-in); every other resource is ResourcesProvisioned.
-        if body.get("Condition") == "HasKillSwitch":
+        # ADDITIVE, opt-in read policies are gated on their own default-off
+        # conditions: the E4 (issue #416) AppConfig kill-switch read on
+        # HasKillSwitch, and the E5 (issue #440) autonomy AppConfig read on
+        # AutonomyOperate. Both default off, so a default deploy still provisions
+        # nothing. Every other resource is gated on ResourcesProvisioned.
+        if body.get("Condition") in ("HasKillSwitch", "AutonomyOperate"):
             continue
         assert (
             body.get("Condition") == "ResourcesProvisioned"

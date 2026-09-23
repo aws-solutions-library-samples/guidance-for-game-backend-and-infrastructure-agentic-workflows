@@ -111,7 +111,20 @@ def test_mode_is_fed_the_execution_mode_kill_switch(exec_template, needle):
 @pytest.mark.parametrize("needle", ["executor", "dispatch"])
 def test_capability_maximum_is_remediate(exec_template, needle):
     env = _env(exec_template, needle)
-    assert str(env["GBAW_OPERATIONS_CAPABILITY_MAXIMUM"]) == "remediate"
+    value = env["GBAW_OPERATIONS_CAPABILITY_MAXIMUM"]
+    # v1 default is 'remediate'. The E5 (issue #440) ADDITIVE autonomy wiring
+    # overlays the EXECUTOR's capability maximum with
+    # !If[AutonomyOperate, operate, remediate] (flattened by the loader to a
+    # list), so the v1/disabled branch stays 'remediate' and only an explicit
+    # AutonomyMode=operate raises it. The dispatcher is unchanged (literal).
+    if isinstance(value, list):
+        assert needle == "executor", "only the executor carries the additive autonomy overlay"
+        assert value[-2:] == [
+            "operate",
+            "remediate",
+        ], f"executor capability maximum must be !If[AutonomyOperate, operate, remediate], got {value}"
+    else:
+        assert str(value) == "remediate"
 
 
 @pytest.mark.parametrize("needle", ["executor", "dispatch"])

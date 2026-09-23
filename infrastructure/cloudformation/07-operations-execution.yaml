@@ -173,6 +173,86 @@ Parameters:
     Default: ''
     Description: E4 AppConfig configuration profile id for the kill-switch (empty = unwired).
 
+  # E5 (issue #440) ADDITIVE bounded-autonomy wiring. All default empty/disabled
+  # so a deploy that does not supply them behaves EXACTLY as the accepted v1 E3
+  # stack: no autonomy env, no extra IAM, no second executor, no provider-write
+  # role. When AutonomyMode=operate (with the identifiers supplied by the reviewed
+  # E5 09 stack outputs), the EXISTING executor's pre-write autonomy hook is
+  # engaged: its static mode + capability maximum become 'operate', it reads the
+  # SEPARATE autonomy AppConfig switch, and it re-verifies the durable reservation
+  # immediately before the single provider write. This NEVER creates a second
+  # executor or a second provider-write role.
+  AutonomyMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - operate
+    Description: >-
+      ADDITIVE autonomy authority for the EXISTING executor, SEPARATE from
+      ExecutionMode. "disabled" (the default) leaves the executor exactly as the
+      v1 E3 stack: GBAW_OPERATIONS_AUTONOMY_ENABLED=false, no autonomy AppConfig
+      read, static mode = ExecutionMode, capability maximum = remediate. "operate"
+      engages the pre-approved autonomy pre-write hook. Requires ExecutionMode=
+      remediate (so the dispatch API + kill switch are wired) and the autonomy
+      identifiers below.
+
+  AutonomyStateMachineArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the E5 (09) Standard autonomy workflow the evaluator starts. Threaded
+      to the executor as GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN so its settings
+      resolve. Empty = autonomy unwired. Required when AutonomyMode=operate.
+
+  AutonomySwitchProfileId:
+    Type: String
+    Default: ''
+    Description: >-
+      SEPARATE AppConfig configuration profile id for the bounded-autonomy switch
+      (distinct from the E4 KillSwitchProfileId). Empty = autonomy unwired.
+      Required when AutonomyMode=operate.
+
+  AutonomyApplicationId:
+    Type: String
+    Default: ''
+    Description: AppConfig application id for the autonomy switch (empty = unwired).
+
+  AutonomyEnvironmentId:
+    Type: String
+    Default: ''
+    Description: AppConfig environment id for the autonomy switch (empty = unwired).
+
+  AutonomyPolicyId:
+    Type: String
+    Default: ''
+    Description: The server-owned autonomy policy id the executor binds exactly (empty = unwired).
+
+  AutonomyPolicyVersion:
+    Type: String
+    Default: ''
+    Description: The exact autonomy policy version (empty = unwired).
+
+  AutonomyPolicyHash:
+    Type: String
+    Default: ''
+    Description: The exact autonomy policy hash re-validated on load (empty = unwired).
+
+  AutonomyStateId:
+    Type: String
+    Default: ''
+    Description: The durable rolling window-state id (empty = unwired).
+
+  AutonomySubject:
+    Type: String
+    Default: ''
+    Description: The trusted automation subject, bound server-side (empty = unwired).
+
+  AutonomyClient:
+    Type: String
+    Default: ''
+    Description: The trusted automation client, bound server-side (empty = unwired).
+
   CodeS3Bucket:
     Type: String
     Default: ''
@@ -260,6 +340,12 @@ Conditions:
   HasAppConfigLayer: !Not [!Equals [!Ref AppConfigExtensionLayerArn, '']]
   HasKillSwitch: !Not [!Equals [!Ref KillSwitchProfileId, '']]
 
+  # E5 additive gate. When AutonomyMode=operate the EXISTING executor's autonomy
+  # pre-write hook is engaged (autonomy env injected + autonomy AppConfig read
+  # granted). Default 'disabled' keeps the stack behaviourally identical to the
+  # accepted v1 E3 stack.
+  AutonomyOperate: !Equals [!Ref AutonomyMode, operate]
+
 Rules:
   # Reject "remediate without provisioning": runtime authority can only be
   # enabled when the resources it needs actually exist.
@@ -301,6 +387,40 @@ Rules:
         AssertDescription: TenantId is required when ExecutionMode=remediate.
       - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
         AssertDescription: WorkspaceId is required when ExecutionMode=remediate.
+
+  # E5 additive: enabling autonomy requires the human-approved remediate lane to
+  # be enabled AND the autonomy identifiers to be supplied. The autonomy switch
+  # profile must be SEPARATE from the E4 kill-switch profile so enabling E4 never
+  # enables autonomy.
+  AutonomyOperateRequiresBindings:
+    RuleCondition: !Equals [!Ref AutonomyMode, operate]
+    Assertions:
+      - Assert: !Equals [!Ref ExecutionMode, remediate]
+        AssertDescription: AutonomyMode=operate requires ExecutionMode=remediate.
+      - Assert: !Not [!Equals [!Ref AutonomyStateMachineArn, '']]
+        AssertDescription: AutonomyStateMachineArn is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomySwitchProfileId, '']]
+        AssertDescription: AutonomySwitchProfileId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyApplicationId, '']]
+        AssertDescription: AutonomyApplicationId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyEnvironmentId, '']]
+        AssertDescription: AutonomyEnvironmentId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyPolicyId, '']]
+        AssertDescription: AutonomyPolicyId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyPolicyVersion, '']]
+        AssertDescription: AutonomyPolicyVersion is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyPolicyHash, '']]
+        AssertDescription: AutonomyPolicyHash is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyStateId, '']]
+        AssertDescription: AutonomyStateId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomySubject, '']]
+        AssertDescription: AutonomySubject is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomyClient, '']]
+        AssertDescription: AutonomyClient is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref AutonomySwitchProfileId, !Ref KillSwitchProfileId]]
+        AssertDescription: >-
+          The autonomy switch profile must be SEPARATE from the E4 kill-switch
+          profile so enabling E4 never enables autonomy.
 
 # --------------------------------------------------------------------------- #
 # Resources
@@ -560,7 +680,11 @@ Resources:
           # fed the ExecutionMode kill switch (disabled|remediate), so an
           # emergency disable makes both handlers fail closed WITHOUT deleting
           # the function (lever 2 of the reversible disable).
-          GBAW_OPERATIONS_MODE: !Ref ExecutionMode
+          # E5 additive: static mode falls back to the v1 ExecutionMode kill switch
+          # unless AutonomyMode=operate, in which case the EXISTING executor's
+          # autonomy pre-write hook requires 'operate'. v1 behaviour is preserved
+          # when autonomy is disabled.
+          GBAW_OPERATIONS_MODE: !If [AutonomyOperate, operate, !Ref ExecutionMode]
           GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTableName
           GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
           GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
@@ -573,7 +697,9 @@ Resources:
           # dependency edge on the state machine, which invokes the executor
           # (that would be a circular dependency). The executor never starts it.
           GBAW_OPERATIONS_STATE_MACHINE_ARN: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-operations-execution'
-          GBAW_OPERATIONS_CAPABILITY_MAXIMUM: remediate
+          # E5 additive: the executor's autonomy hook requires the capability
+          # maximum to be EXACTLY 'operate'; v1 keeps 'remediate'.
+          GBAW_OPERATIONS_CAPABILITY_MAXIMUM: !If [AutonomyOperate, operate, remediate]
           GBAW_OPERATIONS_ENROLLED_FLEET_ID: !Ref EnrolledFleetId
           GBAW_OPERATIONS_ENROLLED_FLEET_ARN: !Sub 'arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:fleet/${EnrolledFleetId}'
           GBAW_OPERATIONS_ENROLLED_LOCATION: !Ref EnrolledLocation
@@ -584,10 +710,25 @@ Resources:
           GBAW_OPERATIONS_CAPACITY_FLOOR: '0'
           GBAW_OPERATIONS_CAPACITY_CEILING: '1'
           GBAW_OPERATIONS_CAPACITY_MAX_STEP: '1'
-          # E4 additive kill-switch identifiers (empty when unwired).
-          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref KillSwitchApplicationId
-          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref KillSwitchEnvironmentId
+          # AppConfig read target. When autonomy is enabled the SEPARATE autonomy
+          # application/environment is used so the executor's autonomy switch gate
+          # and its E4 kill-switch gate read from one extension; both are scoped
+          # reads only. v1 keeps the E4 kill-switch identifiers.
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !If [AutonomyOperate, !Ref AutonomyApplicationId, !Ref KillSwitchApplicationId]
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !If [AutonomyOperate, !Ref AutonomyEnvironmentId, !Ref KillSwitchEnvironmentId]
           GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchProfileId
+          # E5 additive autonomy identifiers. Injected only when AutonomyMode=
+          # operate; absent (AWS::NoValue) otherwise so the executor's
+          # resolve_autonomy_evaluator_settings fails closed and the v1 path runs.
+          GBAW_OPERATIONS_AUTONOMY_ENABLED: !If [AutonomyOperate, 'true', 'false']
+          GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN: !If [AutonomyOperate, !Ref AutonomyStateMachineArn, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE: !If [AutonomyOperate, !Ref AutonomySwitchProfileId, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_POLICY_ID: !If [AutonomyOperate, !Ref AutonomyPolicyId, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION: !If [AutonomyOperate, !Ref AutonomyPolicyVersion, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_POLICY_HASH: !If [AutonomyOperate, !Ref AutonomyPolicyHash, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_STATE_ID: !If [AutonomyOperate, !Ref AutonomyStateId, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_SUBJECT: !If [AutonomyOperate, !Ref AutonomySubject, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_CLIENT: !If [AutonomyOperate, !Ref AutonomyClient, !Ref 'AWS::NoValue']
       # E4 additive: attach the official AppConfig extension layer only when its
       # ARN is supplied; otherwise no layer (AWS::NoValue).
       Layers:
@@ -1009,6 +1150,29 @@ Resources:
               - 'appconfig:GetLatestConfiguration'
             Resource:
               - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${KillSwitchApplicationId}/environment/${KillSwitchEnvironmentId}/configuration/${KillSwitchProfileId}'
+
+  # E5 (issue #440) ADDITIVE autonomy AppConfig READ policy. Created ONLY when
+  # AutonomyMode=operate. Grants EXACTLY the same two data-plane read actions,
+  # scoped to the SEPARATE autonomy configuration resource, to the EXISTING
+  # executor role ONLY (the dispatcher has no autonomy role). No authoring/admin
+  # action, no wildcard, no second role.
+  ExecutionAutonomySwitchReadPolicy:
+    Type: AWS::IAM::Policy
+    Condition: AutonomyOperate
+    Properties:
+      PolicyName: AppConfigAutonomySwitchRead
+      Roles:
+        - !Ref ExecutorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ReadAutonomySwitchConfigurationOnly
+            Effect: Allow
+            Action:
+              - 'appconfig:StartConfigurationSession'
+              - 'appconfig:GetLatestConfiguration'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AutonomyApplicationId}/environment/${AutonomyEnvironmentId}/configuration/${AutonomySwitchProfileId}'
 
   # ------------------------------------------------------------------------- #
   # Metrics / alarms in the retained GameAgent/Operations namespace.
