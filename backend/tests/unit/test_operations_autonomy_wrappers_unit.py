@@ -55,6 +55,8 @@ _CLEARED_ENV = (
     "GBAW_OPERATIONS_TENANT_ID",
     "GBAW_OPERATIONS_WORKSPACE_ID",
     "GBAW_OPERATIONS_ENROLLED_FLEET_ID",
+    "GBAW_OPERATIONS_ENROLLED_FLEET_ARN",
+    "GBAW_OPERATIONS_TRUSTED_AUDIENCE",
     "GBAW_OPERATIONS_EXECUTION_STATE_MACHINE_ARN",
     "GBAW_OPERATIONS_AUTONOMY_SUBJECT",
     "GBAW_OPERATIONS_AUTONOMY_CLIENT",
@@ -183,6 +185,10 @@ def _enable_env(bucket="artifact-bucket-unit", backend_src=None, **overrides):
         "GBAW_OPERATIONS_TENANT_ID": "tenant-demo",
         "GBAW_OPERATIONS_WORKSPACE_ID": "workspace-demo",
         "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
+        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": (
+            f"arn:aws:gamelift:{DEPLOY_REGION}:{SYNTHETIC_ACCOUNT}:fleet/fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555"
+        ),
+        "GBAW_OPERATIONS_TRUSTED_AUDIENCE": "client.gamelift-capacity-autonomy",
         "GBAW_OPERATIONS_EXECUTION_STATE_MACHINE_ARN": (
             f"arn:aws:states:{DEPLOY_REGION}:{SYNTHETIC_ACCOUNT}:stateMachine:game-agent-operations-execution"
         ),

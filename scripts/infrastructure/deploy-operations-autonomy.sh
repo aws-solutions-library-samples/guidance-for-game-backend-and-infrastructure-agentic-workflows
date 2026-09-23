@@ -93,6 +93,11 @@ OPERATIONS_KMS_KEY_ARN="${GBAW_OPERATIONS_KMS_KEY_ARN:-}"
 EXECUTION_STATE_MACHINE_ARN="${GBAW_OPERATIONS_EXECUTION_STATE_MACHINE_ARN:-}"
 ENROLLED_FLEET_ID="${GBAW_OPERATIONS_ENROLLED_FLEET_ID:-}"
 ENROLLED_LOCATION="${GBAW_OPERATIONS_ENROLLED_LOCATION:-$AWS_REGION}"
+# The EXACT enrolled fleet ARN and trusted audience the template requires when
+# AutonomyMode=operate. The ARN is derived from the verified account/region and
+# the fleet id unless supplied explicitly; both are bound server-side.
+ENROLLED_FLEET_ARN="${GBAW_OPERATIONS_ENROLLED_FLEET_ARN:-}"
+OPERATIONS_TRUSTED_AUDIENCE="${GBAW_OPERATIONS_TRUSTED_AUDIENCE:-}"
 OPERATIONS_TENANT_ID="${GBAW_OPERATIONS_TENANT_ID:-}"
 OPERATIONS_WORKSPACE_ID="${GBAW_OPERATIONS_WORKSPACE_ID:-}"
 AUTONOMY_SUBJECT="${GBAW_OPERATIONS_AUTONOMY_SUBJECT:-}"
@@ -104,12 +109,13 @@ AUTONOMY_STATE_ID="${GBAW_OPERATIONS_AUTONOMY_STATE_ID:-}"
 # The server-owned policy + initial window-state documents to seed. JSON files.
 AUTONOMY_POLICY_FILE="${GBAW_OPERATIONS_AUTONOMY_POLICY_FILE:-}"
 AUTONOMY_WINDOW_STATE_FILE="${GBAW_OPERATIONS_AUTONOMY_WINDOW_STATE_FILE:-}"
-# Shared AppConfig identifiers (from the 08 control-plane stack) + the SEPARATE
-# autonomy switch profile.
-APPCONFIG_APPLICATION_ID="${GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID:-}"
-APPCONFIG_ENVIRONMENT_ID="${GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID:-}"
+# The EXISTING E4 (08) kill-switch AppConfig coordinate. The evaluator reads
+# the E4 kill switch from THIS application/environment/profile. The SEPARATE
+# E5 autonomy application/environment/profile is created by the 09 template
+# itself, so it is NOT passed here.
+KILL_SWITCH_APPLICATION_ID="${GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID:-}"
+KILL_SWITCH_ENVIRONMENT_ID="${GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID:-}"
 KILL_SWITCH_PROFILE_ID="${GBAW_OPERATIONS_APPCONFIG_PROFILE_ID:-}"
-AUTONOMY_SWITCH_PROFILE_ID="${GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID:-}"
 # The EXPLICIT, pre-existing artifact bucket for the evaluator zip.
 GBAW_OPERATIONS_ARTIFACT_BUCKET="${GBAW_OPERATIONS_ARTIFACT_BUCKET:-}"
 
@@ -149,9 +155,14 @@ Enabling inputs:
   GBAW_OPERATIONS_AUTONOMY_POLICY_FILE       Policy JSON to seed (conditional).
   GBAW_OPERATIONS_AUTONOMY_WINDOW_STATE_FILE Initial window-state JSON to seed.
   GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID / _ENVIRONMENT_ID
-                                             Shared AppConfig ids (req).
+                                             The EXISTING E4 (08) kill-switch
+                                             AppConfig application/environment
+                                             ids (req). The SEPARATE autonomy
+                                             switch is created by the template.
   GBAW_OPERATIONS_APPCONFIG_PROFILE_ID       E4 kill-switch profile id (req).
-  GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID SEPARATE autonomy switch profile (req).
+  GBAW_OPERATIONS_TRUSTED_AUDIENCE           Server-side trusted audience (req).
+  GBAW_OPERATIONS_ENROLLED_FLEET_ARN         Enrolled fleet ARN (derived if
+                                             unset from account/region/id).
   GBAW_OPERATIONS_ARTIFACT_BUCKET            REQUIRED explicit, pre-existing
                                              artifact bucket (verified).
   AWS_PROFILE, AWS_REGION                    Credentials/region, verified first.
@@ -273,6 +284,18 @@ case "$ENROLLED_FLEET_ID" in
     fleet-*) : ;;
     *) echo "❌ Refusing to enable: GBAW_OPERATIONS_ENROLLED_FLEET_ID must be a fleet id (fleet-...)." >&2; exit 3 ;;
 esac
+if [ -z "$ENROLLED_FLEET_ARN" ]; then
+    echo "❌ Refusing to enable: GBAW_OPERATIONS_ENROLLED_FLEET_ARN (the exact enrolled fleet ARN) is required." >&2
+    exit 3
+fi
+# The ARN is a server-owned binding; validate its shape by the fleet resource
+# suffix without embedding a provider service literal (the wrapper grants no
+# provider permission).
+case "$ENROLLED_FLEET_ARN" in
+    arn:aws*:*:*:*:fleet/"$ENROLLED_FLEET_ID") : ;;
+    arn:aws*:*:*:*:fleet/fleet-*) : ;;
+    *) echo "❌ Refusing to enable: GBAW_OPERATIONS_ENROLLED_FLEET_ARN must be a fleet ARN ending in fleet/<fleet-id>." >&2; exit 3 ;;
+esac
 if [ -z "$OPERATIONS_TENANT_ID" ] || [ -z "$OPERATIONS_WORKSPACE_ID" ]; then
     echo "❌ Refusing to enable: GBAW_OPERATIONS_TENANT_ID and GBAW_OPERATIONS_WORKSPACE_ID are required." >&2
     exit 3
@@ -289,16 +312,16 @@ if [ -z "$AUTONOMY_STATE_ID" ]; then
     echo "❌ Refusing to enable: GBAW_OPERATIONS_AUTONOMY_STATE_ID is required." >&2
     exit 3
 fi
-if [ -z "$APPCONFIG_APPLICATION_ID" ] || [ -z "$APPCONFIG_ENVIRONMENT_ID" ]; then
-    echo "❌ Refusing to enable: GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID and _ENVIRONMENT_ID are required." >&2
+if [ -z "$KILL_SWITCH_APPLICATION_ID" ] || [ -z "$KILL_SWITCH_ENVIRONMENT_ID" ]; then
+    echo "❌ Refusing to enable: GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID and _ENVIRONMENT_ID (the E4 kill-switch coordinate) are required." >&2
     exit 3
 fi
-if [ -z "$KILL_SWITCH_PROFILE_ID" ] || [ -z "$AUTONOMY_SWITCH_PROFILE_ID" ]; then
-    echo "❌ Refusing to enable: both the E4 kill-switch profile and the SEPARATE autonomy switch profile are required." >&2
+if [ -z "$KILL_SWITCH_PROFILE_ID" ]; then
+    echo "❌ Refusing to enable: GBAW_OPERATIONS_APPCONFIG_PROFILE_ID (the E4 kill-switch profile) is required." >&2
     exit 3
 fi
-if [ "$KILL_SWITCH_PROFILE_ID" = "$AUTONOMY_SWITCH_PROFILE_ID" ]; then
-    echo "❌ Refusing to enable: the autonomy switch profile MUST be a SEPARATE document from the kill-switch profile." >&2
+if [ -z "$OPERATIONS_TRUSTED_AUDIENCE" ]; then
+    echo "❌ Refusing to enable: GBAW_OPERATIONS_TRUSTED_AUDIENCE is required (must match the 06/07 stacks)." >&2
     exit 3
 fi
 if [ -z "$GBAW_OPERATIONS_ARTIFACT_BUCKET" ]; then
@@ -622,16 +645,17 @@ aws cloudformation deploy \
         "EnrolledLocation=$ENROLLED_LOCATION" \
         "TenantId=$OPERATIONS_TENANT_ID" \
         "WorkspaceId=$OPERATIONS_WORKSPACE_ID" \
+        "TrustedAudience=$OPERATIONS_TRUSTED_AUDIENCE" \
+        "EnrolledFleetArn=$ENROLLED_FLEET_ARN" \
         "AutonomySubject=$AUTONOMY_SUBJECT" \
         "AutonomyClient=$AUTONOMY_CLIENT" \
         "AutonomyPolicyId=$AUTONOMY_POLICY_ID" \
         "AutonomyPolicyVersion=$AUTONOMY_POLICY_VERSION" \
         "AutonomyPolicyHash=$AUTONOMY_POLICY_HASH" \
         "AutonomyStateId=$AUTONOMY_STATE_ID" \
-        "AppConfigApplicationId=$APPCONFIG_APPLICATION_ID" \
-        "AppConfigEnvironmentId=$APPCONFIG_ENVIRONMENT_ID" \
+        "KillSwitchApplicationId=$KILL_SWITCH_APPLICATION_ID" \
+        "KillSwitchEnvironmentId=$KILL_SWITCH_ENVIRONMENT_ID" \
         "KillSwitchProfileId=$KILL_SWITCH_PROFILE_ID" \
-        "AutonomySwitchProfileId=$AUTONOMY_SWITCH_PROFILE_ID" \
         "AppConfigExtensionLayerArn=$APPCONFIG_EXTENSION_LAYER_ARN" \
         "CodeS3Bucket=$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
         "EvaluatorCodeS3Key=$EVALUATOR_S3_KEY"

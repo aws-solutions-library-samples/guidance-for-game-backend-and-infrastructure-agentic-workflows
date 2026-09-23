@@ -63,6 +63,11 @@ _AUTONOMY_SWITCH_PROFILE_KEY = "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE"
 _APPCONFIG_APPLICATION_KEY = "GBAW_OPERATIONS_APPCONFIG_APPLICATION"
 _APPCONFIG_ENVIRONMENT_KEY = "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT"
 _APPCONFIG_PROFILE_KEY = "GBAW_OPERATIONS_APPCONFIG_PROFILE"
+# The SEPARATE E5 autonomy AppConfig application/environment (09 stack). These
+# are DISTINCT from the E4 kill-switch application/environment above so enabling
+# E4 never enables autonomy and the evaluator can address BOTH switches.
+_AUTONOMY_APPCONFIG_APPLICATION_KEY = "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_APPLICATION"
+_AUTONOMY_APPCONFIG_ENVIRONMENT_KEY = "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT"
 _APPCONFIG_EXTENSION_PORT_KEY = "GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT"
 _AUTONOMY_POLICY_ID_KEY = "GBAW_OPERATIONS_AUTONOMY_POLICY_ID"
 _AUTONOMY_POLICY_VERSION_KEY = "GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION"
@@ -118,6 +123,11 @@ class AutonomyEvaluatorDeploymentSettings:
     automation_client: str
     appconfig_application: str
     appconfig_environment: str
+    # SEPARATE E5 autonomy AppConfig application/environment (09 stack). The
+    # autonomy switch is read from THIS pair; the E4 kill switch is read from
+    # ``appconfig_application``/``appconfig_environment`` above.
+    autonomy_appconfig_application: str
+    autonomy_appconfig_environment: str
     appconfig_extension_port: int
 
     def __post_init__(self) -> None:
@@ -140,6 +150,8 @@ class AutonomyEvaluatorDeploymentSettings:
             "automation_client",
             "appconfig_application",
             "appconfig_environment",
+            "autonomy_appconfig_application",
+            "autonomy_appconfig_environment",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
@@ -150,6 +162,15 @@ class AutonomyEvaluatorDeploymentSettings:
         # kill switch; sharing one document would let enabling E4 enable autonomy.
         if self.autonomy_switch_profile == self.kill_switch_profile:
             raise ValueError("the autonomy switch profile must be separate from the kill-switch profile")
+        # The autonomy switch and the E4 kill switch must not resolve to the
+        # SAME AppConfig configuration coordinate (application+environment+
+        # profile); otherwise enabling one could read the other's document.
+        if (
+            self.autonomy_appconfig_application == self.appconfig_application
+            and self.autonomy_appconfig_environment == self.appconfig_environment
+            and self.autonomy_switch_profile == self.kill_switch_profile
+        ):
+            raise ValueError("the autonomy switch must not share the E4 kill-switch configuration coordinate")
         if not (1 <= self.appconfig_extension_port <= 65535):
             raise ValueError("appconfig_extension_port must be a valid TCP port")
 
@@ -215,6 +236,8 @@ def resolve_autonomy_evaluator_settings(
         automation_client=_required(source, _AUTONOMY_CLIENT_KEY),
         appconfig_application=_required(source, _APPCONFIG_APPLICATION_KEY),
         appconfig_environment=_required(source, _APPCONFIG_ENVIRONMENT_KEY),
+        autonomy_appconfig_application=_required(source, _AUTONOMY_APPCONFIG_APPLICATION_KEY),
+        autonomy_appconfig_environment=_required(source, _AUTONOMY_APPCONFIG_ENVIRONMENT_KEY),
         appconfig_extension_port=extension_port,
     )
 
@@ -793,8 +816,8 @@ def build_evaluator_handler(
 
     # The fresh, SEPARATE AppConfig autonomy switch over the localhost extension.
     autonomy_extension = AppConfigExtensionClient(
-        application=settings.appconfig_application,
-        environment=settings.appconfig_environment,
+        application=settings.autonomy_appconfig_application,
+        environment=settings.autonomy_appconfig_environment,
         profile=settings.autonomy_switch_profile,
         port=settings.appconfig_extension_port,
     )

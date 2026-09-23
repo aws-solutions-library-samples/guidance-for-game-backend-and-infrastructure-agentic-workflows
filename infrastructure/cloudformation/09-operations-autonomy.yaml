@@ -161,6 +161,31 @@ Parameters:
       Server-side trusted audience (GBAW_OPERATIONS_TRUSTED_AUDIENCE). Must match
       the 06/07 stacks. Required when AutonomyMode=operate.
 
+  KillSwitchApplicationId:
+    Type: String
+    Default: ''
+    Description: >-
+      The EXISTING E4 (08) kill-switch AppConfig application id (08 exports
+      OperationsControlApplicationId). The evaluator reads the E4 kill switch
+      from THIS application, which is SEPARATE from the E5 autonomy application
+      this stack creates. Required when AutonomyMode=operate.
+
+  KillSwitchEnvironmentId:
+    Type: String
+    Default: ''
+    Description: >-
+      The EXISTING E4 (08) kill-switch AppConfig environment id (08 exports
+      OperationsControlEnvironmentId). Required when AutonomyMode=operate.
+
+  KillSwitchProfileId:
+    Type: String
+    Default: ''
+    Description: >-
+      The EXISTING E4 (08) kill-switch AppConfig configuration profile id (08
+      exports OperationsKillSwitchProfileId). The evaluator composes the SAME E4
+      kill switch the executor reads; it is never the autonomy switch. Required
+      when AutonomyMode=operate.
+
   EnrolledFleetId:
     Type: String
     Default: ''
@@ -314,6 +339,12 @@ Rules:
         AssertDescription: EnrolledFleetId is required when AutonomyMode=operate.
       - Assert: !Not [!Equals [!Ref EnrolledFleetArn, '']]
         AssertDescription: EnrolledFleetArn is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref KillSwitchApplicationId, '']]
+        AssertDescription: KillSwitchApplicationId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref KillSwitchEnvironmentId, '']]
+        AssertDescription: KillSwitchEnvironmentId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref KillSwitchProfileId, '']]
+        AssertDescription: KillSwitchProfileId is required when AutonomyMode=operate.
 
 # --------------------------------------------------------------------------- #
 # Resources
@@ -532,9 +563,11 @@ Resources:
                   Bool:
                     'kms:GrantIsForAWSResource': 'true'
         - PolicyName: AutonomyAppConfigRead
-          # EXACTLY the two AppConfig data-plane read actions, scoped to the
-          # SEPARATE autonomy configuration resource (never the E4 kill switch).
-          # No authoring/admin action, no wildcard.
+          # EXACTLY the two AppConfig data-plane read actions, scoped to the two
+          # exact configuration coordinates the evaluator composes: (1) the
+          # SEPARATE autonomy switch this stack creates, and (2) the EXISTING E4
+          # kill switch in the 08 control-plane application. No authoring/admin
+          # action, no wildcard, no other configuration.
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -545,6 +578,13 @@ Resources:
                   - 'appconfig:GetLatestConfiguration'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AutonomyApplication}/environment/${AutonomyEnvironment}/configuration/${AutonomySwitchProfile}'
+              - Sid: ReadE4KillSwitchConfigurationOnly
+                Effect: Allow
+                Action:
+                  - 'appconfig:StartConfigurationSession'
+                  - 'appconfig:GetLatestConfiguration'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:appconfig:${AWS::Region}:${AWS::AccountId}:application/${KillSwitchApplicationId}/environment/${KillSwitchEnvironmentId}/configuration/${KillSwitchProfileId}'
         - PolicyName: StartExactExecutionStateMachine
           # Start ONLY the exact existing E3 Standard state machine. This is the
           # sole cross-component authority: the evaluator hands the workflow an
@@ -655,13 +695,17 @@ Resources:
           GBAW_OPERATIONS_AUTONOMY_STATE_ID: !Ref AutonomyStateId
           GBAW_OPERATIONS_AUTONOMY_SUBJECT: !Ref AutonomySubject
           GBAW_OPERATIONS_AUTONOMY_CLIENT: !Ref AutonomyClient
-          # Shared AppConfig read target. The autonomy switch is its OWN profile;
-          # the kill-switch profile is threaded so the E4 durable/cached execute
-          # gate the evaluator composes can read the SAME kill switch the executor
-          # reads. Both are scoped reads only.
-          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref AutonomyApplication
-          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref AutonomyEnvironment
-          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref AutonomySwitchProfile
+          # E4 kill-switch AppConfig coordinate (from the 08 control plane). The
+          # evaluator composes the SAME E4 kill switch the executor reads. This is
+          # a DIFFERENT application/environment from the autonomy switch below, so
+          # enabling E4 never enables autonomy and vice-versa. Scoped reads only.
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref KillSwitchApplicationId
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref KillSwitchEnvironmentId
+          GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchProfileId
+          # Separate E5 autonomy AppConfig coordinate (created by THIS stack). The
+          # autonomy switch document is read from this application/environment.
+          GBAW_OPERATIONS_AUTONOMY_APPCONFIG_APPLICATION: !Ref AutonomyApplication
+          GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT: !Ref AutonomyEnvironment
           GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT: !Ref AppConfigExtensionPort
       Layers:
         - !If [AutonomyOperate, !Ref AppConfigExtensionLayerArn, !Ref 'AWS::NoValue']

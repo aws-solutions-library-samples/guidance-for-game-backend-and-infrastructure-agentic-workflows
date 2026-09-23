@@ -42,9 +42,11 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-abc",
         "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:111122223333:fleet/fleet-abc",
         "GBAW_OPERATIONS_ENROLLED_LOCATION": "us-west-2",
-        "GBAW_OPERATIONS_APPCONFIG_APPLICATION": "gbaw-ops",
+        "GBAW_OPERATIONS_APPCONFIG_APPLICATION": "gbaw-ops-control",
         "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT": "prod",
         "GBAW_OPERATIONS_APPCONFIG_PROFILE": "kill-switch",
+        "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_APPLICATION": "gbaw-ops-autonomy",
+        "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT": "prod",
         "GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN": (
             "arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute"
         ),

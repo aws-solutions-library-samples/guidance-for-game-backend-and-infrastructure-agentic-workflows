@@ -41,6 +41,8 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_ENROLLED_LOCATION": policy["target"]["location"],
         "GBAW_OPERATIONS_APPCONFIG_APPLICATION": "gbaw-ops",
         "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT": "prod",
+        "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_APPLICATION": "autonomy-app",
+        "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT": "prod",
         "GBAW_OPERATIONS_APPCONFIG_PROFILE": "kill-switch",
         "GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN": (
             "arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute"
