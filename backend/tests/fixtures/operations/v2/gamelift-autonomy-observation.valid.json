@@ -1,0 +1,55 @@
+{
+  "observation_contract_version": "1.0",
+  "observation_id": "obs_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "idempotency_token": "idem_cccccccccccccccccccccccc",
+  "phase": "observe",
+  "provider": "gamelift",
+  "capability": {
+    "capability_id": "gamelift.observe-fleet",
+    "capability_version": "1.0"
+  },
+  "effective_authority": "observe",
+  "authority_inputs": {
+    "deployment_mode": "operate",
+    "tenant_policy": "operate",
+    "workspace_policy": "operate",
+    "principal_authority": "operate",
+    "capability_maximum": "observe",
+    "risk_policy": "operate"
+  },
+  "requester": {
+    "subject_id": "subject.autonomy-agent",
+    "client_id": "client.autonomy-runtime",
+    "tenant_id": "tenant.default",
+    "workspace_id": "workspace.default"
+  },
+  "correlation": {
+    "correlation_id": "corr.autonomy-observation-1",
+    "request_id": "request.autonomy-observation-1"
+  },
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789"
+  },
+  "observed_at": "2026-09-21T19:11:52Z",
+  "expires_at": "2026-09-21T19:13:52Z",
+  "results": {
+    "utilization": {
+      "active_server_processes": 0,
+      "active_game_sessions": 0,
+      "current_player_sessions": 0,
+      "maximum_player_sessions": 100
+    },
+    "capacity": [
+      {
+        "location": "us-west-2",
+        "desired": 0,
+        "minimum": 0,
+        "maximum": 1,
+        "active": 0,
+        "idle": 0
+      }
+    ],
+    "scaling_policies": []
+  }
+}

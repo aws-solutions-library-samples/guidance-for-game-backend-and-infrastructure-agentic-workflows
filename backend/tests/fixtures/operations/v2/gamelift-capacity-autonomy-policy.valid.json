@@ -1,0 +1,73 @@
+{
+  "policy_contract_version": "2.0",
+  "policy_id": "policy.gamelift-capacity-autonomy",
+  "policy_version": "2026-09-01",
+  "profile": "gamelift.capacity-adjustment/2.0",
+  "action": "gamelift.adjust-fleet-capacity",
+  "provider": "gamelift",
+  "capability": {
+    "capability_id": "gamelift.capacity-adjustment",
+    "capability_version": "2.0"
+  },
+  "automation_principal": {
+    "source_type": "automation",
+    "subject_id": "subject.autonomy-agent",
+    "client_id": "client.autonomy-runtime"
+  },
+  "tenant_id": "tenant.default",
+  "workspace_id": "workspace.default",
+  "resource_enrollment": {
+    "enrollment_id": "enroll.fleet-default",
+    "enrollment_version": "2026-09-01"
+  },
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+    "location": "us-west-2"
+  },
+  "capacity_bounds": {
+    "floor": 0,
+    "ceiling": 1,
+    "max_step": 1
+  },
+  "risk": {
+    "max_level": "high",
+    "max_score": 60
+  },
+  "observation_freshness": {
+    "max_age_seconds": 120,
+    "max_skew_seconds": 30
+  },
+  "budget": {
+    "window_seconds": 3600,
+    "max_action_micro_usd": 500000,
+    "max_window_micro_usd": 2000000
+  },
+  "cooldown": {
+    "min_seconds_between_writes": 300
+  },
+  "frequency": {
+    "window_seconds": 3600,
+    "max_writes_per_window": 4
+  },
+  "concurrency": {
+    "max_in_flight": 1
+  },
+  "anti_oscillation": {
+    "window_seconds": 3600,
+    "min_seconds_since_opposite_change": 600,
+    "max_direction_flips_per_window": 1
+  },
+  "decision_ttl_seconds": 120,
+  "playbook": {
+    "playbook_id": "playbook.gamelift-capacity-autonomy",
+    "playbook_version": "2.0.0",
+    "playbook_hash": "sha256:29b3047e98446ce4f919610418fd28ecba7339dfdb28382846913749f283b52f"
+  },
+  "executor_binding": {
+    "executor_id": "executor.gamelift-capacity",
+    "executor_binding_version": "1.0"
+  },
+  "required_execution_authority": "operate",
+  "policy_hash": "sha256:7237ef5829513a408b309343ae4117756f46e69574adca3931b83450c9b74b18"
+}

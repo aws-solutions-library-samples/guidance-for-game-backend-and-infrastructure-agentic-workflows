@@ -1,0 +1,108 @@
+{
+  "operation_contract_version": "2.0",
+  "operation_id": "op_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "idempotency_token": "idem_bbbbbbbbbbbbbbbbbbbbbbbb",
+  "phase": "operate",
+  "profile": "gamelift.capacity-adjustment/2.0",
+  "action": "gamelift.adjust-fleet-capacity",
+  "provider": "gamelift",
+  "created_at": "2026-09-21T19:11:52Z",
+  "decision_expires_at": "2026-09-21T19:13:52Z",
+  "playbook": {
+    "playbook_id": "playbook.gamelift-capacity-autonomy",
+    "playbook_version": "2.0.0",
+    "playbook_hash": "sha256:29b3047e98446ce4f919610418fd28ecba7339dfdb28382846913749f283b52f"
+  },
+  "capability": {
+    "capability_id": "gamelift.capacity-adjustment",
+    "capability_version": "2.0"
+  },
+  "automation_principal": {
+    "source_type": "automation",
+    "subject_id": "subject.autonomy-agent",
+    "client_id": "client.autonomy-runtime",
+    "tenant_id": "tenant.default",
+    "workspace_id": "workspace.default"
+  },
+  "correlation": {
+    "correlation_id": "corr.autonomy-1",
+    "request_id": "request.autonomy-1"
+  },
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+    "location": "us-west-2"
+  },
+  "parameters": {
+    "requested": {"desired": 1, "minimum": 0, "maximum": 1},
+    "change": {"desired": 1, "minimum": 0, "maximum": 0}
+  },
+  "current_state": {
+    "evidence_contract_version": "2.0",
+    "observation_id": "obs_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "observation_hash": "sha256:6f7626d6fccc6359a91e442caed06474c2d1f94c956d4d17524a6df92f9f03c8",
+    "tenant_id": "tenant.default",
+    "workspace_id": "workspace.default",
+    "resource_enrollment": {
+      "enrollment_id": "enroll.fleet-default",
+      "enrollment_version": "2026-09-01"
+    },
+    "target": {
+      "provider": "gamelift",
+      "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+      "location": "us-west-2"
+    },
+    "capacity": {"desired": 0, "minimum": 0, "maximum": 1},
+    "observed_at": "2026-09-21T19:11:52Z",
+    "expires_at": "2026-09-21T19:13:52Z",
+    "evidence_hash": "sha256:9606b9e5c0695527100bf34d9373cc5ec57070350a019b77f4491e038c063b48"
+  },
+  "window_state": {
+    "state_id": "state.gamelift-capacity-autonomy",
+    "state_revision": 7,
+    "state_hash": "sha256:b037022bc46ad00af71d23765a1dfedcad6cb2c896cb0b8c55e87ef8721b0339"
+  },
+  "resource_enrollment": {
+    "enrollment_id": "enroll.fleet-default",
+    "enrollment_version": "2026-09-01"
+  },
+  "autonomy_policy": {
+    "policy_id": "policy.gamelift-capacity-autonomy",
+    "policy_version": "2026-09-01",
+    "policy_hash": "sha256:7237ef5829513a408b309343ae4117756f46e69574adca3931b83450c9b74b18"
+  },
+  "decision": {
+    "decision_id": "autz.op_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "decision_hash": "sha256:1318b33e8d2f2c08fdcb210d060b848beb90cb0f1d3a74d8127654c3ada366d6"
+  },
+  "calculated_risk": {
+    "level": "high",
+    "score": 60,
+    "factors": ["desired-magnitude", "scale-up"]
+  },
+  "authority": {
+    "authority_inputs": {
+      "deployment_mode": "operate",
+      "tenant_policy": "operate",
+      "workspace_policy": "operate",
+      "principal_authority": "operate",
+      "capability_maximum": "operate",
+      "operation_risk_policy": "operate"
+    },
+    "effective_authority": "operate",
+    "decision": "authorized",
+    "reason_codes": ["APPROVED_AUTONOMOUS"]
+  },
+  "retry_policy": {
+    "max_attempts": 3,
+    "base_delay_seconds": 2,
+    "max_delay_seconds": 60,
+    "reconcile_before_retry": true
+  },
+  "executor_binding": {
+    "executor_id": "executor.gamelift-capacity",
+    "executor_binding_version": "1.0"
+  },
+  "required_execution_authority": "operate",
+  "prepared_hash": "sha256:6dfb38443897b18d52c0c8cfb893794308a0e28f3139ad1d8403da82bbbb38e9"
+}
