@@ -1,23 +1,131 @@
 
 # ADR 0005: Persist Operations State and Recover Workflows
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-01
+- **Accepted:** 2026-09-21
 - **Decision issue:** [#279](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/279)
 
 ## Status Rationale
 
-This record is **Proposed**, not Accepted. The synchronous single-request
+This record is **Accepted**. The synchronous single-request
 observation design in [Durable observation state without queues](#durable-observation-state-without-queues)
 asserts that three bounded provider reads plus persistence fit inside the
-API Gateway HTTP API integration timeout. That claim requires measured latency
+API Gateway HTTP API integration timeout. That claim required measured latency
 evidence — a validated request-completion percentile below the timeout with the
-declared margin — before acceptance. That evidence is not yet available, and
-this record does not fabricate it. The remaining decisions (externalized
-content, state model, idempotency, fencing, ledger authority, IAM boundary,
-and approval authority) are stable and can be reviewed now, but the record
-stays Proposed until the latency acceptance evidence exists. See
-[Deferred decisions](#deferred-decisions).
+declared margin — before acceptance. That evidence now exists and has been
+reviewed and independently accepted: see
+[E0 latency validation status](#e0-latency-validation-status-issue-412) and the
+recorded measurement in [`docs/evidence/`](../evidence/README.md). The remaining
+decisions (externalized content, state model, idempotency, fencing, ledger
+authority, IAM boundary, and approval authority) were already stable. See
+[Deferred decisions](#deferred-decisions) for what this acceptance does **not**
+resolve. Acceptance is scoped to the synchronous-observation latency claim
+validated below; it does not assert that any operations infrastructure is
+deployed, that provider writes are enabled, or that the deferred decisions are
+closed.
+
+### E0 latency validation status (issue #412)
+
+The E0 validation spike ([#412](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/412))
+produced the deterministic measurement path, its acceptance gate, **and** a live
+measured percentile that satisfies that gate. The measurement was independently
+accepted and moves this record to Accepted for the synchronous-observation
+latency claim.
+
+The accepted measurement
+([`docs/evidence/e0-latency-2026-09-21-dynamodb.json`](../evidence/e0-latency-2026-09-21-dynamodb.json),
+measured `2026-09-21T19:11:52Z`) ran the real **DynamoDB transactional**
+persistence mode over a **clean** sample of **200** observations (200 successes,
+0 failures, 0 timeouts, 0 partial denials) at concurrency 4 under the declared
+closed-loop model. Measured request-completion latency (nearest-rank):
+
+| Statistic | Value |
+|---|---|
+| p50 | 159.753 ms |
+| p95 | 250.094 ms |
+| p99 | 403.194 ms |
+| max | 414.698 ms |
+
+The measured **p99 of 403.194 ms** clears the **27.0 s acceptance ceiling**
+(`gateway_integration_timeout − cancellation_margin`) by a **26.6 s margin**
+(26596.806 ms). The acceptance rule
+(`persistence_acceptable AND clean_run AND p99 ≤ ceiling`) evaluates to
+`synchronous_accepted = true`.
+
+**Assumptions and caveats retained by this measurement** (it validates the
+latency claim only, under these conditions):
+
+- **Closed-loop concurrency** arrival model — a bounded-concurrency,
+  back-to-back stand-in for the single-request synchronous path, **not** a model
+  of production request rate or an open (Poisson-arrival) load test.
+- **Synthetic, task-owned DynamoDB transaction** — each sample wrote synthetic,
+  per-sample-unique operation-state and append-only ledger items to a
+  disposable, task-owned table in one `TransactWriteItems` call; no fleet id,
+  account id, ARN, or provider payload was written.
+- **Model inference is excluded** from the measured path.
+- **No provider writes** — every GameLift call was read-only
+  (`describe`/`list`); the spike created no operations infrastructure and
+  granted no write permissions.
+
+What the spike establishes:
+
+- The exact E1 observation is three bounded, read-only GameLift reads for one
+  fleet — `describe_fleet_utilization`, `describe_fleet_capacity`,
+  `describe_scaling_policies` — plus the transactional persistence and RFC 8785
+  canonical serialization of the observation records.
+- Explicit sub-budgets that sum below the 30 s gateway integration ceiling:
+  3.0 s per read (×3), 3.0 s persistence + canonical serialization, and a 3.0 s
+  cancellation margin, for a 15.0 s total request deadline. The acceptance
+  ceiling is `ceiling − margin` = 27.0 s.
+- **Real wall-clock deadline enforcement**: each read runs in a worker thread
+  and the request waits at most the remaining budget for it. A read that blocks
+  past its deadline is abandoned and a typed **retryable** error
+  (`PROVIDER_UNAVAILABLE`) is raised *before* the read returns; the request does
+  not join the abandoned worker, so a hung read cannot make the request or the
+  harness wait past the deadline. The live client additionally bounds botocore
+  `connect_timeout`/`read_timeout` at or below the per-read budget and caps
+  retries, so a stuck socket surfaces as a fast typed error.
+- A read-only harness and full offline test suite that issue exactly the three
+  reads, fail closed on any per-call, persistence, or total overrun, never
+  return a partial result as success, and report sample size, successes,
+  failures, timeouts, and **partial denials reported separately from timeouts**,
+  plus p50/p95/p99/max using the nearest-rank percentile method. The harness
+  measures under a declared **closed-loop** concurrency arrival model
+  (`assumptions.arrival_model`) so the p99 has a defensible meaning, and it
+  discovers classic (EC2) fleets by paging `list_fleets` and filtering on
+  `ComputeType`, excluding container fleets.
+- A public-safe evidence schema and reproduction guide under
+  [`docs/evidence/`](../evidence/README.md).
+- Two explicit persistence modes for the measured path: a deterministic
+  **in-memory** mode for unit tests only (never acceptable as live evidence),
+  and an opt-in **real DynamoDB transactional** mode that writes synthetic,
+  per-sample-unique operation-state and append-only ledger items to a
+  caller-specified disposable table in one `TransactWriteItems` call with
+  conditional no-replacement (`attribute_not_exists`) semantics, under the
+  persistence deadline, writing no fleet id, account id, ARN, or provider
+  payload. A live provider-read measurement exposed that the harness's
+  original default persistence callable was a **no-op** that measured only
+  canonical serialization; the acceptance rule below now requires the real
+  transactional mode so a measured p99 reflects durable persistence.
+
+Acceptance rule (now satisfied by the accepted run): **synchronous accepted iff
+the run used the real DynamoDB transactional persistence mode AND the sample
+is a clean run (zero failures, zero timeouts, zero partial denials) AND the
+measured p99 ≤ 27.0 s** over a representative sample. A single non-success
+sample would deny acceptance regardless of the successful-subset p99, and a run
+that used the in-memory (test-only) mode would be denied regardless of its p99
+because it did not exercise durable persistence. The accepted evidence records
+the actual persistence mode (`assumptions.persistence_mode = dynamodb-transactional`,
+`evaluation.persistence_mode`, `evaluation.persistence_acceptable = true`).
+
+The previously remaining live step is complete: the harness was run against one
+classic GameLift fleet in a non-production account with
+`--persistence-mode dynamodb-transactional` and a disposable, task-owned,
+on-demand `--persistence-table`, and the measurement was recorded at
+`docs/evidence/e0-latency-2026-09-21-dynamodb.json` and independently accepted.
+This record is therefore **Accepted** for the synchronous-observation latency
+claim; the caveats above remain part of what was validated.
 
 ## Context
 
@@ -134,13 +242,17 @@ deadline; if a sub-budget is exceeded, in-flight work is cancelled and the
 request fails closed with a typed, retryable error rather than returning a
 partial result.
 
-Acceptance of this synchronous design requires measured evidence, not a static
+Acceptance of this synchronous design required measured evidence, not a static
 budget alone: a validated request-completion percentile (for example p99)
 measured under representative provider latency, confirmed to complete within
-the ceiling minus the cancellation margin. Until that measured percentile
-exists, this design is Proposed. A timed synthetic provider-read test exercises
-the budget in continuous integration, but a synthetic test is not the
-acceptance evidence and no latency percentile is asserted here.
+the ceiling minus the cancellation margin. That evidence now exists — a measured
+p99 of 403.194 ms against the 27.0 s acceptance ceiling (a 26.6 s margin), over
+a clean 200-sample run using the real DynamoDB transactional persistence mode —
+so this design is Accepted (see
+[E0 latency validation status](#e0-latency-validation-status-issue-412)). A
+timed synthetic provider-read test continues to exercise the budget in
+continuous integration; the accepted percentile comes from the recorded live
+measurement, not from that synthetic test.
 
 ### Idempotency and independent operations
 
@@ -439,10 +551,12 @@ The following are explicitly deferred and are not decided here:
 - The exact numeric provider-read sub-budgets, cancellation margin, inline
   content ceiling, lease duration, and retention window, which the implementing
   issues fix with tests.
-- The measured request-completion latency percentile that this record requires
-  as acceptance evidence for the synchronous observation design. This record
-  stays Proposed until that evidence exists; it does not assert a measured
-  value.
+- The measured request-completion latency percentile required as acceptance
+  evidence for the synchronous observation design is now recorded and accepted
+  (p99 403.194 ms; see
+  [E0 latency validation status](#e0-latency-validation-status-issue-412)), so
+  this is no longer deferred. Broader production latency characterization under
+  open-arrival load remains future work.
 - Storage-level (write-once or object-lock) immutability beyond the append-only
   application boundary.
 - Executor authentication and remote MCP identity propagation, owned by the
@@ -453,9 +567,10 @@ The following are explicitly deferred and are not decided here:
 ## Consequences
 
 - Observation records durable status and audit events without queue
-  infrastructure. Whether its bounded reads fit the 30-second integration
-  timeout is subject to measured acceptance evidence, so this record is
-  Proposed.
+  infrastructure. Its bounded reads plus persistence fit the 30-second
+  integration timeout: the accepted measurement recorded a p99 of 403.194 ms
+  against the 27.0 s acceptance ceiling, so this record is Accepted for that
+  latency claim.
 - Large content lives in application-write-once, content-addressed object
   storage, so no DynamoDB item or transaction exceeds the 400 KB item limit or
   the 4 MB transaction limit, and every read hash-verifies content before use.
