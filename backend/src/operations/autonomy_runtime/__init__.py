@@ -31,6 +31,7 @@ from operations.autonomy_runtime.service import (
     PreparedAutonomousOperation,
 )
 from operations.autonomy_runtime.store import (
+    DynamoDbReservationStore,
     InMemoryReservationStore,
     ReservationOutcome,
     ReservationRequest,
@@ -45,7 +46,8 @@ __all__ = [
     "AutonomyRuntimeInputs",
     "AutonomyRuntimeService",
     "PreparedAutonomousOperation",
-    # store / reservation port
+    # store / reservation lifecycle
+    "DynamoDbReservationStore",
     "InMemoryReservationStore",
     "ReservationOutcome",
     "ReservationRequest",

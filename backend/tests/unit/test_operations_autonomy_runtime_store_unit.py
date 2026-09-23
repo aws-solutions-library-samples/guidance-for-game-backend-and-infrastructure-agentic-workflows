@@ -12,11 +12,14 @@ These tests assert the port contract and the semantics of a reference
 in-memory store that models DynamoDB conditional-write fencing:
 
 * a reservation is atomic and policy/revision-fenced (exactly-once advance);
-* a stale-revision reservation loses the race and returns ``CONFLICT`` — never
-  a false success and never a double count;
+* a stale-revision reservation (a *distinct* operation) loses the race and
+  returns ``CONFLICT`` — never a false success and never a double count;
 * store unavailability fails closed as ``UNAVAILABLE``;
 * the reserved snapshot stays contract-valid and hash-bound;
 * the store holds no provider-write path or executor credential.
+
+Idempotent same-operation replay is covered separately by the reserve/require/
+settle lifecycle suite.
 """
 
 from __future__ import annotations
@@ -130,8 +133,10 @@ def test_stale_revision_reservation_loses_the_race() -> None:
     # First reservation wins and advances the revision.
     first = store.reserve(_request())
     assert first.outcome is ReservationOutcome.RESERVED
-    # A second reservation at the original (now stale) revision must fail closed.
-    second = store.reserve(_request())
+    # A DISTINCT operation at the original (now stale) revision must fail closed.
+    # (A replay of the SAME operation is idempotent, covered by the lifecycle
+    # suite; a stale race is a different operation losing the revision fence.)
+    second = store.reserve(_request(operation_id="op_cccccccccccccccccccccccccc"))
     assert second.outcome is ReservationOutcome.CONFLICT
     assert second.window_state is None
 
@@ -140,9 +145,10 @@ def test_stale_revision_reservation_loses_the_race() -> None:
 def test_conflict_does_not_double_count() -> None:
     store = _store()
     store.reserve(_request())
-    conflicted = store.reserve(_request())
+    # A distinct operation at the stale revision loses; the durable revision must
+    # have advanced exactly once despite two reservation attempts.
+    conflicted = store.reserve(_request(operation_id="op_cccccccccccccccccccccccccc"))
     assert conflicted.outcome is ReservationOutcome.CONFLICT
-    # The durable revision advanced exactly once despite two attempts.
     current = store.current(_window_state()["state_id"])
     assert current["state_revision"] == _window_state()["state_revision"] + 1
 
