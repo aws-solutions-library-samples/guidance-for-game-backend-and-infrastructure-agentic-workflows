@@ -318,6 +318,7 @@ def test_force_write_evaluator_unavailable_is_not_a_clean_denial() -> None:
         return CommandResult(0, "{}", "")
 
     transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    transport._trusted_observation_id = "op_obs_seeded"  # corrected #440: evaluate requires a succeeded observation
     resp = transport(
         "POST", "https://x/operations/autonomy/op/force-write", headers={"authorization": "Bearer x"}, body=b"{}"
     )
@@ -339,6 +340,7 @@ def test_force_write_refused_with_evidence_confirms_no_write() -> None:
         return CommandResult(0, "{}", "")
 
     transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    transport._trusted_observation_id = "op_obs_seeded"  # corrected #440: evaluate requires a succeeded observation
     resp = transport(
         "POST", "https://x/operations/autonomy/op/force-write", headers={"authorization": "Bearer x"}, body=b"{}"
     )

@@ -40,6 +40,57 @@ PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 SHAKEDOWN = PROJECT_ROOT / "backend/src/operations/validation/e5_shakedown.py"
 
 _STATE_MACHINE_ARN = "arn:aws:states:us-west-2:000000000000:stateMachine:game-agent-operations-autonomy"
+_EXECUTOR_ROLE_ARN = "arn:aws:iam::000000000000:role/game-agent-operations-executor"
+
+
+def _observe_ok_caller(operation_id: str = "op_obs_prior"):
+    # Standard library
+    import json as _json
+
+    def _caller(_call):
+        return 200, {}, _json.dumps({"operation_id": operation_id, "state": "succeeded"})
+
+    return _caller
+
+
+def _seed_observation(
+    transport, *, bearer_env: str = "GBAW_E5_OBSERVE_BEARER", observed_id: str = "op_obs_prior"
+) -> None:
+    """Establish a trusted observation (the evaluate step requires one first).
+
+    Drives the real observe path; if the adapter short-circuits because the test
+    config carries no observe endpoint, seeds the trusted id directly (test
+    tooling) so the evaluate precondition holds without changing every config."""
+    # Standard library
+    import os
+
+    os.environ[bearer_env] = "short-lived"
+    transport("POST", "https://x/operations/observe", headers={"authorization": "Bearer x"}, body=b"{}")
+    if getattr(transport, "_trusted_observation_id", None) is None:
+        transport._trusted_observation_id = observed_id
+
+
+def _correlated_cloudtrail_event(
+    *,
+    fleet_id: str = "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
+    location: str = "us-west-2",
+    role_arn: str = _EXECUTOR_ROLE_ARN,
+) -> dict:
+    """A CloudTrail LookupEvents record whose embedded event correlates to the
+    executor role's UpdateFleetCapacity write, with an event time comfortably
+    after any plausible dispatch instant."""
+    # Standard library
+    import json as _json
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    event_time = (_dt.now(_tz.utc) + _td(hours=1)).isoformat().replace("+00:00", "Z")
+    detail = {
+        "eventName": "UpdateFleetCapacity",
+        "eventTime": event_time,
+        "requestParameters": {"fleetId": fleet_id, "location": location, "desiredInstances": 1},
+        "userIdentity": {"sessionContext": {"sessionIssuer": {"arn": role_arn}}},
+    }
+    return {"EventName": "UpdateFleetCapacity", "CloudTrailEvent": _json.dumps(detail)}
 
 
 def _config() -> CommandAdapterConfig:
@@ -258,7 +309,7 @@ def test_transport_maps_known_paths_to_commands() -> None:
                 return CommandResult(0, json.dumps(_dispatched_audit_item(op)), "")
             return CommandResult(0, json.dumps(_reservation_item(op)), "")
         if key == "cloudtrail lookup-events":
-            return CommandResult(0, json.dumps({"Events": [{"Username": "executor"}]}), "")
+            return CommandResult(0, json.dumps({"Events": [_correlated_cloudtrail_event()]}), "")
         if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
@@ -267,9 +318,14 @@ def test_transport_maps_known_paths_to_commands() -> None:
             return CommandResult(0, json.dumps({"DeploymentNumber": 1}), "")
         return CommandResult(0, "{}", "")
 
+    # Standard library
+    import dataclasses
+
     runner = _RecordingCallable(fn)
-    transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    cfg = dataclasses.replace(_config(), executor_role_arn=_EXECUTOR_ROLE_ARN)
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller()))
     hdr = {"authorization": "Bearer x"}
+    _seed_observation(transport)
     ev = transport("POST", "https://x/operations/autonomy/op/evaluate", headers=hdr, body=b"{}")
     body = ev.json()
     assert body["decision"] == "authorized"
@@ -427,8 +483,10 @@ def test_transport_evaluate_sends_exact_closed_event_not_direction() -> None:
         }
     )
     cfg = _adapter_config_with_event()
-    transport = CommandTransport(CommandAdapter(cfg, runner=runner))
+    observed_id = "op_obs_prior"
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller(observed_id)))
     hdr = {"authorization": "Bearer x"}
+    _seed_observation(transport)
     transport(
         "POST", "https://x/operations/autonomy/op/evaluate", headers=hdr, body=json.dumps({"direction": "up"}).encode()
     )
@@ -441,7 +499,8 @@ def test_transport_evaluate_sends_exact_closed_event_not_direction() -> None:
         "maximum",
     }, f"evaluator event must be the exact closed set, got {sorted(event)}"
     assert "direction" not in event, "the harness 'direction' must NOT be forwarded to the evaluator"
-    assert event["observation_operation_id"] == cfg.observation_operation_id
+    # The event carries the NEWLY-SUCCEEDED observed id, not the config value.
+    assert event["observation_operation_id"] == observed_id
     assert isinstance(event["desired"], int) and isinstance(event["minimum"], int) and isinstance(event["maximum"], int)
 
 
@@ -449,8 +508,9 @@ def test_transport_evaluate_up_and_down_map_to_capacity_triples() -> None:
     """up -> desired 1, down -> desired 0; minimum/maximum stay the 0/1 window."""
     runner = RecordingRunner({"lambda invoke": {"outcome": "refused", "reason": "decision_denied"}})
     cfg = _adapter_config_with_event()
-    transport = CommandTransport(CommandAdapter(cfg, runner=runner))
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller()))
     hdr = {"authorization": "Bearer x"}
+    _seed_observation(transport)
     transport(
         "POST", "https://x/operations/autonomy/op/evaluate", headers=hdr, body=json.dumps({"direction": "up"}).encode()
     )
@@ -470,8 +530,9 @@ def test_transport_consumes_real_outcome_operation_id() -> None:
     evaluator's real reason — never a fabricated 'authorized'."""
     runner = RecordingRunner({"lambda invoke": {"outcome": "refused", "reason": "cooldown_active"}})
     cfg = _adapter_config_with_event()
-    transport = CommandTransport(CommandAdapter(cfg, runner=runner))
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller()))
     hdr = {"authorization": "Bearer x"}
+    _seed_observation(transport)
     resp = transport("POST", "https://x/operations/autonomy/op/evaluate", headers=hdr, body=b"{}")
     body = resp.json()
     assert body.get("decision") == "denied", "a refused outcome must map to a denied decision"
@@ -499,17 +560,24 @@ def test_transport_write_assertions_come_from_real_evidence_reads() -> None:
                 return CommandResult(0, json.dumps(_dispatched_audit_item(op)), "")
             return CommandResult(0, json.dumps(_reservation_item(op)), "")
         if key == "cloudtrail lookup-events":
-            return CommandResult(0, json.dumps({"Events": [{"Username": "some-other-principal"}]}), "")
+            # A correlated UpdateFleetCapacity event but by a FOREIGN role: the
+            # correlation must NOT credit the executor.
+            foreign = _correlated_cloudtrail_event(role_arn="arn:aws:iam::000000000000:role/some-other-principal")
+            return CommandResult(0, json.dumps({"Events": [foreign]}), "")
         if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )
         return CommandResult(0, "{}", "")
 
+    # Standard library
+    import dataclasses
+
     runner = _RecordingCallable(fn)
-    cfg = _adapter_config_with_event()
-    transport = CommandTransport(CommandAdapter(cfg, runner=runner))
+    cfg = dataclasses.replace(_adapter_config_with_event(), executor_role_arn=_EXECUTOR_ROLE_ARN)
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller()))
     hdr = {"authorization": "Bearer x"}
+    _seed_observation(transport)
     resp = transport("POST", "https://x/operations/autonomy/op/evaluate", headers=hdr, body=b"{}")
     body = resp.json()
     # Evidence was actually read.
@@ -546,8 +614,9 @@ def test_transport_force_write_denial_is_proven_by_evidence_not_fabricated() -> 
 
     runner = _RecordingCallable(fn)
     cfg = _adapter_config_with_event()
-    transport = CommandTransport(CommandAdapter(cfg, runner=runner))
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller()))
     hdr = {"authorization": "Bearer x"}
+    _seed_observation(transport)
     resp = transport(
         "POST", "https://x/operations/autonomy/op/force-write", headers=hdr, body=json.dumps({"force": True}).encode()
     )
@@ -622,7 +691,7 @@ class ScriptedLifecycleRunner:
                 return self._json(_dispatched_audit_item(self.last_op))
             return self._json(_reservation_item(self.last_op))
         if key == "cloudtrail lookup-events":
-            return self._json({"Events": [{"Username": "executor"}]} if self.dispatched else {"Events": []})
+            return self._json({"Events": [_correlated_cloudtrail_event()]} if self.dispatched else {"Events": []})
         if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return self._json(
                 {
@@ -675,7 +744,10 @@ def test_command_transport_drives_full_harness_to_accepted(monkeypatch) -> None:
     # Bind the trusted observation id the closed event carries and the 06 HTTPS
     # observe endpoint (observe is an authenticated API call, not a Lambda invoke).
     cfg = dataclasses.replace(
-        cfg, observation_operation_id="op_obs_e2e", observe_api_endpoint="https://obs.example.aws.dev"
+        cfg,
+        observation_operation_id="op_obs_e2e",
+        observe_api_endpoint="https://obs.example.aws.dev",
+        executor_role_arn=_EXECUTOR_ROLE_ARN,
     )
     monkeypatch.setenv("GBAW_E5_OBSERVE_BEARER", "short-lived")
 

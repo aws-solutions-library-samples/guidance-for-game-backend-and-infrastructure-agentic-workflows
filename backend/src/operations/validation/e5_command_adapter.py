@@ -243,6 +243,13 @@ class CommandAdapterConfig:
     # The token is sourced from the environment (or stdin-populated env) and
     # carried only in the Authorization header — never in an argv, URL, or log.
     observe_bearer_env_var: str = "GBAW_E5_OBSERVE_BEARER"
+    # The 07 execution stack's dedicated least-privilege EXECUTOR role ARN (its
+    # ``ExecutorRoleArn`` output). CloudTrail write attribution is CORRELATED to
+    # THIS exact role's session issuer — never a bare ``Username`` literal — so a
+    # write is credited to the executor only when the assumed-role session that
+    # performed the ``UpdateFleetCapacity`` was issued by this exact role.
+    # Defaulted for structural construction; a live run binds it from the 07 stack.
+    executor_role_arn: str = ""
 
 
 class CommandAdapter:
@@ -510,11 +517,143 @@ class CommandAdapter:
         return self._run_json(argv)
 
     def lookup_write_attribution(self, resource_name: str) -> Any:
-        """cloudtrail:LookupEvents to confirm the executor (not the evaluator) wrote."""
+        """cloudtrail:LookupEvents scoped to the write event NAME (not a bare
+        resource) so the correlation reads the actual ``UpdateFleetCapacity``
+        records rather than the newest event of any kind for the fleet.
+
+        The returned records are correlated by :meth:`correlated_executor_write`
+        against the EXACT event name, event time, fleet/location request, and the
+        07 executor role — never trusting ``Events[0].Username``.
+        """
         argv = self._base("cloudtrail", "lookup-events")
         argv += [
             "--lookup-attributes",
-            json.dumps([{"AttributeKey": "ResourceName", "AttributeValue": resource_name}]),
+            json.dumps([{"AttributeKey": "EventName", "AttributeValue": _WRITE_EVENT_NAME}]),
+        ]
+        return self._run_json(argv)
+
+    def correlated_executor_write(self, events: Any, *, not_before: datetime) -> Optional[bool]:
+        """Return whether a CloudTrail record proves the SINGLE bounded write was
+        performed by the exact 07 executor role, or ``None`` when unreadable.
+
+        The proof binds ALL of:
+
+        * ``eventName == UpdateFleetCapacity`` (the one write the executor makes);
+        * ``eventTime`` strictly AFTER ``not_before`` (the dispatch instant), so a
+          stale prior write can never be credited to this dispatch;
+        * ``requestParameters`` name the EXACT enrolled fleet AND location;
+        * the caller's assumed-role SESSION ISSUER ARN equals the configured 07
+          ``executor_role_arn`` (an identity binding, not a display ``Username``).
+
+        Returns:
+          * ``True``  — a fully-correlated executor write exists;
+          * ``False`` — records were readable but NONE correlate (mismatch/foreign
+            role/wrong fleet/old event) — the executor-only invariant is DISPROVEN;
+          * ``None``  — the events are unreadable/absent, so the fact is UNKNOWN.
+        """
+        records = events.get("Events") if isinstance(events, Mapping) else None
+        if not isinstance(records, list):
+            return None  # unreadable shape -> unknown
+        if not records:
+            # No UpdateFleetCapacity record at all: with a scoped lookup this is an
+            # absence of the write, which is UNKNOWN (could not observe the write),
+            # never a positive executor attribution.
+            return None
+        expected_role = (self._config.executor_role_arn or "").strip()
+        if not expected_role:
+            # Without the exact executor role we cannot bind identity -> unknown.
+            return None
+        saw_readable = False
+        for record in records:
+            detail = self._cloudtrail_detail(record)
+            if detail is None:
+                continue
+            saw_readable = True
+            if detail.get("eventName") != _WRITE_EVENT_NAME:
+                continue
+            event_time = self._instant(detail.get("eventTime"))
+            if event_time is None or event_time <= not_before:
+                continue
+            params = detail.get("requestParameters")
+            if not isinstance(params, Mapping):
+                continue
+            fleet = str(params.get("fleetId", ""))
+            location = str(params.get("location", ""))
+            if fleet != self._config.enrolled_fleet_id:
+                continue
+            if location != self._effective_location():
+                continue
+            issuer = self._session_issuer_arn(detail)
+            if issuer is None:
+                continue
+            if issuer == expected_role:
+                return True
+        # Records were present. If NONE were even parseable, we could not read the
+        # attribution -> unknown; otherwise we read them and none correlate -> False.
+        return False if saw_readable else None
+
+    @staticmethod
+    def _cloudtrail_detail(record: Any) -> Optional[Mapping[str, Any]]:
+        """Parse the embedded ``CloudTrailEvent`` JSON string of one LookupEvents
+        record; return ``None`` when it is absent or unparseable."""
+        if not isinstance(record, Mapping):
+            return None
+        raw = record.get("CloudTrailEvent")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, Mapping) else None
+
+    @staticmethod
+    def _session_issuer_arn(detail: Mapping[str, Any]) -> Optional[str]:
+        """Extract the assumed-role session ISSUER arn from a CloudTrail event —
+        the identity binding, not the display ``Username``."""
+        identity = detail.get("userIdentity")
+        if not isinstance(identity, Mapping):
+            return None
+        session_context = identity.get("sessionContext")
+        if not isinstance(session_context, Mapping):
+            return None
+        issuer = session_context.get("sessionIssuer")
+        if not isinstance(issuer, Mapping):
+            return None
+        arn = issuer.get("arn")
+        return arn if isinstance(arn, str) and arn.strip() else None
+
+    def _effective_location(self) -> str:
+        """The enrolled location the capacity/inverse are scoped to (defaults to
+        the adapter region when the enrolled location is unset)."""
+        return self._config.enrolled_location or self._config.region
+
+    def operator_inverse_update_fleet_capacity(self) -> Any:
+        """OPERATOR-OWNED bounded inverse cleanup (TEST TOOLING, not an autonomy
+        component): issue a VALID ``gamelift update-fleet-capacity`` restoring the
+        EXACT enrolled fleet/location to the frozen ``desired=0 / min=0 / max=1``
+        window.
+
+        This is the teardown path the harness uses INSTEAD of the autonomous
+        evaluator inverse: the evaluator ``down`` is denied by the 300/600s
+        cooldown/frequency limits (the same limits the immediate-retry check
+        proves), so reconciling through the evaluator can leave the fleet at
+        ``desired=1``. A direct, bounded ``UpdateFleetCapacity`` at ``0/0/1``
+        deterministically restores zero. It is gated by the operator's inverse
+        confirmation at the harness before it is ever invoked.
+        """
+        argv = self._base("gamelift", "update-fleet-capacity")
+        argv += [
+            "--fleet-id",
+            self._config.enrolled_fleet_id,
+            "--location",
+            self._effective_location(),
+            "--desired-instances",
+            str(_DESIRED_DOWN),
+            "--min-size",
+            str(_WINDOW_MINIMUM),
+            "--max-size",
+            str(_WINDOW_MAXIMUM),
         ]
         return self._run_json(argv)
 
@@ -982,6 +1121,17 @@ _DESIRED_DOWN = 0
 # is not proven, so the transport must report the observed actor truthfully.
 _EXECUTOR_WRITE_ACTOR = "executor"
 
+# The exact CloudTrail eventName of the single bounded write the executor makes.
+# Attribution is scoped to and correlated against this event — a newest event of
+# any other name is never credited as the executor's write.
+_WRITE_EVENT_NAME = "UpdateFleetCapacity"
+
+
+def _utcnow() -> datetime:
+    """Default UTC clock (injectable so tests pin the dispatch instant)."""
+    return datetime.now(timezone.utc)
+
+
 # The evaluator's closed outcome vocabulary (#439). "dispatched" is the only
 # authorized outcome; everything else is a refusal carrying a reason.
 _OUTCOME_DISPATCHED = "dispatched"
@@ -1037,8 +1187,17 @@ class CommandTransport:
       the provider, preserving the harness's 'unauthenticated denied' check.
     """
 
-    def __init__(self, adapter: CommandAdapter) -> None:
+    def __init__(self, adapter: CommandAdapter, *, clock: Callable[[], datetime] = _utcnow) -> None:
         self._adapter = adapter
+        # The trusted observation id captured from the AUTHENTICATED 06 observe +
+        # poll. It is the ONLY id the evaluator event may carry; it starts unset so
+        # an evaluate before a succeeded observe fails CLOSED (never falls back to
+        # the adapter-config observation id, which may be stale/never-observed).
+        self._trusted_observation_id: Optional[str] = None
+        # Injectable UTC clock: the dispatch instant is captured HERE at invoke
+        # time so the CloudTrail correlation can require the write event to be
+        # strictly AFTER the dispatch, without a real wall-clock dependency in tests.
+        self._clock = clock
 
     def __call__(
         self,
@@ -1072,21 +1231,34 @@ class CommandTransport:
         it returns a succeeded observation (a parsed ``observation_id``)."""
         observation_id = self._adapter.observe_succeeded_observation_id()
         if not observation_id:
+            # A failed/unreadable observe clears any prior trusted id: the next
+            # evaluate must fail closed rather than reuse a stale success.
+            self._trusted_observation_id = None
             return _http(200, {"trusted": False, "error_code": "OBSERVATION_NOT_SUCCEEDED"})
+        # Capture the NEWLY-SUCCEEDED observation id: this exact id — not the
+        # adapter-config value — is what the evaluator event will carry.
+        self._trusted_observation_id = observation_id
         return _http(200, {"trusted": True, "observation_id": observation_id})
 
-    def _closed_event(self, direction: str) -> dict[str, Any]:
-        """Build the EXACT closed evaluator event from the harness direction.
+    def _closed_event(self, direction: str) -> Optional[dict[str, Any]]:
+        """Build the EXACT closed evaluator event from the harness direction, or
+        ``None`` when no trusted observation has succeeded yet.
 
         The evaluator's #439 contract accepts exactly
         ``{observation_operation_id, desired, minimum, maximum}`` and rejects any
         unknown field (including ``direction``). The direction is translated here
-        into the requested capacity triple; the observation id is the trusted,
-        server-owned coordinate carried by the adapter config.
+        into the requested capacity triple; the ``observation_operation_id`` is the
+        id returned by the AUTHENTICATED 06 observe+poll and captured by
+        :meth:`_observe` — never the adapter-config value, which may be stale or
+        never-observed. Without a captured trusted id this returns ``None`` and the
+        caller fails closed (it does NOT fabricate or fall back to a config id).
         """
+        trusted = self._trusted_observation_id
+        if not trusted:
+            return None
         desired = _DESIRED_DOWN if str(direction).lower() == "down" else _DESIRED_UP
         return {
-            "observation_operation_id": self._adapter._config.observation_operation_id,
+            "observation_operation_id": trusted,
             "desired": desired,
             "minimum": _WINDOW_MINIMUM,
             "maximum": _WINDOW_MAXIMUM,
@@ -1095,6 +1267,21 @@ class CommandTransport:
     def _evaluate(self, payload: Mapping[str, Any]) -> HttpResponse:
         direction = str(payload.get("direction", "up"))
         event = self._closed_event(direction)
+        if event is None:
+            # No trusted observation has succeeded: fail closed WITHOUT invoking the
+            # evaluator and WITHOUT falling back to the config observation id.
+            return _http(
+                200,
+                {
+                    "decision": "denied",
+                    "outcome": "refused",
+                    "error_code": "NO_TRUSTED_OBSERVATION",
+                    "wrote": False,
+                },
+            )
+        # Capture the dispatch instant BEFORE invoking so the CloudTrail write
+        # correlation can require the write event to be strictly after it.
+        dispatched_at = self._clock()
         try:
             result = self._adapter.invoke_evaluate(event)
         except CommandError:
@@ -1127,7 +1314,7 @@ class CommandTransport:
         # Dispatched: gather the MANDATORY evidence and derive each assertion from
         # it. No field is asserted true unless the evidence supports it.
         operation_id = str(result.get("operation_id", ""))
-        evidence = self._dispatch_evidence(operation_id)
+        evidence = self._dispatch_evidence(operation_id, not_before=dispatched_at)
         body = {
             "decision": "authorized",
             "outcome": _OUTCOME_DISPATCHED,
@@ -1142,7 +1329,7 @@ class CommandTransport:
         }
         return _http(200, body)
 
-    def _dispatch_evidence(self, operation_id: str) -> dict[str, Any]:
+    def _dispatch_evidence(self, operation_id: str, *, not_before: Optional[datetime] = None) -> dict[str, Any]:
         """Read the real StepFunctions / DynamoDB / CloudTrail evidence.
 
         Every field is derived from an actual provider read keyed on the REAL
@@ -1190,14 +1377,19 @@ class CommandTransport:
                 reservation_granted = rsv.get("operation_id", {}).get("S") == operation_id
         except CommandError:
             pass
-        # CloudTrail: the write must be attributed to the executor principal.
+        # CloudTrail: the write is CORRELATED to the exact 07 executor role — the
+        # eventName UpdateFleetCapacity, an event time AFTER dispatch, the exact
+        # fleet/location request, and the executor role's SESSION ISSUER — never a
+        # bare newest ``Username`` literal. The actor is reported as the executor
+        # ONLY on a positive correlation; a readable-but-mismatched or unreadable
+        # attribution reports NO executor actor (fail closed).
         actor = ""
+        correlation_floor = not_before if not_before is not None else datetime.min.replace(tzinfo=timezone.utc)
         try:
             events = self._adapter.lookup_write_attribution(self._adapter._config.enrolled_fleet_id)
-            records = events.get("Events") if isinstance(events, dict) else None
-            if isinstance(records, list) and records:
-                first = records[0]
-                actor = str(first.get("Username", "")) if isinstance(first, dict) else ""
+            correlated = self._adapter.correlated_executor_write(events, not_before=correlation_floor)
+            if correlated is True:
+                actor = _EXECUTOR_WRITE_ACTOR
         except CommandError:
             actor = ""
         return {
@@ -1264,6 +1456,20 @@ class CommandTransport:
         """
         direction = str(payload.get("direction", "up"))
         event = self._closed_event(direction)
+        if event is None:
+            # No trusted observation: the forced attempt cannot even build an event
+            # to send, so it performs no write. This is a confirmed no-write denial.
+            return _http(
+                409,
+                {
+                    "decision": "denied",
+                    "outcome": "refused",
+                    "reason": "NO_TRUSTED_OBSERVATION",
+                    "error_code": "NO_TRUSTED_OBSERVATION",
+                    "wrote": False,
+                },
+            )
+        dispatched_at = self._clock()
         evaluator_unavailable = False
         try:
             result = self._adapter.invoke_evaluate(event)
@@ -1307,7 +1513,7 @@ class CommandTransport:
         # A dispatched outcome is a real failure of the disable; prove the
         # negative from readable write evidence, or report UNKNOWN.
         operation_id = str(result.get("operation_id", ""))
-        started = self._dispatch_evidence(operation_id)["step_functions_started"]
+        started = self._dispatch_evidence(operation_id, not_before=dispatched_at)["step_functions_started"]
         if started is None:
             # UNREADABLE write evidence -> UNKNOWN, do NOT confirm no-write.
             return _http(

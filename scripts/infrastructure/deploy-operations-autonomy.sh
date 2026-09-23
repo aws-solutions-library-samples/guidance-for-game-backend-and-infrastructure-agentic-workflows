@@ -557,6 +557,63 @@ if ! aws lambda get-function "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
 fi
 echo "   Exact 06 bindings verified: operations table, CMK, tenant/workspace/audience, and observation Lambda."
 
+# --------------------------------------------------------------------------- #
+# #440 review (ultimate fix): the 07 EXECUTION stack shares the SAME operations
+# table, operations CMK, tenant, and workspace as the 06 observation stack (see
+# the 07 template's OperationsTableName / OperationsKmsKeyArn parameters and its
+# "Must match the 06 stack's ..." TenantId / WorkspaceId). The earlier binding
+# checked only the 07 workflow/fleet/audience; a 07 stack pointed at a FOREIGN
+# table / CMK / tenant / workspace would let the executor plane write against, or
+# encrypt with, the wrong resource. READ each 07 value and refuse unless it
+# byte-equals the 06 value — preserve (proceed) only after equality.
+# --------------------------------------------------------------------------- #
+echo "🔎 Binding the 07 execution table/CMK/tenant/workspace to the EXACT 06 values ..."
+STACK_07_TABLE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='OperationsTableName'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_TABLE" ] || [ "$STACK_07_TABLE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 OperationsTableName parameter." >&2
+    exit 6
+fi
+if [ "$STACK_07_TABLE" != "$STACK_06_TABLE" ]; then
+    echo "❌ Refusing to enable: the 07 OperationsTableName '$STACK_07_TABLE' does not match the 06 OperationsTableName '$STACK_06_TABLE'." >&2
+    exit 6
+fi
+STACK_07_KMS="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='OperationsKmsKeyArn'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_KMS" ] || [ "$STACK_07_KMS" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 OperationsKmsKeyArn parameter." >&2
+    exit 6
+fi
+if [ "$STACK_07_KMS" != "$STACK_06_KMS" ]; then
+    echo "❌ Refusing to enable: the 07 OperationsKmsKeyArn '$STACK_07_KMS' does not match the 06 OperationsKmsKeyArn '$STACK_06_KMS'." >&2
+    exit 6
+fi
+STACK_07_TENANT="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='TenantId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_TENANT" ] || [ "$STACK_07_TENANT" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 TenantId parameter." >&2
+    exit 6
+fi
+if [ "$STACK_07_TENANT" != "$STACK_06_TENANT" ]; then
+    echo "❌ Refusing to enable: the 07 TenantId '$STACK_07_TENANT' does not match the 06 TenantId '$STACK_06_TENANT'." >&2
+    exit 6
+fi
+STACK_07_WORKSPACE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='WorkspaceId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_WORKSPACE" ] || [ "$STACK_07_WORKSPACE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 WorkspaceId parameter." >&2
+    exit 6
+fi
+if [ "$STACK_07_WORKSPACE" != "$STACK_06_WORKSPACE" ]; then
+    echo "❌ Refusing to enable: the 07 WorkspaceId '$STACK_07_WORKSPACE' does not match the 06 WorkspaceId '$STACK_06_WORKSPACE'." >&2
+    exit 6
+fi
+echo "   Exact 07<->06 bindings verified: operations table, CMK, tenant, and workspace all match the 06 stack."
+
 echo "🔎 Binding the 08 kill-switch AppConfig coordinate to the EXACT deployed values ..."
 if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
     --stack-name "$CONTROL_STACK_NAME" >/dev/null 2>&1; then

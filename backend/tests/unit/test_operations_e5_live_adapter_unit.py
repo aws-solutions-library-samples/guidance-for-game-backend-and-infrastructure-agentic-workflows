@@ -253,6 +253,7 @@ def test_describe_execution_uses_arn_built_from_execution_name_not_operation_id(
         return CommandResult(0, "{}", "")
 
     transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    transport._trusted_observation_id = "op_obs_seeded"  # corrected #440: evaluate requires a succeeded observation
     transport("POST", "https://x/operations/autonomy/op/evaluate", headers={"authorization": "Bearer x"}, body=b"{}")
     arn = captured.get("execution_arn", "")
     assert arn.startswith("arn:aws:states:"), f"must describe by a real execution ARN, got {arn!r}"
@@ -323,6 +324,7 @@ def test_audit_reservation_reads_use_real_uppercase_pk_sk_keys() -> None:
         return CommandResult(0, "{}", "")
 
     transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    transport._trusted_observation_id = "op_obs_seeded"  # corrected #440: evaluate requires a succeeded observation
     resp = transport(
         "POST", "https://x/operations/autonomy/op/evaluate", headers={"authorization": "Bearer x"}, body=b"{}"
     )
@@ -580,6 +582,7 @@ def test_disable_get_reports_unknown_when_switch_unreadable() -> None:
         return CommandResult(0, "{}", "")
 
     transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    transport._trusted_observation_id = "op_obs_seeded"  # corrected #440: evaluate requires a succeeded observation
     resp = transport("GET", "https://x/operations/autonomy/disable", headers={"authorization": "Bearer x"}, body=None)
     body = resp.json()
     # Unknown must NOT be reported as autonomy_enabled=False.
@@ -631,6 +634,7 @@ def test_force_write_denial_requires_evidence_lookup_success() -> None:
         return CommandResult(0, "{}", "")
 
     transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    transport._trusted_observation_id = "op_obs_seeded"  # corrected #440: evaluate requires a succeeded observation
     resp = transport(
         "POST", "https://x/operations/autonomy/op/force-write", headers={"authorization": "Bearer x"}, body=b"{}"
     )

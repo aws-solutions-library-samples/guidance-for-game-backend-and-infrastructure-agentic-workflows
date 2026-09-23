@@ -294,9 +294,19 @@ class E5ShakedownHarness:
         config: E5ShakedownConfig,
         transport: Transport,
         sleep: Optional[Any] = None,
+        cleanup_adapter: Optional[CommandAdapter] = None,
     ) -> None:
         self._config = config
         self._transport = transport
+        # The OPERATOR-OWNED bounded inverse cleanup adapter (TEST TOOLING, not an
+        # autonomy component). Teardown restores the fleet with a direct, bounded
+        # ``gamelift update-fleet-capacity`` at 0/0/1 through THIS adapter instead
+        # of the autonomous evaluator inverse — which the 300/600s cooldown /
+        # frequency limits deny, and which would otherwise leave the fleet at
+        # desired=1. It is invoked only after the operator's inverse confirmation
+        # validates; without a cleanup adapter the teardown falls back to the
+        # (best-effort) evaluator inverse.
+        self._cleanup_adapter = cleanup_adapter
         # Injectable so tests drive the bounded reconcile/disable poll without a
         # real wall-clock wait. Production uses time.sleep.
         if sleep is None:
@@ -601,6 +611,30 @@ class E5ShakedownHarness:
         except Exception:  # noqa: BLE001 - an erroring read is ambiguous, not fatal
             return None, False
 
+    def _bounded_inverse(self) -> None:
+        """Issue ONE bounded inverse toward desired=0, swallowing any error so
+        teardown never re-raises.
+
+        Prefers the OPERATOR-OWNED ``update-fleet-capacity`` cleanup (valid ABI,
+        deterministic, immune to the autonomous 300/600s limits) when a cleanup
+        adapter is wired AND the operator's inverse confirmation validates. It
+        does NOT use the autonomous evaluator inverse for the operator-owned path:
+        that inverse is denied by the cooldown/frequency limits and would leave the
+        fleet at desired=1. Only when no cleanup adapter is available does it fall
+        back to the best-effort evaluator inverse."""
+        if self._cleanup_adapter is not None and inverse_confirmation_is_valid(self._config.inverse_confirmation):
+            try:
+                self._cleanup_adapter.operator_inverse_update_fleet_capacity()
+                return
+            except Exception:  # noqa: BLE001 - teardown must never re-raise
+                return
+        # No operator cleanup adapter (or unconfirmed inverse): best-effort
+        # autonomous inverse. This may be limit-denied; the bounded poll re-reads.
+        try:
+            self._evaluate("down", bearer=self._config.admin_bearer)
+        except Exception:  # noqa: BLE001 - teardown must never re-raise
+            pass
+
     def _confirm_capacity_zero(self) -> bool:
         """Poll the capacity, reconciling with a bounded inverse until the fleet
         is CONFIRMED at desired=0 or the attempts are exhausted.
@@ -608,17 +642,17 @@ class E5ShakedownHarness:
         The inverse is attempted whenever the capacity is not confirmed zero —
         INCLUDING when the read raised or was ambiguous. The read never being
         clean does not skip the inverse; it only means we keep trying within the
-        bounded budget. Any exception is swallowed so teardown never re-raises."""
+        bounded budget. The inverse is the OPERATOR-OWNED bounded
+        ``update-fleet-capacity`` (see :meth:`_bounded_inverse`) so a cooldown on
+        the autonomous inverse can never leave the fleet at desired=1. Any
+        exception is swallowed so teardown never re-raises."""
         for attempt in range(_TEARDOWN_MAX_ATTEMPTS):
             desired, _read_ok = self._read_desired_or_ambiguous()
             if desired == 0:
                 return True
-            # Not confirmed zero (ambiguous OR > 0): attempt the bounded inverse
-            # through the trusted adapter, then loop to re-read and reconcile.
-            try:
-                self._evaluate("down", bearer=self._config.admin_bearer)
-            except Exception:  # noqa: BLE001 - teardown must never re-raise
-                pass
+            # Not confirmed zero (ambiguous OR > 0): attempt the bounded inverse,
+            # then loop to re-read and reconcile.
+            self._bounded_inverse()
             if attempt + 1 < _TEARDOWN_MAX_ATTEMPTS:
                 self._sleep(_TEARDOWN_POLL_SECONDS)
         # Final confirming read after the last inverse.
@@ -812,6 +846,9 @@ def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig"
         observe_api_endpoint=_val("observe_api_endpoint") or config.endpoint,
         # The env var the short-lived observe bearer is read from (never argv).
         observe_bearer_env_var=_val("observe_bearer_env_var", "GBAW_E5_OBSERVE_BEARER"),
+        # The exact 07 executor role ARN the single UpdateFleetCapacity write must
+        # be attributed to (CloudTrail correlation, not a Username literal).
+        executor_role_arn=_val("executor_role_arn"),
     )
     return CommandAdapter(adapter_config, runner=subprocess_runner)
 
@@ -960,7 +997,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 3
     config = _replace_preflight(config, measured)
     transport = CommandTransport(adapter)
-    harness = E5ShakedownHarness(config, transport)
+    # The SAME adapter also serves as the operator-owned bounded inverse cleanup
+    # (TEST TOOLING): teardown restores the fleet with a direct update-fleet-capacity
+    # at 0/0/1 rather than the cooldown-denied autonomous inverse. It only fires
+    # after the operator's inverse confirmation validates (see _bounded_inverse).
+    harness = E5ShakedownHarness(config, transport, cleanup_adapter=adapter)
     summary = harness.run()
     if not summary_is_public_safe(summary):  # defensive: never emit a leaky summary
         print(json.dumps({"error": "summary failed public-safety check"}))
