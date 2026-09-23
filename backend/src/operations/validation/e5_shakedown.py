@@ -126,6 +126,23 @@ _EXECUTOR_WRITE_ACTOR = "executor"
 _FORBIDDEN_MARKERS = ("arn:aws:", "fleet-", "execute-api", "Bearer ", "eyJ", "AKIA")
 
 
+# The concrete COMMAND CONTRACT for a real run. The E5 evaluator exposes NO HTTP
+# API: it is a Lambda invoked by EventBridge / Step Functions StartExecution, and
+# its effects are verified through provider-native reads. Each logical lifecycle
+# step below maps to a concrete AWS operation, NOT an HTTP route. A real adapter
+# wires these; the HTTP-shaped ``path`` strings in this module are only the
+# in-memory test seam and must never be issued against a live plane.
+ADAPTER_COMMAND_CONTRACT = {
+    "observe": "lambda:InvokeFunction on the E1/E2 observe function (trusted observation)",
+    "evaluate": "lambda:InvokeFunction on the E5 evaluator with the closed #439 event",
+    "dispatch": "stepfunctions:DescribeExecution on the started E3 STANDARD execution",
+    "audit_reservation": "dynamodb:GetItem on the 06 operations table (audit + reservation items)",
+    "write_attribution": "cloudtrail:LookupEvents to confirm the executor (not the evaluator) wrote",
+    "capacity": "gamelift:DescribeFleetCapacity / DescribeFleetLocationCapacity on the enrolled fleet",
+    "disable": "appconfig deploy of the disabled autonomy switch document",
+}
+
+
 def confirmation_is_valid(confirmation: str) -> bool:
     """Return whether the operator-supplied forward confirmation exactly unlocks 0->1."""
     return hmac.compare_digest(confirmation, REQUIRED_CONFIRMATION)
@@ -482,38 +499,110 @@ class E5ShakedownHarness:
         # 2. One trusted E1 observation.
         checks.append(self.check_trusted_e1_observation())
 
-        # 3-4. Forward evaluation 0 -> 1 (write-capable) and its write assertions.
-        forward = self._evaluate("up", bearer=self._config.admin_bearer)
-        checks.append(self.check_evaluator_authorizes_0_to_1(forward))
-        checks.append(self.check_write_audited_reserved_sfn_executor_only(forward))
+        # Everything from the forward 0 -> 1 write onward is a SCALED state that
+        # MUST be torn back down no matter what happens. We track whether a
+        # scale-up was attempted and guarantee, in a finally block, a
+        # separately-confirmed inverse 1 -> 0 restore and an autonomy disable —
+        # even if a check in between raises. This is the safety-critical property:
+        # the harness never leaves the enrolled fleet scaled up.
+        scaled_up = False
+        forward: Optional[HttpResponse] = None
+        try:
+            # 3-4. Forward evaluation 0 -> 1 (write-capable) and its write assertions.
+            forward = self._evaluate("up", bearer=self._config.admin_bearer)
+            scaled_up = True
+            checks.append(self.check_evaluator_authorizes_0_to_1(forward))
+            checks.append(self.check_write_audited_reserved_sfn_executor_only(forward))
 
-        # 5. Capacity is one.
-        checks.append(self._check_capacity("capacity_is_one", 1))
+            # 5. Capacity is one.
+            checks.append(self._check_capacity("capacity_is_one", 1))
 
-        # 6. Immediate retry denied by cooldown/frequency/concurrency.
-        checks.append(self.check_immediate_retry_denied_by_limits())
+            # 6. Immediate retry denied by cooldown/frequency/concurrency.
+            checks.append(self.check_immediate_retry_denied_by_limits())
 
-        # 7. Separately-confirmed inverse 1 -> 0 (restore).
-        inverse = self._evaluate("down", bearer=self._config.admin_bearer)
-        checks.append(self.check_inverse_1_to_0(inverse))
+            # 7. Separately-confirmed inverse 1 -> 0 (restore).
+            inverse = self._evaluate("down", bearer=self._config.admin_bearer)
+            checks.append(self.check_inverse_1_to_0(inverse))
+            scaled_up = False  # the planned restore succeeded
 
-        # 8. Capacity is zero (restored).
-        checks.append(self._check_capacity("capacity_is_zero", 0))
+            # 8. Capacity is zero (restored).
+            checks.append(self._check_capacity("capacity_is_zero", 0))
 
-        # 9. Disable autonomy.
-        checks.append(self.check_autonomy_disabled())
+            # 9. Disable autonomy.
+            checks.append(self.check_autonomy_disabled())
 
-        # 10. Forced evaluator/executor attempt after disable cannot write.
-        checks.append(self.check_forced_write_denied())
+            # 10. Forced evaluator/executor attempt after disable cannot write.
+            checks.append(self.check_forced_write_denied())
 
-        # 11-15. Negative controls.
-        checks.append(self.check_iam_negative())
-        checks.append(self._preflight_echo_check("alarms_safe", self._config.preflight.alarms_safe))
-        checks.append(self._preflight_echo_check("drift_safe", self._config.preflight.drift_safe))
-        checks.append(self._exact_artifact_check(forward))
-        checks.append(self._audit_complete_check(forward))
+            # 11-15. Negative controls.
+            checks.append(self.check_iam_negative())
+            checks.append(self._preflight_echo_check("alarms_safe", self._config.preflight.alarms_safe))
+            checks.append(self._preflight_echo_check("drift_safe", self._config.preflight.drift_safe))
+            checks.append(self._exact_artifact_check(forward))
+            checks.append(self._audit_complete_check(forward))
+        except Exception as exc:  # noqa: BLE001 - record and still tear down
+            # A mid-lifecycle failure must NOT abort teardown or the summary. It is
+            # recorded as a failed check; the finally block still restores+disables.
+            checks.append(
+                CheckResult(
+                    name="lifecycle_exception",
+                    passed=False,
+                    detail=f"mid-lifecycle failure: {type(exc).__name__}",
+                )
+            )
+        finally:
+            # GUARANTEED teardown: if the fleet was scaled up and the planned
+            # inverse did not already restore it, force the separately-confirmed
+            # inverse 1 -> 0 and disable autonomy, recording the outcome. This runs
+            # on the normal path (a no-op when already restored+disabled) and on
+            # every post-scale exception path.
+            checks.append(self._guaranteed_restore_and_disable(scaled_up))
 
         return self._sanitized_summary(checks=checks, refused=False, refusal_codes=[])
+
+    def _guaranteed_restore_and_disable(self, scaled_up: bool) -> CheckResult:
+        """Best-effort, exception-safe restore of the fleet to 0 and disable.
+
+        Always attempts to read the current capacity; if it is not already 0 (or
+        the read is unavailable), it issues the separately-confirmed inverse
+        1 -> 0 and then disables autonomy. Any failure here is recorded as a
+        FAILED check rather than raised, so the summary always surfaces whether
+        the guaranteed teardown succeeded. Requires the inverse confirmation to
+        have been supplied (it is a precondition of the whole run)."""
+        restored = True
+        disabled = True
+        detail = "no scale-up occurred; nothing to restore" if not scaled_up else ""
+        try:
+            # Re-read capacity; restore only if not already zero.
+            current = self._desired_or_none(
+                self._request(
+                    "GET",
+                    f"/operations/autonomy/{self._config.operation_id}/capacity",
+                    bearer=self._config.admin_bearer,
+                )
+            )
+            if current != 0:
+                inverse = self._evaluate("down", bearer=self._config.admin_bearer)
+                restored = self._body(inverse).get("decision") == "authorized"
+                after = self._desired_or_none(
+                    self._request(
+                        "GET",
+                        f"/operations/autonomy/{self._config.operation_id}/capacity",
+                        bearer=self._config.admin_bearer,
+                    )
+                )
+                restored = restored and after == 0
+                if not restored:
+                    detail = "guaranteed inverse 1->0 did not restore the fleet to zero"
+        except Exception as exc:  # noqa: BLE001 - teardown must never re-raise
+            restored = False
+            detail = f"guaranteed restore failed: {type(exc).__name__}"
+        try:
+            self._request("POST", "/operations/autonomy/disable", bearer=self._config.admin_bearer)
+        except Exception as exc:  # noqa: BLE001 - teardown must never re-raise
+            disabled = False
+            detail = (detail + "; " if detail else "") + f"disable failed: {type(exc).__name__}"
+        return CheckResult(name="guaranteed_restore", passed=restored and disabled, detail=detail)
 
     def _preflight_echo_check(self, name: str, value: bool) -> CheckResult:
         return CheckResult(name=name, passed=bool(value))
@@ -642,7 +731,31 @@ def main(argv: Optional[list[str]] = None) -> int:
             "is distinct from the forward confirmation."
         ),
     )
+    parser.add_argument(
+        "--adapter",
+        default="",
+        choices=["", "command"],
+        help=(
+            "REQUIRED to run: the E5 evaluator has no HTTP API. Pass "
+            "'--adapter command' to acknowledge the concrete command contract "
+            "(Lambda/StepFunctions/DynamoDB/CloudTrail/GameLift). Without it the "
+            "harness refuses rather than issue HTTP to nonexistent routes."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.adapter != "command":
+        # Fail closed: never issue HTTP to imaginary routes. A real run must wire
+        # the concrete command adapter and pass --adapter command.
+        print(
+            json.dumps(
+                {
+                    "error": "refused: the E5 evaluator has no HTTP API; wire a concrete command adapter",
+                    "command_contract": ADAPTER_COMMAND_CONTRACT,
+                }
+            )
+        )
+        return 3
 
     config = _build_config(args)
     harness = E5ShakedownHarness(config, _requests_transport())

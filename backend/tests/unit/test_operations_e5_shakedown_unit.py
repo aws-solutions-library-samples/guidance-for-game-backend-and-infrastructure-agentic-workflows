@@ -291,6 +291,7 @@ def test_lifecycle_runs_expected_checks_in_order() -> None:
         "drift_safe",
         "exact_artifact",
         "audit_complete",
+        "guaranteed_restore",
     ]
 
 
@@ -395,3 +396,74 @@ def test_config_rejects_non_https_endpoint() -> None:
 def test_config_rejects_blank_admin_bearer() -> None:
     with pytest.raises(ValueError):
         _config(admin_bearer="   ")
+
+
+# --------------------------------------------------------------------------- #
+# Finding 9: guaranteed finally restore + disable on any post-scale exception.
+# --------------------------------------------------------------------------- #
+class _RaiseAfterScaleTransport(FakeDeployedE5):
+    """A transport that raises right after the 0->1 scale, to prove the harness
+    still restores 1->0 and disables in a finally block."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._raised = False
+
+    def __call__(self, method, url, headers, body):
+        path = url[len(ENDPOINT) :]
+        # Let the forward 0->1 evaluate succeed (sets desired=1), then raise on
+        # the very next capacity read to simulate a mid-lifecycle failure.
+        if path == f"/operations/autonomy/{OP_ID}/capacity" and self.desired == 1 and not self._raised:
+            self._raised = True
+            raise RuntimeError("simulated mid-lifecycle failure after scale-up")
+        return super().__call__(method, url, headers, body)
+
+
+def test_post_scale_exception_still_restores_and_disables() -> None:
+    transport = _RaiseAfterScaleTransport()
+    harness = sd.E5ShakedownHarness(_config(), transport)
+    summary = harness.run()
+    # The fleet must have been restored to 0 despite the mid-lifecycle failure.
+    assert transport.desired == 0, "the harness must restore 1->0 in a finally block"
+    # Autonomy must have been disabled as part of the guaranteed teardown.
+    assert transport.autonomy_enabled is False, "the harness must disable autonomy in the finally block"
+    # The summary must record the failure (not silently pass) and the restore.
+    names = {c["name"] for c in summary["checks"]}
+    assert "guaranteed_restore" in names, "the harness must record a guaranteed_restore check"
+
+
+def test_no_restore_needed_when_never_scaled() -> None:
+    """If the run is refused before any scale, the finally must not attempt a
+    provider write (nothing to restore)."""
+    cfg = _config(confirmation="")  # refused: no confirmation
+    transport = FakeDeployedE5()
+    harness = sd.E5ShakedownHarness(cfg, transport)
+    summary = harness.run()
+    assert summary["refused"] is True
+    # No write ever happened, so desired stayed 0 and no evaluate call was made.
+    assert transport.desired == 0
+    assert all(m != "POST" or "/evaluate" not in u for (m, u) in transport.calls)
+
+
+def test_main_refuses_imaginary_http_routes_without_explicit_adapter() -> None:
+    """Finding 9: the E5 evaluator has NO HTTP API (it is a Lambda invoked by
+    EventBridge/StartExecution, verified via DynamoDB/StepFunctions/CloudTrail/
+    GameLift). main() must NOT silently issue HTTP to nonexistent routes; it must
+    fail closed unless an operator explicitly selects a concrete command
+    adapter."""
+    rc = sd.main(["--endpoint", "https://example.invalid"])
+    assert rc != 0, "main() must refuse to run against imaginary HTTP routes by default"
+
+
+def test_adapter_command_contract_is_documented() -> None:
+    """The concrete command contract (each logical step -> real AWS operation)
+    must be documented in the module so operators wire a real adapter."""
+    assert sd.ADAPTER_COMMAND_CONTRACT, "the module must expose a concrete command contract"
+    contract = sd.ADAPTER_COMMAND_CONTRACT
+    # Every lifecycle step maps to a concrete AWS operation, not an HTTP route.
+    joined = " ".join(contract.values()).lower()
+    assert "lambda" in joined
+    assert "stepfunctions" in joined or "states" in joined
+    assert "dynamodb" in joined
+    assert "cloudtrail" in joined
+    assert "gamelift" in joined
