@@ -5,7 +5,9 @@ therefore records a ``dispatch_requested`` state record *before* StartExecution
 and a ``dispatched`` record only after a confirmed (or idempotent) start. After
 StartExecution uncertainty the runtime retains the ``dispatch_requested``
 evidence and never fabricates a ``dispatched`` record. Both records are written
-with conditional immutability so a replay cannot rewrite the audit trail.
+with conditional immutability so a replay cannot rewrite the audit trail, and
+``dispatched`` is additionally fenced — in one ``TransactWriteItems`` — on a
+matching ``dispatch_requested`` predecessor.
 """
 
 from __future__ import annotations
@@ -29,6 +31,15 @@ class _ConditionalFailure(Exception):
         self.response = {"Error": {"Code": "ConditionalCheckFailedException"}}
 
 
+class _TransactionCancelled(Exception):
+    def __init__(self, reasons: list[str]) -> None:
+        super().__init__("transaction cancelled")
+        self.response = {
+            "Error": {"Code": "TransactionCanceledException"},
+            "CancellationReasons": [{"Code": code} for code in reasons],
+        }
+
+
 class _FakeDynamo:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
@@ -42,6 +53,34 @@ class _FakeDynamo:
     def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
         item = self.items.get((Key["PK"]["S"], Key["SK"]["S"]))
         return {"Item": item} if item is not None else {}
+
+    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> None:
+        reasons: list[str] = []
+        staged: list[tuple[tuple[str, str], dict[str, Any]]] = []
+        failed = False
+        for entry in TransactItems:
+            if "ConditionCheck" in entry:
+                cc = entry["ConditionCheck"]
+                key = (cc["Key"]["PK"]["S"], cc["Key"]["SK"]["S"])
+                ok = key in self.items
+                if ok and ":name" in cc.get("ExpressionAttributeValues", {}):
+                    stored = self.items[key]
+                    ok = stored.get("execution_name", {}).get("S") == cc["ExpressionAttributeValues"][":name"]["S"]
+                reasons.append("None" if ok else "ConditionalCheckFailed")
+                failed = failed or not ok
+            elif "Put" in entry:
+                put = entry["Put"]
+                key = (put["Item"]["PK"]["S"], put["Item"]["SK"]["S"])
+                ok = not ("attribute_not_exists" in put.get("ConditionExpression", "") and key in self.items)
+                reasons.append("None" if ok else "ConditionalCheckFailed")
+                if ok:
+                    staged.append((key, put["Item"]))
+                else:
+                    failed = True
+        if failed:
+            raise _TransactionCancelled(reasons)
+        for key, item in staged:
+            self.items[key] = item
 
 
 @pytest.mark.unit

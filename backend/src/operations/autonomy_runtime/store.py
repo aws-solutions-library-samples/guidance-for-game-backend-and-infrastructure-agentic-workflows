@@ -1157,13 +1157,75 @@ class DynamoDbAutonomyBundleStore:
         )
 
     def record_dispatched(self, *, operation_id: str, execution_name: str) -> None:
-        """Durably record that StartExecution was confirmed (or idempotently replayed).
+        """Atomically record ``dispatched`` fenced on a matching ``dispatch_requested``.
 
-        Only written AFTER a confirmed or idempotent start, so a terminal
-        execution never claims an unproven predecessor. Immutable and idempotent
-        exactly like :meth:`record_dispatch_requested`.
+        Only legitimate AFTER a confirmed or idempotent StartExecution, and only
+        when the matching ``dispatch_requested`` predecessor already exists for
+        the SAME operation id and execution name. This is enforced atomically in
+        ONE ``TransactWriteItems`` containing
+
+        * a ``ConditionCheck`` that the exact ``dispatch_requested`` item exists
+          for this operation id and carries this execution name, and
+        * a conditional immutable ``Put`` of the ``dispatched`` record.
+
+        Because both live in one transaction, a ``dispatched`` record can never
+        be written (or forged) without its matching request predecessor, and the
+        executor's two-record check can never observe a crossed pair. An
+        identical re-record is idempotent; a differing execution name, or a
+        missing request, fails closed with :class:`AutonomyBundleStoreError` and
+        writes nothing (no independent ``put_item`` fallback).
         """
-        self._record_dispatch_audit(operation_id=operation_id, phase="dispatched", execution_name=execution_name)
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        if not isinstance(execution_name, str) or not execution_name.strip():
+            raise ValueError("execution_name must be a non-empty string")
+        canonical = _canonical({"operation_id": operation_id, "phase": "dispatched", "execution_name": execution_name})
+        dispatched_item = {
+            "PK": {"S": self._bundle_pk(operation_id)},
+            "SK": {"S": self._audit_sk("dispatched")},
+            "operation_id": {"S": operation_id},
+            "phase": {"S": "dispatched"},
+            "execution_name": {"S": execution_name},
+            "audit": {"S": canonical},
+        }
+        requested_check = {
+            "ConditionCheck": {
+                "TableName": self._table_name,
+                "Key": {
+                    "PK": {"S": self._bundle_pk(operation_id)},
+                    "SK": {"S": self._audit_sk("dispatch_requested")},
+                },
+                "ConditionExpression": "attribute_exists(SK) AND execution_name = :name",
+                "ExpressionAttributeValues": {":name": {"S": execution_name}},
+            }
+        }
+        dispatched_put = {
+            "Put": {
+                "TableName": self._table_name,
+                "Item": dispatched_item,
+                "ConditionExpression": "attribute_not_exists(SK)",
+            }
+        }
+        try:
+            self._client.transact_write_items(TransactItems=[requested_check, dispatched_put])
+        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
+            if _is_conditional_failure(exc):
+                # A condition failed. An identical ``dispatched`` already present
+                # (with its request predecessor still satisfied) is an idempotent
+                # replay and resolves cleanly; anything else — no matching
+                # request, a differing execution name, or a differing existing
+                # ``dispatched`` — fails closed without overwriting the trail.
+                existing = self._raw_audit(operation_id, "dispatched")
+                if existing is not None and existing == canonical:
+                    return
+                raise AutonomyBundleStoreError(
+                    "dispatched requires a matching dispatch_requested predecessor and is immutable"
+                ) from exc
+            _LOGGER.warning(
+                "dynamodb_autonomy_bundle_store dispatched-transaction unavailable exception_type=%s",
+                type(exc).__name__,
+            )
+            raise AutonomyBundleStoreError("bundle store is unavailable") from exc
 
     def load_dispatch_audit(self, *, operation_id: str, phase: str) -> dict[str, Any] | None:
         """Reload one dispatch audit record (``dispatch_requested``/``dispatched``)."""
@@ -1193,6 +1255,10 @@ class DynamoDbAutonomyBundleStore:
             "SK": {"S": self._audit_sk(phase)},
             "operation_id": {"S": operation_id},
             "phase": {"S": phase},
+            # Store ``execution_name`` as a first-class attribute so the
+            # ``record_dispatched`` transaction can fence its ConditionCheck on a
+            # matching ``dispatch_requested`` predecessor without re-parsing JSON.
+            "execution_name": {"S": execution_name},
             "audit": {"S": canonical},
         }
         try:

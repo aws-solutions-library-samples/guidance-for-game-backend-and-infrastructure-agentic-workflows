@@ -72,11 +72,12 @@ class _BundleStore:
         return self._bundle
 
     def load_dispatch_audit(self, *, operation_id: str, phase: str) -> dict[str, Any] | None:
-        # The evaluator records ``dispatched`` after a confirmed StartExecution;
-        # the executor requires it before verifying or writing.
+        # The evaluator records ``dispatch_requested`` before StartExecution and a
+        # transaction-fenced ``dispatched`` after a confirmed start; the executor
+        # requires BOTH matching records before verifying or writing.
         self.audit_loads.append(f"{phase}:{operation_id}")
-        if phase == "dispatched" and self._dispatched:
-            return {"operation_id": operation_id, "phase": "dispatched", "execution_name": operation_id}
+        if phase in ("dispatch_requested", "dispatched") and self._dispatched:
+            return {"operation_id": operation_id, "phase": phase, "execution_name": operation_id}
         return None
 
 

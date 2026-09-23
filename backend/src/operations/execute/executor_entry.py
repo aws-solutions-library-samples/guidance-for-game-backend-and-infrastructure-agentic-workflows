@@ -318,6 +318,29 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
     if path is not ExecutionPath.AUTONOMOUS:
         raise ExecutorServiceError("reloaded bundle is not an autonomous operation")
 
+    # The stable logical action id is derived once from the reloaded, hash-bound
+    # operation and threaded through so the settle always targets the exact
+    # in-flight reservation. It is derived here — before any audit/verify — so the
+    # safe terminal-replay path can key the recorded-result lookup on it.
+    action_id = _derive_v2_action_id(operation)
+
+    # SAFE TERMINAL-REPLAY (issue #439, first E5 blocker). After a successful v2
+    # execution settles the in-flight reservation (generation 1), a retry would
+    # otherwise run the verifier — whose LAST precondition confirms LIVE
+    # reservation ownership — before the E3 store's idempotent replay could return
+    # the already-recorded terminal result, so a genuinely completed operation
+    # reports a spurious precondition failure. Before any live-reservation verify,
+    # consult the existing E3 recorded terminal result for THIS exact derived
+    # action id; when it exists, is contract-valid, terminal, and binds the exact
+    # operation/action ids, return it verbatim with NO Describe, NO provider
+    # write, NO settle, and without running the verifier or the write core. A
+    # missing/nonterminal/malformed/mismatched result never shortcuts: the
+    # invocation continues the normal verify + write path (or fails closed there),
+    # so first attempts (no recorded result) are never bypassed.
+    replayed = _attempt_terminal_replay(runtime, invocation.operation_id, action_id)
+    if replayed is not None:
+        return replayed
+
     # Require the exact ``dispatched`` audit record BEFORE verifying or writing.
     # The evaluator records ``dispatched`` only after a confirmed/idempotent
     # StartExecution; its absence means this execution has no proven dispatch
@@ -325,13 +348,6 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
     # closed with no verify, no Describe, and no provider write.
     _require_dispatched_audit(runtime.bundle_store, invocation.operation_id)
 
-    # The stable logical action id is derived once from the reloaded, hash-bound
-    # operation and threaded through so the settle always targets the exact
-    # in-flight reservation.
-    # Local modules
-    from operations.contracts.execution import logical_action_id
-
-    action_id = logical_action_id(operation["operation_id"], operation["prepared_hash"])
     # The reservation was taken by the runtime handler at generation 1; a sweeper
     # reclaim of an expired lease bumps the generation, so settling/ownership at
     # generation 1 correctly fails closed for a reclaimed operation (fencing).
@@ -416,13 +432,82 @@ def build_pre_write_reverify_hook(
     return _hook
 
 
+def _derive_v2_action_id(operation: Mapping[str, Any]) -> str:
+    """Derive the exact logical action id from the immutable v2 operation.
+
+    Validates that the reloaded operation carries a well-formed ``operation_id``
+    and ``prepared_hash`` (the hash-bound contract fields) and returns the stable
+    ``logical_action_id`` for the ``(operation_id, prepared_hash)`` pair. A
+    missing or malformed field fails closed rather than deriving a bogus id.
+    """
+    # Local modules
+    from operations.contracts.execution import logical_action_id
+    from operations.execute.executor_service import ExecutorServiceError
+
+    operation_id = operation.get("operation_id")
+    prepared_hash = operation.get("prepared_hash")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise ExecutorServiceError("reloaded bundle is malformed")
+    if not isinstance(prepared_hash, str) or not prepared_hash.strip():
+        raise ExecutorServiceError("reloaded bundle is malformed")
+    return logical_action_id(operation_id, prepared_hash)
+
+
+def _attempt_terminal_replay(
+    runtime: AutonomyExecutorRuntime, operation_id: str, action_id: str
+) -> dict[str, Any] | None:
+    """Return an already-recorded, contract-valid terminal result, or ``None``.
+
+    Consults the E3 recorded terminal result for the exact derived
+    ``action_id`` through the narrow, read-only
+    :meth:`ExecutorService.load_recorded_terminal_result`. A result is replayed
+    ONLY when it exists, validates against the execution-result contract, and
+    binds the exact operation id and logical action id. Anything else — no
+    recorded result (a first attempt), a malformed document, or a mismatched
+    operation/action id — returns ``None`` so the caller continues the normal
+    verify + write path. No Describe, provider write, or settle is performed here.
+    """
+    # Local modules
+    from operations.contracts.execution import (
+        EXECUTION_RESULT_SCHEMA_NAME,
+        ExecutionContractError,
+        validate_execution_contract,
+    )
+
+    service = runtime.autonomy_service
+    loader = getattr(service, "load_recorded_terminal_result", None)
+    if loader is None:
+        return None
+    recorded = loader(operation_id=operation_id, logical_action_id=action_id)
+    if not isinstance(recorded, dict):
+        return None
+    # Validate the recorded document against its contract before trusting it.
+    try:
+        validate_execution_contract(EXECUTION_RESULT_SCHEMA_NAME, recorded)
+    except ExecutionContractError:
+        return None
+    # Exact identity binding: the recorded result must be THIS operation and the
+    # exact derived logical action id — never a neighbour or a caller-supplied id.
+    if recorded.get("operation_id") != operation_id:
+        return None
+    if recorded.get("logical_action_id") != action_id:
+        return None
+    return recorded
+
+
 def _require_dispatched_audit(bundle_store: Any, operation_id: str) -> None:
-    """Fail closed unless the exact ``dispatched`` audit record exists.
+    """Fail closed unless BOTH matching dispatch audit records exist and agree.
 
     The v2 autonomous execution is only legitimate if the evaluator durably
-    recorded a confirmed dispatch for this operation id. A bundle store that
-    cannot report the audit, or a missing ``dispatched`` record, refuses the
-    execution before any precondition re-verification or provider write.
+    recorded a confirmed dispatch for this operation id. The store writes two
+    records: a ``dispatch_requested`` before StartExecution and a ``dispatched``
+    only after a confirmed/idempotent start, fenced (in one transaction) on the
+    request. The executor mirrors that contract on read: it loads BOTH records
+    and requires each to be well-formed and to agree on operation id and
+    execution name. A missing record, an unreadable store, a phase mismatch, or
+    a crossed (operation/execution-name) pair refuses the execution before any
+    precondition re-verification or provider write — a lone ``dispatched`` marker
+    is never sufficient.
     """
     # Local modules
     from operations.execute.executor_service import ExecutorServiceError
@@ -431,11 +516,25 @@ def _require_dispatched_audit(bundle_store: Any, operation_id: str) -> None:
     if load is None:
         raise ExecutorServiceError("dispatch audit is unavailable for execution")
     try:
-        record = load(operation_id=operation_id, phase="dispatched")
+        requested = load(operation_id=operation_id, phase="dispatch_requested")
+        dispatched = load(operation_id=operation_id, phase="dispatched")
     except Exception as exc:  # noqa: BLE001 - any audit read failure fails closed
         raise ExecutorServiceError("dispatch audit could not be read") from exc
-    if not isinstance(record, dict) or record.get("phase") != "dispatched":
+
+    if not isinstance(requested, dict) or requested.get("phase") != "dispatch_requested":
+        raise ExecutorServiceError("operation has no confirmed dispatch request record")
+    if not isinstance(dispatched, dict) or dispatched.get("phase") != "dispatched":
         raise ExecutorServiceError("operation has no confirmed dispatch record")
+    # Both records must bind the SAME operation and execution name; a crossed
+    # pair (or one addressed to another operation/execution) fails closed.
+    if requested.get("operation_id") != operation_id or dispatched.get("operation_id") != operation_id:
+        raise ExecutorServiceError("dispatch audit records do not bind this operation")
+    requested_name = requested.get("execution_name")
+    dispatched_name = dispatched.get("execution_name")
+    if not isinstance(requested_name, str) or not requested_name:
+        raise ExecutorServiceError("dispatch request record is malformed")
+    if requested_name != dispatched_name:
+        raise ExecutorServiceError("dispatch audit records do not agree on execution name")
 
 
 def _build_runtime() -> AutonomyExecutorRuntime:

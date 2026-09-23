@@ -142,6 +142,8 @@ class ExecutionStorePort(Protocol):
         result: Mapping[str, Any],
     ) -> ExecutionCommitOutcome: ...
 
+    def load_recorded_result(self, logical_action_id: str) -> dict[str, Any] | None: ...
+
 
 class ExecutionAdapterPort(Protocol):
     """The single-write GameLift adapter port."""
@@ -248,6 +250,22 @@ class ExecutorService:
         if plan.intent.get("operation_id") != invocation.operation_id:
             raise ExecutorServiceError("operation identity mismatch")
         return self._run(invocation, plan=plan, lease_holder=lease_holder)
+
+    def load_recorded_terminal_result(self, *, operation_id: str, logical_action_id: str) -> dict[str, Any] | None:
+        """Return the already-recorded E3 terminal result, or ``None`` if absent.
+
+        A narrow, read-only accessor over the fenced execution store's idempotent
+        replay record. It performs NO Describe, NO provider write, NO settle, and
+        NO precondition verification: it is the safe terminal-replay source the
+        v2 executor entry consults BEFORE the live-reservation verify, so a retry
+        of an operation that already completed (and whose in-flight reservation
+        was settled) returns the recorded terminal result instead of failing the
+        live-reservation check. Callers MUST validate the result contract and its
+        operation/action identity before returning it; this method neither
+        validates nor mutates. ``operation_id`` is accepted for symmetry and
+        call-site clarity; the store key is the stable ``logical_action_id``.
+        """
+        return self._store.load_recorded_result(logical_action_id)
 
     def _run(
         self,
