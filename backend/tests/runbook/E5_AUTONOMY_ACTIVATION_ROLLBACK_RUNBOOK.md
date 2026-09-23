@@ -141,10 +141,20 @@ Rollback is always safe to perform and leaves the fleet at rest.
    inverse step) and confirm `desired=0`.
 3. **Verify no forced write is possible** — a forced evaluator/executor attempt
    returns a denial and performs no write (`forced_evaluator_executor_cannot_write`).
-4. **(Full teardown)** Delete the optional E5 stack wrapper. Because it is layered
-   and separate, deleting it does not touch stacks `00`–`08`, the E4 schema, or
-   the chat runtime. Confirm zero autonomy resources remain and the account is
-   back to the **default-zero** posture.
+4. **(Full teardown)** Delete the optional E5 stack wrapper
+   (`teardown-operations-autonomy.sh --confirm delete-operations-autonomy`).
+   Because it is layered and separate, deleting it does not touch stacks
+   `00`–`08`, the E4 schema, or the chat runtime. Deleting the 09 stack removes
+   the evaluator, the schedule rule, the autonomy AppConfig application, and the
+   four alarms, but **two resources are retained by design** and SURVIVE the
+   teardown: the evaluator **log group** and the evaluator **dead-letter queue**
+   both use a `Retain` deletion policy so the audit trail and any captured
+   failures outlive the stack. They continue to incur minimal storage cost until
+   deleted by hand. The account therefore returns to the enabled-autonomy
+   posture minus the billable evaluation surface — **not** a literal zero-resource
+   state. Confirm those two retained resources are the only autonomy artifacts
+   left, and that no evaluator, schedule, AppConfig autonomy document, or alarm
+   remains.
 
 ## 5. Ambiguous-result / abort handling
 

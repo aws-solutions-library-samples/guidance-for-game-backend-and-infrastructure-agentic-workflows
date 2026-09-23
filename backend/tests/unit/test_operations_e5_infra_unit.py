@@ -96,7 +96,6 @@ ALLOWED_DYNAMODB_ACTIONS = frozenset(
         "dynamodb:PutItem",
         "dynamodb:UpdateItem",
         "dynamodb:GetItem",
-        "dynamodb:Query",
     }
 )
 
@@ -115,6 +114,7 @@ E5_FORBIDDEN_ACTION_SUBSTRINGS = (
     "codebuild:",
     "codepipeline:",
     "dynamodb:DeleteItem",
+    "dynamodb:Query",
     "dynamodb:Scan",
     "dynamodb:BatchWriteItem",
     "dynamodb:BatchGetItem",
@@ -403,6 +403,11 @@ def test_evaluator_dynamodb_actions_are_bounded_single_item(template):
     ddb = {a for a in _all_policy_actions(template) if a.startswith("dynamodb:")}
     assert ddb, "evaluator must have bounded DynamoDB access to the operations table"
     assert ddb <= ALLOWED_DYNAMODB_ACTIONS, f"evaluator DynamoDB actions exceed the bounded set: {ddb}"
+    # The evaluator store performs only single-item get/put/update keyed by the
+    # exact operation id (bundle, reservation, window state); it never Queries.
+    # An unused dynamodb:Query grant is dead least-privilege surface and must be
+    # absent (#440 review).
+    assert "dynamodb:Query" not in ddb, "evaluator must not hold an unused dynamodb:Query grant"
 
 
 def test_evaluator_dynamodb_scoped_to_exact_table(template):

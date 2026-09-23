@@ -665,7 +665,6 @@ Resources:
                   - 'dynamodb:PutItem'
                   - 'dynamodb:UpdateItem'
                   - 'dynamodb:GetItem'
-                  - 'dynamodb:Query'
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${OperationsTableName}'
         - PolicyName: OperationsKmsViaDynamoDb

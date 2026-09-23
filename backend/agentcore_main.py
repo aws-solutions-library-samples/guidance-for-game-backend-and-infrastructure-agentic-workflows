@@ -3,6 +3,7 @@
 AgentCore entrypoint wrapper.
 Delegates to the actual implementation in src/agentcore_main.py
 """
+
 # Standard library
 import importlib.util
 import os

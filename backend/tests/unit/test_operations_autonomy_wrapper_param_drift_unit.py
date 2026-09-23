@@ -158,11 +158,9 @@ def test_disable_07_update_reuses_all_other_07_parameters_dynamically() -> None:
     AutonomyMode."""
     text = DISABLE.read_text(encoding="utf-8")
     # It queries the live 07 parameters and builds the list dynamically.
-    assert "Stacks[0].Parameters[].ParameterKey" in text, (
-        "disable must read the live 07 parameter keys to reuse them"
-    )
+    assert "Stacks[0].Parameters[].ParameterKey" in text, "disable must read the live 07 parameter keys to reuse them"
     assert "UsePreviousValue=true" in text, "disable must reuse 07 params via UsePreviousValue"
     # And it must NOT hardcode a 07 param list that would drift (only AutonomyMode
     # and ProjectName may appear literally in the 07 close path is not required,
     # but the dynamic loop must key off AutonomyMode explicitly).
-    assert 'ParameterKey=AutonomyMode,ParameterValue=disabled' in text.replace(" ", "")
+    assert "ParameterKey=AutonomyMode,ParameterValue=disabled" in text.replace(" ", "")

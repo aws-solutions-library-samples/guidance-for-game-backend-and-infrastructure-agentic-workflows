@@ -468,6 +468,24 @@ def test_e5_runbook_and_teardown_document_both_retained_resources() -> None:
     )
 
 
+def test_e5_runbook_teardown_step_does_not_claim_zero_resources_remain() -> None:
+    """The 09 stack RETAINS the evaluator log group and dead-letter queue on
+    teardown, so the runbook's teardown step must NOT claim that zero autonomy
+    resources remain or that the account returns to a literal default-zero
+    posture. It must instead name the retained resources truthfully (#440
+    review)."""
+    runbook = RUNBOOK.read_text(encoding="utf-8").lower()
+    # The teardown step must acknowledge the retained resources.
+    assert "log group" in runbook and "dead-letter queue" in runbook
+    assert "retain" in runbook, "the teardown step must state the retained resources survive"
+    # It must NOT tell the operator that deleting the stack leaves zero autonomy
+    # resources / a literal default-zero posture, which the Retain policy makes
+    # false.
+    assert (
+        "zero autonomy resources remain" not in runbook
+    ), "teardown wording ignores the retained log group + dead-letter queue"
+
+
 def test_e5_autonomy_doc_does_not_pass_ignored_switch_profile_var() -> None:
     """The wrapper never reads GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID (09
     creates the autonomy profile), so the runbook must not tell operators to

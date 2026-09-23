@@ -328,6 +328,7 @@ def test_deploy_integrates_by_calling_07_execution_workflow():
     # (gamelift:UpdateFleetCapacity, gamelift:DescribeFleetCapacity, ...); a
     # service-ARN segment is 'gamelift:' followed by a region (lowercase or
     # a '*' glob), never a capital. Forbid only a PascalCase action grant.
+    # Standard library
     import re as _re
 
     action_grants = _re.findall(r"gamelift:[A-Z]\w+", text)

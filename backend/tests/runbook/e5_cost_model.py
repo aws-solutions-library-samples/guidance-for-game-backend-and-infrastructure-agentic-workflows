@@ -10,9 +10,17 @@ floating-point money:
 * **enabled** — an operator has stood up the *optional*, reviewed E5 stack. This
   posture adds the incremental monthly cost of the autonomy control plane on top
   of the base deployment (the base ~$752/month from the guidance README is
-  unchanged and not re-counted here). The figures are line-item estimates at
-  us-west-2 public list prices; they are intentionally conservative and rounded
-  to whole cents.
+  unchanged and not re-counted here).
+
+The enabled figures are the human-facing companion of the machine-checked single
+source of truth, ``docs/operations-e5-cost-model.json`` (whose ``enabled_idle``
+scenario totals **$0.44/month**). They reconcile to that model exactly:
+``test_e5_cost_model_unit.py`` asserts this posture equals the canonical
+enabled-idle cents. E5 provisions **no** KMS key, **no** DynamoDB table, and no
+audit trail of its own — it REUSES the 06 operations table and its CMK (for the
+DynamoDB data plane only) and the 06/08 CloudTrail audit path — so those services
+are billed under 06/07/08 and are NOT incremental E5 cost lines here. Counting
+them was the reviewed $0.85 double-count defect.
 
 The model is pure and imports nothing from ``operations``: it exists so the
 runbook's numbers are reproducible and unit-tested rather than asserted prose.
@@ -58,29 +66,26 @@ DEFAULT_ZERO_LINES: tuple[CostLine, ...] = (
 # enabled posture (optional, reviewed stack) — incremental over the base
 # --------------------------------------------------------------------------- #
 
-# Conservative us-west-2 list-price estimates for a low-volume demo autonomy
-# control plane (a few evaluations/day against one enrolled demo fleet). These
-# are *incremental* to the base deployment and rounded to whole cents.
+# Conservative us-west-2 list-price estimates for a low-volume enabled-idle
+# autonomy control plane, reconciled EXACTLY to the canonical
+# docs/operations-e5-cost-model.json enabled_idle scenario ($0.44/month). Only
+# the services E5 actually adds appear here: the four E5-owned CloudWatch alarms,
+# the scheduled evaluator Lambda, and the two AppConfig configuration
+# retrievals. DynamoDB (reuses the 06 table + CMK) and the CloudTrail/KMS audit
+# path (reused from 06/08) are billed under those stacks and are deliberately
+# absent — counting them was the reviewed $0.85 double-count.
 ENABLED_LINES: tuple[CostLine, ...] = (
-    # Step Functions Standard: one execution per autonomous operation, a handful
-    # of state transitions each; a few operations per day. $0.025 / 1K
-    # transitions. ~ (a few hundred transitions/mo) -> rounds to ~1 cent.
-    CostLine("AWS Step Functions", "Standard workflow state transitions (low volume)", 1),
-    # Lambda: evaluator + reservation + verifier invocations, all short and
-    # within/near the free tier at demo volume.
-    CostLine("AWS Lambda", "evaluator/reservation/verifier invocations (near free tier)", 2),
-    # DynamoDB on-demand: reservation store + audit ledger writes/reads at demo
-    # volume, plus a small amount of stored data.
-    CostLine("Amazon DynamoDB", "reservation store + audit ledger (on-demand, low volume)", 25),
-    # AppConfig: the separate autonomy switch document — configuration retrievals
-    # via the AppConfig extension polling loop.
-    CostLine("AWS AppConfig", "separate autonomy switch document retrievals", 12),
-    # CloudWatch: autonomy alarms (a small number of metric alarms) + a little
-    # log ingestion for the autonomy runtime.
-    CostLine("Amazon CloudWatch", "autonomy alarms + runtime log ingestion", 40),
-    # CloudTrail data events / KMS usage for the audited executor write path are
-    # negligible incremental at demo volume.
-    CostLine("AWS CloudTrail + KMS", "audited write-path events (negligible incremental)", 5),
+    # CloudWatch: the FOUR E5-owned alarms at $0.10 each, watching AWS-emitted
+    # metrics only (evaluator Errors + Throttles, schedule FailedInvocations,
+    # dead-letter depth). This is the dominant incremental cost.
+    CostLine("Amazon CloudWatch", "four E5-owned alarms on AWS-emitted metrics ($0.10 each)", 40),
+    # Lambda: the evaluator scheduled every 5 minutes (~8,640 invocations/month)
+    # at ~0.25 GB-second each, near the free tier — a few cents.
+    CostLine("AWS Lambda", "scheduled evaluator invocations (~8,640/mo, near free tier)", 3),
+    # AppConfig: the evaluator reads two documents (E4 kill switch + SEPARATE E5
+    # autonomy switch) through the extension cache; retrievals track the cache
+    # refresh cadence, not per-request — a fraction of a cent, rounded to 1.
+    CostLine("AWS AppConfig", "two autonomy-switch document retrievals via the extension cache", 1),
 )
 
 
