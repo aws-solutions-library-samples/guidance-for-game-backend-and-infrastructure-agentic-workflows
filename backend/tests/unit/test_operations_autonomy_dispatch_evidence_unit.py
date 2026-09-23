@@ -60,9 +60,9 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_WORKSPACE_ID": "workspace.default",
         "GBAW_OPERATIONS_TRUSTED_AUDIENCE": "aud.default",
         "GBAW_OPERATIONS_CAPABILITY_MAXIMUM": "operate",
-        "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:111122223333:stateMachine:execute",
+        "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:123456789012:stateMachine:execute",
         "GBAW_OPERATIONS_ENROLLED_FLEET_ID": policy["target"]["fleet_id"],
-        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:111122223333:fleet/"
+        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:123456789012:fleet/"
         + policy["target"]["fleet_id"],
         "GBAW_OPERATIONS_ENROLLED_LOCATION": policy["target"]["location"],
         "GBAW_OPERATIONS_APPCONFIG_APPLICATION": "gbaw-ops",
@@ -71,7 +71,7 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT": "prod",
         "GBAW_OPERATIONS_APPCONFIG_PROFILE": "kill-switch",
         "GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN": (
-            "arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute"
+            "arn:aws:states:us-west-2:123456789012:stateMachine:autonomy-execute"
         ),
         "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE": "autonomy-switch",
         "GBAW_OPERATIONS_AUTONOMY_POLICY_ID": policy["policy_id"],
@@ -388,7 +388,7 @@ def test_pre_write_reverify_requires_action_id_match() -> None:
             return VerifiedExecutionPlan(
                 intent={"operation_id": op_id, "parameters": {}, "expected_current_capacity": {}},
                 logical_action_id=other_action,
-                fleet_arn="arn:aws:gamelift:us-west-2:111122223333:fleet/fleet-x",
+                fleet_arn="arn:aws:gamelift:us-west-2:123456789012:fleet/fleet-x",
                 fleet_id="fleet-x",
                 location="us-west-2",
                 max_writes=1,
@@ -432,7 +432,7 @@ def test_pre_write_reverify_passes_when_still_fresh_and_action_matches() -> None
             return VerifiedExecutionPlan(
                 intent={"operation_id": op_id, "parameters": {}, "expected_current_capacity": {}},
                 logical_action_id=action_id,
-                fleet_arn="arn:aws:gamelift:us-west-2:111122223333:fleet/fleet-x",
+                fleet_arn="arn:aws:gamelift:us-west-2:123456789012:fleet/fleet-x",
                 fleet_id="fleet-x",
                 location="us-west-2",
                 max_writes=1,
