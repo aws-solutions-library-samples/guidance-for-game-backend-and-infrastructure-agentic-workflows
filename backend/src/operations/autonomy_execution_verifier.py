@@ -105,6 +105,7 @@ class AutonomyExecutionVerificationReason(str, Enum):
     TENANT_WORKSPACE_MISMATCH = "tenant_workspace_mismatch"
     FLEET_BINDING_MISMATCH = "fleet_binding_mismatch"
     DECISION_EXPIRED = "decision_expired"
+    WINDOW_STATE_EXPIRED = "window_state_expired"
     AUTONOMY_SWITCH_DENIED = "autonomy_switch_denied"
     RESERVATION_NOT_OWNED = "reservation_not_owned"
     CONTEXT_INVALID = "context_invalid"
@@ -383,6 +384,24 @@ class AutonomyExecutionVerifier:
             raise AutonomyExecutionVerificationError(
                 AutonomyExecutionVerificationReason.DECISION_EXPIRED,
                 "autonomous decision is no longer eligible for execution",
+            )
+
+        # 6b. Execute-time window freshness: the #438 binding validator
+        # re-derives the decision at the decision's OWN evaluated_at, so a
+        # rolling-window state that was fresh at decision time but has since
+        # passed its expires_at_epoch_seconds is NOT caught by the binding.
+        # Re-check it against the CURRENT clock here, before the switch and
+        # the reservation, and fail closed when the window has expired.
+        window_expires_at = window_state.get("expires_at_epoch_seconds")
+        if not isinstance(window_expires_at, int) or isinstance(window_expires_at, bool):
+            raise AutonomyExecutionVerificationError(
+                AutonomyExecutionVerificationReason.BINDING_INVALID,
+                "window state expiry is invalid",
+            )
+        if int(now.timestamp()) >= window_expires_at:
+            raise AutonomyExecutionVerificationError(
+                AutonomyExecutionVerificationReason.WINDOW_STATE_EXPIRED,
+                "rolling-window state is no longer fresh for execution",
             )
 
         # Build the deterministic, attempt-independent write intent now that the
