@@ -154,6 +154,7 @@ class ExecutorService:
         max_verify_polls: int = _DEFAULT_MAX_VERIFY_POLLS,
         lease_seconds: int = 30,
         kill_switch_gate: Any = None,
+        durable_control_gate: Any = None,
     ) -> None:
         if max_verify_polls < 1:
             raise ValueError("max_verify_polls must be positive")
@@ -171,6 +172,7 @@ class ExecutorService:
         # (after the pre-write Describe), so a switch flipped mid-flight still
         # blocks the write. When absent the executor behaves exactly as before.
         self._kill_switch_gate = kill_switch_gate
+        self._durable_control_gate = durable_control_gate
 
     def execute(
         self,
@@ -329,7 +331,9 @@ class ExecutorService:
         if self._kill_switch_gate is None:
             return
         try:
-            self._kill_switch_gate.require_phase("execute")
+            decision = self._kill_switch_gate.require_phase("execute")
+            if self._durable_control_gate is not None:
+                self._durable_control_gate.require_phase("execute", deployed_decision=decision)
         except Exception as exc:  # noqa: BLE001 - any gate denial fails closed
             raise ExecutorServiceError("execute phase is disabled by the kill-switch") from exc
 

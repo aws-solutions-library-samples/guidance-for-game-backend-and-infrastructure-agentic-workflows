@@ -206,6 +206,7 @@ def _build_approval_handler(
         validate_capacity_approval_binding,
         validate_capacity_prepared_operation,
     )
+    from operations.control.durable_gate import DynamoDbDurableControlGate
     from operations.decisions import LifecycleDecisionService
     from operations.evidence import E2EvidenceService
     from operations.observe.e2_metrics import CloudWatchApprovalMetrics
@@ -258,6 +259,14 @@ def _build_approval_handler(
         clock=_utcnow,
         operation_ttl_seconds=ops.preparation_expiry_s,
         kill_switch_gate=kill_switch_gate,
+        durable_control_gate=(
+            DynamoDbDurableControlGate(
+                client=dynamodb_client,
+                table_name=settings.table_name,
+            )
+            if kill_switch_gate is not None
+            else None
+        ),
     )
     orchestrator = PrepareOrchestrator(
         prepare_service=prepare_service,

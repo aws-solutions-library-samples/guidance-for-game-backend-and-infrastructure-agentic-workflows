@@ -76,6 +76,7 @@ def _build_runtime() -> _ExecutorRuntime:
 
     # Local modules
     from operations.approval_store import DynamoDbApprovalStore
+    from operations.control.durable_gate import DynamoDbDurableControlGate
     from operations.control.gate_bootstrap import build_kill_switch_gate
     from operations.control.metrics import CloudWatchControlMetrics
     from operations.execute.execution_store import DynamoDbExecutionStore
@@ -139,6 +140,14 @@ def _build_runtime() -> _ExecutorRuntime:
         adapter=adapter,
         store=execution_store,
         kill_switch_gate=kill_switch_gate,
+        durable_control_gate=(
+            DynamoDbDurableControlGate(
+                client=dynamodb_client,
+                table_name=obs.table_name,
+            )
+            if kill_switch_gate is not None
+            else None
+        ),
     )
     return _ExecutorRuntime(
         service=service,

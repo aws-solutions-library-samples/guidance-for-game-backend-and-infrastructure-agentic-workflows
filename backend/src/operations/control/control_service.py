@@ -87,6 +87,7 @@ class AuditStorePort(Protocol):
         expected_config_version: int,
         desired: dict[str, Any],
         resulting_config_version: int,
+        publication_document: dict[str, Any] | None = None,
     ) -> ControlCommitOutcome: ...
 
     def commit_control_decision(
@@ -305,6 +306,7 @@ class KillSwitchControlService:
                 expected_config_version=stored_version,
                 desired=live_desired,
                 resulting_config_version=live_version,
+                publication_document=current_document,
             )
         except ControlStoreError as exc:
             raise ControlServiceError("CONTROL_UNAVAILABLE", "external control state could not be recorded") from exc

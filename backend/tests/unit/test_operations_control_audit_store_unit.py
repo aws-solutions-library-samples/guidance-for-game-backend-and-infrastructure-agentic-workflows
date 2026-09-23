@@ -122,6 +122,8 @@ class _FakeDynamo:
         new_item = dict(existing) if existing else {"PK": upd["Key"]["PK"], "SK": upd["Key"]["SK"]}
         if ":new_version" in values:
             new_item["config_version"] = values[":new_version"]
+        if ":document_json" in values:
+            new_item["document_json"] = values[":document_json"]
         self.items[key] = new_item
 
     def update_item(self, **kwargs: Any) -> dict[str, Any]:  # pragma: no cover
@@ -244,9 +246,12 @@ def test_external_appconfig_reconciliation_is_atomic_and_already_published() -> 
         expected_config_version=2,
         desired=_desired(False),
         resulting_config_version=1_800_000_000,
+        publication_document=_publication_document(version=1_800_000_000, enabled=False),
     )
     assert outcome is ControlCommitOutcome.COMMITTED
     assert store.current_config_version() == 1_800_000_000
+    state_item = dynamo.items[("OPCONTROL#kill-switch", "STATE#current")]
+    assert "document_json" in state_item
     assert len(_audit_items(dynamo)) == 1
     assert store.pending_publication(record_id=record_id) is None
 
@@ -416,6 +421,8 @@ def test_commit_records_a_durable_unconfirmed_publication_marker() -> None:
     assert markers[0]["published"]["BOOL"] is False
     assert markers[0]["config_version"]["N"] == "2"
     assert "document_json" in markers[0]
+    state_item = dynamo.items[("OPCONTROL#kill-switch", "STATE#current")]
+    assert state_item["document_json"]["S"] == markers[0]["document_json"]["S"]
     # The marker commits in the SAME atomic transaction as the CAS + audit.
     assert dynamo.transact_calls == 1
     # It is queryable and reported as pending.

@@ -130,3 +130,16 @@ def test_all_write_entrypoints_wire_the_appconfig_rollback_signal() -> None:
         source = entrypoint.read_text(encoding="utf-8")
         assert "unavailable_callback=" in source, entrypoint
         assert 'record("kill_switch.unavailable")' in source, entrypoint
+
+
+def test_all_write_entrypoints_wire_the_durable_control_intent_fence() -> None:
+    project_root = pathlib.Path(__file__).parents[3]
+    entrypoints = (
+        project_root / "backend/src/operations/observe/lambda_entry.py",
+        project_root / "backend/src/operations/execute/dispatcher_entry.py",
+        project_root / "backend/src/operations/execute/executor_entry.py",
+    )
+    for entrypoint in entrypoints:
+        source = entrypoint.read_text(encoding="utf-8")
+        assert "DynamoDbDurableControlGate" in source, entrypoint
+        assert "durable_control_gate=" in source, entrypoint

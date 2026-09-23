@@ -64,6 +64,7 @@ def _build_handler() -> Any:
 
     # Local modules
     from operations.approval_store import DynamoDbApprovalStore
+    from operations.control.durable_gate import DynamoDbDurableControlGate
     from operations.control.gate_bootstrap import build_kill_switch_gate
     from operations.control.metrics import CloudWatchControlMetrics
     from operations.execute.dispatcher_handler import DispatcherRequestHandler
@@ -101,6 +102,14 @@ def _build_handler() -> Any:
         trusted_audience=obs.trusted_audience,
         admin_group=settings.admin_group,
         kill_switch_gate=kill_switch_gate,
+        durable_control_gate=(
+            DynamoDbDurableControlGate(
+                client=dynamodb_client,
+                table_name=obs.table_name,
+            )
+            if kill_switch_gate is not None
+            else None
+        ),
     )
 
 

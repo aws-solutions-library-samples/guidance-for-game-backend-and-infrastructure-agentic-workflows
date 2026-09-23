@@ -104,6 +104,14 @@ and every reader receives only `appconfig:StartConfigurationSession` +
 `appconfig:GetLatestConfiguration`, scoped to the exact kill-switch
 configuration resource.
 
+Because the extension deliberately caches between provider polls, the CAS state
+item also stores the exact latest validated document. Prepare, dispatch, and
+execute intersect the extension decision with one consistent `GetItem` of that
+durable intent. A newer hard-down therefore blocks immediately after the CAS,
+even while a warm extension still serves the prior version. A newer enable
+cannot bypass an older restrictive extension decision. Legacy state without the
+exact document retains extension-only behavior until the next control change.
+
 ## Deploy (opt-in, double confirmation)
 
 A default deploy is $0. To provision and enable:

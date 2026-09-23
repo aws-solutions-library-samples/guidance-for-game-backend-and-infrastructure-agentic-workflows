@@ -262,6 +262,16 @@ class DynamoDbControlAuditStore:
             outcome=outcome,
         )
 
+        publication_document_json: str | None = None
+        if publication_document is not None:
+            try:
+                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, dict(publication_document))
+            except ControlContractError as exc:
+                raise ControlStoreError("publication document failed its contract") from exc
+            if publication_document.get("config_version") != resulting_config_version:
+                raise ControlStoreError("publication document version does not match the control decision")
+            publication_document_json = _canonical_json(publication_document)
+
         # ONE atomic TransactWriteItems commits the compare-and-set state advance
         # and the immutable outcome audit record together. TransactWriteItems is
         # authorized against the underlying dynamodb:UpdateItem (state advance)
@@ -271,15 +281,21 @@ class DynamoDbControlAuditStore:
         # config_version still equals :expected. The Put is conditional on the
         # outcome SK not existing, so a retry after a committed decision is an
         # idempotent no-op rather than a duplicate record.
+        state_values: dict[str, Any] = {
+            ":new_version": int(resulting_config_version),
+            ":expected": int(expected_config_version),
+        }
+        state_expression = "SET config_version = :new_version"
+        if publication_document_json is not None:
+            state_expression += ", document_json = :document_json"
+            state_values[":document_json"] = publication_document_json
         state_update = {
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": _CONTROL_PK, "SK": _STATE_SK}),
-                "UpdateExpression": "SET config_version = :new_version",
+                "UpdateExpression": state_expression,
                 "ConditionExpression": "attribute_exists(PK) AND config_version = :expected",
-                "ExpressionAttributeValues": _marshal(
-                    {":new_version": int(resulting_config_version), ":expected": int(expected_config_version)}
-                ),
+                "ExpressionAttributeValues": _marshal(state_values),
             }
         }
         audit_put = {
@@ -317,14 +333,8 @@ class DynamoDbControlAuditStore:
             "config_version": int(resulting_config_version),
             "published": False,
         }
-        if publication_document is not None:
-            try:
-                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, dict(publication_document))
-            except ControlContractError as exc:
-                raise ControlStoreError("publication document failed its contract") from exc
-            if publication_document.get("config_version") != resulting_config_version:
-                raise ControlStoreError("publication document version does not match the control decision")
-            publication_item["document_json"] = _canonical_json(publication_document)
+        if publication_document_json is not None:
+            publication_item["document_json"] = publication_document_json
         publication_put = {
             "Put": {
                 "TableName": self._table_name,
@@ -357,6 +367,7 @@ class DynamoDbControlAuditStore:
         expected_config_version: int,
         desired: Mapping[str, Any],
         resulting_config_version: int,
+        publication_document: Mapping[str, Any] | None = None,
     ) -> ControlCommitOutcome:
         """Atomically adopt an already-published break-glass document.
 
@@ -376,15 +387,27 @@ class DynamoDbControlAuditStore:
             desired=desired,
             outcome="applied",
         )
+        state_values: dict[str, Any] = {
+            ":new_version": int(resulting_config_version),
+            ":expected": int(expected_config_version),
+        }
+        state_expression = "SET config_version = :new_version"
+        if publication_document is not None:
+            try:
+                validate_control_contract(KILL_SWITCH_SCHEMA_NAME, dict(publication_document))
+            except ControlContractError as exc:
+                raise ControlStoreError("external publication document failed its contract") from exc
+            if publication_document.get("config_version") != resulting_config_version:
+                raise ControlStoreError("external publication document version does not match")
+            state_expression += ", document_json = :document_json"
+            state_values[":document_json"] = _canonical_json(publication_document)
         state_update = {
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": _CONTROL_PK, "SK": _STATE_SK}),
-                "UpdateExpression": "SET config_version = :new_version",
+                "UpdateExpression": state_expression,
                 "ConditionExpression": "attribute_exists(PK) AND config_version = :expected",
-                "ExpressionAttributeValues": _marshal(
-                    {":new_version": int(resulting_config_version), ":expected": int(expected_config_version)}
-                ),
+                "ExpressionAttributeValues": _marshal(state_values),
             }
         }
         audit_put = {

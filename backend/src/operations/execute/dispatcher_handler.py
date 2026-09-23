@@ -92,6 +92,7 @@ class DispatcherRequestHandler:
         trusted_audience: str,
         admin_group: str,
         kill_switch_gate: Any = None,
+        durable_control_gate: Any = None,
     ) -> None:
         for name, value in (
             ("state_machine_arn", state_machine_arn),
@@ -113,6 +114,7 @@ class DispatcherRequestHandler:
         # phase is re-checked before the workflow is started. A None gate is a
         # no-op so the existing E3 dispatcher behavior is preserved.
         self._kill_switch_gate = kill_switch_gate
+        self._durable_control_gate = durable_control_gate
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         try:
@@ -196,7 +198,9 @@ class DispatcherRequestHandler:
         if self._kill_switch_gate is None:
             return
         try:
-            self._kill_switch_gate.require_phase("dispatch")
+            decision = self._kill_switch_gate.require_phase("dispatch")
+            if self._durable_control_gate is not None:
+                self._durable_control_gate.require_phase("dispatch", deployed_decision=decision)
         except Exception as exc:  # noqa: BLE001 - any denial fails closed
             raise _DispatchDenied(403, "AUTHORIZATION_DENIED", "dispatch is disabled by the kill-switch") from exc
 

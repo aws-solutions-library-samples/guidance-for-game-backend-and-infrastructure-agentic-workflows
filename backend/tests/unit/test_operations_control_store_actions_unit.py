@@ -131,6 +131,8 @@ class _TransactDynamo:
         new_item = dict(existing) if existing else {"PK": upd["Key"]["PK"], "SK": upd["Key"]["SK"]}
         if ":new_version" in values:
             new_item["config_version"] = values[":new_version"]
+        if ":document_json" in values:
+            new_item["document_json"] = values[":document_json"]
         self.items[key] = new_item
 
     def scan(self, **kwargs: Any) -> dict[str, Any]:

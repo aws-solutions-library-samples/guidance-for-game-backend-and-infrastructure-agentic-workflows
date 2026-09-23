@@ -203,6 +203,7 @@ class PrepareService:
         clock: Callable[[], datetime],
         operation_ttl_seconds: int = 900,
         kill_switch_gate: Any = None,
+        durable_control_gate: Any = None,
     ) -> None:
         self._settings = settings
         self._identity_boundary = identity_boundary
@@ -212,6 +213,7 @@ class PrepareService:
         # phase is re-checked before any authorization/binding. A None gate is a
         # no-op so the existing E2 prepare behavior is preserved.
         self._kill_switch_gate = kill_switch_gate
+        self._durable_control_gate = durable_control_gate
         if operation_ttl_seconds <= 0:
             raise ValueError("operation_ttl_seconds must be positive")
         self._operation_ttl = timedelta(seconds=operation_ttl_seconds)
@@ -352,7 +354,9 @@ class PrepareService:
         if self._kill_switch_gate is None:
             return
         try:
-            self._kill_switch_gate.require_phase("prepare")
+            decision = self._kill_switch_gate.require_phase("prepare")
+            if self._durable_control_gate is not None:
+                self._durable_control_gate.require_phase("prepare", deployed_decision=decision)
         except Exception as exc:  # noqa: BLE001 - any denial fails closed
             raise PrepareBoundaryError(
                 PrepareErrorCode.AUTHORIZATION_DENIED, "operations prepare is disabled by the kill-switch"

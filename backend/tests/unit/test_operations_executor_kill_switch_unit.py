@@ -25,6 +25,10 @@ pytestmark = [pytest.mark.unit, pytest.mark.fast]
 _NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
+class _Decision:
+    config_version = 7
+
+
 class _GateStub:
     """A kill-switch gate stub that permits or denies the execute phase.
 
@@ -46,10 +50,22 @@ class _GateStub:
             raise PhaseDenied(phase, "disabled")
         if self._deny_after is not None and self.calls > self._deny_after:
             raise PhaseDenied(phase, "flipped mid-flight")
-        return object()
+        return _Decision()
 
 
-def _build_service(gate: Any) -> Any:
+class _DurableGateStub:
+    def __init__(self, *, deny_after: int | None = None) -> None:
+        self._deny_after = deny_after
+        self.calls = 0
+
+    def require_phase(self, phase: str, *, deployed_decision: Any) -> None:
+        self.calls += 1
+        assert deployed_decision.config_version == 7
+        if self._deny_after is not None and self.calls > self._deny_after:
+            raise RuntimeError("durable hard-down advanced")
+
+
+def _build_service(gate: Any, durable: Any = None) -> Any:
     """Build an ExecutorService with a permissive verifier/adapter/store + gate."""
     # Local modules
     from operations.execute.executor_service import ExecutionInvocation, ExecutorService
@@ -93,6 +109,7 @@ def _build_service(gate: Any) -> Any:
         store=_Store(),
         clock=lambda: _NOW,
         kill_switch_gate=gate,
+        durable_control_gate=durable,
     )
     return service, adapter, ExecutionInvocation(operation_id="op_" + "a" * 26)
 
@@ -146,6 +163,24 @@ def test_pre_write_gate_denial_blocks_write_after_describe() -> None:
     assert adapter.writes == 0
     assert gate.calls == 2  # entry permitted, pre-write denied
     assert adapter.describes >= 1  # the pre-write Describe happened before the second check
+
+
+def test_durable_hard_down_between_describe_and_write_blocks_cached_extension() -> None:
+    # Local modules
+    from operations.execute.executor_service import ExecutorServiceError
+
+    # AppConfig remains cached/allowing for both reads, but the consistent
+    # DynamoDB intent fence advances between entry and the pre-write check.
+    gate = _GateStub(permit=True)
+    durable = _DurableGateStub(deny_after=1)
+    service, adapter, invocation = _build_service(gate, durable)
+    prepared, approval = _prepared_and_approval()
+    with pytest.raises(ExecutorServiceError):
+        service.execute(invocation, prepared_operation=prepared, approval=approval, lease_holder="h")
+    assert gate.calls == 2
+    assert durable.calls == 2
+    assert adapter.describes >= 1
+    assert adapter.writes == 0
 
 
 def test_both_gates_permit_allows_write() -> None:

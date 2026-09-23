@@ -27,6 +27,10 @@ from operations.control.kill_switch_gate import PhaseDenied
 pytestmark = [pytest.mark.unit, pytest.mark.fast]
 
 
+class _Decision:
+    config_version = 7
+
+
 class _GateStub:
     def __init__(self, *, permit: bool) -> None:
         self._permit = permit
@@ -36,7 +40,19 @@ class _GateStub:
         self.phases.append(phase)
         if not self._permit:
             raise PhaseDenied(phase, "disabled")
-        return object()
+        return _Decision()
+
+
+class _DurableGateStub:
+    def __init__(self, *, permit: bool) -> None:
+        self._permit = permit
+        self.phases: list[str] = []
+
+    def require_phase(self, phase: str, *, deployed_decision: Any) -> None:
+        self.phases.append(phase)
+        assert deployed_decision.config_version == 7
+        if not self._permit:
+            raise RuntimeError("durable intent disabled")
 
 
 # -- dispatch ---------------------------------------------------------------
@@ -81,7 +97,7 @@ class _Sfn:
         return {}
 
 
-def _dispatcher(gate: Any) -> Any:
+def _dispatcher(gate: Any, durable: Any = None) -> Any:
     # Local modules
     from operations.execute.dispatcher_handler import DispatcherRequestHandler
 
@@ -94,6 +110,7 @@ def _dispatcher(gate: Any) -> Any:
         trusted_audience="trusted-audience",
         admin_group="admin",
         kill_switch_gate=gate,
+        durable_control_gate=durable,
     )
 
 
@@ -114,6 +131,15 @@ def test_dispatch_allowed_when_phase_on() -> None:
     assert "dispatch" in gate.phases
 
 
+def test_dispatch_denied_by_newer_durable_intent() -> None:
+    gate = _GateStub(permit=True)
+    durable = _DurableGateStub(permit=False)
+    handler = _dispatcher(gate, durable)
+    response = handler.handle(_dispatch_event())
+    assert response["statusCode"] == 403
+    assert durable.phases == ["dispatch"]
+
+
 def test_dispatch_no_gate_preserves_behavior() -> None:
     handler = _dispatcher(gate=None)
     response = handler.handle(_dispatch_event())
@@ -123,7 +149,7 @@ def test_dispatch_no_gate_preserves_behavior() -> None:
 # -- prepare ----------------------------------------------------------------
 
 
-def _prepare_service(gate):
+def _prepare_service(gate, durable=None):
     # Standard library
     from datetime import datetime, timezone
 
@@ -163,6 +189,7 @@ def _prepare_service(gate):
         playbook=playbook,
         clock=lambda: datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
         kill_switch_gate=gate,
+        durable_control_gate=durable,
     )
 
 
@@ -182,6 +209,16 @@ def test_prepare_denied_when_prepare_phase_off() -> None:
         service.prepare({}, _ctx(), idempotency_token="idem_" + "a" * 20)
     assert excinfo.value.error_code is PrepareErrorCode.AUTHORIZATION_DENIED
     assert "prepare" in gate.phases
+
+
+def test_prepare_denied_by_newer_durable_intent() -> None:
+    # Local modules
+    from operations.prepare import PrepareBoundaryError, PrepareErrorCode
+
+    service = _prepare_service(_GateStub(permit=True), _DurableGateStub(permit=False))
+    with pytest.raises(PrepareBoundaryError) as excinfo:
+        service.prepare({}, _ctx(), idempotency_token="idem_" + "b" * 20)
+    assert excinfo.value.error_code is PrepareErrorCode.AUTHORIZATION_DENIED
 
 
 def _ctx():
