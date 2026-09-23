@@ -641,3 +641,144 @@ class DynamoDbReservationStore:
         )
         item = response.get("Item") if isinstance(response, dict) else None
         return _unmarshal(item) if isinstance(item, dict) else None
+
+
+_BUNDLE_SK = "AUTZBUNDLE"
+
+
+class AutonomyBundleStoreError(RuntimeError):
+    """Persisting or reloading the immutable v2 bundle failed (fail closed).
+
+    Raised when a conditional immutable put is refused because a *different*
+    bundle already exists for the operation id (a crash/replay must never mutate
+    persisted evidence), when the store is unavailable, or when a reloaded record
+    is structurally malformed. It is never raised for an identical idempotent
+    re-persist, which resolves cleanly.
+    """
+
+
+class DynamoDbAutonomyBundleStore:
+    """Durable, immutable, conditional persistence of the reloadable v2 bundle.
+
+    The bundle is the exact evidence set the executor reloads by ``operation_id``
+    to run the v2 autonomous path: the resolved policy, the canonical E1
+    observation, the deterministic decision, the immutable prepared operation, the
+    bound pre-reservation window state, and the reservation reference. It is
+    written to the existing single (issue #06) table as ONE canonical-JSON record
+    at ``PK=AUTZBUNDLE#<operation_id>, SK=AUTZBUNDLE``.
+
+    Immutability by conditional put
+    -------------------------------
+    ``persist_bundle`` issues a single ``PutItem`` conditioned on
+    ``attribute_not_exists(SK)``. The first persist wins; a later persist of a
+    *different* bundle is refused by the condition and raises
+    :class:`AutonomyBundleStoreError` **without overwriting** the original — so a
+    crash between persist and reserve leaves inert, immutable evidence that a
+    replay can neither mutate nor escalate. An identical re-persist (byte-identical
+    canonical form) is idempotent: the conditional refusal is reconciled against
+    the stored bytes and resolves cleanly.
+
+    Constructing the store captures no credential and performs no I/O until a
+    method is called. It performs no provider write and holds no GameLift or
+    executor credential; the executor is the sole provider writer.
+    """
+
+    __slots__ = ("_client", "_table_name")
+
+    _SECTIONS = ("policy", "observation", "decision", "operation", "window_state", "reservation")
+
+    def __init__(self, *, client: Any, table_name: str) -> None:
+        if not isinstance(table_name, str) or not table_name.strip():
+            raise ValueError("table_name must be a non-empty string")
+        self._client = client
+        self._table_name = table_name
+
+    def persist_bundle(
+        self,
+        *,
+        operation_id: str,
+        policy: dict[str, Any],
+        observation: dict[str, Any],
+        decision: dict[str, Any],
+        operation: dict[str, Any],
+        window_state: dict[str, Any],
+        reservation: dict[str, Any],
+    ) -> None:
+        """Immutably persist the reloadable bundle; fail closed on any mutation attempt."""
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        document = {
+            "policy": policy,
+            "observation": observation,
+            "decision": decision,
+            "operation": operation,
+            "window_state": window_state,
+            "reservation": reservation,
+        }
+        canonical = _canonical(document)
+        item = {
+            "PK": {"S": self._bundle_pk(operation_id)},
+            "SK": {"S": _BUNDLE_SK},
+            "operation_id": {"S": operation_id},
+            "bundle": {"S": canonical},
+        }
+        try:
+            self._client.put_item(
+                TableName=self._table_name,
+                Item=item,
+                ConditionExpression="attribute_not_exists(SK)",
+            )
+        except Exception as exc:  # noqa: BLE001 - classify by conditional vs unavailable
+            if _is_conditional_failure(exc):
+                # A record already exists. An identical re-persist is idempotent;
+                # a differing one must never overwrite the immutable original.
+                existing = self._raw_bundle(operation_id)
+                if existing is not None and existing == canonical:
+                    return
+                raise AutonomyBundleStoreError("bundle already exists and differs; refusing to overwrite") from exc
+            _LOGGER.warning("dynamodb_autonomy_bundle_store persist unavailable exception_type=%s", type(exc).__name__)
+            raise AutonomyBundleStoreError("bundle store is unavailable") from exc
+
+    def load_bundle(self, operation_id: str) -> dict[str, Any] | None:
+        """Reload the immutable bundle by operation id, or ``None`` if absent."""
+        canonical = self._raw_bundle(operation_id)
+        if canonical is None:
+            return None
+        try:
+            parsed = json.loads(canonical)
+        except (ValueError, TypeError) as exc:
+            raise AutonomyBundleStoreError("stored bundle is malformed") from exc
+        if not isinstance(parsed, dict) or any(section not in parsed for section in self._SECTIONS):
+            raise AutonomyBundleStoreError("stored bundle is malformed")
+        return parsed
+
+    def dispatch_view(self, operation_id: str) -> dict[str, str]:
+        """Return the identifier-only dispatch view for a persisted bundle.
+
+        The view carries the ``operation_id`` and nothing else — no policy, no
+        limits, no observation, no window state, and no credential — so nothing
+        beyond the identifier ever crosses the dispatch boundary. Fails closed if
+        no bundle is persisted for the id.
+        """
+        if self._raw_bundle(operation_id) is None:
+            raise AutonomyBundleStoreError("no bundle is persisted for this operation")
+        return {"operation_id": operation_id}
+
+    # -- Low-level helpers -----------------------------------------------
+
+    def _raw_bundle(self, operation_id: str) -> str | None:
+        response = self._client.get_item(
+            TableName=self._table_name,
+            Key={"PK": {"S": self._bundle_pk(operation_id)}, "SK": {"S": _BUNDLE_SK}},
+            ConsistentRead=True,
+        )
+        item = response.get("Item") if isinstance(response, dict) else None
+        if not isinstance(item, dict):
+            return None
+        cell = item.get("bundle")
+        if not isinstance(cell, dict) or "S" not in cell:
+            raise AutonomyBundleStoreError("stored bundle is malformed")
+        return str(cell["S"])
+
+    def _bundle_pk(self, operation_id: str) -> str:
+        return f"AUTZBUNDLE#{operation_id}"

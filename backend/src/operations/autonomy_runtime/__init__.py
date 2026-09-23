@@ -37,6 +37,8 @@ from operations.autonomy_runtime.service import (
     PreparedAutonomousOperation,
 )
 from operations.autonomy_runtime.store import (
+    AutonomyBundleStoreError,
+    DynamoDbAutonomyBundleStore,
     DynamoDbReservationStore,
     InMemoryReservationStore,
     ReservationOutcome,
@@ -53,6 +55,8 @@ __all__ = [
     "AutonomyRuntimeService",
     "PreparedAutonomousOperation",
     # store / reservation lifecycle
+    "AutonomyBundleStoreError",
+    "DynamoDbAutonomyBundleStore",
     "DynamoDbReservationStore",
     "InMemoryReservationStore",
     "ReservationOutcome",
