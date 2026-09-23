@@ -385,6 +385,120 @@ def test_deploy_activation_requires_explicit_enable_and_token_in_source():
     assert "GBAW_OPERATIONS_AUTONOMY_CONFIRM" in text
 
 
+_DISPATCHER = '    "cloudformation describe-stacks"*)\n        want=""\n        prev=""\n        for a in "$@"; do\n            case "$prev" in\n                --query) want="$a" ;;\n            esac\n            prev="$a"\n        done\n        case "$want" in\n            *OperationsTableName*) echo "__TABLE__" ;;\n            *OperationsKmsKeyArn*) echo "__KMS__" ;;\n            *ControlApplicationId*) echo "__CONTROL_APP__" ;;\n            *ControlEnvironmentId*) echo "__CONTROL_ENV__" ;;\n            *KillSwitchProfileId*) echo "__KILLSWITCH_PROFILE__" ;;\n            *ExecutionStateMachineArn*) echo "arn:aws:states:__REGION__:__ACCOUNT__:stateMachine:game-agent-operations-execution" ;;\n            *EnrolledFleetId*) echo "__FLEET__" ;;\n            *TrustedAudience*) echo "__AUDIENCE__" ;;\n            *TenantId*) echo "__TENANT__" ;;\n            *WorkspaceId*) echo "__WORKSPACE__" ;;\n            *AutonomyApplicationId*) echo "auto-app-id" ;;\n            *AutonomyEnvironmentId*) echo "auto-env-id" ;;\n            *AutonomySwitchProfileId*) echo "auto-profile-id" ;;\n            *ParameterKey*) printf "AutonomyMode\\tProjectName\\tExecutorCodeS3Key\\n" ;;\n            *) echo "" ;;\n        esac\n        exit 0 ;;'
+_COARSE = '    "cloudformation describe-stacks"*"ParameterKey"*)\n        echo "AutonomyMode\tProjectName\tExecutorCodeS3Key"\n        exit 0 ;;\n    "cloudformation describe-stacks"*"Outputs"*)\n        echo "auto-app-id"\n        exit 0 ;;\n    "cloudformation describe-stacks"*)\n        exit 0 ;;'
+_LAMBDA_ARM_OLD = "    *)\n        exit 0 ;;"
+_LAMBDA_ARM_NEW = '    "lambda get-function"*)\n        echo "{}"\n        exit 0 ;;\n    *)\n        exit 0 ;;'
+
+
+# --------------------------------------------------------------------------- #
+# #440 review: activation must bind the 06 and 08 stack outputs (and the shared
+# 07 values) to their EXACT deployed values, not merely require non-empty env.
+# --------------------------------------------------------------------------- #
+def test_deploy_binds_06_outputs_exactly():
+    """The evaluator's 06 coordinates (operations table + CMK) must be verified
+    byte-equal to the deployed 06 observation stack's outputs, not just present."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "operations-observation" in text, "deploy must read the 06 observation stack"
+    assert "OperationsTableName" in text, "must read the 06 OperationsTableName output"
+    assert "OperationsKmsKeyArn" in text, "must read the 06 OperationsKmsKeyArn output"
+    assert "does not match the 06" in text, "a 06 mismatch must refuse to enable"
+
+
+def test_deploy_binds_06_shared_identity_params_exactly():
+    """Tenant, workspace, and trusted audience are shared 06 values; the
+    activation must confirm each equals the deployed 06 parameter."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    for key in ("TenantId", "WorkspaceId", "TrustedAudience"):
+        assert key in text, f"must read the 06 {key} parameter for exact binding"
+
+
+def test_deploy_verifies_06_observation_lambda_exists():
+    """The evaluator loads the trusted observation from the 06 observation
+    Lambda; activation must verify that exact function exists (least-privilege
+    read), not assume it."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "lambda get-function" in text, "must verify the 06 observation Lambda exists"
+    assert "operations-observe" in text, "must reference the exact 06 observation function name"
+
+
+def test_deploy_binds_08_appconfig_outputs_exactly():
+    """The E4 (08) kill-switch application/environment/profile must be verified
+    byte-equal to the deployed 08 control-plane stack outputs."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "operations-control-plane" in text, "deploy must read the 08 control-plane stack"
+    for out in ("ControlApplicationId", "ControlEnvironmentId", "KillSwitchProfileId"):
+        assert out in text, f"must read the 08 {out} output"
+    assert "does not match the 08" in text, "an 08 mismatch must refuse to enable"
+
+
+def _fake_aws_stack_values(
+    validate_body,
+    upload,
+    deploy,
+    *,
+    table="game-agent-operations",
+    kms=None,
+    tenant="tenant-demo",
+    workspace="workspace-demo",
+    audience="client.gamelift-capacity-autonomy",
+    fleet="fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
+    control_app="app-abc",
+    control_env="env-abc",
+    killswitch_profile="killswitch-profile",
+):
+    """A stack-and-query-aware fake aws so 06/07/08 binding reads return concrete,
+    per-output values that the deploy script byte-compares against the env."""
+    if kms is None:
+        kms = f"arn:aws:kms:{DEPLOY_REGION}:{SYNTHETIC_ACCOUNT}:key/abc"
+    base = _fake_aws(validate_body, upload, deploy)
+    d = (
+        _DISPATCHER.replace("__TABLE__", table)
+        .replace("__KMS__", kms)
+        .replace("__CONTROL_APP__", control_app)
+        .replace("__CONTROL_ENV__", control_env)
+        .replace("__KILLSWITCH_PROFILE__", killswitch_profile)
+        .replace("__REGION__", DEPLOY_REGION)
+        .replace("__ACCOUNT__", SYNTHETIC_ACCOUNT)
+        .replace("__FLEET__", fleet)
+        .replace("__AUDIENCE__", audience)
+        .replace("__TENANT__", tenant)
+        .replace("__WORKSPACE__", workspace)
+    )
+    base = base.replace(_COARSE, d)
+    base = base.replace(_LAMBDA_ARM_OLD, _LAMBDA_ARM_NEW)
+    return base
+
+
+def _install_stack_value_fakes(fakes, **kwargs):
+    _make_exe(fakes["bindir"] / "cfn-lint", _fake_ok())
+    _make_exe(fakes["bindir"] / "python3", _fake_ok())
+    _make_exe(
+        fakes["bindir"] / "aws",
+        _fake_aws_stack_values(fakes["validate_body"], fakes["upload"], fakes["deploy"], **kwargs),
+    )
+
+
+def test_enable_refuses_when_06_table_mismatches_deployed(fakes, tmp_path):
+    """A supplied 06 table that does not byte-equal the deployed 06 output aborts
+    before the 09 deploy."""
+    _install_stack_value_fakes(fakes, table="game-agent-operations-WRONG")
+    backend_src = _stub_backend_src(tmp_path)
+    result = _run(DEPLOY, "--enable", fakes=fakes, env_extra=_enable_env(backend_src=backend_src))
+    assert result.returncode != 0, "a mismatched 06 table must be refused"
+    assert not fakes["deploy"].exists(), "must abort before the 09 deploy"
+
+
+def test_enable_refuses_when_08_killswitch_app_mismatches_deployed(fakes, tmp_path):
+    """A supplied 08 kill-switch application id that does not byte-equal the
+    deployed 08 output aborts before the 09 deploy."""
+    _install_stack_value_fakes(fakes, control_app="app-WRONG")
+    backend_src = _stub_backend_src(tmp_path)
+    result = _run(DEPLOY, "--enable", fakes=fakes, env_extra=_enable_env(backend_src=backend_src))
+    assert result.returncode != 0, "a mismatched 08 kill-switch application must be refused"
+    assert not fakes["deploy"].exists(), "must abort before the 09 deploy"
+
+
 def test_deploy_default_params_are_zero_resource():
     """Provisioned=true / AutonomyMode=operate appear ONLY under the double-opt-in
     --enable deploy path; the default (no-flag) run is a read-only preview that

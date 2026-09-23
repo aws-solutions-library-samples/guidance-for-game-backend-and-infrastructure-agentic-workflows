@@ -42,6 +42,11 @@ PROJECT_NAME="game-agent"
 STACK_NAME="${PROJECT_NAME}-operations-autonomy"
 EVALUATOR_FUNCTION_NAME="${PROJECT_NAME}-operations-autonomy-evaluator"
 EXECUTION_STACK_NAME="${PROJECT_NAME}-operations-execution"
+OBSERVATION_STACK_NAME="${PROJECT_NAME}-operations-observation"
+CONTROL_STACK_NAME="${PROJECT_NAME}-operations-control-plane"
+# The 06-owned observation Lambda the evaluator loads its trusted observation
+# from (a deterministic 06 name; verified to exist during activation).
+OBSERVE_FUNCTION_NAME="${PROJECT_NAME}-operations-observe"
 # The 09 autonomy template; overridable ONLY for tests (over/under-limit fixtures).
 TEMPLATE="${GBAW_OPERATIONS_AUTONOMY_TEMPLATE:-$PROJECT_ROOT/infrastructure/cloudformation/09-operations-autonomy.yaml}"
 BACKEND_SRC="${GBAW_OPERATIONS_AUTONOMY_BACKEND_SRC:-$PROJECT_ROOT/backend/src}"
@@ -466,6 +471,132 @@ if [ "$OPERATIONS_TRUSTED_AUDIENCE" != "$STACK_07_AUDIENCE" ]; then
     exit 6
 fi
 echo "   Exact bindings verified: workflow, enrolled fleet ($ENROLLED_FLEET_ID), and trusted audience all match the 07 deployment."
+
+# --------------------------------------------------------------------------- #
+# #440 review: bind the 06 (observation) and 08 (control-plane) coordinates to
+# their EXACT deployed stack values, plus the shared 07 identity values. The
+# earlier activation only required these env vars to be non-empty; a value that
+# does not byte-equal the deployed stack output/parameter is a silent
+# mis-binding that would let the evaluator address the wrong table, CMK,
+# tenant/workspace/audience, kill switch, or observation source. Every mismatch
+# below is a hard refusal before any deploy.
+# --------------------------------------------------------------------------- #
+echo "🔎 Binding the 06 operations/observation coordinates to the EXACT deployed values ..."
+if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$OBSERVATION_STACK_NAME" >/dev/null 2>&1; then
+    echo "❌ Refusing to enable: the 06 observation stack '$OBSERVATION_STACK_NAME' was not found; deploy 06 first." >&2
+    exit 6
+fi
+
+# 06 OUTPUTS: operations table + customer-managed KMS key.
+STACK_06_TABLE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$OBSERVATION_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsTableName'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_06_TABLE" ] || [ "$STACK_06_TABLE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 06 OperationsTableName output." >&2
+    exit 6
+fi
+if [ "$OPERATIONS_TABLE_NAME" != "$STACK_06_TABLE" ]; then
+    echo "❌ Refusing to enable: operations table '$OPERATIONS_TABLE_NAME' does not match the 06 OperationsTableName '$STACK_06_TABLE'." >&2
+    exit 6
+fi
+STACK_06_KMS="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$OBSERVATION_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='OperationsKmsKeyArn'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_06_KMS" ] || [ "$STACK_06_KMS" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 06 OperationsKmsKeyArn output." >&2
+    exit 6
+fi
+if [ "$OPERATIONS_KMS_KEY_ARN" != "$STACK_06_KMS" ]; then
+    echo "❌ Refusing to enable: operations CMK '$OPERATIONS_KMS_KEY_ARN' does not match the 06 OperationsKmsKeyArn '$STACK_06_KMS'." >&2
+    exit 6
+fi
+
+# 06 PARAMETERS: the shared tenant / workspace / trusted audience identity. The
+# 06, 07, and 08 stacks all carry the same values; 06 is the identity source.
+STACK_06_TENANT="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$OBSERVATION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='TenantId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_06_TENANT" ] || [ "$STACK_06_TENANT" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 06 TenantId parameter." >&2
+    exit 6
+fi
+if [ "$OPERATIONS_TENANT_ID" != "$STACK_06_TENANT" ]; then
+    echo "❌ Refusing to enable: tenant '$OPERATIONS_TENANT_ID' does not match the 06 TenantId '$STACK_06_TENANT'." >&2
+    exit 6
+fi
+STACK_06_WORKSPACE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$OBSERVATION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='WorkspaceId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_06_WORKSPACE" ] || [ "$STACK_06_WORKSPACE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 06 WorkspaceId parameter." >&2
+    exit 6
+fi
+if [ "$OPERATIONS_WORKSPACE_ID" != "$STACK_06_WORKSPACE" ]; then
+    echo "❌ Refusing to enable: workspace '$OPERATIONS_WORKSPACE_ID' does not match the 06 WorkspaceId '$STACK_06_WORKSPACE'." >&2
+    exit 6
+fi
+STACK_06_AUDIENCE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$OBSERVATION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='TrustedAudience'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_06_AUDIENCE" ] || [ "$STACK_06_AUDIENCE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 06 TrustedAudience parameter." >&2
+    exit 6
+fi
+if [ "$OPERATIONS_TRUSTED_AUDIENCE" != "$STACK_06_AUDIENCE" ]; then
+    echo "❌ Refusing to enable: trusted audience '$OPERATIONS_TRUSTED_AUDIENCE' does not match the 06 TrustedAudience '$STACK_06_AUDIENCE'." >&2
+    exit 6
+fi
+
+# 06 OBSERVATION LAMBDA: the evaluator loads its trusted observation from this
+# exact 06 function. Verify it exists (least-privilege read) rather than assume.
+if ! aws lambda get-function "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --function-name "$OBSERVE_FUNCTION_NAME" >/dev/null 2>&1; then
+    echo "❌ Refusing to enable: the 06 observation Lambda '$OBSERVE_FUNCTION_NAME' was not found in $ACCOUNT_ID/$AWS_REGION." >&2
+    exit 6
+fi
+echo "   Exact 06 bindings verified: operations table, CMK, tenant/workspace/audience, and observation Lambda."
+
+echo "🔎 Binding the 08 kill-switch AppConfig coordinate to the EXACT deployed values ..."
+if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$CONTROL_STACK_NAME" >/dev/null 2>&1; then
+    echo "❌ Refusing to enable: the 08 control-plane stack '$CONTROL_STACK_NAME' was not found; deploy 08 first." >&2
+    exit 6
+fi
+STACK_08_APP="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$CONTROL_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='ControlApplicationId'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_08_APP" ] || [ "$STACK_08_APP" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 08 ControlApplicationId output." >&2
+    exit 6
+fi
+if [ "$KILL_SWITCH_APPLICATION_ID" != "$STACK_08_APP" ]; then
+    echo "❌ Refusing to enable: kill-switch application '$KILL_SWITCH_APPLICATION_ID' does not match the 08 ControlApplicationId '$STACK_08_APP'." >&2
+    exit 6
+fi
+STACK_08_ENV="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$CONTROL_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='ControlEnvironmentId'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_08_ENV" ] || [ "$STACK_08_ENV" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 08 ControlEnvironmentId output." >&2
+    exit 6
+fi
+if [ "$KILL_SWITCH_ENVIRONMENT_ID" != "$STACK_08_ENV" ]; then
+    echo "❌ Refusing to enable: kill-switch environment '$KILL_SWITCH_ENVIRONMENT_ID' does not match the 08 ControlEnvironmentId '$STACK_08_ENV'." >&2
+    exit 6
+fi
+STACK_08_PROFILE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$CONTROL_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='KillSwitchProfileId'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_08_PROFILE" ] || [ "$STACK_08_PROFILE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 08 KillSwitchProfileId output." >&2
+    exit 6
+fi
+if [ "$KILL_SWITCH_PROFILE_ID" != "$STACK_08_PROFILE" ]; then
+    echo "❌ Refusing to enable: kill-switch profile '$KILL_SWITCH_PROFILE_ID' does not match the 08 KillSwitchProfileId '$STACK_08_PROFILE'." >&2
+    exit 6
+fi
+echo "   Exact 08 bindings verified: kill-switch application, environment, and profile all match the 08 deployment."
 
 
 # --------------------------------------------------------------------------- #
