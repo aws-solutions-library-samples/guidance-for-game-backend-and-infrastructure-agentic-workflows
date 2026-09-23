@@ -30,16 +30,19 @@ The executor reloads the operation and selects its execution path from the
 immutable, server-owned envelope alone
 (:func:`~operations.autonomy_execution_selection.select_execution_path`). A v1
 ``gamelift.capacity-adjustment/1.0`` operation follows the untouched
-human-approval path. A v2 ``gamelift.capacity-adjustment/2.0`` autonomous
-operation is re-verified by the independent
+human-approval path (``service.execute`` with the stored granted approval). A v2
+``gamelift.capacity-adjustment/2.0`` autonomous operation is reloaded as its full
+immutable bundle from :class:`~operations.autonomy_runtime.store.DynamoDbAutonomyBundleStore`,
+re-verified by the independent
 :class:`~operations.autonomy_execution_verifier.AutonomyExecutionVerifier`
-against the freshly reloaded bundle and its VerifiedExecutionPlan is fed into the
-existing :meth:`ExecutorService.execute_verified` write core. The autonomous path
-always **settles** the in-flight reservation on every terminal/failed handoff
-(:func:`execute_autonomous`), releasing the concurrency slot while the store
-conservatively retains consumed budget/frequency. No model output authorizes,
-alters policy/limits, dispatches, or reaches the provider; the executor holds the
-only provider-write credential and remains the sole GameLift writer.
+against the freshly reloaded bundle — full reloaded evidence, current reservation
+ownership, a fresh separate autonomy switch, the E4 cached and durable execute
+gate, then the immediate pre-write checks — and its VerifiedExecutionPlan is fed
+into the existing :meth:`ExecutorService.execute_verified` write core via
+:func:`execute_autonomous`, which always **settles** the in-flight reservation on
+every terminal/failed handoff. No model output authorizes, alters policy/limits,
+dispatches, or reaches the provider; the executor holds the only provider-write
+credential and remains the sole GameLift writer.
 """
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ import os
 import time
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 
 # Local modules
 from operations.evidence import OperationEvidence
@@ -115,18 +118,9 @@ def execute_autonomous(
     fabricated, the in-flight slot is released, and the error propagates so the
     Step Functions workflow records a failed execution.
     """
-    # Local modules
-    from operations.autonomy_execution_verifier import AutonomyExecutionEvidence
-
     result: dict[str, Any] | None = None
     try:
-        evidence = AutonomyExecutionEvidence(
-            policy=dict(bundle["policy"]),
-            observation=dict(bundle["observation"]),
-            decision=dict(bundle["decision"]),
-            operation=dict(bundle["operation"]),
-            window_state=dict(bundle["window_state"]),
-        )
+        evidence = _build_autonomy_evidence(bundle)
         plan = verifier.verify(operation_id=invocation.operation_id, evidence=evidence)
         result = service.execute_verified(invocation, plan=plan, lease_holder=lease_holder)
         return result
@@ -162,16 +156,116 @@ def _region() -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
 
-class _ExecutorRuntime:
-    """The resolved, code-owned executor runtime (services + reload store)."""
+class AutonomyExecutorRuntime:
+    """The resolved, code-owned executor runtime (v1 services + optional v2 wiring).
 
-    def __init__(self, *, service: Any, reload_store: EvidenceExecutionReloadStore, metrics: Any) -> None:
+    The v1 human-approval path is always present. The v2 autonomous path is wired
+    only when the deployment configures the autonomy control plane (bundle store,
+    autonomy verifier, and reservation store); otherwise the v2 pieces are absent
+    and a reloaded v2 operation fails closed (nothing to reload/verify), keeping a
+    default deployment provider-read-only.
+    """
+
+    __slots__ = ("service", "reload_store", "metrics", "bundle_store", "autonomy_verifier", "reservation")
+
+    def __init__(
+        self,
+        *,
+        service: Any,
+        reload_store: EvidenceExecutionReloadStore,
+        metrics: Any,
+        bundle_store: Any = None,
+        autonomy_verifier: Any = None,
+        reservation: Any = None,
+    ) -> None:
         self.service = service
         self.reload_store = reload_store
         self.metrics = metrics
+        self.bundle_store = bundle_store
+        self.autonomy_verifier = autonomy_verifier
+        self.reservation = reservation
+
+    @property
+    def autonomy_enabled(self) -> bool:
+        return self.bundle_store is not None and self.autonomy_verifier is not None and self.reservation is not None
 
 
-def _build_runtime() -> _ExecutorRuntime:
+def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease_holder: str) -> dict[str, Any]:
+    """Reload one operation by id and route it to the v1 or v2 execution path.
+
+    The routing decision is made ONLY from the immutable, server-owned reloaded
+    operation envelope (:func:`select_execution_path`), never from model output or
+    a request-body field:
+
+    * A v1 operation reloaded with its granted approval runs the UNCHANGED
+      ``service.execute`` human-approval path.
+    * A v2 operation (no human approval) is reloaded as its full immutable bundle
+      and routed through the AutonomyExecutionVerifier + ``execute_verified`` write
+      core via :func:`execute_autonomous`.
+
+    Fails closed if the operation cannot be reloaded, is not approved (v1), or its
+    envelope does not unambiguously match exactly one known contract.
+    """
+    # Local modules
+    from operations.autonomy_execution_selection import ExecutionPath, SelectionError, select_execution_path
+    from operations.execute.executor_service import ExecutorServiceError
+
+    # 1. The v1 human-approval reload (operation + granted approval + state).
+    reloaded = runtime.reload_store.load_for_execution(invocation.operation_id)
+    if reloaded is not None:
+        prepared_operation, approval, state = reloaded
+        try:
+            path = select_execution_path(prepared_operation)
+        except SelectionError as exc:
+            raise ExecutorServiceError("operation envelope is not recognized") from exc
+        if path is not ExecutionPath.HUMAN_APPROVAL:
+            # A v2 operation must never carry a stored human approval.
+            raise ExecutorServiceError("autonomous operation must not carry a human approval")
+        if state != _APPROVED_STATE:
+            raise ExecutorServiceError("operation is not approved for execution")
+        v1_result: dict[str, Any] = runtime.service.execute(
+            invocation,
+            prepared_operation=prepared_operation,
+            approval=approval,
+            lease_holder=lease_holder,
+        )
+        return v1_result
+
+    # 2. No v1 approval: attempt the v2 autonomous bundle reload.
+    if not runtime.autonomy_enabled:
+        raise ExecutorServiceError("operation is unavailable for execution")
+    bundle = runtime.bundle_store.load_bundle(invocation.operation_id)
+    if bundle is None:
+        raise ExecutorServiceError("operation is unavailable for execution")
+    operation = bundle.get("operation")
+    if not isinstance(operation, Mapping):
+        raise ExecutorServiceError("reloaded bundle is malformed")
+    try:
+        path = select_execution_path(operation)
+    except SelectionError as exc:
+        raise ExecutorServiceError("operation envelope is not recognized") from exc
+    if path is not ExecutionPath.AUTONOMOUS:
+        raise ExecutorServiceError("reloaded bundle is not an autonomous operation")
+
+    # The stable logical action id is derived once from the reloaded, hash-bound
+    # operation and threaded through so the settle always targets the exact
+    # in-flight reservation.
+    # Local modules
+    from operations.contracts.execution import logical_action_id
+
+    action_id = logical_action_id(operation["operation_id"], operation["prepared_hash"])
+    return execute_autonomous(
+        invocation,
+        bundle=bundle,
+        logical_action_id=action_id,
+        verifier=runtime.autonomy_verifier,
+        service=runtime.service,
+        reservation=runtime.reservation,
+        lease_holder=lease_holder,
+    )
+
+
+def _build_runtime() -> AutonomyExecutorRuntime:
     # Third-party packages
     import boto3
     from botocore.config import Config as BotocoreConfig
@@ -237,29 +331,164 @@ def _build_runtime() -> _ExecutorRuntime:
         static_authority=obs.mode,
         unavailable_callback=lambda: kill_switch_metrics.record("kill_switch.unavailable"),
     )
+    durable_control_gate = (
+        DynamoDbDurableControlGate(client=dynamodb_client, table_name=obs.table_name)
+        if kill_switch_gate is not None
+        else None
+    )
+
+    # The v1 human-approval service (no pre-write hook: v1 behavior is unchanged).
     service = ExecutorService(
         verifier=verifier,
         adapter=adapter,
         store=execution_store,
         kill_switch_gate=kill_switch_gate,
-        durable_control_gate=(
-            DynamoDbDurableControlGate(
-                client=dynamodb_client,
-                table_name=obs.table_name,
-            )
-            if kill_switch_gate is not None
-            else None
-        ),
+        durable_control_gate=durable_control_gate,
     )
-    return _ExecutorRuntime(
-        service=service,
+
+    # The optional v2 autonomous wiring: bundle store, AutonomyExecutionVerifier
+    # (with the fresh separate autonomy switch + reservation ownership ports), the
+    # reservation store, and an autonomous ExecutorService whose immediate
+    # pre-write hook re-checks the separate switch and reservation ownership after
+    # the E4 second check and immediately before the single write. Built only when
+    # the deployment configures the autonomy control plane; otherwise absent so a
+    # default deployment stays provider-read-only.
+    bundle_store, autonomy_verifier, reservation_store, autonomy_service = _build_autonomy_wiring(
+        settings=settings,
+        dynamodb_client=dynamodb_client,
+        adapter=adapter,
+        execution_store=execution_store,
+        kill_switch_gate=kill_switch_gate,
+        durable_control_gate=durable_control_gate,
+    )
+
+    return AutonomyExecutorRuntime(
+        service=autonomy_service if autonomy_service is not None else service,
         reload_store=EvidenceExecutionReloadStore(approval_store),
         metrics=metrics,
+        bundle_store=bundle_store,
+        autonomy_verifier=autonomy_verifier,
+        reservation=reservation_store,
     )
+
+
+def _build_autonomy_wiring(
+    *,
+    settings: Any,
+    dynamodb_client: Any,
+    adapter: Any,
+    execution_store: Any,
+    kill_switch_gate: Any,
+    durable_control_gate: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Construct the optional v2 autonomous wiring, or ``(None, None, None, None)``.
+
+    Returns the bundle store, AutonomyExecutionVerifier, reservation store, and an
+    autonomous ExecutorService whose ``pre_write_hook`` re-checks the separate
+    autonomy switch + reservation ownership immediately before the write. Absent
+    unless the deployment fully configures the autonomy control plane (fail
+    closed), so a default deployment provisions no autonomous writer.
+    """
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionAuthorityContext, AutonomyExecutionVerifier
+    from operations.autonomy_runtime.bridges import StoreReservationVerifierPort, SwitchAutonomyPort
+    from operations.autonomy_runtime.evaluator_entry import resolve_autonomy_evaluator_settings
+    from operations.autonomy_runtime.store import DynamoDbAutonomyBundleStore, DynamoDbReservationStore
+    from operations.autonomy_switch import AutonomySwitchGate
+    from operations.control.appconfig_extension import AppConfigExtensionClient
+    from operations.execute.executor_service import ExecutorService
+    from operations.playbook_definition import EXECUTOR_BINDING_VERSION, EXECUTOR_ID
+
+    try:
+        autonomy_settings = resolve_autonomy_evaluator_settings()
+    except ValueError:
+        # Autonomy is default-disabled / not fully configured: no autonomous writer.
+        return None, None, None, None
+
+    obs = settings.observation
+    table_name = obs.table_name
+
+    reservation_store = DynamoDbReservationStore(client=dynamodb_client, table_name=table_name)
+    bundle_store = DynamoDbAutonomyBundleStore(client=dynamodb_client, table_name=table_name)
+
+    autonomy_extension = AppConfigExtensionClient(
+        application=autonomy_settings.appconfig_application,
+        environment=autonomy_settings.appconfig_environment,
+        profile=autonomy_settings.autonomy_switch_profile,
+        port=autonomy_settings.appconfig_extension_port,
+    )
+    switch_gate = AutonomySwitchGate(extension=autonomy_extension)
+    switch_port = SwitchAutonomyPort(switch_gate)
+    reservation_verifier_port = StoreReservationVerifierPort(reservation_store)
+
+    # The code-owned E5 autonomy authority context (operate authority, enrolled
+    # fleet, code-owned policy/playbook/executor identity). The policy id/version/
+    # hash are strict, server-owned deployment inputs the operation must bind
+    # exactly; they are never taken from the operation, the model, or a request.
+    context = AutonomyExecutionAuthorityContext(
+        deployment_mode=obs.mode,
+        capability_maximum=settings.capability_maximum,
+        tenant_id=obs.tenant_id,
+        workspace_id=obs.workspace_id,
+        expected_policy_id=autonomy_settings.autonomy_policy_id,
+        expected_policy_version=autonomy_settings.autonomy_policy_version,
+        expected_policy_hash=autonomy_settings.autonomy_policy_hash,
+        expected_playbook_hash=_autonomy_playbook_hash(),
+        expected_executor_id=EXECUTOR_ID,
+        expected_executor_binding_version=EXECUTOR_BINDING_VERSION,
+        enrolled_fleet_id=settings.enrolled_fleet_id,
+        enrolled_fleet_arn=settings.enrolled_fleet_arn,
+        enrolled_location=settings.enrolled_location,
+    )
+    autonomy_verifier = AutonomyExecutionVerifier(
+        context=context,
+        autonomy_switch=switch_port,
+        reservation=reservation_verifier_port,
+    )
+
+    # The autonomous ExecutorService: identical write core with an immediate
+    # pre-write hook that re-checks the SEPARATE autonomy switch + reservation
+    # ownership after the E4 second check and immediately before the write.
+    def _pre_write_hook(plan: Any) -> None:
+        switch_port.require_autonomy()
+        reservation_verifier_port.require_reservation(
+            operation_id=plan.intent["operation_id"],
+            logical_action_id=plan.logical_action_id,
+        )
+
+    autonomy_service = ExecutorService(
+        verifier=cast("Any", ExecutionVerifierUnused()),
+        adapter=adapter,
+        store=execution_store,
+        kill_switch_gate=kill_switch_gate,
+        durable_control_gate=durable_control_gate,
+        pre_write_hook=_pre_write_hook,
+    )
+    return bundle_store, autonomy_verifier, reservation_store, autonomy_service
+
+
+class ExecutionVerifierUnused:
+    """A v1 verifier placeholder for the autonomous service (never consulted).
+
+    The autonomous path only ever calls ``execute_verified`` (which does not use
+    the v1 verifier), so the autonomous ``ExecutorService`` is constructed with a
+    verifier that fails closed if the v1 ``execute`` entry is ever reached.
+    """
+
+    def verify(self, *, prepared_operation: Any, approval: Any) -> Any:
+        raise RuntimeError("the autonomous executor service does not run the v1 approval verifier")
+
+
+def _autonomy_playbook_hash() -> str:
+    """Return the code-owned autonomy playbook hash."""
+    # Local modules
+    from operations.autonomy_playbook_definition import autonomy_playbook_hash
+
+    return autonomy_playbook_hash()
 
 
 @lru_cache(maxsize=1)
-def _runtime() -> _ExecutorRuntime:
+def _runtime() -> AutonomyExecutorRuntime:
     return _build_runtime()
 
 
@@ -271,7 +500,7 @@ def _emit(metrics: Any, event: str) -> None:
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
-    """Step Functions entry: execute one approved operation (identifier only)."""
+    """Step Functions entry: execute one operation (identifier only), v1 or v2."""
     # Local modules
     from operations.execute.executor_service import ExecutionInvocation, ExecutorServiceError
 
@@ -279,19 +508,8 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
     started = time.monotonic()
     try:
         invocation = ExecutionInvocation.from_payload(dict(event) if isinstance(event, Mapping) else event)
-        reloaded = runtime.reload_store.load_for_execution(invocation.operation_id)
-        if reloaded is None:
-            raise ExecutorServiceError("operation is unavailable for execution")
-        prepared_operation, approval, state = reloaded
-        if state != _APPROVED_STATE:
-            raise ExecutorServiceError("operation is not approved for execution")
         request_id = _request_id(context)
-        result: dict[str, Any] = runtime.service.execute(
-            invocation,
-            prepared_operation=prepared_operation,
-            approval=approval,
-            lease_holder=request_id,
-        )
+        result: dict[str, Any] = execute_reloaded(runtime, invocation, lease_holder=request_id)
         _emit_outcome(runtime.metrics, result)
         return result
     except ExecutorServiceError:

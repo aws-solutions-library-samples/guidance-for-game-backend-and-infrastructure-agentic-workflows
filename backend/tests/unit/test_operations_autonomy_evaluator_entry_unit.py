@@ -49,6 +49,9 @@ def _base_env() -> dict[str, str]:
             "arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute"
         ),
         "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE": "autonomy-switch",
+        "GBAW_OPERATIONS_AUTONOMY_POLICY_ID": "policy.gamelift-capacity-autonomy",
+        "GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION": "2026-09-01",
+        "GBAW_OPERATIONS_AUTONOMY_POLICY_HASH": "sha256:" + "7" * 64,
     }
 
 

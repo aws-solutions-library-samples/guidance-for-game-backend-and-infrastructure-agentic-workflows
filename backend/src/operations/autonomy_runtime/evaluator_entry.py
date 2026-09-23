@@ -52,6 +52,9 @@ _APPCONFIG_APPLICATION_KEY = "GBAW_OPERATIONS_APPCONFIG_APPLICATION"
 _APPCONFIG_ENVIRONMENT_KEY = "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT"
 _APPCONFIG_PROFILE_KEY = "GBAW_OPERATIONS_APPCONFIG_PROFILE"
 _APPCONFIG_EXTENSION_PORT_KEY = "GBAW_OPERATIONS_APPCONFIG_EXTENSION_PORT"
+_AUTONOMY_POLICY_ID_KEY = "GBAW_OPERATIONS_AUTONOMY_POLICY_ID"
+_AUTONOMY_POLICY_VERSION_KEY = "GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION"
+_AUTONOMY_POLICY_HASH_KEY = "GBAW_OPERATIONS_AUTONOMY_POLICY_HASH"
 
 _REQUIRED_STATIC_MODE = "operate"
 _STATE_MACHINE_ARN_PREFIX = "arn:aws:states:"
@@ -75,6 +78,9 @@ class AutonomyEvaluatorDeploymentSettings:
     autonomy_state_machine_arn: str
     autonomy_switch_profile: str
     kill_switch_profile: str
+    autonomy_policy_id: str
+    autonomy_policy_version: str
+    autonomy_policy_hash: str
     appconfig_application: str
     appconfig_environment: str
     appconfig_extension_port: int
@@ -86,6 +92,9 @@ class AutonomyEvaluatorDeploymentSettings:
             "autonomy_state_machine_arn",
             "autonomy_switch_profile",
             "kill_switch_profile",
+            "autonomy_policy_id",
+            "autonomy_policy_version",
+            "autonomy_policy_hash",
             "appconfig_application",
             "appconfig_environment",
         ):
@@ -153,6 +162,9 @@ def resolve_autonomy_evaluator_settings(
         autonomy_state_machine_arn=_required(source, _AUTONOMY_STATE_MACHINE_KEY),
         autonomy_switch_profile=_required(source, _AUTONOMY_SWITCH_PROFILE_KEY),
         kill_switch_profile=_required(source, _APPCONFIG_PROFILE_KEY),
+        autonomy_policy_id=_required(source, _AUTONOMY_POLICY_ID_KEY),
+        autonomy_policy_version=_required(source, _AUTONOMY_POLICY_VERSION_KEY),
+        autonomy_policy_hash=_required(source, _AUTONOMY_POLICY_HASH_KEY),
         appconfig_application=_required(source, _APPCONFIG_APPLICATION_KEY),
         appconfig_environment=_required(source, _APPCONFIG_ENVIRONMENT_KEY),
         appconfig_extension_port=extension_port,
@@ -196,7 +208,8 @@ class DynamoDbWindowStateLoader:
         self._reservation_store = reservation_store
 
     def load(self, state_id: str) -> dict[str, Any]:
-        return self._reservation_store.current(state_id)
+        state: dict[str, Any] = self._reservation_store.current(state_id)
+        return state
 
 
 class _UnusedReservationPort:
