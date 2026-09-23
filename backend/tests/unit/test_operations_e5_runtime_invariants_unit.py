@@ -95,8 +95,10 @@ def test_stepfunctions_start_execution_input_is_operation_id_only() -> None:
         client=_Sfn(),
         state_machine_arn="arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute",
     )
-    start({"operation_id": "op_" + "b" * 26})
+    start({"operation_id": "op_" + "b" * 26}, name="op_" + "b" * 26)
     assert json.loads(captured[0]["input"]) == {"operation_id": "op_" + "b" * 26}
+    # A deterministic execution name is supplied so a duplicate start is idempotent.
+    assert captured[0]["name"] == "op_" + "b" * 26
 
 
 # -- The switch/kill-switch twice + reservation ownership on the write core -----

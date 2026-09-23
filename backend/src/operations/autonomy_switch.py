@@ -23,6 +23,11 @@ Why a separate document, parsed in code
   document (outside ``issued_at``/``not_after``) as :class:`AutonomySwitchUnavailable`.
   The only permit is a fresh, valid document that explicitly enables both the
   primary flag and the exact capability's ``autonomous_write`` flag.
+* **No naive timestamp coercion.** ``issued_at``/``not_after`` must carry an
+  explicit UTC offset (a normalized ``Z`` is fine). A naive, offset-less
+  timestamp is rejected rather than reinterpreted in the host's local zone,
+  which would skew the freshness window by the host's UTC offset and could keep
+  a stale switch "fresh".
 
 This module holds no credential and performs no provider write. It reads one
 localhost AppConfig-extension endpoint (through the same narrow
@@ -121,7 +126,8 @@ def validate_autonomy_switch_document(document: object) -> None:
         value = document[field]
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field} must be a non-empty string")
-        # Reject anything that is not a normalized UTC instant we can parse.
+        # Reject anything that is not a normalized UTC instant we can parse, and
+        # reject a naive (offset-less) timestamp rather than assuming UTC.
         _instant(value)
 
     if not isinstance(document["autonomy_enabled"], bool):
@@ -248,11 +254,18 @@ class AutonomySwitchGate:
 
 
 def _instant(value: str) -> datetime:
-    """Parse a normalized UTC ``Z`` timestamp into a timezone-aware instant."""
+    """Parse a timezone-aware instant, rejecting a naive (offset-less) timestamp.
+
+    ``datetime.astimezone`` on a *naive* value silently reinterprets it in the
+    host's local timezone, so a timestamp without an explicit UTC marker would
+    skew the freshness window by the host's UTC offset. The switch must never
+    guess a timezone: an offset-less timestamp is rejected rather than assumed to
+    be UTC. A normalized ``Z`` or an explicit numeric offset is accepted.
+    """
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError) as exc:
         raise ValueError("timestamp is not a valid ISO-8601 instant") from exc
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("timestamp must carry an explicit UTC offset")
     return parsed.astimezone(timezone.utc)

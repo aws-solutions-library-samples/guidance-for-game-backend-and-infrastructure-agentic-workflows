@@ -52,6 +52,9 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_AUTONOMY_POLICY_ID": "policy.gamelift-capacity-autonomy",
         "GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION": "2026-09-01",
         "GBAW_OPERATIONS_AUTONOMY_POLICY_HASH": "sha256:" + "7" * 64,
+        "GBAW_OPERATIONS_AUTONOMY_STATE_ID": "state.gamelift-capacity-autonomy",
+        "GBAW_OPERATIONS_AUTONOMY_SUBJECT": "subject.autonomy-agent",
+        "GBAW_OPERATIONS_AUTONOMY_CLIENT": "client.autonomy-runtime",
     }
 
 
@@ -87,6 +90,9 @@ def test_resolve_settings_refuses_unless_mode_is_exactly_operate() -> None:
         "GBAW_OPERATIONS_APPCONFIG_APPLICATION",
         "GBAW_OPERATIONS_ENROLLED_FLEET_ARN",
         "GBAW_OPERATIONS_TABLE_NAME",
+        "GBAW_OPERATIONS_AUTONOMY_STATE_ID",
+        "GBAW_OPERATIONS_AUTONOMY_SUBJECT",
+        "GBAW_OPERATIONS_AUTONOMY_CLIENT",
     ],
 )
 def test_resolve_settings_refuses_when_any_autonomy_identifier_missing(missing_key: str) -> None:
@@ -166,7 +172,7 @@ def test_start_execution_client_passes_operation_id_only() -> None:
         client=_FakeSfn(),
         state_machine_arn="arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute",
     )
-    start({"operation_id": "op_" + "a" * 26})
+    start({"operation_id": "op_" + "a" * 26}, name="op_" + "a" * 26)
 
     assert len(calls) == 1
     # The SFN input payload carries the operation_id and nothing else.
@@ -176,3 +182,5 @@ def test_start_execution_client_passes_operation_id_only() -> None:
     payload = json.loads(calls[0]["input"])
     assert payload == {"operation_id": "op_" + "a" * 26}
     assert calls[0]["stateMachineArn"].endswith("autonomy-execute")
+    # A deterministic execution name is passed so a duplicate start is idempotent.
+    assert calls[0]["name"] == "op_" + "a" * 26

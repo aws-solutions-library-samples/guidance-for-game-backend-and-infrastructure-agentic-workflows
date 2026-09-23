@@ -960,6 +960,7 @@ class DynamoDbReservationStore:
 
 
 _BUNDLE_SK = "AUTZBUNDLE"
+_DISPATCH_AUDIT_PHASES = frozenset({"dispatch_requested", "dispatched"})
 
 
 class AutonomyBundleStoreError(RuntimeError):
@@ -1079,6 +1080,94 @@ class DynamoDbAutonomyBundleStore:
         if self._raw_bundle(operation_id) is None:
             raise AutonomyBundleStoreError("no bundle is persisted for this operation")
         return {"operation_id": operation_id}
+
+    def record_dispatch_requested(self, *, operation_id: str, execution_name: str) -> None:
+        """Durably record, before StartExecution, that a dispatch was requested.
+
+        Written with a conditional immutable put so a crash/replay cannot rewrite
+        the audit trail. An identical re-record is idempotent; a differing one
+        (a different execution name for the same operation) fails closed. This
+        record is the fail-closed evidence retained after a StartExecution whose
+        outcome is uncertain: it proves a request was made without ever claiming
+        the execution started.
+        """
+        self._record_dispatch_audit(
+            operation_id=operation_id, phase="dispatch_requested", execution_name=execution_name
+        )
+
+    def record_dispatched(self, *, operation_id: str, execution_name: str) -> None:
+        """Durably record that StartExecution was confirmed (or idempotently replayed).
+
+        Only written AFTER a confirmed or idempotent start, so a terminal
+        execution never claims an unproven predecessor. Immutable and idempotent
+        exactly like :meth:`record_dispatch_requested`.
+        """
+        self._record_dispatch_audit(operation_id=operation_id, phase="dispatched", execution_name=execution_name)
+
+    def load_dispatch_audit(self, *, operation_id: str, phase: str) -> dict[str, Any] | None:
+        """Reload one dispatch audit record (``dispatch_requested``/``dispatched``)."""
+        if phase not in _DISPATCH_AUDIT_PHASES:
+            raise ValueError("phase must be one of dispatch_requested/dispatched")
+        canonical = self._raw_audit(operation_id, phase)
+        if canonical is None:
+            return None
+        try:
+            parsed = json.loads(canonical)
+        except (ValueError, TypeError) as exc:
+            raise AutonomyBundleStoreError("stored dispatch audit is malformed") from exc
+        if not isinstance(parsed, dict):
+            raise AutonomyBundleStoreError("stored dispatch audit is malformed")
+        return parsed
+
+    def _record_dispatch_audit(self, *, operation_id: str, phase: str, execution_name: str) -> None:
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("operation_id must be a non-empty string")
+        if not isinstance(execution_name, str) or not execution_name.strip():
+            raise ValueError("execution_name must be a non-empty string")
+        if phase not in _DISPATCH_AUDIT_PHASES:
+            raise ValueError("phase must be one of dispatch_requested/dispatched")
+        canonical = _canonical({"operation_id": operation_id, "phase": phase, "execution_name": execution_name})
+        item = {
+            "PK": {"S": self._bundle_pk(operation_id)},
+            "SK": {"S": self._audit_sk(phase)},
+            "operation_id": {"S": operation_id},
+            "phase": {"S": phase},
+            "audit": {"S": canonical},
+        }
+        try:
+            self._client.put_item(
+                TableName=self._table_name,
+                Item=item,
+                ConditionExpression="attribute_not_exists(SK)",
+            )
+        except Exception as exc:  # noqa: BLE001 - classify by conditional vs unavailable
+            if _is_conditional_failure(exc):
+                existing = self._raw_audit(operation_id, phase)
+                if existing is not None and existing == canonical:
+                    return
+                raise AutonomyBundleStoreError(
+                    "dispatch audit already exists and differs; refusing to overwrite"
+                ) from exc
+            _LOGGER.warning("dynamodb_autonomy_bundle_store audit unavailable exception_type=%s", type(exc).__name__)
+            raise AutonomyBundleStoreError("bundle store is unavailable") from exc
+
+    def _raw_audit(self, operation_id: str, phase: str) -> str | None:
+        response = self._client.get_item(
+            TableName=self._table_name,
+            Key={"PK": {"S": self._bundle_pk(operation_id)}, "SK": {"S": self._audit_sk(phase)}},
+            ConsistentRead=True,
+        )
+        item = response.get("Item") if isinstance(response, dict) else None
+        if not isinstance(item, dict):
+            return None
+        cell = item.get("audit")
+        if not isinstance(cell, dict) or "S" not in cell:
+            raise AutonomyBundleStoreError("stored dispatch audit is malformed")
+        return str(cell["S"])
+
+    @staticmethod
+    def _audit_sk(phase: str) -> str:
+        return f"AUTZDISPATCH#{phase}"
 
     # -- Low-level helpers -----------------------------------------------
 

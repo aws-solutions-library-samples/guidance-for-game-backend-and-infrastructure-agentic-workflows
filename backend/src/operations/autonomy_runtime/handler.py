@@ -181,7 +181,11 @@ class AutonomyRuntimeHandler:
 
         # 5. Identifier-only dispatch: StartExecution with operation_id alone.
         try:
-            self._start_execution({"operation_id": operation_id})
+            # Identifier-only dispatch under a DETERMINISTIC execution name (the
+            # operation id). A duplicate start of the same name is an idempotent
+            # replay the start callable treats as success; an ambiguous failure
+            # re-raises and fails closed below.
+            self._start_execution({"operation_id": operation_id}, name=operation_id[:80])
         except Exception:  # noqa: BLE001 - a StartExecution failure fails closed
             self._release_in_flight(operation_id, action_id)
             return RuntimeDispatchResult(RuntimeDispatchOutcome.REFUSED, reason="start_execution_failed")

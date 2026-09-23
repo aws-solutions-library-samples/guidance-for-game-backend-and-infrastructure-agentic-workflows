@@ -142,9 +142,13 @@ class _DenyGate:
 class _RecordingStartExecution:
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
+        self.names: list[str] = []
 
-    def __call__(self, payload: dict[str, str]) -> None:
+    def __call__(self, payload: dict[str, str], *, name: str) -> None:
+        # The handler dispatches under a DETERMINISTIC execution name so a
+        # duplicate start collapses to an idempotent ExecutionAlreadyExists.
         self.calls.append(payload)
+        self.names.append(name)
 
 
 def _handler(*, store: Any, gate: Any, start_execution: Any, reservation: Any) -> AutonomyRuntimeHandler:
@@ -181,6 +185,8 @@ def test_happy_path_prepares_persists_reserves_gates_and_starts_execution() -> N
     assert len(start.calls) == 1
     assert set(start.calls[0]) == {"operation_id"}
     assert start.calls[0]["operation_id"] == result.operation_id
+    # The execution name is deterministic (the operation id, capped at 80 chars).
+    assert start.names[0] == result.operation_id[:80]
 
 
 @pytest.mark.unit

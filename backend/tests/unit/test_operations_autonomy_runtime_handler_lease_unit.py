@@ -103,7 +103,7 @@ class _RecordingStartExecution:
     def __init__(self) -> None:
         self.calls: list[dict[str, str]] = []
 
-    def __call__(self, payload: dict[str, str]) -> None:
+    def __call__(self, payload: dict[str, str], *, name: str) -> None:
         self.calls.append(payload)
 
 
