@@ -414,7 +414,12 @@ Resources:
       Name: !Ref Environment
       Description: !Sub 'Operations autonomy environment (${Environment}).'
       Monitors:
-        - AlarmArn: !GetAtt AutonomyUnavailableAlarm.Arn
+        # The rollback monitor watches an AWS-EMITTED metric (the evaluator
+        # Lambda's AWS/Lambda Errors), so a freshly-deployed autonomy-switch
+        # document that makes the evaluator fail is rolled back automatically
+        # during the bake. A custom GameAgent/Operations metric is NOT emitted by
+        # a default/disabled plane and cannot drive rollback.
+        - AlarmArn: !GetAtt AutonomyEvaluatorErrorsAlarm.Arn
           AlarmRoleArn: !GetAtt AppConfigMonitorRole.Arn
 
   AutonomySwitchProfile:
@@ -833,23 +838,54 @@ Resources:
       SourceArn: !GetAtt EvaluationRule.Arn
 
   # ------------------------------------------------------------------------- #
-  # Alarms in the retained GameAgent/Operations namespace. Each is driven by a
-  # backend-emitted autonomy signal; a default (disabled) plane emits none, so
-  # TreatMissingData=notBreaching keeps them quiet until autonomy runs.
+  # Alarms, each driven by an AWS-EMITTED metric (AWS/Lambda Errors + Throttles,
+  # AWS/Events FailedInvocations, AWS/SQS DLQ depth). The evaluator emits NO
+  # custom metrics, so no alarm depends on backend instrumentation that a
+  # default/disabled plane would never emit. TreatMissingData=notBreaching keeps
+  # them quiet until autonomy actually runs.
   # ------------------------------------------------------------------------- #
-  # The real fail-closed signal: the separate autonomy switch could not be read
-  # as a fresh, valid document. Wired to the AppConfig environment monitor so a
-  # gradual autonomy-switch deployment that breaches it rolls back automatically.
-  AutonomyUnavailableAlarm:
+  # The AppConfig environment ROLLBACK monitor metric: the evaluator Lambda's
+  # AWS-emitted AWS/Lambda Errors. This is emitted by the platform whenever the
+  # evaluator errors (e.g. a freshly-deployed switch document it cannot read as
+  # fresh/valid makes it fail closed and raise), so a bad autonomy-switch
+  # deployment rolls back during its bake without depending on custom
+  # instrumentation that a default/disabled plane never emits.
+  AutonomyEvaluatorErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: ResourcesProvisioned
     Properties:
-      AlarmName: !Sub '${ProjectName}-operations-AutonomySwitchUnavailable'
+      AlarmName: !Sub '${ProjectName}-operations-AutonomyEvaluatorErrors'
       AlarmDescription: >-
-        Autonomy failed closed because the separate autonomy switch could not be
-        read as a fresh, valid document (extension unavailable/malformed/stale).
-      Namespace: 'GameAgent/Operations'
-      MetricName: AutonomySwitchUnavailable
+        The autonomy evaluator Lambda emitted AWS/Lambda Errors. Drives the
+        AppConfig autonomy-switch deployment rollback monitor during the bake.
+      Namespace: 'AWS/Lambda'
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EvaluatorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # Denial-of-wallet / concurrency-exhaustion signal on the evaluator, using the
+  # AWS-emitted AWS/Lambda Throttles metric (the reserved-concurrency cap of 1
+  # means a stuck or piled-up evaluation throttles rather than fans out).
+  AutonomyEvaluatorThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-AutonomyEvaluatorThrottles'
+      AlarmDescription: >-
+        The autonomy evaluator Lambda was throttled (reserved-concurrency cap or
+        denial-of-wallet guard). AWS-emitted metric.
+      Namespace: 'AWS/Lambda'
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EvaluatorFunction
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1
@@ -857,16 +893,22 @@ Resources:
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
 
-  # A dispatch that could not be confirmed (ambiguous StartExecution) — the
-  # caller failed closed without recording a confirmed dispatch.
-  AutonomyDispatchFailuresAlarm:
+  # A scheduled evaluation that EventBridge could not deliver to the evaluator,
+  # using the AWS-emitted AWS/Events FailedInvocations metric on the rule (the
+  # rule also has a DLQ; this alarms on delivery failure regardless).
+  AutonomyEvaluationDeliveryFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: ResourcesProvisioned
     Properties:
-      AlarmName: !Sub '${ProjectName}-operations-AutonomyDispatchFailures'
-      AlarmDescription: An autonomy dispatch failed ambiguously and failed closed.
-      Namespace: 'GameAgent/Operations'
-      MetricName: AutonomyDispatchFailures
+      AlarmName: !Sub '${ProjectName}-operations-AutonomyEvaluationDeliveryFailures'
+      AlarmDescription: >-
+        The scheduled autonomy evaluation could not be delivered to the evaluator
+        (EventBridge FailedInvocations). AWS-emitted metric.
+      Namespace: 'AWS/Events'
+      MetricName: FailedInvocations
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref EvaluationRule
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

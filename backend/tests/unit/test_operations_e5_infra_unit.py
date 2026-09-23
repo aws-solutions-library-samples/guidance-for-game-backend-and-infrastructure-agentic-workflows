@@ -514,14 +514,46 @@ def test_autonomy_switch_does_not_reuse_or_mutate_e4_schema(template):
 # --------------------------------------------------------------------------- #
 # Monitors and alarms exist in the retained namespace.
 # --------------------------------------------------------------------------- #
-def test_alarms_present_in_operations_namespace(template):
+def test_alarms_present_and_all_aws_emitted(template):
     alarms = _resources_of_type(template, "AWS::CloudWatch::Alarm")
     assert alarms, "09 must provision autonomy monitors/alarms"
     namespaces = {body["Properties"]["Namespace"] for body in alarms.values()}
     # Autonomy signal alarms live in the retained operations namespace; the DLQ
     # depth alarm necessarily uses the AWS/SQS namespace.
-    assert METRIC_NAMESPACE in namespaces, "09 must alarm on a GameAgent/Operations autonomy signal"
-    assert namespaces <= {METRIC_NAMESPACE, "AWS/SQS"}, f"unexpected alarm namespace(s): {namespaces}"
+    # Finding 5: every E5 alarm must watch an AWS-EMITTED metric. The evaluator
+    # emits NO custom metrics, so an alarm in the custom GameAgent/Operations
+    # namespace would watch a metric that never appears and can never fire.
+    assert METRIC_NAMESPACE not in namespaces, (
+        "09 alarms must not target the custom GameAgent/Operations namespace "
+        "(those metrics are never emitted by the evaluator)"
+    )
+    assert namespaces <= {"AWS/SQS", "AWS/Lambda", "AWS/Events"}, f"unexpected alarm namespace(s): {namespaces}"
+
+
+def test_appconfig_environment_monitor_uses_an_aws_emitted_metric(template):
+    """Finding 5: the AppConfig environment monitor must watch an AWS-EMITTED
+    metric so a bad autonomy-switch deployment actually rolls back during its
+    bake. A custom GameAgent/Operations metric is not emitted by a
+    default/disabled plane (and may not be emitted at all during a bake), so the
+    monitor must key off an AWS/Lambda (or AWS/SQS) metric the platform emits
+    unconditionally."""
+    envs = _resources_of_type(template, "AWS::AppConfig::Environment")
+    assert envs, "09 must declare the autonomy AppConfig environment"
+    alarms = _resources_of_type(template, "AWS::CloudWatch::Alarm")
+    for _name, env in envs.items():
+        monitors = env.get("Properties", {}).get("Monitors", [])
+        assert monitors, "the autonomy environment must declare a rollback monitor"
+        for monitor in monitors:
+            alarm_ref = str(monitor.get("AlarmArn"))
+            # Resolve the referenced alarm by logical id embedded in the GetAtt.
+            matched = [n for n in alarms if n in alarm_ref]
+            assert matched, f"monitor must reference a template alarm: {alarm_ref}"
+            for n in matched:
+                ns = alarms[n]["Properties"]["Namespace"]
+                assert ns.startswith("AWS/"), (
+                    f"AppConfig environment monitor alarm {n} must use an AWS-emitted "
+                    f"namespace, got {ns}"
+                )
 
 
 def test_log_group_present(template):
