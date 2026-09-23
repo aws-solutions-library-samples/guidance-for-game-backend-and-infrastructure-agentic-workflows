@@ -186,9 +186,7 @@ class AutonomySwitchGate:
         """Read the extension fresh and return an immutable decision, or fail closed."""
         document = self._read_fresh_document()
         capabilities = document["capabilities"]
-        flags = {
-            capability_id: bool(block["autonomous_write"]) for capability_id, block in capabilities.items()
-        }
+        flags = {capability_id: bool(block["autonomous_write"]) for capability_id, block in capabilities.items()}
         return AutonomySwitchDecision(
             autonomy_enabled=bool(document["autonomy_enabled"]),
             config_version=int(document["config_version"]),
