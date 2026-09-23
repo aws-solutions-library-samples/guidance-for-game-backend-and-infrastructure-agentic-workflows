@@ -337,6 +337,89 @@ stays at its stored non-terminal state until the first access transitions it.
 A periodic background sweep that expires idle operations without an access is
 deliberately deferred to **E4**.
 
+## Additive Bounded-Autonomy Profile (E5, v2)
+
+The `gamelift.capacity-adjustment/2.0` capability adds a **bounded-autonomy**
+(no-human-in-the-loop) layer that realizes the `operate` rung reserved by
+[ADR 0001](adr/0001-preserve-chat-and-add-optional-operations.md) and decided in
+[ADR 0006](adr/0006-bounded-autonomy-capacity.md). It is a **v2** layer: every
+document carries a `*_contract_version` of `"2.0"` and a distinct
+`urn:game-agent:operations:contracts:v2:...` `$id`, all new `$defs` are defined
+inline, and only the frozen v1 `common` `$defs` are referenced. The v2 schema
+names are disjoint from the published write-contract set and from the E2/E3
+capacity/execution sets, so adding this layer leaves every published v1 schema,
+vector, hash, and meaning byte-for-byte unchanged. Version selection uses a
+separate `is_supported_autonomy_version("2.0")` check; the v1 `== "1.0"`
+allowlist is not loosened.
+
+| Contract | Version field | Schema |
+|---|---|---|
+| Bounded-autonomy policy (immutable, server-owned) | `policy_contract_version` | `gamelift-capacity-autonomy-policy.schema.json` |
+| Autonomous decision (deterministic, trusted) | `decision_contract_version` | `gamelift-capacity-autonomous-decision.schema.json` |
+| Autonomous prepared operation (immutable) | `operation_contract_version` | `gamelift-capacity-autonomous-operation.schema.json` |
+
+The **bounded-autonomy policy** is the entirely server-owned guardrail envelope.
+It is never client, model, or request-body input. It binds the capability `2.0`,
+a distinct trusted **automation** principal (`source_type: const "automation"`,
+distinct from the human `trusted_identity`), tenant/workspace/enrollment and the
+exact enrolled fleet/location, the exact `0/1/1` capacity envelope (`floor`,
+`ceiling`, `max_step` are each `const`), the risk ceiling, observation freshness
+(max age and skew), an **integer micro-USD** per-action and per-window budget,
+cooldown, frequency, `max_in_flight: const 1` concurrency, anti-oscillation,
+`decision_ttl_seconds`, and the exact playbook/executor identities/versions/
+hashes. `required_execution_authority` is `const "operate"`. Its `policy_hash`
+binds every field except itself.
+
+The **autonomous decision** is a pure, deterministic reading that produces
+exactly one of `authorized`/`denied` at `operate` authority. A non-denied
+decision is `authorized` with the single reason code `APPROVED_AUTONOMOUS` and an
+`effective_authority` of `operate` (the deterministic minimum of the six ADR 0001
+authority inputs); any guardrail breach denies with the specific closed reason
+code(s) from the extended v2 set (`BOUNDS_EXCEEDED`, `RISK_LIMIT_EXCEEDED`,
+`OBSERVATION_STALE`, `BUDGET_EXCEEDED`, `COOLDOWN_ACTIVE`, `FREQUENCY_EXCEEDED`,
+`CONCURRENCY_LIMIT`, `OSCILLATION_BLOCKED`, `DECISION_EXPIRED`,
+`AUTOMATION_PRINCIPAL_INVALID`, and the shared authority/enrollment/workspace
+codes) and never carries `APPROVED_AUTONOMOUS`. It binds the exact policy
+id/version/hash and observation id/hash and carries `decision_expires_at =
+min(observation.expires_at, evaluated_at + policy.decision_ttl_seconds)`. There
+is **no human-approval field**: the decision itself is the time-boxed grant.
+
+The **autonomous prepared operation** is immutable and idempotent. Its
+`authority.decision` enum is the `["authorized","denied"]` mirror of the v1
+`["approval_required","denied"]` prepared operation, and it has **no approval
+field anywhere**. Its `prepared_hash` binds every other field — the target, the
+autonomy policy id/version/hash, the bound decision id/hash, the observation
+id/hash, the exact desired/min/max change, the playbook/profile/capability/
+contract versions, the six authority inputs and their minimum, the calculated
+risk, the automation principal scope, `decision_expires_at`, the executor
+binding, and `required_execution_authority` (`const "operate"`) — and excludes
+only itself.
+
+`evaluate_autonomy_policy` is the pure deterministic policy evaluator. It is a
+total function of trusted inputs only (a resolved policy, the six authority
+inputs, the verified automation principal, a trusted E1 observation, the proposed
+capacity triple, the durable rolling-window state, and a supplied epoch clock).
+It performs no AWS, runtime, or infrastructure work, reads no environment, and
+holds no credential; identical inputs always yield an identical reading. Money is
+integer micro-USD only. **Model and untrusted input supply none of** identity,
+policy, limits, authorization, playbook, executor, or credentials: all are
+server-owned and hash-bound, `additionalProperties` is `false` everywhere, and
+the evaluator matches the automation principal against the policy rather than
+trusting request-body or model-supplied identity.
+
+The v2 playbook (`playbook.gamelift-capacity-autonomy` / `2.0.0`) **preserves**
+the E2/E3 executor binding (`executor.gamelift-capacity` / `1.0`) — the single
+`UpdateFleetCapacity` write machinery is reused unchanged — but its precondition
+set (the deterministic guardrail envelope instead of a granted human approval)
+and its `operate` execution authority make its hash **distinct** from the E2
+`playbook.gamelift-capacity` / `1.0.0` hash. `autonomy-contract-vectors.json`
+pins the policy, decision, prepared-operation, and playbook hashes and enumerates
+the hash-invalidation cases for every bound field.
+
+This E5 layer publishes **contracts and a pure evaluator only**. It defines no
+infrastructure, runtime service, executor code path, IAM, or config lever. A
+default deployment creates, authorizes, and executes nothing.
+
 ## Compatibility and Publication
 
 Version `1.0` is exact, not a minimum. Consumers MUST use an explicit allowlist
@@ -356,3 +439,5 @@ meaning. Any semantic or structural change requires:
 The source-control playbook lists the exact hashes of the complete v1 schema
 set. A changed schema therefore invalidates playbook validation and requires a
 new playbook version and hash.
+
+The additive **v2** bounded-autonomy layer (`gamelift.capacity-adjustment/2.0`) follows this rule as a new version, not a change to any v1 document: it introduces new `*_contract_version: "2.0"` values, new `urn:...:v2:...` schema identifiers, new schema files, new canonical hashes and vectors (`autonomy-contract-vectors.json`), and a separate `is_supported_autonomy_version` allowlist, while every published v1 schema, playbook hash, and pinned vector remains byte-for-byte unchanged. A future autonomous executor allowlist keys on the capability version and the distinct autonomy playbook/executor hashes so a v1 human-approved path can never execute a v2 autonomous operation.

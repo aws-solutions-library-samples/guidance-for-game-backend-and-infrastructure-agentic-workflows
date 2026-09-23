@@ -1,0 +1,245 @@
+{
+  "vector_version": "2.0",
+  "policy_fixture": "gamelift-capacity-autonomy-policy.valid.json",
+  "decision_fixture": "gamelift-capacity-autonomous-decision.valid.json",
+  "operation_fixture": "gamelift-capacity-autonomous-operation.valid.json",
+  "expected": {
+    "policy_hash": "sha256:826c3fb781ca57b6e629d32a5cd091beddab786953d22f6247b8137498f953e9",
+    "decision_hash": "sha256:bdfc4554ac60ad14660089498ec634404b4431ae80d328f0fdd9dcbfd11e31ab",
+    "prepared_hash": "sha256:13bdcdb910a98b9c0edc50abbc9777086d07b4f4abcdf6b544836e0264b2a3c3",
+    "playbook_hash": "sha256:1aad3dc54c42e729e27cab78394ad17fc44d397e58ba20521a470890431b19c1",
+    "operation_id": "op_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "decision_id": "autz.op_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "idempotency_token": "idem_bbbbbbbbbbbbbbbbbbbbbbbb",
+    "policy_contract_version": "2.0",
+    "decision_contract_version": "2.0",
+    "operation_contract_version": "2.0",
+    "decision_expires_at": "2026-09-21T19:13:52Z"
+  },
+  "policy_hash_invalidation_cases": [
+    {
+      "name": "1 capability version",
+      "path": ["capability", "capability_version"],
+      "replacement": "3.0"
+    },
+    {
+      "name": "2 automation principal subject",
+      "path": ["automation_principal", "subject_id"],
+      "replacement": "subject.other-agent"
+    },
+    {
+      "name": "2 automation principal client",
+      "path": ["automation_principal", "client_id"],
+      "replacement": "client.other-runtime"
+    },
+    {
+      "name": "3 tenant",
+      "path": ["tenant_id"],
+      "replacement": "tenant.other"
+    },
+    {
+      "name": "3 workspace",
+      "path": ["workspace_id"],
+      "replacement": "workspace.other"
+    },
+    {
+      "name": "3 enrollment version",
+      "path": ["resource_enrollment", "enrollment_version"],
+      "replacement": "2026-10-01"
+    },
+    {
+      "name": "3 target fleet",
+      "path": ["target", "fleet_id"],
+      "replacement": "fleet-deadbeef-0000-0000-0000-000000000000"
+    },
+    {
+      "name": "3 target location",
+      "path": ["target", "location"],
+      "replacement": "eu-west-1"
+    },
+    {
+      "name": "5 policy version",
+      "path": ["policy_version"],
+      "replacement": "2026-10-01"
+    },
+    {
+      "name": "6 playbook version",
+      "path": ["playbook", "playbook_version"],
+      "replacement": "2.0.1"
+    },
+    {
+      "name": "6 playbook hash",
+      "path": ["playbook", "playbook_hash"],
+      "replacement": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0"
+    },
+    {
+      "name": "7 executor id",
+      "path": ["executor_binding", "executor_id"],
+      "replacement": "executor.gamelift-capacity-other"
+    },
+    {
+      "name": "7 executor binding version",
+      "path": ["executor_binding", "executor_binding_version"],
+      "replacement": "2.0"
+    },
+    {
+      "name": "8 observation max age",
+      "path": ["observation_freshness", "max_age_seconds"],
+      "replacement": 240
+    },
+    {
+      "name": "8 observation max skew",
+      "path": ["observation_freshness", "max_skew_seconds"],
+      "replacement": 60
+    },
+    {
+      "name": "9 risk max level",
+      "path": ["risk", "max_level"],
+      "replacement": "critical"
+    },
+    {
+      "name": "9 risk max score",
+      "path": ["risk", "max_score"],
+      "replacement": 75
+    },
+    {
+      "name": "10 budget action micro usd",
+      "path": ["budget", "max_action_micro_usd"],
+      "replacement": 600000
+    },
+    {
+      "name": "10 budget window micro usd",
+      "path": ["budget", "max_window_micro_usd"],
+      "replacement": 3000000
+    },
+    {
+      "name": "10 budget window seconds",
+      "path": ["budget", "window_seconds"],
+      "replacement": 7200
+    },
+    {
+      "name": "11 cooldown seconds",
+      "path": ["cooldown", "min_seconds_between_writes"],
+      "replacement": 600
+    },
+    {
+      "name": "12 frequency max writes",
+      "path": ["frequency", "max_writes_per_window"],
+      "replacement": 8
+    },
+    {
+      "name": "12 frequency window seconds",
+      "path": ["frequency", "window_seconds"],
+      "replacement": 7200
+    },
+    {
+      "name": "14 anti oscillation min seconds",
+      "path": ["anti_oscillation", "min_seconds_since_opposite_change"],
+      "replacement": 1200
+    },
+    {
+      "name": "14 anti oscillation max flips",
+      "path": ["anti_oscillation", "max_direction_flips_per_window"],
+      "replacement": 2
+    },
+    {
+      "name": "14 anti oscillation window seconds",
+      "path": ["anti_oscillation", "window_seconds"],
+      "replacement": 7200
+    },
+    {
+      "name": "15 decision ttl seconds",
+      "path": ["decision_ttl_seconds"],
+      "replacement": 240
+    }
+  ],
+  "operation_hash_invalidation_cases": [
+    {
+      "name": "target fleet",
+      "path": ["target", "fleet_id"],
+      "replacement": "fleet-deadbeef-0000-0000-0000-000000000000"
+    },
+    {
+      "name": "observation hash",
+      "path": ["current_state", "observation_hash"],
+      "replacement": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "requested desired",
+      "path": ["parameters", "requested", "desired"],
+      "replacement": 0
+    },
+    {
+      "name": "playbook hash",
+      "path": ["playbook", "playbook_hash"],
+      "replacement": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0"
+    },
+    {
+      "name": "capability version",
+      "path": ["capability", "capability_version"],
+      "replacement": "3.0"
+    },
+    {
+      "name": "authority decision",
+      "path": ["authority", "decision"],
+      "replacement": "denied"
+    },
+    {
+      "name": "calculated risk score",
+      "path": ["calculated_risk", "score"],
+      "replacement": 21
+    },
+    {
+      "name": "automation principal workspace",
+      "path": ["automation_principal", "workspace_id"],
+      "replacement": "workspace.other"
+    },
+    {
+      "name": "decision expires at",
+      "path": ["decision_expires_at"],
+      "replacement": "2026-09-21T19:14:52Z"
+    },
+    {
+      "name": "executor id",
+      "path": ["executor_binding", "executor_id"],
+      "replacement": "executor.gamelift-capacity-other"
+    },
+    {
+      "name": "required execution authority",
+      "path": ["required_execution_authority"],
+      "replacement": "remediate"
+    },
+    {
+      "name": "bound autonomy policy hash",
+      "path": ["autonomy_policy", "policy_hash"],
+      "replacement": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "name": "bound decision hash",
+      "path": ["decision", "decision_hash"],
+      "replacement": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "decision_hash_invalidation_cases": [
+    {
+      "name": "bound policy hash",
+      "path": ["policy", "policy_hash"],
+      "replacement": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "name": "observation hash",
+      "path": ["current_state", "observation_hash"],
+      "replacement": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "decision value",
+      "path": ["decision"],
+      "replacement": "denied"
+    },
+    {
+      "name": "decision expires at",
+      "path": ["decision_expires_at"],
+      "replacement": "2026-09-21T19:14:52Z"
+    }
+  ]
+}

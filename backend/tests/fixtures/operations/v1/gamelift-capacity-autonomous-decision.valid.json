@@ -1,0 +1,71 @@
+{
+  "decision_contract_version": "2.0",
+  "decision_id": "autz.op_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "phase": "operate",
+  "profile": "gamelift.capacity-adjustment/2.0",
+  "action": "gamelift.adjust-fleet-capacity",
+  "provider": "gamelift",
+  "capability": {
+    "capability_id": "gamelift.capacity-adjustment",
+    "capability_version": "2.0"
+  },
+  "automation_principal": {
+    "source_type": "automation",
+    "subject_id": "subject.autonomy-agent",
+    "client_id": "client.autonomy-runtime"
+  },
+  "policy": {
+    "policy_id": "policy.gamelift-capacity-autonomy",
+    "policy_version": "2026-09-01",
+    "policy_hash": "sha256:826c3fb781ca57b6e629d32a5cd091beddab786953d22f6247b8137498f953e9"
+  },
+  "target": {
+    "provider": "gamelift",
+    "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+    "location": "us-west-2"
+  },
+  "current_state": {
+    "observation_id": "obs_bbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "observation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "capacity": {
+      "desired": 0,
+      "minimum": 0,
+      "maximum": 1
+    },
+    "observed_at": "2026-09-21T19:11:52Z",
+    "expires_at": "2026-09-21T19:13:52Z"
+  },
+  "requested": {
+    "desired": 1,
+    "minimum": 0,
+    "maximum": 1
+  },
+  "calculated_risk": {
+    "level": "high",
+    "score": 60,
+    "factors": [
+      "desired-magnitude",
+      "scale-up"
+    ]
+  },
+  "authority_inputs": {
+    "deployment_mode": "operate",
+    "tenant_policy": "operate",
+    "workspace_policy": "operate",
+    "principal_authority": "operate",
+    "capability_maximum": "operate",
+    "operation_risk_policy": "operate"
+  },
+  "effective_authority": "operate",
+  "decision": "authorized",
+  "reason_codes": [
+    "APPROVED_AUTONOMOUS"
+  ],
+  "required_execution_authority": "operate",
+  "evaluated_at": "2026-09-21T19:11:52Z",
+  "decision_expires_at": "2026-09-21T19:13:52Z",
+  "correlation": {
+    "correlation_id": "corr.autonomy-1",
+    "request_id": "request.autonomy-1"
+  }
+}
