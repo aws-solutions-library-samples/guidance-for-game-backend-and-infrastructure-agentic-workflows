@@ -50,9 +50,14 @@
 > update, reached only through the authenticated workflow.
 
 1. **Deploy the optional E5 stack wrapper** (reviewed) into the target account.
-   This creates the autonomy runtime resources (evaluator, reservation store,
-   Step Functions state machine, audit ledger, alarms) **disabled**. It grants
-   no new provider-write permission to any non-executor component.
+   This creates the autonomy runtime resources (the evaluator Lambda, its
+   retained log group and retained dead-letter queue, the SEPARATE autonomy
+   AppConfig application/environment/profile, the scheduled rule, and the four
+   AWS-native alarms) **disabled**. It does NOT create a reservation store, a
+   Step Functions state machine, or an audit ledger: reservations and the audit
+   ledger live in the REUSED 06 operations table, and autonomous execution
+   reuses the EXISTING 07 STANDARD workflow by ARN. It grants no new
+   provider-write permission to any non-executor component.
 2. **Publish the AppConfig autonomy switch** enabling the autonomy primary flag
    and the `autonomous_write` capability flag, with a fresh
    `issued_at`/`not_after` window carrying an explicit UTC offset. Leave the E4
@@ -61,8 +66,10 @@
    `GBAW_OPERATIONS_AUTONOMY_ENABLED` on, static mode exactly `operate`, the
    separate autonomy switch enabled, and the E4 `dispatch`/`execute` phases and
    durable intent permitting.
-4. **Run the live shakedown** (see §3). It refuses unless every preflight
-   condition holds and both confirmations are supplied.
+4. **Run the live shakedown** (see §3) with the mandatory `--adapter command`
+   flag (the evaluator has no HTTP API; without the flag the harness refuses).
+   It refuses unless every preflight condition holds and both confirmations are
+   supplied.
 
 ## 3. Live validation (`e5_shakedown`)
 
@@ -95,8 +102,16 @@ python -m operations.validation.e5_shakedown \
   --autonomy-switch-fresh-enabled true \
   --alarms-safe true --drift-safe true \
   --confirm-forward "$GBAW_E5_CONFIRM_FORWARD" \
-  --confirm-inverse "$GBAW_E5_CONFIRM_INVERSE"
+  --confirm-inverse "$GBAW_E5_CONFIRM_INVERSE" \
+  --adapter command
 ```
+
+`--adapter command` is MANDATORY: the E5 evaluator has no HTTP API, so the
+harness drives concrete `aws` CLI commands (lambda/stepfunctions/dynamodb/
+cloudtrail/gamelift/appconfig) and refuses without the flag. The
+`--alarms-safe`, `--autonomy-switch-fresh-enabled`, and `--starting-*` values
+are OVERLAID by MEASURED provider reads: a supplied "safe" value cannot
+override an observed unsafe state, and the run fails closed on any conflict.
 
 Exit codes: `0` accepted, `1` a check failed, `2` summary failed public-safety
 (never emitted), `3` refused at preflight (no request made).

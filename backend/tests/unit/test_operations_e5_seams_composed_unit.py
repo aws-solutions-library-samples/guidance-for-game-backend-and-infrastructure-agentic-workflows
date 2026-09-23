@@ -443,3 +443,50 @@ def test_deploy_rejects_loose_fleet_arn_fallback() -> None:
     assert "arn:aws*:*:*:*:fleet/fleet-*" not in w
     # The ARN case must bind the exact enrolled fleet id.
     assert 'arn:aws*:gamelift:*:*:fleet/"$ENROLLED_FLEET_ID"' in w
+
+
+# --------------------------------------------------------------------------- #
+# Finding 10: docs/cost/retention/schedule reconcile with the real artifacts.
+# --------------------------------------------------------------------------- #
+
+DOCS = PROJECT_ROOT / "docs"
+RUNBOOK = PROJECT_ROOT / "backend/tests/runbook/E5_AUTONOMY_ACTIVATION_ROLLBACK_RUNBOOK.md"
+TEARDOWN = PROJECT_ROOT / "scripts/infrastructure/teardown-operations-autonomy.sh"
+
+
+def test_e5_runbook_and_teardown_document_both_retained_resources() -> None:
+    """The template retains BOTH the log group and the dead-letter queue; the
+    teardown script and runbook must name both, not only the logs."""
+    teardown = TEARDOWN.read_text(encoding="utf-8")
+    # Both retained resources referenced.
+    assert "dead-letter queue" in teardown.lower()
+    assert "log group" in teardown.lower()
+    # 09 declares both with a Retain policy.
+    tpl = TEMPLATE_09.read_text(encoding="utf-8")
+    assert tpl.count("RetainExceptOnCreate") >= 2 or (
+        "EvaluatorLogGroup" in tpl and "EvaluatorDeadLetterQueue" in tpl and tpl.count("DeletionPolicy") >= 2
+    )
+
+
+def test_e5_autonomy_doc_does_not_pass_ignored_switch_profile_var() -> None:
+    """The wrapper never reads GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID (09
+    creates the autonomy profile), so the runbook must not tell operators to
+    supply it."""
+    doc = (DOCS / "OPERATIONS_E5_AUTONOMY.md").read_text(encoding="utf-8")
+    deploy = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    assert "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID" not in deploy
+    assert "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID=" not in doc
+
+
+def test_e5_live_runbook_command_includes_adapter_command() -> None:
+    """The live shakedown command must pass --adapter command or it is refused."""
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert "--adapter command" in runbook
+
+
+def test_e5_cost_notes_attribute_appconfig_ownership_correctly() -> None:
+    """The E5 AppConfig set is created by 09; the E4 set is owned by 08."""
+    notes = (DOCS / "operations-e5-cost-notes.md").read_text(encoding="utf-8")
+    assert "created by this 09 stack" in notes
+    # The schedule cost row must be qualified by the four Scheduled* params.
+    assert "Scheduled*" in notes

@@ -21,7 +21,7 @@ double-opt-in owner action via `scripts/infrastructure/deploy-operations-autonom
 | --- | --- | --- |
 | Default (unprovisioned) | **$0.00** | `Provisioned=false`: no resource exists. |
 | Provisioned, disabled | **≈ $0.40** | `Provisioned=true`, `AutonomyMode=disabled`: schedule DISABLED, evaluator never fires; only the four alarms. |
-| Enabled, idle | **≈ $0.44** | `Provisioned=true`, `AutonomyMode=operate`: the evaluator fires every 5 minutes and evaluates the policy, starting no workflow when no change is warranted. |
+| Enabled, idle | **≈ $0.44** | `Provisioned=true`, `AutonomyMode=operate` AND all four `Scheduled*` parameters supplied: the evaluator fires every 5 minutes and evaluates the policy, starting no workflow when no change is warranted. Without a complete `Scheduled*` set the rule stays DISABLED and this row does not apply. |
 | Representative busy month | **≈ $0.44** | Equal to enabled-idle; the schedule cadence dominates and each authorized action only adds one un-metered `StartExecution`. |
 
 ## Why
@@ -36,14 +36,17 @@ double-opt-in owner action via `scripts/infrastructure/deploy-operations-autonom
   deployment rollback monitor. Autonomy-outcome coverage upstream/downstream is
   provided by the **reused** E1 (06), E3 (07), and E4 (08) alarms and is billed
   under those stacks, not double-counted here.
-- **Lambda**: the evaluator is scheduled every 5 minutes (**8,640**
+- **Lambda**: WHEN all four server-owned `Scheduled*` parameters are supplied,
+  the evaluator is scheduled every 5 minutes (**8,640**
   invocations/month) at a modeled 0.25 GB-second each — a few cents/month.
   `ReservedConcurrentExecutions=1` guarantees at most one evaluation at a time.
 - **AWS AppConfig** bills per configuration retrieved. The evaluator reads **two**
   documents (the E4 kill switch and the SEPARATE E5 autonomy switch) through the
   local Lambda extension cache, so retrievals track the cache-refresh cadence,
-  not per-request — a fraction of a cent/month. The application / environment /
-  profile resources themselves are **not** billed (and are owned by the 08 stack).
+  not per-request — a fraction of a cent/month. The E4 kill-switch application /
+  environment / profile are owned by the 08 control plane; the SEPARATE E5
+  autonomy application / environment / profile are **created by this 09 stack**.
+  Neither set of AppConfig application/environment/profile resources is billed.
 - **EventBridge** scheduled-rule invocations are not separately billed at this
   volume.
 - **No KMS key, no Secrets Manager secret, no API**: E5 reuses the 06 operations

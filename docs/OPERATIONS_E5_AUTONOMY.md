@@ -83,7 +83,8 @@ GBAW_OPERATIONS_AUTONOMY_STATE_ID=state.gamelift-capacity-autonomy \
 GBAW_OPERATIONS_APPCONFIG_APPLICATION_ID=<app-id> \
 GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT_ID=<env-id> \
 GBAW_OPERATIONS_APPCONFIG_PROFILE_ID=<e4-kill-switch-profile-id> \
-GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE_ID=<separate-autonomy-profile-id> \
+# NOTE: the SEPARATE autonomy AppConfig profile is CREATED by the 09 stack; the
+# wrapper does not take it as input. Do not pass an autonomy-switch profile id.
 GBAW_OPERATIONS_AUTONOMY_POLICY_FILE=./autonomy-policy.json \
 GBAW_OPERATIONS_AUTONOMY_WINDOW_STATE_FILE=./autonomy-window-state.json \
   scripts/infrastructure/deploy-operations-autonomy.sh --enable

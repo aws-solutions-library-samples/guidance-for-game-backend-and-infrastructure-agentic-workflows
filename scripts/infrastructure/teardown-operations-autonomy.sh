@@ -33,10 +33,11 @@ Usage: teardown-operations-autonomy.sh --confirm delete-operations-autonomy
                                          it this script does nothing.
 
 Deletes only the 09 CloudFormation stack. The 06 operations table + KMS key and
-the 07 executor workflow are NOT owned by this stack and are untouched. The E5
-evaluator log group is Retain-policy and survives. Prefer
-disable-operations-autonomy.sh for a reversible OFF. This script is never called
-by teardown-all.sh; run it by hand.
+the 07 executor workflow are NOT owned by this stack and are untouched. TWO 09
+resources use a Retain policy and SURVIVE deletion: the E5 evaluator log group
+AND the evaluator dead-letter queue. Both continue to incur (minimal) storage
+cost until deleted by hand. Prefer disable-operations-autonomy.sh for a
+reversible OFF. This script is never called by teardown-all.sh; run it by hand.
 USAGE
 }
 
@@ -81,11 +82,14 @@ if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --stack-name "$
 fi
 
 echo "ℹ️  The 06 operations table + KMS key and the 07 executor workflow are NOT"
-echo "    owned by this stack and are left untouched. The E5 evaluator log group"
-echo "    uses a Retain policy and survives."
+echo "    owned by this stack and are left untouched. TWO 09 resources use a"
+echo "    Retain policy and SURVIVE: the evaluator log group AND the evaluator"
+echo "    dead-letter queue. Both keep incurring minimal storage cost until"
+echo "    deleted by hand."
 
 echo "🗑️  Deleting CloudFormation stack $STACK_NAME ..."
 aws cloudformation delete-stack "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION"
 aws cloudformation wait stack-delete-complete "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" || true
 
-echo "✅ Stack deletion requested. The 06 data plane, 07 executor, and retained E5 logs are unaffected."
+echo "✅ Stack deletion requested. The 06 data plane, 07 executor, and the retained"
+echo "    E5 log group + dead-letter queue are unaffected."
