@@ -436,6 +436,55 @@ def test_autonomy_appconfig_profile_present(template):
         assert profile["Properties"]["LocationUri"] == "hosted"
 
 
+def test_autonomy_switch_profile_has_strict_json_schema_validator(template):
+    """Finding 4: the autonomy switch profile must carry a strict JSON_SCHEMA
+    validator so AppConfig rejects a malformed/unknown-field document before it
+    is ever served — not only the in-code check."""
+    profiles = _resources_of_type(template, "AWS::AppConfig::ConfigurationProfile")
+    assert profiles, "09 must declare the autonomy switch configuration profile"
+    for _name, res in profiles.items():
+        validators = res.get("Properties", {}).get("Validators")
+        assert validators, "the autonomy switch profile must declare Validators"
+        types = {v.get("Type") for v in validators}
+        assert "JSON_SCHEMA" in types, "the autonomy switch profile must use a JSON_SCHEMA validator"
+        # The schema must actually constrain the document (closed object, the
+        # required autonomy fields).
+        schema_blob = " ".join(str(v.get("Content", "")) for v in validators if v.get("Type") == "JSON_SCHEMA")
+        assert '"additionalProperties": false' in schema_blob, "validator must forbid unknown fields"
+        assert "autonomy_switch_version" in schema_blob
+        assert "autonomy_enabled" in schema_blob
+        assert "capabilities" in schema_blob
+
+
+def test_default_disabled_autonomy_version_is_deployed_via_immediate_strategy(template):
+    """Finding 4: the safe default (disabled) hosted version must actually be
+    DEPLOYED — an AWS::AppConfig::Deployment referencing it through the immediate
+    (0-minute, no-bake) strategy — otherwise no configuration is ever served and
+    a live read fails to find any deployed document."""
+    deployments = _resources_of_type(template, "AWS::AppConfig::Deployment")
+    assert deployments, "09 must deploy the default disabled autonomy version"
+    versions = _resources_of_type(template, "AWS::AppConfig::HostedConfigurationVersion")
+    strategies = _resources_of_type(template, "AWS::AppConfig::DeploymentStrategy")
+    # Identify the immediate (hard-down, 0 bake) strategy by its properties.
+    immediate = {
+        name
+        for name, res in strategies.items()
+        if res.get("Properties", {}).get("DeploymentDurationInMinutes") in (0, "0")
+        and res.get("Properties", {}).get("FinalBakeTimeInMinutes") in (0, "0")
+    }
+    assert immediate, "09 must declare an immediate (0-duration, 0-bake) deployment strategy"
+    deployed_ok = False
+    for _name, res in deployments.items():
+        props = res.get("Properties", {})
+        strat_ref = str(props.get("DeploymentStrategyId"))
+        ver_ref = str(props.get("ConfigurationVersion"))
+        strat_matches = any(s in strat_ref for s in immediate)
+        ver_matches = any(v in ver_ref for v in versions) or "DefaultDisabled" in ver_ref
+        if strat_matches and ver_matches:
+            deployed_ok = True
+    assert deployed_ok, "a Deployment must deploy the default disabled version via the immediate strategy"
+
+
 def test_default_autonomy_document_is_disabled_and_fail_closed(template):
     versions = _resources_of_type(template, "AWS::AppConfig::HostedConfigurationVersion")
     assert versions, "09 must seed a safe default autonomy document"

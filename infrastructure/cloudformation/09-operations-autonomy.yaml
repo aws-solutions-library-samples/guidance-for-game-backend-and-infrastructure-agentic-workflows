@@ -393,9 +393,11 @@ Resources:
   # Separate AppConfig AUTONOMY switch. This is a DISTINCT application/environment/
   # profile from the E4 (08) kill switch: enabling E4 never enables autonomy.
   # The seeded default document is DISABLED on every axis and already expired so
-  # it fails closed until the reviewed control plane issues a fresh document. The
-  # document is validated in-code by operations.autonomy_switch, so no JSON schema
-  # validator is inlined (and E4's frozen kill-switch schema is never touched).
+  # it fails closed until the reviewed control plane issues a fresh document. It
+  # is validated BOTH by AppConfig against a strict JSON_SCHEMA validator on the
+  # profile AND in-code by operations.autonomy_switch, and it is DEPLOYED through
+  # the immediate strategy so a live read always finds a fail-closed document.
+  # E4's frozen kill-switch schema is never touched.
   # ------------------------------------------------------------------------- #
   AutonomyApplication:
     Type: AWS::AppConfig::Application
@@ -423,9 +425,60 @@ Resources:
       Name: !Sub '${ProjectName}-operations-autonomy-switch'
       LocationUri: hosted
       Description: >-
-        The separate bounded-autonomy switch document, DISABLED by default and
-        validated in code (operations.autonomy_switch); independent of the E4
-        kill switch.
+        The separate bounded-autonomy switch document, DISABLED by default,
+        validated by AppConfig against a strict JSON schema AND re-validated in
+        code (operations.autonomy_switch). Independent of the E4 kill switch.
+      Validators:
+        # A self-contained JSON Schema mirroring operations.autonomy_switch's
+        # strict in-code contract: a closed object with exactly the autonomy
+        # switch fields, a fixed document version, a non-negative integer
+        # config_version, UTC-Z date-time freshness bounds, a boolean primary
+        # flag, and a non-empty capabilities map whose entries are closed
+        # {"autonomous_write": bool} objects. No external/urn $ref, so AppConfig
+        # validates it with no reference resolution. This is SEPARATE from — and
+        # never mutates — E4's frozen kill-switch schema.
+        - Type: JSON_SCHEMA
+          Content: |
+            {
+              "$schema": "https://json-schema.org/draft/2020-12/schema",
+              "$id": "urn:game-agent:operations:autonomy:v1:autonomy-switch",
+              "title": "Operations Autonomy Switch AppConfig Document 1.0",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "autonomy_switch_version",
+                "config_version",
+                "issued_at",
+                "not_after",
+                "autonomy_enabled",
+                "capabilities"
+              ],
+              "properties": {
+                "autonomy_switch_version": { "type": "string", "const": "1.0" },
+                "config_version": { "type": "integer", "minimum": 0 },
+                "issued_at": {
+                  "type": "string",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+                },
+                "not_after": {
+                  "type": "string",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+                },
+                "autonomy_enabled": { "type": "boolean" },
+                "capabilities": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["autonomous_write"],
+                    "properties": {
+                      "autonomous_write": { "type": "boolean" }
+                    }
+                  }
+                }
+              }
+            }
 
   DefaultDisabledAutonomyVersion:
     Type: AWS::AppConfig::HostedConfigurationVersion
@@ -475,6 +528,23 @@ Resources:
       GrowthFactor: 100
       GrowthType: LINEAR
       ReplicateTo: NONE
+
+  # Deploy the SAFE default (disabled, already-expired) hosted version through
+  # the immediate strategy so a live read finds a deployed, fail-closed document
+  # from the moment the plane is provisioned. Without this deployment AppConfig
+  # would serve no configuration and every read would fail to find one. The
+  # reviewed control plane later deploys a fresh, explicitly-enabled version
+  # (gradually, with monitor rollback) to actually enable autonomy.
+  DefaultDisabledAutonomyDeployment:
+    Type: AWS::AppConfig::Deployment
+    Condition: ResourcesProvisioned
+    Properties:
+      ApplicationId: !Ref AutonomyApplication
+      EnvironmentId: !Ref AutonomyEnvironment
+      ConfigurationProfileId: !Ref AutonomySwitchProfile
+      ConfigurationVersion: !Ref DefaultDisabledAutonomyVersion
+      DeploymentStrategyId: !Ref AutonomyImmediateDeploymentStrategy
+      Description: Deploy the safe default (disabled, fail-closed) autonomy switch document.
 
   # AppConfig monitor role: lets AppConfig read the CloudWatch alarm state during
   # a gradual deployment bake so a breach rolls the deployment back automatically.
