@@ -51,6 +51,7 @@ import pytest
 from operations.validation.e5_command_adapter import (
     CommandAdapter,
     CommandAdapterConfig,
+    CommandError,
     CommandResult,
     CommandTransport,
     HttpCall,
@@ -126,12 +127,26 @@ def _reservation_item(operation_id: str) -> dict:
     }
 
 
+def _provider_receipt_item(operation_id: str, *, request_id: str = "request-op-attr") -> dict:
+    return {
+        "Item": {
+            "PK": {"S": f"OP#{operation_id}"},
+            "SK": {"S": "EXECPROVIDER"},
+            "operation_id": {"S": operation_id},
+            "logical_action_id": {"S": "act_" + "a" * 64},
+            "provider_request_id": {"S": request_id},
+            "expected_capacity": {"S": json.dumps({"desired": 1, "minimum": 0, "maximum": 1})},
+        }
+    }
+
+
 def _cloudtrail_update_fleet_event(
     *,
     fleet_id: str = _ENROLLED_FLEET,
     location: str = _ENROLLED_LOCATION,
     role_arn: str = _EXECUTOR_ROLE_ARN,
     event_name: str = "UpdateFleetCapacity",
+    request_id: str = "request-op-attr",
     event_time_offset_seconds: int = 30,
     dispatch_time: datetime,
 ) -> dict:
@@ -143,7 +158,14 @@ def _cloudtrail_update_fleet_event(
         "eventName": event_name,
         "eventSource": "gamelift.amazonaws.com",
         "eventTime": event_time.isoformat().replace("+00:00", "Z"),
-        "requestParameters": {"fleetId": fleet_id, "location": location, "desiredInstances": 1},
+        "requestID": request_id,
+        "requestParameters": {
+            "fleetId": fleet_id,
+            "location": location,
+            "desiredInstances": 1,
+            "minSize": 0,
+            "maxSize": 1,
+        },
         "userIdentity": {
             "type": "AssumedRole",
             "arn": f"{role_arn}/executor-session",
@@ -499,6 +521,8 @@ class _AttribRunner:
             k = json.loads(argv[argv.index("--key") + 1])
             if k["SK"]["S"] == "AUTZDISPATCH#dispatched":
                 return CommandResult(0, json.dumps(_dispatched_audit_item(self.op)), "")
+            if k["SK"]["S"] == "EXECPROVIDER":
+                return CommandResult(0, json.dumps(_provider_receipt_item(self.op)), "")
             return CommandResult(0, json.dumps(_reservation_item(self.op)), "")
         if key == "cloudtrail lookup-events":
             return CommandResult(0, json.dumps({"Events": self._events}), "")
@@ -595,13 +619,12 @@ def test_attribution_rejects_wrong_fleet_or_location() -> None:
     assert _dispatch(_dispatch_transport(_AttribRunner([wrong_loc]), _config()))["cloudtrail_write_actor"] != "executor"
 
 
-def test_attribution_rejects_event_before_dispatch() -> None:
-    """An UpdateFleetCapacity event that predates the dispatch cannot be the write
-    from THIS dispatch and must not attribute to the executor."""
+def test_attribution_accepts_exact_request_id_despite_cloudtrail_timestamp_precision() -> None:
+    """The service request id, not sub-second clock ordering, binds the write."""
     dispatch_time = datetime.now(timezone.utc)
-    stale = _cloudtrail_update_fleet_event(dispatch_time=dispatch_time, event_time_offset_seconds=-120)
-    body = _dispatch(_dispatch_transport(_AttribRunner([stale]), _config()))
-    assert body["cloudtrail_write_actor"] != "executor"
+    same_second = _cloudtrail_update_fleet_event(dispatch_time=dispatch_time, event_time_offset_seconds=-120)
+    body = _dispatch(_dispatch_transport(_AttribRunner([same_second]), _config()))
+    assert body["cloudtrail_write_actor"] == "executor"
 
 
 def test_attribution_unreadable_event_is_unknown_not_executor() -> None:
@@ -609,3 +632,120 @@ def test_attribution_unreadable_event_is_unknown_not_executor() -> None:
     runner = _AttribRunner([])  # no events at all
     body = _dispatch(_dispatch_transport(runner, _config()))
     assert body["cloudtrail_write_actor"] != "executor"
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up: execution identity and CloudTrail attribution bind deployed facts.
+# --------------------------------------------------------------------------- #
+
+
+def test_execution_stack_outputs_bind_state_machine_and_executor_role() -> None:
+    """A live shakedown resolves 07 outputs instead of trusting caller values."""
+    deployed_state_machine = "arn:aws:states:us-west-2:000000000000:stateMachine:deployed-execution"
+    deployed_role = "arn:aws:iam::000000000000:role/deployed-executor"
+
+    class StackRunner(_ScriptedRunner):
+        def __call__(self, argv: list[str]) -> CommandResult:
+            if argv[1:3] == ["cloudformation", "describe-stacks"]:
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "Stacks": [
+                                {
+                                    "Outputs": [
+                                        {
+                                            "OutputKey": "ExecutionStateMachineArn",
+                                            "OutputValue": deployed_state_machine,
+                                        },
+                                        {"OutputKey": "ExecutorRoleArn", "OutputValue": deployed_role},
+                                    ]
+                                }
+                            ]
+                        }
+                    ),
+                    "",
+                )
+            return super().__call__(argv)
+
+    cfg = _config(
+        execution_stack_name="game-agent-operations-execution",
+        autonomy_state_machine_arn="",
+        executor_role_arn="",
+    )
+    bound = CommandAdapter(cfg, runner=StackRunner({})).bind_execution_stack_outputs()
+
+    assert bound.execution_arn_for("op_exact") == (
+        "arn:aws:states:us-west-2:000000000000:execution:deployed-execution:op_exact"
+    )
+
+
+def test_execution_stack_binding_refuses_operator_role_mismatch() -> None:
+    """An operator-supplied role may assert equality but cannot replace 07 output."""
+
+    class StackRunner(_ScriptedRunner):
+        def __call__(self, argv: list[str]) -> CommandResult:
+            if argv[1:3] == ["cloudformation", "describe-stacks"]:
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "Stacks": [
+                                {
+                                    "Outputs": [
+                                        {"OutputKey": "ExecutionStateMachineArn", "OutputValue": _STATE_MACHINE_ARN},
+                                        {"OutputKey": "ExecutorRoleArn", "OutputValue": _EXECUTOR_ROLE_ARN},
+                                    ]
+                                }
+                            ]
+                        }
+                    ),
+                    "",
+                )
+            return super().__call__(argv)
+
+    cfg = _config(
+        execution_stack_name="game-agent-operations-execution",
+        executor_role_arn="arn:aws:iam::000000000000:role/attacker-controlled-role",
+    )
+    with pytest.raises(CommandError):
+        CommandAdapter(cfg, runner=StackRunner({})).bind_execution_stack_outputs()
+
+
+def test_cloudtrail_attribution_requires_exact_provider_request_receipt() -> None:
+    """A matching role/fleet event for another request cannot prove this operation."""
+    dispatch_time = datetime.now(timezone.utc)
+    detail = {
+        "eventSource": "gamelift.amazonaws.com",
+        "eventName": "UpdateFleetCapacity",
+        "eventTime": (dispatch_time + timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+        "requestID": "request-for-another-operation",
+        "requestParameters": {
+            "fleetId": _ENROLLED_FLEET,
+            "location": _ENROLLED_LOCATION,
+            "desiredInstances": 1,
+            "minSize": 0,
+            "maxSize": 1,
+        },
+        "userIdentity": {"sessionContext": {"sessionIssuer": {"arn": _EXECUTOR_ROLE_ARN}}},
+    }
+    events = {"Events": [{"CloudTrailEvent": json.dumps(detail)}]}
+    adapter = CommandAdapter(_config())
+
+    assert (
+        adapter.correlated_executor_write(
+            events,
+            provider_request_id="request-for-this-operation",
+            expected_capacity={"desired": 1, "minimum": 0, "maximum": 1},
+        )
+        is False
+    )
+
+
+def test_execution_stack_binding_failure_is_checked_before_live_preflight() -> None:
+    """The CLI source binds 07 outputs before it can reach any live lifecycle step."""
+    shakedown = PROJECT_ROOT / "backend/src/operations/validation/e5_shakedown.py"
+    source = shakedown.read_text(encoding="utf-8")
+    binding = source.index("adapter.bind_execution_stack_outputs()")
+    preflight = source.index("_measure_preflight(adapter, config.preflight)")
+    assert binding < preflight

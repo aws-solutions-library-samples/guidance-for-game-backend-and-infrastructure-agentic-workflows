@@ -131,17 +131,22 @@ override an observed unsafe state, and the run fails closed on any conflict.
 Exit codes: `0` accepted, `1` a check failed, `2` summary failed public-safety
 (never emitted), `3` refused at preflight (no request made).
 
-The harness performs, in order, one **trusted E1 observation**, an
-evaluator-authorized **`0 -> 1`** write, then verifies the write was
-**audited**, **atomically reserved**, ran through **Step Functions**, and that
-the CloudTrail write is attributed to the **executor principal only**;
-verifies **capacity is 1**; proves an **immediate retry is denied** by
-cooldown/frequency/concurrency; performs a **separately-confirmed inverse
-`1 -> 0`**; verifies **capacity is 0**; **disables autonomy**; and proves a
-**forced evaluator/executor attempt cannot write**. It also runs the negative
-controls: **IAM-negative**, **alarms-safe**, **drift-safe**, **exact-artifact**,
-and **audit-complete**. Any ambiguous result (e.g. a capacity read missing an
-integer `desired`) fails **closed**.
+The harness resolves the exact 07 `ExecutionStateMachineArn` and `ExecutorRoleArn`
+from the deployed stack before preflight; an absent, malformed, or mismatched
+operator-supplied coordinate refuses the run before any write-capable step. It
+performs, in order, one **trusted E1 observation**, an evaluator-authorized
+**`0 -> 1`** write, then verifies the write was **audited**, **atomically
+reserved**, ran through **Step Functions**, and that CloudTrail binds the
+executor role, exact `UpdateFleetCapacity` request ID, and frozen capacity triple
+to this operation; verifies **capacity is 1**; proves an **immediate retry is
+denied** by cooldown/frequency/concurrency; performs a **separately-confirmed
+inverse `1 -> 0`**; verifies **capacity is 0**; **disables autonomy**; and
+proves a **forced evaluator/executor attempt cannot write**. During guaranteed
+teardown it confirms disablement, waits for every known dispatched execution to
+be terminal, reconciles through the separately confirmed operator inverse when
+needed, and only then accepts a final `0/0/1` read. Any ambiguous result (for
+example a missing integer `desired`, an unreadable invocation, or a dispatch
+whose execution cannot be identified) fails **closed**.
 
 ## 4. Rollback / teardown
 
@@ -151,12 +156,17 @@ Rollback is always safe to perform and leaves the fleet at rest.
    with the primary/`autonomous_write` flags off (or let its window lapse). The
    composite gate then fails closed on the next evaluation and immediate
    pre-write. This is the emergency disable; it requires no stack change.
-2. **Confirm capacity is `0/0/1`.** If a write left the demo fleet at `1`, drive
-   the inverse `1 -> 0` through the authenticated workflow (or via the shakedown
-   inverse step) and confirm `desired=0`.
-3. **Verify no forced write is possible** — a forced evaluator/executor attempt
+2. **Quiesce known executions before final reconciliation.** Describe every
+   shakedown operation that reached or might have reached `StartExecution` until
+   it is terminal. An unknown, running, or redrive-pending execution is not a
+   safe teardown result. Do not accept an earlier capacity-zero read as proof.
+3. **Confirm capacity is `0/0/1` after quiescence.** If a write left the demo
+   fleet at `1`, use the separately confirmed bounded inverse and then re-read
+   `desired=0`. A missing provider request receipt or CloudTrail correlation is
+   an unavailable proof, not a successful write attribution.
+4. **Verify no forced write is possible** — a forced evaluator/executor attempt
    returns a denial and performs no write (`forced_evaluator_executor_cannot_write`).
-4. **(Full teardown)** Delete the optional E5 stack wrapper
+5. **(Full teardown)** Delete the optional E5 stack wrapper
    (`teardown-operations-autonomy.sh --confirm delete-operations-autonomy`).
    Because it is layered and separate, deleting it does not touch stacks
    `00`–`08`, the E4 schema, or the chat runtime. Deleting the 09 stack removes

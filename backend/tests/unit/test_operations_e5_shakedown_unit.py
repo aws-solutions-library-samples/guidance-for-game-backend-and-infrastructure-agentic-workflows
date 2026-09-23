@@ -596,3 +596,130 @@ def test_teardown_waits_and_rereads_disable_state() -> None:
     assert fake.disable_state_reads >= 1, "teardown must re-read the disable state, not fire-and-forget"
     # And because the state never confirmed disabled, the teardown must NOT pass.
     assert result.passed is False, "an unconfirmed disable must fail the guaranteed teardown check"
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up: teardown disables and quiesces known executions before final zero.
+# --------------------------------------------------------------------------- #
+
+
+def test_guaranteed_teardown_quiesces_before_final_capacity_reconcile() -> None:
+    """A delayed executor write after an earlier zero read is reconciled safely.
+
+    The emergency disable must be confirmed first. The shakedown then waits for
+    the operation it dispatched to become terminal before it trusts a final zero
+    read or issues the bounded operator inverse.
+    """
+
+    class TraceTransport(FakeDeployedE5):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trace: list[str] = []
+
+        def __call__(self, method, url, headers, body):
+            path = url[len(ENDPOINT) :]
+            if path == "/operations/autonomy/disable":
+                self.trace.append(f"disable-{method.lower()}")
+            elif path.endswith("/capacity"):
+                self.trace.append("capacity")
+            return super().__call__(method, url, headers, body)
+
+    class QuiescingCleanup:
+        def __init__(self, transport: TraceTransport) -> None:
+            self.transport = transport
+            self.polls = 0
+
+        def execution_is_terminal(self, operation_id: str):
+            self.transport.trace.append("execution")
+            self.polls += 1
+            if self.polls == 1:
+                return False
+            # The previously dispatched executor completes after an earlier zero
+            # observation and restores desired=1. The final reconcile must see it.
+            self.transport.desired = 1
+            return True
+
+        def operator_inverse_update_fleet_capacity(self) -> None:
+            self.transport.trace.append("inverse")
+            self.transport.desired = 0
+
+    transport = TraceTransport()
+    cleanup = QuiescingCleanup(transport)
+    harness = sd.E5ShakedownHarness(_config(), transport, sleep=_NO_SLEEP, cleanup_adapter=cleanup)
+    harness._dispatched_operation_ids.add(OP_ID)
+
+    result = harness._guaranteed_restore_and_disable(scaled_up=True)
+
+    assert result.passed is True
+    assert cleanup.polls >= 2
+    assert transport.trace.index("disable-post") < transport.trace.index("execution")
+    assert transport.trace.index("execution") < transport.trace.index("inverse")
+    assert transport.trace[-1] == "capacity"
+    assert transport.desired == 0
+
+
+def test_guaranteed_teardown_fails_closed_when_a_known_execution_never_quiesces() -> None:
+    """A permanently running execution prevents a false restored-to-zero claim."""
+
+    class NeverTerminalCleanup:
+        def execution_is_terminal(self, operation_id: str):
+            return False
+
+        def operator_inverse_update_fleet_capacity(self) -> None:
+            pass
+
+    transport = FakeDeployedE5()
+    harness = sd.E5ShakedownHarness(_config(), transport, sleep=_NO_SLEEP, cleanup_adapter=NeverTerminalCleanup())
+    harness._dispatched_operation_ids.add(OP_ID)
+
+    result = harness._guaranteed_restore_and_disable(scaled_up=True)
+
+    assert result.passed is False
+    assert "execution" in result.detail.lower()
+
+
+def test_ambiguous_dispatch_with_operation_id_is_quiesced_before_teardown_success() -> None:
+    """A refused result that retains an operation id still enters terminality polling."""
+    transport = FakeDeployedE5()
+    harness = sd.E5ShakedownHarness(_config(), transport, sleep=_NO_SLEEP)
+    response = _resp(
+        200,
+        {
+            "decision": "denied",
+            "outcome": "refused",
+            "operation_id": OP_ID,
+            "dispatch_state": "unknown",
+            "wrote": False,
+        },
+    )
+
+    harness._track_dispatched_operation(response)
+
+    assert harness._dispatched_operation_ids == {OP_ID}
+
+
+def test_unresolved_dispatch_uncertainty_fails_guaranteed_teardown() -> None:
+    """No operation id means the harness cannot prove a racing execution is absent."""
+    transport = FakeDeployedE5()
+    harness = sd.E5ShakedownHarness(_config(), transport, sleep=_NO_SLEEP)
+    harness._unresolved_dispatch = True
+
+    result = harness._guaranteed_restore_and_disable(scaled_up=True)
+
+    assert result.passed is False
+    assert "execution" in result.detail.lower()
+
+
+def test_malformed_ambiguous_dispatch_identifier_marks_teardown_unresolved() -> None:
+    """A non-contract operation id cannot be silently ignored during teardown."""
+    transport = FakeDeployedE5()
+    harness = sd.E5ShakedownHarness(_config(), transport, sleep=_NO_SLEEP)
+    response = _resp(
+        200,
+        {"outcome": "refused", "operation_id": "bad-operation-id", "dispatch_state": "unknown", "wrote": None},
+    )
+
+    harness._track_dispatched_operation(response)
+
+    assert harness._dispatched_operation_ids == set()
+    assert harness._unresolved_dispatch is True

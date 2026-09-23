@@ -116,10 +116,11 @@ class _FakeAdapter:
             raise effect
         return effect
 
-    def update_capacity(self, **kwargs: Any) -> None:
+    def update_capacity(self, **kwargs: Any) -> Any:
         self.update_calls.append(kwargs)
         if isinstance(self.update_effect, Exception):
             raise self.update_effect
+        return self.update_effect
 
 
 def _service(store: _FakeStore, adapter: _FakeAdapter) -> ExecutorService:
@@ -229,3 +230,17 @@ def test_verification_failure_when_target_never_reached() -> None:
     assert result["outcome"] == "FAILED"
     assert result["failure_reason_code"] == "VERIFICATION_FAILED"
     assert len(adapter.update_calls) == 1
+
+
+def test_successful_write_receipt_is_committed_with_the_terminal_result() -> None:
+    """The E3 store receives the exact bounded service request id, not a raw response."""
+    store = _FakeStore()
+    adapter = _FakeAdapter(
+        describe_sequence=[_CURRENT, _TARGET],
+        update_effect="request-4f9c2b37-1a4c-4e8e-9d2c-2f6c76c6b470",
+    )
+
+    result = _run(store, adapter)
+
+    assert result["outcome"] == "SUCCEEDED"
+    assert store.commits[0]["provider_request_id"] == "request-4f9c2b37-1a4c-4e8e-9d2c-2f6c76c6b470"

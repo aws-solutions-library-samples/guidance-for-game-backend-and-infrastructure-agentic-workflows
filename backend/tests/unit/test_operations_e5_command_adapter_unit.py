@@ -75,6 +75,7 @@ def _correlated_cloudtrail_event(
     fleet_id: str = "fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555",
     location: str = "us-west-2",
     role_arn: str = _EXECUTOR_ROLE_ARN,
+    request_id: str = "request-e5-evidence",
 ) -> dict:
     """A CloudTrail LookupEvents record whose embedded event correlates to the
     executor role's UpdateFleetCapacity write, with an event time comfortably
@@ -85,9 +86,17 @@ def _correlated_cloudtrail_event(
 
     event_time = (_dt.now(_tz.utc) + _td(hours=1)).isoformat().replace("+00:00", "Z")
     detail = {
+        "eventSource": "gamelift.amazonaws.com",
         "eventName": "UpdateFleetCapacity",
         "eventTime": event_time,
-        "requestParameters": {"fleetId": fleet_id, "location": location, "desiredInstances": 1},
+        "requestID": request_id,
+        "requestParameters": {
+            "fleetId": fleet_id,
+            "location": location,
+            "desiredInstances": 1,
+            "minSize": 0,
+            "maxSize": 1,
+        },
         "userIdentity": {"sessionContext": {"sessionIssuer": {"arn": role_arn}}},
     }
     return {"EventName": "UpdateFleetCapacity", "CloudTrailEvent": _json.dumps(detail)}
@@ -164,6 +173,20 @@ def _reservation_item(operation_id: str) -> dict:
             "SK": {"S": "AUTZRSV"},
             "operation_id": {"S": operation_id},
             "settled": {"BOOL": False},
+        }
+    }
+
+
+def _provider_receipt_item(operation_id: str, *, request_id: str = "request-e5-evidence") -> dict:
+    """The bounded E3 provider receipt used for exact CloudTrail correlation."""
+    return {
+        "Item": {
+            "PK": {"S": f"OP#{operation_id}"},
+            "SK": {"S": "EXECPROVIDER"},
+            "operation_id": {"S": operation_id},
+            "logical_action_id": {"S": "act_" + "a" * 64},
+            "provider_request_id": {"S": request_id},
+            "expected_capacity": {"S": json.dumps({"desired": 1, "minimum": 0, "maximum": 1})},
         }
     }
 
@@ -307,6 +330,8 @@ def test_transport_maps_known_paths_to_commands() -> None:
             k = json.loads(argv[argv.index("--key") + 1])
             if k["SK"]["S"] == "AUTZDISPATCH#dispatched":
                 return CommandResult(0, json.dumps(_dispatched_audit_item(op)), "")
+            if k["SK"]["S"] == "EXECPROVIDER":
+                return CommandResult(0, json.dumps(_provider_receipt_item(op)), "")
             return CommandResult(0, json.dumps(_reservation_item(op)), "")
         if key == "cloudtrail lookup-events":
             return CommandResult(0, json.dumps({"Events": [_correlated_cloudtrail_event()]}), "")
@@ -558,6 +583,8 @@ def test_transport_write_assertions_come_from_real_evidence_reads() -> None:
             k = json.loads(argv[argv.index("--key") + 1])
             if k["SK"]["S"] == "AUTZDISPATCH#dispatched":
                 return CommandResult(0, json.dumps(_dispatched_audit_item(op)), "")
+            if k["SK"]["S"] == "EXECPROVIDER":
+                return CommandResult(0, json.dumps(_provider_receipt_item(op)), "")
             return CommandResult(0, json.dumps(_reservation_item(op)), "")
         if key == "cloudtrail lookup-events":
             # A correlated UpdateFleetCapacity event but by a FOREIGN role: the
@@ -671,11 +698,12 @@ class ScriptedLifecycleRunner:
                 return _write_invoke_payload(argv, {"statusCode": 200, "headers": {}, "body": body})
             want = event.get("desired")
             if not self.enabled:
-                self.dispatched = False
+                # A refused follow-up does not erase the terminal evidence for a
+                # previously started execution.
                 return _write_invoke_payload(argv, {"outcome": "refused", "reason": "AUTONOMY_DISABLED"})
             if want == 1 and self.desired == 1:
-                # Immediate retry at the top of the window is cooldown-denied.
-                self.dispatched = False
+                # Immediate retry at the top of the window is cooldown-denied;
+                # it does not erase the execution evidence already recorded.
                 return _write_invoke_payload(argv, {"outcome": "refused", "reason": "COOLDOWN_ACTIVE"})
             self.desired = int(want)
             self.dispatched = True
@@ -689,6 +717,8 @@ class ScriptedLifecycleRunner:
             k = json.loads(argv[argv.index("--key") + 1])
             if k["SK"]["S"] == "AUTZDISPATCH#dispatched":
                 return self._json(_dispatched_audit_item(self.last_op))
+            if k["SK"]["S"] == "EXECPROVIDER":
+                return self._json(_provider_receipt_item(self.last_op))
             return self._json(_reservation_item(self.last_op))
         if key == "cloudtrail lookup-events":
             return self._json({"Events": [_correlated_cloudtrail_event()]} if self.dispatched else {"Events": []})
@@ -1004,3 +1034,106 @@ def test_measured_preflight_static_e4_drift_enrollment_all_safe_passes() -> None
     assert measured.autonomy_switch_fresh_enabled is True
     assert measured.drift_safe is True
     assert measured.refusals() == []
+
+
+# --------------------------------------------------------------------------- #
+# Follow-up: dispatched evidence requires a durable per-operation receipt.
+# --------------------------------------------------------------------------- #
+
+
+def test_dispatch_evidence_does_not_credit_a_matching_role_without_its_receipt() -> None:
+    """Role/fleet/time alone prove only an executor write, not this operation."""
+    op = "op_receipt_required"
+
+    def runner(argv: list[str]) -> CommandResult:
+        key = f"{argv[1]} {argv[2]}"
+        if key == "lambda invoke":
+            return _write_invoke_payload(argv, {"outcome": "dispatched", "operation_id": op})
+        if key == "stepfunctions describe-execution":
+            return CommandResult(0, json.dumps({"status": "SUCCEEDED"}), "")
+        if key == "dynamodb get-item":
+            key_data = json.loads(argv[argv.index("--key") + 1])
+            if key_data["SK"]["S"] == "AUTZDISPATCH#dispatched":
+                return CommandResult(0, json.dumps(_dispatched_audit_item(op)), "")
+            if key_data["SK"]["S"] == "AUTZRSV":
+                return CommandResult(0, json.dumps(_reservation_item(op)), "")
+            # No EXECPROVIDER record exists for this operation.
+            return CommandResult(0, json.dumps({}), "")
+        if key == "cloudtrail lookup-events":
+            event = _correlated_cloudtrail_event()
+            detail = json.loads(event["CloudTrailEvent"])
+            detail["requestID"] = "request-for-another-operation"
+            detail["requestParameters"].update({"minSize": 0, "maxSize": 1})
+            event["CloudTrailEvent"] = json.dumps(detail)
+            return CommandResult(0, json.dumps({"Events": [event]}), "")
+        return CommandResult(0, "{}", "")
+
+    cfg = _config()
+    cfg = __import__("dataclasses").replace(cfg, executor_role_arn=_EXECUTOR_ROLE_ARN)
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=_observe_ok_caller()))
+    _seed_observation(transport)
+
+    body = transport(
+        "POST", "https://x/operations/autonomy/op/evaluate", headers={"authorization": "Bearer x"}, body=b"{}"
+    ).json()
+
+    assert body["cloudtrail_write_actor"] != "executor"
+
+
+def test_ambiguous_dispatch_refusal_retains_the_operation_for_teardown() -> None:
+    """A StartExecution-uncertain result must not discard its known operation id."""
+    op = "op_ambiguous_dispatch"
+    runner = RecordingRunner(
+        {"lambda invoke": {"outcome": "refused", "reason": "start_execution_uncertain", "operation_id": op}}
+    )
+    transport = CommandTransport(
+        CommandAdapter(_adapter_config_with_event(), runner=runner, http_caller=_observe_ok_caller())
+    )
+    _seed_observation(transport)
+
+    body = transport(
+        "POST", "https://x/operations/autonomy/op/evaluate", headers={"authorization": "Bearer x"}, body=b"{}"
+    ).json()
+
+    assert body["operation_id"] == op
+    assert body["dispatch_state"] == "unknown"
+    assert body["wrote"] is False
+
+
+def test_unreadable_evaluator_dispatch_is_unknown_not_a_no_write_refusal() -> None:
+    """An invocation error has no operation id to quiesce, so it remains unresolved."""
+
+    def runner(argv: list[str]) -> CommandResult:
+        if argv[1:3] == ["lambda", "invoke"]:
+            return CommandResult(255, "", "unavailable")
+        return CommandResult(0, "{}", "")
+
+    transport = CommandTransport(
+        CommandAdapter(_adapter_config_with_event(), runner=runner, http_caller=_observe_ok_caller())
+    )
+    _seed_observation(transport)
+
+    body = transport(
+        "POST", "https://x/operations/autonomy/op/evaluate", headers={"authorization": "Bearer x"}, body=b"{}"
+    ).json()
+
+    assert body["outcome"] == "unknown"
+    assert body["dispatch_state"] == "unknown"
+    assert body["wrote"] is None
+
+
+def test_malformed_dispatched_operation_id_remains_unresolved_for_teardown() -> None:
+    """A malformed dispatch identifier cannot be dropped as a safe refusal."""
+    runner = RecordingRunner({"lambda invoke": {"outcome": "dispatched", "operation_id": "bad-operation-id"}})
+    transport = CommandTransport(
+        CommandAdapter(_adapter_config_with_event(), runner=runner, http_caller=_observe_ok_caller())
+    )
+    _seed_observation(transport)
+
+    body = transport(
+        "POST", "https://x/operations/autonomy/op/evaluate", headers={"authorization": "Bearer x"}, body=b"{}"
+    ).json()
+
+    assert body["outcome"] == "unknown"
+    assert body["dispatch_state"] == "unknown"
+    assert body["wrote"] is None

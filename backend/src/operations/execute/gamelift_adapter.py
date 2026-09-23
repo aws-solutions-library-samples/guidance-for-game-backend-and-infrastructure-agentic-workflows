@@ -29,10 +29,13 @@ Result classification is the crux of safe execution:
 from __future__ import annotations
 
 # Standard library
+import re
 from typing import Any, Protocol
 
 _MIN_INSTANCES = 0
 _MAX_INSTANCES = 1_000_000
+_MAX_PROVIDER_REQUEST_ID_LENGTH = 256
+_PROVIDER_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+=@-]{0,255}$")
 
 
 class ExecutionGameLiftClient(Protocol):
@@ -95,6 +98,25 @@ def _is_client_error(exc: BaseException) -> bool:
     return isinstance(exc, ClientError)
 
 
+def _provider_request_id(response: object) -> str | None:
+    """Extract one bounded service request identifier from a successful response.
+
+    The value is an opaque correlation token, not a provider response. It is
+    retained outside the immutable execution-result contract so an E5 shakedown
+    can match the exact CloudTrail request. Missing or malformed metadata is
+    intentionally unavailable evidence, never a fabricated identifier.
+    """
+    if not isinstance(response, dict):
+        return None
+    metadata = response.get("ResponseMetadata")
+    if not isinstance(metadata, dict):
+        return None
+    request_id = metadata.get("RequestId")
+    if not isinstance(request_id, str) or len(request_id) > _MAX_PROVIDER_REQUEST_ID_LENGTH:
+        return None
+    return request_id if _PROVIDER_REQUEST_ID_PATTERN.fullmatch(request_id) else None
+
+
 class GameLiftExecutionAdapter:
     """Read + single-write GameLift adapter with safe result classification."""
 
@@ -145,12 +167,15 @@ class GameLiftExecutionAdapter:
         desired: int,
         minimum: int,
         maximum: int,
-    ) -> None:
+    ) -> str | None:
         """Issue exactly one bounded UpdateFleetCapacity write.
 
         A ``ClientError`` is a clear rejection (:class:`ProviderWriteRejected`);
         a timeout / lost response is :class:`ProviderWriteInconclusive`. This
         method never retries — the caller owns the Describe-before-retry policy.
+        On a confirmed response it returns only a bounded opaque request id, when
+        present, for durable CloudTrail correlation. It never returns raw provider
+        response data.
         """
         desired = _bounded_instances(desired, "desired")
         minimum = _bounded_instances(minimum, "minimum")
@@ -159,7 +184,7 @@ class GameLiftExecutionAdapter:
             raise ValueError("capacity write is not within [minimum, maximum]")
 
         try:
-            self._client.update_fleet_capacity(
+            response = self._client.update_fleet_capacity(
                 FleetId=fleet_id,
                 Location=location,
                 DesiredInstances=desired,
@@ -175,3 +200,4 @@ class GameLiftExecutionAdapter:
             # Any other unexpected error is treated as inconclusive: we cannot
             # prove the write did not land, so fail closed to reconciliation.
             raise ProviderWriteInconclusive() from exc
+        return _provider_request_id(response)

@@ -98,6 +98,7 @@ from operations.validation.e1_shakedown import (
 from operations.validation.e5_command_adapter import (
     CommandAdapter,
     CommandAdapterConfig,
+    CommandError,
     CommandTransport,
     subprocess_runner,
 )
@@ -307,6 +308,14 @@ class E5ShakedownHarness:
         # validates; without a cleanup adapter the teardown falls back to the
         # (best-effort) evaluator inverse.
         self._cleanup_adapter = cleanup_adapter
+        # Every dispatched operation created by this run must be terminal before
+        # the final capacity-zero claim. The set comes only from evaluator output,
+        # never an operator-supplied identifier.
+        self._dispatched_operation_ids: set[str] = set()
+        # A failed evaluator invoke can be ambiguous even when it returns no
+        # operation identifier. Such a dispatch cannot be quiesced by name, so
+        # teardown must fail closed rather than claim a proven final zero.
+        self._unresolved_dispatch = False
         # Injectable so tests drive the bounded reconcile/disable poll without a
         # real wall-clock wait. Production uses time.sleep.
         if sleep is None:
@@ -383,6 +392,23 @@ class E5ShakedownHarness:
             bearer=bearer,
             payload={"direction": direction},
         )
+
+    def _track_dispatched_operation(self, response: HttpResponse) -> None:
+        """Retain every operation that might have reached StartExecution.
+
+        A confirmed ``dispatched`` outcome is tracked normally. A refusal that
+        still carries an operation id represents an ambiguous StartExecution
+        boundary: the evaluator retained ``dispatch_requested`` evidence but
+        cannot prove whether the workflow started. It must be quiesced by id.
+        An invoke with no identifier leaves unresolved dispatch uncertainty and
+        prevents a successful final teardown claim.
+        """
+        body = self._body(response)
+        operation_id = body.get("operation_id")
+        if isinstance(operation_id, str) and operation_id.startswith("op_"):
+            self._dispatched_operation_ids.add(operation_id)
+        elif body.get("dispatch_state") == "unknown":
+            self._unresolved_dispatch = True
 
     def check_evaluator_authorizes_0_to_1(self, response: HttpResponse) -> CheckResult:
         clean, _ = response_is_bounded_and_clean(response)
@@ -545,6 +571,7 @@ class E5ShakedownHarness:
         try:
             # 3-4. Forward evaluation 0 -> 1 (write-capable) and its write assertions.
             forward = self._evaluate("up", bearer=self._config.admin_bearer)
+            self._track_dispatched_operation(forward)
             scaled_up = True
             checks.append(self.check_evaluator_authorizes_0_to_1(forward))
             checks.append(self.check_write_audited_reserved_sfn_executor_only(forward))
@@ -557,6 +584,7 @@ class E5ShakedownHarness:
 
             # 7. Separately-confirmed inverse 1 -> 0 (restore).
             inverse = self._evaluate("down", bearer=self._config.admin_bearer)
+            self._track_dispatched_operation(inverse)
             checks.append(self.check_inverse_1_to_0(inverse))
             scaled_up = False  # the planned restore succeeded
 
@@ -594,6 +622,36 @@ class E5ShakedownHarness:
             checks.append(self._guaranteed_restore_and_disable(scaled_up))
 
         return self._sanitized_summary(checks=checks, refused=False, refusal_codes=[])
+
+    def _confirm_known_executions_terminal(self) -> bool:
+        """Wait boundedly for every operation this shakedown dispatched to settle.
+
+        The command adapter reads the exact 07 Standard execution by its
+        deterministic operation-id name. A running, redrive-pending, malformed,
+        or unreadable execution is not terminal and therefore cannot coexist with
+        a successful final capacity-zero claim.
+        """
+        if self._unresolved_dispatch:
+            return False
+        if not self._dispatched_operation_ids:
+            return True
+        observer = self._cleanup_adapter if self._cleanup_adapter is not None else self._transport
+        terminal = getattr(observer, "execution_is_terminal", None)
+        if not callable(terminal):
+            return False
+        for attempt in range(_TEARDOWN_MAX_ATTEMPTS):
+            all_terminal = True
+            for operation_id in sorted(self._dispatched_operation_ids):
+                try:
+                    if terminal(operation_id) is not True:
+                        all_terminal = False
+                except Exception:  # noqa: BLE001 - unreadable execution is not terminal
+                    all_terminal = False
+            if all_terminal:
+                return True
+            if attempt + 1 < _TEARDOWN_MAX_ATTEMPTS:
+                self._sleep(_TEARDOWN_POLL_SECONDS)
+        return False
 
     def _read_desired_or_ambiguous(self) -> tuple[Optional[int], bool]:
         """Return (desired, read_ok). A read that RAISES or is ambiguous returns
@@ -699,23 +757,40 @@ class E5ShakedownHarness:
         return self._read_autonomy_disabled() is True
 
     def _guaranteed_restore_and_disable(self, scaled_up: bool) -> CheckResult:
-        """Exception-safe restore of the fleet to 0 and confirmed disable.
+        """Disable, quiesce, reconcile, and then prove the fleet is at zero.
 
-        Reconciles capacity to a CONFIRMED zero via a bounded poll+inverse loop
-        (never skipping the inverse just because a read raised or was ambiguous),
-        then issues disable and WAITS/RE-READS the disable state until confirmed.
-        Any failure is recorded as a FAILED check rather than raised, so the
-        summary always surfaces whether the guaranteed teardown succeeded."""
-        restored = self._confirm_capacity_zero()
+        The order is safety-critical. A capacity read before the E5 switch is
+        confirmed disabled and every known dispatched execution is terminal can
+        race a delayed executor write. The harness still attempts its bounded
+        inverse on any failure, but it never reports teardown success unless all
+        three postconditions are independently confirmed.
+        """
+        # The command-backed live path has a bounded operator-owned inverse, so
+        # it can safely close the autonomy gate first. Generic in-memory/test
+        # transports may lack that adapter; preserve their best-effort evaluator
+        # inverse before disable, but never trust it as the final proof.
+        if self._cleanup_adapter is None:
+            self._confirm_capacity_zero()
         disabled = self._confirm_autonomy_disabled()
-        detail = ""
-        if not restored:
-            detail = "guaranteed reconcile did not confirm the fleet restored to zero"
+        quiesced = self._confirm_known_executions_terminal()
+        # Reconcile a second time after disablement/quiescence even for generic
+        # transports. A delayed write between the first best-effort inverse and
+        # this point is either repaired within the bounded loop or fails closed.
+        restored = self._confirm_capacity_zero()
+        details: list[str] = []
         if not disabled:
-            detail = (detail + "; " if detail else "") + "disable was not confirmed on re-read"
-        if restored and disabled and not scaled_up:
-            detail = "no scale-up occurred; fleet confirmed at zero and autonomy confirmed disabled"
-        return CheckResult(name="guaranteed_restore", passed=restored and disabled, detail=detail)
+            details.append("disable was not confirmed on re-read")
+        if not quiesced:
+            details.append("a known dispatched execution did not reach a terminal state")
+        if not restored:
+            details.append("guaranteed reconcile did not confirm the fleet restored to zero")
+        if restored and disabled and quiesced and not scaled_up:
+            details.append("no scale-up occurred; fleet confirmed at zero and autonomy confirmed disabled")
+        return CheckResult(
+            name="guaranteed_restore",
+            passed=restored and disabled and quiesced,
+            detail="; ".join(details),
+        )
 
     def _preflight_echo_check(self, name: str, value: bool) -> CheckResult:
         return CheckResult(name=name, passed=bool(value))
@@ -835,6 +910,9 @@ def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig"
         kill_switch_profile_id=_val("appconfig_profile_id"),
         # The 09 autonomy stack, measured for FRESH drift (detect-stack-drift).
         autonomy_stack_name=_val("autonomy_stack_name", f"{project}-operations-autonomy"),
+        # The deployed 07 stack is the source of truth for the state-machine and
+        # executor role used by the validation evidence path.
+        execution_stack_name=_val("execution_stack_name", f"{project}-operations-execution"),
         # The 07 Standard state-machine ARN the evaluator starts; required to
         # build the exact dispatched executionArn from the deterministic name.
         autonomy_state_machine_arn=_val("autonomy_state_machine_arn"),
@@ -921,6 +999,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--operation-id", dest="operation_id", default="")
     parser.add_argument("--profile", default="")
     parser.add_argument("--region", default="")
+    parser.add_argument("--project-name", dest="project_name", default="")
+    parser.add_argument("--execution-stack-name", dest="execution_stack_name", default="")
     parser.add_argument("--enrolled-profile", dest="enrolled_profile", default="")
     parser.add_argument("--enrolled-region", dest="enrolled_region", default="")
     parser.add_argument("--enrolled-fleet-id", dest="enrolled_fleet_id", default="")
@@ -984,6 +1064,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     # through it — NEVER _requests_transport / an HTTP route. The adapter issues
     # structured `aws` CLI JSON commands only.
     adapter = _build_command_adapter(args, config)
+
+    # Bind the state-machine and executor role from the deployed 07 stack before
+    # preflight. An operator-supplied value may only match, never replace, those
+    # server-owned outputs; a failed read refuses before any write-capable step.
+    try:
+        adapter = adapter.bind_execution_stack_outputs()
+    except CommandError as exc:
+        print(json.dumps({"error": f"refused: execution identity binding failed ({type(exc).__name__})"}))
+        return 3
 
     # Finding 8: MEASURE the preflight facts from the provider via the adapter
     # (fleet capacity, the four AWS-native alarms, and the live autonomy switch

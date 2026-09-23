@@ -143,3 +143,42 @@ def test_write_timeout_is_inconclusive_not_a_failure() -> None:
     # The write may or may not have landed; the caller must Describe before any
     # retry. Exactly one call was attempted.
     assert len(fake.update_calls) == 1
+
+
+def test_update_capacity_returns_service_request_id_when_available() -> None:
+    """A successful provider response exposes only its bounded request id.
+
+    The executor persists this opaque identifier outside the execution-result
+    contract so E5 validation can match the exact CloudTrail request without
+    retaining a raw provider response.
+    """
+    fake = _FakeGameLift()
+    fake.update_effect = {"ResponseMetadata": {"RequestId": "request-4f9c2b37-1a4c-4e8e-9d2c-2f6c76c6b470"}}
+    adapter = GameLiftExecutionAdapter(fake)
+
+    request_id = adapter.update_capacity(
+        fleet_id="fleet-1234abcd",
+        location="us-west-2",
+        desired=14,
+        minimum=2,
+        maximum=20,
+    )
+
+    assert request_id == "request-4f9c2b37-1a4c-4e8e-9d2c-2f6c76c6b470"
+
+
+def test_update_capacity_returns_no_receipt_when_response_metadata_is_unusable() -> None:
+    """Missing or malformed response metadata cannot be fabricated as evidence."""
+    fake = _FakeGameLift()
+    fake.update_effect = {"ResponseMetadata": {"RequestId": ""}}
+    adapter = GameLiftExecutionAdapter(fake)
+
+    request_id = adapter.update_capacity(
+        fleet_id="fleet-1234abcd",
+        location="us-west-2",
+        desired=14,
+        minimum=2,
+        maximum=20,
+    )
+
+    assert request_id is None

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 # Standard library
 import logging
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -57,6 +58,9 @@ _STATE_SNAPSHOT_SK = "EXECSTATE"
 _INTENT_SK = "EXECINTENT"
 _RESULT_SK = "EXECRESULT"
 _VERIFICATION_SK = "EXECVERIFY"
+_PROVIDER_RECEIPT_SK = "EXECPROVIDER"
+_MAX_PROVIDER_REQUEST_ID_LENGTH = 256
+_PROVIDER_REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+=@-]{0,255}$")
 
 
 class ExecutionStoreError(RuntimeError):
@@ -170,6 +174,7 @@ class DynamoDbExecutionStore:
         expected_state: str,
         new_state: str,
         result: Mapping[str, Any],
+        provider_request_id: str | None = None,
     ) -> ExecutionCommitOutcome:
         """Atomically record provider intent/result/verification/state/ledger.
 
@@ -185,6 +190,12 @@ class DynamoDbExecutionStore:
         # persisted audit timestamp is deterministic and testable.
         recorded_at = _utc(self._clock(), "clock").isoformat().replace("+00:00", "Z")
         result_doc = deepcopy(dict(result))
+        provider_receipt = _provider_receipt_item(
+            operation_id=operation_id,
+            logical_action_id=logical_action_id,
+            result=result_doc,
+            provider_request_id=provider_request_id,
+        )
 
         result_item = _marshal(
             {
@@ -254,6 +265,11 @@ class DynamoDbExecutionStore:
             self._conditional_put(result_item, "attribute_not_exists(SK)"),
             self._conditional_put(verification_item, "attribute_not_exists(SK)"),
             self._conditional_put(intent_item, "attribute_not_exists(SK)"),
+            *(
+                [self._conditional_put(provider_receipt, "attribute_not_exists(SK)")]
+                if provider_receipt is not None
+                else []
+            ),
             self._conditional_put(state_change_item, "attribute_not_exists(SK)"),
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
@@ -286,6 +302,42 @@ class DynamoDbExecutionStore:
             return None
         return parsed if isinstance(parsed, dict) else None
 
+    def load_provider_write_receipt(self, operation_id: str) -> dict[str, Any] | None:
+        """Return bounded, operation-scoped provider correlation evidence.
+
+        The receipt is written atomically with the terminal E3 result. It is
+        intentionally separate from the frozen execution-result contract because
+        it contains an opaque provider request id used only by the E5 validation
+        path. Missing or malformed evidence is unavailable, never reconstructed.
+        """
+        item = self._get(f"OP#{operation_id}", _PROVIDER_RECEIPT_SK)
+        if not isinstance(item, dict) or item.get("operation_id") != operation_id:
+            return None
+        logical_action_id = item.get("logical_action_id")
+        provider_request_id = item.get("provider_request_id")
+        expected_capacity = item.get("expected_capacity")
+        if not isinstance(logical_action_id, str) or not isinstance(provider_request_id, str):
+            return None
+        if not _valid_provider_request_id(provider_request_id):
+            return None
+        if not isinstance(expected_capacity, str):
+            return None
+        try:
+            # Standard library
+            import json
+
+            parsed_capacity = json.loads(expected_capacity)
+        except (TypeError, ValueError):
+            return None
+        if not _valid_capacity(parsed_capacity):
+            return None
+        return {
+            "operation_id": operation_id,
+            "logical_action_id": logical_action_id,
+            "provider_request_id": provider_request_id,
+            "expected_capacity": parsed_capacity,
+        }
+
     # -- Low-level helpers -----------------------------------------------
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
@@ -312,6 +364,59 @@ def _canonical_json(document: Mapping[str, Any]) -> str:
     import json
 
     return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _valid_provider_request_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) <= _MAX_PROVIDER_REQUEST_ID_LENGTH
+        and _PROVIDER_REQUEST_ID_PATTERN.fullmatch(value) is not None
+    )
+
+
+def _valid_capacity(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"desired", "minimum", "maximum"}:
+        return False
+    return all(
+        isinstance(item, int) and not isinstance(item, bool) and 0 <= item <= 1_000_000 for item in value.values()
+    )
+
+
+def _provider_receipt_item(
+    *,
+    operation_id: str,
+    logical_action_id: str,
+    result: Mapping[str, Any],
+    provider_request_id: str | None,
+) -> dict[str, dict[str, Any]] | None:
+    """Build the bounded operation-scoped receipt written with a provider result.
+
+    A write with no usable response request id remains a valid executor outcome,
+    but it yields unavailable attribution evidence. The E5 harness will fail
+    closed rather than credit a nearby CloudTrail event to that operation.
+    """
+    write_issued = result.get("provider_write_issued")
+    if write_issued is not True or not _valid_provider_request_id(provider_request_id):
+        # Receipt evidence is optional audit enrichment. A malformed or missing
+        # provider response must not turn a write that already landed into a lost
+        # terminal result; the E5 shakedown treats its absence as unavailable.
+        return None
+    if result.get("operation_id") != operation_id or result.get("logical_action_id") != logical_action_id:
+        return None
+    verification = result.get("verification")
+    expected_capacity = verification.get("expected_capacity") if isinstance(verification, Mapping) else None
+    if not _valid_capacity(expected_capacity):
+        return None
+    return _marshal(
+        {
+            "PK": f"OP#{operation_id}",
+            "SK": _PROVIDER_RECEIPT_SK,
+            "operation_id": operation_id,
+            "logical_action_id": logical_action_id,
+            "provider_request_id": provider_request_id,
+            "expected_capacity": _canonical_json(expected_capacity),
+        }
+    )
 
 
 # -- ClientError classification (shared shape with E1/E2 stores) --------------

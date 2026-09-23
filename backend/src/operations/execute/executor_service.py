@@ -140,6 +140,7 @@ class ExecutionStorePort(Protocol):
         expected_state: str,
         new_state: str,
         result: Mapping[str, Any],
+        provider_request_id: str | None = None,
     ) -> ExecutionCommitOutcome: ...
 
     def load_recorded_result(self, logical_action_id: str) -> dict[str, Any] | None: ...
@@ -150,7 +151,9 @@ class ExecutionAdapterPort(Protocol):
 
     def describe_capacity(self, *, fleet_id: str, location: str) -> dict[str, int]: ...
 
-    def update_capacity(self, *, fleet_id: str, location: str, desired: int, minimum: int, maximum: int) -> None: ...
+    def update_capacity(
+        self, *, fleet_id: str, location: str, desired: int, minimum: int, maximum: int
+    ) -> str | None: ...
 
 
 def _system_clock() -> datetime:
@@ -342,8 +345,9 @@ class ExecutorService:
                 )
         # Issue exactly one UpdateFleetCapacity.
         write_issued = True
+        provider_request_id: str | None = None
         try:
-            self._adapter.update_capacity(
+            provider_request_id = self._adapter.update_capacity(
                 fleet_id=plan.fleet_id,
                 location=plan.location,
                 desired=target["desired"],
@@ -393,7 +397,12 @@ class ExecutorService:
         observed, matched = self._poll_until_target(plan, target)
         if matched:
             return self._record(
-                plan, acquisition, outcome=OUTCOME_SUCCEEDED, write_issued=write_issued, observed=observed
+                plan,
+                acquisition,
+                outcome=OUTCOME_SUCCEEDED,
+                write_issued=write_issued,
+                observed=observed,
+                provider_request_id=provider_request_id,
             )
         if observed is None:
             # Every verification Describe failed: the write's effect is unknown.
@@ -403,6 +412,7 @@ class ExecutorService:
                 outcome=OUTCOME_HUMAN_RECONCILIATION_REQUIRED,
                 write_issued=write_issued,
                 observed=expected,
+                provider_request_id=provider_request_id,
                 failure_reason="RESULT_INCONCLUSIVE",
                 new_state="failed",
             )
@@ -412,6 +422,7 @@ class ExecutorService:
             outcome=OUTCOME_FAILED,
             write_issued=write_issued,
             observed=observed,
+            provider_request_id=provider_request_id,
             failure_reason="VERIFICATION_FAILED",
             new_state="failed",
         )
@@ -486,6 +497,7 @@ class ExecutorService:
         outcome: str,
         write_issued: bool,
         observed: dict[str, int],
+        provider_request_id: str | None = None,
         failure_reason: str | None = None,
         new_state: str = "succeeded",
     ) -> dict[str, Any]:
@@ -526,6 +538,7 @@ class ExecutorService:
             expected_state="dispatched",
             new_state=commit_state,
             result=result,
+            provider_request_id=provider_request_id,
         )
         if commit_outcome is ExecutionCommitOutcome.PRECONDITION_FAILED:
             # A superseded writer or a state race: do not fabricate success.

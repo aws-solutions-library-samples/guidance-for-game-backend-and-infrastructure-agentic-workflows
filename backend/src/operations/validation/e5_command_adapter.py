@@ -61,7 +61,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
 
@@ -93,6 +93,9 @@ _BUNDLE_SK = "AUTZBUNDLE"
 _DISPATCHED_AUDIT_SK = "AUTZDISPATCH#dispatched"
 _RESERVATION_PK_PREFIX = "AUTZRSV#"
 _RESERVATION_SK = "AUTZRSV"
+_EXECUTION_RECEIPT_PK_PREFIX = "OP#"
+_EXECUTION_RECEIPT_SK = "EXECPROVIDER"
+_EXECUTION_TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"})
 
 # The single supported autonomy capability id (see the 08 kill-switch and 09
 # autonomy-switch AppConfig documents). E4 permission is read from this
@@ -226,6 +229,10 @@ class CommandAdapterConfig:
     kill_switch_profile_id: str = ""
     # The 09 autonomy CloudFormation stack, measured for FRESH drift. Defaulted.
     autonomy_stack_name: str = ""
+    # The 07 stack is the trusted source for the execution state machine and the
+    # executor role used by CloudTrail attribution. Defaulted only so structural
+    # unit tests can construct an adapter; a live run resolves it before preflight.
+    execution_stack_name: str = ""
     # The 07 Standard state-machine ARN the evaluator starts. Required to build
     # the exact dispatched ``executionArn`` (state-machine ARN + execution name);
     # defaulted for structural construction.
@@ -295,6 +302,67 @@ class CommandAdapter:
         if parsed is None:
             raise CommandError(f"command returned no JSON: {argv[1]} {argv[2]}")
         return parsed
+
+    def bind_execution_stack_outputs(self) -> CommandAdapter:
+        """Return an adapter bound to the deployed 07 execution coordinates.
+
+        A command-line or environment value may assert equality with a deployed
+        value but never becomes the source of truth. Missing, malformed, or
+        mismatched outputs fail closed before the shakedown sends any authenticated
+        mutation.
+        """
+        stack_name = self._config.execution_stack_name.strip()
+        if not stack_name:
+            raise CommandError("execution stack binding is unavailable")
+        argv = self._base("cloudformation", "describe-stacks")
+        argv += ["--stack-name", stack_name]
+        data = self._run_json(argv)
+        outputs = self._execution_stack_outputs(data)
+        if outputs is None:
+            raise CommandError("execution stack binding is unavailable")
+        state_machine_arn, executor_role_arn = outputs
+        configured_state_machine = self._config.autonomy_state_machine_arn.strip()
+        configured_role = self._config.executor_role_arn.strip()
+        if configured_state_machine and configured_state_machine != state_machine_arn:
+            raise CommandError("execution state machine binding does not match deployment")
+        if configured_role and configured_role != executor_role_arn:
+            raise CommandError("executor role binding does not match deployment")
+        return CommandAdapter(
+            replace(
+                self._config,
+                autonomy_state_machine_arn=state_machine_arn,
+                executor_role_arn=executor_role_arn,
+            ),
+            runner=self._runner,
+            drift_poll_sleep=self._drift_poll_sleep,
+            http_caller=self._http_caller,
+            observe_poll_sleep=self._observe_poll_sleep,
+            idempotency_token_factory=self._idempotency_token_factory,
+        )
+
+    @staticmethod
+    def _execution_stack_outputs(data: Any) -> tuple[str, str] | None:
+        stacks = data.get("Stacks") if isinstance(data, Mapping) else None
+        if not isinstance(stacks, list) or len(stacks) != 1 or not isinstance(stacks[0], Mapping):
+            return None
+        raw_outputs = stacks[0].get("Outputs")
+        if not isinstance(raw_outputs, list):
+            return None
+        outputs: dict[str, str] = {}
+        for output in raw_outputs:
+            if not isinstance(output, Mapping):
+                continue
+            key = output.get("OutputKey")
+            value = output.get("OutputValue")
+            if isinstance(key, str) and isinstance(value, str) and value.strip():
+                outputs[key] = value
+        state_machine_arn = outputs.get("ExecutionStateMachineArn")
+        executor_role_arn = outputs.get("ExecutorRoleArn")
+        if not isinstance(state_machine_arn, str) or not state_machine_arn.startswith("arn:aws:states:"):
+            return None
+        if not isinstance(executor_role_arn, str) or not executor_role_arn.startswith("arn:aws:iam::"):
+            return None
+        return state_machine_arn, executor_role_arn
 
     # -- lifecycle operations (contract) ------------------------------------ #
 
@@ -472,6 +540,21 @@ class CommandAdapter:
         argv += ["--execution-arn", execution_arn]
         return self._run_json(argv)
 
+    def execution_is_terminal(self, operation_id: str) -> bool | None:
+        """Return terminality for one known shakedown execution.
+
+        ``None`` means the execution could not be read or was malformed. Both a
+        nonterminal state and unknown evidence block final teardown success.
+        """
+        try:
+            execution = self.describe_execution(self.execution_arn_for(operation_id))
+        except CommandError:
+            return None
+        status = execution.get("status") if isinstance(execution, Mapping) else None
+        if not isinstance(status, str):
+            return None
+        return status.upper() in _EXECUTION_TERMINAL_STATUSES
+
     def execution_arn_for(self, operation_id: str) -> str:
         """Build the exact dispatched ``executionArn`` from the state-machine ARN
         and the deterministic execution name (``operation_id[:80]``).
@@ -504,6 +587,51 @@ class CommandAdapter:
         (``PK=AUTZRSV#<op>``, ``SK=AUTZRSV``)."""
         return self._get_item(f"{_RESERVATION_PK_PREFIX}{operation_id}", _RESERVATION_SK)
 
+    def get_provider_write_receipt(self, operation_id: str) -> dict[str, Any] | None:
+        """Read bounded E3 receipt evidence for the exact autonomous operation."""
+        response = self._get_item(f"{_EXECUTION_RECEIPT_PK_PREFIX}{operation_id}", _EXECUTION_RECEIPT_SK)
+        item = response.get("Item") if isinstance(response, Mapping) else None
+        if not isinstance(item, Mapping):
+            return None
+        operation = self._dynamodb_string(item, "operation_id")
+        logical_action_id = self._dynamodb_string(item, "logical_action_id")
+        provider_request_id = self._dynamodb_string(item, "provider_request_id")
+        expected_raw = self._dynamodb_string(item, "expected_capacity")
+        if (
+            operation != operation_id
+            or logical_action_id is None
+            or provider_request_id is None
+            or expected_raw is None
+        ):
+            return None
+        try:
+            expected_capacity = json.loads(expected_raw)
+        except (TypeError, ValueError):
+            return None
+        if not self._valid_capacity(expected_capacity):
+            return None
+        return {
+            "operation_id": operation_id,
+            "logical_action_id": logical_action_id,
+            "provider_request_id": provider_request_id,
+            "expected_capacity": expected_capacity,
+        }
+
+    @staticmethod
+    def _dynamodb_string(item: Mapping[str, Any], name: str) -> str | None:
+        value = item.get(name)
+        text = value.get("S") if isinstance(value, Mapping) else None
+        return text if isinstance(text, str) and text else None
+
+    @staticmethod
+    def _valid_capacity(value: Any) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {"desired", "minimum", "maximum"}:
+            return False
+        return all(
+            isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 1_000_000
+            for count in value.values()
+        )
+
     def _get_item(self, pk: str, sk: str) -> Any:
         """dynamodb:GetItem on the 06 operations table with the real PK/SK."""
         argv = self._base("dynamodb", "get-item")
@@ -532,25 +660,26 @@ class CommandAdapter:
         ]
         return self._run_json(argv)
 
-    def correlated_executor_write(self, events: Any, *, not_before: datetime) -> Optional[bool]:
-        """Return whether a CloudTrail record proves the SINGLE bounded write was
-        performed by the exact 07 executor role, or ``None`` when unreadable.
+    def correlated_executor_write(
+        self,
+        events: Any,
+        *,
+        provider_request_id: str,
+        expected_capacity: Mapping[str, int],
+    ) -> Optional[bool]:
+        """Return whether CloudTrail proves this exact executor write.
 
-        The proof binds ALL of:
-
-        * ``eventName == UpdateFleetCapacity`` (the one write the executor makes);
-        * ``eventTime`` strictly AFTER ``not_before`` (the dispatch instant), so a
-          stale prior write can never be credited to this dispatch;
-        * ``requestParameters`` name the EXACT enrolled fleet AND location;
-        * the caller's assumed-role SESSION ISSUER ARN equals the configured 07
-          ``executor_role_arn`` (an identity binding, not a display ``Username``).
-
-        Returns:
-          * ``True``  — a fully-correlated executor write exists;
-          * ``False`` — records were readable but NONE correlate (mismatch/foreign
-            role/wrong fleet/old event) — the executor-only invariant is DISPROVEN;
-          * ``None``  — the events are unreadable/absent, so the fact is UNKNOWN.
+        The receipt was atomically recorded by the executor after the provider
+        returned. A positive correlation requires its service request id, exact
+        capacity triple, fleet/location, valid CloudTrail event structure, and
+        the deployed 07 executor role. The provider request id is the exact
+        service-generated binding, so CloudTrail's second-resolution timestamp is
+        retained for audit structure but not used as a fragile ordering fence.
         """
+        if not isinstance(provider_request_id, str) or not provider_request_id.strip():
+            return None
+        if not self._valid_capacity(expected_capacity):
+            return None
         records = events.get("Events") if isinstance(events, Mapping) else None
         if not isinstance(records, list):
             return None  # unreadable shape -> unknown
@@ -569,28 +698,41 @@ class CommandAdapter:
             if detail is None:
                 continue
             saw_readable = True
-            if detail.get("eventName") != _WRITE_EVENT_NAME:
+            if detail.get("eventSource") != "gamelift.amazonaws.com" or detail.get("eventName") != _WRITE_EVENT_NAME:
                 continue
-            event_time = self._instant(detail.get("eventTime"))
-            if event_time is None or event_time <= not_before:
+            if self._instant(detail.get("eventTime")) is None:
+                continue
+            if detail.get("requestID") != provider_request_id:
                 continue
             params = detail.get("requestParameters")
             if not isinstance(params, Mapping):
                 continue
-            fleet = str(params.get("fleetId", ""))
-            location = str(params.get("location", ""))
-            if fleet != self._config.enrolled_fleet_id:
+            if str(params.get("fleetId", "")) != self._config.enrolled_fleet_id:
                 continue
-            if location != self._effective_location():
+            if str(params.get("location", "")) != self._effective_location():
+                continue
+            if not self._request_capacity_matches(params, expected_capacity):
                 continue
             issuer = self._session_issuer_arn(detail)
-            if issuer is None:
-                continue
             if issuer == expected_role:
                 return True
         # Records were present. If NONE were even parseable, we could not read the
         # attribution -> unknown; otherwise we read them and none correlate -> False.
         return False if saw_readable else None
+
+    @staticmethod
+    def _request_capacity_matches(params: Mapping[str, Any], expected: Mapping[str, int]) -> bool:
+        observed = {
+            "desired": params.get("desiredInstances"),
+            "minimum": params.get("minSize"),
+            "maximum": params.get("maxSize"),
+        }
+        return all(
+            isinstance(observed[name], int)
+            and not isinstance(observed[name], bool)
+            and observed[name] == expected[name]
+            for name in ("desired", "minimum", "maximum")
+        )
 
     @staticmethod
     def _cloudtrail_detail(record: Any) -> Optional[Mapping[str, Any]]:
@@ -1199,6 +1341,10 @@ class CommandTransport:
         # strictly AFTER the dispatch, without a real wall-clock dependency in tests.
         self._clock = clock
 
+    def execution_is_terminal(self, operation_id: str) -> bool | None:
+        """Expose bounded execution terminality to the shakedown teardown."""
+        return self._adapter.execution_is_terminal(operation_id)
+
     def __call__(
         self,
         method: str,
@@ -1279,19 +1425,37 @@ class CommandTransport:
                     "wrote": False,
                 },
             )
-        # Capture the dispatch instant BEFORE invoking so the CloudTrail write
-        # correlation can require the write event to be strictly after it.
-        dispatched_at = self._clock()
+        # The exact provider request id persisted by the executor is the
+        # correlation fence. No timestamp ordering assumption is safe because
+        # CloudTrail eventTime is lower precision than the local clock.
         try:
             result = self._adapter.invoke_evaluate(event)
         except CommandError:
+            # Lambda invocation outcome is unknown. The evaluator may have begun
+            # a durable dispatch but no operation id is available to quiesce, so
+            # teardown must not claim a proven final zero.
             return _http(
-                200, {"decision": "denied", "outcome": "refused", "error_code": "AMBIGUOUS_RESULT", "wrote": False}
+                200,
+                {
+                    "decision": "denied",
+                    "outcome": "unknown",
+                    "error_code": "AMBIGUOUS_RESULT",
+                    "dispatch_state": "unknown",
+                    "wrote": None,
+                },
             )
         if not isinstance(result, dict):
-            # An unparseable evaluator result is ambiguous -> denied, no write.
+            # An unparseable evaluator result is likewise unknown, not a proven
+            # no-write refusal.
             return _http(
-                200, {"decision": "denied", "outcome": "refused", "error_code": "AMBIGUOUS_RESULT", "wrote": False}
+                200,
+                {
+                    "decision": "denied",
+                    "outcome": "unknown",
+                    "error_code": "AMBIGUOUS_RESULT",
+                    "dispatch_state": "unknown",
+                    "wrote": None,
+                },
             )
         outcome = result.get("outcome")
         if outcome != _OUTCOME_DISPATCHED:
@@ -1301,20 +1465,42 @@ class CommandTransport:
             reason = str(result.get("reason", "")).strip()
             code = reason.upper()
             status = 429 if code in _LIMIT_REASON_CODES else 200
-            return _http(
-                status,
-                {
-                    "decision": "denied",
-                    "outcome": "refused",
-                    "reason": reason,
-                    "error_code": code or "REFUSED",
-                    "wrote": False,
-                },
-            )
+            body: dict[str, Any] = {
+                "decision": "denied",
+                "outcome": "refused",
+                "reason": reason,
+                "error_code": code or "REFUSED",
+                "wrote": False,
+            }
+            operation_id = result.get("operation_id")
+            if isinstance(operation_id, str) and operation_id:
+                if operation_id.startswith("op_"):
+                    # The evaluator returns an id after it records
+                    # dispatch_requested even when StartExecution is uncertain.
+                    # Preserve it for bounded terminality polling instead of
+                    # silently discarding the race.
+                    body["operation_id"] = operation_id
+                # A malformed id is just as unresolvable as no id. Do not echo it
+                # into the public-safe harness response, but block teardown proof.
+                body["dispatch_state"] = "unknown"
+                if not operation_id.startswith("op_"):
+                    body["wrote"] = None
+            return _http(status, body)
         # Dispatched: gather the MANDATORY evidence and derive each assertion from
         # it. No field is asserted true unless the evidence supports it.
-        operation_id = str(result.get("operation_id", ""))
-        evidence = self._dispatch_evidence(operation_id, not_before=dispatched_at)
+        operation_id = result.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id.startswith("op_"):
+            return _http(
+                200,
+                {
+                    "decision": "denied",
+                    "outcome": "unknown",
+                    "error_code": "AMBIGUOUS_RESULT",
+                    "dispatch_state": "unknown",
+                    "wrote": None,
+                },
+            )
+        evidence = self._dispatch_evidence(operation_id)
         body = {
             "decision": "authorized",
             "outcome": _OUTCOME_DISPATCHED,
@@ -1329,7 +1515,7 @@ class CommandTransport:
         }
         return _http(200, body)
 
-    def _dispatch_evidence(self, operation_id: str, *, not_before: Optional[datetime] = None) -> dict[str, Any]:
+    def _dispatch_evidence(self, operation_id: str) -> dict[str, Any]:
         """Read the real StepFunctions / DynamoDB / CloudTrail evidence.
 
         Every field is derived from an actual provider read keyed on the REAL
@@ -1377,19 +1563,22 @@ class CommandTransport:
                 reservation_granted = rsv.get("operation_id", {}).get("S") == operation_id
         except CommandError:
             pass
-        # CloudTrail: the write is CORRELATED to the exact 07 executor role — the
-        # eventName UpdateFleetCapacity, an event time AFTER dispatch, the exact
-        # fleet/location request, and the executor role's SESSION ISSUER — never a
-        # bare newest ``Username`` literal. The actor is reported as the executor
-        # ONLY on a positive correlation; a readable-but-mismatched or unreadable
-        # attribution reports NO executor actor (fail closed).
+        # CloudTrail: require durable per-operation receipt evidence before a
+        # matching event can be credited to this executor write. Without the
+        # receipt a same-role write for the same fleet/location is UNKNOWN, not a
+        # substitute proof. The actor is reported only on a positive correlation.
         actor = ""
-        correlation_floor = not_before if not_before is not None else datetime.min.replace(tzinfo=timezone.utc)
         try:
-            events = self._adapter.lookup_write_attribution(self._adapter._config.enrolled_fleet_id)
-            correlated = self._adapter.correlated_executor_write(events, not_before=correlation_floor)
-            if correlated is True:
-                actor = _EXECUTOR_WRITE_ACTOR
+            receipt = self._adapter.get_provider_write_receipt(operation_id)
+            if receipt is not None:
+                events = self._adapter.lookup_write_attribution(self._adapter._config.enrolled_fleet_id)
+                correlated = self._adapter.correlated_executor_write(
+                    events,
+                    provider_request_id=receipt["provider_request_id"],
+                    expected_capacity=receipt["expected_capacity"],
+                )
+                if correlated is True:
+                    actor = _EXECUTOR_WRITE_ACTOR
         except CommandError:
             actor = ""
         return {
@@ -1469,7 +1658,6 @@ class CommandTransport:
                     "wrote": False,
                 },
             )
-        dispatched_at = self._clock()
         evaluator_unavailable = False
         try:
             result = self._adapter.invoke_evaluate(event)
@@ -1513,7 +1701,7 @@ class CommandTransport:
         # A dispatched outcome is a real failure of the disable; prove the
         # negative from readable write evidence, or report UNKNOWN.
         operation_id = str(result.get("operation_id", ""))
-        started = self._dispatch_evidence(operation_id, not_before=dispatched_at)["step_functions_started"]
+        started = self._dispatch_evidence(operation_id)["step_functions_started"]
         if started is None:
             # UNREADABLE write evidence -> UNKNOWN, do NOT confirm no-write.
             return _http(

@@ -213,3 +213,92 @@ def test_throttle_is_raised_not_swallowed() -> None:
             new_state="succeeded",
             result=_result(),
         )
+
+
+def test_record_execution_result_atomically_persists_provider_write_receipt() -> None:
+    """A successful write retains only bounded correlation evidence atomically.
+
+    The immutable E3 result contract stays unchanged. The separate receipt binds
+    this operation to the service request id and the exact capacity triple that
+    CloudTrail must later prove.
+    """
+    fake = _FakeDynamo()
+    store = _store(fake)
+    acquisition = store.acquire_execution_lease(
+        operation_id=_OP,
+        logical_action_id=_ACTION,
+        lease_holder="exec-1",
+        lease_not_after=_LEASE_NOT_AFTER,
+    )
+
+    outcome = store.record_execution_result(
+        operation_id=_OP,
+        logical_action_id=_ACTION,
+        generation=acquisition.generation,
+        expected_state="dispatched",
+        new_state="succeeded",
+        result=_result(),
+        provider_request_id="request-4f9c2b37-1a4c-4e8e-9d2c-2f6c76c6b470",
+    )
+
+    assert outcome is ExecutionCommitOutcome.RECORDED
+    assert store.load_provider_write_receipt(_OP) == {
+        "operation_id": _OP,
+        "logical_action_id": _ACTION,
+        "provider_request_id": "request-4f9c2b37-1a4c-4e8e-9d2c-2f6c76c6b470",
+        "expected_capacity": {"desired": 14, "minimum": 2, "maximum": 20},
+    }
+    receipt = fake.items[(f"OP#{_OP}", "EXECPROVIDER")]
+    assert "ttl" not in receipt
+
+
+def test_missing_provider_response_id_leaves_no_receipt_evidence() -> None:
+    """A real write without a usable receipt cannot be silently correlated later."""
+    fake = _FakeDynamo()
+    store = _store(fake)
+    acquisition = store.acquire_execution_lease(
+        operation_id=_OP,
+        logical_action_id=_ACTION,
+        lease_holder="exec-1",
+        lease_not_after=_LEASE_NOT_AFTER,
+    )
+
+    outcome = store.record_execution_result(
+        operation_id=_OP,
+        logical_action_id=_ACTION,
+        generation=acquisition.generation,
+        expected_state="dispatched",
+        new_state="succeeded",
+        result=_result(),
+        provider_request_id=None,
+    )
+
+    assert outcome is ExecutionCommitOutcome.RECORDED
+    assert store.load_provider_write_receipt(_OP) is None
+    assert (f"OP#{_OP}", "EXECPROVIDER") not in fake.items
+
+
+def test_malformed_provider_receipt_does_not_hide_the_terminal_result() -> None:
+    """Optional receipt enrichment cannot make a completed write lose its result."""
+    fake = _FakeDynamo()
+    store = _store(fake)
+    acquisition = store.acquire_execution_lease(
+        operation_id=_OP,
+        logical_action_id=_ACTION,
+        lease_holder="exec-1",
+        lease_not_after=_LEASE_NOT_AFTER,
+    )
+
+    outcome = store.record_execution_result(
+        operation_id=_OP,
+        logical_action_id=_ACTION,
+        generation=acquisition.generation,
+        expected_state="dispatched",
+        new_state="succeeded",
+        result=_result(),
+        provider_request_id="not a valid request id",
+    )
+
+    assert outcome is ExecutionCommitOutcome.RECORDED
+    assert store.load_recorded_result(_ACTION) is not None
+    assert store.load_provider_write_receipt(_OP) is None
