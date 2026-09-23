@@ -95,6 +95,8 @@ def execute_autonomous(
     service: Any,
     reservation: Any,
     lease_holder: str,
+    generation: int | None = None,
+    on_settle_failure: Any = None,
 ) -> dict[str, Any]:
     """Run the v2 autonomous path over the existing write core, always settling.
 
@@ -127,15 +129,74 @@ def execute_autonomous(
     finally:
         # Settle the in-flight reservation on EVERY terminal/failed handoff so the
         # single concurrency slot is released. A settle failure must never mask the
-        # original outcome/exception, so it is swallowed after a best-effort call.
-        try:
-            reservation.settle(
-                operation_id=invocation.operation_id,
+        # original outcome/exception and is NEVER retried here (the durable store
+        # already re-reads and fails closed); instead it is surfaced as a
+        # metrics-safe signal so a wedged slot is observable and swept later.
+        terminal = _settle_terminal(result)
+        settle_outcome = _settle_reservation(
+            reservation,
+            operation_id=invocation.operation_id,
+            logical_action_id=logical_action_id,
+            terminal=terminal,
+            generation=generation,
+        )
+        if not settle_outcome and on_settle_failure is not None:
+            try:
+                on_settle_failure()
+            except Exception:  # noqa: BLE001 - metrics must never break the handoff
+                pass
+
+
+def _settle_reservation(
+    reservation: Any,
+    *,
+    operation_id: str,
+    logical_action_id: str,
+    terminal: str,
+    generation: int | None,
+) -> bool:
+    """Best-effort settle that never masks the handoff and never retries.
+
+    Returns ``True`` only when the store reports a released/settled outcome
+    (``RESERVED``); a conflict, unavailability, exception, or a store that does
+    not report an outcome returns ``False`` so the caller can surface a
+    metrics-safe failure. A ``settle`` port that predates the generation fence is
+    called without it (no double-settle, no retry loop).
+    """
+    try:
+        if generation is not None:
+            try:
+                outcome = reservation.settle(
+                    operation_id=operation_id,
+                    logical_action_id=logical_action_id,
+                    terminal=terminal,
+                    generation=generation,
+                )
+            except TypeError:
+                outcome = reservation.settle(
+                    operation_id=operation_id,
+                    logical_action_id=logical_action_id,
+                    terminal=terminal,
+                )
+        else:
+            outcome = reservation.settle(
+                operation_id=operation_id,
                 logical_action_id=logical_action_id,
-                terminal=_settle_terminal(result),
+                terminal=terminal,
             )
-        except Exception:  # noqa: BLE001 - a settle failure never masks the handoff outcome
-            pass
+    except Exception:  # noqa: BLE001 - a settle failure never masks the handoff outcome
+        return False
+    return _settle_reported_release(outcome)
+
+
+def _settle_reported_release(outcome: Any) -> bool:
+    """Whether a settle return value indicates a truly released/settled slot."""
+    value = getattr(outcome, "outcome", None)
+    if value is None:
+        # A port that returns nothing (e.g. a fake) is treated as a best-effort
+        # success: it raised nothing, so the concurrency slot is considered released.
+        return True
+    return bool(getattr(value, "value", value) == "reserved")
 
 
 def _build_autonomy_evidence(bundle: Mapping[str, Any]) -> Any:
@@ -254,6 +315,16 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
     from operations.contracts.execution import logical_action_id
 
     action_id = logical_action_id(operation["operation_id"], operation["prepared_hash"])
+    # The reservation was taken by the runtime handler at generation 1; a sweeper
+    # reclaim of an expired lease bumps the generation, so settling/ownership at
+    # generation 1 correctly fails closed for a reclaimed operation (fencing).
+    on_settle_failure = None
+    metrics = getattr(runtime, "metrics", None)
+    if metrics is not None:
+
+        def on_settle_failure() -> None:  # noqa: E306 - small local closure
+            _emit(metrics, "execution.reservation_settle_failed")
+
     return execute_autonomous(
         invocation,
         bundle=bundle,
@@ -262,6 +333,8 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
         service=runtime.service,
         reservation=runtime.reservation,
         lease_holder=lease_holder,
+        generation=1,
+        on_settle_failure=on_settle_failure,
     )
 
 
@@ -451,9 +524,13 @@ def _build_autonomy_wiring(
     # ownership after the E4 second check and immediately before the write.
     def _pre_write_hook(plan: Any) -> None:
         switch_port.require_autonomy()
+        # Fence the immediate pre-write ownership check on the reserve generation:
+        # a reclaimed (expired-lease-swept) operation fails closed here, before the
+        # single provider write.
         reservation_verifier_port.require_reservation(
             operation_id=plan.intent["operation_id"],
             logical_action_id=plan.logical_action_id,
+            generation=1,
         )
 
     autonomy_service = ExecutorService(

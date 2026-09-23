@@ -47,6 +47,7 @@ from __future__ import annotations
 
 # Standard library
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Protocol
 
@@ -58,6 +59,12 @@ from operations.autonomy_runtime.service import (
 )
 from operations.autonomy_runtime.store import ReservationOutcome, ReservationRequest, ReservationStore
 from operations.contracts.execution import logical_action_id
+
+# The bounded default lease: a reservation's in-flight slot is reclaimable no
+# later than this many seconds after it is taken, and never later than the
+# decision expiry. A crash between reserve and settle therefore cannot wedge
+# the single concurrency slot indefinitely.
+_DEFAULT_LEASE_SECONDS = 900
 
 
 class RuntimeDispatchOutcome(str, Enum):
@@ -199,6 +206,8 @@ class AutonomyRuntimeHandler:
             direction = "increase"
         else:
             direction = "decrease"
+        now_epoch = int(inputs.evaluated_at.timestamp())
+        lease_not_after = self._lease_deadline(now_epoch, prepared.operation["decision_expires_at"])
         return ReservationRequest(
             policy_ref={
                 "policy_id": policy["policy_id"],
@@ -210,9 +219,34 @@ class AutonomyRuntimeHandler:
             operation_id=prepared.operation["operation_id"],
             logical_action_id=action_id,
             action_micro_usd=int(window["action_micro_usd"]),
-            now_epoch_seconds=int(inputs.evaluated_at.timestamp()),
+            now_epoch_seconds=now_epoch,
             change_direction=direction,
+            lease_not_after=lease_not_after,
+            generation=1,
         )
+
+    @staticmethod
+    def _lease_deadline(now_epoch: int, decision_expires_at: str) -> int:
+        """Derive the bounded lease deadline: no later than the decision expiry.
+
+        The lease is the earlier of a bounded default horizon and the decision's
+        own expiry, and is always strictly after ``now`` (a reservation whose
+        decision has already expired would be refused upstream). This binds the
+        recovery window to the decision's own authorization lifetime — a reclaim
+        can never outlive the decision it was taken under.
+        """
+        default_deadline = now_epoch + _DEFAULT_LEASE_SECONDS
+        try:
+            parsed = datetime.fromisoformat(decision_expires_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                decision_epoch = default_deadline
+            else:
+                decision_epoch = int(parsed.astimezone(timezone.utc).timestamp())
+        except (ValueError, AttributeError):
+            decision_epoch = default_deadline
+        deadline = min(default_deadline, decision_epoch)
+        # Never emit a non-positive lease window; clamp to strictly after now.
+        return deadline if deadline > now_epoch else now_epoch + 1
 
     def _release_in_flight(self, operation_id: str, action_id: str) -> None:
         """Best-effort release of the in-flight reservation on a failed handoff.
@@ -224,6 +258,12 @@ class AutonomyRuntimeHandler:
         if settle is None:
             return
         try:
-            settle(operation_id=operation_id, logical_action_id=action_id, terminal="failed")
+            settle(operation_id=operation_id, logical_action_id=action_id, terminal="failed", generation=1)
+        except TypeError:
+            # A settle port without the generation fence (older port): retry without.
+            try:
+                settle(operation_id=operation_id, logical_action_id=action_id, terminal="failed")
+            except Exception:  # noqa: BLE001 - a settle failure never masks the refusal
+                pass
         except Exception:  # noqa: BLE001 - a settle failure never masks the refusal
             pass

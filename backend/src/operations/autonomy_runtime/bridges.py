@@ -64,9 +64,21 @@ class StoreReservationVerifierPort:
     def __init__(self, store: ReservationStore) -> None:
         self._store = store
 
-    def require_reservation(self, *, operation_id: str, logical_action_id: str) -> None:
-        """Confirm the caller owns the live in-flight reservation; fail closed otherwise."""
-        self._store.require(operation_id=operation_id, logical_action_id=logical_action_id)
+    def require_reservation(self, *, operation_id: str, logical_action_id: str, generation: int | None = None) -> None:
+        """Confirm the caller owns the live in-flight reservation; fail closed otherwise.
+
+        When ``generation`` is supplied it is forwarded to the store so a holder
+        whose expired lease was reclaimed (generation bumped) is fenced from the
+        immediate pre-write ownership check. A store ``require`` that predates the
+        generation fence is called without it.
+        """
+        if generation is None:
+            self._store.require(operation_id=operation_id, logical_action_id=logical_action_id)
+            return
+        try:
+            self._store.require(operation_id=operation_id, logical_action_id=logical_action_id, generation=generation)
+        except TypeError:
+            self._store.require(operation_id=operation_id, logical_action_id=logical_action_id)
 
 
 def _direction(decision: dict[str, Any]) -> str:

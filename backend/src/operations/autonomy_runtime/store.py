@@ -73,6 +73,8 @@ from operations.contracts.autonomy import autonomy_window_state_hash, validate_a
 _WINDOW_STATE_SCHEMA = "gamelift-capacity-autonomy-window-state"
 _DIRECTIONS = frozenset({"none", "increase", "decrease"})
 _MAX_REVISION = 9007199254740991
+_MAX_EPOCH_SECONDS = 4102444800  # matches the frozen window-state schema epoch ceiling
+_MAX_TERMINAL_LENGTH = 64
 _ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
@@ -104,6 +106,23 @@ def _derive_action_id(operation_id: str) -> str:
     return "act_" + "".join(reversed(body))
 
 
+_ALLOWED_TERMINALS = frozenset({"succeeded", "failed", "reclaimed"})
+
+
+def _validate_terminal(terminal: str) -> str:
+    """Validate the bounded terminal reason recorded on settlement.
+
+    The terminal reason is a short, closed token (``succeeded`` / ``failed`` /
+    ``reclaimed``) persisted on the reservation record and the immutable audit
+    row. An unknown or oversized value fails closed rather than being stored.
+    """
+    if not isinstance(terminal, str) or terminal not in _ALLOWED_TERMINALS:
+        raise ReservationStoreError("terminal reason must be one of succeeded, failed, reclaimed")
+    if len(terminal) > _MAX_TERMINAL_LENGTH:
+        raise ReservationStoreError("terminal reason is too long")
+    return terminal
+
+
 @dataclass(frozen=True, slots=True)
 class ReservationRequest:
     """One atomic reservation intent — identifiers and integers only.
@@ -121,6 +140,8 @@ class ReservationRequest:
     now_epoch_seconds: int
     change_direction: str
     logical_action_id: str | None = None
+    lease_not_after: int | None = None
+    generation: int = 1
 
     def __post_init__(self) -> None:
         if isinstance(self.action_micro_usd, bool) or not isinstance(self.action_micro_usd, int):
@@ -145,6 +166,23 @@ class ReservationRequest:
             not isinstance(self.logical_action_id, str) or not self.logical_action_id.startswith("act_")
         ):
             raise ValueError("logical_action_id must be an act_ identifier")
+        # A bounded lease deadline, when supplied, MUST be a non-boolean integer
+        # strictly after ``now`` and no later than the schema epoch ceiling. The
+        # caller derives it no later than the decision expiry, so a crash leaves a
+        # bounded, reclaimable lease instead of a wedged in-flight slot.
+        if self.lease_not_after is not None:
+            if isinstance(self.lease_not_after, bool) or not isinstance(self.lease_not_after, int):
+                raise ValueError("lease_not_after must be an integer")
+            if self.lease_not_after <= self.now_epoch_seconds:
+                raise ValueError("lease_not_after must be strictly after now_epoch_seconds")
+            if self.lease_not_after > _MAX_EPOCH_SECONDS:
+                raise ValueError("lease_not_after is out of range")
+        # The monotonic generation fences a stale holder once an expired lease is
+        # reclaimed. It MUST be a non-boolean positive integer.
+        if isinstance(self.generation, bool) or not isinstance(self.generation, int):
+            raise ValueError("generation must be an integer")
+        if self.generation < 1 or self.generation > _MAX_REVISION:
+            raise ValueError("generation must be a positive integer")
 
     @property
     def action_id(self) -> str:
@@ -181,12 +219,24 @@ class ReservationStore(Protocol):
         """Atomically reserve one write's footprint, fenced on state revision."""
         ...
 
-    def require(self, *, operation_id: str, logical_action_id: str) -> None:
-        """Confirm live in-flight ownership of the reservation; fail closed otherwise."""
+    def require(self, *, operation_id: str, logical_action_id: str, generation: int | None = None) -> None:
+        """Confirm live in-flight ownership of the reservation; fail closed otherwise.
+
+        When ``generation`` is supplied it MUST equal the record's current
+        generation, so a holder whose expired lease was reclaimed (which bumps
+        the generation) is fenced.
+        """
         ...
 
-    def settle(self, *, operation_id: str, logical_action_id: str, terminal: str) -> ReservationResult:
-        """Release the in-flight slot on a terminal handoff, retaining budget/frequency."""
+    def settle(
+        self, *, operation_id: str, logical_action_id: str, terminal: str, generation: int | None = None
+    ) -> ReservationResult:
+        """Release the in-flight slot on a terminal handoff, retaining budget/frequency.
+
+        Persists the terminal reason and requires the exact ``generation`` when
+        supplied. On a conditional failure the durable store re-reads and returns
+        success only if the slot is truly released; otherwise it fails closed.
+        """
         ...
 
     def current(self, state_id: str) -> dict[str, Any]:
@@ -243,6 +293,9 @@ class _Reservation:
     logical_action_id: str
     state_id: str
     settled: bool
+    generation: int = 1
+    lease_not_after: int | None = None
+    terminal: str | None = None
 
 
 class InMemoryReservationStore:
@@ -316,27 +369,41 @@ class InMemoryReservationStore:
             logical_action_id=request.action_id,
             state_id=request.state_id,
             settled=False,
+            generation=request.generation,
+            lease_not_after=request.lease_not_after,
+            terminal=None,
         )
         return ReservationResult(ReservationOutcome.RESERVED, window_state=advanced)
 
-    def require(self, *, operation_id: str, logical_action_id: str) -> None:
+    def require(self, *, operation_id: str, logical_action_id: str, generation: int | None = None) -> None:
         reservation = self._reservations.get(operation_id)
         if reservation is None:
             raise ReservationStoreError("no reservation is owned for this operation")
         if reservation.logical_action_id != logical_action_id:
             raise ReservationStoreError("reservation action does not match")
+        if generation is not None and reservation.generation != generation:
+            # A stale holder whose expired lease was reclaimed (generation bumped)
+            # is fenced from confirming ownership.
+            raise ReservationStoreError("reservation generation does not match")
         if reservation.settled:
             raise ReservationStoreError("reservation has already been settled")
         stored = self._by_state_id.get(reservation.state_id)
         if stored is None or stored["in_flight"] != 1:
             raise ReservationStoreError("reservation is no longer in flight")
 
-    def settle(self, *, operation_id: str, logical_action_id: str, terminal: str) -> ReservationResult:
+    def settle(
+        self, *, operation_id: str, logical_action_id: str, terminal: str, generation: int | None = None
+    ) -> ReservationResult:
+        _validate_terminal(terminal)
         reservation = self._reservations.get(operation_id)
         if reservation is None:
             raise ReservationStoreError("no reservation is owned for this operation")
         if reservation.logical_action_id != logical_action_id:
             raise ReservationStoreError("reservation action does not match")
+        if generation is not None and reservation.generation != generation:
+            # A stale holder whose expired lease was reclaimed is fenced from
+            # settling: it no longer owns the (already reclaimed) slot.
+            raise ReservationStoreError("reservation generation does not match")
         stored = self._by_state_id.get(reservation.state_id)
         if stored is None:
             raise ReservationStoreError("reservation window state is unknown")
@@ -353,7 +420,60 @@ class InMemoryReservationStore:
         validate_autonomy_contract(_WINDOW_STATE_SCHEMA, advanced)
         self._by_state_id[reservation.state_id] = deepcopy(advanced)
         reservation.settled = True
+        reservation.terminal = terminal
         return ReservationResult(ReservationOutcome.RESERVED, window_state=advanced)
+
+    def reservation_record(self, operation_id: str) -> dict[str, Any] | None:
+        """Return a read-only view of a reservation record, or ``None`` if absent.
+
+        Exposes the lease deadline, generation, settled flag, and terminal reason
+        for recovery/audit tooling. It carries no policy body, no credential, and
+        no provider surface.
+        """
+        reservation = self._reservations.get(operation_id)
+        if reservation is None:
+            return None
+        return {
+            "operation_id": reservation.operation_id,
+            "logical_action_id": reservation.logical_action_id,
+            "state_id": reservation.state_id,
+            "generation": reservation.generation,
+            "lease_not_after": reservation.lease_not_after,
+            "settled": reservation.settled,
+            "terminal": reservation.terminal,
+        }
+
+    def sweep_expired(self, *, state_id: str, now_epoch_seconds: int) -> bool:
+        """Reclaim the in-flight slot of an EXPIRED lease; fence the stale holder.
+
+        Recovery path for a crash between reserve and settle: a live lease is
+        never reclaimed, but once the bounded ``lease_not_after`` deadline has
+        passed the slot is released (budget/frequency retained, exactly as a
+        settle) and the reclaimed record's generation is bumped so the original
+        holder that later returns is fenced from require/settle. Returns whether a
+        slot was reclaimed.
+        """
+        stored = self._by_state_id.get(state_id)
+        if stored is None or stored["in_flight"] == 0:
+            return False
+        holder = next(
+            (
+                r
+                for r in self._reservations.values()
+                if r.state_id == state_id and not r.settled and r.lease_not_after is not None
+            ),
+            None,
+        )
+        if holder is None or holder.lease_not_after is None or holder.lease_not_after > now_epoch_seconds:
+            # No holder, an unbounded lease, or a still-live lease: never reclaim.
+            return False
+        advanced = self._release(stored)
+        validate_autonomy_contract(_WINDOW_STATE_SCHEMA, advanced)
+        self._by_state_id[state_id] = deepcopy(advanced)
+        holder.settled = True
+        holder.terminal = "reclaimed"
+        holder.generation = holder.generation + 1
+        return True
 
     def _commit(self, stored: dict[str, Any], request: ReservationRequest) -> dict[str, Any]:
         """Return the next reserved snapshot. Overridable seam to model failure."""
@@ -369,6 +489,7 @@ class InMemoryReservationStore:
 _LOGGER = logging.getLogger(__name__)
 _STATE_SK = "AUTZWINDOW"
 _RESERVATION_SK = "AUTZRSV"
+_AUDIT_PK_PREFIX = "AUTZAUDIT#"
 _CONDITIONAL_REASON = "ConditionalCheckFailed"
 _TRANSACTION_CANCELED_CODE = "TransactionCanceledException"
 _BARE_CONDITIONAL_CODE = "ConditionalCheckFailedException"
@@ -517,6 +638,9 @@ class DynamoDbReservationStore:
                 "logical_action_id": request.action_id,
                 "state_id": request.state_id,
                 "settled": False,
+                "generation": request.generation,
+                "lease_not_after": request.lease_not_after if request.lease_not_after is not None else 0,
+                "terminal": None,
             }
         )
         window_update = {
@@ -536,6 +660,14 @@ class DynamoDbReservationStore:
                 ),
             }
         }
+        audit_put = self._audit_put(
+            operation_id=request.operation_id,
+            event="autonomy_reserved",
+            generation=request.generation,
+            logical_action_id=request.action_id,
+            state_id=request.state_id,
+            terminal=None,
+        )
         try:
             self._client.transact_write_items(
                 TransactItems=[
@@ -547,27 +679,54 @@ class DynamoDbReservationStore:
                         }
                     },
                     window_update,
+                    audit_put,
                 ]
             )
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if _is_conditional_failure(exc):
-                # Either the reservation now exists (a concurrent replay) or the
-                # revision/in_flight fence lost the race — both fail closed as a
-                # conflict, never a false success.
-                return ReservationResult(ReservationOutcome.CONFLICT)
+                # The transaction lost a race. Re-read the reservation record and
+                # CONVERGE to it only when it is the SAME operation bound to the
+                # same action/state/generation (a concurrent same-operation replay
+                # that we lost). Anything else — a different action/generation, a
+                # missing record, or the revision/in_flight fence losing to a
+                # distinct operation — fails closed as a conflict, never a false
+                # success.
+                return self._converge_reserve(request)
             _LOGGER.warning("dynamodb_reservation_store reserve unavailable exception_type=%s", type(exc).__name__)
             return ReservationResult(ReservationOutcome.UNAVAILABLE)
         return ReservationResult(ReservationOutcome.RESERVED, window_state=advanced)
 
-    def require(self, *, operation_id: str, logical_action_id: str) -> None:
-        record = self._find_reservation(operation_id, logical_action_id)
+    def _converge_reserve(self, request: ReservationRequest) -> ReservationResult:
+        """Re-read after a lost reserve transaction; converge only on an exact replay."""
+        try:
+            record = self._get(self._reservation_pk(request.operation_id), _RESERVATION_SK)
+        except ReservationStoreError:
+            return ReservationResult(ReservationOutcome.UNAVAILABLE)
+        if (
+            record is not None
+            and record.get("logical_action_id") == request.action_id
+            and record.get("state_id") == request.state_id
+            and record.get("generation") == request.generation
+        ):
+            try:
+                return ReservationResult(ReservationOutcome.RESERVED, window_state=self.current(request.state_id))
+            except ReservationStoreError:
+                return ReservationResult(ReservationOutcome.UNAVAILABLE)
+        return ReservationResult(ReservationOutcome.CONFLICT)
+
+    def require(self, *, operation_id: str, logical_action_id: str, generation: int | None = None) -> None:
+        record = self._find_reservation(operation_id, logical_action_id, generation=generation)
         stored = self.current(record["state_id"])
         if stored["in_flight"] != 1:
             raise ReservationStoreError("reservation is no longer in flight")
 
-    def settle(self, *, operation_id: str, logical_action_id: str, terminal: str) -> ReservationResult:
-        record = self._find_reservation(operation_id, logical_action_id, allow_settled=True)
+    def settle(
+        self, *, operation_id: str, logical_action_id: str, terminal: str, generation: int | None = None
+    ) -> ReservationResult:
+        _validate_terminal(terminal)
+        record = self._find_reservation(operation_id, logical_action_id, allow_settled=True, generation=generation)
         state_id = record["state_id"]
+        record_generation = int(record.get("generation", 1))
         stored = self.current(state_id)
         if record.get("settled") is True:
             return ReservationResult(ReservationOutcome.RESERVED, window_state=stored)
@@ -596,36 +755,193 @@ class DynamoDbReservationStore:
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": self._reservation_pk(operation_id), "SK": _RESERVATION_SK}),
-                "UpdateExpression": "SET settled = :true",
-                "ConditionExpression": "attribute_exists(SK) AND settled = :false",
-                "ExpressionAttributeValues": _marshal({":true": True, ":false": False}),
+                "UpdateExpression": "SET settled = :true, terminal = :terminal",
+                "ConditionExpression": "attribute_exists(SK) AND settled = :false AND generation = :gen",
+                "ExpressionAttributeValues": _marshal(
+                    {":true": True, ":false": False, ":terminal": terminal, ":gen": record_generation}
+                ),
             }
         }
+        audit_put = self._audit_put(
+            operation_id=operation_id,
+            event="autonomy_settled",
+            generation=record_generation,
+            logical_action_id=logical_action_id,
+            state_id=state_id,
+            terminal=terminal,
+        )
         try:
-            self._client.transact_write_items(TransactItems=[window_update, reservation_update])
+            self._client.transact_write_items(TransactItems=[window_update, reservation_update, audit_put])
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if _is_conditional_failure(exc):
-                # A concurrent settle already released the slot; treat as settled.
-                return ReservationResult(ReservationOutcome.RESERVED, window_state=self.current(state_id))
+                # Never fabricate success on a conditional failure. Re-read BOTH the
+                # reservation record and the window state, and return success only
+                # when the slot is TRULY released (in_flight == 0) and the record is
+                # settled — i.e. a genuine concurrent settle. Otherwise fail closed.
+                return self._converge_settle(operation_id, state_id)
             _LOGGER.warning("dynamodb_reservation_store settle unavailable exception_type=%s", type(exc).__name__)
             return ReservationResult(ReservationOutcome.UNAVAILABLE)
         return ReservationResult(ReservationOutcome.RESERVED, window_state=advanced)
 
+    def _converge_settle(self, operation_id: str, state_id: str) -> ReservationResult:
+        """Re-read after a lost settle transaction; success only if truly settled."""
+        try:
+            record = self._get(self._reservation_pk(operation_id), _RESERVATION_SK)
+            stored = self.current(state_id)
+        except ReservationStoreError:
+            return ReservationResult(ReservationOutcome.UNAVAILABLE)
+        if record is not None and record.get("settled") is True and stored.get("in_flight") == 0:
+            return ReservationResult(ReservationOutcome.RESERVED, window_state=stored)
+        # The slot is still held / the record is not settled: this settle lost a
+        # race it must not paper over. Fail closed as a conflict.
+        return ReservationResult(ReservationOutcome.CONFLICT)
+
+    def sweep_expired(self, *, operation_id: str, now_epoch_seconds: int) -> bool:
+        """Reclaim the in-flight slot of an EXPIRED lease; fence the stale holder.
+
+        Recovery path for a crash between reserve and settle. Reads the reservation
+        record by id; if it is unsettled, holds a bounded ``lease_not_after`` that
+        has passed, and still owns the in-flight slot, one conditional transaction
+        releases the slot (budget/frequency retained) and marks the record settled
+        with the ``reclaimed`` terminal fenced on the exact generation. A live lease
+        is never reclaimed. Returns whether a slot was reclaimed. Fails closed
+        (never a false reclaim) on any conditional failure or unavailability.
+        """
+        if not isinstance(now_epoch_seconds, int) or isinstance(now_epoch_seconds, bool) or now_epoch_seconds < 0:
+            raise ReservationStoreError("now_epoch_seconds must be a non-negative integer")
+        record = self._get(self._reservation_pk(operation_id), _RESERVATION_SK)
+        if record is None or record.get("settled") is True:
+            return False
+        lease = record.get("lease_not_after")
+        if not isinstance(lease, int) or lease <= 0 or lease > now_epoch_seconds:
+            # No bounded lease, or the lease is still live: never reclaim.
+            return False
+        state_id = record.get("state_id")
+        if not isinstance(state_id, str):
+            raise ReservationStoreError("reservation record is malformed")
+        record_generation = int(record.get("generation", 1))
+        stored = self.current(state_id)
+        if stored.get("in_flight") != 1:
+            return False
+        advanced = _next_released(stored)
+        validate_autonomy_contract(_WINDOW_STATE_SCHEMA, advanced)
+        window_update = {
+            "Update": {
+                "TableName": self._table_name,
+                "Key": _marshal({"PK": self._state_pk(state_id), "SK": _STATE_SK}),
+                "UpdateExpression": "SET document = :doc, state_revision = :next, in_flight = :zero",
+                "ConditionExpression": "state_revision = :expected AND in_flight = :one",
+                "ExpressionAttributeValues": _marshal(
+                    {
+                        ":doc": _canonical(advanced),
+                        ":next": advanced["state_revision"],
+                        ":zero": 0,
+                        ":expected": stored["state_revision"],
+                        ":one": 1,
+                    }
+                ),
+            }
+        }
+        # Bump the generation so the original holder that later returns is fenced
+        # from require/settle, and mark it reclaimed.
+        reservation_update = {
+            "Update": {
+                "TableName": self._table_name,
+                "Key": _marshal({"PK": self._reservation_pk(operation_id), "SK": _RESERVATION_SK}),
+                "UpdateExpression": "SET settled = :true, terminal = :terminal, generation = :nextgen",
+                "ConditionExpression": "attribute_exists(SK) AND settled = :false AND generation = :gen",
+                "ExpressionAttributeValues": _marshal(
+                    {
+                        ":true": True,
+                        ":false": False,
+                        ":terminal": "reclaimed",
+                        ":gen": record_generation,
+                        ":nextgen": record_generation + 1,
+                    }
+                ),
+            }
+        }
+        audit_put = self._audit_put(
+            operation_id=operation_id,
+            event="autonomy_reclaimed",
+            generation=record_generation,
+            logical_action_id=str(record.get("logical_action_id", "")),
+            state_id=state_id,
+            terminal="reclaimed",
+        )
+        try:
+            self._client.transact_write_items(TransactItems=[window_update, reservation_update, audit_put])
+        except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
+            if _is_conditional_failure(exc):
+                # Someone else reclaimed/settled first: not our reclaim, fail closed.
+                return False
+            _LOGGER.warning("dynamodb_reservation_store sweep unavailable exception_type=%s", type(exc).__name__)
+            return False
+        return True
+
+    def _audit_put(
+        self,
+        *,
+        operation_id: str,
+        event: str,
+        generation: int,
+        logical_action_id: str,
+        state_id: str,
+        terminal: str | None,
+    ) -> dict[str, Any]:
+        """Build a bounded, immutable audit-record Put for one lifecycle event.
+
+        The record is keyed by ``(AUTZAUDIT#<operation_id>, <event>#<generation>)``
+        and written with ``attribute_not_exists(SK)`` so it is append-only and
+        idempotent on replay. It carries only identifiers and the bounded terminal
+        reason — no policy body, no observation, no credential.
+        """
+        item = {
+            "PK": f"{_AUDIT_PK_PREFIX}{operation_id}",
+            "SK": f"{event}#{generation}",
+            "operation_id": operation_id,
+            "event": event,
+            "generation": generation,
+            "logical_action_id": logical_action_id,
+            "state_id": state_id,
+            "terminal": terminal,
+        }
+        return {
+            "Put": {
+                "TableName": self._table_name,
+                "Item": _marshal(item),
+                "ConditionExpression": "attribute_not_exists(SK)",
+            }
+        }
+
     # -- Low-level helpers -----------------------------------------------
 
     def _find_reservation(
-        self, operation_id: str, logical_action_id: str, *, allow_settled: bool = False
+        self,
+        operation_id: str,
+        logical_action_id: str,
+        *,
+        allow_settled: bool = False,
+        generation: int | None = None,
     ) -> dict[str, Any]:
         record = self._get(self._reservation_pk(operation_id), _RESERVATION_SK)
         if record is None:
             raise ReservationStoreError("no reservation is owned for this operation")
         if record.get("logical_action_id") != logical_action_id:
             raise ReservationStoreError("reservation action does not match")
+        if generation is not None and record.get("generation") != generation:
+            # A stale holder whose expired lease was reclaimed (generation bumped)
+            # is fenced from confirming or settling ownership.
+            raise ReservationStoreError("reservation generation does not match")
         if not allow_settled and record.get("settled") is True:
             raise ReservationStoreError("reservation has already been settled")
         if not isinstance(record.get("state_id"), str):
             raise ReservationStoreError("reservation record is malformed")
         return record
+
+    def reservation_record(self, operation_id: str) -> dict[str, Any] | None:
+        """Return the durable reservation record by id, or ``None`` if absent."""
+        return self._get(self._reservation_pk(operation_id), _RESERVATION_SK)
 
     def _state_pk(self, state_id: str) -> str:
         return f"AUTZ#{state_id}"
