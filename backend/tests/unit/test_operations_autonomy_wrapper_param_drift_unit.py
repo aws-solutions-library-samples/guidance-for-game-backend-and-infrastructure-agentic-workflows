@@ -164,3 +164,35 @@ def test_disable_07_update_reuses_all_other_07_parameters_dynamically() -> None:
     # and ProjectName may appear literally in the 07 close path is not required,
     # but the dynamic loop must key off AutonomyMode explicitly).
     assert "ParameterKey=AutonomyMode,ParameterValue=disabled" in text.replace(" ", "")
+
+
+def test_wrapper_binds_08_tenant_workspace_and_source_to_06() -> None:
+    """#440 final semantic blocker: the deploy wrapper must actually COMPARE the
+    live 08 control-plane tenant/workspace to the 06 values and verify the 08
+    kill-switch AppConfig SOURCE (hosted), aborting BEFORE any change — not merely
+    require the kill-switch app/env/profile to be non-empty."""
+    text = DEPLOY.read_text(encoding="utf-8")
+
+    # It reads the 08 TenantId/WorkspaceId parameters and byte-compares them to
+    # the 06 values (STACK_06_TENANT / STACK_06_WORKSPACE).
+    assert "STACK_08_TENANT" in text, "wrapper must read the 08 TenantId"
+    assert "STACK_08_WORKSPACE" in text, "wrapper must read the 08 WorkspaceId"
+    assert '"$STACK_08_TENANT" != "$STACK_06_TENANT"' in text, "wrapper must compare 08 tenant to 06 tenant"
+    assert '"$STACK_08_WORKSPACE" != "$STACK_06_WORKSPACE"' in text, "wrapper must compare 08 workspace to 06 workspace"
+
+    # It verifies the 08 kill-switch AppConfig SOURCE is the hosted document store.
+    assert "get-configuration-profile" in text, "wrapper must read the 08 kill-switch profile source"
+    assert "LocationUri" in text, "wrapper must inspect the 08 profile LocationUri (AppConfig source)"
+    assert '!= "hosted"' in text, "wrapper must require the 08 kill-switch source to be hosted"
+
+
+def test_wrapper_08_identity_checks_precede_any_mutation() -> None:
+    """The 08 identity/source binding must abort BEFORE the wrapper performs any
+    write (the first mutation is the S3 artifact upload / conditional seeds)."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    tenant_at = text.index("STACK_08_TENANT")
+    source_at = text.index("get-configuration-profile")
+    # The first mutating action in the enable path is the S3 put-object upload.
+    first_write_at = text.index("aws s3api put-object")
+    assert tenant_at < first_write_at, "08 tenant binding must run before any mutation"
+    assert source_at < first_write_at, "08 source binding must run before any mutation"

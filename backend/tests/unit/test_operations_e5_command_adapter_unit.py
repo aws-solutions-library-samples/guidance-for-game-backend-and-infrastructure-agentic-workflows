@@ -68,15 +68,18 @@ def _config() -> CommandAdapterConfig:
 # --------------------------------------------------------------------------- #
 
 
-def _fresh_switch_doc(*, autonomy_enabled: bool = True) -> dict:
+_CAPABILITY_ID = "gamelift.capacity-adjustment"
+
+
+def _fresh_switch_doc(*, autonomy_enabled: bool = True, autonomous_write: bool = True) -> dict:
     now = datetime.now(timezone.utc)
     return {
-        "autonomy_switch_version": "1",
+        "autonomy_switch_version": "1.0",
         "config_version": 1,
         "issued_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
         "not_after": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
         "autonomy_enabled": autonomy_enabled,
-        "capabilities": {},
+        "capabilities": {_CAPABILITY_ID: {"autonomous_write": autonomous_write}},
     }
 
 
@@ -143,19 +146,22 @@ def test_every_command_is_a_structured_aws_json_argv() -> None:
             "gamelift describe-fleet-capacity": {
                 "FleetCapacity": [{"InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}]
             },
+            "gamelift describe-fleet-location-capacity": {
+                "FleetCapacity": {"Location": "us-west-2", "InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}
+            },
             "lambda invoke": {"outcome": "dispatched", "operation_id": "op"},
         }
     )
     adapter = CommandAdapter(_config(), runner=runner)
     adapter.invoke_evaluate({"observation_operation_id": "op", "desired": 1, "minimum": 0, "maximum": 1})
-    adapter.invoke_observe(
-        {"httpMethod": "POST", "body": "{}", "requestContext": {"authorizer": {"jwt": {"claims": {}}}}}
-    )
+    # NOTE: the observe step is an authenticated HTTPS API call (not a Lambda
+    # invoke), so it is exercised in the live-final semantic suite, not here.
     adapter.describe_execution("arn:aws:states:us-west-2:000000000000:execution:sm:exec")
     adapter.get_dispatched_audit_item("op")
     adapter.get_reservation_item("op")
     adapter.lookup_write_attribution("fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555")
     adapter.describe_fleet_capacity()
+    adapter.describe_fleet_location_capacity("us-west-2")
     adapter.deploy_disabled_autonomy_switch("1")
     assert runner.calls, "adapter must issue commands"
     for argv in runner.calls:
@@ -163,10 +169,11 @@ def test_every_command_is_a_structured_aws_json_argv() -> None:
         assert "--output" in argv and argv[argv.index("--output") + 1] == "json"
         assert "--region" in argv
         # No HTTP TRANSPORT anywhere in the argv: a command adapter never issues a
-        # URL. (The observe proxy event legitimately carries an ``httpMethod``
-        # field inside the --payload; that is API-Gateway event data, not an HTTP
-        # request, so we reject only URL schemes.)
+        # URL through the CLI runner. (The observe HTTPS call goes through the
+        # injected http_caller, never the argv runner.)
         assert not any(("http://" in tok or "https://" in tok) for tok in argv), f"no HTTP URL in argv: {argv}"
+        # The observe bearer is never placed on any argv.
+        assert not any("Bearer" in tok for tok in argv), f"no bearer token in argv: {argv}"
     services = {argv[1] for argv in runner.calls}
     assert services == {"lambda", "stepfunctions", "dynamodb", "cloudtrail", "gamelift", "appconfig"}
 
@@ -252,7 +259,7 @@ def test_transport_maps_known_paths_to_commands() -> None:
             return CommandResult(0, json.dumps(_reservation_item(op)), "")
         if key == "cloudtrail lookup-events":
             return CommandResult(0, json.dumps({"Events": [{"Username": "executor"}]}), "")
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )
@@ -324,7 +331,7 @@ def test_measured_preflight_overrides_supplied_booleans() -> None:
     # ...but the PROVIDER shows an ALARM and a non-zero starting capacity.
     def runner(argv: list[str]) -> CommandResult:
         key = f"{argv[1]} {argv[2]}"
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )
@@ -493,7 +500,7 @@ def test_transport_write_assertions_come_from_real_evidence_reads() -> None:
             return CommandResult(0, json.dumps(_reservation_item(op)), "")
         if key == "cloudtrail lookup-events":
             return CommandResult(0, json.dumps({"Events": [{"Username": "some-other-principal"}]}), "")
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 1, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )
@@ -529,7 +536,7 @@ def test_transport_force_write_denial_is_proven_by_evidence_not_fabricated() -> 
             return _write_invoke_payload(argv, {"outcome": "refused", "reason": "autonomy_disabled"})
         if key == "stepfunctions describe-execution":
             return CommandResult(0, json.dumps({"status": "ABSENT"}), "")
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )
@@ -616,7 +623,7 @@ class ScriptedLifecycleRunner:
             return self._json(_reservation_item(self.last_op))
         if key == "cloudtrail lookup-events":
             return self._json({"Events": [{"Username": "executor"}]} if self.dispatched else {"Events": []})
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return self._json(
                 {
                     "FleetCapacity": [
@@ -647,13 +654,14 @@ class ScriptedLifecycleRunner:
         return CommandResult(returncode=0, stdout=json.dumps(payload), stderr="")
 
 
-def test_command_transport_drives_full_harness_to_accepted() -> None:
+def test_command_transport_drives_full_harness_to_accepted(monkeypatch) -> None:
     """The real CommandTransport, driven through the full E5 harness with good
     evidence, is ACCEPTED and every check passes."""
     # Standard library
     import dataclasses
 
     # Local modules
+    from operations.validation.e5_command_adapter import HttpCall
     from operations.validation.e5_shakedown import (
         REQUIRED_CONFIRMATION,
         REQUIRED_INVERSE_CONFIRMATION,
@@ -664,9 +672,18 @@ def test_command_transport_drives_full_harness_to_accepted() -> None:
 
     runner = ScriptedLifecycleRunner()
     cfg = _config()
-    # Bind the trusted observation id the closed event carries.
-    cfg = dataclasses.replace(cfg, observation_operation_id="op_obs_e2e")
-    transport = CommandTransport(CommandAdapter(cfg, runner=runner))
+    # Bind the trusted observation id the closed event carries and the 06 HTTPS
+    # observe endpoint (observe is an authenticated API call, not a Lambda invoke).
+    cfg = dataclasses.replace(
+        cfg, observation_operation_id="op_obs_e2e", observe_api_endpoint="https://obs.example.aws.dev"
+    )
+    monkeypatch.setenv("GBAW_E5_OBSERVE_BEARER", "short-lived")
+
+    def observe_http(call: "HttpCall"):
+        # A succeeded observation for the enrolled fleet.
+        return 200, {}, json.dumps({"operation_id": "op_obs_e2e", "state": "succeeded"})
+
+    transport = CommandTransport(CommandAdapter(cfg, runner=runner, http_caller=observe_http))
 
     preflight = E5Preflight(
         profile="unit",
@@ -760,11 +777,12 @@ def _kill_switch_doc(*, fresh: bool) -> dict:
     issued = now - timedelta(minutes=1) if fresh else now + timedelta(hours=1)
     not_after = now + timedelta(hours=1) if fresh else now - timedelta(minutes=1)
     return {
-        "control_switch_version": "1",
+        "contract_version": "1.0",
         "config_version": 1,
         "issued_at": issued.isoformat().replace("+00:00", "Z"),
         "not_after": not_after.isoformat().replace("+00:00", "Z"),
         "operations_enabled": True,
+        "capabilities": {_CAPABILITY_ID: {"prepare": True, "dispatch": True, "execute": True}},
     }
 
 
@@ -797,7 +815,7 @@ def test_measured_preflight_measures_gates_drift_enrollment_not_supplied() -> No
 
     def runner(argv: list[str]) -> CommandResult:
         key = f"{argv[1]} {argv[2]}"
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )
@@ -870,7 +888,7 @@ def test_measured_preflight_static_e4_drift_enrollment_all_safe_passes() -> None
 
     def runner(argv: list[str]) -> CommandResult:
         key = f"{argv[1]} {argv[2]}"
-        if key == "gamelift describe-fleet-capacity":
+        if key in ("gamelift describe-fleet-capacity", "gamelift describe-fleet-location-capacity"):
             return CommandResult(
                 0, json.dumps({"FleetCapacity": [{"InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}}]}), ""
             )

@@ -42,6 +42,14 @@
 5. Least-privilege / ReadOnly credentials are used for every read step; the
    single write path is the executor's own scoped role, reached only via the
    authenticated Standard workflow.
+6. The **06 observation HTTPS API endpoint** (`GBAW_E5_ENDPOINT`, reused as the
+   observe endpoint) and a **short-lived observe bearer** (`GBAW_E5_OBSERVE_BEARER`)
+   are available out of band. The trusted E1 observation is obtained by an
+   AUTHENTICATED call to `POST {endpoint}/operations/observe` (a two-key body
+   `{fleet_id, idempotency_token}`) followed by polling `GET {endpoint}/operations/{id}`
+   for a `succeeded` state — never by a direct 06 Lambda invoke (an invoke with
+   empty JWT claims cannot succeed). The bearer is supplied ONLY in the
+   environment; it is never placed on an argv, in a URL/query, or in a log.
 
 ## 2. Activation
 
@@ -67,7 +75,8 @@
    separate autonomy switch enabled, and the E4 `dispatch`/`execute` phases and
    durable intent permitting.
 4. **Run the live shakedown** (see §3) with the mandatory `--adapter command`
-   flag (the evaluator has no HTTP API; without the flag the harness refuses).
+   flag (the evaluator has no HTTP API — the observe step still uses the 06
+   HTTPS API; without the flag the harness refuses).
    It refuses unless every preflight condition holds and both confirmations are
    supplied.
 
@@ -88,6 +97,9 @@ entire run** — making no authenticated request — unless **all** of:
 ```bash
 # Read-only preflight facts and short-lived tokens are supplied out of band;
 # nothing is persisted or echoed. Endpoint/tokens/ids are never logged.
+# The observe bearer is passed ONLY through the environment (never argv), and the
+# observe step calls the 06 HTTPS API at $GBAW_E5_ENDPOINT.
+export GBAW_E5_OBSERVE_BEARER   # short-lived; carried in the Authorization header only
 python -m operations.validation.e5_shakedown \
   --endpoint "$GBAW_E5_ENDPOINT" \
   --admin-bearer "$GBAW_E5_ADMIN_BEARER" \
@@ -106,9 +118,12 @@ python -m operations.validation.e5_shakedown \
   --adapter command
 ```
 
-`--adapter command` is MANDATORY: the E5 evaluator has no HTTP API, so the
+`--adapter command` is MANDATORY: the E5 **evaluator** has no HTTP API, so the
 harness drives concrete `aws` CLI commands (lambda/stepfunctions/dynamodb/
-cloudtrail/gamelift/appconfig) and refuses without the flag. The
+cloudtrail/gamelift/appconfig) and refuses without the flag. The one exception
+is the trusted E1 **observation**, which is a 06-owned AUTHENTICATED HTTPS API
+call (`POST /operations/observe` + status poll) using `$GBAW_E5_ENDPOINT` and
+the `$GBAW_E5_OBSERVE_BEARER` bearer — not a Lambda invoke. The
 `--alarms-safe`, `--autonomy-switch-fresh-enabled`, and `--starting-*` values
 are OVERLAID by MEASURED provider reads: a supplied "safe" value cannot
 override an observed unsafe state, and the run fails closed on any conflict.

@@ -806,6 +806,12 @@ def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig"
         autonomy_state_machine_arn=_val("autonomy_state_machine_arn"),
         # The enrolled fleet's LOCATION; capacity is read scoped to it.
         enrolled_location=_val("enrolled_location") or config.preflight.enrolled_region or config.preflight.region,
+        # The 06 observation HTTPS API base URL. The observe step is an
+        # authenticated API call (a direct 06 Lambda invoke with empty JWT claims
+        # cannot succeed), so it reuses the shakedown endpoint.
+        observe_api_endpoint=_val("observe_api_endpoint") or config.endpoint,
+        # The env var the short-lived observe bearer is read from (never argv).
+        observe_bearer_env_var=_val("observe_bearer_env_var", "GBAW_E5_OBSERVE_BEARER"),
     )
     return CommandAdapter(adapter_config, runner=subprocess_runner)
 

@@ -596,7 +596,49 @@ if [ "$KILL_SWITCH_PROFILE_ID" != "$STACK_08_PROFILE" ]; then
     echo "❌ Refusing to enable: kill-switch profile '$KILL_SWITCH_PROFILE_ID' does not match the 08 KillSwitchProfileId '$STACK_08_PROFILE'." >&2
     exit 6
 fi
-echo "   Exact 08 bindings verified: kill-switch application, environment, and profile all match the 08 deployment."
+
+# 08 IDENTITY: the 08 control-plane stack carries the SAME tenant/workspace as
+# the 06 observation stack (see the 08 template's TenantId/WorkspaceId
+# parameters, documented "Must match the 06 stack's ..."). Bind them to the 06
+# values so the kill switch cannot be pointed at a foreign tenant/workspace.
+STACK_08_TENANT="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$CONTROL_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='TenantId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_08_TENANT" ] || [ "$STACK_08_TENANT" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 08 TenantId parameter." >&2
+    exit 6
+fi
+if [ "$STACK_08_TENANT" != "$STACK_06_TENANT" ]; then
+    echo "❌ Refusing to enable: the 08 TenantId '$STACK_08_TENANT' does not match the 06 TenantId '$STACK_06_TENANT'." >&2
+    exit 6
+fi
+STACK_08_WORKSPACE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$CONTROL_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='WorkspaceId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_08_WORKSPACE" ] || [ "$STACK_08_WORKSPACE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 08 WorkspaceId parameter." >&2
+    exit 6
+fi
+if [ "$STACK_08_WORKSPACE" != "$STACK_06_WORKSPACE" ]; then
+    echo "❌ Refusing to enable: the 08 WorkspaceId '$STACK_08_WORKSPACE' does not match the 06 WorkspaceId '$STACK_06_WORKSPACE'." >&2
+    exit 6
+fi
+
+# 08 APPCONFIG SOURCE: the kill-switch configuration profile must be a HOSTED
+# AppConfig document (LocationUri 'hosted') so AWS AppConfig owns the document
+# lifecycle and it has no external/foreign source the deploy would trust.
+STACK_08_PROFILE_SOURCE="$(aws appconfig get-configuration-profile "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --application-id "$STACK_08_APP" --configuration-profile-id "$STACK_08_PROFILE" \
+    --query "LocationUri" --output text 2>/dev/null || true)"
+if [ -z "$STACK_08_PROFILE_SOURCE" ] || [ "$STACK_08_PROFILE_SOURCE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 08 kill-switch configuration profile source." >&2
+    exit 6
+fi
+if [ "$STACK_08_PROFILE_SOURCE" != "hosted" ]; then
+    echo "❌ Refusing to enable: the 08 kill-switch profile source '$STACK_08_PROFILE_SOURCE' is not the expected hosted AppConfig source." >&2
+    exit 6
+fi
+echo "   Exact 08 bindings verified: kill-switch application, environment, profile, tenant/workspace (== 06), and hosted AppConfig source."
 
 
 # --------------------------------------------------------------------------- #

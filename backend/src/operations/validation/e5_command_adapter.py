@@ -58,6 +58,9 @@ import re
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
@@ -69,6 +72,13 @@ from operations.validation.e1_shakedown import HttpResponse
 # stderr). Injecting it keeps this module AWS-free under test and lets the CLI use
 # a real subprocess in production.
 CommandRunner = Callable[[list[str]], "CommandResult"]
+
+# An HTTP caller performs one authenticated HTTPS request and returns
+# ``(status, headers, body_text)``. Injecting it keeps this module network-free
+# under test; production uses :func:`urllib_http_caller`. The bearer is carried
+# ONLY in ``HttpCall.headers`` (never in the URL/query) and is sourced from the
+# environment by the adapter, so it never touches an argv, a log, or the output.
+HttpCaller = Callable[["HttpCall"], "tuple[int, dict[str, str], str]"]
 
 # The deterministic Step Functions execution name is ``operation_id[:80]`` (see
 # ``AutonomyRuntimeHandler`` in the #439 runtime). Kept here so the adapter builds
@@ -83,6 +93,12 @@ _BUNDLE_SK = "AUTZBUNDLE"
 _DISPATCHED_AUDIT_SK = "AUTZDISPATCH#dispatched"
 _RESERVATION_PK_PREFIX = "AUTZRSV#"
 _RESERVATION_SK = "AUTZRSV"
+
+# The single supported autonomy capability id (see the 08 kill-switch and 09
+# autonomy-switch AppConfig documents). E4 permission is read from this
+# capability's ordered ``prepare``/``dispatch``/``execute`` phase booleans; E5
+# permission is read from this capability's ``autonomous_write`` flag.
+_CAPABILITY_ID = "gamelift.capacity-adjustment"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +124,72 @@ def subprocess_runner(argv: list[str]) -> CommandResult:
     """
     completed = subprocess.run(argv, capture_output=True, text=True, check=False)  # noqa: S603
     return CommandResult(returncode=completed.returncode, stdout=completed.stdout, stderr=completed.stderr)
+
+
+@dataclass(frozen=True, slots=True)
+class HttpCall:
+    """One authenticated HTTPS request the observe step issues to the 06 API.
+
+    ``headers`` carries the ``Authorization: Bearer <token>`` header; the token
+    is NEVER placed in ``url`` (no query string) so it cannot leak through a log,
+    a proxy access line, or command output. ``body`` is a JSON string for POST
+    and ``None`` for GET.
+    """
+
+    method: str
+    url: str
+    headers: Mapping[str, str]
+    body: Optional[str] = None
+
+
+# The observe request body contract is EXACTLY these two keys (see
+# ``operations.observation.ObservationRequest.from_payload``); any extra/missing
+# key is rejected by the deployed handler. The idempotency token must match the
+# handler's ``^idem_[A-Za-z0-9_-]{20,128}$`` pattern.
+_OBSERVE_BODY_KEYS = ("fleet_id", "idempotency_token")
+# The succeeded observation state the GET status poll waits for (ADR 0005).
+_OBSERVATION_STATE_SUCCEEDED = "succeeded"
+_OBSERVATION_STATE_FAILED = "failed"
+# Bounded status poll budget for the observe HTTPS status route.
+_OBSERVE_POLL_MAX_ATTEMPTS = 20
+_OBSERVE_POLL_SECONDS = 1.5
+
+
+def _new_idempotency_token() -> str:
+    """A fresh idempotency token matching the deployed handler's pattern.
+
+    ``idem_`` + 32 url-safe hex chars satisfies ``^idem_[A-Za-z0-9_-]{20,128}$``.
+    """
+    return "idem_" + uuid.uuid4().hex + uuid.uuid4().hex[:8]
+
+
+def urllib_http_caller(call: HttpCall) -> tuple[int, dict[str, str], str]:
+    """Default HTTPS caller: perform one request over TLS with a short timeout.
+
+    HTTP (non-TLS) URLs are refused so a bearer is never sent in the clear.
+    Production CLI use only; unit tests inject a fake caller.
+    """
+    if not call.url.lower().startswith("https://"):
+        raise CommandError("observe API endpoint must be https")
+    data = call.body.encode("utf-8") if call.body is not None else None
+    request = urllib.request.Request(
+        call.url, data=data, method=call.method.upper()
+    )  # noqa: S310 (https enforced above)
+    for key, value in call.headers.items():
+        request.add_header(key, value)
+    if data is not None:
+        request.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
+            status = int(response.status)
+            body_text = response.read().decode("utf-8", errors="replace")
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            return status, headers, body_text
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace") if exc.fp is not None else ""
+        return int(exc.code), {}, body_text
+    except (urllib.error.URLError, OSError) as exc:
+        raise CommandError("observe API request failed") from exc
 
 
 class CommandError(RuntimeError):
@@ -152,6 +234,15 @@ class CommandAdapterConfig:
     # so a multi-location fleet never reads a foreign location's capacity.
     # Defaults to the adapter region when unset.
     enrolled_location: str = ""
+    # The 06 observation HTTPS API base URL (e.g. the API Gateway ApiEndpoint).
+    # The observe step calls ``POST {endpoint}/operations/observe`` and polls
+    # ``GET {endpoint}/operations/{operation_id}`` — it NEVER invokes the 06
+    # Lambda directly (a direct invoke with empty JWT claims cannot succeed).
+    observe_api_endpoint: str = ""
+    # The environment variable name the short-lived observe bearer is read from.
+    # The token is sourced from the environment (or stdin-populated env) and
+    # carried only in the Authorization header — never in an argv, URL, or log.
+    observe_bearer_env_var: str = "GBAW_E5_OBSERVE_BEARER"
 
 
 class CommandAdapter:
@@ -169,10 +260,16 @@ class CommandAdapter:
         runner: CommandRunner = subprocess_runner,
         *,
         drift_poll_sleep: Callable[[float], None] = time.sleep,
+        http_caller: HttpCaller = urllib_http_caller,
+        observe_poll_sleep: Callable[[float], None] = time.sleep,
+        idempotency_token_factory: Callable[[], str] = _new_idempotency_token,
     ) -> None:
         self._config = config
         self._runner = runner
         self._drift_poll_sleep = drift_poll_sleep
+        self._http_caller = http_caller
+        self._observe_poll_sleep = observe_poll_sleep
+        self._idempotency_token_factory = idempotency_token_factory
 
     # -- argv construction -------------------------------------------------- #
 
@@ -194,76 +291,109 @@ class CommandAdapter:
 
     # -- lifecycle operations (contract) ------------------------------------ #
 
-    def invoke_observe(self, event: Mapping[str, Any]) -> Any:
-        """lambda:InvokeFunction on the 06 observe function (trusted read).
-
-        ``event`` is the API-Gateway proxy event the deployed handler consumes;
-        the parsed value is the proxy RESPONSE (``{statusCode, headers, body}``)
-        read from the tempfile OutputFile, not the CLI invoke metadata.
+    def _observe_bearer(self) -> Optional[str]:
+        """Read the short-lived observe bearer from the configured environment
+        variable. Returns ``None`` when absent/blank so the observe fails closed
+        rather than issuing an unauthenticated call. The token is never returned
+        into an argv, a URL, or a log — only into the Authorization header.
         """
-        return self._invoke_lambda(self._config.observe_function_name, event)
+        token = os.environ.get(self._config.observe_bearer_env_var, "")
+        token = token.strip()
+        return token or None
 
     def observe_succeeded_observation_id(self) -> Optional[str]:
-        """Invoke the real 06 observation Lambda and return the succeeded
-        observation's ``observation_id`` — or ``None`` if the observation did not
-        succeed / could not be parsed (fail closed; never fabricate ``trusted``).
+        """Issue an AUTHENTICATED HTTPS observe against the 06 API and return the
+        succeeded observation's id — or ``None`` (fail closed) if it did not
+        succeed / could not be parsed. Never fabricates ``trusted``.
 
-        The deployed handler is an API-Gateway HTTP API (payload v2) proxy: it
-        reads identity from ``requestContext.authorizer.jwt.claims`` and the
-        request from a JSON ``body`` string, and returns ``{statusCode, headers,
-        body}`` where ``body`` is a JSON string carrying ``observation_id`` on a
-        succeeded (``200``) observe.
+        The deployed 06 handler is an authenticated HTTP API: a direct Lambda
+        invoke with empty ``requestContext.authorizer.jwt.claims`` cannot succeed
+        (it raises ``IDENTITY_CONTEXT_INVALID``), and the request body must be
+        EXACTLY ``{"fleet_id", "idempotency_token"}``. So this:
+
+        1. ``POST {endpoint}/operations/observe`` with the two-key proposal body
+           (a fresh ``idempotency_token``) and a short-lived bearer sourced from
+           the environment and carried only in the Authorization header;
+        2. resolves the ``operation_id`` from the response and POLLs
+           ``GET {endpoint}/operations/{operation_id}`` until ``state`` is
+           terminal, returning the id only when the real status is ``succeeded``.
         """
+        endpoint = (self._config.observe_api_endpoint or "").rstrip("/")
+        if not endpoint:
+            return None
+        bearer = self._observe_bearer()
+        if bearer is None:
+            return None
+        auth = {"authorization": f"Bearer {bearer}", "accept": "application/json"}
+        body = json.dumps(
+            {"fleet_id": self._config.enrolled_fleet_id, "idempotency_token": self._idempotency_token_factory()}
+        )
         try:
-            response = self.invoke_observe(self._observe_proxy_event())
+            status, _headers, text = self._http_caller(
+                HttpCall(method="POST", url=f"{endpoint}/operations/observe", headers=auth, body=body)
+            )
         except CommandError:
             return None
-        if not isinstance(response, Mapping):
+        if status != 200:
             return None
-        if int(response.get("statusCode", 0)) != 200:
+        parsed = self._parse_json(text)
+        operation_id = self._observation_operation_id(parsed)
+        if operation_id is None:
             return None
-        body = self._proxy_body(response)
-        if not isinstance(body, Mapping):
-            return None
-        observation_id = body.get("observation_id")
-        if isinstance(observation_id, str) and observation_id.strip():
-            return observation_id
-        return None
+        # A synchronous succeeded POST may already carry the terminal state.
+        if self._observation_state(parsed) == _OBSERVATION_STATE_SUCCEEDED:
+            return operation_id
+        return self._poll_observation_succeeded(endpoint, auth, operation_id)
 
-    def _observe_proxy_event(self) -> dict[str, Any]:
-        """Build the API-Gateway HTTP API (payload v2) proxy event the deployed
-        06 observation handler consumes for a trusted, bounded observe.
-
-        Identity is carried in ``requestContext.authorizer.jwt.claims`` exactly as
-        the handler reads it; the request body is a JSON string. The observe
-        request re-derives the succeeded observation for the enrolled fleet.
-        """
-        body = json.dumps({"fleet_id": self._config.enrolled_fleet_id})
-        return {
-            "httpMethod": "POST",
-            "routeKey": "POST /operations/observe",
-            "rawPath": "/operations/observe",
-            "isBase64Encoded": False,
-            "headers": {"content-type": "application/json"},
-            "body": body,
-            "requestContext": {
-                "http": {"method": "POST", "path": "/operations/observe"},
-                "authorizer": {"jwt": {"claims": {}}},
-            },
-        }
+    def _poll_observation_succeeded(self, endpoint: str, auth: Mapping[str, str], operation_id: str) -> Optional[str]:
+        """Poll the real status route until the observation reaches a terminal
+        state; return the id only on ``succeeded`` (fail closed otherwise)."""
+        url = f"{endpoint}/operations/{operation_id}"
+        for attempt in range(_OBSERVE_POLL_MAX_ATTEMPTS):
+            try:
+                status, _headers, text = self._http_caller(
+                    HttpCall(method="GET", url=url, headers=dict(auth), body=None)
+                )
+            except CommandError:
+                return None
+            if status != 200:
+                return None
+            parsed = self._parse_json(text)
+            state = self._observation_state(parsed)
+            if state == _OBSERVATION_STATE_SUCCEEDED:
+                return operation_id
+            if state == _OBSERVATION_STATE_FAILED:
+                return None
+            # Still in progress: bounded poll.
+            if attempt + 1 < _OBSERVE_POLL_MAX_ATTEMPTS:
+                self._observe_poll_sleep(_OBSERVE_POLL_SECONDS)
+        return None  # never reached a terminal succeeded state -> fail closed
 
     @staticmethod
-    def _proxy_body(response: Mapping[str, Any]) -> Any:
-        """Parse the proxy response ``body`` JSON string into a dict."""
-        raw = response.get("body")
-        if isinstance(raw, Mapping):
-            return raw
-        if not isinstance(raw, str) or not raw.strip():
-            return None
+    def _parse_json(text: str) -> Any:
         try:
-            return json.loads(raw)
+            return json.loads(text) if text and text.strip() else None
         except (ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _observation_operation_id(parsed: Any) -> Optional[str]:
+        """Resolve the operation id from an observe/status body (``operation_id``
+        or, for a succeeded observe body, ``observation_id``)."""
+        if not isinstance(parsed, Mapping):
+            return None
+        for key in ("operation_id", "observation_id"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        return None
+
+    @staticmethod
+    def _observation_state(parsed: Any) -> Optional[str]:
+        if not isinstance(parsed, Mapping):
+            return None
+        state = parsed.get("state")
+        return state if isinstance(state, str) else None
 
     def invoke_evaluate(self, event: Mapping[str, Any]) -> Any:
         """lambda:InvokeFunction on the E5 evaluator with the closed #439 event.
@@ -389,13 +519,24 @@ class CommandAdapter:
         return self._run_json(argv)
 
     def describe_fleet_capacity(self) -> Any:
-        """gamelift:DescribeFleetCapacity on the enrolled fleet, scoped to the
-        enrolled LOCATION so a multi-location fleet reads only its own location."""
+        """gamelift:DescribeFleetCapacity on the enrolled fleet (home-Region /
+        fleet-wide capacity).
+
+        NOTE: ``DescribeFleetCapacity`` has NO ``--locations`` parameter (that is
+        an invalid ABI). Per-location capacity is read with
+        :meth:`describe_fleet_location_capacity`; this fleet-wide read is only the
+        fallback for a home-Region-only fleet.
+        """
         argv = self._base("gamelift", "describe-fleet-capacity")
         argv += ["--fleet-id", self._config.enrolled_fleet_id]
-        location = self._config.enrolled_location or self._config.region
-        if location:
-            argv += ["--locations", location]
+        return self._run_json(argv)
+
+    def describe_fleet_location_capacity(self, location: str) -> Any:
+        """gamelift:DescribeFleetLocationCapacity for the enrolled fleet at the
+        given LOCATION — the VALID ABI for per-location capacity (singular
+        ``--location``)."""
+        argv = self._base("gamelift", "describe-fleet-location-capacity")
+        argv += ["--fleet-id", self._config.enrolled_fleet_id, "--location", location]
         return self._run_json(argv)
 
     def deploy_disabled_autonomy_switch(self, configuration_version: str) -> Any:
@@ -420,31 +561,25 @@ class CommandAdapter:
     def observed_fleet_capacity(self) -> Optional[dict[str, int]]:
         """Return the enrolled fleet+location's {desired,minimum,maximum} or None.
 
-        A read that lacks the desired field returns None so the caller fails
-        closed (never assumes a capacity it did not observe). When the fleet is
-        multi-location, the enrolled-location entry is selected.
+        When the fleet is enrolled at a specific LOCATION, the exact capacity is
+        read with the VALID ``describe-fleet-location-capacity`` API (whose
+        response is a single ``FleetCapacity`` object for that location). Only a
+        home-Region-only fleet (no enrolled location) falls back to the fleet-wide
+        ``describe-fleet-capacity``. A read that lacks the desired field returns
+        None so the caller fails closed (never assumes a capacity it did not
+        observe).
         """
-        data = self.describe_fleet_capacity()
-        caps = data.get("FleetCapacity") or []
-        if not caps:
-            return None
         location = self._config.enrolled_location or self._config.region
-        chosen: Optional[dict[str, Any]] = None
-        for entry in caps:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("Location") == location:
-                chosen = entry
-                break
-        if chosen is None:
-            # No location-tagged match: fall back to a single unlabelled entry
-            # (a home-Region-only fleet omits Location), else fail closed.
-            if len(caps) == 1 and isinstance(caps[0], dict) and "Location" not in caps[0]:
-                chosen = caps[0]
-            else:
+        if location:
+            try:
+                data = self.describe_fleet_location_capacity(location)
+            except CommandError:
                 return None
-        instance = (chosen or {}).get("InstanceCounts") or {}
-        if "DESIRED" not in instance:
+            instance = self._location_capacity_instance_counts(data, location)
+        else:
+            data = self.describe_fleet_capacity()
+            instance = self._fleet_wide_instance_counts(data)
+        if instance is None or "DESIRED" not in instance:
             return None
         try:
             return {
@@ -454,6 +589,39 @@ class CommandAdapter:
             }
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _location_capacity_instance_counts(data: Any, location: str) -> Optional[dict[str, Any]]:
+        """Extract InstanceCounts from a DescribeFleetLocationCapacity response.
+
+        The response's ``FleetCapacity`` is a single object for the requested
+        location; a mismatched/absent location fails closed.
+        """
+        if not isinstance(data, Mapping):
+            return None
+        capacity = data.get("FleetCapacity")
+        if isinstance(capacity, list):
+            # Some CLI shapes wrap the single object in a list.
+            capacity = next((c for c in capacity if isinstance(c, Mapping)), None)
+        if not isinstance(capacity, Mapping):
+            return None
+        reported_location = capacity.get("Location")
+        if reported_location is not None and reported_location != location:
+            return None
+        instance = capacity.get("InstanceCounts")
+        return instance if isinstance(instance, dict) else None
+
+    @staticmethod
+    def _fleet_wide_instance_counts(data: Any) -> Optional[dict[str, Any]]:
+        """Extract InstanceCounts from a fleet-wide DescribeFleetCapacity response
+        for a home-Region-only fleet (a single unlabelled entry)."""
+        if not isinstance(data, Mapping):
+            return None
+        caps = data.get("FleetCapacity") or []
+        if not isinstance(caps, list) or len(caps) != 1 or not isinstance(caps[0], dict):
+            return None
+        instance = caps[0].get("InstanceCounts")
+        return instance if isinstance(instance, dict) else None
 
     def observed_alarms_safe(self) -> bool:
         """True only if all four E5 alarms are observed in OK (not ALARM) state."""
@@ -495,8 +663,42 @@ class CommandAdapter:
         return enabled
 
     def observed_autonomy_switch_fresh_enabled(self) -> bool:
-        """True only if the live autonomy switch document is fresh AND enabled."""
-        return self.observed_autonomy_switch_state() is True
+        """True only if the live E5 autonomy switch PERMITS an autonomous write.
+
+        E5 permission is ``autonomy_enabled`` AND the EXACT capability's
+        ``capabilities["gamelift.capacity-adjustment"].autonomous_write`` being
+        true AND the document being fresh. A fresh, ``autonomy_enabled`` document
+        whose capability ``autonomous_write`` is false does NOT permit the write
+        (fail closed). The tri-state ``observed_autonomy_switch_state`` remains the
+        enabled/disabled/unknown signal cleanup uses.
+        """
+        doc = self._read_appconfig_document(
+            self._config.autonomy_application_id,
+            self._config.autonomy_environment_id,
+            self._config.autonomy_switch_profile_id,
+            client_id="e5-shakedown-preflight",
+        )
+        if doc is None or not self._document_is_fresh(doc):
+            return False
+        if doc.get("autonomy_enabled") is not True:
+            return False
+        return self._capability_flag(doc, "autonomous_write") is True
+
+    @staticmethod
+    def _capability_flag(document: Mapping[str, Any], flag: str) -> Optional[bool]:
+        """Read a boolean flag off the single supported capability's entry.
+
+        Returns the boolean when present and boolean-typed, else ``None`` (so the
+        caller fails closed on a missing/absent/malformed capability entry).
+        """
+        capabilities = document.get("capabilities")
+        if not isinstance(capabilities, Mapping):
+            return None
+        capability = capabilities.get(_CAPABILITY_ID)
+        if not isinstance(capability, Mapping):
+            return None
+        value = capability.get(flag)
+        return value if isinstance(value, bool) else None
 
     def _read_appconfig_document(
         self,
@@ -583,12 +785,15 @@ class CommandAdapter:
     # -- additional measured preflight reads (#440 Finding 8) --------------- #
 
     def observed_e4_kill_switch_fresh(self) -> bool:
-        """True only if the E4 (08) kill-switch document is fresh (non-expired).
+        """True only if the E4 (08) kill-switch document PERMITS the dispatch and
+        execute phases for this capability AND is fresh.
 
-        The kill switch need not be 'enabled' to be safe — a fresh, readable
-        kill-switch document means the fail-closed lever is live. A stale/absent
-        read fails closed. Uses the REAL keys (``issued_at``/``not_after``) and the
-        required OutputFile positional.
+        E4 permission is the deployment-wide ``operations_enabled`` master switch
+        being true AND the capability's ordered ``dispatch`` and ``execute`` phase
+        booleans both being true AND the document being fresh
+        (``issued_at <= now < not_after`` on the REAL keys). ``operations_enabled``
+        false, either phase disabled, a missing capability entry, or a stale/absent
+        read all fail closed — a merely readable document is not enough.
         """
         if not (
             self._config.kill_switch_application_id
@@ -602,9 +807,11 @@ class CommandAdapter:
             self._config.kill_switch_profile_id,
             client_id="e5-shakedown-preflight-killswitch",
         )
-        if doc is None:
+        if doc is None or not self._document_is_fresh(doc):
             return False
-        return self._document_is_fresh(doc)
+        if doc.get("operations_enabled") is not True:
+            return False
+        return self._capability_flag(doc, "dispatch") is True and self._capability_flag(doc, "execute") is True
 
     def observed_static_mode_operate(self) -> bool:
         """True only if the deployed evaluator's real static mode is operate AND
@@ -1038,46 +1245,91 @@ class CommandTransport:
 
     def _force_write(self, payload: Mapping[str, Any]) -> HttpResponse:
         """After disable, a forced attempt must be refused AND perform no write,
-        PROVEN by evidence: the evaluator refuses, and no new dispatched Step
-        Functions execution exists for the forced attempt.
+        PROVEN by evidence — never false-confirmed on an unavailable read.
 
-        A confirmed no-write denial requires the write-evidence lookup to SUCCEED.
-        If the evaluator dispatched but the execution read was UNREADABLE, the
-        result is UNKNOWN — the response must NOT report a clean ``wrote: false``;
-        it carries ``wrote: null`` and an ``EVIDENCE_UNAVAILABLE`` code so the
-        harness does not false-confirm the negative.
+        Three cases, and only the first is a clean confirmed no-write denial:
+
+        * **Evaluator refused** (a real ``{outcome: refused}`` result): the
+          evaluator denied before any provider write, so ``wrote: false`` is
+          confirmed by the evaluator's own decision.
+        * **Evaluator UNAVAILABLE** (the invoke raised / returned an unparseable
+          result): the outcome is UNKNOWN. The response must NOT map this to a
+          clean disabled/no-write denial — it carries ``wrote: null`` and
+          ``EVALUATOR_UNAVAILABLE`` so the harness does not false-confirm.
+        * **Evaluator dispatched** (a real failure of the disable): the negative
+          is proven only when the before/after write evidence
+          (StepFunctions/DynamoDB/CloudTrail) is READABLE. If any write-evidence
+          read is UNREADABLE, the result is UNKNOWN — ``wrote: null`` +
+          ``EVIDENCE_UNAVAILABLE`` — never a clean ``wrote: false``.
         """
         direction = str(payload.get("direction", "up"))
         event = self._closed_event(direction)
+        evaluator_unavailable = False
         try:
             result = self._adapter.invoke_evaluate(event)
         except CommandError:
             result = None
-        outcome = result.get("outcome") if isinstance(result, dict) else None
-        reason = ""
-        if isinstance(result, dict):
-            reason = str(result.get("reason", "")).strip()
-        wrote: Optional[bool] = False
-        evidence_unavailable = False
-        if outcome == _OUTCOME_DISPATCHED:
-            # A dispatched outcome here would be a real failure of the disable;
-            # prove the negative by reading that no execution was started for it.
-            operation_id = str(result.get("operation_id", "")) if isinstance(result, dict) else ""
-            started = self._dispatch_evidence(operation_id)["step_functions_started"]
-            if started is None:
-                # UNREADABLE write evidence -> UNKNOWN, do NOT confirm no-write.
-                wrote = None
-                evidence_unavailable = True
-            else:
-                wrote = bool(started)
-        body: dict[str, Any] = {
-            "decision": "denied",
-            "outcome": "refused" if outcome != _OUTCOME_DISPATCHED else _OUTCOME_DISPATCHED,
-            "reason": reason or "AUTONOMY_DISABLED",
-            "error_code": ("EVIDENCE_UNAVAILABLE" if evidence_unavailable else (reason.upper() or "AUTONOMY_DISABLED")),
-            "wrote": wrote,
-        }
-        return _http(409, body)
+            evaluator_unavailable = True
+        if not isinstance(result, dict):
+            # An unparseable evaluator result is UNKNOWN, not a confirmed refusal.
+            evaluator_unavailable = True
+            result = {}
+        outcome = result.get("outcome")
+        reason = str(result.get("reason", "")).strip()
+
+        if evaluator_unavailable:
+            # UNKNOWN outcome: cannot map an unavailable evaluator to "disabled".
+            return _http(
+                409,
+                {
+                    "decision": "denied",
+                    "outcome": "unknown",
+                    "reason": reason or "EVALUATOR_UNAVAILABLE",
+                    "error_code": "EVALUATOR_UNAVAILABLE",
+                    "wrote": None,
+                },
+            )
+
+        if outcome != _OUTCOME_DISPATCHED:
+            # A real refusal: the evaluator denied before any write, so no-write
+            # is confirmed by the decision itself.
+            return _http(
+                409,
+                {
+                    "decision": "denied",
+                    "outcome": "refused",
+                    "reason": reason or "AUTONOMY_DISABLED",
+                    "error_code": reason.upper() or "AUTONOMY_DISABLED",
+                    "wrote": False,
+                },
+            )
+
+        # A dispatched outcome is a real failure of the disable; prove the
+        # negative from readable write evidence, or report UNKNOWN.
+        operation_id = str(result.get("operation_id", ""))
+        started = self._dispatch_evidence(operation_id)["step_functions_started"]
+        if started is None:
+            # UNREADABLE write evidence -> UNKNOWN, do NOT confirm no-write.
+            return _http(
+                409,
+                {
+                    "decision": "denied",
+                    "outcome": _OUTCOME_DISPATCHED,
+                    "reason": reason or "AUTONOMY_DISABLED",
+                    "error_code": "EVIDENCE_UNAVAILABLE",
+                    "wrote": None,
+                },
+            )
+        return _http(
+            409,
+            {
+                "decision": "denied",
+                "outcome": _OUTCOME_DISPATCHED,
+                "reason": reason or "AUTONOMY_DISABLED",
+                "error_code": reason.upper() or "AUTONOMY_DISABLED",
+                "wrote": bool(started),
+            },
+        )
 
     # -- helpers ------------------------------------------------------------ #
 

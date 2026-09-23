@@ -80,26 +80,30 @@ def _config(**overrides: object) -> CommandAdapterConfig:
     return CommandAdapterConfig(**base)  # type: ignore[arg-type]
 
 
-def _fresh_switch_doc(*, autonomy_enabled: bool = True) -> dict:
+_CAPABILITY_ID = "gamelift.capacity-adjustment"
+
+
+def _fresh_switch_doc(*, autonomy_enabled: bool = True, autonomous_write: bool = True) -> dict:
     now = datetime.now(timezone.utc)
     return {
-        "autonomy_switch_version": "1",
+        "autonomy_switch_version": "1.0",
         "config_version": 1,
         "issued_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
         "not_after": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
         "autonomy_enabled": autonomy_enabled,
-        "capabilities": {},
+        "capabilities": {_CAPABILITY_ID: {"autonomous_write": autonomous_write}},
     }
 
 
 def _fresh_kill_switch_doc(*, operations_enabled: bool = True) -> dict:
     now = datetime.now(timezone.utc)
     return {
-        "control_switch_version": "1",
+        "contract_version": "1.0",
         "config_version": 1,
         "issued_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
         "not_after": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
         "operations_enabled": operations_enabled,
+        "capabilities": {_CAPABILITY_ID: {"prepare": True, "dispatch": True, "execute": True}},
     }
 
 
@@ -165,63 +169,56 @@ def test_lambda_invoke_detects_function_error_from_metadata() -> None:
         adapter.invoke_evaluate({"observation_operation_id": "op", "desired": 1, "minimum": 0, "maximum": 1})
 
 
-def test_observe_step_invokes_real_06_abi_and_parses_observation_id() -> None:
-    """The observe step must invoke the 06 observation Lambda with its exact
-    API-Gateway-proxy event ABI (POST + requestContext.authorizer.jwt.claims +
-    JSON body) and parse ``observation_id`` from the succeeded response body —
-    never fabricate ``{"trusted": true}``."""
-    captured: dict[str, object] = {}
+def test_observe_step_uses_authenticated_https_api_not_direct_invoke(monkeypatch) -> None:
+    """The observe step must issue an AUTHENTICATED HTTPS API call to the 06
+    endpoint (never a direct Lambda invoke, which cannot succeed with empty JWT
+    claims) and parse the succeeded ``observation_id`` — never fabricate
+    ``{"trusted": true}``."""
+    # Local modules
+    from operations.validation.e5_command_adapter import HttpCall
+
+    monkeypatch.setenv("GBAW_E5_OBSERVE_BEARER", "short-lived")
+    saw_lambda_invoke = {"n": 0}
 
     def runner(argv: list[str]) -> CommandResult:
         if argv[1:3] == ["lambda", "invoke"]:
-            event = json.loads(argv[argv.index("--payload") + 1])
-            captured["event"] = event
-            outfile = argv[-1]
-            # The observe handler returns an API-Gateway proxy response whose body
-            # is a JSON STRING carrying observation_id for a succeeded observation.
-            body = json.dumps(
-                {
-                    "observation_contract_version": "1",
-                    "observation_id": "op_obs_succeeded",
-                    "phase": "observe",
-                }
-            )
-            pathlib.Path(outfile).write_text(
-                json.dumps({"statusCode": 200, "headers": {}, "body": body}), encoding="utf-8"
-            )
-            return CommandResult(0, json.dumps({"StatusCode": 200}), "")
+            saw_lambda_invoke["n"] += 1
         return CommandResult(0, "{}", "")
 
-    adapter = CommandAdapter(_config(), runner=runner)
+    def http(call: "HttpCall"):
+        assert call.url.startswith("https://"), "observe must be an HTTPS call"
+        assert call.headers.get("authorization") == "Bearer short-lived"
+        if call.method == "POST":
+            return 200, {}, json.dumps({"operation_id": "obs_" + "a" * 26, "state": "succeeded"})
+        return 200, {}, json.dumps({"operation_id": "obs_" + "a" * 26, "state": "succeeded"})
+
+    adapter = CommandAdapter(
+        _config(observe_api_endpoint="https://obs.example.aws.dev"), runner=runner, http_caller=http
+    )
     observation_id = adapter.observe_succeeded_observation_id()
-    assert observation_id == "op_obs_succeeded", "must parse the real observation_id from the response body"
-    event = captured["event"]
-    assert isinstance(event, dict)
-    # The event is the real proxy ABI, not a bare {observation_operation_id}.
-    assert "requestContext" in event, "observe invoke must carry the API Gateway proxy requestContext"
-    assert (
-        event.get("httpMethod") == "POST" or event.get("requestContext", {}).get("http", {}).get("method") == "POST"
-    ), "observe is a POST"
-    assert isinstance(event.get("body"), str), "the proxy event body must be a JSON string"
+    assert observation_id == "obs_" + "a" * 26, "must parse the real observation_id from the API response"
+    assert saw_lambda_invoke["n"] == 0, "observe must NOT invoke the 06 Lambda directly"
 
 
-def test_transport_observe_reports_trusted_only_on_real_succeeded_observation() -> None:
+def test_transport_observe_reports_trusted_only_on_real_succeeded_observation(monkeypatch) -> None:
     """The observe transport step must report trusted=True ONLY when the real 06
-    Lambda returns a succeeded observation; an error/ambiguous body is not
+    API returns a succeeded observation; an error/ambiguous status is not
     trusted."""
+    # Local modules
+    from operations.validation.e5_command_adapter import HttpCall
 
-    def runner(argv: list[str]) -> CommandResult:
-        if argv[1:3] == ["lambda", "invoke"]:
-            outfile = argv[-1]
-            # Non-200 proxy response -> not a succeeded observation.
-            pathlib.Path(outfile).write_text(
-                json.dumps({"statusCode": 500, "headers": {}, "body": json.dumps({"error_code": "INTERNAL_ERROR"})}),
-                encoding="utf-8",
-            )
-            return CommandResult(0, json.dumps({"StatusCode": 200}), "")
-        return CommandResult(0, "{}", "")
+    monkeypatch.setenv("GBAW_E5_OBSERVE_BEARER", "short-lived")
 
-    transport = CommandTransport(CommandAdapter(_config(), runner=runner))
+    def http(call: "HttpCall"):
+        # Non-200 -> not a succeeded observation.
+        return 500, {}, json.dumps({"error_code": "INTERNAL_ERROR"})
+
+    adapter = CommandAdapter(
+        _config(observe_api_endpoint="https://obs.example.aws.dev"),
+        runner=lambda argv: CommandResult(0, "{}", ""),
+        http_caller=http,
+    )
+    transport = CommandTransport(adapter)
     resp = transport("POST", "https://x/operations/observe", headers={"authorization": "Bearer x"}, body=b"{}")
     assert resp.json().get("trusted") is not True, "an unsucceeded observation must not be reported trusted"
 
@@ -478,33 +475,38 @@ def test_static_mode_reads_real_gbaw_operations_mode_env_var() -> None:
 
 
 def test_fleet_capacity_read_is_location_specific() -> None:
-    """The capacity read must be scoped to the enrolled fleet's LOCATION so a
-    multi-location fleet does not read a foreign location's capacity."""
+    """The capacity read must be scoped to the enrolled fleet's LOCATION via the
+    VALID ``describe-fleet-location-capacity`` API (singular ``--location``), so a
+    multi-location fleet does not read a foreign location's capacity and no
+    invalid ``describe-fleet-capacity --locations`` ABI is used."""
     captured: dict[str, list[str]] = {}
 
     def runner(argv: list[str]) -> CommandResult:
-        if argv[1:3] == ["gamelift", "describe-fleet-capacity"]:
+        if argv[1:3] == ["gamelift", "describe-fleet-location-capacity"]:
             captured["argv"] = argv
             return CommandResult(
                 0,
                 json.dumps(
                     {
-                        "FleetCapacity": [
-                            {"Location": "us-west-2", "InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1}},
-                            {"Location": "eu-west-1", "InstanceCounts": {"DESIRED": 9, "MINIMUM": 9, "MAXIMUM": 9}},
-                        ]
+                        "FleetCapacity": {
+                            "Location": "us-west-2",
+                            "InstanceCounts": {"DESIRED": 0, "MINIMUM": 0, "MAXIMUM": 1},
+                        }
                     }
                 ),
                 "",
             )
+        if argv[1:3] == ["gamelift", "describe-fleet-capacity"]:
+            assert "--locations" not in argv, "describe-fleet-capacity has no --locations parameter"
         return CommandResult(0, "{}", "")
 
     adapter = CommandAdapter(_config(enrolled_location="us-west-2"), runner=runner)
     caps = adapter.observed_fleet_capacity()
     argv = captured["argv"]
-    assert "--location" in argv or "--locations" in argv, "the capacity read must scope to the enrolled location"
+    assert "--location" in argv and "--locations" not in argv, "the location API takes a singular --location"
+    assert argv[argv.index("--location") + 1] == "us-west-2"
     assert caps is not None
-    # The enrolled-location capacity (0/0/1) is what is returned, not eu-west-1.
+    # The enrolled-location capacity (0/0/1) is what is returned.
     assert caps["desired"] == 0 and caps["maximum"] == 1
 
 
