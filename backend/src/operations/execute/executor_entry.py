@@ -23,6 +23,23 @@ It bootstraps:
 
 The frozen environment contract is resolved and validated once at first
 invocation (fail closed). Importing this module is side-effect free and AWS-free.
+
+E5 bounded-autonomy routing (issue #439)
+----------------------------------------
+The executor reloads the operation and selects its execution path from the
+immutable, server-owned envelope alone
+(:func:`~operations.autonomy_execution_selection.select_execution_path`). A v1
+``gamelift.capacity-adjustment/1.0`` operation follows the untouched
+human-approval path. A v2 ``gamelift.capacity-adjustment/2.0`` autonomous
+operation is re-verified by the independent
+:class:`~operations.autonomy_execution_verifier.AutonomyExecutionVerifier`
+against the freshly reloaded bundle and its VerifiedExecutionPlan is fed into the
+existing :meth:`ExecutorService.execute_verified` write core. The autonomous path
+always **settles** the in-flight reservation on every terminal/failed handoff
+(:func:`execute_autonomous`), releasing the concurrency slot while the store
+conservatively retains consumed budget/frequency. No model output authorizes,
+alters policy/limits, dispatches, or reaches the provider; the executor holds the
+only provider-write credential and remains the sole GameLift writer.
 """
 
 from __future__ import annotations
@@ -39,6 +56,9 @@ from operations.evidence import OperationEvidence
 
 _APPROVED_STATE = "approved"
 
+# Terminal outcomes that indicate a successful (or already-reconciled) write.
+_SUCCESS_OUTCOMES = frozenset({"SUCCEEDED", "RECONCILED"})
+
 
 class EvidenceExecutionReloadStore:
     """Reload the full prepared operation + granted approval + state for execute."""
@@ -54,6 +74,88 @@ class EvidenceExecutionReloadStore:
             # Without a stored granted approval the executor cannot proceed.
             return None
         return evidence.operation, evidence.approval, evidence.state
+
+
+def _settle_terminal(result: dict[str, Any] | None) -> str:
+    """Map a terminal execution result to the reservation settle terminal token."""
+    if isinstance(result, Mapping) and result.get("outcome") in _SUCCESS_OUTCOMES:
+        return "succeeded"
+    return "failed"
+
+
+def execute_autonomous(
+    invocation: Any,
+    *,
+    bundle: Mapping[str, Any],
+    logical_action_id: str,
+    verifier: Any,
+    service: Any,
+    reservation: Any,
+    lease_holder: str,
+) -> dict[str, Any]:
+    """Run the v2 autonomous path over the existing write core, always settling.
+
+    The stable ``logical_action_id`` is computed once by the caller from the
+    reloaded, hash-bound operation and threaded through so the settle in the
+    ``finally`` always targets the exact in-flight reservation — whether the
+    verifier raises, the write core raises, or a terminal result is recorded.
+
+    Order:
+
+    1. Re-verify every precondition against the freshly reloaded bundle
+       (:class:`AutonomyExecutionVerifier`), producing a VerifiedExecutionPlan.
+    2. Feed the plan into :meth:`ExecutorService.execute_verified`, which runs the
+       identical Describe-before-write / write-once / verify / atomic-record
+       pipeline and re-checks the separate autonomy switch + reservation ownership
+       immediately before the single write via its ``pre_write_hook``.
+    3. **Always** settle the in-flight reservation on the terminal/failed handoff,
+       releasing the concurrency slot (budget/frequency are retained by the store).
+
+    Any verifier or write-core failure fails closed: no false success is
+    fabricated, the in-flight slot is released, and the error propagates so the
+    Step Functions workflow records a failed execution.
+    """
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionEvidence
+
+    result: dict[str, Any] | None = None
+    try:
+        evidence = AutonomyExecutionEvidence(
+            policy=dict(bundle["policy"]),
+            observation=dict(bundle["observation"]),
+            decision=dict(bundle["decision"]),
+            operation=dict(bundle["operation"]),
+            window_state=dict(bundle["window_state"]),
+        )
+        plan = verifier.verify(operation_id=invocation.operation_id, evidence=evidence)
+        result = service.execute_verified(invocation, plan=plan, lease_holder=lease_holder)
+        return result
+    finally:
+        # Settle the in-flight reservation on EVERY terminal/failed handoff so the
+        # single concurrency slot is released. A settle failure must never mask the
+        # original outcome/exception, so it is swallowed after a best-effort call.
+        try:
+            reservation.settle(
+                operation_id=invocation.operation_id,
+                logical_action_id=logical_action_id,
+                terminal=_settle_terminal(result),
+            )
+        except Exception:  # noqa: BLE001 - a settle failure never masks the handoff outcome
+            pass
+
+
+def _build_autonomy_evidence(bundle: Mapping[str, Any]) -> Any:
+    """Build the verifier's evidence bundle from a reloaded v2 bundle mapping."""
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionEvidence
+
+    return AutonomyExecutionEvidence(
+        policy=dict(bundle["policy"]),
+        observation=dict(bundle["observation"]),
+        decision=dict(bundle["decision"]),
+        operation=dict(bundle["operation"]),
+        window_state=dict(bundle["window_state"]),
+    )
 
 
 def _region() -> str:
