@@ -89,11 +89,11 @@ def test_stepfunctions_start_execution_input_is_operation_id_only() -> None:
     class _Sfn:
         def start_execution(self, **kwargs: Any) -> dict[str, str]:
             captured.append(kwargs)
-            return {"executionArn": "arn:aws:states:us-west-2:111122223333:execution:x:y"}
+            return {"executionArn": "arn:aws:states:us-west-2:123456789012:execution:x:y"}
 
     start = StepFunctionsStartExecution(
         client=_Sfn(),
-        state_machine_arn="arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute",
+        state_machine_arn="arn:aws:states:us-west-2:123456789012:stateMachine:autonomy-execute",
     )
     start({"operation_id": "op_" + "b" * 26}, name="op_" + "b" * 26)
     assert json.loads(captured[0]["input"]) == {"operation_id": "op_" + "b" * 26}

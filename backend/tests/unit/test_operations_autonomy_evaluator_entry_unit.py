@@ -38,15 +38,15 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_WORKSPACE_ID": "workspace.default",
         "GBAW_OPERATIONS_TRUSTED_AUDIENCE": "aud.default",
         "GBAW_OPERATIONS_CAPABILITY_MAXIMUM": "operate",
-        "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:111122223333:stateMachine:execute",
+        "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:123456789012:stateMachine:execute",
         "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-abc",
-        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:111122223333:fleet/fleet-abc",
+        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:123456789012:fleet/fleet-abc",
         "GBAW_OPERATIONS_ENROLLED_LOCATION": "us-west-2",
         "GBAW_OPERATIONS_APPCONFIG_APPLICATION": "gbaw-ops",
         "GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT": "prod",
         "GBAW_OPERATIONS_APPCONFIG_PROFILE": "kill-switch",
         "GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN": (
-            "arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute"
+            "arn:aws:states:us-west-2:123456789012:stateMachine:autonomy-execute"
         ),
         "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE": "autonomy-switch",
         "GBAW_OPERATIONS_AUTONOMY_POLICY_ID": "policy.gamelift-capacity-autonomy",
@@ -166,11 +166,11 @@ def test_start_execution_client_passes_operation_id_only() -> None:
     class _FakeSfn:
         def start_execution(self, **kwargs: Any) -> dict[str, str]:
             calls.append(kwargs)
-            return {"executionArn": "arn:aws:states:us-west-2:111122223333:execution:autonomy-execute:x"}
+            return {"executionArn": "arn:aws:states:us-west-2:123456789012:execution:autonomy-execute:x"}
 
     start = StepFunctionsStartExecution(
         client=_FakeSfn(),
-        state_machine_arn="arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute",
+        state_machine_arn="arn:aws:states:us-west-2:123456789012:stateMachine:autonomy-execute",
     )
     start({"operation_id": "op_" + "a" * 26}, name="op_" + "a" * 26)
 
