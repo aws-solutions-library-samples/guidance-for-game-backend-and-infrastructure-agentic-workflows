@@ -297,13 +297,13 @@ if [ -z "$ENROLLED_FLEET_ARN" ]; then
     echo "❌ Refusing to enable: GBAW_OPERATIONS_ENROLLED_FLEET_ARN (the exact enrolled fleet ARN) is required." >&2
     exit 3
 fi
-# The ARN is a server-owned binding; validate its shape by the fleet resource
-# suffix without embedding a provider service literal (the wrapper grants no
-# provider permission).
+# The ARN is a server-owned binding: it MUST end in the EXACT enrolled fleet
+# id (no fleet-* wildcard fallback), be a gamelift fleet ARN, and — once the
+# caller identity is known — match the verified account/region (checked
+# below). A mismatched fleet ARN is refused, not silently accepted.
 case "$ENROLLED_FLEET_ARN" in
-    arn:aws*:*:*:*:fleet/"$ENROLLED_FLEET_ID") : ;;
-    arn:aws*:*:*:*:fleet/fleet-*) : ;;
-    *) echo "❌ Refusing to enable: GBAW_OPERATIONS_ENROLLED_FLEET_ARN must be a fleet ARN ending in fleet/<fleet-id>." >&2; exit 3 ;;
+    arn:aws*:gamelift:*:*:fleet/"$ENROLLED_FLEET_ID") : ;;
+    *) echo "❌ Refusing to enable: GBAW_OPERATIONS_ENROLLED_FLEET_ARN must be a gamelift fleet ARN ending in fleet/$ENROLLED_FLEET_ID (the exact enrolled fleet)." >&2; exit 3 ;;
 esac
 if [ -z "$OPERATIONS_TENANT_ID" ] || [ -z "$OPERATIONS_WORKSPACE_ID" ]; then
     echo "❌ Refusing to enable: GBAW_OPERATIONS_TENANT_ID and GBAW_OPERATIONS_WORKSPACE_ID are required." >&2
@@ -412,6 +412,61 @@ if [ "$BUCKET_REGION" != "$AWS_REGION" ]; then
     exit 4
 fi
 echo "   Bucket verified: owner=$ACCOUNT_ID region=$BUCKET_REGION"
+
+# --------------------------------------------------------------------------- #
+# Finding 6: bind the workflow, fleet, and audience to the EXACT deployed 06/07
+# values — not merely the same account/region/shape. The 07 stack is the source
+# of truth: its ExecutionStateMachineArn OUTPUT, and its EnrolledFleetId and
+# TrustedAudience PARAMETERS, must byte-equal what this wrapper will hand the
+# evaluator, or we refuse before granting states:StartExecution authority.
+# --------------------------------------------------------------------------- #
+echo "🔎 Binding workflow/fleet/audience to the EXACT 07 deployed values ..."
+STACK_07_SM_ARN="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Outputs[?OutputKey=='ExecutionStateMachineArn'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_SM_ARN" ] || [ "$STACK_07_SM_ARN" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 ExecutionStateMachineArn output." >&2
+    echo "   Deploy/verify the 07 execution stack first." >&2
+    exit 6
+fi
+if [ "$EXECUTION_STATE_MACHINE_ARN" != "$STACK_07_SM_ARN" ]; then
+    echo "❌ Refusing to enable: the supplied workflow ARN does not byte-equal the 07 output." >&2
+    echo "   supplied: $EXECUTION_STATE_MACHINE_ARN" >&2
+    echo "   07 output: $STACK_07_SM_ARN" >&2
+    exit 6
+fi
+STACK_07_FLEET_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='EnrolledFleetId'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_FLEET_ID" ] || [ "$STACK_07_FLEET_ID" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 EnrolledFleetId parameter." >&2
+    exit 6
+fi
+if [ "$ENROLLED_FLEET_ID" != "$STACK_07_FLEET_ID" ]; then
+    echo "❌ Refusing to enable: enrolled fleet id '$ENROLLED_FLEET_ID' does not match the 07 EnrolledFleetId '$STACK_07_FLEET_ID'." >&2
+    exit 6
+fi
+# The exact enrolled fleet ARN for the VERIFIED account/region and this fleet id.
+EXPECTED_FLEET_ARN="arn:aws:gamelift:${AWS_REGION}:${ACCOUNT_ID}:fleet/${ENROLLED_FLEET_ID}"
+if [ "$ENROLLED_FLEET_ARN" != "$EXPECTED_FLEET_ARN" ]; then
+    echo "❌ Refusing to enable: enrolled fleet ARN does not match the exact enrolled fleet." >&2
+    echo "   supplied: $ENROLLED_FLEET_ARN" >&2
+    echo "   expected: $EXPECTED_FLEET_ARN" >&2
+    exit 6
+fi
+STACK_07_AUDIENCE="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='TrustedAudience'].ParameterValue" --output text 2>/dev/null || true)"
+if [ -z "$STACK_07_AUDIENCE" ] || [ "$STACK_07_AUDIENCE" = "None" ]; then
+    echo "❌ Refusing to enable: could not read the 07 TrustedAudience parameter (must match 06/07)." >&2
+    exit 6
+fi
+if [ "$OPERATIONS_TRUSTED_AUDIENCE" != "$STACK_07_AUDIENCE" ]; then
+    echo "❌ Refusing to enable: trusted audience '$OPERATIONS_TRUSTED_AUDIENCE' does not match the 07 TrustedAudience '$STACK_07_AUDIENCE'." >&2
+    exit 6
+fi
+echo "   Exact bindings verified: workflow, enrolled fleet ($ENROLLED_FLEET_ID), and trusted audience all match the 07 deployment."
+
 
 # --------------------------------------------------------------------------- #
 # Resolve the OFFICIAL AppConfig Agent Lambda extension layer to the
@@ -661,10 +716,11 @@ aws cloudformation validate-template \
     --template-url "$TEMPLATE_URL" \
     --region "$AWS_REGION" >/dev/null
 
-echo "🚀 Deploying $STACK_NAME (Provisioned=true, AutonomyMode=operate) via S3-backed template ..."
-# Provisioned defaults false / AutonomyMode defaults disabled at the TEMPLATE
-# level (a default deploy is $0). This wrapper only sets Provisioned=true and
-# AutonomyMode=operate under the double-opt-in --enable path.
+echo "🚀 Phase 1: deploying $STACK_NAME DISABLED (Provisioned=true, AutonomyMode=disabled) ..."
+# Two-phase enable (Finding 3): provision 09 DISABLED first so the AppConfig
+# autonomy coordinate and every resource exist, but the schedule stays DISABLED
+# and the evaluator fails closed. This prevents any scheduled evaluation from
+# firing before the 07 executor pre-write hook is installed and verified.
 aws cloudformation deploy \
     "${AWS_PROFILE_ARGS[@]}" \
     --region "$AWS_REGION" \
@@ -677,7 +733,7 @@ aws cloudformation deploy \
     --parameter-overrides \
         "ProjectName=$PROJECT_NAME" \
         "Provisioned=true" \
-        "AutonomyMode=operate" \
+        "AutonomyMode=disabled" \
         "Environment=$ENVIRONMENT" \
         "OperationsTableName=$OPERATIONS_TABLE_NAME" \
         "OperationsKmsKeyArn=$OPERATIONS_KMS_KEY_ARN" \
@@ -730,15 +786,38 @@ fi
 echo "   Deployed CodeSha256 verified: $DEPLOYED_CODE_SHA256"
 
 # --------------------------------------------------------------------------- #
-# Finding 7: UPDATE the 07 executor so its pre-write autonomy hook is actually
-# enabled and bound. The 09 evaluator only STARTS the workflow; the executor's
-# own pre-write hook (in 07) is the gate that re-checks the autonomy switch and
-# durable window before the single provider write. We flip the 07 stack to
-# AutonomyMode=operate and thread the SAME server-owned autonomy bindings plus
-# the 09-created autonomy AppConfig ids, reusing every other 07 value. The 07
-# template's wiring is additive and gated on AutonomyMode=operate, so this is
-# the reviewed path — not a second executor.
+# Finding 3, phase 2: UPDATE and VERIFY the 07 executor pre-write hook BEFORE
+# enabling the 09 evaluator plane. The 09 evaluator only STARTS the workflow;
+# the executor's own pre-write hook (in 07) is the gate that re-checks the
+# autonomy switch and durable window before the single provider write.
+#
+# We apply the REVIEWED 07 template (this commit's 07-operations-execution.yaml)
+# through S3 — NOT --use-previous-template, which cannot install this commit's
+# new autonomy parameters/IAM/wiring onto a pre-E5 07 stack — and REQUIRE every
+# autonomy parameter to exist on the reviewed template before proceeding.
 # --------------------------------------------------------------------------- #
+EXECUTION_TEMPLATE="${GBAW_OPERATIONS_EXECUTION_TEMPLATE:-$PROJECT_ROOT/infrastructure/cloudformation/07-operations-execution.yaml}"
+if [ ! -f "$EXECUTION_TEMPLATE" ]; then
+    echo "❌ Refusing: the reviewed 07 template '$EXECUTION_TEMPLATE' is missing." >&2
+    exit 6
+fi
+# Require the reviewed template to declare every autonomy parameter we set, so a
+# stale/pre-E5 template cannot silently drop them.
+for required in AutonomyMode AutonomyStateMachineArn AutonomySwitchProfileId \
+    AutonomyApplicationId AutonomyEnvironmentId AutonomyPolicyId AutonomyPolicyVersion \
+    AutonomyPolicyHash AutonomyStateId AutonomySubject AutonomyClient; do
+    if ! grep -qE "^  ${required}:" "$EXECUTION_TEMPLATE"; then
+        echo "❌ Refusing: the reviewed 07 template does not declare required autonomy parameter '$required'." >&2
+        exit 6
+    fi
+done
+if ! aws cloudformation describe-stacks \
+    "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" >/dev/null 2>&1; then
+    echo "❌ Refusing: the 07 execution stack '$EXECUTION_STACK_NAME' was not found; deploy 07 first." >&2
+    exit 6
+fi
+
 echo "🔗 Reading the 09 autonomy AppConfig ids to bind the 07 executor pre-write hook ..."
 AUTONOMY_APP_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
     --stack-name "$STACK_NAME" \
@@ -749,8 +828,36 @@ AUTONOMY_ENV_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" -
 AUTONOMY_PROFILE_ID="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
     --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='AutonomySwitchProfileId'].OutputValue" --output text 2>/dev/null || true)"
+if [ -z "$AUTONOMY_APP_ID" ] || [ "$AUTONOMY_APP_ID" = "None" ] \
+    || [ -z "$AUTONOMY_ENV_ID" ] || [ "$AUTONOMY_ENV_ID" = "None" ] \
+    || [ -z "$AUTONOMY_PROFILE_ID" ] || [ "$AUTONOMY_PROFILE_ID" = "None" ]; then
+    echo "❌ Refusing: could not read the 09 autonomy AppConfig ids to bind the 07 hook." >&2
+    exit 6
+fi
 
-echo "🔗 Enabling the 07 executor pre-write autonomy hook (AutonomyMode=operate) ..."
+# Upload the reviewed 07 template to S3 (it exceeds the 51,200-byte inline
+# limit) and address it via --template-url. The transient object is deleted by
+# the EXIT trap alongside the 09 template object.
+EXEC_TEMPLATE_HASH="$(shasum -a 256 "$EXECUTION_TEMPLATE" | awk '{print $1}')"
+EXEC_TEMPLATE_S3_KEY="${TEMPLATE_S3_PREFIX}/exec-${EXEC_TEMPLATE_HASH}.yaml"
+EXEC_TEMPLATE_URL="https://s3.${AWS_REGION}.amazonaws.com/${GBAW_OPERATIONS_ARTIFACT_BUCKET}/${EXEC_TEMPLATE_S3_KEY}"
+aws s3api put-object \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+    --key "$EXEC_TEMPLATE_S3_KEY" \
+    --body "$EXECUTION_TEMPLATE" \
+    --region "$AWS_REGION" >/dev/null
+# Extend cleanup to also remove the 07 template object.
+cleanup_exec_template() {
+    aws s3api delete-object \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+        --key "$EXEC_TEMPLATE_S3_KEY" \
+        --region "$AWS_REGION" >/dev/null 2>&1 || true
+}
+trap 'cleanup_autonomy; cleanup_exec_template' EXIT
+
+echo "🔗 Phase 2: applying the REVIEWED 07 template with AutonomyMode=operate ..."
 # Build the 07 parameter list dynamically from the LIVE stack (drift-proof):
 # reuse every current 07 value except the autonomy ones we set explicitly.
 EXEC_PARAM_KEYS="$(aws cloudformation describe-stacks \
@@ -759,10 +866,6 @@ EXEC_PARAM_KEYS="$(aws cloudformation describe-stacks \
     --stack-name "$EXECUTION_STACK_NAME" \
     --query 'Stacks[0].Parameters[].ParameterKey' \
     --output text 2>/dev/null || true)"
-if [ -z "$EXEC_PARAM_KEYS" ]; then
-    echo "❌ Refusing: the 07 execution stack '$EXECUTION_STACK_NAME' was not found; deploy 07 first." >&2
-    exit 6
-fi
 declare -A EXEC_SET
 EXEC_SET[AutonomyMode]="ParameterKey=AutonomyMode,ParameterValue=operate"
 EXEC_SET[AutonomyStateMachineArn]="ParameterKey=AutonomyStateMachineArn,ParameterValue=$EXECUTION_STATE_MACHINE_ARN"
@@ -776,35 +879,106 @@ EXEC_SET[AutonomyStateId]="ParameterKey=AutonomyStateId,ParameterValue=$AUTONOMY
 EXEC_SET[AutonomySubject]="ParameterKey=AutonomySubject,ParameterValue=$AUTONOMY_SUBJECT"
 EXEC_SET[AutonomyClient]="ParameterKey=AutonomyClient,ParameterValue=$AUTONOMY_CLIENT"
 EXEC_PARAMS=()
+# Set the autonomy params explicitly; reuse every OTHER live 07 param. Because we
+# apply the reviewed template (which may add parameters absent from the live
+# stack), any reviewed-template parameter we do not set explicitly and that is
+# absent from the live stack keeps its template default.
 for key in $EXEC_PARAM_KEYS; do
     if [ -n "${EXEC_SET[$key]:-}" ]; then
         EXEC_PARAMS+=("${EXEC_SET[$key]}")
+        unset "EXEC_SET[$key]"
     else
         EXEC_PARAMS+=("ParameterKey=${key},UsePreviousValue=true")
     fi
 done
-aws cloudformation update-stack \
+# Append any autonomy params NOT present on the live stack (a pre-E5 stack) so
+# the reviewed-template update installs them explicitly.
+for remaining in "${EXEC_SET[@]}"; do
+    EXEC_PARAMS+=("$remaining")
+done
+
+EXEC_ERR="$(mktemp)"
+if aws cloudformation update-stack \
     "${AWS_PROFILE_ARGS[@]}" \
     --region "$AWS_REGION" \
     --stack-name "$EXECUTION_STACK_NAME" \
-    --use-previous-template \
+    --template-url "$EXEC_TEMPLATE_URL" \
     --capabilities CAPABILITY_NAMED_IAM \
-    --parameters "${EXEC_PARAMS[@]}" 2>/tmp/enable-07.err || {
-        if grep -q "No updates are to be performed" /tmp/enable-07.err 2>/dev/null; then
-            echo "   07 executor already bound to this autonomy configuration (no change)."
-        else
-            echo "❌ Failed to enable the 07 executor pre-write hook." >&2
-            cat /tmp/enable-07.err >&2 || true
-            rm -f /tmp/enable-07.err
-            exit 6
-        fi
-    }
-aws cloudformation wait stack-update-complete \
+    --parameters "${EXEC_PARAMS[@]}" 2>"$EXEC_ERR"; then
+    rm -f "$EXEC_ERR"
+    # HONOR the waiter (Finding 3): a rolled-back 07 update must abort BEFORE 09
+    # is enabled. No '|| true'.
+    if ! aws cloudformation wait stack-update-complete \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --region "$AWS_REGION" \
+        --stack-name "$EXECUTION_STACK_NAME"; then
+        echo "❌ The 07 executor update did not reach UPDATE_COMPLETE; aborting BEFORE enabling 09." >&2
+        exit 6
+    fi
+elif grep -q "No updates are to be performed" "$EXEC_ERR" 2>/dev/null; then
+    rm -f "$EXEC_ERR"
+    echo "   07 executor already bound to this autonomy configuration (no change)."
+else
+    echo "❌ Failed to update the 07 executor pre-write hook; aborting BEFORE enabling 09." >&2
+    cat "$EXEC_ERR" >&2 || true
+    rm -f "$EXEC_ERR"
+    exit 6
+fi
+# VERIFY the 07 executor is now observed AutonomyMode=operate.
+EXEC_MODE_NOW="$(aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" \
+    --stack-name "$EXECUTION_STACK_NAME" \
+    --query "Stacks[0].Parameters[?ParameterKey=='AutonomyMode'].ParameterValue" --output text 2>/dev/null || true)"
+if [ "$EXEC_MODE_NOW" != "operate" ]; then
+    echo "❌ 07 executor AutonomyMode is '$EXEC_MODE_NOW', not 'operate'; aborting BEFORE enabling 09." >&2
+    exit 6
+fi
+echo "   ✅ 07 executor pre-write autonomy hook enabled, bound, and verified operate."
+
+# --------------------------------------------------------------------------- #
+# Finding 3, phase 3: only NOW enable the 09 evaluator plane (AutonomyMode=
+# operate) so the schedule/evaluator engage AFTER the executor hook exists.
+# --------------------------------------------------------------------------- #
+echo "🚀 Phase 3: enabling the 09 evaluator plane (AutonomyMode=operate) ..."
+aws cloudformation deploy \
     "${AWS_PROFILE_ARGS[@]}" \
     --region "$AWS_REGION" \
-    --stack-name "$EXECUTION_STACK_NAME" 2>/dev/null || true
-rm -f /tmp/enable-07.err
-echo "   07 executor pre-write autonomy hook enabled and bound."
+    --stack-name "$STACK_NAME" \
+    --template-file "$TEMPLATE" \
+    --s3-bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+    --s3-prefix "$TEMPLATE_S3_PREFIX" \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides \
+        "ProjectName=$PROJECT_NAME" \
+        "Provisioned=true" \
+        "AutonomyMode=operate" \
+        "Environment=$ENVIRONMENT" \
+        "OperationsTableName=$OPERATIONS_TABLE_NAME" \
+        "OperationsKmsKeyArn=$OPERATIONS_KMS_KEY_ARN" \
+        "ExecutionStateMachineArn=$EXECUTION_STATE_MACHINE_ARN" \
+        "EnrolledFleetId=$ENROLLED_FLEET_ID" \
+        "EnrolledLocation=$ENROLLED_LOCATION" \
+        "TenantId=$OPERATIONS_TENANT_ID" \
+        "WorkspaceId=$OPERATIONS_WORKSPACE_ID" \
+        "TrustedAudience=$OPERATIONS_TRUSTED_AUDIENCE" \
+        "EnrolledFleetArn=$ENROLLED_FLEET_ARN" \
+        "AutonomySubject=$AUTONOMY_SUBJECT" \
+        "AutonomyClient=$AUTONOMY_CLIENT" \
+        "AutonomyPolicyId=$AUTONOMY_POLICY_ID" \
+        "AutonomyPolicyVersion=$AUTONOMY_POLICY_VERSION" \
+        "AutonomyPolicyHash=$AUTONOMY_POLICY_HASH" \
+        "AutonomyStateId=$AUTONOMY_STATE_ID" \
+        "ScheduledObservationOperationId=$SCHEDULED_OBSERVATION_OPERATION_ID" \
+        "ScheduledDesired=$SCHEDULED_DESIRED" \
+        "ScheduledMinimum=$SCHEDULED_MINIMUM" \
+        "ScheduledMaximum=$SCHEDULED_MAXIMUM" \
+        "KillSwitchApplicationId=$KILL_SWITCH_APPLICATION_ID" \
+        "KillSwitchEnvironmentId=$KILL_SWITCH_ENVIRONMENT_ID" \
+        "KillSwitchProfileId=$KILL_SWITCH_PROFILE_ID" \
+        "AppConfigExtensionLayerArn=$APPCONFIG_EXTENSION_LAYER_ARN" \
+        "CodeS3Bucket=$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+        "EvaluatorCodeS3Key=$EVALUATOR_S3_KEY"
 
-echo "✅ Deployed $STACK_NAME with AutonomyMode=operate. The evaluator starts only the exact E3 workflow $EXECUTION_STATE_MACHINE_ARN."
+echo "✅ Enabled: 07 executor pre-write hook (verified operate) THEN the 09 evaluator plane."
+echo "   The evaluator starts only the exact E3 workflow $EXECUTION_STATE_MACHINE_ARN."
 echo "   Emergency disable (reversible, deletes nothing): disable-operations-autonomy.sh --confirm"

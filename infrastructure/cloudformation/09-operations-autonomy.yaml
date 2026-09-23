@@ -395,6 +395,8 @@ Rules:
         AssertDescription: KillSwitchEnvironmentId is required when AutonomyMode=operate.
       - Assert: !Not [!Equals [!Ref KillSwitchProfileId, '']]
         AssertDescription: KillSwitchProfileId is required when AutonomyMode=operate.
+      - Assert: !Not [!Equals [!Ref TrustedAudience, '']]
+        AssertDescription: TrustedAudience is required when AutonomyMode=operate (must match 06/07).
 
 # --------------------------------------------------------------------------- #
 # Resources

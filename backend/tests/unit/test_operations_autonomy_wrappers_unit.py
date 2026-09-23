@@ -322,7 +322,16 @@ def test_deploy_integrates_by_calling_07_execution_workflow():
     machine ARN and never grants a GameLift action in the wrapper."""
     text = DEPLOY.read_text(encoding="utf-8")
     assert "07-operations-execution" in text or "EXECUTION_STATE_MACHINE_ARN" in text.upper()
-    assert "gamelift:" not in text, "the autonomy wrapper must never grant a GameLift action"
+    # Finding 6 binds the enrolled fleet ARN to the gamelift SERVICE segment
+    # (arn:...:gamelift:<region>:...:fleet/<id>), so a naive 'gamelift:'
+    # substring ban is wrong. A gamelift IAM ACTION is always PascalCase
+    # (gamelift:UpdateFleetCapacity, gamelift:DescribeFleetCapacity, ...); a
+    # service-ARN segment is 'gamelift:' followed by a region (lowercase or
+    # a '*' glob), never a capital. Forbid only a PascalCase action grant.
+    import re as _re
+
+    action_grants = _re.findall(r"gamelift:[A-Z]\w+", text)
+    assert not action_grants, f"the autonomy wrapper must never grant a GameLift action: {action_grants}"
 
 
 def _fake_aws_express(validate_body, upload, deploy):

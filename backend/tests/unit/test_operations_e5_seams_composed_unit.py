@@ -42,6 +42,7 @@ PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 TEMPLATE_09 = PROJECT_ROOT / "infrastructure/cloudformation/09-operations-autonomy.yaml"
 TEMPLATE_07 = PROJECT_ROOT / "infrastructure/cloudformation/07-operations-execution.yaml"
 DISABLE_WRAPPER = PROJECT_ROOT / "scripts/infrastructure/disable-operations-autonomy.sh"
+DEPLOY_WRAPPER = PROJECT_ROOT / "scripts/infrastructure/deploy-operations-autonomy.sh"
 
 
 @pytest.fixture(scope="module")
@@ -369,3 +370,76 @@ def test_disable_wrapper_never_deletes_a_stack() -> None:
     """Disable is lever-flipping only; it must never delete either stack."""
     wrapper = DISABLE_WRAPPER.read_text(encoding="utf-8")
     assert "delete-stack" not in wrapper
+
+
+# --------------------------------------------------------------------------- #
+# Finding 3: two-phase, reviewed-template, waiter-honoring enable ordering.
+# --------------------------------------------------------------------------- #
+
+
+def _deploy_wrapper() -> str:
+    return DEPLOY_WRAPPER.read_text(encoding="utf-8")
+
+
+def test_deploy_provisions_09_disabled_then_07_then_09_operate() -> None:
+    """Enable must be: 09 disabled -> 07 operate -> 09 operate, in that order."""
+    w = _deploy_wrapper()
+    p1 = w.index("Phase 1: deploying $STACK_NAME DISABLED")
+    p2 = w.index("Phase 2: applying the REVIEWED 07 template")
+    p3 = w.index("Phase 3: enabling the 09 evaluator plane")
+    assert p1 < p2 < p3, "enable phases must run 09-disabled -> 07-operate -> 09-operate"
+    # Phase 1 must deploy 09 with AutonomyMode=disabled.
+    phase1 = w[p1:p2]
+    assert '"AutonomyMode=disabled"' in phase1
+
+
+def test_deploy_applies_reviewed_07_template_not_previous() -> None:
+    """The 07 update must apply the reviewed template via --template-url, and the
+    07 update must NOT use --use-previous-template (which cannot install this
+    commit's new autonomy parameters onto a pre-E5 stack)."""
+    w = _deploy_wrapper()
+    p2 = w.index("Phase 2: applying the REVIEWED 07 template")
+    p3 = w.index("Phase 3: enabling the 09 evaluator plane")
+    phase2 = w[p2:p3]
+    assert "--template-url" in phase2, "07 update must apply the reviewed template via --template-url"
+    assert "--use-previous-template" not in phase2, "07 update must not use --use-previous-template"
+
+
+def test_deploy_honors_the_07_waiter_and_aborts_before_09() -> None:
+    """A rolled-back 07 update must abort before enabling 09 (no '|| true')."""
+    w = _deploy_wrapper()
+    p2 = w.index("Phase 2: applying the REVIEWED 07 template")
+    p3 = w.index("Phase 3: enabling the 09 evaluator plane")
+    phase2 = w[p2:p3]
+    # The 07 waiter must be checked (guarded by 'if ! ... wait ...'), and its
+    # failure must exit before phase 3.
+    assert "aborting BEFORE enabling 09" in phase2
+    # There must be no fire-and-forget waiter in the 07 phase.
+    assert "stack-update-complete" in phase2
+    # Guard against the old '|| true' pattern on the 07 waiter.
+    waiter_idx = phase2.index("wait stack-update-complete")
+    trailing = phase2[waiter_idx : waiter_idx + 400]
+    assert "|| true" not in trailing.split("stack-name")[1][:120]
+
+
+def test_deploy_binds_workflow_fleet_audience_to_exact_07_values() -> None:
+    """Finding 6: the wrapper compares the workflow ARN, fleet id, and audience
+    to the exact 07 deployed values before granting StartExecution authority."""
+    w = _deploy_wrapper()
+    # Workflow: byte-equal the 07 ExecutionStateMachineArn OUTPUT.
+    assert "ExecutionStateMachineArn'].OutputValue" in w
+    assert 'if [ "$EXECUTION_STATE_MACHINE_ARN" != "$STACK_07_SM_ARN" ]' in w
+    # Fleet: equal the 07 EnrolledFleetId PARAMETER and the exact fleet ARN.
+    assert "EnrolledFleetId'].ParameterValue" in w
+    assert 'EXPECTED_FLEET_ARN="arn:aws:gamelift:${AWS_REGION}:${ACCOUNT_ID}:fleet/${ENROLLED_FLEET_ID}"' in w
+    # Audience: equal the 07 TrustedAudience PARAMETER (not just non-empty).
+    assert "TrustedAudience'].ParameterValue" in w
+    assert 'if [ "$OPERATIONS_TRUSTED_AUDIENCE" != "$STACK_07_AUDIENCE" ]' in w
+
+
+def test_deploy_rejects_loose_fleet_arn_fallback() -> None:
+    """The loose 'fleet/fleet-*' fallback that accepted any fleet must be gone."""
+    w = _deploy_wrapper()
+    assert "arn:aws*:*:*:*:fleet/fleet-*" not in w
+    # The ARN case must bind the exact enrolled fleet id.
+    assert 'arn:aws*:gamelift:*:*:fleet/"$ENROLLED_FLEET_ID"' in w
