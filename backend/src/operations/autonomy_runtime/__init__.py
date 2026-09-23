@@ -24,6 +24,12 @@ from operations.autonomy_runtime.dispatch import (
     EmergencyDisablement,
     build_dispatch_envelope,
 )
+from operations.autonomy_runtime.handler import (
+    AutonomyRuntimeHandler,
+    BundleStorePort,
+    RuntimeDispatchOutcome,
+    RuntimeDispatchResult,
+)
 from operations.autonomy_runtime.service import (
     AutonomyRuntimeError,
     AutonomyRuntimeInputs,
@@ -54,6 +60,11 @@ __all__ = [
     "ReservationResult",
     "ReservationStore",
     "ReservationStoreError",
+    # runtime handler
+    "AutonomyRuntimeHandler",
+    "BundleStorePort",
+    "RuntimeDispatchOutcome",
+    "RuntimeDispatchResult",
     # dispatch boundary
     "DispatchEnvelope",
     "DispatchOutcome",
