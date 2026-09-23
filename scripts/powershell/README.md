@@ -391,6 +391,36 @@ aws cloudformation list-stacks --region us-west-2 --query "StackSummaries[?start
 aws cloudformation describe-stacks --stack-name game-agent-infrastructure --region us-west-2 --query "Stacks[0].Outputs" --output table
 ```
 
+### Optional operations control planes (E3 / E4 / E5) — shell-only
+
+The OPTIONAL operations control planes are **not** part of `Deploy-GameAgent`
+and are **not** exposed as PowerShell functions. They are deliberately
+default-unprovisioned ($0), reviewed, deliberate opt-ins, and — by intentional
+convention — are driven by Bash wrappers under `scripts/infrastructure/` only.
+This is true for all three: E3 execution (`07`), E4 control (`08`), and E5
+bounded autonomy (`09`). On Windows, run them from WSL2 or any Bash shell with
+the AWS CLI configured; the PowerShell module intentionally has no parity
+functions for them.
+
+E5 bounded autonomy (issue #440) — the default run is a READ-ONLY preview that
+creates nothing; enabling is a DOUBLE opt-in:
+
+```bash
+# Preview only (read-only; creates nothing):
+scripts/infrastructure/deploy-operations-autonomy.sh
+
+# Enable (double opt-in: --enable AND the confirmation token AND operate mode):
+GBAW_OPERATIONS_MODE=operate \
+GBAW_OPERATIONS_AUTONOMY_CONFIRM=operate \
+  scripts/infrastructure/deploy-operations-autonomy.sh --enable
+
+# Reversible emergency disable (keeps everything, deletes nothing):
+scripts/infrastructure/disable-operations-autonomy.sh --confirm
+
+# Explicit teardown (never automatic; exact token required):
+scripts/infrastructure/teardown-operations-autonomy.sh --confirm delete-operations-autonomy
+```
+
 ## 📝 Examples
 
 ### Complete Workflow

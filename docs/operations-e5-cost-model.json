@@ -1,0 +1,96 @@
+{
+  "$comment": "Machine-checkable incremental cost model for the OPTIONAL E5 bounded-autonomy control plane (GitHub issue #440). This file is the single source of truth for docs/operations-e5-cost-notes.md. Tests recompute totals from the model's own rates and reconcile the alarm count against the 09 template. It does not assert that E5 is deployed. Values and identifiers are public-safe (synthetic).",
+  "schema_version": "1.0",
+  "issue": 440,
+  "design": {
+    "stack": "infrastructure/cloudformation/09-operations-autonomy.yaml",
+    "autonomy_shape": "One scheduled evaluator Lambda + role + log group behind an EventBridge schedule rule, reading a SEPARATE AppConfig autonomy switch plus the E4 kill switch, starting the EXACT existing E3 workflow with an identifier only.",
+    "notes": "E5 adds ONE evaluator Lambda, ONE EventBridge schedule rule, ONE log group, and TWO alarms on AWS-emitted metrics (the evaluator Lambda Errors and the schedule rule FailedInvocations). It emits NO custom CloudWatch metrics of its own, provisions NO KMS key (it reuses the 06 CMK via DynamoDB), NO Secrets Manager secret, and NO API. It creates NO executor and NO new workflow: the single gamelift capacity-write grant remains the unchanged E3 executor role in the 07 stack."
+  },
+  "alarms": {
+    "$comment": "The TWO E5-owned CloudWatch alarms provisioned by 09-operations-autonomy.yaml, each on an AWS-emitted metric that always exists for the provisioned resources. cw_alarms below equals the length of this list; the infra test asserts it equals the number of AWS::CloudWatch::Alarm resources in the template.",
+    "e5_owned": [
+      "AutonomyEvaluatorErrors",
+      "AutonomyScheduleFailedInvocations"
+    ]
+  },
+  "custom_metrics": {
+    "$comment": "E5 emits NO custom CloudWatch metrics of its own; its alarms watch AWS-emitted metrics (AWS/Lambda Errors, AWS/Events FailedInvocations). Autonomy-outcome coverage upstream/downstream is provided by the REUSED E1 (06), E3 (07), and E4 (08) alarms and is billed under those stacks, not double-counted here.",
+    "e5_autonomy": []
+  },
+  "pricing": {
+    "region": "us-west-2",
+    "currency": "USD",
+    "as_of": "2026-09-23",
+    "source": "AWS Price List, per-service us-west-2",
+    "sources": {
+      "appconfig": {
+        "human_url": "https://aws.amazon.com/systems-manager/pricing/",
+        "publication_date": "2026-09-19"
+      },
+      "lambda": {
+        "human_url": "https://aws.amazon.com/lambda/pricing/",
+        "publication_date": "2026-09-19"
+      },
+      "eventbridge": {
+        "human_url": "https://aws.amazon.com/eventbridge/pricing/",
+        "publication_date": "2026-09-18"
+      },
+      "cloudwatch": {
+        "human_url": "https://aws.amazon.com/cloudwatch/pricing/",
+        "publication_date": "2026-09-18"
+      }
+    },
+    "rates": {
+      "appconfig_usd_per_config_received": 2e-07,
+      "lambda_usd_per_request": 2e-07,
+      "lambda_usd_per_gb_second": 1.66667e-05,
+      "eventbridge_usd_per_million_invocations": 0.0,
+      "cw_custom_metric_usd_per_metric_month": 0.3,
+      "cw_alarm_usd_per_alarm_month": 0.1
+    }
+  },
+  "assumptions": {
+    "default_unprovisioned": {
+      "$comment": "Provisioned=false: ZERO resources, $0. This is the default.",
+      "monthly_total_usd": 0.0
+    },
+    "provisioned_disabled": {
+      "$comment": "Provisioned=true, AutonomyMode=disabled. The EventBridge rule is DISABLED so the evaluator never fires on a timer; the only steady-state cost is the two alarms. No Lambda invocations, no AppConfig retrievals.",
+      "cw_custom_metrics": 0,
+      "cw_alarms": 2,
+      "evaluator_invocations_per_month": 0,
+      "appconfig_retrievals_per_month": 0
+    },
+    "enabled_idle": {
+      "$comment": "Provisioned=true, AutonomyMode=operate. The schedule fires the evaluator every 5 minutes (8640/month); each invocation reads the two AppConfig documents through the extension cache and evaluates the policy, but starts no workflow when no change is warranted. Cost is the two alarms + the scheduled Lambda + the AppConfig retrievals.",
+      "cw_custom_metrics": 0,
+      "cw_alarms": 2,
+      "evaluator_invocations_per_month": 8640,
+      "evaluator_gb_seconds_per_invocation": 0.25,
+      "appconfig_retrievals_per_month": 17280
+    },
+    "per_autonomous_action": {
+      "$comment": "One authorized autonomous action starts the EXACT E3 workflow with an identifier only. The workflow + executor cost is billed under the 07 execution stack, not here; E5 adds only the StartExecution call, which is not separately metered.",
+      "state_machine_starts": 1
+    },
+    "representative_load": {
+      "$comment": "A busy month of autonomous evaluations; the schedule cadence dominates, so the total equals enabled_idle.",
+      "authorized_actions_per_month": 50
+    }
+  },
+  "scenarios": {
+    "default_unprovisioned": {
+      "monthly_total_usd": 0.0
+    },
+    "provisioned_disabled": {
+      "monthly_total_usd": 0.2
+    },
+    "enabled_idle": {
+      "monthly_total_usd": 0.24
+    },
+    "representative": {
+      "monthly_total_usd": 0.24
+    }
+  }
+}
