@@ -266,6 +266,41 @@ Parameters:
     MaxValue: 65535
     Description: Localhost port the official AppConfig extension listens on.
 
+  # ------------------------------------------------------------------------- #
+  # Server-owned CLOSED evaluation event (#439). The scheduled rule injects
+  # EXACTLY {observation_operation_id, desired, minimum, maximum} — never a
+  # synthetic payload. When any is left at its empty/sentinel default the rule
+  # stays DISABLED, so an operate deploy that has not specified a concrete closed
+  # event schedules nothing (no malformed event is ever delivered).
+  # ------------------------------------------------------------------------- #
+  ScheduledObservationOperationId:
+    Type: String
+    Default: ''
+    Description: >-
+      The EXACT server-owned observation operation id the scheduled evaluation
+      binds. Empty (default) keeps the schedule DISABLED.
+
+  ScheduledDesired:
+    Type: Number
+    Default: -1
+    Description: >-
+      The exact desired capacity of the closed evaluation event. -1 (default) is
+      the "unset" sentinel that keeps the schedule DISABLED.
+
+  ScheduledMinimum:
+    Type: Number
+    Default: -1
+    Description: >-
+      The exact minimum capacity of the closed evaluation event. -1 keeps the
+      schedule DISABLED.
+
+  ScheduledMaximum:
+    Type: Number
+    Default: -1
+    Description: >-
+      The exact maximum capacity of the closed evaluation event. -1 keeps the
+      schedule DISABLED.
+
 # --------------------------------------------------------------------------- #
 # Conditions
 # --------------------------------------------------------------------------- #
@@ -283,6 +318,21 @@ Conditions:
   AutonomyOperate: !Equals [!Ref AutonomyMode, operate]
 
   IsProd: !Equals [!Ref Environment, prod]
+
+  # The scheduled closed event is fully specified: a non-empty observation id and
+  # all three capacity values set away from the -1 "unset" sentinel.
+  ScheduledEventConfigured: !And
+    - !Not [!Equals [!Ref ScheduledObservationOperationId, '']]
+    - !Not [!Equals [!Ref ScheduledDesired, -1]]
+    - !Not [!Equals [!Ref ScheduledMinimum, -1]]
+    - !Not [!Equals [!Ref ScheduledMaximum, -1]]
+
+  # The scheduled evaluation rule is ENABLED only when autonomy is operate AND a
+  # concrete closed #439 event is fully specified; otherwise it stays DISABLED so
+  # no malformed or synthetic event is ever delivered.
+  ScheduledEvaluationEnabled: !And
+    - !Condition AutonomyOperate
+    - !Condition ScheduledEventConfigured
 
 Rules:
   # Reject "operate without provisioning": runtime authority can only be enabled
@@ -817,14 +867,22 @@ Resources:
         Periodic bounded-autonomy evaluation trigger. DISABLED unless
         AutonomyMode=operate so a default/disabled deploy runs no evaluation.
       ScheduleExpression: 'rate(5 minutes)'
-      State: !If [AutonomyOperate, ENABLED, DISABLED]
+      State: !If [ScheduledEvaluationEnabled, ENABLED, DISABLED]
       Targets:
         - Id: autonomy-evaluator
           Arn: !GetAtt EvaluatorFunction.Arn
           # The rule carries no identity/policy/limits — the evaluator owns those
-          # server-side. A concrete evaluation event is produced by the reviewed
-          # observation pipeline; this scheduled probe is a closed liveness tick.
-          Input: '{"source":"autonomy-evaluation"}'
+          # server-side. It injects EXACTLY the closed #439 evaluation event
+          # (observation_operation_id + desired/minimum/maximum) built from the
+          # server-owned Scheduled* parameters. The rule is DISABLED unless those
+          # parameters are all set (ScheduledEvaluationEnabled), so a synthetic or
+          # partial event is never delivered.
+          Input: !Sub
+            - '{"observation_operation_id":"${OpId}","desired":${Desired},"minimum":${Minimum},"maximum":${Maximum}}'
+            - OpId: !Ref ScheduledObservationOperationId
+              Desired: !Ref ScheduledDesired
+              Minimum: !Ref ScheduledMinimum
+              Maximum: !Ref ScheduledMaximum
           DeadLetterConfig:
             Arn: !GetAtt EvaluatorDeadLetterQueue.Arn
 

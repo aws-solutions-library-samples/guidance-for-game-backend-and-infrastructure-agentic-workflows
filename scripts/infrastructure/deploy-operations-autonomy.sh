@@ -106,6 +106,14 @@ AUTONOMY_POLICY_ID="${GBAW_OPERATIONS_AUTONOMY_POLICY_ID:-}"
 AUTONOMY_POLICY_VERSION="${GBAW_OPERATIONS_AUTONOMY_POLICY_VERSION:-}"
 AUTONOMY_POLICY_HASH="${GBAW_OPERATIONS_AUTONOMY_POLICY_HASH:-}"
 AUTONOMY_STATE_ID="${GBAW_OPERATIONS_AUTONOMY_STATE_ID:-}"
+# OPTIONAL server-owned CLOSED scheduled evaluation event (#439). All four
+# must be set to ENABLE the periodic schedule; otherwise the EventBridge rule
+# stays DISABLED and no event is ever delivered (the reviewed observation
+# pipeline drives evaluation instead).
+SCHEDULED_OBSERVATION_OPERATION_ID="${GBAW_OPERATIONS_SCHEDULED_OBSERVATION_OPERATION_ID:-}"
+SCHEDULED_DESIRED="${GBAW_OPERATIONS_SCHEDULED_DESIRED:--1}"
+SCHEDULED_MINIMUM="${GBAW_OPERATIONS_SCHEDULED_MINIMUM:--1}"
+SCHEDULED_MAXIMUM="${GBAW_OPERATIONS_SCHEDULED_MAXIMUM:--1}"
 # The server-owned policy + initial window-state documents to seed. JSON files.
 AUTONOMY_POLICY_FILE="${GBAW_OPERATIONS_AUTONOMY_POLICY_FILE:-}"
 AUTONOMY_WINDOW_STATE_FILE="${GBAW_OPERATIONS_AUTONOMY_WINDOW_STATE_FILE:-}"
@@ -653,6 +661,10 @@ aws cloudformation deploy \
         "AutonomyPolicyVersion=$AUTONOMY_POLICY_VERSION" \
         "AutonomyPolicyHash=$AUTONOMY_POLICY_HASH" \
         "AutonomyStateId=$AUTONOMY_STATE_ID" \
+        "ScheduledObservationOperationId=$SCHEDULED_OBSERVATION_OPERATION_ID" \
+        "ScheduledDesired=$SCHEDULED_DESIRED" \
+        "ScheduledMinimum=$SCHEDULED_MINIMUM" \
+        "ScheduledMaximum=$SCHEDULED_MAXIMUM" \
         "KillSwitchApplicationId=$KILL_SWITCH_APPLICATION_ID" \
         "KillSwitchEnvironmentId=$KILL_SWITCH_ENVIRONMENT_ID" \
         "KillSwitchProfileId=$KILL_SWITCH_PROFILE_ID" \

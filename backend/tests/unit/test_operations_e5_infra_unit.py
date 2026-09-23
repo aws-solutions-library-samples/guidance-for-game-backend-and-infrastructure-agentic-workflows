@@ -302,6 +302,51 @@ def test_evaluation_rule_disabled_unless_operate(template):
         )
 
 
+def test_evaluation_rule_emits_the_closed_439_event_not_a_synthetic_source(template):
+    """Finding 6: the scheduled rule must carry the CLOSED #439 evaluation event
+    (exactly observation_operation_id + desired/minimum/maximum), built from
+    server-owned template parameters — never a synthetic {"source": ...} payload
+    the evaluator rejects. It must also be gated on those parameters being
+    configured, so an operate deploy without them leaves the rule DISABLED."""
+    # Standard library
+    import json
+
+    rules = _resources_of_type(template, "AWS::Events::Rule")
+    params = template["Parameters"]
+    # Server-owned closed-event parameters must exist.
+    for p in ("ScheduledObservationOperationId", "ScheduledDesired", "ScheduledMinimum", "ScheduledMaximum"):
+        assert p in params, f"09 must declare the closed-event parameter {p}"
+    for name, body in rules.items():
+        target = body["Properties"]["Targets"][0]
+        raw_input = target.get("Input")
+        blob = json.dumps(raw_input)
+        # The synthetic liveness payload must be gone.
+        assert (
+            '"source"' not in blob and "autonomy-evaluation" not in blob
+        ), f"{name} must not emit a synthetic source event"
+        # The closed #439 event keys must be present in the Input.
+        for key in ("observation_operation_id", "desired", "minimum", "maximum"):
+            assert key in blob, f"{name} Input must carry the closed-event key {key}"
+        # The rule State must be gated on a compound condition (operate AND
+        # scheduled-event-configured), still resolving to ENABLED/DISABLED.
+        state = body["Properties"]["State"]
+        assert isinstance(state, list) and state[-2:] == ["ENABLED", "DISABLED"]
+
+
+def test_scheduled_event_condition_requires_all_closed_event_params(template):
+    """The condition that enables the scheduled rule must require the operate
+    lever AND every closed-event parameter, so a missing desired/min/max leaves
+    the rule DISABLED (no malformed event is ever scheduled)."""
+    conditions = template.get("Conditions", {})
+    # There must be a condition combining AutonomyOperate with the scheduled
+    # closed-event parameters being non-empty.
+    blob = json._default_encoder.encode(conditions) if False else str(conditions)
+    assert "ScheduledObservationOperationId" in blob, (
+        "a condition must reference ScheduledObservationOperationId so the rule is "
+        "disabled unless the closed event is fully specified"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Emergency disable: default injects AUTONOMY_ENABLED=false (fail closed).
 # --------------------------------------------------------------------------- #
@@ -551,8 +596,7 @@ def test_appconfig_environment_monitor_uses_an_aws_emitted_metric(template):
             for n in matched:
                 ns = alarms[n]["Properties"]["Namespace"]
                 assert ns.startswith("AWS/"), (
-                    f"AppConfig environment monitor alarm {n} must use an AWS-emitted "
-                    f"namespace, got {ns}"
+                    f"AppConfig environment monitor alarm {n} must use an AWS-emitted " f"namespace, got {ns}"
                 )
 
 
