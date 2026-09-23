@@ -227,7 +227,15 @@ class AutonomyExecutorRuntime:
     default deployment provider-read-only.
     """
 
-    __slots__ = ("service", "reload_store", "metrics", "bundle_store", "autonomy_verifier", "reservation")
+    __slots__ = (
+        "service",
+        "autonomy_service",
+        "reload_store",
+        "metrics",
+        "bundle_store",
+        "autonomy_verifier",
+        "reservation",
+    )
 
     def __init__(
         self,
@@ -235,11 +243,13 @@ class AutonomyExecutorRuntime:
         service: Any,
         reload_store: EvidenceExecutionReloadStore,
         metrics: Any,
+        autonomy_service: Any = None,
         bundle_store: Any = None,
         autonomy_verifier: Any = None,
         reservation: Any = None,
     ) -> None:
         self.service = service
+        self.autonomy_service = autonomy_service if autonomy_service is not None else service
         self.reload_store = reload_store
         self.metrics = metrics
         self.bundle_store = bundle_store
@@ -330,7 +340,7 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
         bundle=bundle,
         logical_action_id=action_id,
         verifier=runtime.autonomy_verifier,
-        service=runtime.service,
+        service=runtime.autonomy_service,
         reservation=runtime.reservation,
         lease_holder=lease_holder,
         generation=1,
@@ -436,7 +446,8 @@ def _build_runtime() -> AutonomyExecutorRuntime:
     )
 
     return AutonomyExecutorRuntime(
-        service=autonomy_service if autonomy_service is not None else service,
+        service=service,
+        autonomy_service=autonomy_service,
         reload_store=EvidenceExecutionReloadStore(approval_store),
         metrics=metrics,
         bundle_store=bundle_store,

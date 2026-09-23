@@ -164,6 +164,32 @@ def test_v1_operation_runs_human_approval_path_and_never_touches_bundle_store() 
 
 
 @pytest.mark.unit
+def test_runtime_keeps_v1_and_v2_services_separate() -> None:
+    v1_service = _V1Service()
+    autonomy_service = _V1Service()
+    verifier = _Verifier()
+    reservation = _Reservation()
+    runtime = executor_entry.AutonomyExecutorRuntime(
+        service=v1_service,
+        autonomy_service=autonomy_service,
+        reload_store=_V1ReloadStore((_V1_OPERATION, {"state": "approved"}, "approved")),
+        metrics=_NullMetrics(),
+        bundle_store=_BundleStore(_v2_bundle()),
+        autonomy_verifier=verifier,
+        reservation=reservation,
+    )
+
+    executor_entry.execute_reloaded(runtime, ExecutionInvocation(operation_id=_OP), lease_holder="exec-v1")
+    assert len(v1_service.execute_calls) == 1
+    assert autonomy_service.execute_calls == []
+
+    runtime.reload_store = _V1ReloadStore(None)
+    executor_entry.execute_reloaded(runtime, ExecutionInvocation(operation_id=_OP), lease_holder="exec-v2")
+    assert len(autonomy_service.execute_verified_calls) == 1
+    assert v1_service.execute_verified_calls == []
+
+
+@pytest.mark.unit
 def test_v2_operation_routes_through_autonomous_verifier_and_execute_verified() -> None:
     service = _V1Service()
     verifier = _Verifier()
