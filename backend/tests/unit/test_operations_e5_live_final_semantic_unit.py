@@ -78,7 +78,7 @@ def _config(**overrides: object) -> CommandAdapterConfig:
         observation_operation_id="op_obs_trusted",
         autonomy_state_machine_arn=_STATE_MACHINE_ARN,
         enrolled_location="us-west-2",
-        observe_api_endpoint="https://obs.example.aws.dev",
+        observe_api_endpoint="https://obs.example.com",
         observe_bearer_env_var="GBAW_E5_OBSERVE_BEARER_UNITTEST",
     )
     base.update(overrides)

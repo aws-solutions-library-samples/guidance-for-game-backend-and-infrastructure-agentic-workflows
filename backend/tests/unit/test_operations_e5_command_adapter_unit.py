@@ -776,7 +776,7 @@ def test_command_transport_drives_full_harness_to_accepted(monkeypatch) -> None:
     cfg = dataclasses.replace(
         cfg,
         observation_operation_id="op_obs_e2e",
-        observe_api_endpoint="https://obs.example.aws.dev",
+        observe_api_endpoint="https://obs.example.com",
         executor_role_arn=_EXECUTOR_ROLE_ARN,
     )
     monkeypatch.setenv("GBAW_E5_OBSERVE_BEARER", "short-lived")

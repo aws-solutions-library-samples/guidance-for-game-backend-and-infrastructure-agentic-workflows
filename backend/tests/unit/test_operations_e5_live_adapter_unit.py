@@ -192,9 +192,7 @@ def test_observe_step_uses_authenticated_https_api_not_direct_invoke(monkeypatch
             return 200, {}, json.dumps({"operation_id": "obs_" + "a" * 26, "state": "succeeded"})
         return 200, {}, json.dumps({"operation_id": "obs_" + "a" * 26, "state": "succeeded"})
 
-    adapter = CommandAdapter(
-        _config(observe_api_endpoint="https://obs.example.aws.dev"), runner=runner, http_caller=http
-    )
+    adapter = CommandAdapter(_config(observe_api_endpoint="https://obs.example.com"), runner=runner, http_caller=http)
     observation_id = adapter.observe_succeeded_observation_id()
     assert observation_id == "obs_" + "a" * 26, "must parse the real observation_id from the API response"
     assert saw_lambda_invoke["n"] == 0, "observe must NOT invoke the 06 Lambda directly"
@@ -214,7 +212,7 @@ def test_transport_observe_reports_trusted_only_on_real_succeeded_observation(mo
         return 500, {}, json.dumps({"error_code": "INTERNAL_ERROR"})
 
     adapter = CommandAdapter(
-        _config(observe_api_endpoint="https://obs.example.aws.dev"),
+        _config(observe_api_endpoint="https://obs.example.com"),
         runner=lambda argv: CommandResult(0, "{}", ""),
         http_caller=http,
     )

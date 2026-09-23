@@ -36,9 +36,9 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_WORKSPACE_ID": "workspace.default",
         "GBAW_OPERATIONS_TRUSTED_AUDIENCE": "aud.default",
         "GBAW_OPERATIONS_CAPABILITY_MAXIMUM": "operate",
-        "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:111122223333:stateMachine:execute",
+        "GBAW_OPERATIONS_STATE_MACHINE_ARN": "arn:aws:states:us-west-2:123456789012:stateMachine:execute",
         "GBAW_OPERATIONS_ENROLLED_FLEET_ID": "fleet-abc",
-        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:111122223333:fleet/fleet-abc",
+        "GBAW_OPERATIONS_ENROLLED_FLEET_ARN": "arn:aws:gamelift:us-west-2:123456789012:fleet/fleet-abc",
         "GBAW_OPERATIONS_ENROLLED_LOCATION": "us-west-2",
         # E4 kill-switch application/environment/profile (08 stack).
         "GBAW_OPERATIONS_APPCONFIG_APPLICATION": "gbaw-ops-control",
@@ -48,7 +48,7 @@ def _base_env() -> dict[str, str]:
         "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_APPLICATION": "gbaw-ops-autonomy",
         "GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT": "prod",
         "GBAW_OPERATIONS_AUTONOMY_STATE_MACHINE_ARN": (
-            "arn:aws:states:us-west-2:111122223333:stateMachine:autonomy-execute"
+            "arn:aws:states:us-west-2:123456789012:stateMachine:autonomy-execute"
         ),
         "GBAW_OPERATIONS_AUTONOMY_SWITCH_PROFILE": "autonomy-switch",
         "GBAW_OPERATIONS_AUTONOMY_POLICY_ID": "policy.gamelift-capacity-autonomy",
