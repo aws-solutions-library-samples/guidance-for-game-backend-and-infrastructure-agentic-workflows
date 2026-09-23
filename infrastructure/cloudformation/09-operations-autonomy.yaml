@@ -351,9 +351,17 @@ Rules:
 # --------------------------------------------------------------------------- #
 Resources:
   # ------------------------------------------------------------------------- #
-  # Log group + DLQ. The evaluator log group is CMK-encrypted with the reused
-  # operations CMK. Both are RetainExceptOnCreate so audit data is preserved on
-  # teardown/replacement but a rolled-back initial create leaves no orphan.
+  # Log group + DLQ. The evaluator log group uses default (CloudWatch
+  # service-managed) at-rest encryption. It is deliberately NOT encrypted with
+  # the reused 06 operations CMK: that key's policy pins usage to DynamoDB
+  # (kms:ViaService dynamodb.*) and does not grant CloudWatch Logs
+  # (logs.<region>.amazonaws.com) the kms:Encrypt*/Decrypt/GenerateDataKey*/
+  # DescribeKey it needs to encrypt this log group, so a CMK-encrypted log group
+  # would fail to create. Re-introducing a CMK here requires SAFELY extending the
+  # 06 key policy (owned by another stack) to authorize the Logs service for this
+  # exact log-group ARN. Both resources are RetainExceptOnCreate so audit data is
+  # preserved on teardown/replacement but a rolled-back initial create leaves no
+  # orphan.
   # ------------------------------------------------------------------------- #
   EvaluatorLogGroup:
     Type: AWS::Logs::LogGroup
@@ -363,7 +371,6 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-autonomy-evaluator'
       RetentionInDays: !If [IsProd, 90, 14]
-      KmsKeyId: !Ref OperationsKmsKeyArn
 
   EvaluatorDeadLetterQueue:
     Type: AWS::SQS::Queue

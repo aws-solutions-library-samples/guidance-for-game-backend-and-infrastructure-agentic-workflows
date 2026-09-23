@@ -480,6 +480,26 @@ def test_log_group_present(template):
     assert groups, "09 must provision the evaluator log group"
 
 
+def test_log_group_does_not_use_the_dynamodb_scoped_operations_cmk(template):
+    """Finding 2: the evaluator log group must NOT be encrypted with the 06
+    operations CMK. That key's policy pins usage to DynamoDB (kms:ViaService
+    dynamodb.*) and does not grant CloudWatch Logs (logs.<region>.amazonaws.com)
+    the encrypt/decrypt/GenerateDataKey/Describe the service needs to encrypt a
+    log group, so a KmsKeyId=OperationsKmsKeyArn log group fails to create.
+    The safe posture is default (service-managed) log encryption unless the 06
+    key policy is explicitly extended (which this stack does not own)."""
+    for _name, res in _resources_of_type(template, "AWS::Logs::LogGroup").items():
+        props = res.get("Properties", {})
+        kms = props.get("KmsKeyId")
+        if kms is None:
+            continue
+        blob = str(kms)
+        assert "OperationsKmsKeyArn" not in blob, (
+            "the evaluator log group must not reference the DynamoDB-scoped "
+            "operations CMK; that key cannot encrypt a CloudWatch log group"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # The main deployment never provisions E5; only optional wrappers may.
 # --------------------------------------------------------------------------- #
