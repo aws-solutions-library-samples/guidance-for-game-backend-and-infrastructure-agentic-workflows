@@ -5,13 +5,14 @@
   "design": {
     "stack": "infrastructure/cloudformation/09-operations-autonomy.yaml",
     "autonomy_shape": "One scheduled evaluator Lambda + role + log group behind an EventBridge schedule rule, reading a SEPARATE AppConfig autonomy switch plus the E4 kill switch, starting the EXACT existing E3 workflow with an identifier only.",
-    "notes": "E5 adds ONE evaluator Lambda, ONE EventBridge schedule rule, ONE log group, and TWO alarms on AWS-emitted metrics (the evaluator Lambda Errors and the schedule rule FailedInvocations). It emits NO custom CloudWatch metrics of its own, provisions NO KMS key (it reuses the 06 CMK via DynamoDB), NO Secrets Manager secret, and NO API. It creates NO executor and NO new workflow: the single gamelift capacity-write grant remains the unchanged E3 executor role in the 07 stack."
+    "notes": "E5 adds ONE evaluator Lambda, ONE EventBridge schedule rule, ONE log group, and THREE alarms on AWS-emitted metrics (evaluator errors, dispatch failures, and dead-letter delivery). It emits NO custom CloudWatch metrics of its own, provisions NO KMS key (it reuses the 06 CMK via DynamoDB), NO Secrets Manager secret, and NO API. It creates NO executor and NO new workflow: the single gamelift capacity-write grant remains the unchanged E3 executor role in the 07 stack."
   },
   "alarms": {
-    "$comment": "The TWO E5-owned CloudWatch alarms provisioned by 09-operations-autonomy.yaml, each on an AWS-emitted metric that always exists for the provisioned resources. cw_alarms below equals the length of this list; the infra test asserts it equals the number of AWS::CloudWatch::Alarm resources in the template.",
+    "$comment": "The THREE E5-owned CloudWatch alarms provisioned by 09-operations-autonomy.yaml. cw_alarms below equals the length of this list; the infra test asserts it equals the number of AWS::CloudWatch::Alarm resources in the template.",
     "e5_owned": [
-      "AutonomyEvaluatorErrors",
-      "AutonomyScheduleFailedInvocations"
+      "AutonomyUnavailableAlarm",
+      "AutonomyDispatchFailuresAlarm",
+      "AutonomyDeadLetterAlarm"
     ]
   },
   "custom_metrics": {
@@ -56,16 +57,16 @@
       "monthly_total_usd": 0.0
     },
     "provisioned_disabled": {
-      "$comment": "Provisioned=true, AutonomyMode=disabled. The EventBridge rule is DISABLED so the evaluator never fires on a timer; the only steady-state cost is the two alarms. No Lambda invocations, no AppConfig retrievals.",
+      "$comment": "Provisioned=true, AutonomyMode=disabled. The EventBridge rule is DISABLED so the evaluator never fires on a timer; the only steady-state cost is the three alarms. No Lambda invocations, no AppConfig retrievals.",
       "cw_custom_metrics": 0,
-      "cw_alarms": 2,
+      "cw_alarms": 3,
       "evaluator_invocations_per_month": 0,
       "appconfig_retrievals_per_month": 0
     },
     "enabled_idle": {
-      "$comment": "Provisioned=true, AutonomyMode=operate. The schedule fires the evaluator every 5 minutes (8640/month); each invocation reads the two AppConfig documents through the extension cache and evaluates the policy, but starts no workflow when no change is warranted. Cost is the two alarms + the scheduled Lambda + the AppConfig retrievals.",
+      "$comment": "Provisioned=true, AutonomyMode=operate. The schedule fires the evaluator every 5 minutes (8640/month); each invocation reads the two AppConfig documents through the extension cache and evaluates the policy, but starts no workflow when no change is warranted. Cost is the three alarms + the scheduled Lambda + the AppConfig retrievals.",
       "cw_custom_metrics": 0,
-      "cw_alarms": 2,
+      "cw_alarms": 3,
       "evaluator_invocations_per_month": 8640,
       "evaluator_gb_seconds_per_invocation": 0.25,
       "appconfig_retrievals_per_month": 17280
@@ -84,13 +85,13 @@
       "monthly_total_usd": 0.0
     },
     "provisioned_disabled": {
-      "monthly_total_usd": 0.2
+      "monthly_total_usd": 0.3
     },
     "enabled_idle": {
-      "monthly_total_usd": 0.24
+      "monthly_total_usd": 0.34
     },
     "representative": {
-      "monthly_total_usd": 0.24
+      "monthly_total_usd": 0.34
     }
   }
 }

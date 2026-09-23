@@ -51,7 +51,6 @@ CFN_INLINE_TEMPLATE_LIMIT_BYTES=51200
 
 # The single frozen handler module this stack deploys.
 EVALUATOR_MODULE_PATH="operations/autonomy_runtime/evaluator_entry.py"
-EVALUATOR_IMPORT="operations.autonomy_runtime.evaluator_entry"
 
 # The Lambda target ABI. Python 3.13 on x86_64; manylinux x86_64 wheels only.
 LAMBDA_PY_VERSION="3.13"

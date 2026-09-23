@@ -1,19 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  OPTIONAL operations bounded-AUTONOMY plane (E5, issue #440). A SEPARATE stack
-  from the E1/E2 observation (06), E3 execution (07), and E4 control (08) stacks.
-  It adds a durable, identifier-only autonomy EVALUATOR Lambda that, when
-  explicitly enabled, turns a closed evaluation event into ONE durable dispatch
-  by starting the EXISTING E3 Standard state machine with an operation_id ALONE.
-  The single provider write stays with the existing E3 executor, invoked solely
-  by that authenticated state machine; this stack never creates a second
-  executor or a provider-write role. It is default-UNPROVISIONED ($0) and its
-  runtime authority is a SEPARATE AppConfig autonomy switch that is DISABLED by
-  default. A reversible emergency disable (AutonomyMode=disabled) keeps the
-  EventBridge evaluation source DISABLED and injects
-  GBAW_OPERATIONS_AUTONOMY_ENABLED=false so evaluation and the immediate
-  pre-write autonomy hook fail closed WITHOUT deleting any resource or data. It
-  reuses the 06 table + CMK and the 07 state machine via cross-stack parameters.
+  Optional, default-unprovisioned E5 bounded-autonomy evaluator. It uses a
+  separate disabled-by-default AppConfig switch and starts the existing E3
+  Standard workflow with only an operation ID. The existing E3 executor remains
+  the sole provider writer. Disabling E5 stops scheduled evaluation and fails
+  closed without deleting data.
 
 # --------------------------------------------------------------------------- #
 # Parameters
