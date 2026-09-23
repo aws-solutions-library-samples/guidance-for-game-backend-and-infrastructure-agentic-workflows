@@ -128,7 +128,23 @@ def _iso_z(value: datetime) -> str:
 
 
 def _parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    """Parse an RFC 3339 instant, failing closed on a naive (offset-less) value.
+
+    ``datetime.astimezone`` on a *naive* datetime silently reinterprets it in the
+    host's local timezone, so a timestamp without an explicit UTC marker would
+    skew the decision/window expiry by the host's UTC offset. The runtime must
+    never guess a timezone: an offset-less timestamp is rejected rather than
+    assumed to be local time.
+    """
+    if not isinstance(value, str):
+        raise AutonomyRuntimeError("timestamp must be a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AutonomyRuntimeError("timestamp is not a valid ISO-8601 instant") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise AutonomyRuntimeError("timestamp must carry an explicit UTC offset")
+    return parsed.astimezone(timezone.utc)
 
 
 class AutonomyRuntimeService:

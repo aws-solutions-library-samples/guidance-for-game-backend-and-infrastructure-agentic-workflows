@@ -9,16 +9,20 @@ pre-dispatch gate together and hands the durable Step Functions dispatcher an
 1. deterministically PREPARE the v2 decision + prepared operation from trusted,
    server-owned inputs only (no model/request identity/policy/limits/executor);
 2. PERSIST the policy, canonical observation, decision, operation, bound
-   pre-reservation window state, and (on success) the reservation;
+   pre-reservation window state, and reservation reference as immutable inert
+   evidence BEFORE any reservation is taken — we never reserve before the
+   evidence exists;
 3. atomically RESERVE the write's footprint against the policy-bound window;
 4. check the composite pre-dispatch gate — static + separate AppConfig switch +
    E4 cached kill-switch + E4 durable intent — BEFORE StartExecution;
 5. hand off an identifier-only envelope and call StartExecution with
    ``operation_id`` alone.
 
-Every failure/denial fails closed: a denied decision, a reservation conflict, or
-a gate denial neither persists a reservation nor calls StartExecution, and no
-provider client is ever touched (the handler holds no provider-write credential).
+Every failure/denial fails closed: a denied decision persists nothing and never
+reserves; a persist failure never reserves; a reservation conflict never reaches
+the gate or StartExecution; a gate denial releases the in-flight slot and never
+calls StartExecution. No provider client is ever touched (the handler holds no
+provider-write credential).
 """
 
 from __future__ import annotations
@@ -88,11 +92,35 @@ def _inputs() -> AutonomyRuntimeInputs:
 
 
 class _FakeBundleStore:
-    def __init__(self) -> None:
+    def __init__(self, *, error: Exception | None = None, log: list[str] | None = None) -> None:
         self.persisted: list[dict[str, Any]] = []
+        self._error = error
+        self._log = log
 
     def persist_bundle(self, **kwargs: Any) -> None:
+        if self._log is not None:
+            self._log.append("persist")
+        if self._error is not None:
+            raise self._error
         self.persisted.append(kwargs)
+
+
+class _RecordingReservationStore:
+    """Wrap the in-memory store to record the call order without monkeypatching."""
+
+    def __init__(self, inner: InMemoryReservationStore, log: list[str]) -> None:
+        self._inner = inner
+        self._log = log
+
+    def reserve(self, request: Any) -> ReservationResult:
+        self._log.append("reserve")
+        return self._inner.reserve(request)
+
+    def settle(self, **kwargs: Any) -> ReservationResult:
+        return self._inner.settle(**kwargs)
+
+    def current(self, state_id: str) -> dict[str, Any]:
+        return self._inner.current(state_id)
 
 
 class _PermitGate:
@@ -156,6 +184,43 @@ def test_happy_path_prepares_persists_reserves_gates_and_starts_execution() -> N
 
 
 @pytest.mark.unit
+def test_evidence_is_persisted_before_the_reservation_is_taken() -> None:
+    """Never reserve before evidence exists: persist strictly precedes reserve."""
+    order: list[str] = []
+    inner = InMemoryReservationStore(initial_state=_window_state())
+    reservation = _RecordingReservationStore(inner, order)
+    store = _FakeBundleStore(log=order)
+    handler = _handler(
+        store=store,
+        gate=_PermitGate(),
+        start_execution=_RecordingStartExecution(),
+        reservation=reservation,
+    )
+
+    handler.dispatch(_inputs())
+
+    assert order == ["persist", "reserve"]
+
+
+@pytest.mark.unit
+def test_persist_failure_fails_closed_and_never_reserves() -> None:
+    store = _FakeBundleStore(error=RuntimeError("bundle store unavailable"))
+    gate = _PermitGate()
+    start = _RecordingStartExecution()
+    reservation = InMemoryReservationStore(initial_state=_window_state())
+    handler = _handler(store=store, gate=gate, start_execution=start, reservation=reservation)
+
+    result = handler.dispatch(_inputs())
+
+    assert result.outcome is RuntimeDispatchOutcome.REFUSED
+    assert result.reason == "persist_failed"
+    assert start.calls == []
+    # A persist failure never advances the window state / takes the in-flight slot.
+    assert reservation.current(_window_state()["state_id"])["in_flight"] == 0
+    assert gate.pre_dispatch_calls == 0
+
+
+@pytest.mark.unit
 def test_gate_denial_fails_closed_without_starting_execution() -> None:
     store = _FakeBundleStore()
     start = _RecordingStartExecution()
@@ -167,6 +232,10 @@ def test_gate_denial_fails_closed_without_starting_execution() -> None:
     assert result.outcome is RuntimeDispatchOutcome.REFUSED
     # No StartExecution on a gate denial.
     assert start.calls == []
+    # The bundle was already persisted (evidence precedes reserve/gate), and the
+    # gate denial released the in-flight slot.
+    assert len(store.persisted) == 1
+    assert reservation.current(_window_state()["state_id"])["in_flight"] == 0
 
 
 @pytest.mark.unit
@@ -184,13 +253,14 @@ def test_reservation_conflict_fails_closed_without_starting_execution() -> None:
 
     assert result.outcome is RuntimeDispatchOutcome.REFUSED
     assert start.calls == []
-    # The gate is never even reached on a reservation conflict (reserve is atomic
-    # and precedes dispatch), and nothing is dispatched.
+    # Evidence was persisted FIRST (inert), then the reservation conflicted; the
+    # gate is never reached and nothing is dispatched.
+    assert len(store.persisted) == 1
     assert gate.pre_dispatch_calls == 0
 
 
 @pytest.mark.unit
-def test_denied_decision_never_reserves_or_dispatches() -> None:
+def test_denied_decision_never_persists_reserves_or_dispatches() -> None:
     store = _FakeBundleStore()
     gate = _PermitGate()
     start = _RecordingStartExecution()
@@ -212,7 +282,8 @@ def test_denied_decision_never_reserves_or_dispatches() -> None:
 
     assert result.outcome is RuntimeDispatchOutcome.REFUSED
     assert start.calls == []
-    # A denied decision never takes the in-flight slot.
+    # A denied decision persists no evidence and never takes the in-flight slot.
+    assert store.persisted == []
     assert reservation.current(_window_state()["state_id"])["in_flight"] == 0
 
 

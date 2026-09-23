@@ -11,20 +11,28 @@ Order of operations (each step fails closed):
 
 1. **Prepare.** :class:`~operations.autonomy_runtime.service.AutonomyRuntimeService`
    deterministically assembles the hash-bound v2 decision and prepared operation
-   from trusted inputs only. A ``denied`` decision refuses here — no reservation
-   is taken and nothing is dispatched.
-2. **Reserve.** The write's budget/frequency/concurrency footprint is atomically
+   from trusted inputs only. A ``denied`` decision refuses here — no evidence is
+   persisted, no reservation is taken, and nothing is dispatched.
+2. **Persist evidence FIRST.** The policy, canonical observation, decision,
+   operation, and bound pre-reservation window state are persisted durably as an
+   *immutable, conditional* bundle keyed by ``operation_id`` **before** any
+   reservation is taken. A single durable transaction spanning reserve **and**
+   bundle is not expressible against the current DynamoDB item interfaces, so the
+   safe ordering is: persist immutable inert evidence, *then* reserve. A crash
+   between persist and reserve therefore leaves only inert evidence that a replay
+   can neither mutate nor escalate (the conditional ``attribute_not_exists`` put
+   refuses to overwrite), and the durable window state was never advanced — so no
+   budget/frequency/concurrency was consumed. We **never** reserve before the
+   evidence exists.
+3. **Reserve.** The write's budget/frequency/concurrency footprint is atomically
    reserved against the policy-bound rolling window state, fenced on the exact
    ``state_revision`` and the single in-flight slot. A conflict or unavailability
-   refuses without dispatch.
-3. **Gate.** The composite pre-dispatch gate — static deployment mode exactly
+   refuses without dispatch; the already-persisted bundle remains inert evidence.
+4. **Gate.** The composite pre-dispatch gate — static deployment mode exactly
    ``operate`` + the separate AppConfig autonomy switch + the E4 cached
    kill-switch dispatch phase + the E4 durable dispatch intent — must all permit
    *before* StartExecution. A denial here releases the in-flight reservation
    (fail closed) and refuses.
-4. **Persist.** The policy, canonical observation, decision, operation, bound
-   pre-reservation window state, and reservation are persisted durably so the
-   executor can reload the exact bundle by ``operation_id``.
 5. **Dispatch.** An identifier-only envelope (``operation_id`` alone) is handed to
    the injected ``start_execution`` callable, which starts the durable Step
    Functions Standard workflow. No policy, limits, observation, window, or
@@ -89,7 +97,7 @@ class BundleStorePort(Protocol):
 
 
 class AutonomyRuntimeHandler:
-    """Compose prepare -> reserve -> gate -> persist -> identifier-only dispatch."""
+    """Compose prepare -> persist -> reserve -> gate -> identifier-only dispatch."""
 
     __slots__ = ("_service", "_reservation_store", "_bundle_store", "_gate", "_start_execution")
 
@@ -111,7 +119,8 @@ class AutonomyRuntimeHandler:
     def dispatch(self, inputs: AutonomyRuntimeInputs) -> RuntimeDispatchResult:
         """Run the full identifier-only dispatch pipeline, failing closed at every step."""
         # 1. Prepare the deterministic v2 documents. A denied decision refuses
-        # before any reservation is taken or anything is dispatched.
+        # before any evidence is persisted, any reservation is taken, or anything
+        # is dispatched.
         prepared = self._service.prepare(inputs)
         if not prepared.authorized:
             return RuntimeDispatchResult(RuntimeDispatchOutcome.REFUSED, reason="decision_denied")
@@ -120,27 +129,13 @@ class AutonomyRuntimeHandler:
         operation_id = operation["operation_id"]
         action_id = logical_action_id(operation_id, operation["prepared_hash"])
 
-        # 2. Atomically reserve the write's footprint. A conflict or unavailability
-        # refuses without dispatch and without persisting a reservation.
-        request = self._reservation_request(inputs, prepared, action_id)
-        reservation_result = self._reservation_store.reserve(request)
-        if reservation_result.outcome is not ReservationOutcome.RESERVED:
-            return RuntimeDispatchResult(
-                RuntimeDispatchOutcome.REFUSED, reason="reservation_" + reservation_result.outcome.value
-            )
-
-        # 3. Composite pre-dispatch gate BEFORE StartExecution. A denial releases
-        # the in-flight reservation (fail closed) and refuses.
-        try:
-            self._gate.require_pre_dispatch()
-        except Exception as exc:  # noqa: BLE001 - any gate denial fails closed
-            self._release_in_flight(operation_id, action_id)
-            return RuntimeDispatchResult(RuntimeDispatchOutcome.REFUSED, reason="gate_denied")
-
-        # 4. Persist the reloadable bundle. A persistence failure releases the
-        # in-flight reservation and refuses rather than dispatching a write the
-        # executor cannot reload.
-        reservation_snapshot = reservation_result.window_state or {}
+        # 2. Persist the reloadable bundle FIRST — before any reservation. A
+        # single durable transaction spanning reserve + bundle is not expressible
+        # against the current DynamoDB interfaces, so evidence is persisted with
+        # an immutable conditional put before the window state is ever advanced.
+        # A crash after this point leaves only inert evidence (no budget/frequency/
+        # concurrency consumed) that a replay can neither mutate nor escalate. A
+        # persistence failure refuses without reserving.
         try:
             self._bundle_store.persist_bundle(
                 operation_id=operation_id,
@@ -153,17 +148,34 @@ class AutonomyRuntimeHandler:
                     "operation_id": operation_id,
                     "logical_action_id": action_id,
                     "state_id": inputs.window_state["state_id"],
-                    "window_state": dict(reservation_snapshot),
+                    "expected_state_revision": int(inputs.window_state["state_revision"]),
                 },
             )
-        except Exception as exc:  # noqa: BLE001 - a persist failure fails closed
-            self._release_in_flight(operation_id, action_id)
+        except Exception:  # noqa: BLE001 - a persist failure fails closed, nothing reserved
             return RuntimeDispatchResult(RuntimeDispatchOutcome.REFUSED, reason="persist_failed")
+
+        # 3. Atomically reserve the write's footprint against the now-persisted
+        # evidence. A conflict or unavailability refuses without dispatch; the
+        # already-persisted bundle remains inert (the window was not advanced).
+        request = self._reservation_request(inputs, prepared, action_id)
+        reservation_result = self._reservation_store.reserve(request)
+        if reservation_result.outcome is not ReservationOutcome.RESERVED:
+            return RuntimeDispatchResult(
+                RuntimeDispatchOutcome.REFUSED, reason="reservation_" + reservation_result.outcome.value
+            )
+
+        # 4. Composite pre-dispatch gate BEFORE StartExecution. A denial releases
+        # the in-flight reservation (fail closed) and refuses.
+        try:
+            self._gate.require_pre_dispatch()
+        except Exception:  # noqa: BLE001 - any gate denial fails closed
+            self._release_in_flight(operation_id, action_id)
+            return RuntimeDispatchResult(RuntimeDispatchOutcome.REFUSED, reason="gate_denied")
 
         # 5. Identifier-only dispatch: StartExecution with operation_id alone.
         try:
             self._start_execution({"operation_id": operation_id})
-        except Exception as exc:  # noqa: BLE001 - a StartExecution failure fails closed
+        except Exception:  # noqa: BLE001 - a StartExecution failure fails closed
             self._release_in_flight(operation_id, action_id)
             return RuntimeDispatchResult(RuntimeDispatchOutcome.REFUSED, reason="start_execution_failed")
 
