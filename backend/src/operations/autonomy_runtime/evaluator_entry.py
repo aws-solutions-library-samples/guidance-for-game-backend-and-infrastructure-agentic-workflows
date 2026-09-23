@@ -36,7 +36,8 @@ Safety boundaries (ADR 0001 / AGENTS.md):
   identifier is configured. A default deployment provisions no autonomy control
   plane, so the bootstrap is never reached there.
 * **The evaluator holds no provider-write credential.** It constructs ONLY
-  DynamoDB, AppConfig, and Step Functions clients (plus CloudWatch for metrics) —
+  DynamoDB, AppConfig, and Step Functions clients (it emits NO custom metric;
+  rollback/health alarms use AWS-emitted metrics only) —
   never a GameLift client and never a Lambda-invoke client. It advances durable
   accounting state and starts a durable workflow with an identifier; the single
   provider write is performed elsewhere, by the existing narrow executor, invoked

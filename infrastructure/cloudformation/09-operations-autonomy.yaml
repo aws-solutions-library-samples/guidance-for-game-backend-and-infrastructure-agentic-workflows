@@ -743,14 +743,6 @@ Resources:
                 Resource:
                   - !GetAtt EvaluatorLogGroup.Arn
                   - !Sub '${EvaluatorLogGroup.Arn}:*'
-              - Sid: PublishScopedMetrics
-                Effect: Allow
-                Action:
-                  - 'cloudwatch:PutMetricData'
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    'cloudwatch:namespace': 'GameAgent/Operations'
               - Sid: XRayTraceWrite
                 Effect: Allow
                 Action:
@@ -773,7 +765,7 @@ Resources:
 
   # ------------------------------------------------------------------------- #
   # Evaluator Lambda: the deployable #439 runtime bootstrap. It constructs (from
-  # env only) DynamoDB/AppConfig/StepFunctions/CloudWatch clients — NEVER a
+  # env only) DynamoDB/AppConfig/StepFunctions clients — NEVER a CloudWatch,
   # GameLift client and NEVER a Lambda-invoke client. The disable levers are the
   # DISABLED EventBridge source and the injected AUTONOMY_ENABLED=false flag.
   # ------------------------------------------------------------------------- #
@@ -920,7 +912,12 @@ Resources:
       MetricName: Errors
       Dimensions:
         - Name: FunctionName
-          Value: !Ref EvaluatorFunction
+          # Deterministic function name (matches EvaluatorFunction's
+          # FunctionName property) so the alarm does not take a resource
+          # dependency on EvaluatorFunction. That edge would otherwise close
+          # the cycle AutonomyEnvironment(monitor)->this alarm->EvaluatorFunction
+          # ->AutonomyEnvironment(env var) that cfn-lint rejects as E3004.
+          Value: !Sub '${ProjectName}-operations-autonomy-evaluator'
       Statistic: Sum
       Period: 60
       EvaluationPeriods: 1
@@ -943,7 +940,12 @@ Resources:
       MetricName: Throttles
       Dimensions:
         - Name: FunctionName
-          Value: !Ref EvaluatorFunction
+          # Deterministic function name (matches EvaluatorFunction's
+          # FunctionName property) so the alarm does not take a resource
+          # dependency on EvaluatorFunction. That edge would otherwise close
+          # the cycle AutonomyEnvironment(monitor)->this alarm->EvaluatorFunction
+          # ->AutonomyEnvironment(env var) that cfn-lint rejects as E3004.
+          Value: !Sub '${ProjectName}-operations-autonomy-evaluator'
       Statistic: Sum
       Period: 300
       EvaluationPeriods: 1

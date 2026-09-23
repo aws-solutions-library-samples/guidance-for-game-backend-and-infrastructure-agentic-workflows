@@ -710,13 +710,21 @@ Resources:
           GBAW_OPERATIONS_CAPACITY_FLOOR: '0'
           GBAW_OPERATIONS_CAPACITY_CEILING: '1'
           GBAW_OPERATIONS_CAPACITY_MAX_STEP: '1'
-          # AppConfig read target. When autonomy is enabled the SEPARATE autonomy
-          # application/environment is used so the executor's autonomy switch gate
-          # and its E4 kill-switch gate read from one extension; both are scoped
-          # reads only. v1 keeps the E4 kill-switch identifiers.
-          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !If [AutonomyOperate, !Ref AutonomyApplicationId, !Ref KillSwitchApplicationId]
-          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !If [AutonomyOperate, !Ref AutonomyEnvironmentId, !Ref KillSwitchEnvironmentId]
+          # E4 kill-switch AppConfig read target. This ALWAYS addresses the E4
+          # kill switch (application/environment/profile), enabled or not: the
+          # resolver reads the kill-switch document from this coordinate. The
+          # SEPARATE autonomy switch is addressed by the AUTONOMY_APPCONFIG_*
+          # keys below, so enabling autonomy never repoints the kill-switch read.
+          GBAW_OPERATIONS_APPCONFIG_APPLICATION: !Ref KillSwitchApplicationId
+          GBAW_OPERATIONS_APPCONFIG_ENVIRONMENT: !Ref KillSwitchEnvironmentId
           GBAW_OPERATIONS_APPCONFIG_PROFILE: !Ref KillSwitchProfileId
+          # SEPARATE E5 autonomy AppConfig application/environment (the 09 stack).
+          # resolve_autonomy_evaluator_settings REQUIRES both keys; the executor
+          # builds its autonomy-switch AppConfig client from this coordinate plus
+          # AUTONOMY_SWITCH_PROFILE. Injected only when AutonomyMode=operate;
+          # absent otherwise so the resolver fails closed and the v1 path runs.
+          GBAW_OPERATIONS_AUTONOMY_APPCONFIG_APPLICATION: !If [AutonomyOperate, !Ref AutonomyApplicationId, !Ref 'AWS::NoValue']
+          GBAW_OPERATIONS_AUTONOMY_APPCONFIG_ENVIRONMENT: !If [AutonomyOperate, !Ref AutonomyEnvironmentId, !Ref 'AWS::NoValue']
           # E5 additive autonomy identifiers. Injected only when AutonomyMode=
           # operate; absent (AWS::NoValue) otherwise so the executor's
           # resolve_autonomy_evaluator_settings fails closed and the v1 path runs.

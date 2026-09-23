@@ -685,8 +685,12 @@ def _build_autonomy_wiring(
     bundle_store = DynamoDbAutonomyBundleStore(client=dynamodb_client, table_name=table_name)
 
     autonomy_extension = AppConfigExtensionClient(
-        application=autonomy_settings.appconfig_application,
-        environment=autonomy_settings.appconfig_environment,
+        # The autonomy switch lives in the SEPARATE E5 autonomy AppConfig
+        # application/environment (the 09 stack), NOT the E4 kill-switch pair.
+        # Reading it from the kill-switch coordinate would address the wrong
+        # document; the executor must use the autonomy-specific coordinate.
+        application=autonomy_settings.autonomy_appconfig_application,
+        environment=autonomy_settings.autonomy_appconfig_environment,
         profile=autonomy_settings.autonomy_switch_profile,
         port=autonomy_settings.appconfig_extension_port,
     )
