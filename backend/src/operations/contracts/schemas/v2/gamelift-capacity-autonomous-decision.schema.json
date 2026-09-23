@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v2:gamelift-capacity-autonomous-decision",
+  "title": "GameLift Capacity Adjustment Autonomous Decision 2.0",
+  "$comment": "Additive, deterministic E5 autonomous authorization for gamelift.capacity-adjustment/2.0. It is a pure, server-computed reading of one proposed capacity triple against one trusted E1 observation, one immutable autonomy policy, and the durable rolling-window state, producing exactly one of authorized/denied at operate authority with no human in the loop. A non-denied decision is authorized with reason code APPROVED_AUTONOMOUS and effective authority >= operate; any guardrail breach denies with the specific closed reason code(s). It binds the exact policy id/version/hash and observation id/hash, and carries decision_expires_at = min(observation.expires_at, evaluated_at + policy.decision_ttl_seconds). This is a v2 contract that only references the frozen v1 common $defs; it changes no published v1 schema, vector, or meaning.",
+  "$defs": {
+    "capacity_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desired", "minimum", "maximum"],
+      "properties": {
+        "desired": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "minimum": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "maximum": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    },
+    "reason_code": {
+      "type": "string",
+      "enum": [
+        "APPROVED_AUTONOMOUS",
+        "DEPLOYMENT_DISABLED",
+        "INSUFFICIENT_AUTHORITY",
+        "POLICY_DENIED",
+        "TARGET_NOT_ENROLLED",
+        "RISK_LIMIT_EXCEEDED",
+        "WORKSPACE_MISMATCH",
+        "BOUNDS_EXCEEDED",
+        "OBSERVATION_STALE",
+        "BUDGET_EXCEEDED",
+        "COOLDOWN_ACTIVE",
+        "FREQUENCY_EXCEEDED",
+        "CONCURRENCY_LIMIT",
+        "OSCILLATION_BLOCKED",
+        "DECISION_EXPIRED",
+        "AUTOMATION_PRINCIPAL_INVALID"
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_contract_version",
+    "decision_id",
+    "phase",
+    "profile",
+    "action",
+    "provider",
+    "capability",
+    "automation_principal",
+    "policy",
+    "target",
+    "current_state",
+    "requested",
+    "calculated_risk",
+    "authority_inputs",
+    "effective_authority",
+    "decision",
+    "reason_codes",
+    "required_execution_authority",
+    "evaluated_at",
+    "decision_expires_at",
+    "correlation"
+  ],
+  "properties": {
+    "decision_contract_version": {"type": "string", "const": "2.0"},
+    "decision_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "phase": {"type": "string", "const": "operate"},
+    "profile": {"type": "string", "const": "gamelift.capacity-adjustment/2.0"},
+    "action": {"type": "string", "const": "gamelift.adjust-fleet-capacity"},
+    "provider": {"type": "string", "const": "gamelift"},
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_id", "capability_version"],
+      "properties": {
+        "capability_id": {"type": "string", "const": "gamelift.capacity-adjustment"},
+        "capability_version": {"type": "string", "const": "2.0"}
+      }
+    },
+    "automation_principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_type", "subject_id", "client_id"],
+      "properties": {
+        "source_type": {"type": "string", "const": "automation"},
+        "subject_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+        "client_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "policy_version", "policy_hash"],
+      "properties": {
+        "policy_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+        "policy_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "policy_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "fleet_id", "location"],
+      "properties": {
+        "provider": {"type": "string", "const": "gamelift"},
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        }
+      }
+    },
+    "current_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observation_id", "observation_hash", "capacity", "observed_at", "expires_at"],
+      "properties": {
+        "observation_id": {"type": "string", "pattern": "^obs_[a-z0-9]{26}$"},
+        "observation_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"},
+        "capacity": {"$ref": "#/$defs/capacity_values"},
+        "observed_at": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"},
+        "expires_at": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"}
+      }
+    },
+    "requested": {"$ref": "#/$defs/capacity_values"},
+    "calculated_risk": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/calculated_risk"},
+    "authority_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_mode",
+        "tenant_policy",
+        "workspace_policy",
+        "principal_authority",
+        "capability_maximum",
+        "operation_risk_policy"
+      ],
+      "properties": {
+        "deployment_mode": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"},
+        "tenant_policy": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"},
+        "workspace_policy": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"},
+        "principal_authority": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"},
+        "capability_maximum": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"},
+        "operation_risk_policy": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"}
+      }
+    },
+    "effective_authority": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/authority"},
+    "decision": {"type": "string", "enum": ["authorized", "denied"]},
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/reason_code"}
+    },
+    "required_execution_authority": {
+      "type": "string",
+      "const": "operate",
+      "$comment": "Immutable minimum execution authority a future E5 autonomous executor MUST independently re-verify (mode/policy >= operate) before the single provider write. There is no human-approval field; the decision itself is the time-boxed grant."
+    },
+    "evaluated_at": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"},
+    "decision_expires_at": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"},
+    "correlation": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/correlation"}
+  }
+}

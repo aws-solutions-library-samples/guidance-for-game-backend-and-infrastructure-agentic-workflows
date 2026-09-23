@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v2:gamelift-capacity-autonomy-policy",
+  "title": "GameLift Capacity Adjustment Bounded-Autonomy Policy 2.0",
+  "$comment": "Additive, immutable E5 bounded-autonomy policy for gamelift.capacity-adjustment/2.0. It is the server-owned guardrail envelope a deterministic evaluator reads to authorize a single autonomous capacity write with no human in the loop. It is never client, model, or request-body input: it carries the trusted automation principal, tenant/workspace/enrollment, the exact 0/1/1 capacity envelope, the risk ceiling, observation freshness, an integer micro-USD action/window budget, cooldown, frequency, max-in-flight concurrency, anti-oscillation, decision expiry, and the exact playbook/executor identities/versions/hashes. Its policy_hash binds every field except itself. This is a v2 contract: it defines all new $defs inline and only references the frozen v1 common $defs, so it changes no published v1 schema, vector, or meaning.",
+  "$defs": {
+    "automation_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_type", "subject_id", "client_id"],
+      "properties": {
+        "source_type": {"type": "string", "const": "automation"},
+        "subject_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+        "client_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"}
+      }
+    },
+    "capacity_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["floor", "ceiling", "max_step"],
+      "properties": {
+        "floor": {"type": "integer", "const": 0},
+        "ceiling": {"type": "integer", "const": 1},
+        "max_step": {"type": "integer", "const": 1}
+      }
+    },
+    "positive_seconds": {"type": "integer", "minimum": 1, "maximum": 604800},
+    "positive_count": {"type": "integer", "minimum": 1, "maximum": 1000},
+    "micro_usd": {"type": "integer", "minimum": 0, "maximum": 1000000000000}
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy_contract_version",
+    "policy_id",
+    "policy_version",
+    "profile",
+    "action",
+    "provider",
+    "capability",
+    "automation_principal",
+    "tenant_id",
+    "workspace_id",
+    "resource_enrollment",
+    "target",
+    "capacity_bounds",
+    "risk",
+    "observation_freshness",
+    "budget",
+    "cooldown",
+    "frequency",
+    "concurrency",
+    "anti_oscillation",
+    "decision_ttl_seconds",
+    "playbook",
+    "executor_binding",
+    "required_execution_authority",
+    "policy_hash"
+  ],
+  "properties": {
+    "policy_contract_version": {"type": "string", "const": "2.0"},
+    "policy_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "policy_version": {"type": "string", "minLength": 1, "maxLength": 128},
+    "profile": {"type": "string", "const": "gamelift.capacity-adjustment/2.0"},
+    "action": {"type": "string", "const": "gamelift.adjust-fleet-capacity"},
+    "provider": {"type": "string", "const": "gamelift"},
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_id", "capability_version"],
+      "properties": {
+        "capability_id": {"type": "string", "const": "gamelift.capacity-adjustment"},
+        "capability_version": {"type": "string", "const": "2.0"}
+      }
+    },
+    "automation_principal": {"$ref": "#/$defs/automation_identity"},
+    "tenant_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "workspace_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "resource_enrollment": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/resource_enrollment"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "fleet_id", "location"],
+      "properties": {
+        "provider": {"type": "string", "const": "gamelift"},
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        }
+      }
+    },
+    "capacity_bounds": {"$ref": "#/$defs/capacity_envelope"},
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_level", "max_score"],
+      "properties": {
+        "max_level": {"type": "string", "enum": ["low", "moderate", "high", "critical"]},
+        "max_score": {"type": "integer", "minimum": 0, "maximum": 100}
+      }
+    },
+    "observation_freshness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_age_seconds", "max_skew_seconds"],
+      "properties": {
+        "max_age_seconds": {"$ref": "#/$defs/positive_seconds"},
+        "max_skew_seconds": {"type": "integer", "minimum": 0, "maximum": 3600}
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["window_seconds", "max_action_micro_usd", "max_window_micro_usd"],
+      "properties": {
+        "window_seconds": {"$ref": "#/$defs/positive_seconds"},
+        "max_action_micro_usd": {"$ref": "#/$defs/micro_usd"},
+        "max_window_micro_usd": {"$ref": "#/$defs/micro_usd"}
+      }
+    },
+    "cooldown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min_seconds_between_writes"],
+      "properties": {"min_seconds_between_writes": {"$ref": "#/$defs/positive_seconds"}}
+    },
+    "frequency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["window_seconds", "max_writes_per_window"],
+      "properties": {
+        "window_seconds": {"$ref": "#/$defs/positive_seconds"},
+        "max_writes_per_window": {"$ref": "#/$defs/positive_count"}
+      }
+    },
+    "concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_in_flight"],
+      "properties": {"max_in_flight": {"type": "integer", "const": 1}}
+    },
+    "anti_oscillation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["window_seconds", "min_seconds_since_opposite_change", "max_direction_flips_per_window"],
+      "properties": {
+        "window_seconds": {"$ref": "#/$defs/positive_seconds"},
+        "min_seconds_since_opposite_change": {"$ref": "#/$defs/positive_seconds"},
+        "max_direction_flips_per_window": {"type": "integer", "minimum": 0, "maximum": 100}
+      }
+    },
+    "decision_ttl_seconds": {"$ref": "#/$defs/positive_seconds"},
+    "playbook": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/playbook_ref"},
+    "executor_binding": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/executor_binding"},
+    "required_execution_authority": {
+      "type": "string",
+      "const": "operate",
+      "$comment": "Immutable, hash-bound minimum execution authority a future E5 autonomous executor MUST independently re-verify (mode/policy >= operate) before the single provider write. There is no human-approval field anywhere in the autonomy layer; the deterministic decision itself is the time-boxed grant."
+    },
+    "policy_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"}
+  }
+}

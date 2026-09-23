@@ -6,9 +6,12 @@ control plane. The contracts implement the boundaries accepted in
 [ADR 0003](adr/0003-isolate-provider-writes.md). They do not enable operations,
 deploy an executor, or change the existing chat path.
 
-The normative JSON Schemas are in
-`backend/src/operations/contracts/schemas/v1`. Example documents and fixed
-test vectors are in `backend/tests/fixtures/operations/v1`.
+The normative `1.0` JSON Schemas are in
+`backend/src/operations/contracts/schemas/v1`; its example documents and fixed
+test vectors are in `backend/tests/fixtures/operations/v1`. Additive bounded-
+autonomy `2.0` schemas and vectors live separately under the matching `v2`
+directories. A v2 schema may reference frozen v1 common definitions, but v2
+artifacts never share the v1 publication directory.
 
 ## Published Contracts
 

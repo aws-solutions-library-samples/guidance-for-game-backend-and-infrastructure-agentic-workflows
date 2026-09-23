@@ -20,7 +20,7 @@ import pytest
 from operations.contracts import load_json
 from operations.contracts.autonomy import evaluate_autonomy_policy
 
-FIXTURES = Path(__file__).parents[1] / "fixtures" / "operations" / "v1"
+FIXTURES = Path(__file__).parents[1] / "fixtures" / "operations" / "v2"
 
 
 def _policy() -> dict[str, Any]:

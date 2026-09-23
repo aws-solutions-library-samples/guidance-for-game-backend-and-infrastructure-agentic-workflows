@@ -44,6 +44,7 @@ from __future__ import annotations
 
 # Standard library
 from copy import deepcopy
+from datetime import datetime, timedelta
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any
@@ -114,15 +115,15 @@ REQUIRED_EXECUTION_AUTHORITY = "operate"
 # The single reason code carried by a non-denied autonomous decision.
 _AUTHORIZED_REASON = "APPROVED_AUTONOMOUS"
 
-# The closed reason-code set the v2 decision/operation enums publish. It is a
-# superset of the v1 closed set (the v1 enum is untouched) plus the
-# autonomy-specific guardrail codes.
-AUTONOMY_REASON_CODES = frozenset(
+# The pure evaluator only emits guardrail results computable from its trusted
+# input tuple. POLICY_DENIED and DECISION_EXPIRED belong to later runtime
+# policy-resolution and execute-time clock checks; exposing the sets separately
+# prevents either runtime condition from being attributed to the pure evaluator.
+AUTONOMY_EVALUATOR_REASON_CODES = frozenset(
     {
         "APPROVED_AUTONOMOUS",
         "DEPLOYMENT_DISABLED",
         "INSUFFICIENT_AUTHORITY",
-        "POLICY_DENIED",
         "TARGET_NOT_ENROLLED",
         "RISK_LIMIT_EXCEEDED",
         "WORKSPACE_MISMATCH",
@@ -133,10 +134,14 @@ AUTONOMY_REASON_CODES = frozenset(
         "FREQUENCY_EXCEEDED",
         "CONCURRENCY_LIMIT",
         "OSCILLATION_BLOCKED",
-        "DECISION_EXPIRED",
         "AUTOMATION_PRINCIPAL_INVALID",
     }
 )
+AUTONOMY_RUNTIME_REASON_CODES = frozenset({"POLICY_DENIED", "DECISION_EXPIRED"})
+
+# The closed reason-code set the v2 decision/operation enums publish. It includes
+# both the pure evaluator's outputs and later fail-closed runtime outcomes.
+AUTONOMY_REASON_CODES = AUTONOMY_EVALUATOR_REASON_CODES | AUTONOMY_RUNTIME_REASON_CODES
 
 
 class AutonomyContractError(ValueError):
@@ -158,13 +163,14 @@ def is_supported_autonomy_version(version: str) -> bool:
     return version == AUTONOMY_CONTRACT_VERSION
 
 
-def _schema_directory():
-    return files("operations.contracts").joinpath("schemas", "v1")
+def _schema_directory(schema_name: str):
+    version = "v1" if schema_name == COMMON_SCHEMA_NAME else "v2"
+    return files("operations.contracts").joinpath("schemas", version)
 
 
 @lru_cache(maxsize=None)
 def _load_schema_cached(schema_name: str) -> dict[str, Any]:
-    schema_path = _schema_directory().joinpath(f"{schema_name}.schema.json")
+    schema_path = _schema_directory(schema_name).joinpath(f"{schema_name}.schema.json")
     document = load_json(schema_path.read_text(encoding="utf-8"))
     if not isinstance(document, dict):
         raise ValueError(f"autonomy schema must be a JSON object: {schema_name}")
@@ -190,6 +196,11 @@ def _autonomy_registry() -> Registry:
 def _format_path(error) -> str:
     path = ".".join(str(part) for part in error.absolute_path)
     return f"{path}: {error.message}" if path else error.message
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Parse a schema-validated RFC 3339 timestamp for semantic ordering."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 # -- Canonical hashes --------------------------------------------------------
@@ -298,8 +309,11 @@ def _decision_semantic_errors(document: dict[str, Any]) -> list[str]:
         if "DEPLOYMENT_DISABLED" not in reasons:
             errors.append("disabled deployment mode requires the DEPLOYMENT_DISABLED reason code")
 
-    if document["decision_expires_at"] <= document["evaluated_at"]:
+    decision_expires_at = _parse_timestamp(document["decision_expires_at"])
+    if decision_expires_at <= _parse_timestamp(document["evaluated_at"]):
         errors.append("decision_expires_at must be strictly after evaluated_at")
+    if decision_expires_at > _parse_timestamp(document["current_state"]["expires_at"]):
+        errors.append("decision_expires_at cannot exceed the current-state observation expiry")
     return errors
 
 
@@ -325,8 +339,11 @@ def _operation_semantic_errors(document: dict[str, Any]) -> list[str]:
         errors.append("capability_version is not the autonomy capability version")
     if document["target"]["provider"] != document["provider"]:
         errors.append("target.provider does not match the operation provider")
-    if document["decision_expires_at"] <= document["created_at"]:
+    decision_expires_at = _parse_timestamp(document["decision_expires_at"])
+    if decision_expires_at <= _parse_timestamp(document["created_at"]):
         errors.append("decision_expires_at must be strictly after created_at")
+    if decision_expires_at > _parse_timestamp(document["current_state"]["expires_at"]):
+        errors.append("decision_expires_at cannot exceed the current-state observation expiry")
 
     if document["required_execution_authority"] != REQUIRED_EXECUTION_AUTHORITY:
         errors.append("required_execution_authority must be operate")
@@ -435,6 +452,9 @@ def validate_autonomous_operation_binding(
         errors.append("operation authority_inputs do not match the decision")
     if operation["decision_expires_at"] != decision["decision_expires_at"]:
         errors.append("operation decision_expires_at does not match the decision")
+    policy_deadline = _parse_timestamp(decision["evaluated_at"]) + timedelta(seconds=policy["decision_ttl_seconds"])
+    if _parse_timestamp(decision["decision_expires_at"]) > policy_deadline:
+        errors.append("decision_expires_at cannot exceed the autonomy policy decision TTL")
     if operation["required_execution_authority"] != decision["required_execution_authority"]:
         errors.append("operation required_execution_authority does not match the decision")
     if errors:

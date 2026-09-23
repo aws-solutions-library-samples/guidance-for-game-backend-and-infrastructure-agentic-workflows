@@ -32,8 +32,10 @@ evaluator. Every published v1 schema, vector, hash, and meaning is left
 byte-for-byte unchanged.
 
 1. **A new capability version, not a v1 edit.** The autonomy documents carry a
-   `*_contract_version` of `"2.0"` and distinct `urn:...:v2:...` `$id`s. New
-   `$defs` are defined *inline* in the v2 schema files; only the frozen v1
+   `*_contract_version` of `"2.0"` and distinct `urn:...:v2:...` `$id`s. The
+   schema and vector files live under physical `schemas/v2` and
+   `fixtures/operations/v2` directories, separate from the frozen v1 artifacts.
+   New `$defs` are defined *inline* in the v2 schema files; only the frozen v1
    `common` `$defs` are *referenced* unchanged, so no v1 schema re-hashes
    (`common` is not touched). The v2 schema names are disjoint from the published
    write-contract set and from the E2/E3 capacity/execution sets. A parallel
@@ -58,9 +60,13 @@ byte-for-byte unchanged.
      `authorized` with the single reason code `APPROVED_AUTONOMOUS` and effective
      authority `operate` (the deterministic minimum of the six ADR 0001 inputs);
      any guardrail breach denies with the specific closed reason code(s). It binds
-     the exact policy id/version/hash and observation id/hash and carries
-     `decision_expires_at = min(observation.expires_at, evaluated_at +
-     policy.decision_ttl_seconds)`. It has **no human-approval field**: the
+     the exact policy id/version/hash and observation id/hash and carries a
+     `decision_expires_at` no later than either `observation.expires_at` or
+     `evaluated_at + policy.decision_ttl_seconds`. Contract validation enforces
+     the observation clamp; policy binding independently enforces the TTL clamp.
+     `POLICY_DENIED` and `DECISION_EXPIRED` remain closed runtime reason codes for
+     later policy-resolution and execute-time checks and are intentionally not
+     emitted by the pure evaluator. It has **no human-approval field**: the
      decision itself is the time-boxed grant.
    - **Immutable autonomous prepared operation**
      (`gamelift-capacity-autonomous-operation`): the `authority.decision` enum is
@@ -68,7 +74,8 @@ byte-for-byte unchanged.
      "denied"]` prepared operation. It binds the autonomy policy id/version/hash,
      the decision id/hash, the observation id/hash, the exact desired/min/max
      change, the six authority inputs and their minimum, the calculated risk, the
-     automation principal scope, the executor binding, `decision_expires_at`, and
+     automation principal scope, the executor binding, `decision_expires_at`
+     (which cannot exceed the bound observation expiry), and
      `required_execution_authority: const "operate"`. Its `prepared_hash` binds
      every field except itself. There is no approval field anywhere.
 

@@ -33,8 +33,10 @@ from operations.contracts import SCHEMA_NAMES, canonical_sha256, load_json
 from operations.contracts.autonomy import (
     AUTONOMOUS_DECISION_SCHEMA_NAME,
     AUTONOMOUS_OPERATION_SCHEMA_NAME,
+    AUTONOMY_EVALUATOR_REASON_CODES,
     AUTONOMY_POLICY_SCHEMA_NAME,
     AUTONOMY_REASON_CODES,
+    AUTONOMY_RUNTIME_REASON_CODES,
     AUTONOMY_SCHEMA_NAMES,
     AutonomyContractError,
     autonomous_decision_hash,
@@ -49,7 +51,10 @@ from operations.contracts.capacity import CAPACITY_SCHEMA_NAMES
 from operations.contracts.execution import EXECUTION_SCHEMA_NAMES
 from operations.contracts.versions import is_supported_contract_version
 
-FIXTURES = Path(__file__).parents[1] / "fixtures" / "operations" / "v1"
+FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "operations"
+FIXTURES = FIXTURE_ROOT / "v2"
+V1_FIXTURES = FIXTURE_ROOT / "v1"
+SCHEMA_ROOT = Path(__file__).parents[2] / "src" / "operations" / "contracts" / "schemas"
 
 # Genuinely sensitive names that must never appear as a key anywhere in an
 # autonomy document. The legitimate ``policy``/``autonomy_policy`` bindings are
@@ -124,6 +129,17 @@ def test_autonomy_schemas_are_disjoint_from_every_published_set() -> None:
 
 
 @pytest.mark.unit
+def test_v2_artifacts_are_physically_disjoint_from_v1() -> None:
+    expected_schemas = {f"{name}.schema.json" for name in AUTONOMY_SCHEMA_NAMES}
+    expected_fixtures = set(VALID.values()) | {"autonomy-contract-vectors.json"}
+
+    assert expected_schemas.issubset({path.name for path in (SCHEMA_ROOT / "v2").iterdir()})
+    assert expected_schemas.isdisjoint({path.name for path in (SCHEMA_ROOT / "v1").iterdir()})
+    assert expected_fixtures.issubset({path.name for path in FIXTURES.iterdir()})
+    assert expected_fixtures.isdisjoint({path.name for path in V1_FIXTURES.iterdir()})
+
+
+@pytest.mark.unit
 def test_autonomy_schema_names_have_no_sensitive_keys() -> None:
     for schema_name in AUTONOMY_SCHEMA_NAMES:
         assert _all_keys(_fixture(schema_name)).isdisjoint(SENSITIVE_FIELDS)
@@ -155,6 +171,17 @@ def test_reason_code_set_extends_the_v1_closed_set() -> None:
     assert "APPROVED_AUTONOMOUS" in AUTONOMY_REASON_CODES
     assert "APPROVAL_REQUIRED" not in AUTONOMY_REASON_CODES
     assert (v1_codes - {"APPROVAL_REQUIRED"}).issubset(AUTONOMY_REASON_CODES)
+
+
+@pytest.mark.unit
+def test_pure_evaluator_and_runtime_reason_codes_are_explicitly_disjoint() -> None:
+    # POLICY_DENIED and DECISION_EXPIRED are reserved for runtime checks that
+    # occur after the pure evaluator returns. Keeping them out of the evaluator
+    # set prevents callers from mistaking policy resolution or clock checks for
+    # a result produced by evaluate_autonomy_policy.
+    assert AUTONOMY_RUNTIME_REASON_CODES == {"POLICY_DENIED", "DECISION_EXPIRED"}
+    assert AUTONOMY_EVALUATOR_REASON_CODES.isdisjoint(AUTONOMY_RUNTIME_REASON_CODES)
+    assert AUTONOMY_EVALUATOR_REASON_CODES | AUTONOMY_RUNTIME_REASON_CODES == AUTONOMY_REASON_CODES
 
 
 # -- Valid fixtures ----------------------------------------------------------
@@ -394,6 +421,23 @@ def test_decision_effective_must_be_minimum() -> None:
 
 
 @pytest.mark.unit
+def test_decision_rejects_expiry_after_observation() -> None:
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    decision["decision_expires_at"] = "2026-09-21T19:13:53Z"
+    with pytest.raises(AutonomyContractError, match="current-state observation"):
+        validate_autonomy_contract(AUTONOMOUS_DECISION_SCHEMA_NAME, decision)
+
+
+@pytest.mark.unit
+def test_operation_rejects_expiry_after_observation() -> None:
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    operation["decision_expires_at"] = "2026-09-21T19:13:53Z"
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+    with pytest.raises(AutonomyContractError, match="current-state observation"):
+        validate_autonomy_contract(AUTONOMOUS_OPERATION_SCHEMA_NAME, operation)
+
+
+@pytest.mark.unit
 def test_operation_rejects_tampered_hash() -> None:
     operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
     operation["target"]["fleet_id"] = "fleet-deadbeef-0000-0000-0000-000000000000"
@@ -420,6 +464,25 @@ def test_operation_rejects_non_operate_execution_authority() -> None:
 
 
 # -- Binding failures --------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_binding_fails_when_decision_expiry_exceeds_policy_ttl() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+
+    # Keep the observation valid beyond the attempted grant so this case
+    # isolates the independent policy-TTL clamp.
+    decision["current_state"]["expires_at"] = "2026-09-21T19:20:00Z"
+    decision["decision_expires_at"] = "2026-09-21T19:13:53Z"
+    operation["current_state"]["expires_at"] = "2026-09-21T19:20:00Z"
+    operation["decision_expires_at"] = decision["decision_expires_at"]
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="policy decision TTL"):
+        validate_autonomous_operation_binding(operation, decision, policy)
 
 
 @pytest.mark.unit
@@ -459,9 +522,9 @@ def test_v1_schema_and_vector_hashes_are_unchanged_by_the_v2_layer() -> None:
     # Local modules
     from operations.playbook_definition import capacity_playbook_hash
 
-    v1_vectors = load_json(FIXTURES / "contract-vectors.json")
-    v1_playbook = load_json(FIXTURES / v1_vectors["playbook_fixture"])
-    v1_operation = load_json(FIXTURES / v1_vectors["prepared_operation_fixture"])
+    v1_vectors = load_json(V1_FIXTURES / "contract-vectors.json")
+    v1_playbook = load_json(V1_FIXTURES / v1_vectors["playbook_fixture"])
+    v1_operation = load_json(V1_FIXTURES / v1_vectors["prepared_operation_fixture"])
 
     assert canonical_sha256(v1_playbook) == v1_vectors["expected"]["playbook_hash"]
     assert canonical_sha256(v1_operation) == v1_vectors["expected"]["prepared_operation_hash"]
