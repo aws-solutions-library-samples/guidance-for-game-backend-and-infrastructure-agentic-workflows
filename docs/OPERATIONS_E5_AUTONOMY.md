@@ -70,6 +70,8 @@ GBAW_OPERATIONS_TABLE_NAME=game-agent-operations \
 GBAW_OPERATIONS_KMS_KEY_ARN=arn:aws:kms:us-west-2:000000000000:key/EXAMPLE \
 GBAW_OPERATIONS_EXECUTION_STATE_MACHINE_ARN=arn:aws:states:us-west-2:000000000000:stateMachine:game-agent-operations-execution \
 GBAW_OPERATIONS_ENROLLED_FLEET_ID=fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555 \
+GBAW_OPERATIONS_ENROLLED_FLEET_ARN=arn:aws:gamelift:us-west-2:000000000000:fleet/fleet-0000aaaa-11bb-22cc-33dd-4444eeee5555 \
+GBAW_OPERATIONS_TRUSTED_AUDIENCE=aud.default \
 GBAW_OPERATIONS_TENANT_ID=tenant.default \
 GBAW_OPERATIONS_WORKSPACE_ID=workspace.default \
 GBAW_OPERATIONS_AUTONOMY_SUBJECT=automation.gamelift-capacity-autonomy \
@@ -110,14 +112,22 @@ scripts/infrastructure/teardown-operations-autonomy.sh --confirm delete-operatio
 7. Size-safely deploys the 09 stack via `--template-url` (over the 51,200-byte
    inline limit) after service-validating it, then deletes the transient
    template object.
-8. **Verifies** the deployed evaluator `CodeSha256` matches the built artifact,
+8. **Verifies** the exact 07 E3 workflow is a **STANDARD** Step Functions
+   state machine in the **same account and region** before enabling (refusing an
+   EXPRESS or cross-account/region workflow).
+9. **Verifies** the deployed evaluator `CodeSha256` matches the built artifact,
    failing closed on any mismatch.
+10. **Enables the 07 executor pre-write hook**: updates the 07 stack to
+    `AutonomyMode=operate` and binds the 09-created autonomy AppConfig ids and
+    policy pins, reusing every other 07 value. The evaluator only *starts* the
+    workflow; the executor's own pre-write hook is the gate that re-checks the
+    autonomy switch and durable window before the single provider write.
 
 ## Cost
 
 See [`operations-e5-cost-notes.md`](operations-e5-cost-notes.md) (machine-checked
-by `operations-e5-cost-model.json`). Default $0; provisioned-disabled ≈ $0.20/mo;
-enabled-idle ≈ $0.24/mo, incremental over E1–E4.
+by `operations-e5-cost-model.json`). Default $0; provisioned-disabled ≈ $0.40/mo;
+enabled-idle ≈ $0.44/mo, incremental over E1–E4 (four AWS-emitted alarms).
 
 ## Invariants (enforced by tests)
 
@@ -130,4 +140,15 @@ enabled-idle ≈ $0.24/mo, incremental over E1–E4.
   read on the two exact switch documents.
 - The autonomy AppConfig switch is separate from the E4 kill switch; the E4
   schema is unchanged.
-- Emergency disable blocks evaluation and immediate pre-write.
+- Emergency disable blocks evaluation and immediate pre-write, and also flips
+  the **07 executor** to `AutonomyMode=disabled` so an in-flight pre-write
+  closes (both stacks fail closed; nothing is deleted).
+- The evaluator log group uses **default (service-managed) CloudWatch**
+  encryption; the 06 CMK cannot encrypt a log group, so no CMK is attached.
+- The four owned alarms all watch **AWS-emitted** metrics (evaluator errors +
+  throttles, scheduled-evaluation delivery failures, DLQ depth); the evaluator
+  emits no custom metrics, and the AppConfig deployment rollback monitor keys
+  off the AWS/Lambda errors alarm.
+- The scheduled EventBridge rule is DISABLED unless the server-owned closed
+  #439 event (observation operation id + exact desired/min/max) is fully
+  specified; it never emits a synthetic event.

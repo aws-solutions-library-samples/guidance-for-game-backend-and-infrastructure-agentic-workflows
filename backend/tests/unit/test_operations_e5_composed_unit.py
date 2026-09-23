@@ -89,3 +89,58 @@ def test_template_env_matches_runtime_required_keys(template: dict) -> None:
     }
     missing = required - injected
     assert not missing, f"template must inject every runtime-required autonomy env key: {sorted(missing)}"
+
+
+# --------------------------------------------------------------------------- #
+# Finding 10: docs / cost / retention must agree with the template and model.
+# --------------------------------------------------------------------------- #
+RUNBOOK = PROJECT_ROOT / "docs/OPERATIONS_E5_AUTONOMY.md"
+COST_MODEL = PROJECT_ROOT / "docs/operations-e5-cost-model.json"
+COST_NOTES = PROJECT_ROOT / "docs/operations-e5-cost-notes.md"
+
+
+def test_runbook_cost_figures_match_the_cost_model() -> None:
+    """The runbook's provisioned-disabled / enabled-idle figures must equal the
+    machine-checked cost model scenarios."""
+    # Standard library
+    import json as _json
+
+    model = _json.loads(COST_MODEL.read_text(encoding="utf-8"))
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    disabled = model["scenarios"]["provisioned_disabled"]["monthly_total_usd"]
+    idle = model["scenarios"]["enabled_idle"]["monthly_total_usd"]
+    assert (
+        f"${disabled:.2f}/mo" in runbook or f"${disabled}" in runbook
+    ), f"runbook must cite the provisioned-disabled cost ${disabled}"
+    assert f"${idle:.2f}/mo" in runbook or f"${idle}" in runbook, f"runbook must cite the enabled-idle cost ${idle}"
+
+
+def test_runbook_deploy_example_includes_required_bindings() -> None:
+    """Finding 10: the runbook's enable example must include the now-required
+    fleet ARN and trusted audience env vars (which the wrapper enforces)."""
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert "GBAW_OPERATIONS_ENROLLED_FLEET_ARN" in runbook
+    assert "GBAW_OPERATIONS_TRUSTED_AUDIENCE" in runbook
+
+
+def test_cost_notes_alarm_count_matches_model(template: dict) -> None:
+    """Finding 10: the cost notes and model must both reflect the template's
+    actual alarm count."""
+    # Standard library
+    import json as _json
+
+    model = _json.loads(COST_MODEL.read_text(encoding="utf-8"))
+    alarms = [name for name, body in template["Resources"].items() if body.get("Type") == "AWS::CloudWatch::Alarm"]
+    assert len(model["alarms"]["e5_owned"]) == len(alarms)
+    notes = COST_NOTES.read_text(encoding="utf-8")
+    # The notes must not claim an out-of-date "two"/"three" alarm count.
+    assert "two E5-owned alarms" not in notes
+    assert "three E5-owned alarms" not in notes
+
+
+def test_09_defines_no_state_machine_of_its_own(template: dict) -> None:
+    """Finding 8: E5 must reuse the EXACT 07 STANDARD workflow, never define its
+    own (even a syntax-only) state machine. The evaluator only StartExecutions
+    the 07 ARN."""
+    own = [n for n, b in template["Resources"].items() if b.get("Type") == "AWS::StepFunctions::StateMachine"]
+    assert not own, f"09 must not define its own state machine, found: {own}"
