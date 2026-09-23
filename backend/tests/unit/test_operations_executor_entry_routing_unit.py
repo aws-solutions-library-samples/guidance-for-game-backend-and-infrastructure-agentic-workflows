@@ -61,13 +61,23 @@ class _V1ReloadStore:
 
 
 class _BundleStore:
-    def __init__(self, bundle: dict[str, Any] | None) -> None:
+    def __init__(self, bundle: dict[str, Any] | None, *, dispatched: bool = True) -> None:
         self._bundle = bundle
+        self._dispatched = dispatched
         self.loads: list[str] = []
+        self.audit_loads: list[str] = []
 
     def load_bundle(self, operation_id: str) -> dict[str, Any] | None:
         self.loads.append(operation_id)
         return self._bundle
+
+    def load_dispatch_audit(self, *, operation_id: str, phase: str) -> dict[str, Any] | None:
+        # The evaluator records ``dispatched`` after a confirmed StartExecution;
+        # the executor requires it before verifying or writing.
+        self.audit_loads.append(f"{phase}:{operation_id}")
+        if phase == "dispatched" and self._dispatched:
+            return {"operation_id": operation_id, "phase": "dispatched", "execution_name": operation_id}
+        return None
 
 
 class _V1Service:

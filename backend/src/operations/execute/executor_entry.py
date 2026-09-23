@@ -318,6 +318,13 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
     if path is not ExecutionPath.AUTONOMOUS:
         raise ExecutorServiceError("reloaded bundle is not an autonomous operation")
 
+    # Require the exact ``dispatched`` audit record BEFORE verifying or writing.
+    # The evaluator records ``dispatched`` only after a confirmed/idempotent
+    # StartExecution; its absence means this execution has no proven dispatch
+    # predecessor (a forged or premature invocation), so the executor fails
+    # closed with no verify, no Describe, and no provider write.
+    _require_dispatched_audit(runtime.bundle_store, invocation.operation_id)
+
     # The stable logical action id is derived once from the reloaded, hash-bound
     # operation and threaded through so the settle always targets the exact
     # in-flight reservation.
@@ -346,6 +353,89 @@ def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease
         generation=1,
         on_settle_failure=on_settle_failure,
     )
+
+
+def build_pre_write_reverify_hook(
+    *,
+    bundle_store: Any,
+    verifier: Any,
+    switch_port: Any,
+    reservation_port: Any,
+) -> Any:
+    """Build the immediate pre-write hook that re-verifies at the current clock.
+
+    The hook runs AFTER the E4 second kill-switch/durable check and IMMEDIATELY
+    BEFORE the single ``UpdateFleetCapacity``. It:
+
+    1. reloads the immutable bundle by the in-flight plan's operation id;
+    2. re-runs the independent :class:`AutonomyExecutionVerifier` against that
+       freshly reloaded evidence at the CURRENT clock — so a decision or
+       rolling-window deadline that was fresh when the first verify ran, but has
+       since been crossed (e.g. the pre-write Describe was slow), fails closed
+       here with no provider write;
+    3. requires the re-verified plan's ``logical_action_id`` to equal the
+       in-flight plan's — a differing action id means the reloaded evidence no
+       longer binds the same write, and the hook fails closed;
+    4. re-checks the separate autonomy switch and atomic reservation ownership
+       (fenced on the reserve generation) one last time.
+
+    Any failure raises, and the executor service converts that into a bounded
+    ``FAILED`` (``PRECONDITION_FAILED``) with no ``UpdateFleetCapacity`` issued.
+    """
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionEvidence
+    from operations.execute.executor_service import ExecutorServiceError
+
+    def _hook(plan: Any) -> None:
+        operation_id = plan.intent["operation_id"]
+        bundle = bundle_store.load_bundle(operation_id)
+        if not isinstance(bundle, Mapping):
+            raise ExecutorServiceError("bundle could not be reloaded for pre-write re-verification")
+        evidence = AutonomyExecutionEvidence(
+            policy=dict(bundle["policy"]),
+            observation=dict(bundle["observation"]),
+            decision=dict(bundle["decision"]),
+            operation=dict(bundle["operation"]),
+            window_state=dict(bundle["window_state"]),
+        )
+        # Re-run the full verifier at the CURRENT clock (its own default clock).
+        reverified = verifier.verify(operation_id=operation_id, evidence=evidence)
+        # The re-verified write must be the SAME logical action; anything else
+        # means the reloaded evidence no longer binds this in-flight write.
+        if reverified.logical_action_id != plan.logical_action_id:
+            raise ExecutorServiceError("pre-write re-verification produced a different action id")
+        # One last separate-switch + reservation-ownership check, fenced on the
+        # reserve generation so a reclaimed (expired-lease-swept) operation fails.
+        switch_port.require_autonomy()
+        reservation_port.require_reservation(
+            operation_id=operation_id,
+            logical_action_id=plan.logical_action_id,
+            generation=1,
+        )
+
+    return _hook
+
+
+def _require_dispatched_audit(bundle_store: Any, operation_id: str) -> None:
+    """Fail closed unless the exact ``dispatched`` audit record exists.
+
+    The v2 autonomous execution is only legitimate if the evaluator durably
+    recorded a confirmed dispatch for this operation id. A bundle store that
+    cannot report the audit, or a missing ``dispatched`` record, refuses the
+    execution before any precondition re-verification or provider write.
+    """
+    # Local modules
+    from operations.execute.executor_service import ExecutorServiceError
+
+    load = getattr(bundle_store, "load_dispatch_audit", None)
+    if load is None:
+        raise ExecutorServiceError("dispatch audit is unavailable for execution")
+    try:
+        record = load(operation_id=operation_id, phase="dispatched")
+    except Exception as exc:  # noqa: BLE001 - any audit read failure fails closed
+        raise ExecutorServiceError("dispatch audit could not be read") from exc
+    if not isinstance(record, dict) or record.get("phase") != "dispatched":
+        raise ExecutorServiceError("operation has no confirmed dispatch record")
 
 
 def _build_runtime() -> AutonomyExecutorRuntime:
@@ -531,18 +621,19 @@ def _build_autonomy_wiring(
     )
 
     # The autonomous ExecutorService: identical write core with an immediate
-    # pre-write hook that re-checks the SEPARATE autonomy switch + reservation
-    # ownership after the E4 second check and immediately before the write.
-    def _pre_write_hook(plan: Any) -> None:
-        switch_port.require_autonomy()
-        # Fence the immediate pre-write ownership check on the reserve generation:
-        # a reclaimed (expired-lease-swept) operation fails closed here, before the
-        # single provider write.
-        reservation_verifier_port.require_reservation(
-            operation_id=plan.intent["operation_id"],
-            logical_action_id=plan.logical_action_id,
-            generation=1,
-        )
+    # pre-write hook that RELOADS the bundle and RE-RUNS the AutonomyExecutionVerifier
+    # at the CURRENT clock (after the E4 second check, immediately before the
+    # write), then re-checks the separate autonomy switch + reservation ownership.
+    # Re-running the verifier here is what catches a clock that crossed the
+    # decision/window deadline DURING the pre-write Describe: the initial verify
+    # ran before Describe, so without this a stale-by-now decision could still be
+    # written.
+    _pre_write_hook = build_pre_write_reverify_hook(
+        bundle_store=bundle_store,
+        verifier=autonomy_verifier,
+        switch_port=switch_port,
+        reservation_port=reservation_verifier_port,
+    )
 
     autonomy_service = ExecutorService(
         verifier=cast("Any", ExecutionVerifierUnused()),

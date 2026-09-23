@@ -243,6 +243,16 @@ class ReservationStore(Protocol):
         """Return the current durable window-state snapshot for ``state_id``."""
         ...
 
+    def sweep_state(self, *, state_id: str, now_epoch_seconds: int) -> bool:
+        """Reclaim the state's active owner iff its lease has expired (no ``Scan``).
+
+        An implementation MUST locate the single active in-flight owner by a
+        durable index (never a table scan), reclaim it ONLY when its bounded
+        lease has passed, and fail closed (no reclaim) on any conditional failure
+        or unavailability. Returns whether a slot was reclaimed.
+        """
+        ...
+
 
 def _next_reserved(stored: dict[str, Any], request: ReservationRequest) -> dict[str, Any]:
     """Return the next window snapshot with one reservation applied.
@@ -475,6 +485,17 @@ class InMemoryReservationStore:
         holder.generation = holder.generation + 1
         return True
 
+    def sweep_state(self, *, state_id: str, now_epoch_seconds: int) -> bool:
+        """Reclaim the state's active owner iff its lease has EXPIRED.
+
+        The reference store already indexes reservations by state, so the
+        owner-index lookup the durable store performs is modelled directly by the
+        existing :meth:`sweep_expired`. Exposed under the unified ``sweep_state``
+        name so the production window loader can call the same recovery entry
+        point on either store.
+        """
+        return self.sweep_expired(state_id=state_id, now_epoch_seconds=now_epoch_seconds)
+
     def _commit(self, stored: dict[str, Any], request: ReservationRequest) -> dict[str, Any]:
         """Return the next reserved snapshot. Overridable seam to model failure."""
         return _next_reserved(stored, request)
@@ -647,13 +668,16 @@ class DynamoDbReservationStore:
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": self._state_pk(request.state_id), "SK": _STATE_SK}),
-                "UpdateExpression": "SET document = :doc, state_revision = :next, in_flight = :one",
+                "UpdateExpression": (
+                    "SET document = :doc, state_revision = :next, in_flight = :one, " "active_operation_id = :owner"
+                ),
                 "ConditionExpression": "state_revision = :expected AND in_flight = :zero",
                 "ExpressionAttributeValues": _marshal(
                     {
                         ":doc": _canonical(advanced),
                         ":next": advanced["state_revision"],
                         ":one": 1,
+                        ":owner": request.operation_id,
                         ":expected": request.expected_revision,
                         ":zero": 0,
                     }
@@ -738,7 +762,9 @@ class DynamoDbReservationStore:
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": self._state_pk(state_id), "SK": _STATE_SK}),
-                "UpdateExpression": "SET document = :doc, state_revision = :next, in_flight = :zero",
+                "UpdateExpression": (
+                    "SET document = :doc, state_revision = :next, in_flight = :zero " "REMOVE active_operation_id"
+                ),
                 "ConditionExpression": "state_revision = :expected AND in_flight = :one",
                 "ExpressionAttributeValues": _marshal(
                     {
@@ -829,7 +855,9 @@ class DynamoDbReservationStore:
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": self._state_pk(state_id), "SK": _STATE_SK}),
-                "UpdateExpression": "SET document = :doc, state_revision = :next, in_flight = :zero",
+                "UpdateExpression": (
+                    "SET document = :doc, state_revision = :next, in_flight = :zero " "REMOVE active_operation_id"
+                ),
                 "ConditionExpression": "state_revision = :expected AND in_flight = :one",
                 "ExpressionAttributeValues": _marshal(
                     {
@@ -878,6 +906,39 @@ class DynamoDbReservationStore:
             _LOGGER.warning("dynamodb_reservation_store sweep unavailable exception_type=%s", type(exc).__name__)
             return False
         return True
+
+    def sweep_state(self, *, state_id: str, now_epoch_seconds: int) -> bool:
+        """Reclaim the state's active owner iff its lease has EXPIRED (no ``Scan``).
+
+        Production recovery entry point that needs no operation id: it reads the
+        window item's ``active_operation_id`` index (written in the reserve
+        transaction, removed on settle/reclaim) and, when an owner is present,
+        delegates to :meth:`sweep_expired` for that exact operation id. A live
+        lease is never reclaimed; a missing owner index or an unavailable read is
+        a fail-closed no-op. This is called by the production window loader before
+        ``current()`` so the next evaluation reclaims only an expired owner.
+        """
+        if not isinstance(now_epoch_seconds, int) or isinstance(now_epoch_seconds, bool) or now_epoch_seconds < 0:
+            raise ReservationStoreError("now_epoch_seconds must be a non-negative integer")
+        owner = self._active_owner(state_id)
+        if owner is None:
+            return False
+        return self.sweep_expired(operation_id=owner, now_epoch_seconds=now_epoch_seconds)
+
+    def _active_owner(self, state_id: str) -> str | None:
+        """Return the window item's active-owner operation id, or ``None``.
+
+        The owner index is a top-level attribute on the window item (never inside
+        the validated ``document``), so a release that ``REMOVE``s it leaves no
+        owner to reclaim.
+        """
+        item = self._get(self._state_pk(state_id), _STATE_SK)
+        if not isinstance(item, dict):
+            return None
+        owner = item.get("active_operation_id")
+        if isinstance(owner, str) and owner.strip():
+            return owner
+        return None
 
     def _audit_put(
         self,

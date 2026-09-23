@@ -383,9 +383,17 @@ class DynamoDbAutonomyPolicyLoader:
             raise AutonomyPolicyLoaderError("stored policy is malformed") from exc
         if not isinstance(document, dict):
             raise AutonomyPolicyLoaderError("stored policy is malformed")
-        # The stored policy must bind to the CONFIGURED hash. A server-owned
-        # config drift (or a tampered record) fails closed rather than executing
-        # a policy the deployment did not pin.
+        # The stored policy must bind to the CONFIGURED id, version, AND hash. A
+        # record whose declared id/version disagrees with the configured pins —
+        # even if its self-hash is internally consistent — is a server-owned
+        # config drift (or a mis-seeded/tampered record) and fails closed rather
+        # than executing a policy the deployment did not pin. Checking the hash
+        # alone is insufficient: the hash binds the bytes, not the deployment's
+        # configured identity.
+        if document.get("policy_id") != policy_id:
+            raise AutonomyPolicyLoaderError("stored policy_id does not match the configured policy id")
+        if document.get("policy_version") != policy_version:
+            raise AutonomyPolicyLoaderError("stored policy_version does not match the configured policy version")
         if document.get("policy_hash") != policy_hash:
             raise AutonomyPolicyLoaderError("stored policy_hash does not match the configured policy hash")
         try:
@@ -419,14 +427,30 @@ def _is_conditional_failure(exc: Exception) -> bool:
 
 
 class DynamoDbWindowStateLoader:
-    """Load the current durable rolling-window state from the reservation store."""
+    """Load the current durable rolling-window state from the reservation store.
 
-    __slots__ = ("_reservation_store",)
+    Before reading the snapshot, the loader sweeps an EXPIRED active owner via the
+    store's ``sweep_state`` (owner-index lookup, no ``Scan``). A crash between
+    reserve and settle leaves a bounded, reclaimable lease rather than a wedged
+    in-flight slot: the next evaluation reclaims the expired owner here, so
+    ``current()`` reflects the released slot and a fresh reservation can proceed.
+    A live lease is never reclaimed, and a sweep failure never blocks the read
+    (the reserve fence still fails closed against a genuinely held slot).
+    """
 
-    def __init__(self, reservation_store: Any) -> None:
+    __slots__ = ("_reservation_store", "_clock")
+
+    def __init__(self, reservation_store: Any, *, clock: Callable[[], datetime] | None = None) -> None:
         self._reservation_store = reservation_store
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def load(self, state_id: str) -> dict[str, Any]:
+        sweep = getattr(self._reservation_store, "sweep_state", None)
+        if sweep is not None:
+            try:
+                sweep(state_id=state_id, now_epoch_seconds=int(self._clock().timestamp()))
+            except Exception:  # noqa: BLE001 - a sweep failure never blocks the read; reserve still fences
+                pass
         state: dict[str, Any] = self._reservation_store.current(state_id)
         return state
 
@@ -653,6 +677,7 @@ class AutonomyModuleRuntime:
         """
         # Local modules
         from operations.autonomy_runtime.handler import RuntimeDispatchOutcome
+        from operations.contracts.execution import logical_action_id
 
         prepared = self._handler._service.prepare(inputs)
         if not prepared.authorized:
@@ -663,16 +688,35 @@ class AutonomyModuleRuntime:
         execution_name = _execution_name(operation_id)
         bundle_store = self._handler._bundle_store
 
-        # Record the request BEFORE any StartExecution so a terminal execution
-        # never claims an unproven predecessor.
-        _best_effort_audit(bundle_store, "record_dispatch_requested", operation_id, execution_name)
+        # The dispatch audit is MANDATORY evidence, not best-effort. Record the
+        # request BEFORE any StartExecution; if that durable write fails we must
+        # NOT start an execution with no request evidence — refuse and release the
+        # in-flight reservation so the slot is not wedged. (The reservation is
+        # taken inside handler.dispatch, so at this point nothing is reserved yet;
+        # a request-audit failure simply refuses before the handler runs.)
+        try:
+            _require_audit(bundle_store, "record_dispatch_requested", operation_id, execution_name)
+        except Exception:  # noqa: BLE001 - a missing request audit refuses before any reserve/start
+            return {"outcome": "refused", "reason": "dispatch_requested_audit_failed", "operation_id": operation_id}
 
         result = self._handler.dispatch(inputs)
 
-        if result.outcome is RuntimeDispatchOutcome.DISPATCHED:
-            _best_effort_audit(bundle_store, "record_dispatched", operation_id, execution_name)
-            return {"outcome": "dispatched", "operation_id": operation_id}
-        return {"outcome": "refused", "reason": result.reason, "operation_id": operation_id}
+        if result.outcome is not RuntimeDispatchOutcome.DISPATCHED:
+            return {"outcome": "refused", "reason": result.reason, "operation_id": operation_id}
+
+        # A confirmed/idempotent start MUST be durably recorded before we report a
+        # proven dispatch. If the confirming audit fails, refuse and release the
+        # in-flight reservation: an execution the runtime cannot prove it recorded
+        # is not claimed as dispatched, and the executor's own reload requires the
+        # exact dispatched audit before it verifies or writes.
+        try:
+            _require_audit(bundle_store, "record_dispatched", operation_id, execution_name)
+        except Exception:  # noqa: BLE001 - an unrecorded start is not a proven dispatch
+            action_id = logical_action_id(operation_id, prepared.operation["prepared_hash"])
+            self._handler._release_in_flight(operation_id, action_id)
+            return {"outcome": "refused", "reason": "dispatched_audit_failed", "operation_id": operation_id}
+
+        return {"outcome": "dispatched", "operation_id": operation_id}
 
 
 def _execution_name(operation_id: str) -> str:
@@ -688,21 +732,20 @@ def _execution_name(operation_id: str) -> str:
     return operation_id[:80]
 
 
-def _best_effort_audit(bundle_store: Any, method_name: str, operation_id: str, execution_name: str) -> None:
-    """Write a dispatch audit record when the store supports it.
+def _require_audit(bundle_store: Any, method_name: str, operation_id: str, execution_name: str) -> None:
+    """Durably write a MANDATORY dispatch audit record; raise on any failure.
 
-    A missing method (older bundle-store port) or a store hiccup must not mask
-    the dispatch outcome; the audit is durable evidence, not a gate. An immutable
-    conditional-refusal on an identical record is already idempotent inside the
-    store, so only truly unexpected failures are swallowed here.
+    The dispatch audit is fail-closed evidence, not a best-effort side note. A
+    bundle store that cannot record the audit (missing method or a store failure)
+    MUST NOT let a dispatch be treated as proven: the caller refuses and releases
+    the reservation. An immutable conditional-refusal on a byte-identical record
+    is already reconciled to success inside the store, so an idempotent replay
+    does not raise here.
     """
     method = getattr(bundle_store, method_name, None)
     if method is None:
-        return
-    try:
-        method(operation_id=operation_id, execution_name=execution_name)
-    except Exception:  # noqa: BLE001 - an audit write never masks the dispatch outcome
-        pass
+        raise RuntimeError(f"bundle store does not support {method_name}")
+    method(operation_id=operation_id, execution_name=execution_name)
 
 
 def build_evaluator_handler(
