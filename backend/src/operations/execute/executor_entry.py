@@ -23,6 +23,26 @@ It bootstraps:
 
 The frozen environment contract is resolved and validated once at first
 invocation (fail closed). Importing this module is side-effect free and AWS-free.
+
+E5 bounded-autonomy routing (issue #439)
+----------------------------------------
+The executor reloads the operation and selects its execution path from the
+immutable, server-owned envelope alone
+(:func:`~operations.autonomy_execution_selection.select_execution_path`). A v1
+``gamelift.capacity-adjustment/1.0`` operation follows the untouched
+human-approval path (``service.execute`` with the stored granted approval). A v2
+``gamelift.capacity-adjustment/2.0`` autonomous operation is reloaded as its full
+immutable bundle from :class:`~operations.autonomy_runtime.store.DynamoDbAutonomyBundleStore`,
+re-verified by the independent
+:class:`~operations.autonomy_execution_verifier.AutonomyExecutionVerifier`
+against the freshly reloaded bundle — full reloaded evidence, current reservation
+ownership, a fresh separate autonomy switch, the E4 cached and durable execute
+gate, then the immediate pre-write checks — and its VerifiedExecutionPlan is fed
+into the existing :meth:`ExecutorService.execute_verified` write core via
+:func:`execute_autonomous`, which always **settles** the in-flight reservation on
+every terminal/failed handoff. No model output authorizes, alters policy/limits,
+dispatches, or reaches the provider; the executor holds the only provider-write
+credential and remains the sole GameLift writer.
 """
 
 from __future__ import annotations
@@ -32,12 +52,15 @@ import os
 import time
 from collections.abc import Mapping
 from functools import lru_cache
-from typing import Any
+from typing import Any, cast
 
 # Local modules
 from operations.evidence import OperationEvidence
 
 _APPROVED_STATE = "approved"
+
+# Terminal outcomes that indicate a successful (or already-reconciled) write.
+_SUCCESS_OUTCOMES = frozenset({"SUCCEEDED", "RECONCILED"})
 
 
 class EvidenceExecutionReloadStore:
@@ -56,20 +79,465 @@ class EvidenceExecutionReloadStore:
         return evidence.operation, evidence.approval, evidence.state
 
 
+def _settle_terminal(result: dict[str, Any] | None) -> str:
+    """Map a terminal execution result to the reservation settle terminal token."""
+    if isinstance(result, Mapping) and result.get("outcome") in _SUCCESS_OUTCOMES:
+        return "succeeded"
+    return "failed"
+
+
+def execute_autonomous(
+    invocation: Any,
+    *,
+    bundle: Mapping[str, Any],
+    logical_action_id: str,
+    verifier: Any,
+    service: Any,
+    reservation: Any,
+    lease_holder: str,
+    generation: int | None = None,
+    on_settle_failure: Any = None,
+) -> dict[str, Any]:
+    """Run the v2 autonomous path over the existing write core, always settling.
+
+    The stable ``logical_action_id`` is computed once by the caller from the
+    reloaded, hash-bound operation and threaded through so the settle in the
+    ``finally`` always targets the exact in-flight reservation — whether the
+    verifier raises, the write core raises, or a terminal result is recorded.
+
+    Order:
+
+    1. Re-verify every precondition against the freshly reloaded bundle
+       (:class:`AutonomyExecutionVerifier`), producing a VerifiedExecutionPlan.
+    2. Feed the plan into :meth:`ExecutorService.execute_verified`, which runs the
+       identical Describe-before-write / write-once / verify / atomic-record
+       pipeline and re-checks the separate autonomy switch + reservation ownership
+       immediately before the single write via its ``pre_write_hook``.
+    3. **Always** settle the in-flight reservation on the terminal/failed handoff,
+       releasing the concurrency slot (budget/frequency are retained by the store).
+
+    Any verifier or write-core failure fails closed: no false success is
+    fabricated, the in-flight slot is released, and the error propagates so the
+    Step Functions workflow records a failed execution.
+    """
+    result: dict[str, Any] | None = None
+    try:
+        evidence = _build_autonomy_evidence(bundle)
+        plan = verifier.verify(operation_id=invocation.operation_id, evidence=evidence)
+        result = service.execute_verified(invocation, plan=plan, lease_holder=lease_holder)
+        return result
+    finally:
+        # Settle the in-flight reservation on EVERY terminal/failed handoff so the
+        # single concurrency slot is released. A settle failure must never mask the
+        # original outcome/exception and is NEVER retried here (the durable store
+        # already re-reads and fails closed); instead it is surfaced as a
+        # metrics-safe signal so a wedged slot is observable and swept later.
+        terminal = _settle_terminal(result)
+        settle_outcome = _settle_reservation(
+            reservation,
+            operation_id=invocation.operation_id,
+            logical_action_id=logical_action_id,
+            terminal=terminal,
+            generation=generation,
+        )
+        if not settle_outcome and on_settle_failure is not None:
+            try:
+                on_settle_failure()
+            except Exception:  # noqa: BLE001 - metrics must never break the handoff
+                pass
+
+
+def _settle_reservation(
+    reservation: Any,
+    *,
+    operation_id: str,
+    logical_action_id: str,
+    terminal: str,
+    generation: int | None,
+) -> bool:
+    """Best-effort settle that never masks the handoff and never retries.
+
+    Returns ``True`` only when the store reports a released/settled outcome
+    (``RESERVED``); a conflict, unavailability, exception, or a store that does
+    not report an outcome returns ``False`` so the caller can surface a
+    metrics-safe failure. A ``settle`` port that predates the generation fence is
+    called without it (no double-settle, no retry loop).
+    """
+    try:
+        if generation is not None:
+            try:
+                outcome = reservation.settle(
+                    operation_id=operation_id,
+                    logical_action_id=logical_action_id,
+                    terminal=terminal,
+                    generation=generation,
+                )
+            except TypeError:
+                outcome = reservation.settle(
+                    operation_id=operation_id,
+                    logical_action_id=logical_action_id,
+                    terminal=terminal,
+                )
+        else:
+            outcome = reservation.settle(
+                operation_id=operation_id,
+                logical_action_id=logical_action_id,
+                terminal=terminal,
+            )
+    except Exception:  # noqa: BLE001 - a settle failure never masks the handoff outcome
+        return False
+    return _settle_reported_release(outcome)
+
+
+def _settle_reported_release(outcome: Any) -> bool:
+    """Whether a settle return value indicates a truly released/settled slot."""
+    value = getattr(outcome, "outcome", None)
+    if value is None:
+        # A port that returns nothing (e.g. a fake) is treated as a best-effort
+        # success: it raised nothing, so the concurrency slot is considered released.
+        return True
+    return bool(getattr(value, "value", value) == "reserved")
+
+
+def _build_autonomy_evidence(bundle: Mapping[str, Any]) -> Any:
+    """Build the verifier's evidence bundle from a reloaded v2 bundle mapping."""
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionEvidence
+
+    return AutonomyExecutionEvidence(
+        policy=dict(bundle["policy"]),
+        observation=dict(bundle["observation"]),
+        decision=dict(bundle["decision"]),
+        operation=dict(bundle["operation"]),
+        window_state=dict(bundle["window_state"]),
+    )
+
+
 def _region() -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
 
-class _ExecutorRuntime:
-    """The resolved, code-owned executor runtime (services + reload store)."""
+class AutonomyExecutorRuntime:
+    """The resolved, code-owned executor runtime (v1 services + optional v2 wiring).
 
-    def __init__(self, *, service: Any, reload_store: EvidenceExecutionReloadStore, metrics: Any) -> None:
+    The v1 human-approval path is always present. The v2 autonomous path is wired
+    only when the deployment configures the autonomy control plane (bundle store,
+    autonomy verifier, and reservation store); otherwise the v2 pieces are absent
+    and a reloaded v2 operation fails closed (nothing to reload/verify), keeping a
+    default deployment provider-read-only.
+    """
+
+    __slots__ = (
+        "service",
+        "autonomy_service",
+        "reload_store",
+        "metrics",
+        "bundle_store",
+        "autonomy_verifier",
+        "reservation",
+    )
+
+    def __init__(
+        self,
+        *,
+        service: Any,
+        reload_store: EvidenceExecutionReloadStore,
+        metrics: Any,
+        autonomy_service: Any = None,
+        bundle_store: Any = None,
+        autonomy_verifier: Any = None,
+        reservation: Any = None,
+    ) -> None:
         self.service = service
+        self.autonomy_service = autonomy_service if autonomy_service is not None else service
         self.reload_store = reload_store
         self.metrics = metrics
+        self.bundle_store = bundle_store
+        self.autonomy_verifier = autonomy_verifier
+        self.reservation = reservation
+
+    @property
+    def autonomy_enabled(self) -> bool:
+        return self.bundle_store is not None and self.autonomy_verifier is not None and self.reservation is not None
 
 
-def _build_runtime() -> _ExecutorRuntime:
+def execute_reloaded(runtime: AutonomyExecutorRuntime, invocation: Any, *, lease_holder: str) -> dict[str, Any]:
+    """Reload one operation by id and route it to the v1 or v2 execution path.
+
+    The routing decision is made ONLY from the immutable, server-owned reloaded
+    operation envelope (:func:`select_execution_path`), never from model output or
+    a request-body field:
+
+    * A v1 operation reloaded with its granted approval runs the UNCHANGED
+      ``service.execute`` human-approval path.
+    * A v2 operation (no human approval) is reloaded as its full immutable bundle
+      and routed through the AutonomyExecutionVerifier + ``execute_verified`` write
+      core via :func:`execute_autonomous`.
+
+    Fails closed if the operation cannot be reloaded, is not approved (v1), or its
+    envelope does not unambiguously match exactly one known contract.
+    """
+    # Local modules
+    from operations.autonomy_execution_selection import ExecutionPath, SelectionError, select_execution_path
+    from operations.execute.executor_service import ExecutorServiceError
+
+    # 1. The v1 human-approval reload (operation + granted approval + state).
+    reloaded = runtime.reload_store.load_for_execution(invocation.operation_id)
+    if reloaded is not None:
+        prepared_operation, approval, state = reloaded
+        try:
+            path = select_execution_path(prepared_operation)
+        except SelectionError as exc:
+            raise ExecutorServiceError("operation envelope is not recognized") from exc
+        if path is not ExecutionPath.HUMAN_APPROVAL:
+            # A v2 operation must never carry a stored human approval.
+            raise ExecutorServiceError("autonomous operation must not carry a human approval")
+        if state != _APPROVED_STATE:
+            raise ExecutorServiceError("operation is not approved for execution")
+        v1_result: dict[str, Any] = runtime.service.execute(
+            invocation,
+            prepared_operation=prepared_operation,
+            approval=approval,
+            lease_holder=lease_holder,
+        )
+        return v1_result
+
+    # 2. No v1 approval: attempt the v2 autonomous bundle reload.
+    if not runtime.autonomy_enabled:
+        raise ExecutorServiceError("operation is unavailable for execution")
+    bundle = runtime.bundle_store.load_bundle(invocation.operation_id)
+    if bundle is None:
+        raise ExecutorServiceError("operation is unavailable for execution")
+    operation = bundle.get("operation")
+    if not isinstance(operation, Mapping):
+        raise ExecutorServiceError("reloaded bundle is malformed")
+    try:
+        path = select_execution_path(operation)
+    except SelectionError as exc:
+        raise ExecutorServiceError("operation envelope is not recognized") from exc
+    if path is not ExecutionPath.AUTONOMOUS:
+        raise ExecutorServiceError("reloaded bundle is not an autonomous operation")
+
+    # The stable logical action id is derived once from the reloaded, hash-bound
+    # operation and threaded through so the settle always targets the exact
+    # in-flight reservation. It is derived here — before any audit/verify — so the
+    # safe terminal-replay path can key the recorded-result lookup on it.
+    action_id = _derive_v2_action_id(operation)
+
+    # SAFE TERMINAL-REPLAY (issue #439, first E5 blocker). After a successful v2
+    # execution settles the in-flight reservation (generation 1), a retry would
+    # otherwise run the verifier — whose LAST precondition confirms LIVE
+    # reservation ownership — before the E3 store's idempotent replay could return
+    # the already-recorded terminal result, so a genuinely completed operation
+    # reports a spurious precondition failure. Before any live-reservation verify,
+    # consult the existing E3 recorded terminal result for THIS exact derived
+    # action id; when it exists, is contract-valid, terminal, and binds the exact
+    # operation/action ids, return it verbatim with NO Describe, NO provider
+    # write, NO settle, and without running the verifier or the write core. A
+    # missing/nonterminal/malformed/mismatched result never shortcuts: the
+    # invocation continues the normal verify + write path (or fails closed there),
+    # so first attempts (no recorded result) are never bypassed.
+    replayed = _attempt_terminal_replay(runtime, invocation.operation_id, action_id)
+    if replayed is not None:
+        return replayed
+
+    # Require the exact ``dispatched`` audit record BEFORE verifying or writing.
+    # The evaluator records ``dispatched`` only after a confirmed/idempotent
+    # StartExecution; its absence means this execution has no proven dispatch
+    # predecessor (a forged or premature invocation), so the executor fails
+    # closed with no verify, no Describe, and no provider write.
+    _require_dispatched_audit(runtime.bundle_store, invocation.operation_id)
+
+    # The reservation was taken by the runtime handler at generation 1; a sweeper
+    # reclaim of an expired lease bumps the generation, so settling/ownership at
+    # generation 1 correctly fails closed for a reclaimed operation (fencing).
+    on_settle_failure = None
+    metrics = getattr(runtime, "metrics", None)
+    if metrics is not None:
+
+        def on_settle_failure() -> None:  # noqa: E306 - small local closure
+            _emit(metrics, "execution.reservation_settle_failed")
+
+    return execute_autonomous(
+        invocation,
+        bundle=bundle,
+        logical_action_id=action_id,
+        verifier=runtime.autonomy_verifier,
+        service=runtime.autonomy_service,
+        reservation=runtime.reservation,
+        lease_holder=lease_holder,
+        generation=1,
+        on_settle_failure=on_settle_failure,
+    )
+
+
+def build_pre_write_reverify_hook(
+    *,
+    bundle_store: Any,
+    verifier: Any,
+    switch_port: Any,
+    reservation_port: Any,
+) -> Any:
+    """Build the immediate pre-write hook that re-verifies at the current clock.
+
+    The hook runs AFTER the E4 second kill-switch/durable check and IMMEDIATELY
+    BEFORE the single ``UpdateFleetCapacity``. It:
+
+    1. reloads the immutable bundle by the in-flight plan's operation id;
+    2. re-runs the independent :class:`AutonomyExecutionVerifier` against that
+       freshly reloaded evidence at the CURRENT clock — so a decision or
+       rolling-window deadline that was fresh when the first verify ran, but has
+       since been crossed (e.g. the pre-write Describe was slow), fails closed
+       here with no provider write;
+    3. requires the re-verified plan's ``logical_action_id`` to equal the
+       in-flight plan's — a differing action id means the reloaded evidence no
+       longer binds the same write, and the hook fails closed;
+    4. re-checks the separate autonomy switch and atomic reservation ownership
+       (fenced on the reserve generation) one last time.
+
+    Any failure raises, and the executor service converts that into a bounded
+    ``FAILED`` (``PRECONDITION_FAILED``) with no ``UpdateFleetCapacity`` issued.
+    """
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionEvidence
+    from operations.execute.executor_service import ExecutorServiceError
+
+    def _hook(plan: Any) -> None:
+        operation_id = plan.intent["operation_id"]
+        bundle = bundle_store.load_bundle(operation_id)
+        if not isinstance(bundle, Mapping):
+            raise ExecutorServiceError("bundle could not be reloaded for pre-write re-verification")
+        evidence = AutonomyExecutionEvidence(
+            policy=dict(bundle["policy"]),
+            observation=dict(bundle["observation"]),
+            decision=dict(bundle["decision"]),
+            operation=dict(bundle["operation"]),
+            window_state=dict(bundle["window_state"]),
+        )
+        # Re-run the full verifier at the CURRENT clock (its own default clock).
+        reverified = verifier.verify(operation_id=operation_id, evidence=evidence)
+        # The re-verified write must be the SAME logical action; anything else
+        # means the reloaded evidence no longer binds this in-flight write.
+        if reverified.logical_action_id != plan.logical_action_id:
+            raise ExecutorServiceError("pre-write re-verification produced a different action id")
+        # One last separate-switch + reservation-ownership check, fenced on the
+        # reserve generation so a reclaimed (expired-lease-swept) operation fails.
+        switch_port.require_autonomy()
+        reservation_port.require_reservation(
+            operation_id=operation_id,
+            logical_action_id=plan.logical_action_id,
+            generation=1,
+        )
+
+    return _hook
+
+
+def _derive_v2_action_id(operation: Mapping[str, Any]) -> str:
+    """Derive the exact logical action id from the immutable v2 operation.
+
+    Validates that the reloaded operation carries a well-formed ``operation_id``
+    and ``prepared_hash`` (the hash-bound contract fields) and returns the stable
+    ``logical_action_id`` for the ``(operation_id, prepared_hash)`` pair. A
+    missing or malformed field fails closed rather than deriving a bogus id.
+    """
+    # Local modules
+    from operations.contracts.execution import logical_action_id
+    from operations.execute.executor_service import ExecutorServiceError
+
+    operation_id = operation.get("operation_id")
+    prepared_hash = operation.get("prepared_hash")
+    if not isinstance(operation_id, str) or not operation_id.strip():
+        raise ExecutorServiceError("reloaded bundle is malformed")
+    if not isinstance(prepared_hash, str) or not prepared_hash.strip():
+        raise ExecutorServiceError("reloaded bundle is malformed")
+    return logical_action_id(operation_id, prepared_hash)
+
+
+def _attempt_terminal_replay(
+    runtime: AutonomyExecutorRuntime, operation_id: str, action_id: str
+) -> dict[str, Any] | None:
+    """Return an already-recorded, contract-valid terminal result, or ``None``.
+
+    Consults the E3 recorded terminal result for the exact derived
+    ``action_id`` through the narrow, read-only
+    :meth:`ExecutorService.load_recorded_terminal_result`. A result is replayed
+    ONLY when it exists, validates against the execution-result contract, and
+    binds the exact operation id and logical action id. Anything else — no
+    recorded result (a first attempt), a malformed document, or a mismatched
+    operation/action id — returns ``None`` so the caller continues the normal
+    verify + write path. No Describe, provider write, or settle is performed here.
+    """
+    # Local modules
+    from operations.contracts.execution import (
+        EXECUTION_RESULT_SCHEMA_NAME,
+        ExecutionContractError,
+        validate_execution_contract,
+    )
+
+    service = runtime.autonomy_service
+    loader = getattr(service, "load_recorded_terminal_result", None)
+    if loader is None:
+        return None
+    recorded = loader(operation_id=operation_id, logical_action_id=action_id)
+    if not isinstance(recorded, dict):
+        return None
+    # Validate the recorded document against its contract before trusting it.
+    try:
+        validate_execution_contract(EXECUTION_RESULT_SCHEMA_NAME, recorded)
+    except ExecutionContractError:
+        return None
+    # Exact identity binding: the recorded result must be THIS operation and the
+    # exact derived logical action id — never a neighbour or a caller-supplied id.
+    if recorded.get("operation_id") != operation_id:
+        return None
+    if recorded.get("logical_action_id") != action_id:
+        return None
+    return recorded
+
+
+def _require_dispatched_audit(bundle_store: Any, operation_id: str) -> None:
+    """Fail closed unless BOTH matching dispatch audit records exist and agree.
+
+    The v2 autonomous execution is only legitimate if the evaluator durably
+    recorded a confirmed dispatch for this operation id. The store writes two
+    records: a ``dispatch_requested`` before StartExecution and a ``dispatched``
+    only after a confirmed/idempotent start, fenced (in one transaction) on the
+    request. The executor mirrors that contract on read: it loads BOTH records
+    and requires each to be well-formed and to agree on operation id and
+    execution name. A missing record, an unreadable store, a phase mismatch, or
+    a crossed (operation/execution-name) pair refuses the execution before any
+    precondition re-verification or provider write — a lone ``dispatched`` marker
+    is never sufficient.
+    """
+    # Local modules
+    from operations.execute.executor_service import ExecutorServiceError
+
+    load = getattr(bundle_store, "load_dispatch_audit", None)
+    if load is None:
+        raise ExecutorServiceError("dispatch audit is unavailable for execution")
+    try:
+        requested = load(operation_id=operation_id, phase="dispatch_requested")
+        dispatched = load(operation_id=operation_id, phase="dispatched")
+    except Exception as exc:  # noqa: BLE001 - any audit read failure fails closed
+        raise ExecutorServiceError("dispatch audit could not be read") from exc
+
+    if not isinstance(requested, dict) or requested.get("phase") != "dispatch_requested":
+        raise ExecutorServiceError("operation has no confirmed dispatch request record")
+    if not isinstance(dispatched, dict) or dispatched.get("phase") != "dispatched":
+        raise ExecutorServiceError("operation has no confirmed dispatch record")
+    # Both records must bind the SAME operation and execution name; a crossed
+    # pair (or one addressed to another operation/execution) fails closed.
+    if requested.get("operation_id") != operation_id or dispatched.get("operation_id") != operation_id:
+        raise ExecutorServiceError("dispatch audit records do not bind this operation")
+    requested_name = requested.get("execution_name")
+    dispatched_name = dispatched.get("execution_name")
+    if not isinstance(requested_name, str) or not requested_name:
+        raise ExecutorServiceError("dispatch request record is malformed")
+    if requested_name != dispatched_name:
+        raise ExecutorServiceError("dispatch audit records do not agree on execution name")
+
+
+def _build_runtime() -> AutonomyExecutorRuntime:
     # Third-party packages
     import boto3
     from botocore.config import Config as BotocoreConfig
@@ -135,29 +603,170 @@ def _build_runtime() -> _ExecutorRuntime:
         static_authority=obs.mode,
         unavailable_callback=lambda: kill_switch_metrics.record("kill_switch.unavailable"),
     )
+    durable_control_gate = (
+        DynamoDbDurableControlGate(client=dynamodb_client, table_name=obs.table_name)
+        if kill_switch_gate is not None
+        else None
+    )
+
+    # The v1 human-approval service (no pre-write hook: v1 behavior is unchanged).
     service = ExecutorService(
         verifier=verifier,
         adapter=adapter,
         store=execution_store,
         kill_switch_gate=kill_switch_gate,
-        durable_control_gate=(
-            DynamoDbDurableControlGate(
-                client=dynamodb_client,
-                table_name=obs.table_name,
-            )
-            if kill_switch_gate is not None
-            else None
-        ),
+        durable_control_gate=durable_control_gate,
     )
-    return _ExecutorRuntime(
+
+    # The optional v2 autonomous wiring: bundle store, AutonomyExecutionVerifier
+    # (with the fresh separate autonomy switch + reservation ownership ports), the
+    # reservation store, and an autonomous ExecutorService whose immediate
+    # pre-write hook re-checks the separate switch and reservation ownership after
+    # the E4 second check and immediately before the single write. Built only when
+    # the deployment configures the autonomy control plane; otherwise absent so a
+    # default deployment stays provider-read-only.
+    bundle_store, autonomy_verifier, reservation_store, autonomy_service = _build_autonomy_wiring(
+        settings=settings,
+        dynamodb_client=dynamodb_client,
+        adapter=adapter,
+        execution_store=execution_store,
+        kill_switch_gate=kill_switch_gate,
+        durable_control_gate=durable_control_gate,
+    )
+
+    return AutonomyExecutorRuntime(
         service=service,
+        autonomy_service=autonomy_service,
         reload_store=EvidenceExecutionReloadStore(approval_store),
         metrics=metrics,
+        bundle_store=bundle_store,
+        autonomy_verifier=autonomy_verifier,
+        reservation=reservation_store,
     )
+
+
+def _build_autonomy_wiring(
+    *,
+    settings: Any,
+    dynamodb_client: Any,
+    adapter: Any,
+    execution_store: Any,
+    kill_switch_gate: Any,
+    durable_control_gate: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Construct the optional v2 autonomous wiring, or ``(None, None, None, None)``.
+
+    Returns the bundle store, AutonomyExecutionVerifier, reservation store, and an
+    autonomous ExecutorService whose ``pre_write_hook`` re-checks the separate
+    autonomy switch + reservation ownership immediately before the write. Absent
+    unless the deployment fully configures the autonomy control plane (fail
+    closed), so a default deployment provisions no autonomous writer.
+    """
+    # Local modules
+    from operations.autonomy_execution_verifier import AutonomyExecutionAuthorityContext, AutonomyExecutionVerifier
+    from operations.autonomy_runtime.bridges import StoreReservationVerifierPort, SwitchAutonomyPort
+    from operations.autonomy_runtime.evaluator_entry import resolve_autonomy_evaluator_settings
+    from operations.autonomy_runtime.store import DynamoDbAutonomyBundleStore, DynamoDbReservationStore
+    from operations.autonomy_switch import AutonomySwitchGate
+    from operations.control.appconfig_extension import AppConfigExtensionClient
+    from operations.execute.executor_service import ExecutorService
+    from operations.playbook_definition import EXECUTOR_BINDING_VERSION, EXECUTOR_ID
+
+    try:
+        autonomy_settings = resolve_autonomy_evaluator_settings()
+    except ValueError:
+        # Autonomy is default-disabled / not fully configured: no autonomous writer.
+        return None, None, None, None
+
+    obs = settings.observation
+    table_name = obs.table_name
+
+    reservation_store = DynamoDbReservationStore(client=dynamodb_client, table_name=table_name)
+    bundle_store = DynamoDbAutonomyBundleStore(client=dynamodb_client, table_name=table_name)
+
+    autonomy_extension = AppConfigExtensionClient(
+        application=autonomy_settings.appconfig_application,
+        environment=autonomy_settings.appconfig_environment,
+        profile=autonomy_settings.autonomy_switch_profile,
+        port=autonomy_settings.appconfig_extension_port,
+    )
+    switch_gate = AutonomySwitchGate(extension=autonomy_extension)
+    switch_port = SwitchAutonomyPort(switch_gate)
+    reservation_verifier_port = StoreReservationVerifierPort(reservation_store)
+
+    # The code-owned E5 autonomy authority context (operate authority, enrolled
+    # fleet, code-owned policy/playbook/executor identity). The policy id/version/
+    # hash are strict, server-owned deployment inputs the operation must bind
+    # exactly; they are never taken from the operation, the model, or a request.
+    context = AutonomyExecutionAuthorityContext(
+        deployment_mode=obs.mode,
+        capability_maximum=settings.capability_maximum,
+        tenant_id=obs.tenant_id,
+        workspace_id=obs.workspace_id,
+        expected_policy_id=autonomy_settings.autonomy_policy_id,
+        expected_policy_version=autonomy_settings.autonomy_policy_version,
+        expected_policy_hash=autonomy_settings.autonomy_policy_hash,
+        expected_playbook_hash=_autonomy_playbook_hash(),
+        expected_executor_id=EXECUTOR_ID,
+        expected_executor_binding_version=EXECUTOR_BINDING_VERSION,
+        enrolled_fleet_id=settings.enrolled_fleet_id,
+        enrolled_fleet_arn=settings.enrolled_fleet_arn,
+        enrolled_location=settings.enrolled_location,
+    )
+    autonomy_verifier = AutonomyExecutionVerifier(
+        context=context,
+        autonomy_switch=switch_port,
+        reservation=reservation_verifier_port,
+    )
+
+    # The autonomous ExecutorService: identical write core with an immediate
+    # pre-write hook that RELOADS the bundle and RE-RUNS the AutonomyExecutionVerifier
+    # at the CURRENT clock (after the E4 second check, immediately before the
+    # write), then re-checks the separate autonomy switch + reservation ownership.
+    # Re-running the verifier here is what catches a clock that crossed the
+    # decision/window deadline DURING the pre-write Describe: the initial verify
+    # ran before Describe, so without this a stale-by-now decision could still be
+    # written.
+    _pre_write_hook = build_pre_write_reverify_hook(
+        bundle_store=bundle_store,
+        verifier=autonomy_verifier,
+        switch_port=switch_port,
+        reservation_port=reservation_verifier_port,
+    )
+
+    autonomy_service = ExecutorService(
+        verifier=cast("Any", ExecutionVerifierUnused()),
+        adapter=adapter,
+        store=execution_store,
+        kill_switch_gate=kill_switch_gate,
+        durable_control_gate=durable_control_gate,
+        pre_write_hook=_pre_write_hook,
+    )
+    return bundle_store, autonomy_verifier, reservation_store, autonomy_service
+
+
+class ExecutionVerifierUnused:
+    """A v1 verifier placeholder for the autonomous service (never consulted).
+
+    The autonomous path only ever calls ``execute_verified`` (which does not use
+    the v1 verifier), so the autonomous ``ExecutorService`` is constructed with a
+    verifier that fails closed if the v1 ``execute`` entry is ever reached.
+    """
+
+    def verify(self, *, prepared_operation: Any, approval: Any) -> Any:
+        raise RuntimeError("the autonomous executor service does not run the v1 approval verifier")
+
+
+def _autonomy_playbook_hash() -> str:
+    """Return the code-owned autonomy playbook hash."""
+    # Local modules
+    from operations.autonomy_playbook_definition import autonomy_playbook_hash
+
+    return autonomy_playbook_hash()
 
 
 @lru_cache(maxsize=1)
-def _runtime() -> _ExecutorRuntime:
+def _runtime() -> AutonomyExecutorRuntime:
     return _build_runtime()
 
 
@@ -169,7 +778,7 @@ def _emit(metrics: Any, event: str) -> None:
 
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
-    """Step Functions entry: execute one approved operation (identifier only)."""
+    """Step Functions entry: execute one operation (identifier only), v1 or v2."""
     # Local modules
     from operations.execute.executor_service import ExecutionInvocation, ExecutorServiceError
 
@@ -177,19 +786,8 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
     started = time.monotonic()
     try:
         invocation = ExecutionInvocation.from_payload(dict(event) if isinstance(event, Mapping) else event)
-        reloaded = runtime.reload_store.load_for_execution(invocation.operation_id)
-        if reloaded is None:
-            raise ExecutorServiceError("operation is unavailable for execution")
-        prepared_operation, approval, state = reloaded
-        if state != _APPROVED_STATE:
-            raise ExecutorServiceError("operation is not approved for execution")
         request_id = _request_id(context)
-        result: dict[str, Any] = runtime.service.execute(
-            invocation,
-            prepared_operation=prepared_operation,
-            approval=approval,
-            lease_holder=request_id,
-        )
+        result: dict[str, Any] = execute_reloaded(runtime, invocation, lease_holder=request_id)
         _emit_outcome(runtime.metrics, result)
         return result
     except ExecutorServiceError:

@@ -545,6 +545,19 @@ def _expected_observation_evidence(observation: dict[str, Any], policy: dict[str
     return evidence
 
 
+def project_observation_evidence(observation: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    """Return the single canonical autonomy projection of one E1 observation.
+
+    Public, stable entry point for the deterministic observation-evidence
+    projection the binding validator computes. An assembler (e.g. the E5 runtime
+    service) uses this to build the exact ``current_state`` evidence a decision
+    and prepared operation must embed, so the produced documents bind without
+    drift. Raises :class:`AutonomyContractError` when the observation is not the
+    policy's own (invalid, wrong principal/tenant/workspace/target/location).
+    """
+    return _expected_observation_evidence(observation, policy)
+
+
 def _window_state_reference(window_state: dict[str, Any]) -> dict[str, Any]:
     return {
         "state_id": window_state["state_id"],
