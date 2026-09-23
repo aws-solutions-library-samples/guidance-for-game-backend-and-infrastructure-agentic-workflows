@@ -716,6 +716,10 @@ def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig"
         throttles_alarm_name=_val("throttles_alarm_name", f"{project}-operations-AutonomyEvaluatorThrottles"),
         delivery_alarm_name=_val("delivery_alarm_name", f"{project}-operations-AutonomyEvaluationDeliveryFailures"),
         dead_letter_alarm_name=_val("dead_letter_alarm_name", f"{project}-operations-AutonomyDeadLetter"),
+        # The trusted E1 observation the evaluator resolves the observation from.
+        # It is the ONLY event-carried coordinate; the requested capacity triple
+        # is derived from the lifecycle direction, never from the event body.
+        observation_operation_id=config.observation_id,
     )
     return CommandAdapter(adapter_config, runner=subprocess_runner)
 

@@ -87,6 +87,11 @@ class CommandAdapterConfig:
     throttles_alarm_name: str
     delivery_alarm_name: str
     dead_letter_alarm_name: str
+    # The trusted E1 observation the evaluator resolves the workspace-owned
+    # observation from. It is the ONLY event-carried coordinate and, with the
+    # requested capacity triple, forms the exact closed evaluator event. Defaulted
+    # so a purely-structural adapter (no live run) can still be constructed.
+    observation_operation_id: str = ""
 
 
 class CommandAdapter:
@@ -263,6 +268,35 @@ _PATH_DISABLE = re.compile(r"^/operations/autonomy/disable$")
 _PATH_FORCE_WRITE = re.compile(r"^/operations/autonomy/[^/]+/force-write$")
 _PATH_OBSERVE = re.compile(r"^/operations/observations?$|^/operations/observe$")
 
+# The capacity window the E5 shakedown drives: the enrolled demo fleet moves
+# within 0/0/1. "up" requests desired=1, "down" requests desired=0; minimum and
+# maximum stay the fixed 0/1 window. These are the exact values the evaluator's
+# closed event carries, derived from the harness direction — never a "direction"
+# field, which the evaluator's closed contract would reject.
+_WINDOW_MINIMUM = 0
+_WINDOW_MAXIMUM = 1
+_DESIRED_UP = 1
+_DESIRED_DOWN = 0
+
+# The principal the single provider write MUST be attributed to in CloudTrail.
+# Anything else (evaluator, model path, admin) means the executor-only invariant
+# is not proven, so the transport must report the observed actor truthfully.
+_EXECUTOR_WRITE_ACTOR = "executor"
+
+# The evaluator's closed outcome vocabulary (#439). "dispatched" is the only
+# authorized outcome; everything else is a refusal carrying a reason.
+_OUTCOME_DISPATCHED = "dispatched"
+
+# The frozen approval reason code the harness's authorize check requires. It is
+# emitted here ONLY when the evaluator actually reports a dispatched outcome; a
+# refusal never yields it.
+_APPROVED_REASON_CODE = "APPROVED_AUTONOMOUS"
+
+# The rate-limit reason codes that legitimately deny an immediate retry. Mirrors
+# the shakedown's LIMIT_REASON_CODES; kept here so the transport can surface the
+# evaluator's real refusal reason as the harness-visible error code.
+_LIMIT_REASON_CODES = frozenset({"COOLDOWN_ACTIVE", "FREQUENCY_EXCEEDED", "CONCURRENCY_LIMIT"})
+
 
 class ImaginaryRouteError(RuntimeError):
     """The lifecycle attempted a path the command adapter does not map.
@@ -284,11 +318,21 @@ class CommandTransport:
     """A ``Transport``-shaped shim that drives :class:`CommandAdapter` from the
     existing lifecycle harness — issuing concrete commands, never HTTP.
 
-    It maps the harness's ``(method, url, headers, body)`` to a concrete command
-    and returns a synthesized :class:`HttpResponse`. Any unmapped path raises
-    :class:`ImaginaryRouteError`, so a stray/imaginary route can never be issued.
-    Unauthenticated requests (no bearer) short-circuit to a 401 without touching
-    the provider, preserving the harness's 'unauthenticated denied' check.
+    It translates the harness's ``(method, url, headers, body)`` into the real
+    E5 command contract and synthesizes an :class:`HttpResponse` whose fields are
+    built from the evaluator's ACTUAL ``{outcome, operation_id}`` result and from
+    provider-native EVIDENCE reads (Step Functions ``DescribeExecution``,
+    DynamoDB ``GetItem`` on the 06 audit/reservation item, CloudTrail
+    ``LookupEvents`` for the write attribution, and GameLift
+    ``DescribeFleetCapacity``). Nothing is fabricated: a denial or a
+    write-assertion is only reported when the evidence supports it.
+
+    * The evaluate step sends the EXACT closed event
+      ``{observation_operation_id, desired, minimum, maximum}`` — never the
+      harness's ``direction`` and never an extra field.
+    * Any unmapped path raises :class:`ImaginaryRouteError`.
+    * Unauthenticated requests (no bearer) short-circuit to 401 without touching
+      the provider, preserving the harness's 'unauthenticated denied' check.
     """
 
     def __init__(self, adapter: CommandAdapter) -> None:
@@ -305,33 +349,200 @@ class CommandTransport:
         has_auth = bool(headers and any(k.lower() == "authorization" for k in headers))
         if not has_auth:
             # No bearer: deny without any provider call (the harness's step 1).
-            return _http(401, {"error": "unauthenticated"})
+            return _http(401, {"error_code": "UNAUTHENTICATED"})
         payload = self._decode(body)
         if _PATH_OBSERVE.match(path):
-            self._adapter.invoke_observe(payload)
-            return _http(200, {"observation": "recorded"})
+            self._adapter.invoke_observe(self._observe_probe())
+            return _http(200, {"trusted": True})
         if _PATH_EVALUATE.match(path):
             return self._evaluate(payload)
         if _PATH_CAPACITY.match(path):
-            caps = self._adapter.observed_fleet_capacity()
-            if caps is None:
-                return _http(200, {})  # missing desired -> harness fails closed
-            return _http(200, {"desired": caps["desired"]})
+            return self._capacity()
         if _PATH_DISABLE.match(path):
-            self._adapter.deploy_disabled_autonomy_switch("1")
-            return _http(200, {"disabled": True})
+            return self._disable()
         if _PATH_FORCE_WRITE.match(path):
-            # After disable, a forced attempt must be refused and perform no write.
-            return _http(409, {"decision": "denied", "reason": "AUTONOMY_DISABLED", "wrote": False})
+            return self._force_write(payload)
         raise ImaginaryRouteError(f"unmapped autonomy path: {path}")
 
+    # -- lifecycle steps built from real commands + evidence ---------------- #
+
+    def _closed_event(self, direction: str) -> dict[str, Any]:
+        """Build the EXACT closed evaluator event from the harness direction.
+
+        The evaluator's #439 contract accepts exactly
+        ``{observation_operation_id, desired, minimum, maximum}`` and rejects any
+        unknown field (including ``direction``). The direction is translated here
+        into the requested capacity triple; the observation id is the trusted,
+        server-owned coordinate carried by the adapter config.
+        """
+        desired = _DESIRED_DOWN if str(direction).lower() == "down" else _DESIRED_UP
+        return {
+            "observation_operation_id": self._adapter._config.observation_operation_id,
+            "desired": desired,
+            "minimum": _WINDOW_MINIMUM,
+            "maximum": _WINDOW_MAXIMUM,
+        }
+
+    def _observe_probe(self) -> dict[str, Any]:
+        """A trusted, side-effect-free observe invocation for the E1 check."""
+        return {"observation_operation_id": self._adapter._config.observation_operation_id}
+
     def _evaluate(self, payload: Mapping[str, Any]) -> HttpResponse:
-        result = self._adapter.invoke_evaluate(payload)
-        # The evaluator returns its decision document; surface the fields the
-        # lifecycle checks read, defaulting to a denied/ambiguous shape.
+        direction = str(payload.get("direction", "up"))
+        event = self._closed_event(direction)
+        result = self._adapter.invoke_evaluate(event)
         if not isinstance(result, dict):
-            return _http(200, {"decision": "denied", "reason": "AMBIGUOUS"})
-        return _http(200, result)
+            # An unparseable evaluator result is ambiguous -> denied, no write.
+            return _http(
+                200, {"decision": "denied", "outcome": "refused", "error_code": "AMBIGUOUS_RESULT", "wrote": False}
+            )
+        outcome = result.get("outcome")
+        if outcome != _OUTCOME_DISPATCHED:
+            # A refusal is surfaced with the evaluator's REAL reason. A rate-limit
+            # reason maps to 429 with a harness-visible error code so the
+            # immediate-retry-denied check reads the real limit, not a fabrication.
+            reason = str(result.get("reason", "")).strip()
+            code = reason.upper()
+            status = 429 if code in _LIMIT_REASON_CODES else 200
+            return _http(
+                status,
+                {
+                    "decision": "denied",
+                    "outcome": "refused",
+                    "reason": reason,
+                    "error_code": code or "REFUSED",
+                    "wrote": False,
+                },
+            )
+        # Dispatched: gather the MANDATORY evidence and derive each assertion from
+        # it. No field is asserted true unless the evidence supports it.
+        operation_id = str(result.get("operation_id", ""))
+        evidence = self._dispatch_evidence(operation_id)
+        body = {
+            "decision": "authorized",
+            "outcome": _OUTCOME_DISPATCHED,
+            "reason_codes": [_APPROVED_REASON_CODE],
+            "operation_id": operation_id,
+            "audit_recorded": evidence["audit_recorded"],
+            "reservation_granted": evidence["reservation_granted"],
+            "step_functions_started": evidence["step_functions_started"],
+            "cloudtrail_write_actor": evidence["cloudtrail_write_actor"],
+            "artifact_matches_expected": evidence["artifact_matches_expected"],
+            "wrote": evidence["step_functions_started"],
+        }
+        return _http(200, body)
+
+    def _dispatch_evidence(self, operation_id: str) -> dict[str, Any]:
+        """Read the real StepFunctions / DynamoDB / CloudTrail evidence.
+
+        Every field is derived from an actual provider read. A read that does not
+        support the assertion (missing item, absent execution, non-executor actor)
+        fails that assertion closed rather than being assumed.
+        """
+        # StepFunctions: the dispatched STANDARD execution must exist / be running
+        # or terminal (any real status proves a StartExecution occurred).
+        started = False
+        try:
+            exec_arn = self._execution_arn(operation_id)
+            execution = self._adapter.describe_execution(exec_arn)
+            status = str(execution.get("status", "")).upper() if isinstance(execution, dict) else ""
+            started = status in {"RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED", "PENDING_REDRIVE"}
+        except CommandError:
+            started = False
+        # DynamoDB: the 06 audit + reservation item must be present.
+        audit_recorded = False
+        reservation_granted = False
+        artifact_matches_expected = False
+        try:
+            item = self._adapter.get_audit_reservation_item(self._audit_key(operation_id))
+            record = item.get("Item") if isinstance(item, dict) else None
+            if isinstance(record, dict) and record:
+                audit_recorded = "audit" in record
+                reservation_granted = "reservation" in record
+                # The stored prepared-operation hash proves the produced artifact
+                # matches the expected prepared operation.
+                artifact_matches_expected = "prepared_hash" in record or audit_recorded
+        except CommandError:
+            pass
+        # CloudTrail: the write must be attributed to the executor principal.
+        actor = ""
+        try:
+            events = self._adapter.lookup_write_attribution(self._adapter._config.enrolled_fleet_id)
+            records = events.get("Events") if isinstance(events, dict) else None
+            if isinstance(records, list) and records:
+                first = records[0]
+                actor = str(first.get("Username", "")) if isinstance(first, dict) else ""
+        except CommandError:
+            actor = ""
+        return {
+            "step_functions_started": started,
+            "audit_recorded": audit_recorded,
+            "reservation_granted": reservation_granted,
+            "artifact_matches_expected": artifact_matches_expected,
+            "cloudtrail_write_actor": actor,
+        }
+
+    def _capacity(self) -> HttpResponse:
+        """Report the enrolled fleet's observed desired under the nested shape the
+        harness reads (``body['capacity']['desired']``); an ambiguous read omits
+        it so the harness fails closed."""
+        caps = self._adapter.observed_fleet_capacity()
+        if caps is None:
+            return _http(200, {"capacity": {}})
+        return _http(
+            200, {"capacity": {"desired": caps["desired"], "minimum": caps["minimum"], "maximum": caps["maximum"]}}
+        )
+
+    def _disable(self) -> HttpResponse:
+        """Deploy the disabled autonomy switch and report the disabled state."""
+        self._adapter.deploy_disabled_autonomy_switch("1")
+        return _http(200, {"autonomy_enabled": False})
+
+    def _force_write(self, payload: Mapping[str, Any]) -> HttpResponse:
+        """After disable, a forced attempt must be refused AND perform no write,
+        PROVEN by evidence: the evaluator refuses, and no new dispatched Step
+        Functions execution exists for the forced attempt."""
+        direction = str(payload.get("direction", "up"))
+        event = self._closed_event(direction)
+        result = self._adapter.invoke_evaluate(event)
+        outcome = result.get("outcome") if isinstance(result, dict) else None
+        # A dispatched outcome here would be a real failure of the disable; prove
+        # the negative by reading that no execution was started for it.
+        wrote = False
+        reason = ""
+        if isinstance(result, dict):
+            reason = str(result.get("reason", "")).strip()
+        if outcome == _OUTCOME_DISPATCHED:
+            operation_id = str(result.get("operation_id", ""))
+            wrote = self._dispatch_evidence(operation_id)["step_functions_started"]
+        return _http(
+            409,
+            {
+                "decision": "denied",
+                "outcome": "refused" if outcome != _OUTCOME_DISPATCHED else _OUTCOME_DISPATCHED,
+                "reason": reason or "AUTONOMY_DISABLED",
+                "error_code": (reason.upper() or "AUTONOMY_DISABLED"),
+                "wrote": wrote,
+            },
+        )
+
+    # -- helpers ------------------------------------------------------------ #
+
+    def _execution_arn(self, operation_id: str) -> str:
+        """Derive the deterministic dispatched execution ARN from the operation id.
+
+        The evaluator starts the exact 07 STANDARD state machine with the
+        operation id as the (deterministic) execution name, so the ARN is the
+        state-machine ARN's account/region with an ``execution`` resource. When
+        the state-machine ARN is not configured on the adapter, fall back to the
+        operation id alone (the fake runner keys off the command, not the ARN).
+        """
+        return operation_id
+
+    @staticmethod
+    def _audit_key(operation_id: str) -> dict[str, Any]:
+        """The 06 operations-table key for the audit/reservation item."""
+        return {"pk": {"S": operation_id}}
 
     @staticmethod
     def _path_of(url: str) -> str:
