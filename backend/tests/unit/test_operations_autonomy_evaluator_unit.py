@@ -18,7 +18,13 @@ import pytest
 
 # Local modules
 from operations.contracts import load_json
-from operations.contracts.autonomy import evaluate_autonomy_policy
+from operations.contracts.autonomy import (
+    AutonomyContractError,
+    autonomy_evidence_hash,
+    autonomy_policy_hash,
+    autonomy_window_state_hash,
+    evaluate_autonomy_policy,
+)
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "operations" / "v2"
 
@@ -44,25 +50,25 @@ _PRINCIPAL = {
 
 
 def _observation() -> dict[str, Any]:
-    return {
-        "capacity": {"desired": 0, "minimum": 0, "maximum": 1},
-        "tenant_id": "tenant.default",
-        "workspace_id": "workspace.default",
-        "target_enrolled": True,
-        "observed_at_epoch_seconds": 1_000_000,
-    }
+    return load_json(FIXTURES / "gamelift-capacity-autonomy-observation-evidence.valid.json")
 
 
 def _window() -> dict[str, Any]:
-    return {
-        "last_write_epoch_seconds": None,
-        "writes_in_window": 0,
-        "window_micro_usd": 0,
-        "action_micro_usd": 100000,
-        "in_flight": 0,
-        "seconds_since_opposite_change": None,
-        "direction_flips_in_window": 0,
-    }
+    return load_json(FIXTURES / "gamelift-capacity-autonomy-window-state.valid.json")
+
+
+def _changed_observation(**changes: Any) -> dict[str, Any]:
+    observation = _observation()
+    observation.update(changes)
+    observation["evidence_hash"] = autonomy_evidence_hash(observation)
+    return observation
+
+
+def _changed_window(**changes: Any) -> dict[str, Any]:
+    window = _window()
+    window.update(changes)
+    window["state_hash"] = autonomy_window_state_hash(window)
+    return window
 
 
 def _evaluate(**overrides: Any) -> dict[str, Any]:
@@ -73,10 +79,48 @@ def _evaluate(**overrides: Any) -> dict[str, Any]:
         "observation": _observation(),
         "requested": {"desired": 1, "minimum": 0, "maximum": 1},
         "window_state": _window(),
-        "now_epoch_seconds": 1_000_060,
+        "now_epoch_seconds": 1_790_017_972,
     }
     kwargs.update(overrides)
     return evaluate_autonomy_policy(**kwargs)
+
+
+@pytest.mark.unit
+def test_unvalidated_widened_policy_fails_closed() -> None:
+    policy = _policy()
+    policy["capacity_bounds"] = {"floor": 0, "ceiling": 2, "max_step": 2}
+    with pytest.raises(AutonomyContractError):
+        _evaluate(policy=policy, requested={"desired": 2, "minimum": 0, "maximum": 2})
+
+
+@pytest.mark.unit
+def test_missing_window_state_fails_closed() -> None:
+    with pytest.raises(AutonomyContractError, match="window"):
+        _evaluate(window_state={})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "field",
+    ["writes_in_window", "window_micro_usd", "action_micro_usd", "in_flight", "direction_flips_in_window"],
+)
+def test_negative_window_state_fails_closed(field: str) -> None:
+    window = _window()
+    window[field] = -1
+    with pytest.raises(AutonomyContractError, match="window"):
+        _evaluate(window_state=window)
+
+
+@pytest.mark.unit
+def test_flip_at_existing_limit_denies() -> None:
+    window = _changed_window(
+        last_write_epoch_seconds=1_790_017_372,
+        last_change_direction="decrease",
+        direction_flips_in_window=1,
+    )
+    result = _evaluate(window_state=window)
+    assert result["decision"] == "denied"
+    assert result["reason_codes"] == ["OSCILLATION_BLOCKED"]
 
 
 @pytest.mark.unit
@@ -126,7 +170,7 @@ def test_non_automation_source_denies() -> None:
 
 @pytest.mark.unit
 def test_workspace_mismatch_denies() -> None:
-    observation = dict(_observation(), workspace_id="workspace.other")
+    observation = _changed_observation(workspace_id="workspace.other")
     result = _evaluate(observation=observation)
     assert result["decision"] == "denied"
     assert result["reason_codes"] == ["WORKSPACE_MISMATCH"]
@@ -134,7 +178,9 @@ def test_workspace_mismatch_denies() -> None:
 
 @pytest.mark.unit
 def test_unenrolled_target_denies() -> None:
-    observation = dict(_observation(), target_enrolled=False)
+    observation = _changed_observation(
+        resource_enrollment={"enrollment_id": "enroll.other", "enrollment_version": "2026-09-01"}
+    )
     result = _evaluate(observation=observation)
     assert result["reason_codes"] == ["TARGET_NOT_ENROLLED"]
 
@@ -151,78 +197,132 @@ def test_bounds_exceeded_denies() -> None:
 def test_risk_ceiling_denies() -> None:
     policy = _policy()
     policy["risk"] = {"max_level": "low", "max_score": 5}
-    result = _evaluate(policy=policy)
+    policy["policy_hash"] = autonomy_policy_hash(policy)
+    window = _window()
+    window["policy"]["policy_hash"] = policy["policy_hash"]
+    window["state_hash"] = autonomy_window_state_hash(window)
+    result = _evaluate(policy=policy, window_state=window)
     assert result["decision"] == "denied"
     assert "RISK_LIMIT_EXCEEDED" in result["reason_codes"]
 
 
 @pytest.mark.unit
 def test_stale_observation_denies() -> None:
-    # observed 1_000_000, max_age 120, now beyond age.
-    result = _evaluate(now_epoch_seconds=1_000_600)
+    now = 1_790_018_512
+    window = _changed_window(as_of_epoch_seconds=now, expires_at_epoch_seconds=now + 60)
+    result = _evaluate(now_epoch_seconds=now, window_state=window)
     assert result["reason_codes"] == ["OBSERVATION_STALE"]
 
 
 @pytest.mark.unit
 def test_future_skew_observation_denies() -> None:
-    # observation in the future beyond max_skew (30s).
-    result = _evaluate(now_epoch_seconds=999_960)
+    now = 1_790_017_872
+    window = _changed_window(as_of_epoch_seconds=now, expires_at_epoch_seconds=now + 60)
+    result = _evaluate(now_epoch_seconds=now, window_state=window)
     assert "OBSERVATION_STALE" in result["reason_codes"]
 
 
 @pytest.mark.unit
 def test_action_budget_exceeded_denies() -> None:
-    window = dict(_window(), action_micro_usd=600000)  # > max_action 500000
+    window = _changed_window(action_micro_usd=600000)  # > max_action 500000
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["BUDGET_EXCEEDED"]
 
 
 @pytest.mark.unit
 def test_window_budget_exceeded_denies() -> None:
-    window = dict(_window(), window_micro_usd=1_950_000, action_micro_usd=100000)  # 2.05M > 2M
+    window = _changed_window(window_micro_usd=1_950_000, action_micro_usd=100000)  # 2.05M > 2M
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["BUDGET_EXCEEDED"]
 
 
 @pytest.mark.unit
 def test_cooldown_active_denies() -> None:
-    window = dict(_window(), last_write_epoch_seconds=1_000_000)  # 60s ago < 300s cooldown
+    window = _changed_window(last_write_epoch_seconds=1_790_017_912, last_change_direction="increase")
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["COOLDOWN_ACTIVE"]
 
 
 @pytest.mark.unit
 def test_frequency_exceeded_denies() -> None:
-    window = dict(_window(), writes_in_window=4)  # == max 4
+    window = _changed_window(writes_in_window=4)  # == max 4
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["FREQUENCY_EXCEEDED"]
 
 
 @pytest.mark.unit
 def test_concurrency_limit_denies() -> None:
-    window = dict(_window(), in_flight=1)  # == max_in_flight 1
+    window = _changed_window(in_flight=1)  # == max_in_flight 1
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["CONCURRENCY_LIMIT"]
 
 
 @pytest.mark.unit
 def test_oscillation_opposite_change_denies() -> None:
-    window = dict(_window(), seconds_since_opposite_change=100)  # < 600
+    window = _changed_window(
+        last_write_epoch_seconds=1_790_017_672,
+        last_change_direction="decrease",
+    )
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["OSCILLATION_BLOCKED"]
 
 
 @pytest.mark.unit
 def test_oscillation_direction_flips_denies() -> None:
-    window = dict(_window(), direction_flips_in_window=2)  # > max 1
+    window = _changed_window(
+        last_write_epoch_seconds=1_790_017_372,
+        last_change_direction="decrease",
+        direction_flips_in_window=2,
+    )
     result = _evaluate(window_state=window)
     assert result["reason_codes"] == ["OSCILLATION_BLOCKED"]
 
 
 @pytest.mark.unit
+def test_stale_window_state_denies() -> None:
+    window = _changed_window(as_of_epoch_seconds=1_790_017_850, expires_at_epoch_seconds=1_790_017_971)
+    result = _evaluate(window_state=window)
+    assert result["reason_codes"] == ["WINDOW_STATE_STALE"]
+
+
+@pytest.mark.unit
+def test_window_state_bound_to_another_policy_denies() -> None:
+    window = _window()
+    window["policy"]["policy_version"] = "2026-10-01"
+    window["state_hash"] = autonomy_window_state_hash(window)
+    result = _evaluate(window_state=window)
+    assert result["reason_codes"] == ["POLICY_DENIED"]
+
+
+@pytest.mark.unit
+def test_first_reversal_at_elapsed_time_boundary_is_authorized() -> None:
+    window = _changed_window(
+        last_write_epoch_seconds=1_790_017_372,
+        last_change_direction="decrease",
+        direction_flips_in_window=0,
+    )
+    result = _evaluate(window_state=window)
+    assert result["decision"] == "authorized"
+
+
+@pytest.mark.unit
+def test_same_direction_at_flip_limit_is_not_oscillation() -> None:
+    window = _changed_window(
+        last_write_epoch_seconds=1_790_017_372,
+        last_change_direction="increase",
+        direction_flips_in_window=1,
+    )
+    result = _evaluate(window_state=window)
+    assert result["decision"] == "authorized"
+
+
+@pytest.mark.unit
 def test_multiple_breaches_are_all_reported_sorted_without_authorized() -> None:
-    observation = dict(_observation(), target_enrolled=False, workspace_id="workspace.other")
-    window = dict(_window(), in_flight=1)
+    observation = _changed_observation(
+        workspace_id="workspace.other",
+        resource_enrollment={"enrollment_id": "enroll.other", "enrollment_version": "2026-09-01"},
+    )
+    window = _changed_window(in_flight=1)
     result = _evaluate(observation=observation, window_state=window)
     assert result["decision"] == "denied"
     assert result["reason_codes"] == sorted(result["reason_codes"])

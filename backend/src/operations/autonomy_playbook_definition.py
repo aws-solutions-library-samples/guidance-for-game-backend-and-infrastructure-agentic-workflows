@@ -2,7 +2,8 @@
 
 The E5 autonomous prepared operation and its policy bind a ``playbook_hash`` — a
 stable, deterministic digest of the *complete* trusted bounded-autonomy playbook
-a future autonomous executor would honor. This is a **v2** playbook
+and every transitive v2, E1 observation, and shared-common schema hash that a
+future autonomous executor would honor. This is a **v2** playbook
 (``gamelift.capacity-adjustment/2.0``): it is deliberately distinct from the E2
 ``playbook.gamelift-capacity`` / ``1.0.0`` definition and produces a **distinct
 hash**, so a v1 human-approved operation and a v2 autonomous operation can never
@@ -30,12 +31,16 @@ from typing import Any, Mapping
 # Local modules
 from operations.contracts.autonomy import (
     ACTION,
+    AUTONOMY_SCHEMA_NAMES,
     CAPABILITY_ID,
     CAPABILITY_VERSION,
     PROFILE,
     REQUIRED_EXECUTION_AUTHORITY,
+    load_autonomy_schema,
 )
 from operations.contracts.canonical import canonical_sha256
+from operations.contracts.observation import load_observation_schema
+from operations.contracts.validation import load_schema
 
 PLAYBOOK_ID = "playbook.gamelift-capacity-autonomy"
 PLAYBOOK_VERSION = "2.0.0"
@@ -101,6 +106,22 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def _schema_bindings() -> list[dict[str, str]]:
+    """Return sorted hashes for every schema interpreted by this playbook."""
+    schemas = [load_schema("common"), load_observation_schema()]
+    schemas.extend(load_autonomy_schema(name) for name in sorted(AUTONOMY_SCHEMA_NAMES))
+    return sorted(
+        (
+            {
+                "schema_id": schema["$id"],
+                "schema_hash": canonical_sha256(schema),
+            }
+            for schema in schemas
+        ),
+        key=lambda binding: binding["schema_id"],
+    )
+
+
 def _build_definition() -> dict[str, Any]:
     return {
         "playbook_id": PLAYBOOK_ID,
@@ -111,6 +132,7 @@ def _build_definition() -> dict[str, Any]:
             "capability_id": CAPABILITY_ID,
             "capability_version": CAPABILITY_VERSION,
         },
+        "schemas": _schema_bindings(),
         "retry_policy": _plain(RETRY_POLICY),
         "capacity_bounds": _plain(CAPACITY_BOUNDS),
         "preconditions": list(PRECONDITIONS),

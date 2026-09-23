@@ -24,17 +24,37 @@ from operations.autonomy_playbook_definition import (
     PLAYBOOK_VERSION,
     autonomy_playbook_hash,
 )
-from operations.contracts import canonical_sha256
+from operations.contracts import canonical_sha256, load_schema
+from operations.contracts.autonomy import AUTONOMY_SCHEMA_NAMES, load_autonomy_schema
+from operations.contracts.observation import load_observation_schema
 from operations.playbook_definition import EXECUTOR_ID as V1_EXECUTOR_ID
 from operations.playbook_definition import capacity_playbook_hash
 
-_EXPECTED_AUTONOMY_PLAYBOOK_HASH = "sha256:1aad3dc54c42e729e27cab78394ad17fc44d397e58ba20521a470890431b19c1"
+_EXPECTED_AUTONOMY_PLAYBOOK_HASH = "sha256:29b3047e98446ce4f919610418fd28ecba7339dfdb28382846913749f283b52f"
 
 
 @pytest.mark.unit
 def test_autonomy_playbook_hash_is_pinned() -> None:
     assert autonomy_playbook_hash() == canonical_sha256(AUTONOMY_PLAYBOOK_DEFINITION)
     assert autonomy_playbook_hash() == _EXPECTED_AUTONOMY_PLAYBOOK_HASH
+
+
+@pytest.mark.unit
+def test_autonomy_playbook_binds_every_transitive_schema_hash() -> None:
+    schemas = [load_schema("common"), load_observation_schema()]
+    schemas.extend(load_autonomy_schema(name) for name in sorted(AUTONOMY_SCHEMA_NAMES))
+    expected = {schema["$id"]: canonical_sha256(schema) for schema in schemas}
+    actual = {binding["schema_id"]: binding["schema_hash"] for binding in AUTONOMY_PLAYBOOK_DEFINITION["schemas"]}
+
+    assert actual == expected
+    assert len(actual) == len(AUTONOMY_PLAYBOOK_DEFINITION["schemas"])
+
+
+@pytest.mark.unit
+def test_any_transitive_schema_drift_changes_the_playbook_hash() -> None:
+    drifted = deepcopy(AUTONOMY_PLAYBOOK_DEFINITION)
+    drifted["schemas"][0]["schema_hash"] = "sha256:" + "f" * 64
+    assert canonical_sha256(drifted) != autonomy_playbook_hash()
 
 
 @pytest.mark.unit

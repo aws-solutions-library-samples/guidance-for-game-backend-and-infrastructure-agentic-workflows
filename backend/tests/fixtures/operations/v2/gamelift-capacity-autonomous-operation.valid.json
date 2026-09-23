@@ -11,7 +11,7 @@
   "playbook": {
     "playbook_id": "playbook.gamelift-capacity-autonomy",
     "playbook_version": "2.0.0",
-    "playbook_hash": "sha256:1aad3dc54c42e729e27cab78394ad17fc44d397e58ba20521a470890431b19c1"
+    "playbook_hash": "sha256:29b3047e98446ce4f919610418fd28ecba7339dfdb28382846913749f283b52f"
   },
   "capability": {
     "capability_id": "gamelift.capacity-adjustment",
@@ -34,27 +34,33 @@
     "location": "us-west-2"
   },
   "parameters": {
-    "requested": {
-      "desired": 1,
-      "minimum": 0,
-      "maximum": 1
-    },
-    "change": {
-      "desired": 1,
-      "minimum": 0,
-      "maximum": 0
-    }
+    "requested": {"desired": 1, "minimum": 0, "maximum": 1},
+    "change": {"desired": 1, "minimum": 0, "maximum": 0}
   },
   "current_state": {
+    "evidence_contract_version": "2.0",
     "observation_id": "obs_bbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "observation_hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "capacity": {
-      "desired": 0,
-      "minimum": 0,
-      "maximum": 1
+    "observation_hash": "sha256:6f7626d6fccc6359a91e442caed06474c2d1f94c956d4d17524a6df92f9f03c8",
+    "tenant_id": "tenant.default",
+    "workspace_id": "workspace.default",
+    "resource_enrollment": {
+      "enrollment_id": "enroll.fleet-default",
+      "enrollment_version": "2026-09-01"
     },
+    "target": {
+      "provider": "gamelift",
+      "fleet_id": "fleet-1234abcd-5678-90ef-a1b2-c3d4e5f60789",
+      "location": "us-west-2"
+    },
+    "capacity": {"desired": 0, "minimum": 0, "maximum": 1},
     "observed_at": "2026-09-21T19:11:52Z",
-    "expires_at": "2026-09-21T19:13:52Z"
+    "expires_at": "2026-09-21T19:13:52Z",
+    "evidence_hash": "sha256:9606b9e5c0695527100bf34d9373cc5ec57070350a019b77f4491e038c063b48"
+  },
+  "window_state": {
+    "state_id": "state.gamelift-capacity-autonomy",
+    "state_revision": 7,
+    "state_hash": "sha256:b037022bc46ad00af71d23765a1dfedcad6cb2c896cb0b8c55e87ef8721b0339"
   },
   "resource_enrollment": {
     "enrollment_id": "enroll.fleet-default",
@@ -63,19 +69,16 @@
   "autonomy_policy": {
     "policy_id": "policy.gamelift-capacity-autonomy",
     "policy_version": "2026-09-01",
-    "policy_hash": "sha256:826c3fb781ca57b6e629d32a5cd091beddab786953d22f6247b8137498f953e9"
+    "policy_hash": "sha256:7237ef5829513a408b309343ae4117756f46e69574adca3931b83450c9b74b18"
   },
   "decision": {
     "decision_id": "autz.op_bbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "decision_hash": "sha256:bdfc4554ac60ad14660089498ec634404b4431ae80d328f0fdd9dcbfd11e31ab"
+    "decision_hash": "sha256:fca2884b279ae3952610d72fd117ded111c0c748f0b81c524245d5faba5880e9"
   },
   "calculated_risk": {
     "level": "high",
     "score": 60,
-    "factors": [
-      "desired-magnitude",
-      "scale-up"
-    ]
+    "factors": ["desired-magnitude", "scale-up"]
   },
   "authority": {
     "authority_inputs": {
@@ -88,9 +91,7 @@
     },
     "effective_authority": "operate",
     "decision": "authorized",
-    "reason_codes": [
-      "APPROVED_AUTONOMOUS"
-    ]
+    "reason_codes": ["APPROVED_AUTONOMOUS"]
   },
   "retry_policy": {
     "max_attempts": 3,
@@ -103,5 +104,5 @@
     "executor_binding_version": "1.0"
   },
   "required_execution_authority": "operate",
-  "prepared_hash": "sha256:13bdcdb910a98b9c0edc50abbc9777086d07b4f4abcdf6b544836e0264b2a3c3"
+  "prepared_hash": "sha256:e760768b066d6a553fb27110b7a448ec6df07d60206e0a95ef6122a8f22d3c23"
 }

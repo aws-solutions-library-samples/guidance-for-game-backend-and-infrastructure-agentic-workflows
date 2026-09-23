@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v2:gamelift-capacity-autonomy-observation-evidence",
+  "title": "GameLift Capacity Autonomy Observation Evidence 2.0",
+  "$comment": "Strict projection of one canonical E1 observation plus its server-owned enrollment and workspace binding. The autonomous decision and operation embed this exact document; evidence_hash excludes only itself.",
+  "$defs": {
+    "capacity_values": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desired", "minimum", "maximum"],
+      "properties": {
+        "desired": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "minimum": {"type": "integer", "minimum": 0, "maximum": 1000000},
+        "maximum": {"type": "integer", "minimum": 0, "maximum": 1000000}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_contract_version",
+    "observation_id",
+    "observation_hash",
+    "tenant_id",
+    "workspace_id",
+    "resource_enrollment",
+    "target",
+    "capacity",
+    "observed_at",
+    "expires_at",
+    "evidence_hash"
+  ],
+  "properties": {
+    "evidence_contract_version": {"type": "string", "const": "2.0"},
+    "observation_id": {"type": "string", "pattern": "^obs_[a-z0-9]{26}$"},
+    "observation_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"},
+    "tenant_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "workspace_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "resource_enrollment": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/resource_enrollment"},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "fleet_id", "location"],
+      "properties": {
+        "provider": {"type": "string", "const": "gamelift"},
+        "fleet_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^fleet-[a-f0-9-]{1,120}$"},
+        "location": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$"}
+      }
+    },
+    "capacity": {"$ref": "#/$defs/capacity_values"},
+    "observed_at": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"},
+    "expires_at": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/timestamp"},
+    "evidence_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"}
+  }
+}

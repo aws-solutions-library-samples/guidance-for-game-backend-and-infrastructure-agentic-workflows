@@ -34,14 +34,18 @@ from operations.contracts.autonomy import (
     AUTONOMOUS_DECISION_SCHEMA_NAME,
     AUTONOMOUS_OPERATION_SCHEMA_NAME,
     AUTONOMY_EVALUATOR_REASON_CODES,
+    AUTONOMY_EVIDENCE_SCHEMA_NAME,
     AUTONOMY_POLICY_SCHEMA_NAME,
     AUTONOMY_REASON_CODES,
     AUTONOMY_RUNTIME_REASON_CODES,
     AUTONOMY_SCHEMA_NAMES,
+    AUTONOMY_WINDOW_STATE_SCHEMA_NAME,
     AutonomyContractError,
     autonomous_decision_hash,
     autonomous_prepared_hash,
+    autonomy_evidence_hash,
     autonomy_policy_hash,
+    autonomy_window_state_hash,
     is_supported_autonomy_version,
     load_autonomy_schema,
     validate_autonomous_operation_binding,
@@ -80,6 +84,8 @@ SENSITIVE_FIELDS = {
 
 VALID = {
     AUTONOMY_POLICY_SCHEMA_NAME: "gamelift-capacity-autonomy-policy.valid.json",
+    AUTONOMY_EVIDENCE_SCHEMA_NAME: "gamelift-capacity-autonomy-observation-evidence.valid.json",
+    AUTONOMY_WINDOW_STATE_SCHEMA_NAME: "gamelift-capacity-autonomy-window-state.valid.json",
     AUTONOMOUS_DECISION_SCHEMA_NAME: "gamelift-capacity-autonomous-decision.valid.json",
     AUTONOMOUS_OPERATION_SCHEMA_NAME: "gamelift-capacity-autonomous-operation.valid.json",
 }
@@ -87,6 +93,30 @@ VALID = {
 
 def _fixture(schema_name: str) -> dict[str, Any]:
     return load_json(FIXTURES / VALID[schema_name])
+
+
+def _observation() -> dict[str, Any]:
+    return load_json(FIXTURES / "gamelift-autonomy-observation.valid.json")
+
+
+def _window_state() -> dict[str, Any]:
+    return _fixture(AUTONOMY_WINDOW_STATE_SCHEMA_NAME)
+
+
+def _validate_binding(
+    operation: dict[str, Any],
+    decision: dict[str, Any],
+    policy: dict[str, Any],
+    observation: dict[str, Any] | None = None,
+    window_state: dict[str, Any] | None = None,
+) -> None:
+    validate_autonomous_operation_binding(
+        operation,
+        decision,
+        policy,
+        observation if observation is not None else _observation(),
+        window_state if window_state is not None else _window_state(),
+    )
 
 
 def _vectors() -> dict[str, Any]:
@@ -175,11 +205,11 @@ def test_reason_code_set_extends_the_v1_closed_set() -> None:
 
 @pytest.mark.unit
 def test_pure_evaluator_and_runtime_reason_codes_are_explicitly_disjoint() -> None:
-    # POLICY_DENIED and DECISION_EXPIRED are reserved for runtime checks that
-    # occur after the pure evaluator returns. Keeping them out of the evaluator
-    # set prevents callers from mistaking policy resolution or clock checks for
-    # a result produced by evaluate_autonomy_policy.
-    assert AUTONOMY_RUNTIME_REASON_CODES == {"POLICY_DENIED", "DECISION_EXPIRED"}
+    # DECISION_EXPIRED is reserved for the execute-time clock check. A valid
+    # durable state bound to another policy is denied by the pure evaluator with
+    # POLICY_DENIED, and stale state is denied with WINDOW_STATE_STALE.
+    assert AUTONOMY_RUNTIME_REASON_CODES == {"DECISION_EXPIRED"}
+    assert {"POLICY_DENIED", "WINDOW_STATE_STALE"}.issubset(AUTONOMY_EVALUATOR_REASON_CODES)
     assert AUTONOMY_EVALUATOR_REASON_CODES.isdisjoint(AUTONOMY_RUNTIME_REASON_CODES)
     assert AUTONOMY_EVALUATOR_REASON_CODES | AUTONOMY_RUNTIME_REASON_CODES == AUTONOMY_REASON_CODES
 
@@ -195,7 +225,7 @@ def test_valid_fixture_passes_contract(schema_name: str) -> None:
 
 @pytest.mark.unit
 def test_binding_passes_for_matching_documents() -> None:
-    validate_autonomous_operation_binding(
+    _validate_binding(
         _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME),
         _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME),
         _fixture(AUTONOMY_POLICY_SCHEMA_NAME),
@@ -212,19 +242,25 @@ def test_pinned_hash_vectors() -> None:
     policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
     decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
     operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    evidence = _fixture(AUTONOMY_EVIDENCE_SCHEMA_NAME)
+    window_state = _fixture(AUTONOMY_WINDOW_STATE_SCHEMA_NAME)
 
     assert autonomy_policy_hash(policy) == expected["policy_hash"]
+    assert autonomy_evidence_hash(evidence) == expected["evidence_hash"]
+    assert autonomy_window_state_hash(window_state) == expected["window_state_hash"]
     assert autonomous_decision_hash(decision) == expected["decision_hash"]
     assert autonomous_prepared_hash(operation) == expected["prepared_hash"]
     assert autonomy_playbook_hash() == expected["playbook_hash"]
     assert policy["policy_hash"] == expected["policy_hash"]
     assert operation["prepared_hash"] == expected["prepared_hash"]
 
-    # The four pinned digests plus the three ids are all distinct.
+    # Every pinned digest and workflow identifier is distinct.
     assert (
         len(
             {
                 expected["policy_hash"],
+                expected["evidence_hash"],
+                expected["window_state_hash"],
                 expected["decision_hash"],
                 expected["prepared_hash"],
                 expected["playbook_hash"],
@@ -232,7 +268,7 @@ def test_pinned_hash_vectors() -> None:
                 expected["decision_id"],
             }
         )
-        == 6
+        == 8
     )
 
 
@@ -248,6 +284,20 @@ def test_prepared_hash_excludes_only_itself() -> None:
     operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
     material = {k: v for k, v in operation.items() if k != "prepared_hash"}
     assert operation["prepared_hash"] == canonical_sha256(material)
+
+
+@pytest.mark.unit
+def test_evidence_hash_excludes_only_itself() -> None:
+    evidence = _fixture(AUTONOMY_EVIDENCE_SCHEMA_NAME)
+    material = {k: v for k, v in evidence.items() if k != "evidence_hash"}
+    assert evidence["evidence_hash"] == canonical_sha256(material) == autonomy_evidence_hash(evidence)
+
+
+@pytest.mark.unit
+def test_window_state_hash_excludes_only_itself() -> None:
+    window_state = _fixture(AUTONOMY_WINDOW_STATE_SCHEMA_NAME)
+    material = {k: v for k, v in window_state.items() if k != "state_hash"}
+    assert window_state["state_hash"] == canonical_sha256(material) == autonomy_window_state_hash(window_state)
 
 
 # -- Exhaustive hash invalidation -------------------------------------------
@@ -366,6 +416,24 @@ def test_policy_rejects_non_operate_execution_authority() -> None:
 
 
 @pytest.mark.unit
+def test_policy_rejects_unregistered_playbook_even_when_rehashed() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    policy["playbook"]["playbook_hash"] = "sha256:" + "e" * 64
+    policy["policy_hash"] = autonomy_policy_hash(policy)
+    with pytest.raises(AutonomyContractError, match="registered autonomy playbook"):
+        validate_autonomy_contract(AUTONOMY_POLICY_SCHEMA_NAME, policy)
+
+
+@pytest.mark.unit
+def test_policy_rejects_unregistered_executor_even_when_rehashed() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    policy["executor_binding"]["executor_id"] = "executor.gamelift-capacity-other"
+    policy["policy_hash"] = autonomy_policy_hash(policy)
+    with pytest.raises(AutonomyContractError, match="registered autonomy executor"):
+        validate_autonomy_contract(AUTONOMY_POLICY_SCHEMA_NAME, policy)
+
+
+@pytest.mark.unit
 def test_policy_rejects_tampered_hash() -> None:
     policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
     policy["budget"]["max_action_micro_usd"] += 1  # changed but hash not recomputed
@@ -467,6 +535,112 @@ def test_operation_rejects_non_operate_execution_authority() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("path", "replacement", "expected"),
+    [
+        (["current_state", "observation_id"], "obs_cccccccccccccccccccccccccc", "current_state"),
+        (["calculated_risk", "score"], 59, "calculated_risk"),
+        (["correlation", "request_id"], "request.substituted", "correlation"),
+        (["resource_enrollment", "enrollment_version"], "2026-10-01", "resource_enrollment"),
+        (["playbook", "playbook_hash"], "sha256:" + "e" * 64, "playbook"),
+        (["executor_binding", "executor_binding_version"], "2.0", "executor_binding"),
+    ],
+    ids=["observation", "risk", "correlation", "enrollment", "playbook", "executor"],
+)
+def test_binding_rejects_rehashed_operation_substitution(path: list[str], replacement: Any, expected: str) -> None:
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    _replace(operation, path, replacement)
+    if path[0] == "current_state":
+        operation["current_state"]["evidence_hash"] = autonomy_evidence_hash(operation["current_state"])
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match=expected):
+        _validate_binding(operation, _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME), _fixture(AUTONOMY_POLICY_SCHEMA_NAME))
+
+
+@pytest.mark.unit
+def test_binding_rejects_rehashed_requested_action_substitution() -> None:
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    operation["parameters"]["requested"]["desired"] = 0
+    operation["parameters"]["change"]["desired"] = 0
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="requested"):
+        _validate_binding(operation, _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME), _fixture(AUTONOMY_POLICY_SCHEMA_NAME))
+
+
+@pytest.mark.unit
+def test_binding_rejects_policy_target_substitution_with_recomputed_hashes() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    substituted = "fleet-deadbeef-0000-0000-0000-000000000000"
+    decision["target"]["fleet_id"] = substituted
+    operation["target"]["fleet_id"] = substituted
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="policy target"):
+        _validate_binding(operation, decision, policy)
+
+
+@pytest.mark.unit
+def test_binding_rejects_policy_principal_substitution_with_recomputed_hashes() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    policy["automation_principal"]["subject_id"] = "subject.other-agent"
+    policy["policy_hash"] = autonomy_policy_hash(policy)
+    decision["policy"]["policy_hash"] = policy["policy_hash"]
+    operation["autonomy_policy"]["policy_hash"] = policy["policy_hash"]
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="automation principal"):
+        _validate_binding(operation, decision, policy)
+
+
+@pytest.mark.unit
+def test_binding_rejects_decision_policy_identity_substitution() -> None:
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    decision["policy"]["policy_id"] = "policy.other"
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="decision policy_id"):
+        _validate_binding(operation, decision, _fixture(AUTONOMY_POLICY_SCHEMA_NAME))
+
+
+@pytest.mark.unit
+def test_binding_rejects_substituted_canonical_observation() -> None:
+    observation = _observation()
+    observation["results"]["capacity"][0]["desired"] = 1
+    with pytest.raises(AutonomyContractError, match="canonical E1 observation evidence"):
+        _validate_binding(
+            _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME),
+            _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME),
+            _fixture(AUTONOMY_POLICY_SCHEMA_NAME),
+            observation=observation,
+        )
+
+
+@pytest.mark.unit
+def test_binding_rejects_substituted_window_state() -> None:
+    window_state = _window_state()
+    window_state["action_micro_usd"] += 1
+    window_state["state_revision"] += 1
+    window_state["state_hash"] = autonomy_window_state_hash(window_state)
+    with pytest.raises(AutonomyContractError, match="window_state"):
+        _validate_binding(
+            _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME),
+            _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME),
+            _fixture(AUTONOMY_POLICY_SCHEMA_NAME),
+            window_state=window_state,
+        )
+
+
+@pytest.mark.unit
 def test_binding_fails_when_decision_expiry_exceeds_policy_ttl() -> None:
     policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
     decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
@@ -475,14 +649,16 @@ def test_binding_fails_when_decision_expiry_exceeds_policy_ttl() -> None:
     # Keep the observation valid beyond the attempted grant so this case
     # isolates the independent policy-TTL clamp.
     decision["current_state"]["expires_at"] = "2026-09-21T19:20:00Z"
+    decision["current_state"]["evidence_hash"] = autonomy_evidence_hash(decision["current_state"])
     decision["decision_expires_at"] = "2026-09-21T19:13:53Z"
     operation["current_state"]["expires_at"] = "2026-09-21T19:20:00Z"
+    operation["current_state"]["evidence_hash"] = autonomy_evidence_hash(operation["current_state"])
     operation["decision_expires_at"] = decision["decision_expires_at"]
     operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
     operation["prepared_hash"] = autonomous_prepared_hash(operation)
 
     with pytest.raises(AutonomyContractError, match="policy decision TTL"):
-        validate_autonomous_operation_binding(operation, decision, policy)
+        _validate_binding(operation, decision, policy)
 
 
 @pytest.mark.unit
@@ -491,9 +667,7 @@ def test_binding_fails_on_decision_hash_mismatch() -> None:
     operation["decision"]["decision_hash"] = "sha256:" + "a" * 64
     operation["prepared_hash"] = autonomous_prepared_hash(operation)
     with pytest.raises(AutonomyContractError):
-        validate_autonomous_operation_binding(
-            operation, _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME), _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
-        )
+        _validate_binding(operation, _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME), _fixture(AUTONOMY_POLICY_SCHEMA_NAME))
 
 
 @pytest.mark.unit
@@ -502,9 +676,7 @@ def test_binding_fails_on_policy_hash_mismatch() -> None:
     operation["autonomy_policy"]["policy_hash"] = "sha256:" + "b" * 64
     operation["prepared_hash"] = autonomous_prepared_hash(operation)
     with pytest.raises(AutonomyContractError):
-        validate_autonomous_operation_binding(
-            operation, _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME), _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
-        )
+        _validate_binding(operation, _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME), _fixture(AUTONOMY_POLICY_SCHEMA_NAME))
 
 
 # -- v1 immutability regression guard ---------------------------------------

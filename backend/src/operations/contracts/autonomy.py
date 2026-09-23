@@ -1,6 +1,6 @@
 """Additive E5 bounded-autonomy contract layer (issue #438, E5 operate).
 
-This module validates and binds the three additive **v2** contracts of the
+This module validates and binds the five additive **v2** contracts of the
 ``gamelift.capacity-adjustment/2.0`` capability. They are the bounded-autonomy
 (no-human-in-the-loop) counterpart of the E2 prepare/approval contracts in
 :mod:`operations.contracts.capacity`:
@@ -13,6 +13,12 @@ This module validates and binds the three additive **v2** contracts of the
   budget, cooldown, frequency, ``max_in_flight`` concurrency, anti-oscillation,
   decision expiry, and the exact playbook/executor identities/versions/hashes.
   Its ``policy_hash`` binds every field except itself.
+* ``gamelift-capacity-autonomy-observation-evidence`` — a strict, hash-bound
+  projection of one canonical E1 observation onto the exact policy target,
+  location, tenant, workspace, and enrollment.
+* ``gamelift-capacity-autonomy-window-state`` — a strict, non-negative,
+  versioned and hash-bound snapshot of durable budget, cooldown, frequency,
+  concurrency, and anti-oscillation evidence.
 * ``gamelift-capacity-autonomous-decision`` — the deterministic autonomous
   authorization. A non-denied decision is ``authorized`` at ``operate`` authority
   with the single reason code ``APPROVED_AUTONOMOUS``; any guardrail breach
@@ -56,6 +62,7 @@ from referencing import Registry, Resource
 # Local modules
 from operations.contracts.canonical import CanonicalizationError, canonical_sha256, canonicalize, load_json
 from operations.contracts.capacity import calculate_capacity_risk, capacity_change
+from operations.contracts.observation import ObservationContractError, validate_observation
 
 AUTONOMY_CONTRACT_VERSION = "2.0"
 
@@ -68,12 +75,16 @@ PROVIDER = "gamelift"
 
 COMMON_SCHEMA_NAME = "common"
 AUTONOMY_POLICY_SCHEMA_NAME = "gamelift-capacity-autonomy-policy"
+AUTONOMY_EVIDENCE_SCHEMA_NAME = "gamelift-capacity-autonomy-observation-evidence"
+AUTONOMY_WINDOW_STATE_SCHEMA_NAME = "gamelift-capacity-autonomy-window-state"
 AUTONOMOUS_DECISION_SCHEMA_NAME = "gamelift-capacity-autonomous-decision"
 AUTONOMOUS_OPERATION_SCHEMA_NAME = "gamelift-capacity-autonomous-operation"
 
 AUTONOMY_SCHEMA_NAMES = frozenset(
     {
         AUTONOMY_POLICY_SCHEMA_NAME,
+        AUTONOMY_EVIDENCE_SCHEMA_NAME,
+        AUTONOMY_WINDOW_STATE_SCHEMA_NAME,
         AUTONOMOUS_DECISION_SCHEMA_NAME,
         AUTONOMOUS_OPERATION_SCHEMA_NAME,
     }
@@ -116,14 +127,16 @@ REQUIRED_EXECUTION_AUTHORITY = "operate"
 _AUTHORIZED_REASON = "APPROVED_AUTONOMOUS"
 
 # The pure evaluator only emits guardrail results computable from its trusted
-# input tuple. POLICY_DENIED and DECISION_EXPIRED belong to later runtime
-# policy-resolution and execute-time clock checks; exposing the sets separately
-# prevents either runtime condition from being attributed to the pure evaluator.
+# input tuple. DECISION_EXPIRED belongs to a later execute-time clock check;
+# exposing the sets separately prevents that runtime condition from being
+# attributed to the pure evaluator. POLICY_DENIED is an evaluator result for a
+# valid state document bound to a different policy revision.
 AUTONOMY_EVALUATOR_REASON_CODES = frozenset(
     {
         "APPROVED_AUTONOMOUS",
         "DEPLOYMENT_DISABLED",
         "INSUFFICIENT_AUTHORITY",
+        "POLICY_DENIED",
         "TARGET_NOT_ENROLLED",
         "RISK_LIMIT_EXCEEDED",
         "WORKSPACE_MISMATCH",
@@ -134,10 +147,11 @@ AUTONOMY_EVALUATOR_REASON_CODES = frozenset(
         "FREQUENCY_EXCEEDED",
         "CONCURRENCY_LIMIT",
         "OSCILLATION_BLOCKED",
+        "WINDOW_STATE_STALE",
         "AUTOMATION_PRINCIPAL_INVALID",
     }
 )
-AUTONOMY_RUNTIME_REASON_CODES = frozenset({"POLICY_DENIED", "DECISION_EXPIRED"})
+AUTONOMY_RUNTIME_REASON_CODES = frozenset({"DECISION_EXPIRED"})
 
 # The closed reason-code set the v2 decision/operation enums publish. It includes
 # both the pure evaluator's outputs and later fail-closed runtime outcomes.
@@ -217,6 +231,18 @@ def autonomy_policy_hash(policy: dict[str, Any]) -> str:
     return canonical_sha256(material)
 
 
+def autonomy_evidence_hash(evidence: dict[str, Any]) -> str:
+    """Return the canonical hash binding every evidence field except itself."""
+    material = {key: value for key, value in evidence.items() if key != "evidence_hash"}
+    return canonical_sha256(material)
+
+
+def autonomy_window_state_hash(window_state: dict[str, Any]) -> str:
+    """Return the canonical hash binding every rolling-state field except itself."""
+    material = {key: value for key, value in window_state.items() if key != "state_hash"}
+    return canonical_sha256(material)
+
+
 def autonomous_decision_hash(decision: dict[str, Any]) -> str:
     """Return the canonical hash of a complete autonomous decision document.
 
@@ -245,6 +271,17 @@ def autonomous_prepared_hash(operation: dict[str, Any]) -> str:
 
 
 def _policy_semantic_errors(document: dict[str, Any]) -> list[str]:
+    # Local import avoids a module cycle: the code-owned playbook definition
+    # imports the contract constants and schema loaders from this module.
+    # Local modules
+    from operations.autonomy_playbook_definition import (
+        EXECUTOR_BINDING_VERSION,
+        EXECUTOR_ID,
+        PLAYBOOK_ID,
+        PLAYBOOK_VERSION,
+        autonomy_playbook_hash,
+    )
+
     errors: list[str] = []
     if document["capability"]["capability_id"] != CAPABILITY_ID:
         errors.append("capability_id is not the capacity-adjustment capability")
@@ -254,11 +291,51 @@ def _policy_semantic_errors(document: dict[str, Any]) -> list[str]:
         errors.append("target.provider does not match the policy provider")
     if document["required_execution_authority"] != REQUIRED_EXECUTION_AUTHORITY:
         errors.append("required_execution_authority must be operate")
+    expected_playbook = {
+        "playbook_id": PLAYBOOK_ID,
+        "playbook_version": PLAYBOOK_VERSION,
+        "playbook_hash": autonomy_playbook_hash(),
+    }
+    if document["playbook"] != expected_playbook:
+        errors.append("playbook does not match the registered autonomy playbook")
+    expected_executor = {
+        "executor_id": EXECUTOR_ID,
+        "executor_binding_version": EXECUTOR_BINDING_VERSION,
+    }
+    if document["executor_binding"] != expected_executor:
+        errors.append("executor_binding does not match the registered autonomy executor")
     budget = document["budget"]
     if budget["max_action_micro_usd"] > budget["max_window_micro_usd"]:
         errors.append("budget max_action_micro_usd cannot exceed max_window_micro_usd")
     if document["policy_hash"] != autonomy_policy_hash(document):
         errors.append("policy_hash does not bind the canonical policy")
+    return errors
+
+
+def _evidence_semantic_errors(document: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if document["target"]["provider"] != PROVIDER:
+        errors.append("evidence target provider is not gamelift")
+    if _parse_timestamp(document["expires_at"]) <= _parse_timestamp(document["observed_at"]):
+        errors.append("evidence expires_at must be strictly after observed_at")
+    if document["evidence_hash"] != autonomy_evidence_hash(document):
+        errors.append("evidence_hash does not bind the canonical observation evidence")
+    return errors
+
+
+def _window_state_semantic_errors(document: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    as_of = document["as_of_epoch_seconds"]
+    if document["expires_at_epoch_seconds"] <= as_of:
+        errors.append("window state expiry must be strictly after as_of_epoch_seconds")
+    last_write = document["last_write_epoch_seconds"]
+    if last_write is not None and last_write > as_of:
+        errors.append("last_write_epoch_seconds cannot be after as_of_epoch_seconds")
+    direction = document["last_change_direction"]
+    if (last_write is None) != (direction == "none"):
+        errors.append("last_change_direction must be none exactly when last_write_epoch_seconds is null")
+    if document["state_hash"] != autonomy_window_state_hash(document):
+        errors.append("state_hash does not bind the canonical autonomy window state")
     return errors
 
 
@@ -277,6 +354,7 @@ def _decision_reason_errors(decision: str, reasons: set[str]) -> list[str]:
 
 def _decision_semantic_errors(document: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    errors.extend(_evidence_semantic_errors(document["current_state"]))
     authority_inputs = document["authority_inputs"]
     expected_effective = effective_authority(authority_inputs)
     effective = document["effective_authority"]
@@ -319,6 +397,7 @@ def _decision_semantic_errors(document: dict[str, Any]) -> list[str]:
 
 def _operation_semantic_errors(document: dict[str, Any]) -> list[str]:
     errors: list[str] = []
+    errors.extend(_evidence_semantic_errors(document["current_state"]))
     current = document["current_state"]["capacity"]
     requested = document["parameters"]["requested"]
     expected_change = capacity_change(current, requested)
@@ -355,6 +434,8 @@ def _operation_semantic_errors(document: dict[str, Any]) -> list[str]:
 
 _SEMANTIC_VALIDATORS = {
     AUTONOMY_POLICY_SCHEMA_NAME: _policy_semantic_errors,
+    AUTONOMY_EVIDENCE_SCHEMA_NAME: _evidence_semantic_errors,
+    AUTONOMY_WINDOW_STATE_SCHEMA_NAME: _window_state_semantic_errors,
     AUTONOMOUS_DECISION_SCHEMA_NAME: _decision_semantic_errors,
     AUTONOMOUS_OPERATION_SCHEMA_NAME: _operation_semantic_errors,
 }
@@ -402,24 +483,98 @@ def effective_authority(authority_inputs: dict[str, str]) -> str:
 # -- Binding -----------------------------------------------------------------
 
 
+def _expected_observation_evidence(observation: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
+    """Build the only valid autonomy projection of one canonical E1 observation."""
+    try:
+        validate_observation(observation)
+    except ObservationContractError as exc:
+        raise AutonomyContractError(
+            "gamelift-capacity-autonomy-observation-binding",
+            [f"canonical E1 observation is invalid: {error}" for error in exc.errors],
+        ) from exc
+
+    target = policy["target"]
+    expected_observer = policy["automation_principal"]
+    if (
+        observation["requester"]["subject_id"],
+        observation["requester"]["client_id"],
+    ) != (expected_observer["subject_id"], expected_observer["client_id"]):
+        raise AutonomyContractError(
+            "gamelift-capacity-autonomy-observation-binding",
+            ["canonical E1 observation requester does not match the automation principal"],
+        )
+    if observation["target"] != {"provider": target["provider"], "fleet_id": target["fleet_id"]}:
+        raise AutonomyContractError(
+            "gamelift-capacity-autonomy-observation-binding",
+            ["canonical E1 observation target does not match the autonomy policy target"],
+        )
+    matching_capacity = [
+        capacity for capacity in observation["results"]["capacity"] if capacity["location"] == target["location"]
+    ]
+    if len(matching_capacity) != 1:
+        raise AutonomyContractError(
+            "gamelift-capacity-autonomy-observation-binding",
+            ["canonical E1 observation must contain exactly one capacity entry for the policy location"],
+        )
+    observed_capacity = matching_capacity[0]
+    evidence = {
+        "evidence_contract_version": AUTONOMY_CONTRACT_VERSION,
+        "observation_id": observation["observation_id"],
+        "observation_hash": canonical_sha256(observation),
+        "tenant_id": observation["requester"]["tenant_id"],
+        "workspace_id": observation["requester"]["workspace_id"],
+        "resource_enrollment": deepcopy(policy["resource_enrollment"]),
+        "target": deepcopy(target),
+        "capacity": {
+            "desired": observed_capacity["desired"],
+            "minimum": observed_capacity["minimum"],
+            "maximum": observed_capacity["maximum"],
+        },
+        "observed_at": observation["observed_at"],
+        "expires_at": observation["expires_at"],
+    }
+    evidence["evidence_hash"] = autonomy_evidence_hash(evidence)
+    return evidence
+
+
+def _window_state_reference(window_state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "state_id": window_state["state_id"],
+        "state_revision": window_state["state_revision"],
+        "state_hash": window_state["state_hash"],
+    }
+
+
 def validate_autonomous_operation_binding(
     operation: dict[str, Any],
     decision: dict[str, Any],
     policy: dict[str, Any],
+    observation: dict[str, Any],
+    window_state: dict[str, Any],
 ) -> None:
-    """Verify one prepared autonomous operation binds one exact decision + policy.
+    """Verify one operation binds exact policy, observation, state, and decision.
 
-    All three documents must be contract-valid, and the operation must bind the
-    decision by id and canonical hash, bind the policy by id/version/hash, and
-    agree on the automation principal scope, target, authority, risk, decision
-    expiry, and execution authority. This is the E5 analogue of
-    ``validate_prepared_operation_binding`` for the no-human-approval path.
+    Every document is contract-valid. The canonical E1 observation is reduced to
+    one deterministic target/location projection, and the rolling-state snapshot
+    is bound by id, revision, and hash. No duplicated semantic field may differ.
     """
     validate_autonomy_contract(AUTONOMOUS_OPERATION_SCHEMA_NAME, operation)
     validate_autonomy_contract(AUTONOMOUS_DECISION_SCHEMA_NAME, decision)
     validate_autonomy_contract(AUTONOMY_POLICY_SCHEMA_NAME, policy)
+    validate_autonomy_contract(AUTONOMY_WINDOW_STATE_SCHEMA_NAME, window_state)
+
+    expected_evidence = _expected_observation_evidence(observation, policy)
+    expected_window_reference = _window_state_reference(window_state)
 
     errors: list[str] = []
+    if decision["current_state"] != expected_evidence:
+        errors.append("decision current_state does not match the canonical E1 observation evidence")
+    if operation["current_state"] != expected_evidence:
+        errors.append("operation current_state does not match the canonical E1 observation evidence")
+    if decision["window_state"] != expected_window_reference:
+        errors.append("decision window_state does not match the canonical autonomy window state")
+    if operation["window_state"] != expected_window_reference:
+        errors.append("operation window_state does not match the canonical autonomy window state")
     if operation["decision"]["decision_id"] != decision["decision_id"]:
         errors.append("operation decision_id does not match the autonomous decision")
     if operation["decision"]["decision_hash"] != autonomous_decision_hash(decision):
@@ -430,26 +585,91 @@ def validate_autonomous_operation_binding(
         errors.append("operation policy_version does not match the autonomy policy")
     if operation["autonomy_policy"]["policy_hash"] != policy["policy_hash"]:
         errors.append("operation policy_hash does not match the autonomy policy")
+    if decision["policy"]["policy_id"] != policy["policy_id"]:
+        errors.append("decision policy_id does not match the autonomy policy")
+    if decision["policy"]["policy_version"] != policy["policy_version"]:
+        errors.append("decision policy_version does not match the autonomy policy")
     if decision["policy"]["policy_hash"] != policy["policy_hash"]:
         errors.append("decision policy_hash does not match the autonomy policy")
-
-    op_principal = operation["automation_principal"]
-    if (op_principal["subject_id"], op_principal["client_id"]) != (
-        decision["automation_principal"]["subject_id"],
-        decision["automation_principal"]["client_id"],
+    expected_policy_reference = {
+        "policy_id": policy["policy_id"],
+        "policy_version": policy["policy_version"],
+        "policy_hash": policy["policy_hash"],
+    }
+    if window_state["policy"] != expected_policy_reference:
+        errors.append("window state policy does not match the autonomy policy")
+    if (window_state["tenant_id"], window_state["workspace_id"]) != (
+        policy["tenant_id"],
+        policy["workspace_id"],
     ):
-        errors.append("operation automation_principal does not match the decision")
-    if (op_principal["tenant_id"], op_principal["workspace_id"]) != (policy["tenant_id"], policy["workspace_id"]):
-        errors.append("operation automation_principal scope does not match the policy")
+        errors.append("window state tenant/workspace does not match the autonomy policy")
+    if window_state["target"] != policy["target"]:
+        errors.append("window state target does not match the autonomy policy")
+    if window_state["resource_enrollment"] != policy["resource_enrollment"]:
+        errors.append("window state resource_enrollment does not match the autonomy policy")
+
+    expected_principal = policy["automation_principal"]
+    if decision["automation_principal"] != expected_principal:
+        errors.append("decision automation_principal does not match the policy automation_principal")
+    op_principal = operation["automation_principal"]
+    expected_operation_principal = {
+        **expected_principal,
+        "tenant_id": policy["tenant_id"],
+        "workspace_id": policy["workspace_id"],
+    }
+    if op_principal != expected_operation_principal:
+        errors.append("operation automation_principal does not match the policy automation_principal and scope")
 
     if operation["target"] != decision["target"]:
         errors.append("operation target does not match the decision target")
+    if decision["target"] != policy["target"]:
+        errors.append("decision target does not match the policy target")
+    if operation["current_state"] != decision["current_state"]:
+        errors.append("operation current_state does not match the decision current_state")
+    if operation["parameters"]["requested"] != decision["requested"]:
+        errors.append("operation requested capacity does not match the decision requested capacity")
+    if operation["calculated_risk"] != decision["calculated_risk"]:
+        errors.append("operation calculated_risk does not match the decision calculated_risk")
+    if operation["correlation"] != decision["correlation"]:
+        errors.append("operation correlation does not match the decision correlation")
+    if operation["resource_enrollment"] != policy["resource_enrollment"]:
+        errors.append("operation resource_enrollment does not match the policy resource_enrollment")
+    if operation["playbook"] != policy["playbook"]:
+        errors.append("operation playbook does not match the policy playbook")
+    if operation["executor_binding"] != policy["executor_binding"]:
+        errors.append("operation executor_binding does not match the policy executor_binding")
+    # Local modules
+    from operations.autonomy_playbook_definition import autonomy_playbook_definition
+
+    if operation["retry_policy"] != autonomy_playbook_definition()["retry_policy"]:
+        errors.append("operation retry_policy does not match the registered autonomy playbook")
+
+    expected_risk = calculate_capacity_risk(
+        current=decision["current_state"]["capacity"],
+        requested=decision["requested"],
+        within_bounds=not _bounds_violations(
+            requested=decision["requested"],
+            change=capacity_change(decision["current_state"]["capacity"], decision["requested"]),
+            bounds=policy["capacity_bounds"],
+        ),
+    )
+    if decision["calculated_risk"] != expected_risk:
+        errors.append("decision calculated_risk does not match the deterministic policy calculation")
+    risk_limit = policy["risk"]
+    if decision["decision"] == "authorized" and (
+        _RISK_ORDER[expected_risk["level"]] > _RISK_ORDER[risk_limit["max_level"]]
+        or expected_risk["score"] > risk_limit["max_score"]
+    ):
+        errors.append("authorized decision calculated_risk exceeds the policy risk ceiling")
+
     if operation["authority"]["decision"] != decision["decision"]:
         errors.append("operation authority decision does not match the decision")
     if operation["authority"]["effective_authority"] != decision["effective_authority"]:
         errors.append("operation effective_authority does not match the decision")
     if operation["authority"]["authority_inputs"] != decision["authority_inputs"]:
         errors.append("operation authority_inputs do not match the decision")
+    if operation["authority"]["reason_codes"] != decision["reason_codes"]:
+        errors.append("operation authority reason_codes do not match the decision")
     if operation["decision_expires_at"] != decision["decision_expires_at"]:
         errors.append("operation decision_expires_at does not match the decision")
     policy_deadline = _parse_timestamp(decision["evaluated_at"]) + timedelta(seconds=policy["decision_ttl_seconds"])
@@ -499,12 +719,27 @@ def evaluate_autonomy_policy(
     calculated_risk)`` reading, and the caller binds that reading into the
     hash-bound decision document.
 
-    ``window_state`` is the durable, server-owned rolling-window reading the
-    caller supplies (``last_write_epoch_seconds`` or ``None``,
-    ``writes_in_window``, ``window_micro_usd``, ``in_flight``,
-    ``seconds_since_opposite_change`` or ``None``, ``direction_flips_in_window``).
+    ``window_state`` is a strict, hash-bound durable snapshot. Missing fields,
+    negative counters, an invalid hash, or an unknown contract/policy version
+    raise :class:`AutonomyContractError` before any authorization result exists.
     All comparisons use integers; there is no floating-point money.
     """
+    validate_autonomy_contract(AUTONOMY_POLICY_SCHEMA_NAME, policy)
+    validate_autonomy_contract(AUTONOMY_EVIDENCE_SCHEMA_NAME, observation)
+    validate_autonomy_contract(AUTONOMY_WINDOW_STATE_SCHEMA_NAME, window_state)
+
+    requested_errors: list[str] = []
+    if set(requested) != {"desired", "minimum", "maximum"}:
+        requested_errors.append("requested capacity must contain exactly desired, minimum, and maximum")
+    elif any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in requested.values()):
+        requested_errors.append("requested capacity values must be non-negative integers")
+    if set(authority_inputs) != set(_AUTHORITY_INPUT_FIELDS) or any(
+        value not in _AUTHORITY_ORDER for value in authority_inputs.values()
+    ):
+        requested_errors.append("authority_inputs must contain the six valid authority ceilings")
+    if requested_errors:
+        raise AutonomyContractError("gamelift-capacity-autonomy-evaluation-input", requested_errors)
+
     current = observation["capacity"]
     change = capacity_change(current, requested)
     within_bounds = not _bounds_violations(requested=requested, change=change, bounds=policy["capacity_bounds"])
@@ -522,28 +757,38 @@ def evaluate_autonomy_policy(
     # Trusted automation principal must match the policy exactly. Model/untrusted
     # input can never supply this: it comes from the verified principal.
     expected_principal = policy["automation_principal"]
-    if (
-        automation_principal.get("source_type") != "automation"
-        or automation_principal.get("subject_id") != expected_principal["subject_id"]
-        or automation_principal.get("client_id") != expected_principal["client_id"]
-    ):
+    if automation_principal != expected_principal:
         reasons.append("AUTOMATION_PRINCIPAL_INVALID")
 
-    # Workspace scope (tenant/workspace are policy-owned).
-    if (observation.get("tenant_id"), observation.get("workspace_id")) != (
+    if (observation["tenant_id"], observation["workspace_id"]) != (
         policy["tenant_id"],
         policy["workspace_id"],
     ):
         reasons.append("WORKSPACE_MISMATCH")
+    if observation["target"] != policy["target"] or observation["resource_enrollment"] != policy["resource_enrollment"]:
+        reasons.append("TARGET_NOT_ENROLLED")
 
-    # Enrollment / target.
-    if not observation.get("target_enrolled", False):
+    expected_policy_reference = {
+        "policy_id": policy["policy_id"],
+        "policy_version": policy["policy_version"],
+        "policy_hash": policy["policy_hash"],
+    }
+    if window_state["policy"] != expected_policy_reference:
+        reasons.append("POLICY_DENIED")
+    if (window_state["tenant_id"], window_state["workspace_id"]) != (
+        policy["tenant_id"],
+        policy["workspace_id"],
+    ):
+        reasons.append("WORKSPACE_MISMATCH")
+    if (
+        window_state["target"] != policy["target"]
+        or window_state["resource_enrollment"] != policy["resource_enrollment"]
+    ):
         reasons.append("TARGET_NOT_ENROLLED")
 
     if not within_bounds:
         reasons.append("BOUNDS_EXCEEDED")
 
-    # Risk ceiling.
     risk_limit = policy["risk"]
     if (
         _RISK_ORDER[calculated_risk["level"]] > _RISK_ORDER[risk_limit["max_level"]]
@@ -551,44 +796,51 @@ def evaluate_autonomy_policy(
     ):
         reasons.append("RISK_LIMIT_EXCEEDED")
 
-    # Observation freshness / skew.
     freshness = policy["observation_freshness"]
-    age = now_epoch_seconds - int(observation["observed_at_epoch_seconds"])
-    if age > freshness["max_age_seconds"] or age < -freshness["max_skew_seconds"]:
+    observed_epoch = int(_parse_timestamp(observation["observed_at"]).timestamp())
+    expires_epoch = int(_parse_timestamp(observation["expires_at"]).timestamp())
+    age = now_epoch_seconds - observed_epoch
+    if age > freshness["max_age_seconds"] or age < -freshness["max_skew_seconds"] or now_epoch_seconds > expires_epoch:
         reasons.append("OBSERVATION_STALE")
 
-    # Budget (integer micro-USD, per-action and per-window).
+    state_age = now_epoch_seconds - window_state["as_of_epoch_seconds"]
+    if (
+        state_age > freshness["max_age_seconds"]
+        or state_age < -freshness["max_skew_seconds"]
+        or now_epoch_seconds > window_state["expires_at_epoch_seconds"]
+    ):
+        reasons.append("WINDOW_STATE_STALE")
+
     budget = policy["budget"]
-    action_cost = int(window_state.get("action_micro_usd", 0))
+    action_cost = window_state["action_micro_usd"]
     if action_cost > budget["max_action_micro_usd"]:
         reasons.append("BUDGET_EXCEEDED")
-    elif int(window_state.get("window_micro_usd", 0)) + action_cost > budget["max_window_micro_usd"]:
+    elif window_state["window_micro_usd"] + action_cost > budget["max_window_micro_usd"]:
         reasons.append("BUDGET_EXCEEDED")
 
-    # Cooldown since the last successful autonomous write.
-    last_write = window_state.get("last_write_epoch_seconds")
-    if (
-        last_write is not None
-        and (now_epoch_seconds - int(last_write)) < policy["cooldown"]["min_seconds_between_writes"]
-    ):
+    last_write = window_state["last_write_epoch_seconds"]
+    if last_write is not None and (now_epoch_seconds - last_write) < policy["cooldown"]["min_seconds_between_writes"]:
         reasons.append("COOLDOWN_ACTIVE")
 
-    # Frequency cap (writes per window).
-    if int(window_state.get("writes_in_window", 0)) >= policy["frequency"]["max_writes_per_window"]:
+    if window_state["writes_in_window"] >= policy["frequency"]["max_writes_per_window"]:
         reasons.append("FREQUENCY_EXCEEDED")
 
-    # Concurrency (max_in_flight == 1).
-    if int(window_state.get("in_flight", 0)) >= policy["concurrency"]["max_in_flight"]:
+    if window_state["in_flight"] >= policy["concurrency"]["max_in_flight"]:
         reasons.append("CONCURRENCY_LIMIT")
 
-    # Anti-oscillation: block a change that reverses a recent opposite change,
-    # or exceeds the allowed direction flips in the window.
-    anti = policy["anti_oscillation"]
-    since_opposite = window_state.get("seconds_since_opposite_change")
-    if since_opposite is not None and int(since_opposite) < anti["min_seconds_since_opposite_change"]:
-        reasons.append("OSCILLATION_BLOCKED")
-    elif int(window_state.get("direction_flips_in_window", 0)) > anti["max_direction_flips_per_window"]:
-        reasons.append("OSCILLATION_BLOCKED")
+    proposed_direction = "none"
+    if change["desired"] > 0:
+        proposed_direction = "increase"
+    elif change["desired"] < 0:
+        proposed_direction = "decrease"
+    last_direction = window_state["last_change_direction"]
+    is_reversal = proposed_direction != "none" and last_direction != "none" and proposed_direction != last_direction
+    if is_reversal:
+        anti = policy["anti_oscillation"]
+        if last_write is None or (now_epoch_seconds - last_write) < anti["min_seconds_since_opposite_change"]:
+            reasons.append("OSCILLATION_BLOCKED")
+        if window_state["direction_flips_in_window"] >= anti["max_direction_flips_per_window"]:
+            reasons.append("OSCILLATION_BLOCKED")
 
     unique_reasons = sorted(set(reasons))
     if unique_reasons:

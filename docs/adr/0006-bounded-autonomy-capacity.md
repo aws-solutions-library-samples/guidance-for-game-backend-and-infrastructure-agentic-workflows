@@ -26,7 +26,7 @@ meaning** of published `1.0` schemas — forbidden by the
 ## Decision
 
 Add bounded autonomy as a **new, additive v2 layer** —
-`gamelift.capacity-adjustment/2.0` — delivered as three new strict schemas, a new
+`gamelift.capacity-adjustment/2.0` — delivered as five new strict schemas, a new
 contract module, a new playbook definition, and a pure deterministic policy
 evaluator. Every published v1 schema, vector, hash, and meaning is left
 byte-for-byte unchanged.
@@ -42,7 +42,7 @@ byte-for-byte unchanged.
    `is_supported_autonomy_version("2.0")` is added; the v1 `== "1.0"` allowlist is
    not loosened.
 
-2. **Three v2 contracts.**
+2. **Five v2 contracts.**
    - **Immutable bounded-autonomy policy**
      (`gamelift-capacity-autonomy-policy`): the entirely server-owned guardrail
      envelope. It binds the capability `2.0`, a distinct trusted **automation**
@@ -54,6 +54,19 @@ byte-for-byte unchanged.
      concurrency, anti-oscillation, decision expiry, and the exact
      playbook/executor identities/versions/hashes. `required_execution_authority`
      is `const "operate"`. Its `policy_hash` binds every field except itself.
+     Semantic validation also pins the playbook and executor to their code-owned
+     registered definitions.
+   - **Canonical observation evidence**
+     (`gamelift-capacity-autonomy-observation-evidence`): a strict projection of
+     one contract-valid E1 observation onto the exact policy fleet, location,
+     tenant, workspace, and enrollment. It binds the full E1 document by
+     canonical hash and binds every projected field through `evidence_hash`.
+   - **Durable rolling-window state**
+     (`gamelift-capacity-autonomy-window-state`): a strict, non-negative,
+     versioned snapshot of budget, cooldown, frequency, concurrency, and
+     direction history. It binds the exact policy, target, enrollment, scope,
+     revision, freshness deadline, and counters through `state_hash`; missing,
+     malformed, stale, or substituted state cannot authorize.
    - **Deterministic autonomous decision**
      (`gamelift-capacity-autonomous-decision`): exactly one of
      `authorized`/`denied` at `operate` authority. A non-denied decision is
@@ -64,16 +77,17 @@ byte-for-byte unchanged.
      `decision_expires_at` no later than either `observation.expires_at` or
      `evaluated_at + policy.decision_ttl_seconds`. Contract validation enforces
      the observation clamp; policy binding independently enforces the TTL clamp.
-     `POLICY_DENIED` and `DECISION_EXPIRED` remain closed runtime reason codes for
-     later policy-resolution and execute-time checks and are intentionally not
-     emitted by the pure evaluator. It has **no human-approval field**: the
-     decision itself is the time-boxed grant.
+     `POLICY_DENIED` and `WINDOW_STATE_STALE` are deterministic evaluator
+     outcomes for valid but mismatched or stale state. `DECISION_EXPIRED` is
+     reserved for the execute-time clock check. It has **no human-approval
+     field**: the decision itself is the time-boxed grant.
    - **Immutable autonomous prepared operation**
      (`gamelift-capacity-autonomous-operation`): the `authority.decision` enum is
      the `["authorized","denied"]` mirror of the v1 `["approval_required",
      "denied"]` prepared operation. It binds the autonomy policy id/version/hash,
-     the decision id/hash, the observation id/hash, the exact desired/min/max
-     change, the six authority inputs and their minimum, the calculated risk, the
+     the decision id/hash, the complete observation-evidence document, the
+     rolling-state id/revision/hash, the exact desired/min/max change, the six
+     authority inputs and their deterministic minimum, the calculated risk, the
      automation principal scope, the executor binding, `decision_expires_at`
      (which cannot exceed the bound observation expiry), and
      `required_execution_authority: const "operate"`. Its `prepared_hash` binds
@@ -96,7 +110,8 @@ byte-for-byte unchanged.
 5. **Preserve the executor identity; distinct autonomy playbook.** The v2
    playbook (`playbook.gamelift-capacity-autonomy` / `2.0.0`) **reuses** the
    E2/E3 executor binding (`executor.gamelift-capacity` / `1.0`) — the single
-   `UpdateFleetCapacity` write machinery is unchanged — but its precondition set
+   `UpdateFleetCapacity` write machinery is unchanged — but its complete set of
+   transitive v2, E1 observation, and common schema hashes, its precondition set
    (the guardrail envelope instead of a granted human approval) and its
    `operate` execution authority make its hash **distinct** from the E2
    `playbook.gamelift-capacity` / `1.0.0` hash.

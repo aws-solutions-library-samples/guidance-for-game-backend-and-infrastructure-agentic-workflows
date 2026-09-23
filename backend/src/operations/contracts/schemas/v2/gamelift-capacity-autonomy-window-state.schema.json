@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v2:gamelift-capacity-autonomy-window-state",
+  "title": "GameLift Capacity Autonomy Rolling Window State 2.0",
+  "$comment": "Strict, non-negative, versioned snapshot of durable budget, cooldown, frequency, concurrency, and anti-oscillation evidence. state_hash excludes only itself. Missing, stale, malformed, or mismatched state fails closed.",
+  "$defs": {
+    "non_negative_epoch": {"type": "integer", "minimum": 0, "maximum": 4102444800},
+    "non_negative_count": {"type": "integer", "minimum": 0, "maximum": 1000000000},
+    "micro_usd": {"type": "integer", "minimum": 0, "maximum": 1000000000000},
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "fleet_id", "location"],
+      "properties": {
+        "provider": {"type": "string", "const": "gamelift"},
+        "fleet_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^fleet-[a-f0-9-]{1,120}$"},
+        "location": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$"}
+      }
+    },
+    "policy_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_id", "policy_version", "policy_hash"],
+      "properties": {
+        "policy_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+        "policy_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "policy_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "state_contract_version",
+    "state_id",
+    "state_revision",
+    "policy",
+    "tenant_id",
+    "workspace_id",
+    "resource_enrollment",
+    "target",
+    "as_of_epoch_seconds",
+    "expires_at_epoch_seconds",
+    "last_write_epoch_seconds",
+    "writes_in_window",
+    "window_micro_usd",
+    "action_micro_usd",
+    "in_flight",
+    "last_change_direction",
+    "direction_flips_in_window",
+    "state_hash"
+  ],
+  "properties": {
+    "state_contract_version": {"type": "string", "const": "2.0"},
+    "state_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "state_revision": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "policy": {"$ref": "#/$defs/policy_ref"},
+    "tenant_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "workspace_id": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/identifier"},
+    "resource_enrollment": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/resource_enrollment"},
+    "target": {"$ref": "#/$defs/target"},
+    "as_of_epoch_seconds": {"$ref": "#/$defs/non_negative_epoch"},
+    "expires_at_epoch_seconds": {"$ref": "#/$defs/non_negative_epoch"},
+    "last_write_epoch_seconds": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/non_negative_epoch"}
+      ]
+    },
+    "writes_in_window": {"$ref": "#/$defs/non_negative_count"},
+    "window_micro_usd": {"$ref": "#/$defs/micro_usd"},
+    "action_micro_usd": {"$ref": "#/$defs/micro_usd"},
+    "in_flight": {"type": "integer", "minimum": 0, "maximum": 1},
+    "last_change_direction": {"type": "string", "enum": ["none", "increase", "decrease"]},
+    "direction_flips_in_window": {"$ref": "#/$defs/non_negative_count"},
+    "state_hash": {"$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/digest"}
+  }
+}
