@@ -92,9 +92,14 @@ from typing import Any, Optional
 from operations.validation.e1_shakedown import (
     HttpResponse,
     Transport,
-    _requests_transport,
     _short_ref,
     response_is_bounded_and_clean,
+)
+from operations.validation.e5_command_adapter import (
+    CommandAdapter,
+    CommandAdapterConfig,
+    CommandTransport,
+    subprocess_runner,
 )
 
 # The exact, frozen out-of-band confirmations the operator must supply. They are
@@ -690,6 +695,79 @@ def _build_config(args: argparse.Namespace) -> E5ShakedownConfig:
     )
 
 
+def _build_command_adapter(args: argparse.Namespace, config: "E5ShakedownConfig") -> CommandAdapter:
+    """Assemble the concrete command adapter from args/env. No secrets are read."""
+
+    def _val(name: str, default: str = "") -> str:
+        return getattr(args, name, None) or os.environ.get(f"GBAW_E5_{name.upper()}", "") or default
+
+    project = _val("project_name", "game-agent")
+    adapter_config = CommandAdapterConfig(
+        region=config.preflight.region,
+        profile=config.preflight.profile,
+        evaluator_function_name=_val("evaluator_function_name", f"{project}-operations-autonomy-evaluator"),
+        observe_function_name=_val("observe_function_name", f"{project}-operations-observation"),
+        operations_table_name=_val("operations_table_name", f"{project}-operations"),
+        enrolled_fleet_id=config.preflight.enrolled_fleet_id or config.fleet_id,
+        autonomy_application_id=_val("autonomy_application_id"),
+        autonomy_environment_id=_val("autonomy_environment_id"),
+        autonomy_switch_profile_id=_val("autonomy_switch_profile_id"),
+        errors_alarm_name=_val("errors_alarm_name", f"{project}-operations-AutonomyEvaluatorErrors"),
+        throttles_alarm_name=_val("throttles_alarm_name", f"{project}-operations-AutonomyEvaluatorThrottles"),
+        delivery_alarm_name=_val("delivery_alarm_name", f"{project}-operations-AutonomyEvaluationDeliveryFailures"),
+        dead_letter_alarm_name=_val("dead_letter_alarm_name", f"{project}-operations-AutonomyDeadLetter"),
+    )
+    return CommandAdapter(adapter_config, runner=subprocess_runner)
+
+
+def _measure_preflight(adapter: CommandAdapter, supplied: E5Preflight) -> E5Preflight:
+    """Return a preflight whose measurable facts come from the provider.
+
+    Capacity, alarm safety, and autonomy-switch freshness are READ from the
+    provider and OVERRIDE the operator-supplied values. If an observed value
+    conflicts with a supplied "safe" flag, the measured (unsafe) value wins so
+    the run refuses. Profile/region/fleet identity remain operator-declared and
+    are still checked by E5Preflight.refusals().
+    """
+    caps = adapter.observed_fleet_capacity()
+    if caps is None:
+        # Missing/ambiguous capacity read -> fail closed with an out-of-window
+        # sentinel so STARTING_CAPACITY_NOT_0_0_1 fires.
+        starting_desired, starting_minimum, starting_maximum = -1, -1, -1
+    else:
+        starting_desired = caps["desired"]
+        starting_minimum = caps["minimum"]
+        starting_maximum = caps["maximum"]
+    alarms_safe = adapter.observed_alarms_safe()
+    autonomy_switch_fresh_enabled = adapter.observed_autonomy_switch_fresh_enabled()
+    # Drift and the static/E4 gates are AND-ed with the supplied values: a
+    # measurement can only make the preflight MORE conservative, never less.
+    return E5Preflight(
+        profile=supplied.profile,
+        region=supplied.region,
+        fleet_id=supplied.fleet_id,
+        enrolled_profile=supplied.enrolled_profile,
+        enrolled_region=supplied.enrolled_region,
+        enrolled_fleet_id=supplied.enrolled_fleet_id,
+        starting_desired=starting_desired,
+        starting_minimum=starting_minimum,
+        starting_maximum=starting_maximum,
+        static_gate_fresh_enabled=supplied.static_gate_fresh_enabled,
+        e4_gate_fresh_enabled=supplied.e4_gate_fresh_enabled,
+        autonomy_switch_fresh_enabled=autonomy_switch_fresh_enabled and supplied.autonomy_switch_fresh_enabled,
+        alarms_safe=alarms_safe,
+        drift_safe=supplied.drift_safe,
+    )
+
+
+def _replace_preflight(config: "E5ShakedownConfig", preflight: E5Preflight) -> "E5ShakedownConfig":
+    """Return a copy of config with a new (measured) preflight."""
+    # Standard library
+    import dataclasses
+
+    return dataclasses.replace(config, preflight=preflight)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Public-safe E5 bounded-autonomy shakedown")
     parser.add_argument("--endpoint", default="")
@@ -758,7 +836,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 3
 
     config = _build_config(args)
-    harness = E5ShakedownHarness(config, _requests_transport())
+
+    # Finding 7: build the CONCRETE command adapter and drive the lifecycle
+    # through it — NEVER _requests_transport / an HTTP route. The adapter issues
+    # structured `aws` CLI JSON commands only.
+    adapter = _build_command_adapter(args, config)
+
+    # Finding 8: MEASURE the preflight facts from the provider via the adapter
+    # (fleet capacity, the four AWS-native alarms, and the live autonomy switch
+    # freshness) and OVERLAY them over the operator-supplied values. A conflict
+    # between an observed state and a supplied boolean fails closed BEFORE any
+    # authenticated mutation.
+    try:
+        measured = _measure_preflight(adapter, config.preflight)
+    except Exception as exc:  # noqa: BLE001 - a failed measurement fails closed
+        print(json.dumps({"error": f"refused: preflight measurement failed ({type(exc).__name__})"}))
+        return 3
+    config = _replace_preflight(config, measured)
+    transport = CommandTransport(adapter)
+    harness = E5ShakedownHarness(config, transport)
     summary = harness.run()
     if not summary_is_public_safe(summary):  # defensive: never emit a leaky summary
         print(json.dumps({"error": "summary failed public-safety check"}))
