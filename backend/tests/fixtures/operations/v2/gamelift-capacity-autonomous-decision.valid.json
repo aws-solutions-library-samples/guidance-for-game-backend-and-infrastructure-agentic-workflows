@@ -75,7 +75,7 @@
   "decision": "authorized",
   "reason_codes": ["APPROVED_AUTONOMOUS"],
   "required_execution_authority": "operate",
-  "evaluated_at": "2026-09-21T19:11:52Z",
+  "evaluated_at": "2026-09-21T19:12:52Z",
   "decision_expires_at": "2026-09-21T19:13:52Z",
   "correlation": {
     "correlation_id": "corr.autonomy-1",

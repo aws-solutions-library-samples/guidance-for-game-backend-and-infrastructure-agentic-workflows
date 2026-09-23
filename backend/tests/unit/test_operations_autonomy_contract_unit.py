@@ -613,6 +613,111 @@ def test_binding_rejects_decision_policy_identity_substitution() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"action_micro_usd": 600000}, "BUDGET_EXCEEDED"),
+        ({"last_write_epoch_seconds": 1_790_017_912, "last_change_direction": "increase"}, "COOLDOWN_ACTIVE"),
+        ({"writes_in_window": 4}, "FREQUENCY_EXCEEDED"),
+        ({"in_flight": 1}, "CONCURRENCY_LIMIT"),
+        (
+            {
+                "last_write_epoch_seconds": 1_790_017_672,
+                "last_change_direction": "decrease",
+                "direction_flips_in_window": 1,
+            },
+            "OSCILLATION_BLOCKED",
+        ),
+        ({"as_of_epoch_seconds": 1_790_017_850, "expires_at_epoch_seconds": 1_790_017_971}, "WINDOW_STATE_STALE"),
+    ],
+)
+def test_binding_recomputes_evaluator_for_coordinated_window_state_changes(
+    changes: dict[str, Any], reason: str
+) -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    window_state = _window_state()
+    window_state.update(changes)
+    window_state["state_revision"] += 1
+    window_state["state_hash"] = autonomy_window_state_hash(window_state)
+    reference = {
+        "state_id": window_state["state_id"],
+        "state_revision": window_state["state_revision"],
+        "state_hash": window_state["state_hash"],
+    }
+    decision["window_state"] = deepcopy(reference)
+    operation["window_state"] = deepcopy(reference)
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match=reason):
+        _validate_binding(operation, decision, policy, window_state=window_state)
+
+
+@pytest.mark.unit
+def test_binding_recomputes_evaluator_for_coordinated_bounds_change() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    window_state = _window_state()
+
+    policy["risk"] = {"max_level": "critical", "max_score": 100}
+    policy["policy_hash"] = autonomy_policy_hash(policy)
+    policy_reference = {
+        "policy_id": policy["policy_id"],
+        "policy_version": policy["policy_version"],
+        "policy_hash": policy["policy_hash"],
+    }
+    window_state["policy"] = deepcopy(policy_reference)
+    window_state["state_hash"] = autonomy_window_state_hash(window_state)
+    window_reference = {
+        "state_id": window_state["state_id"],
+        "state_revision": window_state["state_revision"],
+        "state_hash": window_state["state_hash"],
+    }
+    decision["policy"] = deepcopy(policy_reference)
+    decision["window_state"] = deepcopy(window_reference)
+    decision["requested"] = {"desired": 2, "minimum": 0, "maximum": 2}
+    decision["calculated_risk"] = {
+        "level": "critical",
+        "score": 100,
+        "factors": ["bounds-violation", "desired-magnitude", "scale-up"],
+    }
+    operation["autonomy_policy"] = deepcopy(policy_reference)
+    operation["window_state"] = deepcopy(window_reference)
+    operation["parameters"] = {
+        "requested": deepcopy(decision["requested"]),
+        "change": {"desired": 2, "minimum": 0, "maximum": 1},
+    }
+    operation["calculated_risk"] = deepcopy(decision["calculated_risk"])
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="BOUNDS_EXCEEDED"):
+        _validate_binding(operation, decision, policy, window_state=window_state)
+
+
+@pytest.mark.unit
+def test_binding_rejects_cross_workspace_canonical_observation() -> None:
+    policy = _fixture(AUTONOMY_POLICY_SCHEMA_NAME)
+    decision = _fixture(AUTONOMOUS_DECISION_SCHEMA_NAME)
+    operation = _fixture(AUTONOMOUS_OPERATION_SCHEMA_NAME)
+    observation = _observation()
+    observation["requester"]["workspace_id"] = "workspace.other"
+    observation_hash = canonical_sha256(observation)
+    for document in (decision, operation):
+        document["current_state"]["workspace_id"] = "workspace.other"
+        document["current_state"]["observation_hash"] = observation_hash
+        document["current_state"]["evidence_hash"] = autonomy_evidence_hash(document["current_state"])
+    operation["decision"]["decision_hash"] = autonomous_decision_hash(decision)
+    operation["prepared_hash"] = autonomous_prepared_hash(operation)
+
+    with pytest.raises(AutonomyContractError, match="tenant/workspace"):
+        _validate_binding(operation, decision, policy, observation=observation)
+
+
+@pytest.mark.unit
 def test_binding_rejects_substituted_canonical_observation() -> None:
     observation = _observation()
     observation["results"]["capacity"][0]["desired"] = 1
@@ -650,7 +755,7 @@ def test_binding_fails_when_decision_expiry_exceeds_policy_ttl() -> None:
     # isolates the independent policy-TTL clamp.
     decision["current_state"]["expires_at"] = "2026-09-21T19:20:00Z"
     decision["current_state"]["evidence_hash"] = autonomy_evidence_hash(decision["current_state"])
-    decision["decision_expires_at"] = "2026-09-21T19:13:53Z"
+    decision["decision_expires_at"] = "2026-09-21T19:14:53Z"
     operation["current_state"]["expires_at"] = "2026-09-21T19:20:00Z"
     operation["current_state"]["evidence_hash"] = autonomy_evidence_hash(operation["current_state"])
     operation["decision_expires_at"] = decision["decision_expires_at"]

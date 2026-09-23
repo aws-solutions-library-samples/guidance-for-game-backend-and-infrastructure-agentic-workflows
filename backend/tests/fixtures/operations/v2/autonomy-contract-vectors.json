@@ -7,8 +7,8 @@
   "operation_fixture": "gamelift-capacity-autonomous-operation.valid.json",
   "expected": {
     "policy_hash": "sha256:7237ef5829513a408b309343ae4117756f46e69574adca3931b83450c9b74b18",
-    "decision_hash": "sha256:fca2884b279ae3952610d72fd117ded111c0c748f0b81c524245d5faba5880e9",
-    "prepared_hash": "sha256:e760768b066d6a553fb27110b7a448ec6df07d60206e0a95ef6122a8f22d3c23",
+    "decision_hash": "sha256:1318b33e8d2f2c08fdcb210d060b848beb90cb0f1d3a74d8127654c3ada366d6",
+    "prepared_hash": "sha256:6dfb38443897b18d52c0c8cfb893794308a0e28f3139ad1d8403da82bbbb38e9",
     "playbook_hash": "sha256:29b3047e98446ce4f919610418fd28ecba7339dfdb28382846913749f283b52f",
     "evidence_hash": "sha256:9606b9e5c0695527100bf34d9373cc5ec57070350a019b77f4491e038c063b48",
     "window_state_hash": "sha256:b037022bc46ad00af71d23765a1dfedcad6cb2c896cb0b8c55e87ef8721b0339",

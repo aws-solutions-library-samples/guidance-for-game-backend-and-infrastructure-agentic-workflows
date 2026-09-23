@@ -503,6 +503,14 @@ def _expected_observation_evidence(observation: dict[str, Any], policy: dict[str
             "gamelift-capacity-autonomy-observation-binding",
             ["canonical E1 observation requester does not match the automation principal"],
         )
+    if (
+        observation["requester"]["tenant_id"],
+        observation["requester"]["workspace_id"],
+    ) != (policy["tenant_id"], policy["workspace_id"]):
+        raise AutonomyContractError(
+            "gamelift-capacity-autonomy-observation-binding",
+            ["canonical E1 observation tenant/workspace does not match the autonomy policy"],
+        )
     if observation["target"] != {"provider": target["provider"], "fleet_id": target["fleet_id"]}:
         raise AutonomyContractError(
             "gamelift-capacity-autonomy-observation-binding",
@@ -661,6 +669,28 @@ def validate_autonomous_operation_binding(
         or expected_risk["score"] > risk_limit["max_score"]
     ):
         errors.append("authorized decision calculated_risk exceeds the policy risk ceiling")
+
+    evaluated_epoch = int(_parse_timestamp(decision["evaluated_at"]).timestamp())
+    evaluation = evaluate_autonomy_policy(
+        policy=policy,
+        authority_inputs=decision["authority_inputs"],
+        automation_principal=decision["automation_principal"],
+        observation=decision["current_state"],
+        requested=decision["requested"],
+        window_state=window_state,
+        now_epoch_seconds=evaluated_epoch,
+    )
+    evaluator_reasons = ",".join(evaluation["reason_codes"])
+    if decision["decision"] != evaluation["decision"]:
+        errors.append(f"decision does not match the deterministic evaluator result: {evaluator_reasons}")
+    if decision["reason_codes"] != evaluation["reason_codes"]:
+        errors.append(f"decision reason_codes do not match the deterministic evaluator result: {evaluator_reasons}")
+    if decision["effective_authority"] != evaluation["effective_authority"]:
+        errors.append("decision effective_authority does not match the deterministic evaluator result")
+    if decision["calculated_risk"] != evaluation["calculated_risk"]:
+        errors.append("decision calculated_risk does not match the deterministic evaluator result")
+    if operation["parameters"]["change"] != evaluation["change"]:
+        errors.append("operation change does not match the deterministic evaluator result")
 
     if operation["authority"]["decision"] != decision["decision"]:
         errors.append("operation authority decision does not match the decision")
