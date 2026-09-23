@@ -62,13 +62,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
 # Local modules
-from operations.contracts.autonomy import autonomy_window_state_hash, validate_autonomy_contract
+from operations.contracts.autonomy import (
+    AutonomyContractError,
+    autonomy_window_state_hash,
+    validate_autonomy_contract,
+)
 
 _WINDOW_STATE_SCHEMA = "gamelift-capacity-autonomy-window-state"
 _DIRECTIONS = frozenset({"none", "increase", "decrease"})
@@ -622,6 +627,53 @@ class DynamoDbReservationStore:
         if not isinstance(parsed, dict):
             raise ReservationStoreError("stored window state is malformed")
         return parsed
+
+    def seed_window_state(self, window_state: Mapping[str, Any]) -> None:
+        """Create the initial durable window snapshot (deploy-time seed, #440).
+
+        The runtime only ever *advances* an already-present window snapshot
+        behind a revision + ``in_flight`` fence; it never creates one. The
+        initial snapshot is therefore a deploy-time seed, and this method is the
+        only writer allowed to create it. It is invoked by the issue #440
+        ``--enable`` deploy wrapper, never on any request path.
+
+        Fails closed unless the document satisfies the frozen #438 window-state
+        contract (which binds ``state_hash`` to the canonical bytes), then writes
+        the snapshot with a conditional ``attribute_not_exists(SK)`` put so it can
+        never clobber a live snapshot the runtime is fencing on. An identical
+        re-seed is idempotent (a benign wrapper re-run); a *different* snapshot
+        for the same ``state_id`` is refused without overwrite. A transient fault
+        surfaces as an error, never a silent success.
+        """
+        document = dict(window_state)
+        try:
+            validate_autonomy_contract(_WINDOW_STATE_SCHEMA, document)
+        except AutonomyContractError as exc:
+            raise ReservationStoreError("window state failed the frozen autonomy contract") from exc
+
+        state_id = document["state_id"]
+        canonical = _canonical(document)
+        item = {
+            "PK": self._state_pk(state_id),
+            "SK": _STATE_SK,
+            "document": canonical,
+            "state_revision": int(document["state_revision"]),
+            "in_flight": int(document["in_flight"]),
+        }
+        try:
+            self._client.put_item(
+                TableName=self._table_name,
+                Item=_marshal(item),
+                ConditionExpression="attribute_not_exists(SK)",
+            )
+        except Exception as exc:  # noqa: BLE001 - classify conditional vs unavailable
+            if _is_conditional_failure(exc):
+                existing = self._get(self._state_pk(state_id), _STATE_SK)
+                existing_doc = existing.get("document") if isinstance(existing, dict) else None
+                if isinstance(existing_doc, str) and existing_doc == canonical:
+                    return
+                raise ReservationStoreError("a different window state is already sealed for this state_id") from exc
+            raise ReservationStoreError("window state store is unavailable") from exc
 
     def reserve(self, request: ReservationRequest) -> ReservationResult:
         try:
