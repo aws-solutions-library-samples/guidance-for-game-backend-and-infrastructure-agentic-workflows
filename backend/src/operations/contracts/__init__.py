@@ -21,6 +21,7 @@ from operations.contracts.autonomy import (
     evaluate_autonomy_policy,
     is_supported_autonomy_version,
     load_autonomy_schema,
+    project_observation_evidence,
     validate_autonomous_operation_binding,
     validate_autonomy_contract,
 )
@@ -158,6 +159,7 @@ __all__ = [
     "load_json",
     "load_schema",
     "logical_action_id",
+    "project_observation_evidence",
     "source_control_branch_name",
     "source_control_content_hash",
     "validate_approval_binding",
