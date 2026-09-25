@@ -151,9 +151,9 @@ Resources:
         Type: S3
         S3Configuration:
           BucketArn: !GetAtt DocumentBucket.Arn
-          # The operations control-plane stores deployment archives in the same
-          # bucket. Restrict Bedrock ingestion to the documentation prefix so
-          # unsupported archives do not degrade GameLift retrieval coverage.
+          # Limit this data source to the GameLift documentation uploaded by
+          # the seeding workflow. Other objects in the bucket are unrelated to
+          # this Knowledge Base and must not enter ingestion.
           InclusionPrefixes:
             - gamelift/
       VectorIngestionConfiguration:
