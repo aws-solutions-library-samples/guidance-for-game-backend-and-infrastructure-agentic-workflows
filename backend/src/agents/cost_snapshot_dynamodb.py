@@ -90,17 +90,17 @@ class DynamoDbCostSnapshotStore:
             if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 # A report ID already exists; snapshots are immutable. Fail closed
                 # as a typed collision and never re-query Cost Explorer.
-                logger.error("Cost report snapshot collision on immutable write", exc_info=True)
+                logger.exception("Cost report snapshot collision on immutable write")
                 raise SnapshotCollisionError("cost report snapshot already exists") from exc
-            logger.error("Failed to persist cost report snapshot to shared store", exc_info=True)
+            logger.exception("Failed to persist cost report snapshot to shared store")
             raise CostSnapshotStoreError("cost report snapshot could not be persisted") from exc
         except BotoCoreError as exc:
-            logger.error("Failed to persist cost report snapshot to shared store", exc_info=True)
+            logger.exception("Failed to persist cost report snapshot to shared store")
             raise CostSnapshotStoreError("cost report snapshot could not be persisted") from exc
         except Exception as exc:
             # Serialization or any other unexpected error: fail closed as a typed
             # store failure so the caller never returns an unreusable report ID.
-            logger.error("Unexpected error persisting cost report snapshot", exc_info=True)
+            logger.exception("Unexpected error persisting cost report snapshot")
             raise CostSnapshotStoreError("cost report snapshot could not be persisted") from exc
 
     def get(self, report_id: str, scope_hash: str) -> "CostReportSnapshot | None":
@@ -112,7 +112,7 @@ class DynamoDbCostSnapshotStore:
                 ConsistentRead=True,
             )
         except (BotoCoreError, ClientError) as exc:
-            logger.error("Failed to read cost report snapshot from shared store", exc_info=True)
+            logger.exception("Failed to read cost report snapshot from shared store")
             raise CostSnapshotStoreError("cost report snapshot could not be read") from exc
 
         item = response.get("Item")
