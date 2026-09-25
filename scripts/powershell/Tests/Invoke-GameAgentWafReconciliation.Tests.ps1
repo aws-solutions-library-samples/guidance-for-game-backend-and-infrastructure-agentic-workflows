@@ -37,12 +37,18 @@ BeforeAll {
             switch ($operation) {
                 'wafv2 get-web-acl-for-resource' {
                     $value = if ($activeQueue.Count -gt 0) { $activeQueue.Dequeue() } else { $lastActiveValue }
-                    if ($value -eq 'TRANSIENT') { throw 'WAFUnavailableEntityException' }
+                    switch ($value) {
+                        'TRANSIENT_UNAVAILABLE' { throw 'WAFUnavailableEntityException' }
+                        'TRANSIENT_INTERNAL' { throw 'WAFInternalErrorException' }
+                    }
                     return $value
                 }
                 'wafv2 associate-web-acl' {
                     $value = if ($associationQueue.Count -gt 0) { $associationQueue.Dequeue() } else { $lastAssociationValue }
-                    if ($value -eq 'TRANSIENT') { throw 'WAFUnavailableEntityException' }
+                    switch ($value) {
+                        'TRANSIENT_UNAVAILABLE' { throw 'WAFUnavailableEntityException' }
+                        'TRANSIENT_INTERNAL' { throw 'WAFInternalErrorException' }
+                    }
                     return ''
                 }
                 'wafv2 get-web-acl' {
@@ -70,11 +76,16 @@ Describe 'Invoke-GameAgentWafReconciliation' {
         $calls | Should -Contain 'wafv2 get-web-acl'
     }
 
-    It 'Retries transient association and lookup failures before converging' {
+    It 'Retries <Marker> association and lookup failures before converging' -TestCases @(
+        @{ Marker = 'TRANSIENT_UNAVAILABLE' }
+        @{ Marker = 'TRANSIENT_INTERNAL' }
+    ) {
+        param($Marker)
+
         $calls = [System.Collections.Generic.List[string]]::new()
         $invokeAws = New-TestWafInvoker `
-            -ActiveSequence @('platform/name/id', 'TRANSIENT', 'expected/name/id') `
-            -AssociationSequence @('TRANSIENT', 'SUCCESS') `
+            -ActiveSequence @('platform/name/id', $Marker, 'expected/name/id') `
+            -AssociationSequence @($Marker, 'SUCCESS') `
             -Calls $calls
 
         Invoke-GameAgentWafReconciliation `
@@ -90,11 +101,16 @@ Describe 'Invoke-GameAgentWafReconciliation' {
         $calls | Should -Contain 'wafv2 get-web-acl'
     }
 
-    It 'Fails when transient association errors exhaust the retry budget' {
+    It 'Fails when <Marker> association errors exhaust the retry budget' -TestCases @(
+        @{ Marker = 'TRANSIENT_UNAVAILABLE' }
+        @{ Marker = 'TRANSIENT_INTERNAL' }
+    ) {
+        param($Marker)
+
         $calls = [System.Collections.Generic.List[string]]::new()
         $invokeAws = New-TestWafInvoker `
             -ActiveSequence @('platform/name/id') `
-            -AssociationSequence @('TRANSIENT') `
+            -AssociationSequence @($Marker) `
             -Calls $calls
 
         {

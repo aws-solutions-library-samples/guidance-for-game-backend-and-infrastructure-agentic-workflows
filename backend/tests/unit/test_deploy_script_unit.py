@@ -85,6 +85,7 @@ def _run_waf_reconciliation(
         "AWSManagedRulesCommonRuleSet AWSManagedRulesSQLiRuleSet AWSManagedRulesKnownBadInputsRuleSet"
     ),
     transient_association_failures: int = 0,
+    association_error_marker: str = "TRANSIENT_UNAVAILABLE",
     association_max_attempts: int = 3,
     verification_max_attempts: int = 3,
 ) -> subprocess.CompletedProcess[str]:
@@ -117,10 +118,16 @@ aws() {
   local value
   if [ "$1" = "wafv2" ] && [ "$2" = "get-web-acl-for-resource" ]; then
     value="$(next_sequence_value "$WAF_TEST_ACTIVE_SEQUENCE" active_count)"
-    if [ "$value" = "TRANSIENT" ]; then
-      echo 'WAFUnavailableEntityException' >&2
-      return 255
-    fi
+    case "$value" in
+      TRANSIENT_UNAVAILABLE)
+        echo 'WAFUnavailableEntityException' >&2
+        return 255
+        ;;
+      TRANSIENT_INTERNAL)
+        echo 'WAFInternalErrorException' >&2
+        return 255
+        ;;
+    esac
     printf '%s\n' "$value"
     return 0
   fi
@@ -131,7 +138,10 @@ aws() {
   if [ "$1" = "wafv2" ] && [ "$2" = "associate-web-acl" ]; then
     count="$(next_sequence_value '1,2,3,4,5' association_count)"
     if [ "$count" -le "$WAF_TEST_TRANSIENT_ASSOCIATION_FAILURES" ]; then
-      echo 'WAFUnavailableEntityException' >&2
+      case "$WAF_TEST_ASSOCIATION_ERROR_MARKER" in
+        TRANSIENT_INTERNAL) echo 'WAFInternalErrorException' >&2 ;;
+        *) echo 'WAFUnavailableEntityException' >&2 ;;
+      esac
       return 255
     fi
     return 0
@@ -163,6 +173,7 @@ exit "$exit_code"
                 "WAF_TEST_ACTIVE_SEQUENCE": active_sequence,
                 "WAF_TEST_RULE_NAMES": rule_names,
                 "WAF_TEST_TRANSIENT_ASSOCIATION_FAILURES": str(transient_association_failures),
+                "WAF_TEST_ASSOCIATION_ERROR_MARKER": association_error_marker,
                 "WAF_TEST_ASSOCIATION_MAX_ATTEMPTS": str(association_max_attempts),
                 "WAF_TEST_VERIFICATION_MAX_ATTEMPTS": str(verification_max_attempts),
             }
@@ -290,20 +301,24 @@ def test_waf_reconciliation_skips_association_when_expected_acl_and_rules_are_ac
     assert result.stdout.splitlines()[-2:] == ["association_count=0", "active_count=1"]
 
 
-def test_waf_reconciliation_recovers_from_transient_association_and_lookup_failures():
+@pytest.mark.parametrize("transient_marker", ["TRANSIENT_UNAVAILABLE", "TRANSIENT_INTERNAL"])
+def test_waf_reconciliation_recovers_from_retryable_association_and_lookup_failures(transient_marker):
     result = _run_waf_reconciliation(
-        "platform-acl,TRANSIENT,expected-acl",
+        f"platform-acl,{transient_marker},expected-acl",
         transient_association_failures=1,
+        association_error_marker=transient_marker,
     )
 
     assert result.returncode == 0
     assert result.stdout.splitlines()[-2:] == ["association_count=2", "active_count=3"]
 
 
-def test_waf_reconciliation_fails_when_association_retries_are_exhausted():
+@pytest.mark.parametrize("transient_marker", ["TRANSIENT_UNAVAILABLE", "TRANSIENT_INTERNAL"])
+def test_waf_reconciliation_fails_when_retryable_association_errors_exhaust_budget(transient_marker):
     result = _run_waf_reconciliation(
         "platform-acl",
         transient_association_failures=3,
+        association_error_marker=transient_marker,
         association_max_attempts=3,
     )
 

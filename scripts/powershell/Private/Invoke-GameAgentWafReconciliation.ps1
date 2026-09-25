@@ -38,7 +38,7 @@ function Invoke-GameAgentWafReconciliation {
 
     function Test-TransientWafError {
         param([string]$ErrorText)
-        return $ErrorText -match 'WAFNonexistentItemException|WAFUnavailableEntityException'
+        return $ErrorText -match 'WAFNonexistentItemException|WAFUnavailableEntityException|WAFInternalErrorException'
     }
 
     function Invoke-WafAws {

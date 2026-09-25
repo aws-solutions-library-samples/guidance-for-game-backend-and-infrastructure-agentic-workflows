@@ -281,7 +281,8 @@ build_agentcore_env_args() {
 is_transient_waf_error() {
   local error_text="$1"
   [[ "$error_text" == *"WAFNonexistentItemException"* \
-    || "$error_text" == *"WAFUnavailableEntityException"* ]]
+    || "$error_text" == *"WAFUnavailableEntityException"* \
+    || "$error_text" == *"WAFInternalErrorException"* ]]
 }
 
 get_active_web_acl_arn() {
