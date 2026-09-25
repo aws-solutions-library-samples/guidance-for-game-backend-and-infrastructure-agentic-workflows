@@ -102,11 +102,23 @@ _FINANCIAL_TOPIC_RE = re.compile(
     rf"\b(?:{_ISO_ALTERNATION})\b",
     re.IGNORECASE,
 )
-# A label line ends with the financial noun (plus at most two trailing words and
-# Markdown/colon decoration): "Monthly cost:", "**Billing total**", "Savings:".
-# A noun followed by other content on its line ("| Billing | On-Demand |",
-# "Billing type: SPOT", "rate limit applies.") is not a label.
-_LABEL_LINE_END = r"(?:\s+\w+){0,2}[ \t*:_]*\n"
+# A label line ends with the financial noun plus at most two allowlisted
+# financial-label words and Markdown/colon decoration: "Monthly cost:",
+# "**Billing total**", "Cost per month:". Restricting the suffix prevents
+# ordinary operational prose such as "cost efficiency" from becoming a label
+# merely because a numeric line follows it.
+_FINANCIAL_LABEL_WORD = (
+    r"total|amount|estimate|value|rate|price|cost|spend|spending|savings?|"
+    r"charges?|bill|billing|per|hour|day|week|month|year|hourly|daily|weekly|"
+    r"monthly|annual|yearly"
+)
+# An explicit colon is a strong label delimiter, so allow bounded arbitrary
+# qualifiers before it ("Amount due:", "Invoice subtotal:", "Cost per
+# instance:"). Without a colon, allow only known financial-label words so
+# ordinary prose such as "cost efficiency" cannot bind to a later count.
+_EXPLICIT_LABEL_LINE_END = r"[^\n:]{0,80}:[ \t*]*\n"
+_IMPLICIT_LABEL_LINE_END = rf"(?:\s+(?:{_FINANCIAL_LABEL_WORD})){{0,2}}[ \t*]*\n"
+_LABEL_LINE_END = rf"(?:{_EXPLICIT_LABEL_LINE_END}|{_IMPLICIT_LABEL_LINE_END})"
 _VALUE_LANGUAGE_RE = re.compile(
     rf"(?:\b(?:{_FINANCIAL_NOUN})\b[^\n]{{0,200}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,200}}\b(?:{_FINANCIAL_NOUN})\b)"
