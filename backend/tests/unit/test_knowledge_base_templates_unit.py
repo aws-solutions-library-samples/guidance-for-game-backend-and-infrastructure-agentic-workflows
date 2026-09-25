@@ -46,6 +46,14 @@ def test_knowledge_base_replacement_uses_versioned_name(knowledge_base):
     assert kb_name == f"${{ProjectName}}-{knowledge_base}-kb-v2"
 
 
+def test_gamelift_data_source_scopes_ingestion_to_document_prefix():
+    """Non-document artifacts in the shared bucket must not enter KB ingestion."""
+    template = _load_template("gamelift")
+    s3_configuration = template["Resources"]["DataSource"]["Properties"]["DataSourceConfiguration"]["S3Configuration"]
+
+    assert s3_configuration["InclusionPrefixes"] == ["gamelift/"]
+
+
 def test_eks_chunk_size_is_restored_after_metadata_fix():
     template = _load_template("eks")
     ingestion = template["Resources"]["DataSource"]["Properties"]["VectorIngestionConfiguration"]

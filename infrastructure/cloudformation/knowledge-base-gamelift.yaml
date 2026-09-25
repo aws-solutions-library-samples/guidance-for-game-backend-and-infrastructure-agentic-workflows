@@ -151,6 +151,11 @@ Resources:
         Type: S3
         S3Configuration:
           BucketArn: !GetAtt DocumentBucket.Arn
+          # The operations control-plane stores deployment archives in the same
+          # bucket. Restrict Bedrock ingestion to the documentation prefix so
+          # unsupported archives do not degrade GameLift retrieval coverage.
+          InclusionPrefixes:
+            - gamelift/
       VectorIngestionConfiguration:
         ChunkingConfiguration:
           ChunkingStrategy: FIXED_SIZE
