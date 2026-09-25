@@ -686,6 +686,45 @@ def test_direct_operational_model_response_remains_unchanged():
     assert response == operational
 
 
+def test_direct_operational_cost_efficiency_response_remains_unchanged():
+    """Operational cost-efficiency prose must not bind to a later fleet count."""
+    operational = (
+        "Using ARM-based instances for cost efficiency.\n" "Currently deployed in 1 region for lower player latency."
+    )
+
+    class StubOrchestratorAgent:
+        def __call__(self, query: str) -> str:
+            return operational
+
+    with (
+        patch.object(orchestrator, "Agent", return_value=StubOrchestratorAgent()),
+        patch.object(orchestrator, "USE_BEDROCK_SESSIONS", False),
+        patch.object(orchestrator, "create_bedrock_model_with_overrides", return_value=MagicMock()),
+    ):
+        response = orchestrator.run_orchestrator("List my GameLift fleets and their status")
+
+    assert response == operational
+
+
+def test_direct_operational_response_with_explicit_financial_label_is_withheld():
+    """An unknown but colon-delimited financial label remains fail-closed."""
+    model_response = "GameLift fleet is healthy.\n\nAmount due:\n999"
+
+    class StubOrchestratorAgent:
+        def __call__(self, query: str) -> str:
+            return model_response
+
+    with (
+        patch.object(orchestrator, "Agent", return_value=StubOrchestratorAgent()),
+        patch.object(orchestrator, "USE_BEDROCK_SESSIONS", False),
+        patch.object(orchestrator, "create_bedrock_model_with_overrides", return_value=MagicMock()),
+    ):
+        response = orchestrator.run_orchestrator("List my GameLift fleets and their status")
+
+    assert "999" not in response
+    assert "Unvalidated financial figures were withheld." in response
+
+
 def test_direct_operational_model_response_withholds_volunteered_financial_value():
     """A monetary claim is withheld based on output even when the query is not cost-classified."""
     model_response = "EKS is healthy, and its projected monthly cost is USD 999.00."

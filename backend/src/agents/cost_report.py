@@ -567,7 +567,7 @@ class CostReportService:
         except CostReportError:
             raise
         except Exception as exc:
-            logger.error("Cost Explorer request failed while building a deterministic report", exc_info=True)
+            logger.exception("Cost Explorer request failed while building a deterministic report")
             raise CostReportError(
                 "COST_EXPLORER_REQUEST_FAILED",
                 "AWS Cost Explorer could not produce a validated report. Retry the request.",

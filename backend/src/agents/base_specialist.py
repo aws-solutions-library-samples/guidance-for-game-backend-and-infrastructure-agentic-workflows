@@ -135,7 +135,7 @@ def create_specialist_agent(
                     # NOT interpolate it into the user-facing string — the raw
                     # message can leak internal details (ARNs, stack frames, SDK
                     # errors). Return a generic message instead.
-                    logger.error(f"❌ {service_name} agent failed", exc_info=True)
+                    logger.exception(f"❌ {service_name} agent failed")
                     if fallback_fn:
                         fallback_message = fallback_fn(AWS_REGION)
                         record_specialist_output(service_name, fallback_message)
