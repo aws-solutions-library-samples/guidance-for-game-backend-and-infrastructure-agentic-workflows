@@ -278,6 +278,80 @@ build_agentcore_env_args() {
   return 0
 }
 
+get_active_web_acl_arn() {
+  local resource_arn="$1"
+  local query_result
+
+  if ! query_result=$(aws wafv2 get-web-acl-for-resource \
+    --resource-arn "$resource_arn" \
+    --region "$AWS_REGION" \
+    --query 'WebACL.ARN' \
+    --output text 2>&1); then
+    if [[ "$query_result" == *"WAFNonexistentItemException"* ]]; then
+      return 0
+    fi
+    echo "❌ Unable to inspect the active WAF association" >&2
+    return 1
+  fi
+
+  if [ "$query_result" != "None" ]; then
+    printf '%s\n' "$query_result"
+  fi
+}
+
+reconcile_waf_association() {
+  local expected_web_acl_arn="$1"
+  local resource_arn="$2"
+  local max_attempts="${GBAW_WAF_ASSOCIATION_MAX_ATTEMPTS:-12}"
+  local retry_seconds="${GBAW_WAF_ASSOCIATION_RETRY_SECONDS:-5}"
+  local active_web_acl_arn
+  local attempt
+
+  if ! is_resolved_deployment_value "$expected_web_acl_arn" \
+    || ! is_resolved_deployment_value "$resource_arn"; then
+    echo "❌ Cannot reconcile WAF without resolved WebACL and frontend ALB ARNs" >&2
+    return 1
+  fi
+  if ! [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || ! [[ "$retry_seconds" =~ ^[0-9]+$ ]]; then
+    echo "❌ WAF association retry settings must be positive attempts and non-negative seconds" >&2
+    return 1
+  fi
+
+  if ! active_web_acl_arn=$(get_active_web_acl_arn "$resource_arn"); then
+    return 1
+  fi
+  if [ "$active_web_acl_arn" = "$expected_web_acl_arn" ]; then
+    echo "✅ Expected WAF is already associated with the frontend ALB"
+    return 0
+  fi
+
+  if [ -n "$active_web_acl_arn" ]; then
+    echo "🔄 Replacing a different active WAF association with the project WebACL"
+  else
+    echo "🔄 Associating the project WebACL with the frontend ALB"
+  fi
+  aws wafv2 associate-web-acl \
+    --web-acl-arn "$expected_web_acl_arn" \
+    --resource-arn "$resource_arn" \
+    --region "$AWS_REGION"
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if ! active_web_acl_arn=$(get_active_web_acl_arn "$resource_arn"); then
+      return 1
+    fi
+    if [ "$active_web_acl_arn" = "$expected_web_acl_arn" ]; then
+      echo "✅ Project WAF association converged after ${attempt} check(s)"
+      return 0
+    fi
+    if [ "$attempt" -lt "$max_attempts" ]; then
+      sleep "$retry_seconds"
+    fi
+  done
+
+  echo "❌ Project WAF association did not converge" >&2
+  return 1
+}
+
 build_agentcore_env_args
 
 # Get execution role from CloudFormation
@@ -595,6 +669,13 @@ WAF_ACL_ARN=$(aws cloudformation describe-stacks \
   --region $AWS_REGION \
   --query 'Stacks[0].Outputs[?OutputKey==`WebACLArn`].OutputValue' \
   --output text 2>/dev/null || echo "")
+
+# ECS Express owns the ALB lifecycle and can leave a platform WAF attached even
+# when CloudFormation reports this association as complete. Reassert and verify
+# the project ACL after the frontend deployment so the declared auth/admin and
+# application rate limits are the active controls.
+echo "🔗 Step 8c: Reconciling WAF association..."
+reconcile_waf_association "$WAF_ACL_ARN" "$FRONTEND_ALB_ARN"
 
 CLOUDTRAIL_ARN=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-security" \

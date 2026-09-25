@@ -18,6 +18,11 @@ FUNCTION_NAMES = (
     "append_agentcore_env_if_resolved",
     "build_agentcore_env_args",
 )
+WAF_FUNCTION_NAMES = (
+    "is_resolved_deployment_value",
+    "get_active_web_acl_arn",
+    "reconcile_waf_association",
+)
 OPTIONAL_VARIABLES = (
     "GUARDRAIL_ID",
     "GBAW_ORCHESTRATOR_PROMPT_ARN",
@@ -67,6 +72,42 @@ def _build_agentcore_env_args(overrides: dict[str, str] | None = None) -> list[s
         check=True,
     )
     return result.stdout.splitlines()
+
+
+def _run_waf_reconciliation(initial_acl: str, final_acl: str) -> subprocess.CompletedProcess[str]:
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    functions = "\n".join(_function_source(content, name) for name in WAF_FUNCTION_NAMES)
+    command = "\n".join(
+        (
+            functions,
+            """
+association_count=0
+aws() {
+  if [ "$1" = "wafv2" ] && [ "$2" = "get-web-acl-for-resource" ]; then
+    if [ "$association_count" -eq 0 ]; then
+      printf '%s\\n' "__INITIAL_ACL__"
+    else
+      printf '%s\\n' "__FINAL_ACL__"
+    fi
+    return 0
+  fi
+  if [ "$1" = "wafv2" ] && [ "$2" = "associate-web-acl" ]; then
+    association_count=$((association_count + 1))
+    return 0
+  fi
+  return 1
+}
+sleep() { :; }
+WAF_ASSOCIATION_MAX_ATTEMPTS=1
+WAF_ASSOCIATION_RETRY_SECONDS=0
+reconcile_waf_association expected-acl resource-arn
+exit_code=$?
+printf 'association_count=%s\\n' "$association_count"
+exit "$exit_code"
+""".replace("__INITIAL_ACL__", initial_acl).replace("__FINAL_ACL__", final_acl),
+        )
+    )
+    return subprocess.run(["bash", "-c", command], capture_output=True, text=True)
 
 
 def test_deploy_script_has_valid_bash_syntax():
@@ -180,3 +221,24 @@ def test_agentcore_env_args_filter_optional_values_independently():
         "-env",
         "GBAW_COST_KB_ID=cost-kb",
     ]
+
+
+def test_waf_reconciliation_skips_association_when_expected_acl_is_active():
+    result = _run_waf_reconciliation("expected-acl", "expected-acl")
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[-1] == "association_count=0"
+
+
+def test_waf_reconciliation_reassociates_and_verifies_the_expected_acl():
+    result = _run_waf_reconciliation("platform-acl", "expected-acl")
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[-1] == "association_count=1"
+
+
+def test_waf_reconciliation_fails_when_the_expected_acl_does_not_converge():
+    result = _run_waf_reconciliation("platform-acl", "platform-acl")
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines()[-1] == "association_count=1"
