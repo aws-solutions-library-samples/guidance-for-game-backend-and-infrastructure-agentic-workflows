@@ -200,6 +200,12 @@ _ACCOUNT_ID = re.compile(r"\d{12}")
 # octets are validated exactly (0-255) so a version-like token is only rejected
 # when it is genuinely a legal IPv4 address.
 
+# A dotted-quad-shaped numeric run is a network coordinate candidate even when
+# octets use noncanonical padding or oversized prefixes accepted by legacy host
+# parsers. GameLift's model-visible operational strings do not need four numeric
+# components, so reject this shape before any value crosses the boundary.
+_DOTTED_QUAD_TEXT = re.compile(r"\d+(?:\.\d+){3}")
+
 # URL / URI schemes (http, https, s3, file, ftp, ...) — the "scheme://" shape.
 _URL_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://")
 
@@ -258,20 +264,12 @@ def _looks_like_network_coordinate(value: str) -> bool:
             return True
         except ValueError:
             continue
-    # Embedded dotted-quad IPv4 anywhere in the value. The overlapping
-    # lookahead examines every digit offset, so a valid quad is still found when
-    # it starts inside an oversized leading component (for example, the
-    # ``10.11.12.13`` suffix of ``99910.11.12.13``) or is followed by more
-    # dotted components. Validate each candidate's octets exactly.
-    for match in re.finditer(r"(?=(\d{1,3}(?:\.\d{1,3}){3}))", value):
-        candidate = match.group(1)
-        octets = candidate.split(".")
-        # Parse the decimal octets ourselves so zero-padded spellings such as
-        # 010.011.012.013 are rejected too. Some host/network parsers accept
-        # those spellings even though ipaddress.IPv4Address intentionally does
-        # not, so relying only on that library leaves a model-visible bypass.
-        if len(octets) == 4 and all(0 <= int(octet, 10) <= 255 for octet in octets):
-            return True
+    # Reject every dotted-quad-shaped numeric run before canonical parsing.
+    # This catches zero-padded and oversized components that legacy host parsers
+    # can normalize as IPv4 even though Python's strict ipaddress parser rejects
+    # their spelling.
+    if _DOTTED_QUAD_TEXT.search(value):
+        return True
     # Embedded colon-hex IPv6 runs. Any colon-bearing hextet sequence that parses
     # as an IPv6 address is a network coordinate.
     for token in re.split(r"[^0-9A-Fa-f:]+", value):

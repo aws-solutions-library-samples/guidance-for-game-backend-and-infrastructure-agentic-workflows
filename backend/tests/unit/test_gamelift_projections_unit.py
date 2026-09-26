@@ -943,6 +943,24 @@ class TestEmbeddedSensitiveCoordinateDetection:
         assert utilization_row["Location"] == "us-west-2"
         assert padded not in json.dumps({"scaling": scaling, "utilization": utilization})
 
+    def test_noncanonical_long_octet_quads_are_rejected(self):
+        # Legacy host parsers accept noncanonical component widths. Four
+        # numeric dotted components are unnecessary for these operational
+        # fields and must be rejected regardless of padding or prefix length.
+        # Local modules
+        from agents.gamelift_projections import project_fleet_capacity, project_scaling_policies
+
+        for coordinate in ("0001.0002.0003.0004", "9990001.0002.0003.0004"):
+            scaling = project_scaling_policies(
+                {"ScalingPolicies": [{"Name": f"host-{coordinate}-prod", "Status": "ACTIVE"}]}
+            )
+            capacity = project_fleet_capacity(
+                {"FleetCapacity": [{"InstanceType": f"host-{coordinate}-prod", "Location": "us-west-2"}]}
+            )
+            assert "Name" not in scaling["ScalingPolicies"][0]
+            assert "InstanceType" not in capacity["FleetCapacity"][0]
+            assert coordinate not in json.dumps({"scaling": scaling, "capacity": capacity})
+
 
 # ---------------------------------------------------------------------------
 # Log redaction: the failure log must never contain raw provider text or the
