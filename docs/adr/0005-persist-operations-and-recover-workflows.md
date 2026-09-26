@@ -127,6 +127,74 @@ on-demand `--persistence-table`, and the measurement was recorded at
 This record is therefore **Accepted** for the synchronous-observation latency
 claim; the caveats above remain part of what was validated.
 
+### E0 latency validation status (issue #412)
+
+The E0 validation spike ([#412](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/412))
+has produced the deterministic measurement path and its acceptance gate, but not
+yet a live measured percentile. It therefore does **not** move this record to
+Accepted.
+
+What the spike establishes now:
+
+- The exact E1 observation is three bounded, read-only GameLift reads for one
+  fleet — `describe_fleet_utilization`, `describe_fleet_capacity`,
+  `describe_scaling_policies` — plus the transactional persistence and RFC 8785
+  canonical serialization of the observation records.
+- Explicit sub-budgets that sum below the 30 s gateway integration ceiling:
+  3.0 s per read (×3), 3.0 s persistence + canonical serialization, and a 3.0 s
+  cancellation margin, for a 15.0 s total request deadline. The acceptance
+  ceiling is `ceiling − margin` = 27.0 s.
+- **Real wall-clock deadline enforcement**: each read runs in a worker thread
+  and the request waits at most the remaining budget for it. A read that blocks
+  past its deadline is abandoned and a typed **retryable** error
+  (`PROVIDER_UNAVAILABLE`) is raised *before* the read returns; the request does
+  not join the abandoned worker, so a hung read cannot make the request or the
+  harness wait past the deadline. The live client additionally bounds botocore
+  `connect_timeout`/`read_timeout` at or below the per-read budget and caps
+  retries, so a stuck socket surfaces as a fast typed error.
+- A read-only harness and full offline test suite that issue exactly the three
+  reads, fail closed on any per-call, persistence, or total overrun, never
+  return a partial result as success, and report sample size, successes,
+  failures, timeouts, and **partial denials reported separately from timeouts**,
+  plus p50/p95/p99/max using the nearest-rank percentile method. The harness
+  measures under a declared **closed-loop** concurrency arrival model
+  (`assumptions.arrival_model`) so the p99 has a defensible meaning, and it
+  discovers classic (EC2) fleets by paging `list_fleets` and filtering on
+  `ComputeType`, excluding container fleets.
+- A public-safe evidence schema and reproduction guide under
+  [`docs/evidence/`](../evidence/README.md).
+- Two explicit persistence modes for the measured path: a deterministic
+  **in-memory** mode for unit tests only (never acceptable as live evidence),
+  and an opt-in **real DynamoDB transactional** mode that writes synthetic,
+  per-sample-unique operation-state and append-only ledger items to a
+  caller-specified disposable table in one `TransactWriteItems` call with
+  conditional no-replacement (`attribute_not_exists`) semantics, under the
+  persistence deadline, writing no fleet id, account id, ARN, or provider
+  payload. A live provider-read measurement exposed that the harness's
+  original default persistence callable was a **no-op** that measured only
+  canonical serialization; the acceptance rule below now requires the real
+  transactional mode so a measured p99 reflects durable persistence.
+
+Acceptance rule to apply once the live run exists: **synchronous accepted iff
+the run used the real DynamoDB transactional persistence mode AND the sample
+is a clean run (zero failures, zero timeouts, zero partial denials) AND the
+measured p99 ≤ 27.0 s** over a representative sample. A single non-success
+sample denies acceptance regardless of the successful-subset p99, and a run
+that used the in-memory (test-only) mode is denied regardless of its p99
+because it did not exercise durable persistence. The emitted evidence states
+the actual persistence mode (`assumptions.persistence_mode`,
+`evaluation.persistence_mode`, `evaluation.persistence_acceptable`).
+
+Remaining live step (not completed in the read-only validation wave): run the
+harness against **one classic GameLift fleet** in a non-production account,
+with `--persistence-mode dynamodb-transactional` and a disposable,
+task-owned, on-demand `--persistence-table`, and record
+`docs/evidence/e0-latency-<date>.json`. The available demo account has no
+classic fleet — only a container fleet, which `describe_fleet_utilization`
+rejects (`Operation only supports Fleet resource`) — so representative live
+measurement requires provisioning a classic fleet, an AWS mutation outside this
+wave. This record stays **Proposed** until that evidence exists and is reviewed.
+
 ## Context
 
 The optional operations control plane accepted in [ADR 0001](0001-preserve-chat-and-add-optional-operations.md)

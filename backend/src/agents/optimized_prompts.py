@@ -194,7 +194,7 @@ def _load_from_bedrock_pm():
         # Local modules
         from utils.logger import logger
 
-        logger.warning("Bedrock Prompt Management load failed; using code-defined prompts", exc_info=True)
+        logger.opt(exception=True).warning("Bedrock Prompt Management load failed; using code-defined prompts")
 
 
 # Run at import time (container startup)
