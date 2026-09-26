@@ -80,3 +80,53 @@ class TestReuseCostReportRegistered:
         assert "reuse_cost_report" in text
         low = text.lower()
         assert "no new" in low or "never issues a new" in low or "no-new-query" in low
+
+
+class TestMalformedDispositionInventoryAccuracy:
+    """Bind the inventory's malformed/partial-result claims to production behavior.
+
+    The prior inventory assigned two statuses to a skipped non-dict item
+    ("truncated" in one column, "incomplete/malformed_response" in another) and
+    promised a hard serialized-char cap that a mixed malformed result could
+    exceed. These tests compare the documented contract to the exact production
+    status/flag a mixed collection produces.
+    """
+
+    def test_inventory_does_not_conflate_skipped_non_dict_with_truncated_status(self):
+        text = _inventory_text()
+        # The contradictory phrasing that lumped skipped non-dict items under the
+        # ``truncated`` status must be gone.
+        assert "item/char cap or skipped non-dict items → `truncated`" not in text
+
+    def test_inventory_matches_production_status_for_mixed_non_dict_collection(self):
+        # Local modules
+        from agents.gamelift_projections import project_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                "malformed",
+                {"FleetId": "fleet-1", "ActiveServerProcessCount": 3, "Location": "us-west-2"},
+            ]
+        }
+        result = project_fleet_utilization(raw)
+        # Production: status=incomplete, error.code=malformed_response, and a
+        # SEPARATE truncated=true boolean marker.
+        assert result["status"] == "incomplete"
+        assert result["error"]["code"] == "malformed_response"
+        assert result["truncated"] is True
+
+        text = _inventory_text()
+        # The document must describe the status and the boolean marker distinctly
+        # and must state that skipped/discarded rows map to
+        # incomplete/malformed_response with a truncated flag — not to a
+        # ``truncated`` status.
+        assert "malformed_response" in text
+        low = text.lower()
+        assert "truncated: true" in low or "truncated=true" in low or "`truncated` flag" in low
+
+    def test_inventory_does_not_over_promise_a_hard_serialized_char_guarantee(self):
+        # The final malformed envelope is now budgeted, but the inventory must
+        # describe the budget as applying to the FINAL envelope (not a naive
+        # unconditional guarantee that a reader could read as un-scoped).
+        text = _inventory_text().lower()
+        assert "final" in text and "serialized" in text

@@ -39,60 +39,64 @@ FLEET_B = "fleet-bbbb-0002"
 # Routing / registration compatibility
 # ---------------------------------------------------------------------------
 class TestRoutingRegistrationCompatibility:
-    def test_factory_receives_the_four_runtime_tools(self):
-        # Observe the ACTUAL additional_tools argument handed to
-        # create_specialist_agent at module construction time via an import-time
-        # capture hook, NOT a post-construction alias. Dropping a tool from
-        # additional_tools must fail here.
+    def test_fake_factory_observes_exact_kwargs_passed_to_the_call(self):
+        # Inject a fake agent_factory and assert on the ACTUAL call_args the
+        # builder passed to it. This observes the real factory argument, not a
+        # pre-call local alias: changing the collection handed to the factory
+        # (or the service name/kb wiring) changes call_args and fails here.
         # Local modules
         import agents.gamelift_specialist as gls
 
-        captured = gls.get_captured_specialist_registration()
-        assert captured is not None, "no create_specialist_agent call was captured at import time"
-        registered = captured["additional_tools"]
+        fake_factory = MagicMock(return_value="fake-agent")
+        agent = gls.build_gamelift_agent(agent_factory=fake_factory)
+
+        assert agent == "fake-agent"
+        fake_factory.assert_called_once()
+        _, kwargs = fake_factory.call_args
+        assert kwargs["service_name"] == "GameLift"
+        registered = kwargs["additional_tools"]
         names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
         for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
-            assert name in names, f"{name} missing from the tools handed to create_specialist_agent"
+            assert name in names, f"{name} missing from the tools passed to the factory"
         assert len(registered) == 4
-        # The captured service name confirms this is the GameLift specialist.
-        assert captured["service_name"] == "GameLift"
+        # The canonical collection is what the runtime is built from.
+        assert kwargs["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
 
-    def test_dropping_a_tool_from_additional_tools_is_observed(self):
-        # Discriminating: rebuild the specialist through the SAME factory path
-        # with one tool removed and prove the capture reflects the reduced list.
-        # This is what makes the test fail when additional_tools loses a tool.
+    def test_fake_factory_fails_if_additional_tools_drift(self):
+        # Discriminating: if a tool is dropped from the collection handed to the
+        # factory, the fake's observed call_args reflect the reduced list. This
+        # is the regression that a pre-call capture alias could not catch.
         # Local modules
         import agents.gamelift_specialist as gls
 
-        baseline = gls.get_captured_specialist_registration()
-        full = list(baseline["additional_tools"])
-        assert len(full) == 4
+        reduced = gls.GAMELIFT_AGENT_TOOLS[:-1]
+        fake_factory = MagicMock(return_value="fake-agent")
+        gls.build_gamelift_agent(additional_tools=reduced, agent_factory=fake_factory)
 
-        reduced = full[:-1]
-        gls.build_gamelift_agent(additional_tools=reduced)
-        after = gls.get_captured_specialist_registration()
-        assert len(after["additional_tools"]) == 3
-        dropped_name = getattr(full[-1], "__name__", getattr(full[-1], "tool_name", None))
-        after_names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in after["additional_tools"]}
-        assert dropped_name not in after_names
+        _, kwargs = fake_factory.call_args
+        observed = kwargs["additional_tools"]
+        assert len(observed) == 3
+        dropped_name = getattr(
+            gls.GAMELIFT_AGENT_TOOLS[-1], "__name__", getattr(gls.GAMELIFT_AGENT_TOOLS[-1], "tool_name", None)
+        )
+        observed_names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in observed}
+        assert dropped_name not in observed_names
 
-        # Restore the canonical registration so module state is not left reduced
-        # for other tests importing this module.
-        gls.build_gamelift_agent(additional_tools=gls.GAMELIFT_AGENT_TOOLS)
-        restored = gls.get_captured_specialist_registration()
-        assert len(restored["additional_tools"]) == 4
-
-    def test_runtime_agent_is_built_from_the_captured_tools(self):
-        # Prove the tools that were captured are the ones the runtime agent is
-        # built from: the module-level gamelift_agent is produced by the same
-        # build path that records the capture.
+    def test_production_build_uses_real_create_specialist_agent(self):
+        # Production must default to the REAL factory. Patch it and confirm the
+        # default build path (no injected factory) calls create_specialist_agent
+        # with the four canonical tools.
         # Local modules
         import agents.gamelift_specialist as gls
 
-        # Ensure canonical state.
-        gls.build_gamelift_agent(additional_tools=gls.GAMELIFT_AGENT_TOOLS)
-        captured = gls.get_captured_specialist_registration()
-        assert captured["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
+        with patch.object(gls, "create_specialist_agent", return_value="real-agent") as real_factory:
+            agent = gls.build_gamelift_agent()
+
+        assert agent == "real-agent"
+        real_factory.assert_called_once()
+        _, kwargs = real_factory.call_args
+        assert kwargs["service_name"] == "GameLift"
+        assert kwargs["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
 
     def test_registration_collection_holds_the_four_runtime_tools(self):
         # Model access is controlled by the exact tool collection passed to

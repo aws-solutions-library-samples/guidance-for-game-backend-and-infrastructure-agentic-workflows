@@ -823,6 +823,50 @@ class TestEmbeddedSensitiveCoordinateDetection:
         assert "Name" not in row
         assert "fe80::1" not in json.dumps(result)
 
+    def test_ipv4_substring_inside_longer_dotted_name_is_rejected(self):
+        # `host-10.11.12.13.14-prod` contains the valid IPv4 substring
+        # `10.11.12.13`. An IPv4 matcher that refuses a quad adjacent to another
+        # dot would let the sensitive coordinate through with status="ok". The
+        # substring must be rejected regardless of an adjacent trailing dot/octet.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "host-10.11.12.13.14-prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert "10.11.12.13" not in json.dumps(result)
+        assert row["Status"] == "ACTIVE"
+
+    def test_ipv4_substring_with_out_of_range_trailing_octet_is_rejected(self):
+        # `host-10.11.12.13.999-prod`: the trailing `.999` is not a legal octet,
+        # so a whole-token IPv4 parse fails, yet the embedded `10.11.12.13` is a
+        # valid dotted quad and must still be rejected anywhere in the value.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "host-10.11.12.13.999-prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert "10.11.12.13" not in json.dumps(result)
+        assert row["Status"] == "ACTIVE"
+
+    def test_ipv4_substring_with_leading_extra_octet_is_rejected(self):
+        # Symmetric case: an extra LEADING octet (`9.10.11.12.13`) must not let
+        # the trailing valid quad `10.11.12.13` survive either.
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {"FleetUtilization": [{"FleetId": "node-9.10.11.12.13", "Location": "us-west-2"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "FleetId" not in row
+        assert "10.11.12.13" not in json.dumps(result)
+
 
 # ---------------------------------------------------------------------------
 # Log redaction: the failure log must never contain raw provider text or the
@@ -1104,6 +1148,30 @@ class TestMalformedCollectionSemantics:
             assert result["status"] == "incomplete"
             assert result["error"]["code"] == "malformed_response"
             assert result["FleetUtilization"] == []
+
+    def test_mixed_malformed_result_respects_serialized_cap(self):
+        # A malformed (non-dict) row combined with many long-but-legal valid rows
+        # must NOT push the FINAL envelope past the serialized cap. The final
+        # disposition is incomplete + malformed_response + truncated=true, whose
+        # keys are ~42 chars longer than the short {"status":"truncated",
+        # "truncated":true} shape the budget loop previously measured. When the
+        # trim loop stops with the short envelope just under the cap, the final
+        # envelope overflows. These parameters reproduce a 20,033-char final
+        # envelope against the 20,000 cap.
+        # Local modules
+        from agents.gamelift_projections import GAMELIFT_MAX_PROJECTED_CHARS
+        from agents.gamelift_specialist import get_scaling_policies
+
+        long_name = "scale-" + "a" * 137  # 143 chars, long but grammar-legal
+        valid_rows = [{"FleetId": FLEET_ID, "Name": long_name, "Status": "ACTIVE"} for _ in range(130)]
+        raw = {"ScalingPolicies": ["malformed", *valid_rows]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        assert result["status"] == "incomplete"
+        assert result["error"]["code"] == "malformed_response"
+        assert result["truncated"] is True
+        # The FINAL serialized envelope the model sees must be within budget.
+        assert len(json.dumps(result)) <= GAMELIFT_MAX_PROJECTED_CHARS
 
     def test_wholly_valid_complete_payload_is_ok(self):
         # Regression guard: a payload with only valid dict rows and no discarded

@@ -23,7 +23,9 @@ Code-owned projections classify each result into one mutually distinct
 | `empty` | call succeeded, zero items |
 | `denied` | provider refused (authorization/access) |
 | `incomplete` | call failed, or only part of the set was retrieved (residual `NextToken`, no client-side cap) |
-| `truncated` | result set bounded by the projection's item cap |
+| `truncated` | result set bounded by the projection's item cap or the serialized-payload budget (a distinct `status`; a partial view is additionally flagged with the boolean marker `truncated: true`) |
+
+A malformed/mixed collection (see below) uses `status` == `incomplete` with `error.code` == `malformed_response` AND the boolean marker `truncated: true`; the `truncated` **status** is reserved for a wholly-valid payload bounded only by the item cap or serialized-payload budget. The `status` and the `truncated: true` boolean marker are distinct fields.
 
 Typed, sanitized error codes (no provider text): `access_denied`,
 `not_found`, `throttled`, `invalid_request`, `provider_error`,
@@ -35,9 +37,9 @@ missing/wrongly typed, or every item non-projectable).
 | Operation | Pagination / bounds | Sensitive / customer-controlled fields in raw response | Transform | Error / partial semantics | Disposition |
 | --- | --- | --- | --- | --- | --- |
 | `list_gamelift_fleets` (`list_fleets` + `describe_fleet_attributes` + container APIs) | Paginates all fleet IDs; chunks describe at 100; **neither classic nor container fleet output is item-bounded to the model** — both paths append every page/summary with no aggregate cap | `FleetArn` (account ID), `FleetId`, `LogPaths`, `MetricGroups`, `ScriptId`/`BuildId`, `InstanceRoleArn`, location detail, arbitrary future attributes | **Container fleets:** code-owned `_summarize_container_fleet` allowlist. **Classic fleets: NONE** — raw `describe_fleet_attributes` items are appended unchanged and exposed under `FleetAttributes` (and `ClassicFleets`); `Warnings[]` carry raw provider `str(e)` text | Per-source `Warnings` (raw provider text); `error` only when totally empty | **Partially projected.** Container path is field-allowlisted but **not item- or value-capped**; the classic path returns **raw `FleetAttributes` including `FleetArn`/account ID and raw provider warning text** and is **also not item-capped**, and neither path is routed through the sanitized error vocabulary — **follow-up** to project the classic path, cap both paths, and sanitize warnings. |
-| `get_fleet_utilization` (`describe_fleet_utilization`) | Single call; item cap `GAMELIFT_MAX_PROJECTED_ITEMS=100` + aggregate `GAMELIFT_MAX_PROJECTED_CHARS` budget measured against the **actual serialized JSON** (incl. escaping); residual `NextToken` (incl. empty page) → partial | `FleetArn` (account ID), arbitrary/future item fields, nested blobs | `project_fleet_utilization` allowlist + **field-specific grammar validators** (GameLift identifier/region/enum/name grammars; rejects control chars, ARN prefixes, account-ID patterns, URL schemes, IP/network coordinates, and malformed values even when short; finite bounded numbers); drops `FleetArn`, unknown fields, and allowed fields carrying an invalid value | Typed sanitized error; `NextToken` → `incomplete`; item/char cap or skipped non-dict items → `truncated`; empty+token → `incomplete`; malformed shape (missing/wrong collection type, non-dict items, all-invalid rows) → `incomplete` w/ `malformed_response` | **Migrated.** ok/empty/denied/incomplete/truncated distinct; not_found and malformed pinned via `error.code`. |
-| `get_fleet_capacity` (`describe_fleet_capacity`) | Single call; item cap 100 + serialized-JSON char budget | `FleetArn`, `ManagedCapacityConfiguration`, arbitrary/future fields | `project_fleet_capacity` allowlist + field-specific grammar validators; `InstanceType`, `Location`, and bounded/validated `InstanceCounts` / `GameServerContainerGroupCounts` numbers | Typed sanitized error; empty+token → `incomplete`; malformed shape → `incomplete` w/ `malformed_response` | **Migrated.** |
-| `get_scaling_policies` (`describe_scaling_policies`) | Single call; item cap 100 + serialized-JSON char budget | `FleetArn`, arbitrary/future fields, endpoints | `project_scaling_policies` allowlist + field-specific grammar validators; policy name/status/metric + finite bounded threshold/target; drops `FleetArn` | Typed sanitized error; empty+token → `incomplete`; malformed shape → `incomplete` w/ `malformed_response` | **Migrated.** |
+| `get_fleet_utilization` (`describe_fleet_utilization`) | Single call; item cap `GAMELIFT_MAX_PROJECTED_ITEMS=100` + aggregate `GAMELIFT_MAX_PROJECTED_CHARS` budget measured against the **actual final serialized envelope** (the exact `status`/`truncated`/`error` keys plus escaping the model will see), so a mixed/malformed disposition cannot outgrow the cap; residual `NextToken` (incl. empty page) → partial | `FleetArn` (account ID), arbitrary/future item fields, nested blobs | `project_fleet_utilization` allowlist + **field-specific grammar validators** (GameLift identifier/region/enum/name grammars; rejects control chars, ARN prefixes, account-ID patterns, URL schemes, IP/network coordinates — including a valid IPv4 quad embedded inside a longer dotted run — and malformed values even when short; finite bounded numbers); drops `FleetArn`, unknown fields, and allowed fields carrying an invalid value | Typed sanitized error; `NextToken` → `incomplete`; wholly-valid item/char-cap bound → `truncated` **status**; empty+token → `incomplete`; malformed shape (missing/wrong collection type, non-dict items, all-invalid rows, or a mixed collection that discarded rows) → `status` `incomplete` w/ `malformed_response` AND boolean `truncated: true` | **Migrated.** ok/empty/denied/incomplete/truncated distinct; not_found and malformed pinned via `error.code`; discarded/skipped rows are `incomplete`/`malformed_response` (never the `truncated` status), flagged `truncated: true`. |
+| `get_fleet_capacity` (`describe_fleet_capacity`) | Single call; item cap 100 + serialized-envelope char budget (measured against the final envelope) | `FleetArn`, `ManagedCapacityConfiguration`, arbitrary/future fields | `project_fleet_capacity` allowlist + field-specific grammar validators; `InstanceType`, `Location`, and bounded/validated `InstanceCounts` / `GameServerContainerGroupCounts` numbers | Typed sanitized error; empty+token → `incomplete`; malformed shape → `status` `incomplete` w/ `malformed_response` + `truncated: true` | **Migrated.** |
+| `get_scaling_policies` (`describe_scaling_policies`) | Single call; item cap 100 + serialized-envelope char budget (measured against the final envelope) | `FleetArn`, arbitrary/future fields, endpoints | `project_scaling_policies` allowlist + field-specific grammar validators; policy name/status/metric + finite bounded threshold/target; drops `FleetArn` | Typed sanitized error; empty+token → `incomplete`; malformed shape → `status` `incomplete` w/ `malformed_response` + `truncated: true` | **Migrated.** |
 
 Proof (unit + integration): `tests/unit/test_gamelift_projections_unit.py` and
 `tests/integration/test_gamelift_projections_integration.py` assert, with
@@ -47,17 +49,24 @@ collections never appear in the projection; that allowed fields carrying attack
 values (short ARNs/URLs/account IDs/IPs, control characters, malformed
 region/enum/name values, huge strings, wrong scalar types, nested blobs,
 NaN/Inf, oversized numbers/collections) are dropped by field-specific grammar;
-that the aggregate budget holds against the actual serialized JSON
-(`len(json.dumps(result)) <= GAMELIFT_MAX_PROJECTED_CHARS`); that the sanitized
+that the aggregate budget holds against the actual **final serialized envelope**
+(`len(json.dumps(result)) <= GAMELIFT_MAX_PROJECTED_CHARS`, including the mixed
+malformed disposition, which cannot outgrow the cap); that a valid IPv4 quad
+embedded inside a longer dotted run (`host-10.11.12.13.14-prod`) is rejected;
+that the sanitized
 failure log omits the raw provider message and the caller fleet id (captured
 from the real Loguru sink); that empty/denied/incomplete/truncated stay distinct,
 an empty page carrying a `NextToken` is `incomplete` (never a complete `empty`),
-and a malformed shape (missing/wrong collection type, non-dict items, all-invalid
-rows) is typed `incomplete`/`malformed_response`; and that `not_found` is pinned
+and a malformed/mixed shape (missing/wrong collection type, non-dict items,
+all-invalid rows, or a mixed collection that discarded rows) is typed
+`incomplete`/`malformed_response` with a boolean `truncated: true` marker (never
+the `truncated` status); and that `not_found` is pinned
 via `error.code`. `tests/unit/test_gamelift_chart_routing_unit.py` proves the
 projected outputs remain chart-compatible and asserts the exact runtime tool
-registration collection (`GAMELIFT_AGENT_TOOLS`) passed to the specialist
-factory. `tests/unit/test_provider_inventory_accuracy_unit.py` pins this
+registration collection by injecting a fake `agent_factory` into
+`build_gamelift_agent` and observing the factory's actual `call_args`
+(`additional_tools` == `GAMELIFT_AGENT_TOOLS`); production builds default to the
+real `create_specialist_agent`. `tests/unit/test_provider_inventory_accuracy_unit.py` pins this
 inventory's corrected claims to the code they describe.
 
 ## Knowledge Base retrieval (Bedrock KB via `kb_retrieve`) — model-visible, NOT projected

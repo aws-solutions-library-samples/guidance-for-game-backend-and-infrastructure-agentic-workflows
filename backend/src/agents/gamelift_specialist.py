@@ -356,9 +356,9 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
 
 # The ONE runtime tool-registration collection. Model access to GameLift tools
 # is defined by exactly this list — it is what create_specialist_agent receives
-# and therefore what the agent can call. Tests assert on the tools actually
-# handed to the factory (captured below), so dropping or renaming a tool here is
-# caught as a regression.
+# and therefore what the agent can call. Tests inject a fake ``agent_factory``
+# into :func:`build_gamelift_agent` and assert on the ACTUAL kwargs the builder
+# passes to it, so dropping or renaming a tool here is caught as a regression.
 GAMELIFT_AGENT_TOOLS = [
     list_gamelift_fleets,
     get_fleet_utilization,
@@ -366,40 +366,24 @@ GAMELIFT_AGENT_TOOLS = [
     get_scaling_policies,
 ]
 
-# Import-time capture of the exact arguments handed to create_specialist_agent.
-# Tests read this to observe what the runtime agent was actually built from —
-# not a post-construction alias that could silently drift from the factory call.
-# Removing a tool from ``additional_tools`` changes this captured record and so
-# fails the registration test.
-_CAPTURED_SPECIALIST_REGISTRATION: dict[str, Any] | None = None
 
+def build_gamelift_agent(additional_tools: list | None = None, agent_factory: Any = None):
+    """Build the GameLift specialist agent through an injectable factory.
 
-def get_captured_specialist_registration() -> dict[str, Any] | None:
-    """Return the arguments captured from the most recent specialist build.
+    This is the single construction path for the runtime agent. ``agent_factory``
+    defaults to the real :func:`create_specialist_agent`; production always uses
+    that default. Tests inject a fake factory and assert on its recorded
+    ``call_args`` to observe the EXACT keyword arguments — service name and the
+    ``additional_tools`` collection — the builder hands to the factory. There is
+    no pre-call alias to drift from the real call: whatever is passed to the
+    factory is exactly what these arguments describe.
 
-    Contains ``service_name`` and the exact ``additional_tools`` list passed to
-    :func:`create_specialist_agent`. Used by tests to prove the runtime agent is
-    registered with precisely the intended tool collection.
+    Callers that omit ``additional_tools`` get the canonical
+    :data:`GAMELIFT_AGENT_TOOLS`.
     """
-    return _CAPTURED_SPECIALIST_REGISTRATION
-
-
-def build_gamelift_agent(additional_tools: list | None = None):
-    """Build the GameLift specialist agent and capture its registration.
-
-    This is the single construction path for the runtime agent. It records the
-    exact ``additional_tools`` collection (and service name) handed to
-    :func:`create_specialist_agent` in ``_CAPTURED_SPECIALIST_REGISTRATION`` so a
-    test can observe the actual factory argument. Callers that omit
-    ``additional_tools`` get the canonical :data:`GAMELIFT_AGENT_TOOLS`.
-    """
-    global _CAPTURED_SPECIALIST_REGISTRATION
+    factory = create_specialist_agent if agent_factory is None else agent_factory
     tools = GAMELIFT_AGENT_TOOLS if additional_tools is None else additional_tools
-    _CAPTURED_SPECIALIST_REGISTRATION = {
-        "service_name": "GameLift",
-        "additional_tools": tools,
-    }
-    return create_specialist_agent(
+    return factory(
         service_name="GameLift",
         emoji="🎮",
         mcp_server_names=None,  # GameLift uses boto3 directly

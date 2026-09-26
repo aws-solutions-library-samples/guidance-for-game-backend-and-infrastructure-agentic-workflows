@@ -45,10 +45,12 @@ Dispositions are kept mutually distinct via the ``status`` field:
                   mixed collection retained its valid rows while discarding
                   malformed ones. All malformed/partial-shape cases surface via
                   ``error.code`` == ``malformed_response`` and are never ``ok``.
-* ``truncated`` — the result set was bounded by this projection's item cap or
-                  the serialized-payload budget. (A mixed collection that also
-                  discarded malformed rows is ``incomplete``/``malformed_response``,
-                  not ``truncated``, even though it is likewise partial.)
+* ``truncated`` — a wholly-valid result set was bounded by this projection's
+                  item cap or the serialized-payload budget (measured against
+                  the final envelope). (A mixed collection that discarded
+                  malformed rows is ``incomplete``/``malformed_response`` with a
+                  boolean ``truncated: true`` marker, not the ``truncated``
+                  status, even though it is likewise partial.)
 """
 
 from __future__ import annotations
@@ -191,10 +193,13 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # surrounding non-digit characters.
 _ACCOUNT_ID = re.compile(r"(?<!\d)\d{12}(?!\d)")
 
-# Dotted-quad IPv4 (optionally with a ``/prefix``) embedded anywhere in a value,
-# even when flanked by name characters (e.g. ``host-10.11.12.13-prod`` or
-# ``net-10.11.12.0-24-prod``). Each octet is 0-255; validated exactly below.
-_EMBEDDED_IPV4 = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
+# Dotted-quad IPv4 detection is performed inside
+# :func:`_looks_like_network_coordinate` by sliding a 4-octet window over each
+# maximal dotted-numeric run, so a valid quad is rejected even when embedded in a
+# longer dotted run (``host-10.11.12.13.14-prod``) or flanked by name characters
+# (``host-10.11.12.13-prod``, ``net-10.11.12.0-24-prod``). Each candidate quad's
+# octets are validated exactly (0-255) so a version-like token is only rejected
+# when it is genuinely a legal IPv4 address.
 
 # URL / URI schemes (http, https, s3, file, ftp, ...) — the "scheme://" shape.
 _URL_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://")
@@ -254,15 +259,22 @@ def _looks_like_network_coordinate(value: str) -> bool:
             return True
         except ValueError:
             continue
-    # Embedded dotted-quad IPv4 flanked by non-IP characters (dashes, letters,
-    # underscores). Validate each captured quad so a version-like ``1.2.3.4``
-    # token is only rejected when every octet is a legal 0-255 IPv4 octet.
-    for match in _EMBEDDED_IPV4.finditer(value):
-        try:
-            ipaddress.IPv4Address(match.group(1))
-            return True
-        except ValueError:
-            continue
+    # Embedded dotted-quad IPv4 anywhere in the value, including inside a longer
+    # dotted run (``10.11.12.13.14``) or flanked by name characters. Validate
+    # each captured quad so a version-like token is only rejected when every
+    # octet is a legal 0-255 IPv4 octet. To catch a valid quad that begins at
+    # any octet boundary inside a longer dotted run (both the leading
+    # ``10.11.12.13`` of ``10.11.12.13.14`` and the trailing ``11.12.13.14``),
+    # slide a 4-octet window over each maximal dotted-numeric run.
+    for run in re.findall(r"\d{1,3}(?:\.\d{1,3})+", value):
+        octets = run.split(".")
+        for i in range(len(octets) - 3):
+            candidate = ".".join(octets[i : i + 4])
+            try:
+                ipaddress.IPv4Address(candidate)
+                return True
+            except ValueError:
+                continue
     # Embedded colon-hex IPv6 runs. Any colon-bearing hextet sequence that parses
     # as an IPv6 address is a network coordinate.
     for token in re.split(r"[^0-9A-Fa-f:]+", value):
@@ -444,28 +456,19 @@ def _project_collection(
             "error": {"code": ERROR_MALFORMED_RESPONSE},
         }
 
-    # Aggregate payload budget, measured against the actual serialized result:
-    # drop rows from the tail until the serialized envelope fits, then mark it
-    # truncated.
-    payload_capped = False
-    while (
-        len(projected) > 1
-        and _serialized_length({collection_key: projected, "status": STATUS_TRUNCATED, "truncated": True})
-        > GAMELIFT_MAX_PROJECTED_CHARS
-    ):
-        projected.pop()
-        payload_capped = True
+    # Decide the final disposition envelope BEFORE enforcing the payload budget,
+    # so the budget is measured against the exact keys the model will see. A
+    # mixed collection (malformed rows discarded) carries the longer
+    # incomplete + malformed_response + truncated envelope; that envelope — not a
+    # shorter proxy — must fit within the char budget.
+    mixed_malformed = non_dict_dropped or invalid_row_dropped
 
     result: dict[str, Any] = {collection_key: projected}
-
-    # A mixed collection retains bounded valid rows but is partial by
-    # construction: some rows were discarded as malformed. Report it as typed
-    # incomplete/malformed_response and truncated — never ok.
-    if non_dict_dropped or invalid_row_dropped:
+    if mixed_malformed:
         result["status"] = STATUS_INCOMPLETE
         result["truncated"] = True
         result["error"] = {"code": ERROR_MALFORMED_RESPONSE}
-    elif capped or payload_capped:
+    elif capped:
         result["status"] = STATUS_TRUNCATED
         result["truncated"] = True
     elif has_more_pages:
@@ -473,6 +476,19 @@ def _project_collection(
         result["truncated"] = True
     else:
         result["status"] = STATUS_OK
+
+    # Aggregate payload budget, measured against the ACTUAL final envelope the
+    # model will see (status + truncated + any error code + escaped scalars):
+    # drop rows from the tail until the serialized result fits. If trimming a row
+    # made the view partial, the envelope must reflect that (truncated + typed
+    # incomplete) even if it was previously a complete ``ok``.
+    while len(projected) > 1 and _serialized_length(result) > GAMELIFT_MAX_PROJECTED_CHARS:
+        projected.pop()
+        if result["status"] == STATUS_OK:
+            # A complete payload trimmed for size is no longer complete: it is a
+            # bounded, partial view.
+            result["status"] = STATUS_TRUNCATED
+            result["truncated"] = True
     return result
 
 
