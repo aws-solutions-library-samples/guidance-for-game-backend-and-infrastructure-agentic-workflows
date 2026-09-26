@@ -3,7 +3,7 @@
  */
 
 import React, { act } from 'react';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { Chat } from '../../components/Chat';
 
@@ -17,6 +17,15 @@ function setupPortalContainer() {
 
 function cleanupPortalContainer(container: HTMLElement) {
   document.body.removeChild(container);
+}
+
+// Access the submit counter set by the mock CopilotChat input (see mock below).
+function resetSends() {
+  const w = window as unknown as { __chatSends?: number };
+  w.__chatSends = 0;
+}
+function getSends(): number {
+  return (window as unknown as { __chatSends?: number }).__chatSends ?? 0;
 }
 
 // Mock CopilotKit components
@@ -49,10 +58,32 @@ jest.mock('@copilotkit/react-ui', () => ({
       onInProgress?.(false);
     };
 
+    // A realistic input + submit path: a focusable textarea that submits on a
+    // bare Enter (as CopilotKit does) and a send button, so tests exercise the
+    // real key/submit surface rather than only markers.
+    const bumpSends = () => {
+      const w = globalThis as unknown as { __chatSends?: number };
+      w.__chatSends = (w.__chatSends ?? 0) + 1;
+    };
+    const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        bumpSends();
+      }
+    };
+    const onSubmit = (e: React.FormEvent) => {
+      e.preventDefault();
+      bumpSends();
+    };
+
     return (
       <div data-testid="copilot-chat" className={className}>
         <div data-testid="chat-title">{labels?.title}</div>
         {Messages && <Messages messages={[]} inProgress={inProgress} />}
+        <form onSubmit={onSubmit}>
+          <textarea data-testid="chat-textarea" placeholder="Ask about game infrastructure..." onKeyDown={onKeyDown} />
+          <button data-testid="chat-send" type="submit">Send</button>
+        </form>
         <button
           data-testid="trigger-thinking"
           onClick={handleStart}
@@ -223,15 +254,61 @@ describe('Chat', () => {
     expect(document.querySelector('.ga-chat-disabled-overlay')).not.toBeInTheDocument();
     const wrapper = document.querySelector('.ga-chat-wrapper');
     expect(wrapper).not.toHaveAttribute('aria-disabled', 'true');
+    // The input is usable when enabled.
+    const textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(false);
   });
 
-  it('blocks new submissions once logout begins (disabled)', () => {
+  it('functionally disables the textarea and blocks Enter submission once logout begins', () => {
+    resetSends();
     render(<Chat disabled />);
-    // A blocking overlay prevents pointer/keyboard interaction with the input.
+
+    // Semantics preserved: overlay + aria-disabled wrapper.
+    expect(document.querySelector('.ga-chat-disabled-overlay')).toBeInTheDocument();
+    expect(document.querySelector('.ga-chat-wrapper')).toHaveAttribute('aria-disabled', 'true');
+
+    const textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
+    // The ACTUAL input is disabled, not merely visually covered.
+    expect(textarea.disabled).toBe(true);
+    expect(textarea).toHaveAttribute('aria-disabled', 'true');
+
+    // Even if focus is forced onto the input, a bare Enter must not submit.
+    textarea.focus();
+    fireEvent.keyDown(textarea, { key: 'Enter' });
+    expect(getSends()).toBe(0);
+  });
+
+  it('blocks a programmatic submit/click while disabled', () => {
+    resetSends();
+    render(<Chat disabled />);
+    const send = screen.getByTestId('chat-send');
+    fireEvent.click(send);
+    fireEvent.submit(send.closest('form') as HTMLFormElement);
+    expect(getSends()).toBe(0);
+  });
+
+  it('preserves transcript accessibility while disabled (transcript stays in the tree)', () => {
+    render(<Chat disabled />);
+    // The overlay is aria-hidden so it does not swallow the transcript for AT,
+    // and the chat container itself is still present/readable.
     const overlay = document.querySelector('.ga-chat-disabled-overlay');
-    expect(overlay).toBeInTheDocument();
-    const wrapper = document.querySelector('.ga-chat-wrapper');
-    expect(wrapper).toHaveAttribute('aria-disabled', 'true');
+    expect(overlay).toHaveAttribute('aria-hidden', 'true');
+    expect(screen.getByTestId('copilot-chat')).toBeInTheDocument();
+    expect(screen.getByTestId('chat-title')).toHaveTextContent('🎮 Game Agent');
+  });
+
+  it('re-enables the input when logout state clears (guard is reversible)', () => {
+    resetSends();
+    const { rerender } = render(<Chat disabled />);
+    let textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(true);
+
+    rerender(<Chat disabled={false} />);
+    textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
+    expect(textarea.disabled).toBe(false);
+    // Submission works again once re-enabled.
+    fireEvent.submit(textarea.closest('form') as HTMLFormElement);
+    expect(getSends()).toBe(1);
   });
 
 });

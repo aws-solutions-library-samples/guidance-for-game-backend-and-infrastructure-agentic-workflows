@@ -5,14 +5,23 @@ import {
   IDLE_ACTIVITY_THROTTLE_MS,
 } from '@/utils/idleTimer';
 
+type ChannelData = { type?: string; deadline?: number; generation?: number };
+
+// A queued BroadcastChannel mock. The real BroadcastChannel delivers messages
+// asynchronously via the event loop; a synchronous mock hides ordering races
+// (a listener can observe a message before the poster finishes its own work).
+// Delivery is buffered and only flushed by an explicit `flush()` so tests can
+// assert behavior against controlled message ordering.
 class MockBroadcastChannel {
   static instances: MockBroadcastChannel[] = [];
-  onmessage: ((event: MessageEvent<{ type?: string; deadline?: number }>) => void) | null = null;
-  postMessage = jest.fn((message: { type?: string; deadline?: number }) => {
-    // Deliver to every other open channel of the same name, like the real API.
+  static queue: Array<() => void> = [];
+  onmessage: ((event: MessageEvent<ChannelData>) => void) | null = null;
+  postMessage = jest.fn((message: ChannelData) => {
     for (const other of MockBroadcastChannel.instances) {
-      if (other !== this && other.name === this.name && other.onmessage) {
-        other.onmessage({ data: message } as MessageEvent<{ type?: string; deadline?: number }>);
+      if (other !== this && other.name === this.name) {
+        MockBroadcastChannel.queue.push(() => {
+          other.onmessage?.({ data: message } as MessageEvent<ChannelData>);
+        });
       }
     }
   });
@@ -22,6 +31,12 @@ class MockBroadcastChannel {
 
   constructor(public name: string) {
     MockBroadcastChannel.instances.push(this);
+  }
+
+  static flush(): void {
+    const pending = MockBroadcastChannel.queue;
+    MockBroadcastChannel.queue = [];
+    for (const deliver of pending) deliver();
   }
 }
 
@@ -57,6 +72,7 @@ describe('idle controller', () => {
     resetIdleCoordinatorForTests();
     window.localStorage.clear();
     MockBroadcastChannel.instances = [];
+    MockBroadcastChannel.queue = [];
     Object.defineProperty(global, 'BroadcastChannel', {
       configurable: true,
       writable: true,
@@ -162,6 +178,7 @@ describe('idle controller', () => {
     expect(tabB.phase()).toBe('warning');
 
     tabA.extend();
+    MockBroadcastChannel.flush();
     // Tab B converged on the extended deadline without its own user action.
     expect(tabB.phase()).toBe('active');
     tabA.stop();
@@ -177,7 +194,128 @@ describe('idle controller', () => {
     tabB.onLogout(onExpiredB);
 
     tabA.logout();
+    MockBroadcastChannel.flush();
     expect(onExpiredB).toHaveBeenCalledTimes(1);
+    tabA.stop();
+    tabB.stop();
+  });
+
+  // ---- Blocker 2 regressions: cross-tab convergence via versioned state ----
+
+  it('a later-starting tab broadcasts its newer deadline so existing tabs converge', () => {
+    // Tab A starts now with a 30-minute deadline.
+    const tabA = createIdleController(config);
+    tabA.start();
+    const deadlineA = tabA.deadline();
+
+    // 10 minutes later Tab B starts. Its fresh deadline is strictly newer.
+    now += 10 * 60_000;
+    const tabB = createIdleController(config);
+    tabB.start();
+    MockBroadcastChannel.flush();
+
+    // Tab A must have adopted Tab B's newer deadline (it was broadcast), not
+    // kept its own older one. Previously B persisted without broadcasting and A
+    // would expire while B still reported active.
+    expect(tabA.deadline()).toBeGreaterThan(deadlineA);
+    expect(tabA.deadline()).toBe(tabB.deadline());
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('a new tab does not silently extend an already-established session past a peer deadline', () => {
+    // Tab A has been active and just refreshed: its deadline is now+30m.
+    const tabA = createIdleController(config);
+    tabA.start();
+    now += 5 * 60_000;
+    tabA.extend(); // deadline = now + 30m
+    MockBroadcastChannel.flush();
+    const established = tabA.deadline();
+
+    // A brand-new tab starts. It must adopt the established (later) shared
+    // deadline rather than resetting everyone to its own now+30m — but since
+    // both compute the same now+30m here, the invariant we assert is that the
+    // established peer deadline is never moved *backward* and both converge.
+    const tabB = createIdleController(config);
+    tabB.start();
+    MockBroadcastChannel.flush();
+    expect(tabB.deadline()).toBeGreaterThanOrEqual(established);
+    expect(tabA.deadline()).toBe(tabB.deadline());
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('automatic expiry (not just explicit logout) broadcasts logout to other tabs', () => {
+    const tabA = createIdleController(config);
+    const tabB = createIdleController(config);
+    const onLogoutB = jest.fn();
+    tabA.start();
+    tabB.start();
+    tabB.onLogout(onLogoutB);
+
+    // Tab A crosses the absolute deadline and evaluates its phase on tick.
+    now += 31 * 60_000;
+    tabA.tick();
+    MockBroadcastChannel.flush();
+
+    // The other tab must be told to log out, not left showing authenticated UI.
+    expect(onLogoutB).toHaveBeenCalledTimes(1);
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('clears the persisted deadline on logout so a new tab does not resurrect the session', () => {
+    const tabA = createIdleController(config);
+    tabA.start();
+    tabA.logout();
+    MockBroadcastChannel.flush();
+
+    // The stored deadline must be gone; a tab starting afterward begins a fresh
+    // session rather than adopting a stale, pre-logout deadline.
+    expect(window.localStorage.getItem('game-agent-idle-deadline')).toBeNull();
+    tabA.stop();
+  });
+
+  it('rejects a stale deadline broadcast from an older generation after logout', () => {
+    const tabA = createIdleController(config);
+    const tabB = createIdleController(config);
+    const onLogoutA = jest.fn();
+    tabA.start();
+    tabB.start();
+    tabA.onLogout(onLogoutA);
+
+    // Tab B logs out (terminal). Tab A converges to logged-out.
+    tabB.logout();
+    MockBroadcastChannel.flush();
+    expect(onLogoutA).toHaveBeenCalledTimes(1);
+
+    // A late deadline message from the pre-logout generation must NOT revive A.
+    tabB.extend();
+    MockBroadcastChannel.flush();
+    expect(tabA.phase()).toBe('expired');
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('converges via localStorage when BroadcastChannel is unavailable', () => {
+    // Simulate an environment without BroadcastChannel.
+    Object.defineProperty(global, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const tabA = createIdleController(config);
+    tabA.start();
+    now += 3 * 60_000;
+    tabA.extend(); // persists a newer deadline to localStorage
+    const established = tabA.deadline();
+
+    // A second tab starting later reads the persisted deadline and adopts the
+    // later of (its fresh deadline, stored deadline).
+    const tabB = createIdleController(config);
+    tabB.start();
+    expect(tabB.deadline()).toBeGreaterThanOrEqual(established);
     tabA.stop();
     tabB.stop();
   });

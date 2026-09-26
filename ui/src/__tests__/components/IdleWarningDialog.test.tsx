@@ -107,6 +107,26 @@ describe('IdleWarningDialog accessibility', () => {
     expect(screen.getByRole('button', { name: /stay signed in/i })).toBeDisabled();
   });
 
+  it('keeps a focusable target inside the dialog while busy (both actions disabled)', () => {
+    render(<IdleWarningDialog {...baseProps} busy />);
+    const dialog = screen.getByRole('dialog');
+    // The dialog container must itself be focusable so the trap has a target
+    // when both buttons are disabled during refresh.
+    expect(dialog).toHaveAttribute('tabindex', '-1');
+    // Initial focus lands on the container (no enabled action to receive it).
+    expect(dialog).toHaveFocus();
+  });
+
+  it('pins Tab focus to the dialog container when both actions are disabled (busy)', () => {
+    render(<IdleWarningDialog {...baseProps} busy />);
+    const dialog = screen.getByRole('dialog');
+    dialog.focus();
+    fireEvent.keyDown(dialog, { key: 'Tab' });
+    expect(dialog).toHaveFocus();
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true });
+    expect(dialog).toHaveFocus();
+  });
+
   it('surfaces a refresh failure message', () => {
     render(<IdleWarningDialog {...baseProps} errorMessage="Could not extend your session. Try again." />);
     expect(screen.getByRole('alert')).toHaveTextContent(/could not extend/i);

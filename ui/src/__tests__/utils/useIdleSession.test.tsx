@@ -147,4 +147,100 @@ describe('useIdleSession', () => {
     expect(screen.getByTestId('warning-open')).toHaveTextContent('false');
     expect(onLogout).not.toHaveBeenCalled();
   });
+
+  // ---- Blocker 1 regressions: refresh must never reverse an in-progress logout ----
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  it('expiry during a pending "Stay signed in" refresh: logout wins and refresh cannot extend', async () => {
+    const gate = deferred<boolean>();
+    const refresh = jest.fn().mockReturnValue(gate.promise);
+    const onLogout = jest.fn();
+    render(<Harness enabled config={CONFIG} refresh={refresh} onLogout={onLogout} />);
+
+    // Open the warning and start the refresh (still pending).
+    advance(28 * 60_000 + 1_000);
+    act(() => {
+      fireEvent.click(screen.getByText('stay'));
+    });
+    expect(screen.getByTestId('busy')).toHaveTextContent('true');
+
+    // The absolute deadline passes while the refresh is still in flight.
+    advance(2 * 60_000);
+    expect(screen.getByTestId('logging-out')).toHaveTextContent('true');
+
+    // The refresh finally resolves successfully — it MUST NOT revive the session.
+    await act(async () => {
+      gate.resolve(true);
+      await Promise.resolve();
+    });
+
+    expect(onLogout).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('logging-out')).toHaveTextContent('true');
+    // The warning must stay closed; the session is not restored.
+    expect(screen.getByTestId('warning-open')).toHaveTextContent('false');
+  });
+
+  it('remote-tab logout during a pending refresh: a late successful refresh does not restore auth', async () => {
+    const gate = deferred<boolean>();
+    const refresh = jest.fn().mockReturnValue(gate.promise);
+    const onLogout = jest.fn();
+    render(<Harness enabled config={CONFIG} refresh={refresh} onLogout={onLogout} />);
+
+    advance(28 * 60_000 + 1_000);
+    act(() => {
+      fireEvent.click(screen.getByText('stay'));
+    });
+
+    // Another tab chooses "Sign out" — simulated here by the local sign-out
+    // path firing while the refresh is pending.
+    act(() => {
+      fireEvent.click(screen.getByText('signout'));
+    });
+    expect(screen.getByTestId('logging-out')).toHaveTextContent('true');
+
+    await act(async () => {
+      gate.resolve(true);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId('logging-out')).toHaveTextContent('true');
+    expect(screen.getByTestId('warning-open')).toHaveTextContent('false');
+  });
+
+  it('cookie clearing ordering: the logout callback fires only AFTER a pending refresh settles', async () => {
+    const gate = deferred<boolean>();
+    const refresh = jest.fn().mockReturnValue(gate.promise);
+    const order: string[] = [];
+    const onLogout = jest.fn(() => order.push('logout'));
+    render(<Harness enabled config={CONFIG} refresh={refresh} onLogout={onLogout} />);
+
+    advance(28 * 60_000 + 1_000);
+    act(() => {
+      fireEvent.click(screen.getByText('stay'));
+    });
+
+    // Expire while refresh is pending. Logout must be deferred until the
+    // refresh response settles so its cookie write cannot land last.
+    advance(2 * 60_000);
+    expect(onLogout).not.toHaveBeenCalled();
+
+    await act(async () => {
+      order.push('refresh-settled');
+      gate.resolve(true);
+      await Promise.resolve();
+    });
+
+    expect(onLogout).toHaveBeenCalledTimes(1);
+    // The refresh response is observed before the final logout/cookie clear.
+    expect(order).toEqual(['refresh-settled', 'logout']);
+  });
 });

@@ -39,6 +39,8 @@ export const IDLE_ACTIVITY_THROTTLE_MS = 5_000;
 
 const CHANNEL_NAME = 'game-agent-idle';
 const DEADLINE_KEY = 'game-agent-idle-deadline';
+const GENERATION_KEY = 'game-agent-idle-generation';
+const LOGOUT_KEY = 'game-agent-idle-loggedout';
 
 function bounded(value: number | undefined, fallback: number, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
@@ -76,6 +78,10 @@ type LogoutListener = () => void;
 interface ChannelMessage {
   type: 'deadline' | 'logout';
   deadline?: number;
+  // Versioned shared state: every message carries the generation it belongs to.
+  // A logout bumps the generation to a terminal value; peers reject any deadline
+  // message from an older generation so a late refresh cannot revive a session.
+  generation: number;
 }
 
 export interface IdleController {
@@ -85,6 +91,8 @@ export interface IdleController {
   phase(): IdlePhase;
   remainingMs(): number;
   deadline(): number;
+  generation(): number;
+  isLoggedOut(): boolean;
   markActivity(): void;
   extend(): void;
   logout(): void;
@@ -105,24 +113,81 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
   let lastPhase: IdlePhase = 'active';
   let channel: BroadcastChannel | null = null;
   let started = false;
+  // Session-transition version. Any extend/deadline change increments it within
+  // the active session; logout advances it to a terminal generation and latches
+  // `loggedOut`. Once logged out the controller ignores extensions and rejects
+  // deadline messages from older generations — this is what makes "logout wins".
+  let generation = 0;
+  let loggedOut = false;
 
   function computePhase(): IdlePhase {
+    if (loggedOut) return 'expired';
     const remaining = deadlineMs - Date.now();
     if (remaining <= 0) return 'expired';
     if (remaining <= config.idleWarningMs) return 'warning';
     return 'active';
   }
 
-  function persistDeadline(): void {
+  function readStoredNumber(key: string): number | null {
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (raw === null) return null;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function persistState(): void {
     try {
       window.localStorage.setItem(DEADLINE_KEY, String(deadlineMs));
+      window.localStorage.setItem(GENERATION_KEY, String(generation));
     } catch {
       // Coordination degrades gracefully to per-tab timers when storage is off.
     }
   }
 
-  function adoptDeadline(next: number): void {
+  function persistLogout(): void {
+    try {
+      window.localStorage.setItem(GENERATION_KEY, String(generation));
+      window.localStorage.setItem(LOGOUT_KEY, String(generation));
+      // Clear stale deadline state so a newly opened tab does not resurrect the
+      // session from a pre-logout deadline.
+      window.localStorage.removeItem(DEADLINE_KEY);
+    } catch {
+      // Nothing more we can do; the terminal state is still authoritative here.
+    }
+  }
+
+  function notifyLogout(): void {
+    for (const listener of logoutListeners) listener();
+  }
+
+  // Latch the terminal logged-out state exactly once. `propagate` broadcasts the
+  // terminal generation to peers (used for both explicit logout and automatic
+  // expiry); a message received from a peer converges without re-broadcasting.
+  function enterLoggedOut(nextGeneration: number, propagate: boolean): void {
+    if (loggedOut && nextGeneration <= generation) {
+      return;
+    }
+    loggedOut = true;
+    generation = Math.max(generation, nextGeneration);
+    persistLogout();
+    if (propagate) broadcast({ type: 'logout', generation });
+    emitPhaseIfChanged();
+    notifyLogout();
+  }
+
+  function adoptDeadline(next: number, incomingGeneration: number): void {
+    if (loggedOut) return; // A terminated session is never revived by a deadline.
     if (!Number.isFinite(next) || next <= 0) return;
+    // Reject messages from an older generation (e.g. a late extension racing a
+    // newer logout/extend).
+    if (incomingGeneration < generation) return;
+    if (incomingGeneration > generation) {
+      generation = incomingGeneration;
+    }
     // Converge on the *latest* deadline any tab has established so a single
     // active tab keeps every tab signed in, but never move a deadline backwards.
     if (next > deadlineMs) {
@@ -150,10 +215,21 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
   }
 
   function setDeadline(next: number, propagate: boolean): void {
+    if (loggedOut) return;
     deadlineMs = next;
-    persistDeadline();
-    if (propagate) broadcast({ type: 'deadline', deadline: next });
+    generation += 1;
+    persistState();
+    if (propagate) broadcast({ type: 'deadline', deadline: next, generation });
     emitPhaseIfChanged();
+  }
+
+  // Automatic expiry: when the phase reaches `expired` on its own (deadline
+  // passed) we must converge peers too, not only on explicit logout.
+  function handleAutomaticExpiryIfNeeded(): void {
+    if (loggedOut) return;
+    if (Date.now() >= deadlineMs) {
+      enterLoggedOut(generation + 1, true);
+    }
   }
 
   return {
@@ -161,30 +237,49 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       if (started) return;
       started = true;
       activeControllerCount += 1;
-      // Adopt any deadline another tab already published so tabs converge.
-      try {
-        const stored = Number(window.localStorage.getItem(DEADLINE_KEY));
-        if (Number.isFinite(stored) && stored > Date.now()) {
-          deadlineMs = Math.max(deadlineMs, stored);
-        }
-      } catch {
-        // Ignore storage access failures.
+
+      // Adopt any shared state another tab already published so tabs converge.
+      const storedGeneration = readStoredNumber(GENERATION_KEY);
+      const storedLogout = readStoredNumber(LOGOUT_KEY);
+      const storedDeadline = readStoredNumber(DEADLINE_KEY);
+      if (typeof storedGeneration === 'number') {
+        generation = Math.max(generation, storedGeneration);
       }
+      // If a peer already logged out at our generation-or-newer, converge to the
+      // terminal state instead of starting a fresh authenticated timer.
+      if (typeof storedLogout === 'number' && storedLogout >= generation) {
+        generation = Math.max(generation, storedLogout);
+        loggedOut = true;
+      }
+      if (!loggedOut && typeof storedDeadline === 'number' && storedDeadline > Date.now()) {
+        deadlineMs = Math.max(deadlineMs, storedDeadline);
+      }
+
       lastActivityRecordedAt = Date.now();
       lastPhase = computePhase();
+
       if (typeof BroadcastChannel !== 'undefined') {
         channel = new BroadcastChannel(CHANNEL_NAME);
         channel.onmessage = (event: MessageEvent<ChannelMessage>) => {
           const data = event.data;
           if (!data) return;
           if (data.type === 'deadline' && typeof data.deadline === 'number') {
-            adoptDeadline(data.deadline);
+            adoptDeadline(data.deadline, typeof data.generation === 'number' ? data.generation : 0);
           } else if (data.type === 'logout') {
-            for (const listener of logoutListeners) listener();
+            enterLoggedOut(typeof data.generation === 'number' ? data.generation : generation + 1, false);
           }
         };
       }
-      persistDeadline();
+
+      if (loggedOut) {
+        // Converge asynchronously so subscribers attached after start() still fire.
+        persistLogout();
+      } else {
+        // Publish our (possibly newest) deadline so existing tabs converge on a
+        // later-starting tab's deadline instead of expiring under it.
+        persistState();
+        broadcast({ type: 'deadline', deadline: deadlineMs, generation });
+      }
     },
 
     stop(): void {
@@ -198,6 +293,7 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
     },
 
     tick(): void {
+      handleAutomaticExpiryIfNeeded();
       emitPhaseIfChanged();
     },
 
@@ -206,6 +302,7 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
     },
 
     remainingMs(): number {
+      if (loggedOut) return 0;
       return Math.max(0, deadlineMs - Date.now());
     },
 
@@ -213,7 +310,16 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       return deadlineMs;
     },
 
+    generation(): number {
+      return generation;
+    },
+
+    isLoggedOut(): boolean {
+      return loggedOut;
+    },
+
     markActivity(): void {
+      if (loggedOut) return;
       const now = Date.now();
       // Only meaningful, throttled activity resets the deadline, and only while
       // the session is still active. Activity during the warning must go through
@@ -225,14 +331,14 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
     },
 
     extend(): void {
+      if (loggedOut) return; // A won logout is never reversed by a later extend.
       const now = Date.now();
       lastActivityRecordedAt = now;
       setDeadline(now + config.idleTimeoutMs, true);
     },
 
     logout(): void {
-      broadcast({ type: 'logout' });
-      for (const listener of logoutListeners) listener();
+      enterLoggedOut(generation + 1, true);
     },
 
     subscribe(listener: PhaseListener): () => void {
@@ -251,6 +357,8 @@ export function resetIdleCoordinatorForTests(): void {
   activeControllerCount = 0;
   try {
     window.localStorage.removeItem(DEADLINE_KEY);
+    window.localStorage.removeItem(GENERATION_KEY);
+    window.localStorage.removeItem(LOGOUT_KEY);
   } catch {
     // Ignore storage access failures in test teardown.
   }

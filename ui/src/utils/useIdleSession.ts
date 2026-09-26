@@ -62,6 +62,13 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
 
   const controllerRef = useRef<ReturnType<typeof createIdleController> | null>(null);
   const loggingOutRef = useRef(false);
+  // Tracks an in-flight "Stay signed in" refresh so logout can be serialized
+  // against it: if logout wins, cookie clearing is deferred until the refresh
+  // response settles so a late success cannot write auth cookies last.
+  const pendingRefreshRef = useRef<Promise<unknown> | null>(null);
+  // Set when logout is requested while a refresh is still pending; the deferred
+  // logout finalization runs once the refresh settles.
+  const deferredLogoutRef = useRef(false);
   // Keep the latest callbacks without re-subscribing the controller.
   const refreshRef = useRef(refresh);
   const onLogoutRef = useRef(onLogout);
@@ -72,13 +79,28 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
     onLogoutRef.current = onLogout;
   }, [refresh, onLogout]);
 
+  // Run the logout side effect (server cookie clearing via onLogout). If a
+  // refresh is still in flight, defer until it settles so the refresh's cookie
+  // write can never land after the logout's cookie clear ("logout wins", and
+  // cookie clearing happens after any issued refresh response).
+  const finalizeLogout = useCallback(() => {
+    if (pendingRefreshRef.current) {
+      deferredLogoutRef.current = true;
+      return;
+    }
+    onLogoutRef.current();
+  }, []);
+
   const beginLogout = useCallback(() => {
     if (loggingOutRef.current) return;
     loggingOutRef.current = true;
     setLoggingOut(true);
     setPhase('expired');
-    onLogoutRef.current();
-  }, []);
+    // Ensure the controller latches its terminal generation so any pending or
+    // future extend/deadline from this or another tab cannot revive the session.
+    controllerRef.current?.logout();
+    finalizeLogout();
+  }, [finalizeLogout]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -86,6 +108,8 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
     const controller = createIdleController(resolved);
     controllerRef.current = controller;
     loggingOutRef.current = false;
+    pendingRefreshRef.current = null;
+    deferredLogoutRef.current = false;
 
     controller.subscribe((next) => {
       setPhase(next);
@@ -137,28 +161,53 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
     if (!controller || busy || loggingOutRef.current) return;
     setBusy(true);
     setErrorMessage(undefined);
-    void refreshRef.current()
+    // Capture the session generation at the moment we start the refresh. If a
+    // logout (local expiry, this tab's sign-out, or a remote tab) advances the
+    // generation while the refresh is in flight, the refresh result is stale and
+    // must NOT extend or restore the session.
+    const startGeneration = controller.generation();
+    const refreshPromise = refreshRef.current();
+    pendingRefreshRef.current = refreshPromise;
+    void refreshPromise
       .then((ok) => {
-        if (ok) {
+        const stillOurSession =
+          !loggingOutRef.current &&
+          !controller.isLoggedOut() &&
+          controller.generation() === startGeneration;
+        if (ok && stillOurSession) {
           // Confirm recent activity and reset the shared deadline for all tabs.
           controller.extend();
           setPhase('active');
           setRemainingMs(controller.remainingMs());
-        } else {
+        } else if (!ok && !loggingOutRef.current) {
+          setErrorMessage(REFRESH_FAILED_MESSAGE);
+          beginLogout();
+        }
+        // If logout already won, do nothing here: the refresh response is
+        // discarded and the deferred logout finalizer (below) clears cookies.
+      })
+      .catch(() => {
+        if (!loggingOutRef.current) {
           setErrorMessage(REFRESH_FAILED_MESSAGE);
           beginLogout();
         }
       })
-      .catch(() => {
-        setErrorMessage(REFRESH_FAILED_MESSAGE);
-        beginLogout();
-      })
-      .finally(() => setBusy(false));
+      .finally(() => {
+        setBusy(false);
+        if (pendingRefreshRef.current === refreshPromise) {
+          pendingRefreshRef.current = null;
+        }
+        // A logout that arrived while this refresh was pending deferred its
+        // cookie clearing until now — run it after the refresh has settled so
+        // the refresh response cannot write auth cookies last.
+        if (deferredLogoutRef.current) {
+          deferredLogoutRef.current = false;
+          onLogoutRef.current();
+        }
+      });
   }, [busy, beginLogout]);
 
   const onSignOut = useCallback(() => {
-    const controller = controllerRef.current;
-    controller?.logout();
     beginLogout();
   }, [beginLogout]);
 

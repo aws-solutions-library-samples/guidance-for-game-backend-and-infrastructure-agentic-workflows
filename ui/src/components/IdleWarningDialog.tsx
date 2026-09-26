@@ -19,6 +19,7 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef } from 'react';
+import { handleFocusTrapKeydown, initialFocusTarget } from '@/utils/dialogFocusTrap';
 
 interface IdleWarningDialogProps {
   open: boolean;
@@ -46,8 +47,6 @@ function coarseAnnouncement(remainingMs: number): string {
   return `Your session will end in about ${minutes} minute${minutes === 1 ? '' : 's'} unless you stay signed in.`;
 }
 
-const FOCUSABLE = 'button:not([disabled])';
-
 export function IdleWarningDialog({
   open,
   remainingMs,
@@ -66,8 +65,6 @@ export function IdleWarningDialog({
     if (!open) return;
     // Remember what had focus so we can restore it when the dialog closes.
     previouslyFocused.current = document.activeElement;
-    // Initial focus target: the primary, least-destructive action.
-    stayRef.current?.focus();
     return () => {
       const toRestore = previouslyFocused.current;
       if (toRestore instanceof HTMLElement && document.contains(toRestore)) {
@@ -75,6 +72,18 @@ export function IdleWarningDialog({
       }
     };
   }, [open]);
+
+  // Manage focus on open AND across the busy transition. When a refresh disables
+  // both actions there is no enabled button to hold focus, so we focus the
+  // dialog container itself (which carries tabindex="-1"). This keeps focus
+  // inside the modal instead of escaping to the page behind it.
+  useEffect(() => {
+    if (!open) return;
+    const container = dialogRef.current;
+    if (!container) return;
+    const target = initialFocusTarget(container, stayRef.current);
+    target.focus();
+  }, [open, busy]);
 
   if (!open) return null;
 
@@ -85,21 +94,11 @@ export function IdleWarningDialog({
       onStay();
       return;
     }
-    if (event.key !== 'Tab') return;
     const container = dialogRef.current;
     if (!container) return;
-    const focusable = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE));
-    if (focusable.length === 0) return;
-    const first = focusable[0];
-    const last = focusable[focusable.length - 1];
-    const active = document.activeElement;
-    if (event.shiftKey && active === first) {
-      event.preventDefault();
-      last.focus();
-    } else if (!event.shiftKey && active === last) {
-      event.preventDefault();
-      first.focus();
-    }
+    // Delegates to the shared trap, which always keeps at least the focusable
+    // container as a target — including the zero-enabled-action busy state.
+    handleFocusTrapKeydown(container, event.nativeEvent);
   };
 
   return (
@@ -111,6 +110,7 @@ export function IdleWarningDialog({
         aria-labelledby="ga-idle-title"
         aria-describedby="ga-idle-desc"
         className="ga-idle-dialog"
+        tabIndex={-1}
         onKeyDown={handleKeyDown}
       >
         <h2 id="ga-idle-title" className="ga-idle-title">Still there?</h2>

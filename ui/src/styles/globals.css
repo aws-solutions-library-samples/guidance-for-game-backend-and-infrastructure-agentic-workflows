@@ -258,6 +258,14 @@ body {
   font-family: Inter, system-ui, sans-serif;
 }
 
+/* While a refresh disables both actions the dialog container itself holds focus
+   (tabindex="-1") to keep the focus trap intact (#310). Suppress the container
+   outline so the transient busy state does not draw a full-dialog focus ring;
+   the individual controls keep their own visible focus styles. */
+.ga-idle-dialog:focus {
+  outline: none;
+}
+
 .ga-idle-title {
   margin: 0 0 0.5rem;
   font-size: 1.25rem;
