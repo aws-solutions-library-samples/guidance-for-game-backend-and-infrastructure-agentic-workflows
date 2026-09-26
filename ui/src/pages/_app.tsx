@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
 import { IdleWarningDialog } from '../components/IdleWarningDialog';
 import { useIdleSession } from '@/utils/useIdleSession';
+import { createSessionCoordinator } from '@/utils/sessionCoordinator';
 import type { CognitoUser } from 'amazon-cognito-identity-js';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import {
@@ -55,45 +56,82 @@ function MyApp({ Component, pageProps }: AppProps) {
   const [user, setUser] = useState<CognitoUser | null>(null);
   const [authNotice, setAuthNotice] = useState('');
   const [sessionCleanupPending, setSessionCleanupPending] = useState(false);
-  const sessionExpirationInProgress = useRef(false);
+  // Authenticated session epoch (#310, Blocker 1). Increments on each sign-in so
+  // the idle controller binds to a fresh session and a prior terminal record
+  // cannot immediately log the new session out.
+  const [sessionEpoch, setSessionEpoch] = useState(0);
   const lastActivityAt = useRef(0);
+  const userRef = useRef<CognitoUser | null>(null);
+  const authModeRef = useRef(authMode);
 
-  const handleSessionExpired = useCallback(() => {
-    if (authMode !== 'cognito' || !user || sessionExpirationInProgress.current) {
-      return;
-    }
+  useEffect(() => {
+    userRef.current = user;
+    authModeRef.current = authMode;
+  }, [user, authMode]);
 
-    sessionExpirationInProgress.current = true;
+  // The actual cookie-clearing + local-state logout side effect. This is the
+  // LAST auth-affecting response every logout entry converges on. It is only
+  // ever invoked by the coordinator (Blocker 3), so it is serialized behind any
+  // in-flight refresh — a late `/api/auth/refresh` success can never write
+  // cookies after this clears them.
+  const performLogout = useCallback(async () => {
+    if (authModeRef.current !== 'cognito' || !userRef.current) return;
     clearSessionRefreshMarker();
     setSessionCleanupPending(true);
     try {
-      user.signOut();
+      userRef.current.signOut();
     } catch {
       // Continue clearing the server cookies and React state even if the Cognito
       // client cannot remove its cached session.
     }
     setUser(null);
     setAuthNotice(SESSION_EXPIRED_MESSAGE);
+    try {
+      await fetchWithTimeout('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // The local signed-out state is authoritative even if cookie cleanup
+      // cannot reach the server. The next protected request still fails closed.
+    } finally {
+      setSessionCleanupPending(false);
+    }
+  }, []);
 
-    void fetchWithTimeout('/api/auth/logout', { method: 'POST' })
-      .catch(() => {
-        // The local signed-out state is authoritative even if cookie cleanup
-        // cannot reach the server. The next protected request still fails closed.
-      })
-      .finally(() => {
-        sessionExpirationInProgress.current = false;
-        setSessionCleanupPending(false);
+  // One application-level coordinator (#310, Blocker 3) shared by idle
+  // expiry/sign-out, protected-request 401 expiration, refresh-failure
+  // broadcasts, cross-tab logout, and the header manual sign-out. Every logout
+  // waits for (or invalidates) an in-flight refresh and clears cookies last.
+  //
+  // Created lazily in a ref (never during render) so its closures — which read
+  // identity refs — are only ever invoked from effects and event handlers.
+  const coordinatorRef = useRef<ReturnType<typeof createSessionCoordinator> | null>(null);
+  const getCoordinator = useCallback((): ReturnType<typeof createSessionCoordinator> => {
+    if (!coordinatorRef.current) {
+      coordinatorRef.current = createSessionCoordinator({
+        refresh: () => refreshSessionOnce(window.fetch),
+        logout: () => performLogout(),
       });
-  }, [authMode, user]);
+    }
+    return coordinatorRef.current;
+  }, [performLogout]);
+
+  // A logout entry point usable by any caller (protected-request expiration,
+  // refresh-failure broadcast, the header manual sign-out). Routes through the
+  // coordinator so ordering is preserved for every path.
+  const handleSessionExpired = useCallback(() => {
+    void getCoordinator().logout();
+  }, [getCoordinator]);
 
   useEffect(() => subscribeToSessionExpiration(handleSessionExpired), [handleSessionExpired]);
 
   // Idle-session warning (#310): a UX/local-exposure control only. The server
   // still verifies tokens on every request. "Stay signed in" runs the secure
-  // #309 refresh; expiry and explicit sign-out reuse handleSessionExpired.
+  // #309 refresh through the shared coordinator; expiry and explicit sign-out
+  // route their cookie clear through the same coordinator.
   const idle = useIdleSession({
     enabled: authMode === 'cognito' && !!user,
     config: config?.session,
+    epoch: sessionEpoch,
+    getCoordinator,
     refresh: useCallback(() => refreshSessionOnce(window.fetch), []),
     onLogout: handleSessionExpired,
   });
@@ -131,6 +169,8 @@ function MyApp({ Component, pageProps }: AppProps) {
         }
       }
 
+      // Route the expiration through the coordinator so its cookie clear waits
+      // for any in-flight idle refresh and lands last.
       handleSessionExpired();
       return response;
     };
@@ -186,7 +226,14 @@ function MyApp({ Component, pageProps }: AppProps) {
       </div>
     );
   } else if (authMode === 'skip' || user) {
-    content = <Component {...pageProps} user={user} loggingOut={idle.loggingOut} />;
+    content = (
+      <Component
+        {...pageProps}
+        user={user}
+        loggingOut={idle.loggingOut}
+        onSignOut={handleSessionExpired}
+      />
+    );
   } else {
     content = (
       <CognitoAuth
@@ -197,6 +244,11 @@ function MyApp({ Component, pageProps }: AppProps) {
           setAuthNotice('');
           clearSessionRefreshMarker();
           lastActivityAt.current = Date.now();
+          // Begin a fresh authenticated session (#310, Blocker 1): reset the
+          // coordinator's terminal state and advance the epoch so a prior
+          // session's terminal idle record cannot immediately sign this one out.
+          getCoordinator().beginSession();
+          setSessionEpoch((epoch) => epoch + 1);
           setUser(cognitoUser);
         }}
       />

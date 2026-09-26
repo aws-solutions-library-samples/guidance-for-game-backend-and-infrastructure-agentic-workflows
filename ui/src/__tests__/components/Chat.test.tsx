@@ -47,6 +47,10 @@ jest.mock('@copilotkit/react-ui', () => ({
     Messages?: React.ComponentType<{ messages: unknown[]; inProgress: boolean }>;
   }) => {
     const [inProgress, setInProgress] = mockReact.useState(false);
+    // Retained React text state, exactly like the installed CopilotKit Input:
+    // the send button stays enabled while there is non-empty text even after the
+    // DOM textarea is disabled by the guard.
+    const [text, setText] = mockReact.useState('has text');
 
     const handleStart = () => {
       setInProgress(true);
@@ -58,32 +62,49 @@ jest.mock('@copilotkit/react-ui', () => ({
       onInProgress?.(false);
     };
 
-    // A realistic input + submit path: a focusable textarea that submits on a
-    // bare Enter (as CopilotKit does) and a send button, so tests exercise the
-    // real key/submit surface rather than only markers.
+    // Faithfully model the installed @copilotkit/react-ui 1.10.6 sender: a PLAIN
+    // button with onClick={send} (NOT a form submit), and a textarea whose bare
+    // Enter calls send() directly from onKeyDown. See
+    // node_modules/@copilotkit/react-ui/src/components/chat/Input.tsx.
     const bumpSends = () => {
       const w = globalThis as unknown as { __chatSends?: number };
       w.__chatSends = (w.__chatSends ?? 0) + 1;
     };
+    const send = () => {
+      if (inProgress) return;
+      bumpSends();
+    };
+    const canSend = text.trim().length > 0 && !inProgress;
     const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        bumpSends();
+        if (canSend) send();
       }
-    };
-    const onSubmit = (e: React.FormEvent) => {
-      e.preventDefault();
-      bumpSends();
     };
 
     return (
       <div data-testid="copilot-chat" className={className}>
         <div data-testid="chat-title">{labels?.title}</div>
         {Messages && <Messages messages={[]} inProgress={inProgress} />}
-        <form onSubmit={onSubmit}>
-          <textarea data-testid="chat-textarea" placeholder="Ask about game infrastructure..." onKeyDown={onKeyDown} />
-          <button data-testid="chat-send" type="submit">Send</button>
-        </form>
+        <div className="copilotKitInput">
+          <textarea
+            data-testid="chat-textarea"
+            placeholder="Ask about game infrastructure..."
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={onKeyDown}
+          />
+          <div className="copilotKitInputControls">
+            <button
+              data-testid="chat-send"
+              className="copilotKitInputControlButton"
+              disabled={!canSend}
+              onClick={send}
+            >
+              Send
+            </button>
+          </div>
+        </div>
         <button
           data-testid="trigger-thinking"
           onClick={handleStart}
@@ -254,9 +275,11 @@ describe('Chat', () => {
     expect(document.querySelector('.ga-chat-disabled-overlay')).not.toBeInTheDocument();
     const wrapper = document.querySelector('.ga-chat-wrapper');
     expect(wrapper).not.toHaveAttribute('aria-disabled', 'true');
-    // The input is usable when enabled.
+    // The input and send button are usable when enabled.
     const textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
     expect(textarea.disabled).toBe(false);
+    const send = screen.getByTestId('chat-send') as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
   });
 
   it('functionally disables the textarea and blocks Enter submission once logout begins', () => {
@@ -272,18 +295,36 @@ describe('Chat', () => {
     expect(textarea.disabled).toBe(true);
     expect(textarea).toHaveAttribute('aria-disabled', 'true');
 
-    // Even if focus is forced onto the input, a bare Enter must not submit.
+    // Even if focus is forced onto the input, a bare Enter must not send
+    // (CopilotKit's onKeyDown calls send() directly — the capture guard wins).
     textarea.focus();
     fireEvent.keyDown(textarea, { key: 'Enter' });
     expect(getSends()).toBe(0);
   });
 
-  it('blocks a programmatic submit/click while disabled', () => {
+  it('disables and blocks the REAL CopilotKit send button (plain onClick) while disabled', () => {
     resetSends();
     render(<Chat disabled />);
-    const send = screen.getByTestId('chat-send');
+    const send = screen.getByTestId('chat-send') as HTMLButtonElement;
+
+    // The installed sender is a plain button with onClick={send} and retained
+    // text state; it must be functionally disabled, not just covered.
+    expect(send.disabled).toBe(true);
+    expect(send).toHaveAttribute('aria-disabled', 'true');
+
+    // A programmatic button.click() must not send (capture-phase click guard +
+    // disabled button).
+    send.click();
+    expect(getSends()).toBe(0);
+
+    // A synthesized click event likewise cannot reach the plain onClick sender.
     fireEvent.click(send);
-    fireEvent.submit(send.closest('form') as HTMLFormElement);
+    expect(getSends()).toBe(0);
+
+    // Keyboard activation on the focused send button (Space/Enter) is blocked.
+    send.focus();
+    fireEvent.keyDown(send, { key: ' ' });
+    fireEvent.keyDown(send, { key: 'Enter' });
     expect(getSends()).toBe(0);
   });
 
@@ -297,17 +338,21 @@ describe('Chat', () => {
     expect(screen.getByTestId('chat-title')).toHaveTextContent('🎮 Game Agent');
   });
 
-  it('re-enables the input when logout state clears (guard is reversible)', () => {
+  it('re-enables the input and send button when logout state clears (guard is reversible)', () => {
     resetSends();
     const { rerender } = render(<Chat disabled />);
     let textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
+    let send = screen.getByTestId('chat-send') as HTMLButtonElement;
     expect(textarea.disabled).toBe(true);
+    expect(send.disabled).toBe(true);
 
     rerender(<Chat disabled={false} />);
     textarea = screen.getByTestId('chat-textarea') as HTMLTextAreaElement;
+    send = screen.getByTestId('chat-send') as HTMLButtonElement;
     expect(textarea.disabled).toBe(false);
-    // Submission works again once re-enabled.
-    fireEvent.submit(textarea.closest('form') as HTMLFormElement);
+    expect(send.disabled).toBe(false);
+    // Sending works again once re-enabled: a plain button click sends.
+    send.click();
     expect(getSends()).toBe(1);
   });
 

@@ -9,6 +9,19 @@
  * `Date.now()`, never from a decrement-only counter. A background tab whose
  * interval is throttled therefore cannot extend the session: when it next
  * evaluates the phase the wall-clock deadline has already passed.
+ *
+ * Cross-tab state is a SINGLE versioned session record bound to an authenticated
+ * session `epoch` (Blocker 1). One record — not three separate keys — carries
+ * `{ epoch, generation, deadline, loggedOut }`, so a newly opened tab never sees
+ * an intermediate mix of a stale deadline and a fresh generation. A terminal
+ * (logged-out) record is consumed on startup and delivered to the hook so a tab
+ * opened after a peer logout does not keep authenticated UI. `beginSession()`
+ * explicitly initializes a fresh epoch after authentication, so the terminal
+ * record from a prior session does not immediately log the new session out.
+ *
+ * When `BroadcastChannel` is unavailable the controller registers a live
+ * `storage` listener (Blocker 2) so already-open tabs converge on a peer's
+ * deadline extension or logout, applying the same epoch/generation validation.
  */
 
 export interface IdleSessionConfig {
@@ -19,6 +32,12 @@ export interface IdleSessionConfig {
 export interface ResolvedIdleConfig {
   idleTimeoutMs: number;
   idleWarningMs: number;
+  /**
+   * Authenticated session epoch. All persisted/broadcast state is bound to it;
+   * a record from a different epoch is ignored. Defaults to 0 when unset (a
+   * single-session environment). The hook derives this from authentication.
+   */
+  epoch?: number;
 }
 
 export type IdlePhase = 'active' | 'warning' | 'expired';
@@ -38,9 +57,9 @@ export const MAX_IDLE_WARNING_SECONDS = 600; // 10 minutes
 export const IDLE_ACTIVITY_THROTTLE_MS = 5_000;
 
 const CHANNEL_NAME = 'game-agent-idle';
-const DEADLINE_KEY = 'game-agent-idle-deadline';
-const GENERATION_KEY = 'game-agent-idle-generation';
-const LOGOUT_KEY = 'game-agent-idle-loggedout';
+// A SINGLE versioned session record replaces the former separate deadline/
+// generation/logout keys so tabs never observe an inconsistent intermediate.
+const SESSION_KEY = 'game-agent-idle-session';
 
 function bounded(value: number | undefined, fallback: number, min: number, max: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
@@ -82,6 +101,16 @@ interface ChannelMessage {
   // A logout bumps the generation to a terminal value; peers reject any deadline
   // message from an older generation so a late refresh cannot revive a session.
   generation: number;
+  // The authenticated session the message belongs to. Messages from a different
+  // epoch are ignored.
+  epoch: number;
+}
+
+interface SessionRecord {
+  epoch: number;
+  generation: number;
+  deadline: number;
+  loggedOut: boolean;
 }
 
 export interface IdleController {
@@ -92,26 +121,35 @@ export interface IdleController {
   remainingMs(): number;
   deadline(): number;
   generation(): number;
+  epoch(): number;
   isLoggedOut(): boolean;
   markActivity(): void;
   extend(): void;
   logout(): void;
+  /**
+   * Begin a fresh authenticated session: adopt a new epoch (one past any stored
+   * epoch) so a terminal record from a prior session does not log this one out.
+   * Call after authentication succeeds and BEFORE start().
+   */
+  beginSession(): void;
   subscribe(listener: PhaseListener): () => void;
   onLogout(listener: LogoutListener): () => void;
 }
 
 // Guards against duplicate work when several React effects mount at once within
-// a single tab; the cross-tab guard is the BroadcastChannel itself.
+// a single tab; the cross-tab guard is the BroadcastChannel/storage record.
 let activeControllerCount = 0;
 
 export function createIdleController(config: ResolvedIdleConfig): IdleController {
   const phaseListeners = new Set<PhaseListener>();
   const logoutListeners = new Set<LogoutListener>();
 
+  let epoch = typeof config.epoch === 'number' && Number.isFinite(config.epoch) ? config.epoch : 0;
   let deadlineMs = Date.now() + config.idleTimeoutMs;
   let lastActivityRecordedAt = 0;
   let lastPhase: IdlePhase = 'active';
   let channel: BroadcastChannel | null = null;
+  let storageListener: ((event: StorageEvent) => void) | null = null;
   let started = false;
   // Session-transition version. Any extend/deadline change increments it within
   // the active session; logout advances it to a terminal generation and latches
@@ -128,35 +166,31 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
     return 'active';
   }
 
-  function readStoredNumber(key: string): number | null {
+  function readRecord(): SessionRecord | null {
     try {
-      const raw = window.localStorage.getItem(key);
+      const raw = window.localStorage.getItem(SESSION_KEY);
       if (raw === null) return null;
-      const value = Number(raw);
-      return Number.isFinite(value) ? value : null;
+      const parsed = JSON.parse(raw) as Partial<SessionRecord>;
+      if (
+        typeof parsed?.epoch !== 'number' ||
+        typeof parsed?.generation !== 'number' ||
+        typeof parsed?.deadline !== 'number' ||
+        typeof parsed?.loggedOut !== 'boolean'
+      ) {
+        return null;
+      }
+      return parsed as SessionRecord;
     } catch {
       return null;
     }
   }
 
-  function persistState(): void {
+  function writeRecord(): void {
     try {
-      window.localStorage.setItem(DEADLINE_KEY, String(deadlineMs));
-      window.localStorage.setItem(GENERATION_KEY, String(generation));
+      const record: SessionRecord = { epoch, generation, deadline: deadlineMs, loggedOut };
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify(record));
     } catch {
       // Coordination degrades gracefully to per-tab timers when storage is off.
-    }
-  }
-
-  function persistLogout(): void {
-    try {
-      window.localStorage.setItem(GENERATION_KEY, String(generation));
-      window.localStorage.setItem(LOGOUT_KEY, String(generation));
-      // Clear stale deadline state so a newly opened tab does not resurrect the
-      // session from a pre-logout deadline.
-      window.localStorage.removeItem(DEADLINE_KEY);
-    } catch {
-      // Nothing more we can do; the terminal state is still authoritative here.
     }
   }
 
@@ -173,13 +207,14 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
     }
     loggedOut = true;
     generation = Math.max(generation, nextGeneration);
-    persistLogout();
-    if (propagate) broadcast({ type: 'logout', generation });
+    writeRecord();
+    if (propagate) broadcast({ type: 'logout', generation, epoch });
     emitPhaseIfChanged();
     notifyLogout();
   }
 
-  function adoptDeadline(next: number, incomingGeneration: number): void {
+  function adoptDeadline(next: number, incomingGeneration: number, incomingEpoch: number): void {
+    if (incomingEpoch !== epoch) return; // A message from another session is ignored.
     if (loggedOut) return; // A terminated session is never revived by a deadline.
     if (!Number.isFinite(next) || next <= 0) return;
     // Reject messages from an older generation (e.g. a late extension racing a
@@ -194,6 +229,17 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       deadlineMs = next;
       emitPhaseIfChanged();
     }
+  }
+
+  // Apply an incoming record (from a BroadcastChannel message or a live storage
+  // event) with the same epoch/generation validation.
+  function applyIncomingRecord(record: SessionRecord): void {
+    if (record.epoch !== epoch) return;
+    if (record.loggedOut) {
+      enterLoggedOut(record.generation, false);
+      return;
+    }
+    adoptDeadline(record.deadline, record.generation, record.epoch);
   }
 
   function broadcast(message: ChannelMessage): void {
@@ -218,8 +264,8 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
     if (loggedOut) return;
     deadlineMs = next;
     generation += 1;
-    persistState();
-    if (propagate) broadcast({ type: 'deadline', deadline: next, generation });
+    writeRecord();
+    if (propagate) broadcast({ type: 'deadline', deadline: next, generation, epoch });
     emitPhaseIfChanged();
   }
 
@@ -238,21 +284,17 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       started = true;
       activeControllerCount += 1;
 
-      // Adopt any shared state another tab already published so tabs converge.
-      const storedGeneration = readStoredNumber(GENERATION_KEY);
-      const storedLogout = readStoredNumber(LOGOUT_KEY);
-      const storedDeadline = readStoredNumber(DEADLINE_KEY);
-      if (typeof storedGeneration === 'number') {
-        generation = Math.max(generation, storedGeneration);
-      }
-      // If a peer already logged out at our generation-or-newer, converge to the
-      // terminal state instead of starting a fresh authenticated timer.
-      if (typeof storedLogout === 'number' && storedLogout >= generation) {
-        generation = Math.max(generation, storedLogout);
-        loggedOut = true;
-      }
-      if (!loggedOut && typeof storedDeadline === 'number' && storedDeadline > Date.now()) {
-        deadlineMs = Math.max(deadlineMs, storedDeadline);
+      // Adopt any shared state another tab already published for THIS epoch so
+      // tabs converge. A record from a different epoch is a superseded session
+      // and is ignored (Blocker 1: beginSession() must not be logged out by it).
+      const stored = readRecord();
+      if (stored && stored.epoch === epoch) {
+        generation = Math.max(generation, stored.generation);
+        if (stored.loggedOut) {
+          loggedOut = true;
+        } else if (stored.deadline > Date.now()) {
+          deadlineMs = Math.max(deadlineMs, stored.deadline);
+        }
       }
 
       lastActivityRecordedAt = Date.now();
@@ -262,23 +304,35 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
         channel = new BroadcastChannel(CHANNEL_NAME);
         channel.onmessage = (event: MessageEvent<ChannelMessage>) => {
           const data = event.data;
-          if (!data) return;
+          if (!data || typeof data.epoch !== 'number' || data.epoch !== epoch) return;
           if (data.type === 'deadline' && typeof data.deadline === 'number') {
-            adoptDeadline(data.deadline, typeof data.generation === 'number' ? data.generation : 0);
+            adoptDeadline(data.deadline, typeof data.generation === 'number' ? data.generation : 0, data.epoch);
           } else if (data.type === 'logout') {
             enterLoggedOut(typeof data.generation === 'number' ? data.generation : generation + 1, false);
           }
         };
+      } else {
+        // Blocker 2: without BroadcastChannel, a live storage listener converges
+        // already-open tabs on a peer's extension/logout. The writing tab does
+        // not receive its own event, so this only fires for peer writes.
+        storageListener = (event: StorageEvent) => {
+          if (event.key !== SESSION_KEY) return;
+          const record = readRecord();
+          if (record) applyIncomingRecord(record);
+        };
+        window.addEventListener('storage', storageListener);
       }
 
       if (loggedOut) {
-        // Converge asynchronously so subscribers attached after start() still fire.
-        persistLogout();
+        // Consume the adopted terminal state and DELIVER it to the hook so a tab
+        // opened after peer logout signs out instead of keeping authenticated UI.
+        writeRecord();
+        notifyLogout();
       } else {
         // Publish our (possibly newest) deadline so existing tabs converge on a
         // later-starting tab's deadline instead of expiring under it.
-        persistState();
-        broadcast({ type: 'deadline', deadline: deadlineMs, generation });
+        writeRecord();
+        broadcast({ type: 'deadline', deadline: deadlineMs, generation, epoch });
       }
     },
 
@@ -289,6 +343,10 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       if (channel) {
         channel.close();
         channel = null;
+      }
+      if (storageListener) {
+        window.removeEventListener('storage', storageListener);
+        storageListener = null;
       }
     },
 
@@ -312,6 +370,10 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
 
     generation(): number {
       return generation;
+    },
+
+    epoch(): number {
+      return epoch;
     },
 
     isLoggedOut(): boolean {
@@ -341,6 +403,18 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       enterLoggedOut(generation + 1, true);
     },
 
+    beginSession(): void {
+      // Pick an epoch strictly newer than anything stored so a prior terminal
+      // record cannot log this fresh session out.
+      const stored = readRecord();
+      const base = stored ? stored.epoch : epoch;
+      epoch = Math.max(epoch, base) + 1;
+      generation = 0;
+      loggedOut = false;
+      deadlineMs = Date.now() + config.idleTimeoutMs;
+      lastPhase = 'active';
+    },
+
     subscribe(listener: PhaseListener): () => void {
       phaseListeners.add(listener);
       return () => phaseListeners.delete(listener);
@@ -356,9 +430,7 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
 export function resetIdleCoordinatorForTests(): void {
   activeControllerCount = 0;
   try {
-    window.localStorage.removeItem(DEADLINE_KEY);
-    window.localStorage.removeItem(GENERATION_KEY);
-    window.localStorage.removeItem(LOGOUT_KEY);
+    window.localStorage.removeItem(SESSION_KEY);
   } catch {
     // Ignore storage access failures in test teardown.
   }

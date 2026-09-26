@@ -683,4 +683,164 @@ describe('MyApp - Logout behavior', () => {
     nowSpy.mockRestore();
     jest.useRealTimers();
   });
+
+  // ---- Blocker 3 regressions: every logout entry clears cookies LAST, and a
+  // later successful reauthentication works. ----
+
+  it('a protected-request expiration during a pending idle refresh clears cookies AFTER the refresh (#310)', async () => {
+    jest.useFakeTimers();
+    let now = 3_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const order: string[] = [];
+    let releaseRefresh!: (value: Response) => void;
+    const pendingRefresh = new Promise<Response>((resolve) => {
+      releaseRefresh = resolve;
+    });
+
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            // idleRefreshSeconds is tiny so the 401 path treats the user as NOT
+            // recently active and expires directly (a non-idle logout entry)
+            // instead of attempting its own refresh.
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120, idleRefreshSeconds: 1 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        order.push('refresh-start');
+        return pendingRefresh;
+      }
+      if (url === '/api/copilot/chat') {
+        return { ok: false, status: 401, json: async () => ({ error: 'Unauthorized' }) } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        order.push('logout');
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>Submit message</button>
+      </div>
+    );
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // Open the idle warning and start a "Stay signed in" refresh (kept pending).
+    act(() => {
+      now += 28 * 60_000 + 1_000;
+      jest.advanceTimersByTime(1_000);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Stay signed in' }));
+      await Promise.resolve();
+    });
+    expect(order).toEqual(['refresh-start']);
+
+    // A protected request returns 401 while the idle refresh is still pending.
+    // The user is past the idleRefresh window, so this expires directly — a
+    // non-idle logout entry. It must NOT clear cookies before the refresh
+    // settles (Blocker 3).
+    now += 10_000; // beyond the 1s idleRefresh window
+    await act(async () => {
+      await window.fetch('/api/copilot/chat', { method: 'POST' });
+      await Promise.resolve();
+    });
+    expect(order).toEqual(['refresh-start']);
+
+    // The refresh finally succeeds. Its cookie write happens, THEN the deferred
+    // logout clears cookies last.
+    await act(async () => {
+      releaseRefresh({ ok: true, status: 200, json: async () => ({ success: true }) } as Response);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(order).toContain('logout');
+    // Logout is the final auth-affecting response.
+    expect(order[order.length - 1]).toBe('logout');
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
+  it('supports a successful reauthentication after an idle logout (#310)', async () => {
+    jest.useFakeTimers();
+    let now = 4_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => <div data-testid="app-content">App Content</div>;
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    // Flush the /api/config promise so the login screen renders.
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    // First sign-in.
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // Idle logout.
+    await act(async () => {
+      now += 31 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('cognito-auth')).toBeInTheDocument();
+
+    // A later sign-in must succeed and NOT be immediately logged out by the
+    // prior session's terminal idle record (fresh epoch via beginSession()).
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // Advance short of the new warning window: the session stays authenticated.
+    await act(async () => {
+      now += 5 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
 });

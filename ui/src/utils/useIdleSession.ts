@@ -3,8 +3,14 @@
  *
  * Wires the pure {@link createIdleController} to React state, a polling tick
  * that re-evaluates the *absolute* deadline (so background-tab throttling
- * cannot extend the session), throttled activity listeners, and the existing
- * secure refresh (#309) and logout paths.
+ * cannot extend the session), throttled activity listeners, and the shared
+ * application-level {@link SessionCoordinator} (Blocker 3) that serializes the
+ * secure refresh (#309) against every logout entry.
+ *
+ * Refresh/logout ordering no longer lives in this hook's closure. It lives in
+ * one coordinator shared with `_app`'s protected-request expiration,
+ * refresh-failure broadcasts, cross-tab logout, and the header manual sign-out,
+ * so a late refresh success can never write auth cookies after any logout.
  *
  * This is a UX/local-exposure control only. The server continues to verify
  * tokens on every request and remains the authorization boundary.
@@ -17,6 +23,10 @@ import {
   type IdlePhase,
   type IdleSessionConfig,
 } from '@/utils/idleTimer';
+import {
+  createSessionCoordinator,
+  type SessionCoordinator,
+} from '@/utils/sessionCoordinator';
 
 const REFRESH_FAILED_MESSAGE = 'Could not extend your session. Signing you out.';
 
@@ -30,6 +40,21 @@ export interface UseIdleSessionOptions {
   config: IdleSessionConfig | undefined;
   refresh: () => Promise<boolean>;
   onLogout: () => void;
+  /**
+   * Authenticated session epoch. Increment on each successful authentication so
+   * the controller binds to a fresh session and a prior terminal record cannot
+   * immediately log the new session out.
+   */
+  epoch?: number;
+  /**
+   * Shared application-level coordinator accessor (Blocker 3). When omitted the
+   * hook builds its own from `refresh`/`onLogout` (used by the focused hook
+   * tests). In production `_app` supplies the shared coordinator so every logout
+   * entry — not just idle expiry/sign-out — serializes against the same refresh.
+   * Passed as a getter so the instance is resolved inside the hook's effect,
+   * never during the parent's render.
+   */
+  getCoordinator?: () => SessionCoordinator;
 }
 
 export interface IdleSessionState {
@@ -51,9 +76,12 @@ const ACTIVITY_EVENTS: Array<[keyof WindowEventMap, boolean]> = [
 ];
 
 export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState {
-  const { enabled, config, refresh, onLogout } = options;
+  const { enabled, config, refresh, onLogout, epoch, getCoordinator } = options;
 
-  const resolved = useMemo(() => resolveIdleConfig(config), [config]);
+  const resolved = useMemo(() => {
+    const base = resolveIdleConfig(config);
+    return { ...base, epoch: typeof epoch === 'number' ? epoch : 0 };
+  }, [config, epoch]);
   const [phase, setPhase] = useState<IdlePhase>('active');
   const [remainingMs, setRemainingMs] = useState(resolved.idleTimeoutMs);
   const [loggingOut, setLoggingOut] = useState(false);
@@ -62,34 +90,19 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
 
   const controllerRef = useRef<ReturnType<typeof createIdleController> | null>(null);
   const loggingOutRef = useRef(false);
-  // Tracks an in-flight "Stay signed in" refresh so logout can be serialized
-  // against it: if logout wins, cookie clearing is deferred until the refresh
-  // response settles so a late success cannot write auth cookies last.
-  const pendingRefreshRef = useRef<Promise<unknown> | null>(null);
-  // Set when logout is requested while a refresh is still pending; the deferred
-  // logout finalization runs once the refresh settles.
-  const deferredLogoutRef = useRef(false);
   // Keep the latest callbacks without re-subscribing the controller.
   const refreshRef = useRef(refresh);
   const onLogoutRef = useRef(onLogout);
+  // The shared coordinator (or a hook-local one). All refresh/logout ordering
+  // lives here so every entry point converges on the same "logout wins, cookie
+  // clear last" guarantee.
+  const coordinatorRef = useRef<SessionCoordinator | null>(null);
 
   // Sync the latest callbacks in an effect, never during render.
   useEffect(() => {
     refreshRef.current = refresh;
     onLogoutRef.current = onLogout;
   }, [refresh, onLogout]);
-
-  // Run the logout side effect (server cookie clearing via onLogout). If a
-  // refresh is still in flight, defer until it settles so the refresh's cookie
-  // write can never land after the logout's cookie clear ("logout wins", and
-  // cookie clearing happens after any issued refresh response).
-  const finalizeLogout = useCallback(() => {
-    if (pendingRefreshRef.current) {
-      deferredLogoutRef.current = true;
-      return;
-    }
-    onLogoutRef.current();
-  }, []);
 
   const beginLogout = useCallback(() => {
     if (loggingOutRef.current) return;
@@ -99,8 +112,10 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
     // Ensure the controller latches its terminal generation so any pending or
     // future extend/deadline from this or another tab cannot revive the session.
     controllerRef.current?.logout();
-    finalizeLogout();
-  }, [finalizeLogout]);
+    // Route the cookie clear through the coordinator so it waits for any
+    // in-flight refresh and clears cookies last.
+    void coordinatorRef.current?.logout();
+  }, []);
 
   useEffect(() => {
     if (!enabled) return;
@@ -108,14 +123,23 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
     const controller = createIdleController(resolved);
     controllerRef.current = controller;
     loggingOutRef.current = false;
-    pendingRefreshRef.current = null;
-    deferredLogoutRef.current = false;
+
+    // Build (or adopt) the coordinator that serializes refresh vs logout.
+    const localCoordinator =
+      getCoordinator?.() ??
+      createSessionCoordinator({
+        refresh: () => refreshRef.current(),
+        logout: () => onLogoutRef.current(),
+      });
+    coordinatorRef.current = localCoordinator;
 
     controller.subscribe((next) => {
       setPhase(next);
       if (next === 'expired') beginLogout();
     });
-    // Another tab signalling logout converges this tab too.
+    // A peer logout (BroadcastChannel/storage) OR an adopted terminal record on
+    // startup converges this tab too — delivered through the controller's
+    // logout listener (Blocker 1: startup notifies the hook).
     controller.onLogout(() => beginLogout());
     controller.start();
 
@@ -153,12 +177,14 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
       document.removeEventListener('visibilitychange', markVisibility);
       controller.stop();
       controllerRef.current = null;
+      coordinatorRef.current = null;
     };
-  }, [enabled, resolved, beginLogout]);
+  }, [enabled, resolved, beginLogout, getCoordinator]);
 
   const onStay = useCallback(() => {
     const controller = controllerRef.current;
-    if (!controller || busy || loggingOutRef.current) return;
+    const activeCoordinator = coordinatorRef.current;
+    if (!controller || !activeCoordinator || busy || loggingOutRef.current) return;
     setBusy(true);
     setErrorMessage(undefined);
     // Capture the session generation at the moment we start the refresh. If a
@@ -166,13 +192,13 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
     // generation while the refresh is in flight, the refresh result is stale and
     // must NOT extend or restore the session.
     const startGeneration = controller.generation();
-    const refreshPromise = refreshRef.current();
-    pendingRefreshRef.current = refreshPromise;
-    void refreshPromise
+    void activeCoordinator
+      .refresh()
       .then((ok) => {
         const stillOurSession =
           !loggingOutRef.current &&
           !controller.isLoggedOut() &&
+          !activeCoordinator.isLoggedOut() &&
           controller.generation() === startGeneration;
         if (ok && stillOurSession) {
           // Confirm recent activity and reset the shared deadline for all tabs.
@@ -180,30 +206,16 @@ export function useIdleSession(options: UseIdleSessionOptions): IdleSessionState
           setPhase('active');
           setRemainingMs(controller.remainingMs());
         } else if (!ok && !loggingOutRef.current) {
+          // The coordinator already drove the logout on a failed refresh; mirror
+          // the terminal UI state here.
           setErrorMessage(REFRESH_FAILED_MESSAGE);
           beginLogout();
         }
-        // If logout already won, do nothing here: the refresh response is
-        // discarded and the deferred logout finalizer (below) clears cookies.
-      })
-      .catch(() => {
-        if (!loggingOutRef.current) {
-          setErrorMessage(REFRESH_FAILED_MESSAGE);
-          beginLogout();
-        }
+        // If logout already won, do nothing: the coordinator discards the late
+        // response and clears cookies last.
       })
       .finally(() => {
         setBusy(false);
-        if (pendingRefreshRef.current === refreshPromise) {
-          pendingRefreshRef.current = null;
-        }
-        // A logout that arrived while this refresh was pending deferred its
-        // cookie clearing until now — run it after the refresh has settled so
-        // the refresh response cannot write auth cookies last.
-        if (deferredLogoutRef.current) {
-          deferredLogoutRef.current = false;
-          onLogoutRef.current();
-        }
       });
   }, [busy, beginLogout]);
 

@@ -264,16 +264,96 @@ describe('idle controller', () => {
     tabB.stop();
   });
 
-  it('clears the persisted deadline on logout so a new tab does not resurrect the session', () => {
+  it('persists a terminal session record on logout so a new tab does not resurrect the session', () => {
     const tabA = createIdleController(config);
     tabA.start();
     tabA.logout();
     MockBroadcastChannel.flush();
 
-    // The stored deadline must be gone; a tab starting afterward begins a fresh
-    // session rather than adopting a stale, pre-logout deadline.
-    expect(window.localStorage.getItem('game-agent-idle-deadline')).toBeNull();
+    // A single versioned record carries the terminal state; a tab starting
+    // afterward at the same epoch adopts the logout instead of a stale deadline.
+    const raw = window.localStorage.getItem('game-agent-idle-session');
+    expect(raw).not.toBeNull();
+    const record = JSON.parse(raw as string);
+    expect(record.loggedOut).toBe(true);
+
+    // A tab starting at the same epoch converges to logged-out.
+    const tabB = createIdleController(config);
+    const onLogoutB = jest.fn();
+    tabB.onLogout(onLogoutB);
+    tabB.start();
+    MockBroadcastChannel.flush();
+    expect(tabB.isLoggedOut()).toBe(true);
+    // Startup must NOTIFY the hook (Blocker 1): a tab opened after peer logout
+    // does not silently keep authenticated UI.
+    expect(onLogoutB).toHaveBeenCalledTimes(1);
     tabA.stop();
+    tabB.stop();
+  });
+
+  // ---- Blocker 1 regressions: session epoch binds startup + reauthentication ----
+
+  it('startup after peer logout notifies the hook exactly once', () => {
+    const tabA = createIdleController(config);
+    tabA.start();
+    tabA.logout();
+    MockBroadcastChannel.flush();
+    tabA.stop();
+
+    // A brand-new controller opened afterward (same epoch) must deliver the
+    // adopted terminal state to its logout listener, not just latch internally.
+    const tabB = createIdleController(config);
+    const onLogoutB = jest.fn();
+    tabB.onLogout(onLogoutB);
+    tabB.start();
+    MockBroadcastChannel.flush();
+    expect(tabB.phase()).toBe('expired');
+    expect(onLogoutB).toHaveBeenCalledTimes(1);
+    tabB.stop();
+  });
+
+  it('beginSession() supersedes a terminal record so a later sign-in is not immediately logged out', () => {
+    // A prior session logged out and persisted its terminal record.
+    const prior = createIdleController(config);
+    prior.start();
+    prior.logout();
+    MockBroadcastChannel.flush();
+    prior.stop();
+
+    // The user signs in again: a fresh epoch is explicitly initialized.
+    const next = createIdleController(config);
+    const onLogoutNext = jest.fn();
+    next.onLogout(onLogoutNext);
+    next.beginSession();
+    next.start();
+    MockBroadcastChannel.flush();
+
+    // The new session must be active, not immediately expired.
+    expect(next.isLoggedOut()).toBe(false);
+    expect(next.phase()).toBe('active');
+    expect(onLogoutNext).not.toHaveBeenCalled();
+    next.stop();
+  });
+
+  it('a stored terminal record from an OLDER epoch does not log out a newer session', () => {
+    const prior = createIdleController(config);
+    prior.start();
+    prior.logout();
+    MockBroadcastChannel.flush();
+    prior.stop();
+
+    // A new authenticated epoch begins. A stored terminal record from the old
+    // epoch must be ignored (it belongs to a superseded session).
+    const next = createIdleController(config);
+    next.beginSession();
+    next.start();
+    MockBroadcastChannel.flush();
+    expect(next.isLoggedOut()).toBe(false);
+
+    // The persisted record now belongs to the new (active) epoch.
+    const record = JSON.parse(window.localStorage.getItem('game-agent-idle-session') as string);
+    expect(record.loggedOut).toBe(false);
+    next.stop();
   });
 
   it('rejects a stale deadline broadcast from an older generation after logout', () => {
@@ -318,5 +398,127 @@ describe('idle controller', () => {
     expect(tabB.deadline()).toBeGreaterThanOrEqual(established);
     tabA.stop();
     tabB.stop();
+  });
+
+  // ---- Blocker 2: live storage-event convergence for ALREADY-OPEN tabs ----
+
+  // Deliver a localStorage write to every other open controller as a real
+  // `storage` event would (the writing tab never receives its own event).
+  function dispatchStorageFromWrite(key: string): void {
+    const newValue = window.localStorage.getItem(key);
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key,
+        newValue,
+        storageArea: window.localStorage,
+      }),
+    );
+  }
+
+  it('without BroadcastChannel, an already-open tab converges on a peer deadline extension via storage', () => {
+    Object.defineProperty(global, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    // BOTH tabs are already open (the exact case a startup-only snapshot misses).
+    const tabA = createIdleController(config);
+    const tabB = createIdleController(config);
+    tabA.start();
+    tabB.start();
+
+    // Push both into the warning window.
+    now += 29 * 60_000;
+    tabA.tick();
+    tabB.tick();
+    expect(tabB.phase()).toBe('warning');
+
+    // Tab A extends. In a real browser this writes localStorage and every other
+    // open tab receives a `storage` event asynchronously.
+    tabA.extend();
+    dispatchStorageFromWrite('game-agent-idle-session');
+
+    // The already-open Tab B must have converged on the extended deadline.
+    expect(tabB.phase()).toBe('active');
+    expect(tabB.deadline()).toBe(tabA.deadline());
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('without BroadcastChannel, an already-open tab converges on a peer logout via storage', () => {
+    Object.defineProperty(global, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const tabA = createIdleController(config);
+    const tabB = createIdleController(config);
+    const onLogoutB = jest.fn();
+    tabA.start();
+    tabB.start();
+    tabB.onLogout(onLogoutB);
+
+    // Tab A logs out; Tab B (already open) must observe it through storage.
+    tabA.logout();
+    dispatchStorageFromWrite('game-agent-idle-session');
+
+    expect(onLogoutB).toHaveBeenCalledTimes(1);
+    expect(tabB.phase()).toBe('expired');
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('a storage event from an older generation does not revive a logged-out tab', () => {
+    Object.defineProperty(global, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const tabA = createIdleController(config);
+    const tabB = createIdleController(config);
+    tabA.start();
+    tabB.start();
+
+    // Tab B logs out.
+    tabB.logout();
+    dispatchStorageFromWrite('game-agent-idle-session');
+    expect(tabB.phase()).toBe('expired');
+
+    // A stale deadline record from a pre-logout generation must not revive B.
+    // Simulate it by writing a record with a lower generation.
+    const stale = JSON.stringify({
+      epoch: tabA.epoch ? tabA.epoch() : 0,
+      generation: 0,
+      deadline: now + 30 * 60_000,
+      loggedOut: false,
+    });
+    window.localStorage.setItem('game-agent-idle-session', stale);
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key: 'game-agent-idle-session',
+        newValue: stale,
+        storageArea: window.localStorage,
+      }),
+    );
+    expect(tabB.phase()).toBe('expired');
+    tabA.stop();
+    tabB.stop();
+  });
+
+  it('removes the storage listener on stop()', () => {
+    Object.defineProperty(global, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+    const removeSpy = jest.spyOn(window, 'removeEventListener');
+    const controller = createIdleController(config);
+    controller.start();
+    controller.stop();
+    expect(removeSpy).toHaveBeenCalledWith('storage', expect.any(Function));
+    removeSpy.mockRestore();
   });
 });
