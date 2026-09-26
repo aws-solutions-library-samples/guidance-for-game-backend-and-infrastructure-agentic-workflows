@@ -4,6 +4,8 @@ import type { AppProps } from 'next/app';
 import Head from 'next/head';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
+import { IdleWarningDialog } from '../components/IdleWarningDialog';
+import { useIdleSession } from '@/utils/useIdleSession';
 import type { CognitoUser } from 'amazon-cognito-identity-js';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import {
@@ -26,6 +28,8 @@ interface Config {
   session?: {
     absoluteLifetimeHours: number;
     idleRefreshSeconds: number;
+    idleTimeoutSeconds?: number;
+    idleWarningSeconds?: number;
   };
   cognito: {
     region: string;
@@ -83,6 +87,16 @@ function MyApp({ Component, pageProps }: AppProps) {
   }, [authMode, user]);
 
   useEffect(() => subscribeToSessionExpiration(handleSessionExpired), [handleSessionExpired]);
+
+  // Idle-session warning (#310): a UX/local-exposure control only. The server
+  // still verifies tokens on every request. "Stay signed in" runs the secure
+  // #309 refresh; expiry and explicit sign-out reuse handleSessionExpired.
+  const idle = useIdleSession({
+    enabled: authMode === 'cognito' && !!user,
+    config: config?.session,
+    refresh: useCallback(() => refreshSessionOnce(window.fetch), []),
+    onLogout: handleSessionExpired,
+  });
 
   useEffect(() => {
     if (authMode !== 'cognito' || !user) return;
@@ -172,7 +186,7 @@ function MyApp({ Component, pageProps }: AppProps) {
       </div>
     );
   } else if (authMode === 'skip' || user) {
-    content = <Component {...pageProps} user={user} />;
+    content = <Component {...pageProps} user={user} loggingOut={idle.loggingOut} />;
   } else {
     content = (
       <CognitoAuth
@@ -198,6 +212,14 @@ function MyApp({ Component, pageProps }: AppProps) {
         <title>Game Agent - AI-Powered Game Server Management</title>
       </Head>
       {content}
+      <IdleWarningDialog
+        open={idle.warningOpen}
+        remainingMs={idle.remainingMs}
+        onStay={idle.onStay}
+        onSignOut={idle.onSignOut}
+        busy={idle.busy}
+        errorMessage={idle.errorMessage}
+      />
     </ThemeProvider>
   );
 }

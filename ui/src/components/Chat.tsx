@@ -36,9 +36,15 @@ const PROGRESS_MESSAGES = [
 interface ChatProps {
   className?: string;
   onThinkingChange?: (isThinking: boolean) => void;
+  /**
+   * When true (e.g. once idle logout begins, #310), block new submissions.
+   * A transparent overlay intercepts pointer/keyboard interaction with the
+   * CopilotKit input, which does not expose its own disabled prop.
+   */
+  disabled?: boolean;
 }
 
-export function Chat({ className, onThinkingChange }: ChatProps) {
+export function Chat({ className, onThinkingChange, disabled = false }: ChatProps) {
   const [isThinking, setIsThinking] = useState(false);
   const [messagesContainer, setMessagesContainer] = useState<Element | null>(null);
   const [messageIndex, setMessageIndex] = useState(0);
@@ -107,7 +113,17 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
         runtimeUrl="/api/copilot/chat"
         showDevConsole={false}
       >
-        <div className="ga-chat-wrapper">
+        <div className="ga-chat-wrapper" aria-disabled={disabled || undefined}>
+          {/* Block new submissions once logout begins (#310). The overlay sits
+              above the CopilotKit input and swallows interaction; the chat
+              transcript itself stays visible so context is not lost. */}
+          {disabled && (
+            <div
+              className="ga-chat-disabled-overlay"
+              aria-hidden="true"
+              data-testid="chat-disabled-overlay"
+            />
+          )}
           {/* Must live inside the CopilotKit provider: it consumes the chat
               context to reset messages AND rotate the threadId (#253). */}
           <NewChatButton />

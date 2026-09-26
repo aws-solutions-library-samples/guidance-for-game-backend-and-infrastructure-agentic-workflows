@@ -15,12 +15,14 @@ interface HomeProps {
     email?: string;
     isAdmin?: boolean;
   };
+  /** True once idle-session logout begins (#310); blocks new chat submissions. */
+  loggingOut?: boolean;
 }
 
 /**
  * Home page component with Command Center layout
  */
-export default function Home({ user }: HomeProps) {
+export default function Home({ user, loggingOut = false }: HomeProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [userInfo, setUserInfo] = useState<{ username: string; email: string; isAdmin: boolean } | null>(null);
   const [isAIThinking, setIsAIThinking] = useState(false);
@@ -169,7 +171,7 @@ export default function Home({ user }: HomeProps) {
               <div className="ga-chat-subtitle">Ready to help with your game infrastructure</div>
             </div>
           </div>
-          <Chat onThinkingChange={setIsAIThinking} />
+          <Chat onThinkingChange={setIsAIThinking} disabled={loggingOut} />
         </div>
       </main>
 

@@ -218,4 +218,20 @@ describe('Chat', () => {
     });
   });
 
+  it('does not block interaction when enabled (default)', () => {
+    render(<Chat />);
+    expect(document.querySelector('.ga-chat-disabled-overlay')).not.toBeInTheDocument();
+    const wrapper = document.querySelector('.ga-chat-wrapper');
+    expect(wrapper).not.toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('blocks new submissions once logout begins (disabled)', () => {
+    render(<Chat disabled />);
+    // A blocking overlay prevents pointer/keyboard interaction with the input.
+    const overlay = document.querySelector('.ga-chat-disabled-overlay');
+    expect(overlay).toBeInTheDocument();
+    const wrapper = document.querySelector('.ga-chat-wrapper');
+    expect(wrapper).toHaveAttribute('aria-disabled', 'true');
+  });
+
 });

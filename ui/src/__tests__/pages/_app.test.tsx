@@ -579,4 +579,108 @@ describe('MyApp - Logout behavior', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Complete sign in' })).toBeInTheDocument());
     expect(screen.getByRole('alert')).toHaveTextContent('Your session expired. Sign in again.');
   });
+
+  it('opens the idle warning at the threshold and keeps the session on "Stay signed in" (#310)', async () => {
+    jest.useFakeTimers();
+    let now = 1_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => <div data-testid="app-content">App Content</div>;
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // Advance past the 28-minute warning threshold and let the tick fire.
+    act(() => {
+      now += 28 * 60_000 + 1_000;
+      jest.advanceTimersByTime(1_000);
+    });
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    // "Stay signed in" runs the secure refresh and closes the dialog.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Stay signed in' }));
+      await Promise.resolve();
+    });
+    expect(fetchMock.mock.calls.some(([input]) => input.toString() === '/api/auth/refresh')).toBe(true);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    act(() => {
+      jest.runOnlyPendingTimers();
+    });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
+  it('idle expiry signs out through the existing logout path without a page refresh (#310)', async () => {
+    jest.useFakeTimers();
+    let now = 2_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => <div data-testid="app-content">App Content</div>;
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // Jump past the absolute idle deadline (background-tab throttle scenario);
+    // a single tick observes the passed deadline and logs out.
+    await act(async () => {
+      now += 31 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    expect(fetchMock.mock.calls.some(([input]) => input.toString() === '/api/auth/logout')).toBe(true);
+    expect(mockCognitoSignOut).toHaveBeenCalled();
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
 });
