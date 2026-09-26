@@ -288,12 +288,22 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
       // tabs converge. A record from a different epoch is a superseded session
       // and is ignored (Blocker 1: beginSession() must not be logged out by it).
       const stored = readRecord();
+      let selfDetectedTerminal = false;
       if (stored && stored.epoch === epoch) {
         generation = Math.max(generation, stored.generation);
         if (stored.loggedOut) {
           loggedOut = true;
         } else if (stored.deadline > Date.now()) {
           deadlineMs = Math.max(deadlineMs, stored.deadline);
+        } else {
+          // Blocker 2: a same-epoch, non-terminal record whose deadline has
+          // already elapsed (every tab slept/closed/throttled past it before a
+          // tick recorded logout) must be CONSUMED as terminal on startup, not
+          // replaced by a fresh now+timeout deadline. Advance the generation so
+          // this transition is authoritative and broadcast it to peers below.
+          loggedOut = true;
+          generation = stored.generation + 1;
+          selfDetectedTerminal = true;
         }
       }
 
@@ -327,6 +337,12 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
         // Consume the adopted terminal state and DELIVER it to the hook so a tab
         // opened after peer logout signs out instead of keeping authenticated UI.
         writeRecord();
+        // A terminal state we DETECTED ourselves (an elapsed persisted deadline,
+        // Blocker 2) must be broadcast so already-open peers converge; a terminal
+        // record ADOPTED from a peer is not re-broadcast (it already propagated).
+        if (selfDetectedTerminal) {
+          broadcast({ type: 'logout', generation, epoch });
+        }
         notifyLogout();
       } else {
         // Publish our (possibly newest) deadline so existing tabs converge on a
@@ -434,4 +450,47 @@ export function resetIdleCoordinatorForTests(): void {
   } catch {
     // Ignore storage access failures in test teardown.
   }
+}
+
+// Parse the single versioned session record from localStorage (module-level so
+// the epoch allocator can read the same source of truth the controller writes).
+function readPersistedSessionRecord(): SessionRecord | null {
+  try {
+    const raw = window.localStorage.getItem(SESSION_KEY);
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as Partial<SessionRecord>;
+    if (
+      typeof parsed?.epoch !== 'number' ||
+      typeof parsed?.generation !== 'number' ||
+      typeof parsed?.deadline !== 'number' ||
+      typeof parsed?.loggedOut !== 'boolean'
+    ) {
+      return null;
+    }
+    return parsed as SessionRecord;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Allocate the authenticated session epoch to bind a newly authenticated tab to
+ * (#310, Blocker 1). This is the ONE monotonic, persisted source of the epoch —
+ * production must derive the epoch from here, never from component-local state
+ * that resets to zero on every reload/new mount.
+ *
+ * - When a LIVE (non-terminal) session record exists, adopt its epoch so a later
+ *   tab in the same authenticated session converges on the same cross-tab state
+ *   instead of splitting under a different epoch.
+ * - Otherwise (no record, or a terminal record from a prior session), allocate
+ *   an epoch strictly past the stored one so a fresh sign-in — including one
+ *   after a full reload — can never reuse a terminal epoch and be immediately
+ *   logged out by its leftover record.
+ */
+export function allocateSessionEpoch(): number {
+  const stored = readPersistedSessionRecord();
+  if (stored && !stored.loggedOut) {
+    return stored.epoch;
+  }
+  return (stored ? stored.epoch : 0) + 1;
 }

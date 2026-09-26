@@ -780,6 +780,228 @@ describe('MyApp - Logout behavior', () => {
     jest.useRealTimers();
   });
 
+  // ---- Blocker 1 (production epoch): the authenticated session epoch is
+  // allocated from PERSISTED storage, not component-local state, so a full
+  // reload after logout does not reuse the prior terminal epoch. ----
+
+  it('a fresh sign-in after a full reload is not immediately logged out by the prior terminal idle record (#310, Blocker 1)', async () => {
+    jest.useFakeTimers();
+    let now = 6_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => <div data-testid="app-content">App Content</div>;
+
+    // First app instance: sign in, then idle out (persists a terminal record).
+    const first = render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+    await act(async () => {
+      now += 31 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('cognito-auth')).toBeInTheDocument();
+
+    // A FULL RELOAD: unmount and mount a brand-new _app instance. Component
+    // state (any local epoch counter) resets to zero, but the persisted terminal
+    // record survives in localStorage. A component-local epoch would repeat the
+    // prior epoch and be logged out immediately.
+    first.unmount();
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    // The reloaded, freshly signed-in session must stay authenticated.
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    await act(async () => {
+      now += 5 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
+  // ---- Blocker 3 (production wiring): the protected-request 401 refresh runs
+  // through the SAME coordinator pendingRefresh path, so a logout requested
+  // while that refresh is in flight clears cookies LAST. ----
+
+  it('a logout during a pending protected-request refresh clears cookies AFTER the refresh (#310, Blocker 3)', async () => {
+    jest.useFakeTimers();
+    let now = 7_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const order: string[] = [];
+    let releaseRefresh!: (value: Response) => void;
+    const pendingRefresh = new Promise<Response>((resolve) => {
+      releaseRefresh = resolve;
+    });
+
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            // Large idleRefresh window: the protected 401 treats the user as
+            // recently active and attempts its refresh through the coordinator.
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120, idleRefreshSeconds: 900 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        order.push('refresh-start');
+        return pendingRefresh;
+      }
+      if (url === '/api/copilot/chat') {
+        return { ok: false, status: 401, json: async () => ({ error: 'Unauthorized' }) } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        order.push('logout');
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>Submit message</button>
+      </div>
+    );
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // A protected request returns 401 while the user is recently active. The
+    // 401 path starts a refresh THROUGH THE COORDINATOR and keeps it pending.
+    await act(async () => {
+      void window.fetch('/api/copilot/chat', { method: 'POST' });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(order).toEqual(['refresh-start']);
+
+    // While that refresh is still pending, the idle deadline elapses and drives
+    // a logout. Because the protected refresh is tracked by the coordinator, the
+    // cookie-clearing logout must WAIT for it and land last.
+    await act(async () => {
+      now += 31 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+    // Logout has NOT cleared cookies yet — the coordinator is waiting on the
+    // tracked protected refresh.
+    expect(order).toEqual(['refresh-start']);
+
+    await act(async () => {
+      releaseRefresh({ ok: true, status: 200, json: async () => ({ success: true }) } as Response);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(order).toContain('logout');
+    expect(order[order.length - 1]).toBe('logout');
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
+  // ---- Blocker 2 (production startup): a tab that reopens into a still-active
+  // (non-terminal) persisted session whose deadline has ALREADY elapsed must
+  // consume it as terminal logout, not grant a fresh idle timeout. ----
+
+  it('startup with an elapsed persisted deadline signs out instead of reviving the session (#310, Blocker 2)', async () => {
+    jest.useFakeTimers();
+    const now = 8_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    // Seed a still-active (non-terminal) session record whose deadline is in the
+    // PAST — the tab slept/closed past the deadline before a tick recorded
+    // logout. allocateSessionEpoch() adopts this live epoch on sign-in, so the
+    // controller starts at the same epoch and observes the elapsed deadline.
+    window.localStorage.setItem(
+      'game-agent-idle-session',
+      JSON.stringify({ epoch: 1, generation: 3, deadline: now - 60_000, loggedOut: false }),
+    );
+
+    const AuthenticatedPage = () => <div data-testid="app-content">App Content</div>;
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The elapsed persisted deadline must be consumed as terminal logout on
+    // startup: the session is signed out, not granted a fresh timeout.
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+    expect(fetchMock.mock.calls.some(([input]) => input.toString() === '/api/auth/logout')).toBe(true);
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
   it('supports a successful reauthentication after an idle logout (#310)', async () => {
     jest.useFakeTimers();
     let now = 4_000_000;

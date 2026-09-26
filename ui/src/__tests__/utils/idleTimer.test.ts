@@ -2,6 +2,7 @@ import {
   resolveIdleConfig,
   createIdleController,
   resetIdleCoordinatorForTests,
+  allocateSessionEpoch,
   IDLE_ACTIVITY_THROTTLE_MS,
 } from '@/utils/idleTimer';
 
@@ -262,6 +263,97 @@ describe('idle controller', () => {
     expect(onLogoutB).toHaveBeenCalledTimes(1);
     tabA.stop();
     tabB.stop();
+  });
+
+  // ---- Blocker 2 regression: an elapsed persisted deadline is consumed on
+  // startup as terminal logout, never revived with a fresh constructor deadline. ----
+
+  it('consumes an elapsed persisted deadline on startup as logout instead of granting a fresh timeout', () => {
+    // A prior tab established a deadline for THIS epoch, then every tab slept or
+    // closed before a tick could record terminal logout.
+    const prior = createIdleController(config);
+    prior.start();
+    const priorDeadline = prior.deadline();
+    prior.stop();
+
+    // Wall clock advances PAST that persisted deadline while no tab was ticking.
+    now = priorDeadline + 60_000;
+
+    // Reopening from the still-active (but elapsed) persisted record must treat
+    // it as terminal, not publish a fresh now+timeout deadline.
+    const reopened = createIdleController(config);
+    const onLogout = jest.fn();
+    reopened.onLogout(onLogout);
+    reopened.start();
+
+    expect(reopened.isLoggedOut()).toBe(true);
+    expect(reopened.phase()).toBe('expired');
+    expect(reopened.remainingMs()).toBe(0);
+    // Startup must notify the hook so the reopened tab signs out.
+    expect(onLogout).toHaveBeenCalledTimes(1);
+    // The persisted record is now terminal, not a revived future deadline.
+    const record = JSON.parse(window.localStorage.getItem('game-agent-idle-session') as string);
+    expect(record.loggedOut).toBe(true);
+    reopened.stop();
+  });
+
+  it('an elapsed-deadline startup broadcasts terminal logout so already-open peers converge', () => {
+    // Tab A is already open and mid-session.
+    const tabA = createIdleController(config);
+    tabA.start();
+    const onLogoutA = jest.fn();
+    tabA.onLogout(onLogoutA);
+    const deadlineA = tabA.deadline();
+
+    // Wall clock passes the shared deadline (both tabs were throttled). A new
+    // tab opens and observes the elapsed persisted record on startup.
+    now = deadlineA + 30_000;
+    const tabB = createIdleController(config);
+    tabB.start();
+    MockBroadcastChannel.flush();
+
+    // The startup terminal transition must propagate to the already-open peer.
+    expect(tabB.isLoggedOut()).toBe(true);
+    expect(onLogoutA).toHaveBeenCalledTimes(1);
+    tabA.stop();
+    tabB.stop();
+  });
+
+  // ---- Blocker 1 regression: a persisted monotonic epoch allocator drives
+  // fresh-session vs later-tab-convergence, independent of component state. ----
+
+  describe('allocateSessionEpoch', () => {
+    it('allocates epoch 1 when no session has ever been persisted', () => {
+      expect(allocateSessionEpoch()).toBe(1);
+    });
+
+    it('allocates an epoch strictly past a terminal record so a fresh sign-in cannot reuse it', () => {
+      // A prior session at epoch 1 logged out and persisted a terminal record.
+      const prior = createIdleController({ ...config, epoch: 1 });
+      prior.beginSession(); // adopts epoch 1 (one past stored 0)
+      prior.start();
+      prior.logout();
+      MockBroadcastChannel.flush();
+      prior.stop();
+
+      // A brand-new sign-in (e.g. after a full reload) must NOT reuse epoch 1.
+      const next = allocateSessionEpoch();
+      expect(next).toBeGreaterThan(1);
+    });
+
+    it('adopts the epoch of a LIVE (non-terminal) session so a later tab converges instead of splitting', () => {
+      // An active session exists at some epoch.
+      const active = createIdleController(config);
+      active.beginSession();
+      active.start();
+      MockBroadcastChannel.flush();
+      const liveEpoch = active.epoch();
+
+      // A later tab in the SAME authenticated session must adopt liveEpoch, not
+      // allocate a new one that would split cross-tab coordination.
+      expect(allocateSessionEpoch()).toBe(liveEpoch);
+      active.stop();
+    });
   });
 
   it('persists a terminal session record on logout so a new tab does not resurrect the session', () => {

@@ -14,6 +14,7 @@ import {
   refreshSessionOnce,
   subscribeToSessionExpiration,
 } from '@/utils/sessionRefresh';
+import { allocateSessionEpoch } from '@/utils/idleTimer';
 import { ThemeProvider } from '../components/ThemeProvider';
 
 const SESSION_EXPIRED_MESSAGE = 'Your session expired. Sign in again.';
@@ -56,9 +57,11 @@ function MyApp({ Component, pageProps }: AppProps) {
   const [user, setUser] = useState<CognitoUser | null>(null);
   const [authNotice, setAuthNotice] = useState('');
   const [sessionCleanupPending, setSessionCleanupPending] = useState(false);
-  // Authenticated session epoch (#310, Blocker 1). Increments on each sign-in so
-  // the idle controller binds to a fresh session and a prior terminal record
-  // cannot immediately log the new session out.
+  // Authenticated session epoch (#310, Blocker 1). Derived from the ONE
+  // persisted, monotonic allocator (allocateSessionEpoch) on each successful
+  // sign-in — never from a component-local counter that resets to zero on
+  // reload. This is what lets a post-reload sign-in avoid reusing a prior
+  // terminal epoch, while a later tab in a live session converges on its epoch.
   const [sessionEpoch, setSessionEpoch] = useState(0);
   const lastActivityAt = useRef(0);
   const userRef = useRef<CognitoUser | null>(null);
@@ -115,11 +118,17 @@ function MyApp({ Component, pageProps }: AppProps) {
   }, [performLogout]);
 
   // A logout entry point usable by any caller (protected-request expiration,
-  // refresh-failure broadcast, the header manual sign-out). Routes through the
-  // coordinator so ordering is preserved for every path.
+  // refresh-failure broadcast, the header manual sign-out, admin navigation).
+  // It is the ONE terminal logout gateway (#310, Blocker 4): it latches the
+  // idle controller's terminal generation (so peer tabs converge and the chat
+  // locks via `idle.loggingOut`), broadcasts the terminal record, AND routes the
+  // cookie clear through the coordinator so it lands last. Delegates to the idle
+  // hook's sign-out through a ref so its definition order does not matter and no
+  // stale closure is captured.
+  const idleSignOutRef = useRef<() => void>(() => {});
   const handleSessionExpired = useCallback(() => {
-    void getCoordinator().logout();
-  }, [getCoordinator]);
+    idleSignOutRef.current();
+  }, []);
 
   useEffect(() => subscribeToSessionExpiration(handleSessionExpired), [handleSessionExpired]);
 
@@ -135,6 +144,15 @@ function MyApp({ Component, pageProps }: AppProps) {
     refresh: useCallback(() => refreshSessionOnce(window.fetch), []),
     onLogout: handleSessionExpired,
   });
+
+  // Bind the terminal logout gateway to the idle hook's sign-out. Every logout
+  // entry (protected-request 401 expiration, session-expiration broadcast, main
+  // header sign-out, admin navigation) flows through this one path so it latches
+  // the idle terminal generation, broadcasts it, locks the chat, and clears
+  // cookies last via the coordinator (#310, Blocker 4).
+  useEffect(() => {
+    idleSignOutRef.current = idle.onSignOut;
+  }, [idle.onSignOut]);
 
   useEffect(() => {
     if (authMode !== 'cognito' || !user) return;
@@ -163,7 +181,12 @@ function MyApp({ Component, pageProps }: AppProps) {
       const idleRefreshMs = (config?.session?.idleRefreshSeconds ?? 900) * 1000;
       const recentlyActive = Date.now() - lastActivityAt.current <= idleRefreshMs;
       if (authMode === 'cognito' && user && recentlyActive) {
-        const refreshed = await refreshSessionOnce(originalFetch);
+        // Route the protected-request renewal through the SAME coordinator
+        // pendingRefresh path (#310, Blocker 3) — never a direct
+        // refreshSessionOnce bypass. This makes a concurrent logout wait for
+        // this refresh so it can never clear cookies before the refresh's
+        // cookie write, and lets logout invalidate a stale late success.
+        const refreshed = await getCoordinator().refresh();
         if (refreshed) {
           return originalFetch(retryInput, init);
         }
@@ -181,7 +204,7 @@ function MyApp({ Component, pageProps }: AppProps) {
         window.fetch = originalFetch;
       }
     };
-  }, [authMode, config?.session?.idleRefreshSeconds, handleSessionExpired, user]);
+  }, [authMode, config?.session?.idleRefreshSeconds, getCoordinator, handleSessionExpired, user]);
 
   useEffect(() => {
     // Dev-only auth bypass is decided from build-time env (NOT from cookies):
@@ -245,10 +268,13 @@ function MyApp({ Component, pageProps }: AppProps) {
           clearSessionRefreshMarker();
           lastActivityAt.current = Date.now();
           // Begin a fresh authenticated session (#310, Blocker 1): reset the
-          // coordinator's terminal state and advance the epoch so a prior
-          // session's terminal idle record cannot immediately sign this one out.
+          // coordinator's terminal state and derive the epoch from the persisted
+          // monotonic allocator. allocateSessionEpoch() adopts a live session's
+          // epoch (later-tab convergence) or advances strictly past a terminal
+          // record (so a post-reload sign-in is never logged out by leftover
+          // terminal state).
           getCoordinator().beginSession();
-          setSessionEpoch((epoch) => epoch + 1);
+          setSessionEpoch(allocateSessionEpoch());
           setUser(cognitoUser);
         }}
       />
