@@ -7,7 +7,14 @@
  * Tags: @browser @idle
  */
 import { test, expect } from '@playwright/test';
+import { readFileSync } from 'fs';
+import { join } from 'path';
 import { handleFocusTrapKeydown } from '../../src/utils/dialogFocusTrap';
+
+const GLOBALS_CSS = readFileSync(
+  join(__dirname, '..', '..', 'src', 'styles', 'globals.css'),
+  'utf8',
+);
 
 const FIXTURE = `
   <input id="outside" type="text" />
@@ -82,5 +89,45 @@ test.describe('idle warning dialog focus trap (real browser)', { tag: ['@browser
     const activeId = await page.evaluate(() => document.activeElement?.id);
     expect(activeId).not.toBe('outside');
     expect(activeId).toBe('dialog');
+  });
+
+  test('the busy-state fallback focus target shows a VISIBLE focus indicator under production CSS (#310, Blocker 2)', async ({ page }) => {
+    await page.setContent(FIXTURE);
+    // Load the REAL production stylesheet so we measure what ships, not a mock.
+    await page.addStyleTag({ content: GLOBALS_CSS });
+    // Give the dialog its production class so the .ga-idle-dialog rules apply.
+    await page.evaluate(() => {
+      const dialog = document.getElementById('dialog') as HTMLElement;
+      dialog.classList.add('ga-idle-dialog');
+    });
+
+    // Enter the busy state: disable BOTH actions and move keyboard focus to the
+    // container, exactly as the component does while a refresh is in flight.
+    await page.evaluate(() => {
+      (document.getElementById('stay') as HTMLButtonElement).disabled = true;
+      (document.getElementById('signout') as HTMLButtonElement).disabled = true;
+    });
+    // Use keyboard interaction so :focus-visible matches (not a pointer focus).
+    await page.keyboard.press('Tab');
+    await page.evaluate(() => (document.getElementById('dialog') as HTMLElement).focus());
+
+    const indicator = await page.evaluate(() => {
+      const dialog = document.getElementById('dialog') as HTMLElement;
+      const style = getComputedStyle(dialog);
+      return {
+        outlineStyle: style.outlineStyle,
+        outlineWidth: style.outlineWidth,
+        outlineColor: style.outlineColor,
+        boxShadow: style.boxShadow,
+      };
+    });
+
+    // The container must render a visible ring: a real outline (non-none style
+    // with non-zero width) OR an equivalent box-shadow. A bare outline:none with
+    // no replacement — the pre-fix behavior — would fail this assertion.
+    const outlineWidthPx = parseFloat(indicator.outlineWidth || '0');
+    const hasVisibleOutline = indicator.outlineStyle !== 'none' && outlineWidthPx > 0;
+    const hasVisibleBoxShadow = !!indicator.boxShadow && indicator.boxShadow !== 'none';
+    expect(hasVisibleOutline || hasVisibleBoxShadow).toBe(true);
   });
 });

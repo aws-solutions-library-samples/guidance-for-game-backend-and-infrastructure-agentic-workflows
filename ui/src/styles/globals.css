@@ -259,10 +259,19 @@ body {
 }
 
 /* While a refresh disables both actions the dialog container itself holds focus
-   (tabindex="-1") to keep the focus trap intact (#310). Suppress the container
-   outline so the transient busy state does not draw a full-dialog focus ring;
-   the individual controls keep their own visible focus styles. */
+   (tabindex="-1") to keep the focus trap intact (#310). It is the ONLY focusable
+   element in the busy state, so it MUST show a visible keyboard focus indicator
+   (WCAG 2.4.7). Draw a high-contrast ring with the same accent token as the
+   global focus-visible style; a negative offset keeps the ring inside the
+   dialog's rounded border instead of being clipped by the overlay. */
 .ga-idle-dialog:focus {
+  outline: 2px solid var(--ga-accent);
+  outline-offset: -2px;
+}
+
+.ga-idle-dialog:focus:not(:focus-visible) {
+  /* Pointer-driven focus on the container (not keyboard) need not show the ring;
+     keyboard focus still matches :focus-visible and keeps the indicator above. */
   outline: none;
 }
 

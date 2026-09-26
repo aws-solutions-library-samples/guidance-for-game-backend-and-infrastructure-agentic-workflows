@@ -33,7 +33,10 @@ export interface SessionCoordinatorOptions {
 }
 
 export interface SessionCoordinator {
-  /** Run a refresh serialized against logout. Resolves the refresh result. */
+  /** Run a refresh serialized against logout. Resolves the refresh result.
+   * Resolves false if a logout latched terminal while the refresh was pending,
+   * even if the raw refresh succeeded — so callers never act on a stale success.
+   */
   refresh(): Promise<boolean>;
   /**
    * Request logout from any entry. Waits for an in-flight refresh to settle,
@@ -88,6 +91,12 @@ export function createSessionCoordinator(options: SessionCoordinatorOptions): Se
             if (!ok && !loggedOut) {
               void runLogout();
             }
+            // If a logout latched terminal WHILE this refresh was pending, the
+            // raw success is stale: the session is already gone. Report the
+            // terminal outcome (false) so a protected-request 401 caller does
+            // not retry the protected request after logout, and so no caller
+            // treats a discarded late success as a live session.
+            if (loggedOut) return false;
             return ok;
           },
           () => {

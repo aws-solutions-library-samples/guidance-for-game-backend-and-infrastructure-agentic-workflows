@@ -109,6 +109,44 @@ describe('createSessionCoordinator', () => {
     expect(coordinator.isLoggedOut()).toBe(true);
   });
 
+  it('refresh() resolves FALSE when logout became terminal while it was pending, even if the raw refresh resolved true', async () => {
+    // Discriminating deferred probe (#310, Blocker 1). A protected-request 401
+    // renewal awaits coordinator.refresh() and retries the protected request
+    // ONLY when it resolves true. If refresh() returns the raw refresh result
+    // (true) after a logout has already latched terminal, the caller would
+    // re-issue the protected request AFTER the session was terminally logged
+    // out — resurrecting a dead session. refresh() must instead report the
+    // terminal outcome (false) so no protected retry occurs.
+    const gate = deferred<boolean>();
+    let logoutCalls = 0;
+    const coordinator = createSessionCoordinator({
+      refresh: () => gate.promise,
+      logout: async () => {
+        logoutCalls += 1;
+      },
+    });
+
+    const refreshPromise = coordinator.refresh();
+    // A logout entry (idle expiry / cross-tab / manual sign-out) latches
+    // terminal while the refresh is still in flight.
+    const logoutPromise = coordinator.logout();
+    expect(coordinator.isLoggedOut()).toBe(true);
+
+    // The raw refresh only NOW resolves true — a late success.
+    gate.resolve(true);
+
+    const refreshResult = await refreshPromise;
+    await logoutPromise;
+    await coordinator.settled();
+
+    // The protected caller must observe a terminal (false) result and therefore
+    // must NOT retry the protected request.
+    expect(refreshResult).toBe(false);
+    // Cookie clear/logout is final and happened exactly once.
+    expect(coordinator.isLoggedOut()).toBe(true);
+    expect(logoutCalls).toBe(1);
+  });
+
   it('coalesces multiple concurrent logout entries into a single cookie clear', async () => {
     let logoutCalls = 0;
     const coordinator = createSessionCoordinator({

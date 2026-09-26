@@ -943,6 +943,104 @@ describe('MyApp - Logout behavior', () => {
     jest.useRealTimers();
   });
 
+  it('does NOT retry the protected request when a logout latched terminal while its refresh was pending (#310, Blocker 1)', async () => {
+    jest.useFakeTimers();
+    let now = 9_000_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const order: string[] = [];
+    let chatCalls = 0;
+    let releaseRefresh!: (value: Response) => void;
+    const pendingRefresh = new Promise<Response>((resolve) => {
+      releaseRefresh = resolve;
+    });
+
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/config') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            cognito: { region: 'us-west-2', userPoolId: 'test-pool', clientId: 'test-client' },
+            // Large idleRefresh window: the protected 401 treats the user as
+            // recently active and attempts a refresh through the coordinator.
+            session: { idleTimeoutSeconds: 1800, idleWarningSeconds: 120, idleRefreshSeconds: 900 },
+          }),
+        } as Response;
+      }
+      if (url === '/api/auth/refresh') {
+        order.push('refresh-start');
+        return pendingRefresh; // stays pending until released
+      }
+      if (url === '/api/copilot/chat') {
+        chatCalls += 1;
+        order.push('chat');
+        return { ok: false, status: 401, json: async () => ({ error: 'Unauthorized' }) } as Response;
+      }
+      if (url === '/api/auth/logout') {
+        order.push('logout');
+        return { ok: true, status: 200, json: async () => ({ success: true }) } as Response;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    global.fetch = fetchMock as unknown as typeof global.fetch;
+    process.env.NEXT_PUBLIC_SKIP_AUTH = 'false';
+    process.env.NODE_ENV = 'production';
+
+    const AuthenticatedPage = () => (
+      <div data-testid="app-content">
+        <button onClick={() => void fetch('/api/copilot/chat', { method: 'POST' })}>Submit message</button>
+      </div>
+    );
+    render(<MyApp Component={AuthenticatedPage} pageProps={{}} />);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    fireEvent.click(screen.getByRole('button', { name: 'Complete sign in' }));
+    expect(screen.getByTestId('app-content')).toBeInTheDocument();
+
+    // A protected request returns 401 while the user is recently active; the
+    // 401 path starts a refresh through the coordinator and keeps it pending.
+    await act(async () => {
+      void window.fetch('/api/copilot/chat', { method: 'POST' });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(order).toEqual(['chat', 'refresh-start']);
+    expect(chatCalls).toBe(1);
+
+    // While that refresh is still pending, the idle deadline elapses and drives
+    // a terminal logout.
+    await act(async () => {
+      now += 31 * 60_000;
+      jest.advanceTimersByTime(1_000);
+      await Promise.resolve();
+    });
+    expect(order).toEqual(['chat', 'refresh-start']);
+
+    // The raw refresh finally resolves true — a LATE success after terminal
+    // logout. Because the session is terminally logged out, the protected
+    // request must NOT be retried, and the cookie-clearing logout must be the
+    // final auth-affecting response.
+    await act(async () => {
+      releaseRefresh({ ok: true, status: 200, json: async () => ({ success: true }) } as Response);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // No protected retry occurred: /api/copilot/chat was called exactly once.
+    expect(chatCalls).toBe(1);
+    expect(order.filter((e) => e === 'chat')).toHaveLength(1);
+    // Logout/cookie clear is final.
+    expect(order).toContain('logout');
+    expect(order[order.length - 1]).toBe('logout');
+    await waitFor(() => expect(screen.getByTestId('cognito-auth')).toBeInTheDocument());
+
+    act(() => { jest.runOnlyPendingTimers(); });
+    nowSpy.mockRestore();
+    jest.useRealTimers();
+  });
+
   // ---- Blocker 2 (production startup): a tab that reopens into a still-active
   // (non-terminal) persisted session whose deadline has ALREADY elapsed must
   // consume it as terminal logout, not grant a fresh idle timeout. ----

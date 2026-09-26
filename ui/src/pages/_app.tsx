@@ -187,7 +187,12 @@ function MyApp({ Component, pageProps }: AppProps) {
         // this refresh so it can never clear cookies before the refresh's
         // cookie write, and lets logout invalidate a stale late success.
         const refreshed = await getCoordinator().refresh();
-        if (refreshed) {
+        // Re-check terminal state before retrying (#310, Blocker 1). The
+        // coordinator already reports a terminal outcome as `false`, but guard
+        // explicitly here too: a logout that latched terminal while this refresh
+        // was in flight means the session is gone, so the protected request MUST
+        // NOT be retried even if the raw refresh happened to succeed.
+        if (refreshed && !getCoordinator().isLoggedOut()) {
           return originalFetch(retryInput, init);
         }
       }
