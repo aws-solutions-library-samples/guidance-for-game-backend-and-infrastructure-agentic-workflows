@@ -52,7 +52,15 @@ class AgentGuidanceDocChecks(unittest.TestCase):
             text=True,
             check=False,
         )
-        # git grep exits 1 when there are no matches, which is the passing case.
+        # git grep exits 0 when it finds matches and 1 when there are none; any
+        # higher exit code is a command failure, not a clean "no references"
+        # result, so fail loudly with stderr instead of treating empty stdout as
+        # proof that nothing references the retired doc.
+        self.assertIn(
+            result.returncode,
+            (0, 1),
+            f"git grep failed (exit {result.returncode}): {result.stderr.strip()}",
+        )
         offenders = [line for line in result.stdout.splitlines() if line and line != SELF_PATH]
         self.assertEqual(offenders, [], f"tracked files still reference {RETIRED_DOC}: {offenders}")
 

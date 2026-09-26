@@ -11,9 +11,9 @@
   mutations, or cleanup of resources you did not create.
 - Preserve user changes and unrelated worktree state. Never rewrite history,
   delete branches, force-push, or discard files without explicit authorization.
-- Normal commits and non-force `git push` operations are permitted without
-  asking. Ask before force-pushing, rewriting remote history, or changing
-  branch protections.
+- Contribute through your fork and a pull request (see `CONTRIBUTING.md`); treat
+  any remote write as requiring an explicitly selected fork and task-specific
+  approval.
 
 ## Repository Reality
 
@@ -22,7 +22,11 @@ This is a read-only game-infrastructure assistant, not a generic web service:
 - `backend/src/agentcore_main.py` is the actual Python 3.13
   `BedrockAgentCoreApp` entrypoint. `backend/agentcore_main.py` is a thin
   compatibility wrapper. The backend is deployed as direct AgentCore code via
-  CodeBuild; there is no FastAPI service.
+  CodeBuild; there is no FastAPI service. Importing the entrypoint runs startup
+  work, not just handler definition: `prewarm_container()` initializes the
+  cached Bedrock model, all three MCP clients, and configured Knowledge Base
+  tools at module load. Pre-warm failures are logged and non-blocking; they must
+  not hard-fail startup.
 - `ui/` is a Next.js Pages Router application with CopilotKit. Its principal
   API boundary is `ui/src/pages/api/copilot/chat.ts`; locally it proxies to
   `localhost:8080`, while deployed it invokes AgentCore.
@@ -54,7 +58,10 @@ relevant ADRs before changing code.
 - Hosted requests require a verified Cognito access token at both the frontend
   proxy and runtime. Trusted tenant, workspace, and actor values are
   server-owned; never derive authorization from request-body fields, model
-  output, or browser-supplied identity.
+  output, or browser-supplied identity. When changing either side of this
+  boundary, run the focused frontend API tests and `uv run pytest
+  tests/unit/test_runtime_jwt_identity_unit.py
+  tests/unit/test_agentcore_startup_unit.py`.
 - `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS` is a local-development-only setting made
   by `dev-start.sh`. Do not enable it in a hosted environment.
 - `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID` are independent
@@ -62,11 +69,20 @@ relevant ADRs before changing code.
   `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY` aliases.
 - The source prompt definitions are
   `backend/src/agents/optimized_prompts.py`. Production consumes published
-  Bedrock Prompt Management versions, so prompt changes require
-  `scripts/infrastructure/deploy-prompts.sh` or the full deployment workflow.
+  Bedrock Prompt Management versions. `scripts/infrastructure/deploy-prompts.sh`
+  publishes managed versions and writes their ARNs to `backend/.env.local`, but
+  it does not update a running AgentCore runtime; the runtime sees a new version
+  only after the full deployment passes those ARNs to
+  `agentcore launch --auto-update-on-conflict`. Do not describe a production
+  prompt change as effective until a runtime update or full deployment has run.
 - Each specialist has its own Bedrock Knowledge Base. Infrastructure creation
   alone is insufficient: source documents must be seeded before retrieval can
   return results.
+- Cost totals and service breakdowns come from the owned deterministic Cost
+  Explorer rendering path, not from unvalidated model prose. Preserve that path
+  when changing cost behavior and cover it with
+  `backend/tests/unit/test_cost_report_unit.py` and the focused cost-report
+  integration tests.
 - The AgentCore container runs with a read-only home and working directory. The
   AWS API MCP server writes a log under `$HOME` and needs a writable working
   dir, so `backend/src/utils/mcp_client_factory.py` redirects `HOME` and
@@ -123,8 +139,10 @@ credentials/tokens. `./test-cloud.sh`, `./test-ai-evals.sh`, and
   `backend/tests/{unit,integration,ai_evals,performance}`. Pytest markers and
   the 30-second default timeout are defined in `backend/pytest.ini`.
 - Keep Python imports grouped as standard library, third-party packages, and
-  local modules. Black and isort use a 120-character line limit; mypy is
-  configured in the backend project.
+  local modules, each under its configured isort heading comment
+  (`# Standard library`, `# Third-party packages`, `# Local modules`). Black and
+  isort use a 120-character line limit; mypy is configured in the backend
+  project.
 - Frontend source and Jest tests live in `ui/src/`; Playwright tests live in
   `ui/tests/`. The `@/` alias maps to `ui/src/`.
 - Repository script and documentation regression checks live in
@@ -138,36 +156,6 @@ credentials/tokens. `./test-cloud.sh`, `./test-ai-evals.sh`, and
 - Treat examples, tests, documentation, logs, and generated diagnostics as
   public content. Use synthetic identifiers and never expose credentials,
   customer data, JWTs, account IDs, or deployment-specific ARNs.
-
-## Change Impact Map
-
-- For an authenticated chat-path change, trace both sides of the boundary:
-  `ui/src/pages/api/copilot/chat.ts` verifies the access token and builds the
-  trusted principal; `backend/src/agentcore_main.py` verifies the runtime
-  context. Preserve the rule that body fields, browser headers, and model
-  output cannot establish actor, tenant, workspace, group, or authorization
-  values. Run the focused frontend API tests and
-  `uv run pytest tests/unit/test_runtime_jwt_identity_unit.py tests/unit/test_agentcore_startup_unit.py`.
-- For an agent behavior or prompt change, inspect the relevant specialist,
-  orchestrator, `backend/src/agents/optimized_prompts.py`, and its focused
-  tests. Prompt source changes are incomplete until the managed prompt version
-  is published through `scripts/infrastructure/deploy-prompts.sh` or the full
-  deployment; do not describe source-only changes as deployed behavior.
-- For deterministic cost-report behavior, preserve the owned Cost Explorer
-  rendering path rather than allowing financial figures from unvalidated model
-  prose. Use `backend/tests/unit/test_cost_report_unit.py` and the focused
-  cost-report integration tests when changing this path.
-- For operations-contract changes, update the versioned schemas, fixtures,
-  implementation, contract tests, and the corresponding documentation or ADR
-  together. Read `docs/IDENTITY_AND_AUTHORIZATION.md`,
-  `docs/OPERATIONS_CONTRACTS.md`, and the relevant ADR before modifying the
-  operations layer; it remains an optional, disabled control-plane design and
-  must not broaden chat-runtime permissions.
-- For deployment workflow changes, keep the shell and PowerShell implementations
-  aligned where both intentionally cover the same behavior. Prefer the
-  read-only `scripts/infrastructure/check-deployment.sh` and
-  `validate-deployment.sh` for validation; deployment, teardown, cloud,
-  AI-eval, and stress scripts target live resources and require explicit scope.
 
 ## Completion
 
