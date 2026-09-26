@@ -6,6 +6,7 @@ using boto3 for AWS GameLift operations.
 """
 
 # Standard library
+import uuid
 from typing import Any
 
 # Third-party packages
@@ -308,7 +309,7 @@ def get_fleet_utilization(fleet_id: str) -> dict:  # type: ignore
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
         response = client.describe_fleet_utilization(FleetIds=[fleet_id])
     except Exception as e:
-        log_sanitized_failure("describe_fleet_utilization", fleet_id, e)
+        log_sanitized_failure("describe_fleet_utilization", uuid.uuid4().hex, e)
         return error_result("FleetUtilization", e)
     return project_fleet_utilization(response)
 
@@ -326,7 +327,7 @@ def get_fleet_capacity(fleet_id: str) -> dict:  # type: ignore
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
         response = client.describe_fleet_capacity(FleetIds=[fleet_id])
     except Exception as e:
-        log_sanitized_failure("describe_fleet_capacity", fleet_id, e)
+        log_sanitized_failure("describe_fleet_capacity", uuid.uuid4().hex, e)
         return error_result("FleetCapacity", e)
     return project_fleet_capacity(response)
 
@@ -344,7 +345,7 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
         response = client.describe_scaling_policies(FleetId=fleet_id)
     except Exception as e:
-        log_sanitized_failure("describe_scaling_policies", fleet_id, e)
+        log_sanitized_failure("describe_scaling_policies", uuid.uuid4().hex, e)
         return error_result("ScalingPolicies", e)
     return project_scaling_policies(response)
 

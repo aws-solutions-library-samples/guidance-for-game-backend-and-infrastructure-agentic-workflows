@@ -10,30 +10,42 @@ This module keeps the transform *in code we own* rather than trusting the model
 to ignore sensitive fields:
 
 * Each ``project_*`` function copies only an explicit allowlist of operational
-  fields from each item. Unknown / future / customer-controlled fields
-  (endpoints, credential ARNs, private IPs, arbitrary nested blobs) are dropped
-  by construction, not stripped by pattern.
+  fields from each item, and every copied value is additionally validated by a
+  code-owned typed validator. Field-name allowlisting alone is not enough: an
+  allowed key (``FleetId``, ``Name``, ``Location``, a numeric count, ...) still
+  carries a *value* the provider (or a compromised upstream) controls, so each
+  value must satisfy an exact scalar type, a bounded string length, and finite
+  bounded numeric magnitude before it may cross into model context.
+* Unknown / future / customer-controlled fields (endpoints, credential ARNs,
+  private IPs, arbitrary nested blobs) are dropped by construction. Allowed
+  fields carrying an invalid value (wrong type, oversized string, NaN/Inf,
+  out-of-range magnitude, oversized nested collection) are dropped predictably
+  rather than passed through.
 * Full ARNs are never projected. Caller-supplied identifiers (the ``fleet_id``
-  argument and its echo) are non-sensitive and retained for correlation.
-* Collections are bounded by ``GAMELIFT_MAX_PROJECTED_ITEMS``; exceeding the cap
-  or a residual ``NextToken`` marks the result ``truncated`` so the model is
-  told the view is partial instead of silently losing rows.
+  argument and its echo) are non-sensitive and retained for correlation, still
+  subject to the string bound.
+* Collections are bounded by ``GAMELIFT_MAX_PROJECTED_ITEMS`` and, in aggregate,
+  by ``GAMELIFT_MAX_PROJECTED_CHARS``; exceeding either the item cap or a
+  residual ``NextToken`` marks the result ``truncated``/``incomplete`` so the
+  model is told the view is partial instead of silently losing rows.
 * Provider exceptions are mapped to a small, typed, sanitized error vocabulary.
-  The raw exception message is logged server-side only.
+  The raw exception message is never logged or returned.
 
 Dispositions are kept mutually distinct via the ``status`` field:
 
 * ``ok``        — full result set returned.
-* ``empty``     — the call succeeded and returned zero items.
+* ``empty``     — the call succeeded and returned zero items *and* no more pages.
 * ``denied``    — the provider refused the call (authorization / access).
 * ``incomplete``— the call failed, or only part of the result set was retrieved
-                  (residual ``NextToken`` with no client-side cap hit).
+                  (residual ``NextToken`` — including an empty page that still
+                  carries a continuation token — with no client-side cap hit).
 * ``truncated`` — the result set was bounded by this projection's item cap.
 """
 
 from __future__ import annotations
 
 # Standard library
+import math
 from typing import Any, Callable
 
 # Third-party packages
@@ -46,6 +58,19 @@ from utils.logger import logger
 # single fleet can report many location rows and many scaling policies; without
 # a cap an adversarial or unusual account could flood the context window.
 GAMELIFT_MAX_PROJECTED_ITEMS = 100
+
+# Aggregate payload budget: after projecting (and item-capping) a collection, the
+# serialized projection must also stay within this many characters. This bounds
+# the case where each item is individually valid but the collection as a whole
+# would still flood model context (e.g. many long-but-legal Location strings).
+GAMELIFT_MAX_PROJECTED_CHARS = 20_000
+
+# Per-value bounds. Allowed *string* fields are capped in Unicode code points;
+# allowed *numeric* fields must be finite and within this magnitude. These are
+# operational GameLift values (region-like strings, session counts, thresholds),
+# so the bounds are deliberately generous but finite.
+GAMELIFT_MAX_STRING_LENGTH = 256
+GAMELIFT_MAX_ABS_NUMBER = 1e12
 
 # Disposition vocabulary — kept distinct on purpose (see module docstring).
 STATUS_OK = "ok"
@@ -74,12 +99,22 @@ _NOT_FOUND_CODES = {"NotFoundException", "ResourceNotFoundException"}
 _THROTTLE_CODES = {"ThrottlingException", "Throttling", "TooManyRequestsException", "LimitExceededException"}
 _INVALID_CODES = {"InvalidRequestException", "ValidationException", "InvalidFleetStatusException"}
 
+# Error code -> distinct disposition. Denied and not-found are pinned to their
+# own dispositions; every other failure is ``incomplete``.
+_ERROR_CODE_STATUS = {
+    ERROR_ACCESS_DENIED: STATUS_DENIED,
+    ERROR_NOT_FOUND: STATUS_INCOMPLETE,
+    ERROR_THROTTLED: STATUS_INCOMPLETE,
+    ERROR_INVALID_REQUEST: STATUS_INCOMPLETE,
+    ERROR_PROVIDER_ERROR: STATUS_INCOMPLETE,
+}
+
 
 def classify_error(exc: BaseException) -> str:
     """Map a provider exception to a typed, sanitized error code.
 
-    The raw message is never returned; callers log it server-side. Only the
-    stable code crosses into model context.
+    The raw message is never returned or logged; only the stable code crosses
+    into model context.
     """
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "") if isinstance(exc.response, dict) else ""
@@ -98,12 +133,16 @@ def classify_error(exc: BaseException) -> str:
 
 
 def _status_for_error_code(code: str) -> str:
-    """Denied maps to the distinct ``denied`` disposition; all else is incomplete."""
-    return STATUS_DENIED if code == ERROR_ACCESS_DENIED else STATUS_INCOMPLETE
+    """Pin each typed error code to a distinct disposition."""
+    return _ERROR_CODE_STATUS.get(code, STATUS_INCOMPLETE)
 
 
 def error_result(collection_key: str, exc: BaseException) -> dict[str, Any]:
-    """Build a sanitized error result for a failed provider call."""
+    """Build a sanitized error result for a failed provider call.
+
+    ``not_found`` is surfaced through ``error.code`` while keeping the
+    disposition distinct from ``denied`` and ``empty``.
+    """
     code = classify_error(exc)
     return {
         "status": _status_for_error_code(code),
@@ -112,18 +151,89 @@ def error_result(collection_key: str, exc: BaseException) -> dict[str, Any]:
     }
 
 
-def _copy_allowed(item: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
-    """Return only allowlisted, non-null fields from ``item``.
+# ---------------------------------------------------------------------------
+# Code-owned value validators
+# ---------------------------------------------------------------------------
+def _valid_string(value: Any) -> bool:
+    """Exact ``str`` within the code-point bound (rejects oversized strings)."""
+    return isinstance(value, str) and len(value) <= GAMELIFT_MAX_STRING_LENGTH
 
-    Anything not named in ``allowed`` — including future provider fields, full
-    ARNs, endpoints, and arbitrary nested blobs — is dropped by construction.
+
+def _valid_number(value: Any) -> bool:
+    """Finite real number within the magnitude bound.
+
+    ``bool`` is a subclass of ``int`` but is not a numeric metric here, so it is
+    rejected. A Python ``int`` is arbitrary precision and ``float(huge_int)``
+    raises ``OverflowError``; the int-vs-float comparison below is exact in
+    CPython and never overflows. Floats are checked with ``math.isfinite`` so
+    ``NaN`` / ``inf`` are rejected before the magnitude check.
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return abs(value) <= GAMELIFT_MAX_ABS_NUMBER
+    if isinstance(value, float):
+        return math.isfinite(value) and abs(value) <= GAMELIFT_MAX_ABS_NUMBER
+    return False
+
+
+# Per-field validator kind. ``str`` fields must pass ``_valid_string``; ``num``
+# fields must pass ``_valid_number``. Anything failing its validator (or of an
+# unexpected type) is dropped by construction.
+_STRING = "str"
+_NUMBER = "num"
+
+
+def _copy_validated(item: dict[str, Any], fields: tuple[tuple[str, str], ...]) -> dict[str, Any]:
+    """Return only allowlisted fields whose value passes its typed validator.
+
+    ``fields`` is a tuple of ``(field_name, kind)`` pairs. Anything not named —
+    including future provider fields, full ARNs, endpoints, and arbitrary nested
+    blobs — is dropped by construction. An allowed field carrying an invalid
+    value (wrong type, oversized string, non-finite / oversized number) is also
+    dropped, predictably, rather than passed through.
     """
     projected: dict[str, Any] = {}
-    for key in allowed:
+    for key, kind in fields:
         value = item.get(key)
-        if value is not None:
+        if value is None:
+            continue
+        if kind is _STRING and _valid_string(value):
+            projected[key] = value
+        elif kind is _NUMBER and _valid_number(value):
             projected[key] = value
     return projected
+
+
+def _copy_validated_numbers(counts: dict[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
+    """Project a nested numeric map (instance/group counts): validated numbers only."""
+    projected: dict[str, Any] = {}
+    for key in allowed:
+        value = counts.get(key)
+        if value is not None and _valid_number(value):
+            projected[key] = value
+    return projected
+
+
+def _within_payload_budget(projected: list[dict[str, Any]]) -> bool:
+    """True when the aggregate serialized projection is within the char budget."""
+    # A rough, allocation-light size estimate: sum the code points of every key
+    # and stringified scalar. This bounds total model-context growth without
+    # importing json for a hot path.
+    total = 0
+    for row in projected:
+        for key, value in row.items():
+            total += len(key)
+            if isinstance(value, str):
+                total += len(value)
+            elif isinstance(value, dict):
+                for nk, nv in value.items():
+                    total += len(nk) + len(str(nv))
+            else:
+                total += len(str(value))
+            if total > GAMELIFT_MAX_PROJECTED_CHARS:
+                return False
+    return total <= GAMELIFT_MAX_PROJECTED_CHARS
 
 
 def _project_collection(
@@ -131,24 +241,40 @@ def _project_collection(
     collection_key: str,
     project_item: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Bound, project, and classify a successful provider response.
+    """Bound, project, validate, and classify a successful provider response.
 
     Empty, ok, truncated (cap hit), and incomplete (residual NextToken)
-    dispositions are kept distinct.
+    dispositions are kept distinct. An empty page that still carries a
+    continuation token is ``incomplete`` — never a complete ``empty``.
     """
-    raw_items = response.get(collection_key) or []
-    projected = [project_item(item) for item in raw_items[:GAMELIFT_MAX_PROJECTED_ITEMS]]
+    raw_items = response.get(collection_key)
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    has_more_pages = bool(response.get("NextToken"))
+    capped = len(raw_items) > GAMELIFT_MAX_PROJECTED_ITEMS
+
+    projected = [project_item(item) for item in raw_items[:GAMELIFT_MAX_PROJECTED_ITEMS] if isinstance(item, dict)]
+
+    # Aggregate payload budget: if the (already item-capped) projection is still
+    # too large, drop rows from the tail until it fits and mark it truncated.
+    payload_capped = False
+    while projected and not _within_payload_budget(projected):
+        projected.pop()
+        payload_capped = True
 
     result: dict[str, Any] = {collection_key: projected}
 
-    capped = len(raw_items) > GAMELIFT_MAX_PROJECTED_ITEMS
-    has_more_pages = bool(response.get("NextToken"))
-
     if not projected:
-        result["status"] = STATUS_EMPTY
+        # Distinguish "genuinely empty" from "empty page with more to come".
+        if has_more_pages:
+            result["status"] = STATUS_INCOMPLETE
+            result["truncated"] = True
+        else:
+            result["status"] = STATUS_EMPTY
         return result
 
-    if capped:
+    if capped or payload_capped:
         result["status"] = STATUS_TRUNCATED
         result["truncated"] = True
     elif has_more_pages:
@@ -161,66 +287,66 @@ def _project_collection(
 
 
 # ---------------------------------------------------------------------------
-# Per-operation allowlists and item projectors
+# Per-operation allowlists (field name + typed validator) and item projectors
 # ---------------------------------------------------------------------------
-_UTILIZATION_FIELDS = (
-    "FleetId",
-    "ActiveServerProcessCount",
-    "ActiveGameSessionCount",
-    "CurrentPlayerSessionCount",
-    "MaximumPlayerSessionCount",
-    "Location",
+_UTILIZATION_FIELDS: tuple[tuple[str, str], ...] = (
+    ("FleetId", _STRING),
+    ("ActiveServerProcessCount", _NUMBER),
+    ("ActiveGameSessionCount", _NUMBER),
+    ("CurrentPlayerSessionCount", _NUMBER),
+    ("MaximumPlayerSessionCount", _NUMBER),
+    ("Location", _STRING),
 )
 
-_CAPACITY_FIELDS = (
-    "FleetId",
-    "InstanceType",
-    "Location",
+_CAPACITY_FIELDS: tuple[tuple[str, str], ...] = (
+    ("FleetId", _STRING),
+    ("InstanceType", _STRING),
+    ("Location", _STRING),
 )
 _INSTANCE_COUNT_FIELDS = ("DESIRED", "MINIMUM", "MAXIMUM", "PENDING", "ACTIVE", "IDLE", "TERMINATING")
 _GROUP_COUNT_FIELDS = ("PENDING", "ACTIVE", "IDLE", "TERMINATING")
 
-_SCALING_POLICY_FIELDS = (
-    "FleetId",
-    "Name",
-    "Status",
-    "ScalingAdjustment",
-    "ScalingAdjustmentType",
-    "ComparisonOperator",
-    "Threshold",
-    "EvaluationPeriods",
-    "MetricName",
-    "PolicyType",
-    "UpdateStatus",
-    "Location",
+_SCALING_POLICY_FIELDS: tuple[tuple[str, str], ...] = (
+    ("FleetId", _STRING),
+    ("Name", _STRING),
+    ("Status", _STRING),
+    ("ScalingAdjustment", _NUMBER),
+    ("ScalingAdjustmentType", _STRING),
+    ("ComparisonOperator", _STRING),
+    ("Threshold", _NUMBER),
+    ("EvaluationPeriods", _NUMBER),
+    ("MetricName", _STRING),
+    ("PolicyType", _STRING),
+    ("UpdateStatus", _STRING),
+    ("Location", _STRING),
 )
 
 
 def _project_utilization_item(item: dict[str, Any]) -> dict[str, Any]:
-    return _copy_allowed(item, _UTILIZATION_FIELDS)
+    return _copy_validated(item, _UTILIZATION_FIELDS)
 
 
 def _project_capacity_item(item: dict[str, Any]) -> dict[str, Any]:
-    projected = _copy_allowed(item, _CAPACITY_FIELDS)
+    projected = _copy_validated(item, _CAPACITY_FIELDS)
     instance_counts = item.get("InstanceCounts")
     if isinstance(instance_counts, dict):
-        counts = _copy_allowed(instance_counts, _INSTANCE_COUNT_FIELDS)
+        counts = _copy_validated_numbers(instance_counts, _INSTANCE_COUNT_FIELDS)
         if counts:
             projected["InstanceCounts"] = counts
     group_counts = item.get("GameServerContainerGroupCounts")
     if isinstance(group_counts, dict):
-        counts = _copy_allowed(group_counts, _GROUP_COUNT_FIELDS)
+        counts = _copy_validated_numbers(group_counts, _GROUP_COUNT_FIELDS)
         if counts:
             projected["GameServerContainerGroupCounts"] = counts
     return projected
 
 
 def _project_scaling_policy_item(item: dict[str, Any]) -> dict[str, Any]:
-    projected = _copy_allowed(item, _SCALING_POLICY_FIELDS)
+    projected = _copy_validated(item, _SCALING_POLICY_FIELDS)
     target = item.get("TargetConfiguration")
     if isinstance(target, dict):
         target_value = target.get("TargetValue")
-        if target_value is not None:
+        if target_value is not None and _valid_number(target_value):
             projected["TargetConfiguration"] = {"TargetValue": target_value}
     return projected
 
@@ -237,10 +363,44 @@ def project_scaling_policies(response: dict[str, Any]) -> dict[str, Any]:
     return _project_collection(response, "ScalingPolicies", _project_scaling_policy_item)
 
 
-def log_sanitized_failure(operation: str, fleet_id: str, exc: BaseException) -> None:
-    """Log the full provider error server-side only.
+def log_sanitized_failure(operation: str, correlation_token: str, exc: BaseException) -> None:
+    """Log a bounded, non-sensitive record of a provider failure.
 
-    Model-visible output receives a typed code via :func:`error_result`; the raw
-    message (which may embed ARNs / account IDs / URLs) stays in logs.
+    Only three things are logged, none provider- or caller-controlled in an
+    unbounded way:
+
+    * ``operation`` — a constant, code-owned operation name (e.g.
+      ``describe_fleet_utilization``);
+    * the typed, sanitized error code from :func:`classify_error`;
+    * a bounded, non-sensitive correlation token.
+
+    The raw exception message (which may embed ARNs / account IDs / URLs) and the
+    caller-supplied fleet identifier are **never** logged. We deliberately do not
+    attach the exception object to the Loguru record: Loguru's traceback
+    rendering would serialize ``str(exc)`` (and, with ``diagnose``, local values)
+    into the sink, which is exactly the provider-authored disclosure this
+    function exists to prevent. The sanitized code preserves the operationally
+    useful signal (denied vs throttled vs provider error) without the message.
     """
-    logger.error(f"GameLift {operation} failed for fleet {fleet_id} [{classify_error(exc)}]: {exc}")
+    safe_operation = _bounded_token(operation, 64)
+    safe_token = _bounded_token(correlation_token, 64)
+    logger.bind(
+        gamelift_operation=safe_operation,
+        error_code=classify_error(exc),
+        correlation_token=safe_token,
+    ).error("GameLift provider call failed")
+
+
+def _bounded_token(value: Any, max_length: int) -> str:
+    """Coerce a value to a bounded, single-line, non-sensitive token.
+
+    Non-strings become ``"<non-string>"``; strings are truncated to
+    ``max_length`` code points with newlines stripped so a crafted identifier
+    cannot inject log lines or smuggle a large payload into the sink.
+    """
+    if not isinstance(value, str):
+        return "<non-string>"
+    single_line = value.replace("\n", " ").replace("\r", " ")
+    if len(single_line) > max_length:
+        return single_line[:max_length] + "…"
+    return single_line

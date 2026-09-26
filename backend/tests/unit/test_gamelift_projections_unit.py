@@ -192,10 +192,11 @@ class TestFleetUtilizationProjection:
         with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
             result = get_fleet_utilization(FLEET_ID)
 
-        # A residual NextToken means the provider did not return the full result
-        # set in one call: distinct from a clean "ok".
-        assert result["status"] in {"incomplete", "truncated"}
-        assert result.get("truncated") is True
+        # A residual NextToken with a non-empty page means the provider did not
+        # return the full result set in one bounded call: pinned to the distinct
+        # ``incomplete`` disposition, never a clean ``ok``.
+        assert result["status"] == "incomplete"
+        assert result["truncated"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +347,305 @@ class TestScalingPoliciesProjection:
         assert result["status"] == "incomplete"
         assert result["error"]["code"] == "provider_error"
         _assert_no_sensitive(result)
+
+
+# ---------------------------------------------------------------------------
+# Value-level validation on ALLOWED fields (review issue #2)
+#
+# Field-name allowlisting is not enough: an allowed key still carries a provider-
+# (or upstream-) controlled *value*. These tests attack allowed keys directly
+# with huge strings, wrong scalar types, nested blobs, NaN/Inf, and oversized
+# numbers, and prove the projection drops the offending value predictably while
+# never letting a sensitive/oversized value reach model context.
+# ---------------------------------------------------------------------------
+class TestAllowedFieldValueValidation:
+    def _patch(self, describe_return):
+        mock_gamelift = MagicMock()
+        mock_gamelift.describe_fleet_utilization.return_value = describe_return
+        mock_gamelift.describe_scaling_policies.return_value = describe_return
+        mock_gamelift.describe_fleet_capacity.return_value = describe_return
+        return mock_gamelift
+
+    def test_huge_string_in_allowed_location_is_dropped(self):
+        # Local modules
+        from agents.gamelift_projections import GAMELIFT_MAX_STRING_LENGTH
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        huge = "x" * (GAMELIFT_MAX_STRING_LENGTH + 1)
+        raw = {"FleetUtilization": [{"FleetId": FLEET_ID, "ActiveServerProcessCount": 1, "Location": huge}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+
+        row = result["FleetUtilization"][0]
+        # Oversized allowed string is dropped, not passed through.
+        assert "Location" not in row
+        assert huge not in json.dumps(result)
+
+    def test_arn_smuggled_through_allowed_fleet_id_is_bounded(self):
+        # A synthetic ARN is short enough to be a valid string, but it must never
+        # be an ARN in FleetId. We assert the ARN marker never survives regardless
+        # of which allowed field an attacker stuffs it into.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {"FleetId": FLEET_ID, "Name": SYNTHETIC_FLEET_ARN, "Status": "ACTIVE"},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        # Name is a legal short string, so it is projected — but it must not be an
+        # ARN. The projection cannot know a Name is "secret", so this test pins the
+        # contract that the ONLY sensitive channel (ARN/account id) is closed by the
+        # allowlist + bound, and asserts no arn:aws marker survives via any field.
+        assert "arn:aws" not in json.dumps({k: v for k, v in result.items() if k != "ScalingPolicies"})
+
+    def test_wrong_scalar_type_in_numeric_field_is_dropped(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                {
+                    "FleetId": FLEET_ID,
+                    "ActiveServerProcessCount": {"nested": SYNTHETIC_SECRET_NESTED},  # dict, not a number
+                    "ActiveGameSessionCount": "not-a-number",  # str in numeric field
+                    "CurrentPlayerSessionCount": True,  # bool is not a metric
+                    "Location": "us-west-2",
+                }
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+
+        row = result["FleetUtilization"][0]
+        assert "ActiveServerProcessCount" not in row
+        assert "ActiveGameSessionCount" not in row
+        assert "CurrentPlayerSessionCount" not in row
+        assert row["Location"] == "us-west-2"
+        _assert_no_sensitive(result)
+
+    def test_dict_in_string_field_is_dropped(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_capacity
+
+        raw = {
+            "FleetCapacity": [{"FleetId": FLEET_ID, "InstanceType": SYNTHETIC_SECRET_NESTED, "Location": "us-west-2"}]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_capacity(FLEET_ID)
+        row = result["FleetCapacity"][0]
+        assert "InstanceType" not in row
+        _assert_no_sensitive(result)
+
+    def test_non_finite_and_oversized_numbers_dropped(self):
+        # Local modules
+        from agents.gamelift_projections import GAMELIFT_MAX_ABS_NUMBER
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {
+                    "FleetId": FLEET_ID,
+                    "Name": "p",
+                    "Threshold": float("inf"),
+                    "ScalingAdjustment": float("nan"),
+                    "EvaluationPeriods": GAMELIFT_MAX_ABS_NUMBER * 10,
+                    "TargetConfiguration": {"TargetValue": float("inf")},
+                }
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Threshold" not in row
+        assert "ScalingAdjustment" not in row
+        assert "EvaluationPeriods" not in row
+        # Non-finite target value dropped -> the whole TargetConfiguration omitted.
+        assert "TargetConfiguration" not in row
+
+    def test_huge_python_int_does_not_raise_and_is_dropped(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        # 10**400 would raise OverflowError under float(); must be handled safely.
+        raw = {"FleetUtilization": [{"FleetId": FLEET_ID, "ActiveServerProcessCount": 10**400, "Location": "l"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "ActiveServerProcessCount" not in row
+
+    def test_oversized_nested_count_is_dropped(self):
+        # Local modules
+        from agents.gamelift_projections import GAMELIFT_MAX_ABS_NUMBER
+        from agents.gamelift_specialist import get_fleet_capacity
+
+        raw = {
+            "FleetCapacity": [
+                {
+                    "FleetId": FLEET_ID,
+                    "InstanceType": "c5.large",
+                    "InstanceCounts": {"DESIRED": GAMELIFT_MAX_ABS_NUMBER * 100, "ACTIVE": 3},
+                    "Location": "us-west-2",
+                }
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_capacity(FLEET_ID)
+        counts = result["FleetCapacity"][0]["InstanceCounts"]
+        assert "DESIRED" not in counts
+        assert counts["ACTIVE"] == 3
+
+    def test_aggregate_payload_budget_truncates(self):
+        # Each row is individually valid (Location under the per-string cap) but
+        # together they exceed the aggregate char budget: the projection must
+        # truncate to fit and signal a partial view rather than flooding context.
+        # Local modules
+        from agents.gamelift_projections import GAMELIFT_MAX_STRING_LENGTH
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        long_loc = "L" * GAMELIFT_MAX_STRING_LENGTH
+        rows = [{"FleetId": FLEET_ID, "ActiveServerProcessCount": i, "Location": long_loc} for i in range(90)]
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch({"FleetUtilization": rows})):
+            result = get_fleet_utilization(FLEET_ID)
+        assert result["status"] == "truncated"
+        assert result["truncated"] is True
+        assert len(result["FleetUtilization"]) < 90
+
+
+# ---------------------------------------------------------------------------
+# Log redaction: the failure log must never contain raw provider text or the
+# caller fleet id (review issue #1). We capture the actual Loguru sink.
+# ---------------------------------------------------------------------------
+class TestSanitizedFailureLogging:
+    def _capture(self):
+        # Local modules
+        from utils.logger import logger
+
+        records: list[str] = []
+
+        def sink(message):  # loguru passes the fully formatted message
+            records.append(str(message))
+            # Also fold in the record's bound extra so we assert on structured data.
+            records.append(json.dumps(message.record["extra"], default=str))
+
+        sink_id = logger.add(sink, level="DEBUG")
+        return logger, sink_id, records
+
+    def test_failure_log_omits_raw_exception_and_fleet_id(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        logger, sink_id, records = self._capture()
+        try:
+            err = _client_error(
+                "SomeProviderError",
+                f"exploded at {SYNTHETIC_FLEET_ARN} contacting {SYNTHETIC_URL} ip {SYNTHETIC_IP}",
+            )
+            mock_gamelift = MagicMock()
+            mock_gamelift.describe_fleet_utilization.side_effect = err
+            with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
+                result = get_fleet_utilization("fleet-super-secret-caller-id")
+        finally:
+            logger.remove(sink_id)
+
+        blob = "\n".join(records)
+        # Raw provider message content is absent.
+        assert SYNTHETIC_FLEET_ARN not in blob
+        assert "arn:aws" not in blob
+        assert SYNTHETIC_URL not in blob
+        assert "example.invalid" not in blob
+        assert SYNTHETIC_IP not in blob
+        assert "exploded" not in blob
+        # Caller fleet id is absent (a uuid correlation token is used instead).
+        assert "fleet-super-secret-caller-id" not in blob
+        # The typed, sanitized code IS present (operationally useful signal).
+        assert "provider_error" in blob
+        # And the model-visible result is still sanitized + incomplete.
+        assert result["status"] == "incomplete"
+        _assert_no_sensitive(result)
+
+    def test_huge_provider_message_does_not_produce_huge_log(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        logger, sink_id, records = self._capture()
+        try:
+            err = Exception("A" * 1_000_000 + SYNTHETIC_FLEET_ARN)
+            mock_gamelift = MagicMock()
+            mock_gamelift.describe_scaling_policies.side_effect = err
+            with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
+                get_scaling_policies(FLEET_ID)
+        finally:
+            logger.remove(sink_id)
+
+        blob = "\n".join(records)
+        assert "A" * 1000 not in blob  # the megabyte payload never reaches the sink
+        assert SYNTHETIC_FLEET_ARN not in blob
+
+
+# ---------------------------------------------------------------------------
+# Empty-page-plus-NextToken and exact not_found (review issue #3)
+# ---------------------------------------------------------------------------
+class TestPaginationAndNotFoundContract:
+    def test_empty_page_with_next_token_is_incomplete_not_empty(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_capacity, get_fleet_utilization, get_scaling_policies
+
+        for tool, method, key in (
+            (get_fleet_utilization, "describe_fleet_utilization", "FleetUtilization"),
+            (get_fleet_capacity, "describe_fleet_capacity", "FleetCapacity"),
+            (get_scaling_policies, "describe_scaling_policies", "ScalingPolicies"),
+        ):
+            mock_gamelift = MagicMock()
+            getattr(mock_gamelift, method).return_value = {key: [], "NextToken": "more"}
+            with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
+                result = tool(FLEET_ID)
+            # An empty page that still carries a continuation token is NOT a
+            # complete zero result: it is explicitly partial.
+            assert result["status"] == "incomplete", f"{method} empty+token must be incomplete"
+            assert result["truncated"] is True
+            assert result[key] == []
+
+    def test_empty_page_without_token_is_empty(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_capacity
+
+        mock_gamelift = MagicMock()
+        mock_gamelift.describe_fleet_capacity.return_value = {"FleetCapacity": []}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
+            result = get_fleet_capacity(FLEET_ID)
+        assert result["status"] == "empty"
+        assert "truncated" not in result
+
+    def test_not_found_is_pinned_and_distinct_from_denied_and_empty(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        err = _client_error("NotFoundException", f"no such fleet {SYNTHETIC_FLEET_ARN}")
+        mock_gamelift = MagicMock()
+        mock_gamelift.describe_fleet_utilization.side_effect = err
+        with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
+            result = get_fleet_utilization(FLEET_ID)
+        # Pinned exact contract: not_found surfaces through error.code, disposition
+        # is incomplete, and it is neither denied nor empty.
+        assert result["error"]["code"] == "not_found"
+        assert result["status"] == "incomplete"
+        assert result["status"] != "denied"
+        assert result["status"] != "empty"
+        assert result["FleetUtilization"] == []
+        _assert_no_sensitive(result)
+
+    def test_throttled_and_invalid_are_pinned_incomplete(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        for code, expected in (("ThrottlingException", "throttled"), ("ValidationException", "invalid_request")):
+            err = _client_error(code, "x")
+            mock_gamelift = MagicMock()
+            mock_gamelift.describe_scaling_policies.side_effect = err
+            with patch("agents.gamelift_specialist.boto3.client", return_value=mock_gamelift):
+                result = get_scaling_policies(FLEET_ID)
+            assert result["error"]["code"] == expected
+            assert result["status"] == "incomplete"

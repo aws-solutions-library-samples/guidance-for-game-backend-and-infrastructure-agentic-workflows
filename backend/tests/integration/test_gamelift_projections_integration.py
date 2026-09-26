@@ -105,3 +105,38 @@ def test_get_scaling_policies_empty_distinct():
     assert result["status"] == "empty"
     assert result["ScalingPolicies"] == []
     assert "error" not in result
+
+
+def test_stubber_denied_path_does_not_log_provider_message():
+    """The failure path runs the real logger; capture the sink and prove the
+    provider-authored message and caller fleet id never reach it (issue #1)."""
+    # Local modules
+    from agents.gamelift_specialist import get_fleet_capacity
+    from utils.logger import logger
+
+    captured: list[str] = []
+
+    def sink(message):
+        captured.append(str(message))
+        captured.append(json.dumps(message.record["extra"], default=str))
+
+    sink_id = logger.add(sink, level="DEBUG")
+    client, stubber = _stubbed_client()
+    stubber.add_client_error(
+        "describe_fleet_capacity",
+        service_error_code="AccessDeniedException",
+        service_message=f"not authorized for {SYNTHETIC_FLEET_ARN}",
+    )
+    try:
+        with stubber, patch("agents.gamelift_specialist.boto3.client", return_value=client):
+            result = get_fleet_capacity(FLEET_ID)
+    finally:
+        logger.remove(sink_id)
+
+    blob = "\n".join(captured)
+    assert SYNTHETIC_FLEET_ARN not in blob
+    assert "arn:aws" not in blob
+    assert FLEET_ID not in blob  # caller fleet id is never logged
+    assert "not authorized" not in blob
+    assert "access_denied" in blob  # sanitized code is retained
+    assert result["status"] == "denied"
