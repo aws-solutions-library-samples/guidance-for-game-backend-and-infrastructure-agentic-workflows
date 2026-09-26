@@ -84,7 +84,10 @@ GAMELIFT_MAX_PROJECTED_CHARS = 20_000
 # operational GameLift values (region-like strings, session counts, thresholds),
 # so the bounds are deliberately generous but finite.
 GAMELIFT_MAX_STRING_LENGTH = 256
-GAMELIFT_MAX_ABS_NUMBER = 1e12
+# Provider counts, policy thresholds, and adjustment values are operational
+# metrics, not identifiers. Keep them below the 12-digit account-identifier
+# range in addition to requiring finite values.
+GAMELIFT_MAX_ABS_NUMBER = 1_000_000_000
 
 # Disposition vocabulary — kept distinct on purpose (see module docstring).
 STATUS_OK = "ok"
@@ -184,14 +187,10 @@ def error_result(collection_key: str, exc: BaseException) -> dict[str, Any]:
 # can inject log/JSON structure or smuggle payload past a naive length check.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
-# A run of exactly 12 digits is an AWS account ID; reject it anywhere in a value,
-# including when it is *decorated* — flanked by letters, underscores, or other
-# name characters (e.g. ``acct_123456789012_prod`` or ``prodX123456789012Y``).
-# Word boundaries (``\b``) do not fire between a letter/underscore and a digit,
-# so they miss these evasions. Digit-specific negative lookarounds match a run
-# of exactly 12 digits with no adjacent digit on either side, regardless of any
-# surrounding non-digit characters.
-_ACCOUNT_ID = re.compile(r"(?<!\d)\d{12}(?!\d)")
+# Any 12 consecutive digits can carry an AWS account ID. Reject the sequence
+# even when it is embedded in a longer digit or name run; preserving such a
+# value is unnecessary for these model-visible operational fields.
+_ACCOUNT_ID = re.compile(r"\d{12}")
 
 # Dotted-quad IPv4 detection is performed inside
 # :func:`_looks_like_network_coordinate` by sliding a 4-octet window over each
@@ -259,22 +258,18 @@ def _looks_like_network_coordinate(value: str) -> bool:
             return True
         except ValueError:
             continue
-    # Embedded dotted-quad IPv4 anywhere in the value, including inside a longer
-    # dotted run (``10.11.12.13.14``) or flanked by name characters. Validate
-    # each captured quad so a version-like token is only rejected when every
-    # octet is a legal 0-255 IPv4 octet. To catch a valid quad that begins at
-    # any octet boundary inside a longer dotted run (both the leading
-    # ``10.11.12.13`` of ``10.11.12.13.14`` and the trailing ``11.12.13.14``),
-    # slide a 4-octet window over each maximal dotted-numeric run.
-    for run in re.findall(r"\d{1,3}(?:\.\d{1,3})+", value):
-        octets = run.split(".")
-        for i in range(len(octets) - 3):
-            candidate = ".".join(octets[i : i + 4])
-            try:
-                ipaddress.IPv4Address(candidate)
-                return True
-            except ValueError:
-                continue
+    # Embedded dotted-quad IPv4 anywhere in the value. The overlapping
+    # lookahead examines every digit offset, so a valid quad is still found when
+    # it starts inside an oversized leading component (for example, the
+    # ``10.11.12.13`` suffix of ``99910.11.12.13``) or is followed by more
+    # dotted components. Validate each candidate's octets exactly.
+    for match in re.finditer(r"(?=(\d{1,3}(?:\.\d{1,3}){3}))", value):
+        candidate = match.group(1)
+        try:
+            ipaddress.IPv4Address(candidate)
+            return True
+        except ValueError:
+            continue
     # Embedded colon-hex IPv6 runs. Any colon-bearing hextet sequence that parses
     # as an IPv6 address is a network coordinate.
     for token in re.split(r"[^0-9A-Fa-f:]+", value):

@@ -471,6 +471,28 @@ class TestAllowedFieldValueValidation:
         # Non-finite target value dropped -> the whole TargetConfiguration omitted.
         assert "TargetConfiguration" not in row
 
+    def test_account_id_shaped_numeric_value_is_dropped(self):
+        # Numeric operational fields never need 12-digit identifier-sized
+        # values; reject them rather than exposing a possible account ID.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {
+                    "FleetId": FLEET_ID,
+                    "Name": "scale-up",
+                    "Status": "ACTIVE",
+                    "Threshold": 123456789012,
+                }
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Threshold" not in row
+        assert "123456789012" not in json.dumps(result)
+
     def test_huge_python_int_does_not_raise_and_is_dropped(self):
         # Local modules
         from agents.gamelift_specialist import get_fleet_utilization
@@ -794,21 +816,22 @@ class TestEmbeddedSensitiveCoordinateDetection:
         assert "Location" not in result["FleetUtilization"][0]
         assert "10.11.12.13" not in json.dumps(result)
 
-    def test_thirteen_digit_run_is_not_falsely_flagged_but_twelve_is(self):
-        # Discriminating: exactly 12 consecutive digits (an account id) inside a
-        # value is rejected; a legitimate shorter numeric suffix survives.
+    def test_account_id_substring_inside_longer_digit_run_is_rejected(self):
+        # Any 12-digit account-ID substring remains sensitive even when extra
+        # digits surround it. A legitimate short numeric suffix still survives.
         # Local modules
         from agents.gamelift_specialist import get_scaling_policies
 
         raw = {
             "ScalingPolicies": [
+                {"FleetId": FLEET_ID, "Name": "scale-99123456789012-v2", "Status": "ACTIVE"},
                 {"FleetId": FLEET_ID, "Name": "scale-up-v2", "Status": "ACTIVE"},
             ]
         }
         with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
             result = get_scaling_policies(FLEET_ID)
-        # Legitimate short numeric suffix is preserved.
-        assert result["ScalingPolicies"][0]["Name"] == "scale-up-v2"
+        assert "Name" not in result["ScalingPolicies"][0]
+        assert result["ScalingPolicies"][1]["Name"] == "scale-up-v2"
 
     def test_embedded_ipv6_in_name_is_rejected(self):
         # A colon-hex IPv6 address wrapped in valid name characters must be
@@ -866,6 +889,20 @@ class TestEmbeddedSensitiveCoordinateDetection:
         row = result["FleetUtilization"][0]
         assert "FleetId" not in row
         assert "10.11.12.13" not in json.dumps(result)
+
+    def test_ipv4_substring_starting_inside_oversized_leading_component_is_rejected(self):
+        # The valid 10.11.12.13 suffix begins inside the oversized first
+        # dotted component. Detection must examine overlapping digit offsets.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "host-99910.11.12.13-prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert "10.11.12.13" not in json.dumps(result)
+        assert row["Status"] == "ACTIVE"
 
 
 # ---------------------------------------------------------------------------
