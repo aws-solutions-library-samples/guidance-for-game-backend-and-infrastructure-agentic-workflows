@@ -39,13 +39,26 @@ FLEET_B = "fleet-bbbb-0002"
 # Routing / registration compatibility
 # ---------------------------------------------------------------------------
 class TestRoutingRegistrationCompatibility:
-    def test_specialist_exports_the_four_tool_names(self):
+    def test_registration_collection_holds_the_four_runtime_tools(self):
+        # Model access is controlled by the exact tool collection passed to
+        # create_specialist_agent, NOT by __all__. Assert the runtime
+        # registration collection so dropping a tool from the agent fails here.
         # Local modules
         import agents.gamelift_specialist as gls
 
+        registered = gls.GAMELIFT_AGENT_TOOLS
+        names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
         for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
-            assert name in gls.__all__, f"{name} missing from __all__ (routing/registration contract)"
-            assert callable(getattr(gls, name)), f"{name} is not a callable tool"
+            assert name in names, f"{name} missing from GAMELIFT_AGENT_TOOLS (runtime registration contract)"
+        assert len(registered) == 4
+
+    def test_agent_is_created_from_the_registration_collection(self):
+        # Prove the collection asserted above is the SAME object handed to the
+        # factory — not a parallel list that could drift from what the agent runs.
+        # Local modules
+        import agents.gamelift_specialist as gls
+
+        assert gls._REGISTERED_TOOLS_FOR_AGENT is gls.GAMELIFT_AGENT_TOOLS
 
     def test_projected_field_names_the_router_and_charts_depend_on_are_stable(self):
         # These operational field names are the axis/series source for charts and

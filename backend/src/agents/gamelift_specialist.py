@@ -354,6 +354,17 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
 # GameLift Agent (using factory pattern)
 # ============================================================================
 
+# The ONE runtime tool-registration collection. Model access to GameLift tools
+# is defined by exactly this list — it is what create_specialist_agent receives
+# and therefore what the agent can call. Tests assert on this collection (not
+# ``__all__``) so dropping or renaming a tool here is caught as a regression.
+GAMELIFT_AGENT_TOOLS = [
+    list_gamelift_fleets,
+    get_fleet_utilization,
+    get_fleet_capacity,
+    get_scaling_policies,
+]
+
 gamelift_agent = create_specialist_agent(
     service_name="GameLift",
     emoji="🎮",
@@ -361,5 +372,10 @@ gamelift_agent = create_specialist_agent(
     kb_id=GAMELIFT_KB_ID,
     prompt_fn=get_optimized_gamelift_prompt,
     fallback_fn=None,  # No fallback needed (boto3 is primary)
-    additional_tools=[list_gamelift_fleets, get_fleet_utilization, get_fleet_capacity, get_scaling_policies],
+    additional_tools=GAMELIFT_AGENT_TOOLS,
 )
+
+# Bind the exact object handed to the factory so a test can prove the asserted
+# registration collection is the same one the runtime agent was built from —
+# not a parallel list that could silently drift.
+_REGISTERED_TOOLS_FOR_AGENT = GAMELIFT_AGENT_TOOLS

@@ -382,24 +382,30 @@ class TestAllowedFieldValueValidation:
         assert huge not in json.dumps(result)
 
     def test_arn_smuggled_through_allowed_fleet_id_is_bounded(self):
-        # A synthetic ARN is short enough to be a valid string, but it must never
-        # be an ARN in FleetId. We assert the ARN marker never survives regardless
-        # of which allowed field an attacker stuffs it into.
+        # A synthetic ARN is short enough to pass a naive length check, but it
+        # must never survive in ANY allowed field. This test inspects the
+        # ATTACKED collection (ScalingPolicies) itself — not a stripped copy —
+        # and proves the ARN never reaches model context.
         # Local modules
         from agents.gamelift_specialist import get_scaling_policies
 
         raw = {
             "ScalingPolicies": [
-                {"FleetId": FLEET_ID, "Name": SYNTHETIC_FLEET_ARN, "Status": "ACTIVE"},
+                {"FleetId": SYNTHETIC_FLEET_ARN, "Name": SYNTHETIC_FLEET_ARN, "Status": "ACTIVE"},
             ]
         }
         with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
             result = get_scaling_policies(FLEET_ID)
-        # Name is a legal short string, so it is projected — but it must not be an
-        # ARN. The projection cannot know a Name is "secret", so this test pins the
-        # contract that the ONLY sensitive channel (ARN/account id) is closed by the
-        # allowlist + bound, and asserts no arn:aws marker survives via any field.
-        assert "arn:aws" not in json.dumps({k: v for k, v in result.items() if k != "ScalingPolicies"})
+        # Inspect the whole serialized result INCLUDING the attacked collection.
+        blob = json.dumps(result)
+        assert "arn:aws" not in blob
+        assert SYNTHETIC_ACCOUNT_ID not in blob
+        row = result["ScalingPolicies"][0]
+        # Field-specific grammar rejects the ARN in both the identifier and name
+        # fields; the legal Status enum survives.
+        assert "FleetId" not in row
+        assert "Name" not in row
+        assert row["Status"] == "ACTIVE"
 
     def test_wrong_scalar_type_in_numeric_field_is_dropped(self):
         # Local modules
@@ -501,17 +507,174 @@ class TestAllowedFieldValueValidation:
         # Each row is individually valid (Location under the per-string cap) but
         # together they exceed the aggregate char budget: the projection must
         # truncate to fit and signal a partial view rather than flooding context.
+        # The budget is measured against the ACTUAL serialized JSON.
         # Local modules
-        from agents.gamelift_projections import GAMELIFT_MAX_STRING_LENGTH
+        from agents.gamelift_projections import GAMELIFT_MAX_PROJECTED_CHARS
         from agents.gamelift_specialist import get_fleet_utilization
 
-        long_loc = "L" * GAMELIFT_MAX_STRING_LENGTH
+        long_loc = "us-west-2-" + "a" * 200  # long but legal region-like token
         rows = [{"FleetId": FLEET_ID, "ActiveServerProcessCount": i, "Location": long_loc} for i in range(90)]
         with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch({"FleetUtilization": rows})):
             result = get_fleet_utilization(FLEET_ID)
         assert result["status"] == "truncated"
         assert result["truncated"] is True
         assert len(result["FleetUtilization"]) < 90
+        # The serialized representation the model actually sees is within budget.
+        assert len(json.dumps(result)) <= GAMELIFT_MAX_PROJECTED_CHARS
+
+    def test_control_characters_expand_serialized_json_but_budget_holds(self):
+        # Control characters (e.g. NUL) are individually rejected by the string
+        # grammar, but even if a value were retained the budget is measured
+        # against the escaped JSON representation, so an escaping-expansion
+        # bypass cannot exceed GAMELIFT_MAX_PROJECTED_CHARS.
+        # Local modules
+        from agents.gamelift_projections import GAMELIFT_MAX_PROJECTED_CHARS, GAMELIFT_MAX_STRING_LENGTH
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        # Legal long region-like tokens that each escape to ~1x, many rows.
+        loc = "us-west-2" + "-x" * ((GAMELIFT_MAX_STRING_LENGTH - 9) // 2)
+        rows = [{"FleetId": FLEET_ID, "ActiveServerProcessCount": i, "Location": loc} for i in range(200)]
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch({"FleetUtilization": rows})):
+            result = get_fleet_utilization(FLEET_ID)
+        assert len(json.dumps(result)) <= GAMELIFT_MAX_PROJECTED_CHARS
+        assert result["status"] == "truncated"
+
+
+# ---------------------------------------------------------------------------
+# Field-specific grammar validation (review issue #1)
+#
+# Allowlisting a field name and bounding its length is not enough: an allowed
+# string field still carries a provider-controlled value. Each model-visible
+# string must satisfy its field-specific grammar — GameLift identifier, region,
+# enum/token, or name — and reject control characters, account-ID patterns,
+# ARN prefixes, URL schemes, and IP/network coordinates even when the value is
+# short.
+# ---------------------------------------------------------------------------
+class TestFieldSpecificGrammar:
+    def _patch(self, describe_return):
+        mock_gamelift = MagicMock()
+        mock_gamelift.describe_fleet_utilization.return_value = describe_return
+        mock_gamelift.describe_scaling_policies.return_value = describe_return
+        mock_gamelift.describe_fleet_capacity.return_value = describe_return
+        return mock_gamelift
+
+    def test_short_arn_in_identifier_is_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                {"FleetId": "arn:aws:gamelift:us-west-2:123456789012:fleet/f", "Location": "us-west-2"}
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "FleetId" not in row
+        assert "arn:aws" not in json.dumps(result)
+
+    def test_url_scheme_in_name_is_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "https://internal.example.invalid/secret", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert "https://" not in json.dumps(result)
+        assert row["Status"] == "ACTIVE"
+
+    def test_bare_account_id_in_name_is_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "123456789012", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert "123456789012" not in json.dumps(result)
+
+    def test_ip_address_in_location_is_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {"FleetUtilization": [{"FleetId": FLEET_ID, "Location": "10.11.12.13", "ActiveServerProcessCount": 1}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "Location" not in row
+        assert "10.11.12.13" not in json.dumps(result)
+
+    def test_control_characters_in_string_field_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                {"FleetId": FLEET_ID, "Location": "us-\x00west-2", "ActiveServerProcessCount": 1},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "Location" not in row
+        assert "\x00" not in json.dumps(result)
+
+    def test_newline_in_name_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "line1\nline2", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        assert "Name" not in result["ScalingPolicies"][0]
+
+    def test_malformed_region_rejected_even_when_short(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {"FleetUtilization": [{"FleetId": FLEET_ID, "Location": "not a region!", "ActiveServerProcessCount": 1}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        assert "Location" not in result["FleetUtilization"][0]
+
+    def test_unknown_enum_value_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "p", "Status": "arn:aws:evil"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        assert "Status" not in result["ScalingPolicies"][0]
+
+    def test_legal_values_survive_grammar(self):
+        # Regression guard: valid GameLift values are still projected.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {
+                    "FleetId": "fleet-1234abcd-5678-90ef-abcd-1234567890ab",
+                    "Name": "scale-up_on-util.v2",
+                    "Status": "ACTIVE",
+                    "ComparisonOperator": "GreaterThanThreshold",
+                    "MetricName": "PercentAvailableGameSessions",
+                    "Location": "us-west-2",
+                }
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert row["FleetId"].startswith("fleet-")
+        assert row["Name"] == "scale-up_on-util.v2"
+        assert row["Status"] == "ACTIVE"
+        assert row["ComparisonOperator"] == "GreaterThanThreshold"
+        assert row["MetricName"] == "PercentAvailableGameSessions"
+        assert row["Location"] == "us-west-2"
 
 
 # ---------------------------------------------------------------------------
@@ -649,3 +812,93 @@ class TestPaginationAndNotFoundContract:
                 result = get_scaling_policies(FLEET_ID)
             assert result["error"]["code"] == expected
             assert result["status"] == "incomplete"
+
+
+# ---------------------------------------------------------------------------
+# Malformed collections become typed `incomplete`, never authoritative `empty`
+# (review issue #2). `empty` is reserved for a valid empty list with no token.
+# ---------------------------------------------------------------------------
+class TestMalformedCollectionSemantics:
+    def _patch(self, describe_return):
+        mock_gamelift = MagicMock()
+        mock_gamelift.describe_fleet_utilization.return_value = describe_return
+        mock_gamelift.describe_scaling_policies.return_value = describe_return
+        mock_gamelift.describe_fleet_capacity.return_value = describe_return
+        return mock_gamelift
+
+    def test_missing_collection_key_is_incomplete(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch({})):
+            result = get_fleet_utilization(FLEET_ID)
+        assert result["status"] == "incomplete"
+        assert result["FleetUtilization"] == []
+        assert result.get("error", {}).get("code") == "malformed_response"
+
+    def test_wrong_collection_type_is_incomplete(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch({"FleetUtilization": "nope"})):
+            result = get_fleet_utilization(FLEET_ID)
+        assert result["status"] == "incomplete"
+        assert result["FleetUtilization"] == []
+        assert result["error"]["code"] == "malformed_response"
+
+    def test_list_of_non_dict_items_is_incomplete(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {"FleetUtilization": ["malformed", 123, None]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        assert result["status"] == "incomplete"
+        assert result["FleetUtilization"] == []
+        assert result["error"]["code"] == "malformed_response"
+
+    def test_rows_with_all_operational_values_invalid_is_incomplete(self):
+        # A dict item that projects to nothing usable (all operational values
+        # fail validation, only a bare correlation id remains) is not an
+        # authoritative zero result.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {"Name": "arn:aws:evil", "Status": "http://x", "Threshold": float("inf")},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        assert result["status"] == "incomplete"
+        assert result["ScalingPolicies"] == []
+        assert result["error"]["code"] == "malformed_response"
+
+    def test_valid_empty_list_without_token_is_empty(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_capacity
+
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch({"FleetCapacity": []})):
+            result = get_fleet_capacity(FLEET_ID)
+        assert result["status"] == "empty"
+        assert result["FleetCapacity"] == []
+        assert "error" not in result
+
+    def test_mixed_valid_and_non_dict_items_projects_valid_only(self):
+        # A malformed item mixed with a valid one yields the valid row (ok),
+        # not incomplete — at least one usable operational row was returned.
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                "malformed",
+                {"FleetId": FLEET_ID, "ActiveServerProcessCount": 3, "Location": "us-west-2"},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        assert result["status"] == "ok"
+        assert len(result["FleetUtilization"]) == 1
+        assert result["FleetUtilization"][0]["ActiveServerProcessCount"] == 3

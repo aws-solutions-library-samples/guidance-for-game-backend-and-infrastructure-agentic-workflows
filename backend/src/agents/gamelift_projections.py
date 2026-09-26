@@ -34,18 +34,27 @@ to ignore sensitive fields:
 Dispositions are kept mutually distinct via the ``status`` field:
 
 * ``ok``        — full result set returned.
-* ``empty``     — the call succeeded and returned zero items *and* no more pages.
+* ``empty``     — the call succeeded and returned a valid, present, empty list
+                  *and* no more pages. Never used for a malformed shape.
 * ``denied``    — the provider refused the call (authorization / access).
-* ``incomplete``— the call failed, or only part of the result set was retrieved
+* ``incomplete``— the call failed; only part of the result set was retrieved
                   (residual ``NextToken`` — including an empty page that still
-                  carries a continuation token — with no client-side cap hit).
-* ``truncated`` — the result set was bounded by this projection's item cap.
+                  carries a continuation token); or the response shape was
+                  malformed (collection missing/wrongly typed, or every item
+                  non-projectable), surfaced via ``error.code`` ==
+                  ``malformed_response``.
+* ``truncated`` — the result set was bounded by this projection's item cap, the
+                  serialized-payload budget, or contained non-dict items that
+                  were skipped.
 """
 
 from __future__ import annotations
 
 # Standard library
+import ipaddress
+import json
 import math
+import re
 from typing import Any, Callable
 
 # Third-party packages
@@ -86,6 +95,10 @@ ERROR_NOT_FOUND = "not_found"
 ERROR_THROTTLED = "throttled"
 ERROR_INVALID_REQUEST = "invalid_request"
 ERROR_PROVIDER_ERROR = "provider_error"
+# Raised locally (not by the provider) when the response shape itself is
+# unusable: the collection is missing/wrongly typed, or every item is
+# non-projectable. A malformed response is never an authoritative zero result.
+ERROR_MALFORMED_RESPONSE = "malformed_response"
 
 # AWS/GameLift error codes that mean "authorization refused".
 _DENIED_CODES = {
@@ -153,10 +166,106 @@ def error_result(collection_key: str, exc: BaseException) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # Code-owned value validators
+#
+# Field-name allowlisting is not enough: an allowed string field still carries a
+# provider-controlled *value*. Every model-visible string must satisfy its
+# field-specific grammar and must never carry sensitive coordinates — an ARN
+# prefix, a bare account ID, a URL scheme, an IP/network address, or control
+# characters — even when the value is short. Values that do not match their
+# grammar are dropped by construction rather than passed through.
 # ---------------------------------------------------------------------------
-def _valid_string(value: Any) -> bool:
-    """Exact ``str`` within the code-point bound (rejects oversized strings)."""
-    return isinstance(value, str) and len(value) <= GAMELIFT_MAX_STRING_LENGTH
+
+# Any C0/C1 control character (incl. newlines, NUL) disqualifies a string: it
+# can inject log/JSON structure or smuggle payload past a naive length check.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+# A run of exactly 12 digits is an AWS account ID; reject it anywhere in a value.
+_ACCOUNT_ID = re.compile(r"\b\d{12}\b")
+
+# URL / URI schemes (http, https, s3, file, ftp, ...) — the "scheme://" shape.
+_URL_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+# Field grammars. These are deliberately strict allowlists of the character
+# classes GameLift actually uses for each field kind.
+#
+# * identifier — fleet/resource IDs: ``fleet-...``, ``sc-...``; ASCII word chars
+#   and dashes only. An ARN contains ``:`` and ``/`` so it fails this grammar.
+# * region     — GameLift Location: ``us-west-2``, ``eu-west-1``, ``local-...``;
+#   lowercase letters, digits, and single dashes.
+# * name       — human/policy names: word chars, space, dash, underscore, dot.
+# * token      — enum-like values (Status, ComparisonOperator, InstanceType,
+#   metric names, ...): word chars, dash, dot; no whitespace or slashes.
+_RE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{0,254}$")
+_RE_REGION = re.compile(r"^[a-z]{2,}(-[a-z0-9]+){1,4}$")
+_RE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,254}$")
+_RE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,254}$")
+
+# Validator kinds keyed on field grammar.
+_IDENTIFIER = "identifier"
+_REGION = "region"
+_NAME = "name"
+_TOKEN = "token"
+_NUMBER = "num"
+
+_STRING_GRAMMARS: dict[str, "re.Pattern[str]"] = {
+    _IDENTIFIER: _RE_IDENTIFIER,
+    _REGION: _RE_REGION,
+    _NAME: _RE_NAME,
+    _TOKEN: _RE_TOKEN,
+}
+
+
+def _looks_like_network_coordinate(value: str) -> bool:
+    """True if the string is (or contains) an IP address or CIDR block."""
+    candidate = value.split("/", 1)[0]
+    try:
+        ipaddress.ip_address(candidate)
+        return True
+    except ValueError:
+        pass
+    # Also catch dotted-quad / colon-hex substrings embedded in a longer string.
+    for token in re.split(r"[\s,;]+", value):
+        host = token.split("/", 1)[0]
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _has_sensitive_coordinate(value: str) -> bool:
+    """True if the string carries an ARN prefix, account ID, URL scheme, or IP."""
+    if value.startswith("arn:"):
+        return True
+    if _ACCOUNT_ID.search(value):
+        return True
+    if _URL_SCHEME.search(value):
+        return True
+    if _looks_like_network_coordinate(value):
+        return True
+    return False
+
+
+def _valid_typed_string(value: Any, kind: str) -> bool:
+    """Exact ``str`` matching ``kind``'s grammar and free of sensitive content.
+
+    Rejects, regardless of length: non-strings, oversized strings, control
+    characters, ARN prefixes, bare account IDs, URL schemes, IP/network
+    coordinates, and anything failing the field-specific grammar.
+    """
+    if not isinstance(value, str):
+        return False
+    if len(value) > GAMELIFT_MAX_STRING_LENGTH:
+        return False
+    if _CONTROL_CHARS.search(value):
+        return False
+    if _has_sensitive_coordinate(value):
+        return False
+    grammar = _STRING_GRAMMARS.get(kind)
+    if grammar is None:
+        return False
+    return grammar.match(value) is not None
 
 
 def _valid_number(value: Any) -> bool:
@@ -177,30 +286,25 @@ def _valid_number(value: Any) -> bool:
     return False
 
 
-# Per-field validator kind. ``str`` fields must pass ``_valid_string``; ``num``
-# fields must pass ``_valid_number``. Anything failing its validator (or of an
-# unexpected type) is dropped by construction.
-_STRING = "str"
-_NUMBER = "num"
-
-
 def _copy_validated(item: dict[str, Any], fields: tuple[tuple[str, str], ...]) -> dict[str, Any]:
-    """Return only allowlisted fields whose value passes its typed validator.
+    """Return only allowlisted fields whose value passes its field grammar.
 
-    ``fields`` is a tuple of ``(field_name, kind)`` pairs. Anything not named —
-    including future provider fields, full ARNs, endpoints, and arbitrary nested
-    blobs — is dropped by construction. An allowed field carrying an invalid
-    value (wrong type, oversized string, non-finite / oversized number) is also
-    dropped, predictably, rather than passed through.
+    ``fields`` is a tuple of ``(field_name, kind)`` pairs where ``kind`` is one
+    of the string grammar kinds (identifier/region/name/token) or ``_NUMBER``.
+    Anything not named — future provider fields, full ARNs, endpoints, arbitrary
+    nested blobs — is dropped by construction. An allowed field carrying an
+    invalid value (wrong type, failed grammar, sensitive coordinate, oversized
+    string, non-finite / oversized number) is also dropped, predictably.
     """
     projected: dict[str, Any] = {}
     for key, kind in fields:
         value = item.get(key)
         if value is None:
             continue
-        if kind is _STRING and _valid_string(value):
-            projected[key] = value
-        elif kind is _NUMBER and _valid_number(value):
+        if kind is _NUMBER:
+            if _valid_number(value):
+                projected[key] = value
+        elif _valid_typed_string(value, kind):
             projected[key] = value
     return projected
 
@@ -215,25 +319,15 @@ def _copy_validated_numbers(counts: dict[str, Any], allowed: tuple[str, ...]) ->
     return projected
 
 
-def _within_payload_budget(projected: list[dict[str, Any]]) -> bool:
-    """True when the aggregate serialized projection is within the char budget."""
-    # A rough, allocation-light size estimate: sum the code points of every key
-    # and stringified scalar. This bounds total model-context growth without
-    # importing json for a hot path.
-    total = 0
-    for row in projected:
-        for key, value in row.items():
-            total += len(key)
-            if isinstance(value, str):
-                total += len(value)
-            elif isinstance(value, dict):
-                for nk, nv in value.items():
-                    total += len(nk) + len(str(nv))
-            else:
-                total += len(str(value))
-            if total > GAMELIFT_MAX_PROJECTED_CHARS:
-                return False
-    return total <= GAMELIFT_MAX_PROJECTED_CHARS
+def _serialized_length(result: dict[str, Any]) -> int:
+    """Length of the exact JSON representation the model will see.
+
+    Measured with the same escaping (``json.dumps`` default ``ensure_ascii``)
+    the runtime uses, so control characters and non-ASCII code points that
+    expand under escaping cannot slip a payload past the budget. Covers keys,
+    the ``status``/``truncated`` envelope, and every escaped scalar.
+    """
+    return len(json.dumps(result))
 
 
 def _project_collection(
@@ -243,42 +337,67 @@ def _project_collection(
 ) -> dict[str, Any]:
     """Bound, project, validate, and classify a successful provider response.
 
-    Empty, ok, truncated (cap hit), and incomplete (residual NextToken)
-    dispositions are kept distinct. An empty page that still carries a
-    continuation token is ``incomplete`` — never a complete ``empty``.
+    Dispositions are kept distinct. A malformed response shape — the collection
+    missing or of the wrong type, or a non-empty collection every item of which
+    is non-projectable — is ``incomplete`` with a ``malformed_response`` error
+    code, never an authoritative ``empty``. ``empty`` is reserved for a valid,
+    present, empty list with no continuation token. An empty page that still
+    carries a continuation token is ``incomplete``.
     """
     raw_items = response.get(collection_key)
-    if not isinstance(raw_items, list):
-        raw_items = []
-
     has_more_pages = bool(response.get("NextToken"))
-    capped = len(raw_items) > GAMELIFT_MAX_PROJECTED_ITEMS
 
-    projected = [project_item(item) for item in raw_items[:GAMELIFT_MAX_PROJECTED_ITEMS] if isinstance(item, dict)]
+    # Missing or wrongly-typed collection: the shape itself is unusable.
+    if not isinstance(raw_items, list):
+        return {
+            "status": STATUS_INCOMPLETE,
+            collection_key: [],
+            "error": {"code": ERROR_MALFORMED_RESPONSE},
+        }
 
-    # Aggregate payload budget: if the (already item-capped) projection is still
-    # too large, drop rows from the tail until it fits and mark it truncated.
+    # A valid, present, empty list: distinguish a clean zero result from an
+    # empty page that still has a continuation token.
+    if not raw_items:
+        if has_more_pages:
+            return {"status": STATUS_INCOMPLETE, collection_key: [], "truncated": True}
+        return {"status": STATUS_EMPTY, collection_key: []}
+
+    dict_items = [item for item in raw_items if isinstance(item, dict)]
+
+    capped = len(dict_items) > GAMELIFT_MAX_PROJECTED_ITEMS
+    projected = [project_item(item) for item in dict_items[:GAMELIFT_MAX_PROJECTED_ITEMS]]
+    # Drop rows that projected to nothing usable (every operational value failed
+    # validation); they carry no signal and could hide a malformed row.
+    projected = [row for row in projected if row]
+
+    if not projected:
+        # The provider returned items, but none survived projection (wrong item
+        # types, or every operational value invalid) — the response was
+        # malformed/invalid, not an authoritative zero inventory.
+        return {
+            "status": STATUS_INCOMPLETE,
+            collection_key: [],
+            "error": {"code": ERROR_MALFORMED_RESPONSE},
+        }
+
+    # Aggregate payload budget, measured against the actual serialized result:
+    # drop rows from the tail until the serialized envelope fits, then mark it
+    # truncated.
     payload_capped = False
-    while projected and not _within_payload_budget(projected):
+    while (
+        len(projected) > 1
+        and _serialized_length({collection_key: projected, "status": STATUS_TRUNCATED, "truncated": True})
+        > GAMELIFT_MAX_PROJECTED_CHARS
+    ):
         projected.pop()
         payload_capped = True
 
     result: dict[str, Any] = {collection_key: projected}
 
-    if not projected:
-        # Distinguish "genuinely empty" from "empty page with more to come".
-        if has_more_pages:
-            result["status"] = STATUS_INCOMPLETE
-            result["truncated"] = True
-        else:
-            result["status"] = STATUS_EMPTY
-        return result
-
     if capped or payload_capped:
         result["status"] = STATUS_TRUNCATED
         result["truncated"] = True
     elif has_more_pages:
-        # More pages exist but we returned a single, bounded call: partial view.
         result["status"] = STATUS_INCOMPLETE
         result["truncated"] = True
     else:
@@ -290,35 +409,35 @@ def _project_collection(
 # Per-operation allowlists (field name + typed validator) and item projectors
 # ---------------------------------------------------------------------------
 _UTILIZATION_FIELDS: tuple[tuple[str, str], ...] = (
-    ("FleetId", _STRING),
+    ("FleetId", _IDENTIFIER),
     ("ActiveServerProcessCount", _NUMBER),
     ("ActiveGameSessionCount", _NUMBER),
     ("CurrentPlayerSessionCount", _NUMBER),
     ("MaximumPlayerSessionCount", _NUMBER),
-    ("Location", _STRING),
+    ("Location", _REGION),
 )
 
 _CAPACITY_FIELDS: tuple[tuple[str, str], ...] = (
-    ("FleetId", _STRING),
-    ("InstanceType", _STRING),
-    ("Location", _STRING),
+    ("FleetId", _IDENTIFIER),
+    ("InstanceType", _TOKEN),
+    ("Location", _REGION),
 )
 _INSTANCE_COUNT_FIELDS = ("DESIRED", "MINIMUM", "MAXIMUM", "PENDING", "ACTIVE", "IDLE", "TERMINATING")
 _GROUP_COUNT_FIELDS = ("PENDING", "ACTIVE", "IDLE", "TERMINATING")
 
 _SCALING_POLICY_FIELDS: tuple[tuple[str, str], ...] = (
-    ("FleetId", _STRING),
-    ("Name", _STRING),
-    ("Status", _STRING),
+    ("FleetId", _IDENTIFIER),
+    ("Name", _NAME),
+    ("Status", _TOKEN),
     ("ScalingAdjustment", _NUMBER),
-    ("ScalingAdjustmentType", _STRING),
-    ("ComparisonOperator", _STRING),
+    ("ScalingAdjustmentType", _TOKEN),
+    ("ComparisonOperator", _TOKEN),
     ("Threshold", _NUMBER),
     ("EvaluationPeriods", _NUMBER),
-    ("MetricName", _STRING),
-    ("PolicyType", _STRING),
-    ("UpdateStatus", _STRING),
-    ("Location", _STRING),
+    ("MetricName", _TOKEN),
+    ("PolicyType", _TOKEN),
+    ("UpdateStatus", _TOKEN),
+    ("Location", _REGION),
 )
 
 
