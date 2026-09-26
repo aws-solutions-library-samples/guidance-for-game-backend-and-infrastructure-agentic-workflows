@@ -22,7 +22,11 @@ from operations.validation.e0_latency import DEFAULT_BUDGET
 
 pytestmark = pytest.mark.unit
 
-SCHEMA_PATH = Path(__file__).parents[3] / "docs" / "evidence" / "e0-latency-evidence.schema.json"
+PROJECT_ROOT = Path(__file__).parents[3]
+SCHEMA_PATH = PROJECT_ROOT / "docs" / "evidence" / "e0-latency-evidence.schema.json"
+PUBLISHED_EVIDENCE_PATH = PROJECT_ROOT / "docs" / "evidence" / "e0-latency-2026-09-21-dynamodb.json"
+ADR_PATH = PROJECT_ROOT / "docs" / "adr" / "0005-persist-operations-and-recover-workflows.md"
+ADR_INDEX_PATH = PROJECT_ROOT / "docs" / "adr" / "README.md"
 FAKE_FLEET_ID = "fleet-00000000-0000-4000-8000-000000000000"
 
 
@@ -94,3 +98,43 @@ def test_transactional_mode_document_validates_and_states_mode():
     assert errors == [], f"transactional evidence document failed schema: {errors}"
     assert doc["assumptions"]["persistence_mode"] == MODE_DYNAMODB_TRANSACT
     assert doc["evaluation"]["persistence_acceptable"] is True
+
+
+def test_published_evidence_validates_and_satisfies_acceptance_rule():
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    evidence = json.loads(PUBLISHED_EVIDENCE_PATH.read_text(encoding="utf-8"))
+    errors = sorted(Draft202012Validator(schema).iter_errors(evidence), key=str)
+
+    assert errors == [], f"published evidence failed schema: {errors}"
+
+    results = evidence["results_ms"]
+    evaluation = evidence["evaluation"]
+    budget = evidence["budget_ms"]
+    clean_run = (
+        results["successes"] == results["sample_size"]
+        and results["failures"] == 0
+        and results["timeouts"] == 0
+        and results["partial_denials"] == 0
+    )
+    acceptance_ceiling_ms = budget["gateway_integration_timeout"] - budget["cancellation_margin"]
+
+    assert evidence["assumptions"]["persistence_mode"] == "dynamodb-transactional"
+    assert evaluation["persistence_acceptable"] is True
+    assert evaluation["clean_run"] is clean_run is True
+    assert evaluation["acceptance_ceiling_ms"] == acceptance_ceiling_ms
+    assert evaluation["p99_ms"] <= acceptance_ceiling_ms
+    assert evaluation["synchronous_accepted"] is True
+
+
+def test_published_adr_records_accepted_state_without_stale_pending_claims():
+    adr = ADR_PATH.read_text(encoding="utf-8")
+    adr_index = ADR_INDEX_PATH.read_text(encoding="utf-8")
+
+    assert "- **Status:** Accepted" in adr
+    assert "| [ADR 0005](0005-persist-operations-and-recover-workflows.md) | Accepted |" in adr_index
+    for stale_claim in (
+        "live measurement PENDING",
+        "not yet a live measured percentile",
+        "This record stays **Proposed** until that evidence exists",
+    ):
+        assert stale_claim not in adr
