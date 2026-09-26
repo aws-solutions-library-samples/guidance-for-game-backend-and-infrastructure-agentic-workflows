@@ -39,13 +39,16 @@ Dispositions are kept mutually distinct via the ``status`` field:
 * ``denied``    — the provider refused the call (authorization / access).
 * ``incomplete``— the call failed; only part of the result set was retrieved
                   (residual ``NextToken`` — including an empty page that still
-                  carries a continuation token); or the response shape was
-                  malformed (collection missing/wrongly typed, or every item
-                  non-projectable), surfaced via ``error.code`` ==
-                  ``malformed_response``.
-* ``truncated`` — the result set was bounded by this projection's item cap, the
-                  serialized-payload budget, or contained non-dict items that
-                  were skipped.
+                  carries a continuation token); the response shape was
+                  malformed (non-mapping top-level response, collection
+                  missing/wrongly typed, or every item non-projectable); or a
+                  mixed collection retained its valid rows while discarding
+                  malformed ones. All malformed/partial-shape cases surface via
+                  ``error.code`` == ``malformed_response`` and are never ``ok``.
+* ``truncated`` — the result set was bounded by this projection's item cap or
+                  the serialized-payload budget. (A mixed collection that also
+                  discarded malformed rows is ``incomplete``/``malformed_response``,
+                  not ``truncated``, even though it is likewise partial.)
 """
 
 from __future__ import annotations
@@ -179,8 +182,19 @@ def error_result(collection_key: str, exc: BaseException) -> dict[str, Any]:
 # can inject log/JSON structure or smuggle payload past a naive length check.
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
-# A run of exactly 12 digits is an AWS account ID; reject it anywhere in a value.
-_ACCOUNT_ID = re.compile(r"\b\d{12}\b")
+# A run of exactly 12 digits is an AWS account ID; reject it anywhere in a value,
+# including when it is *decorated* — flanked by letters, underscores, or other
+# name characters (e.g. ``acct_123456789012_prod`` or ``prodX123456789012Y``).
+# Word boundaries (``\b``) do not fire between a letter/underscore and a digit,
+# so they miss these evasions. Digit-specific negative lookarounds match a run
+# of exactly 12 digits with no adjacent digit on either side, regardless of any
+# surrounding non-digit characters.
+_ACCOUNT_ID = re.compile(r"(?<!\d)\d{12}(?!\d)")
+
+# Dotted-quad IPv4 (optionally with a ``/prefix``) embedded anywhere in a value,
+# even when flanked by name characters (e.g. ``host-10.11.12.13-prod`` or
+# ``net-10.11.12.0-24-prod``). Each octet is 0-255; validated exactly below.
+_EMBEDDED_IPV4 = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
 
 # URL / URI schemes (http, https, s3, file, ftp, ...) — the "scheme://" shape.
 _URL_SCHEME = re.compile(r"[a-zA-Z][a-zA-Z0-9+.\-]*://")
@@ -216,14 +230,23 @@ _STRING_GRAMMARS: dict[str, "re.Pattern[str]"] = {
 
 
 def _looks_like_network_coordinate(value: str) -> bool:
-    """True if the string is (or contains) an IP address or CIDR block."""
+    """True if the string is, or merely *contains*, an IP address or CIDR block.
+
+    Detects three shapes, including when the coordinate is embedded inside an
+    otherwise grammar-valid value (dashes/underscores/letters around it):
+
+    * the whole value (or a ``host/prefix`` split) parses as an IP address;
+    * any whitespace/comma/semicolon-delimited token parses as an IP address;
+    * a dotted-quad IPv4 (with an optional ``/prefix`` or ``-prefix``) or a
+      colon-hex IPv6 run appears anywhere in the value.
+    """
     candidate = value.split("/", 1)[0]
     try:
         ipaddress.ip_address(candidate)
         return True
     except ValueError:
         pass
-    # Also catch dotted-quad / colon-hex substrings embedded in a longer string.
+    # Whole tokens delimited by whitespace/comma/semicolon.
     for token in re.split(r"[\s,;]+", value):
         host = token.split("/", 1)[0]
         try:
@@ -231,6 +254,24 @@ def _looks_like_network_coordinate(value: str) -> bool:
             return True
         except ValueError:
             continue
+    # Embedded dotted-quad IPv4 flanked by non-IP characters (dashes, letters,
+    # underscores). Validate each captured quad so a version-like ``1.2.3.4``
+    # token is only rejected when every octet is a legal 0-255 IPv4 octet.
+    for match in _EMBEDDED_IPV4.finditer(value):
+        try:
+            ipaddress.IPv4Address(match.group(1))
+            return True
+        except ValueError:
+            continue
+    # Embedded colon-hex IPv6 runs. Any colon-bearing hextet sequence that parses
+    # as an IPv6 address is a network coordinate.
+    for token in re.split(r"[^0-9A-Fa-f:]+", value):
+        if ":" in token:
+            try:
+                ipaddress.IPv6Address(token)
+                return True
+            except ValueError:
+                continue
     return False
 
 
@@ -331,19 +372,36 @@ def _serialized_length(result: dict[str, Any]) -> int:
 
 
 def _project_collection(
-    response: dict[str, Any],
+    response: Any,
     collection_key: str,
     project_item: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
     """Bound, project, validate, and classify a successful provider response.
 
-    Dispositions are kept distinct. A malformed response shape — the collection
-    missing or of the wrong type, or a non-empty collection every item of which
-    is non-projectable — is ``incomplete`` with a ``malformed_response`` error
-    code, never an authoritative ``empty``. ``empty`` is reserved for a valid,
-    present, empty list with no continuation token. An empty page that still
-    carries a continuation token is ``incomplete``.
+    Dispositions are kept distinct. A malformed response shape — a non-mapping
+    top-level response, the collection missing or of the wrong type, or a
+    non-empty collection every item of which is non-projectable — is
+    ``incomplete`` with a ``malformed_response`` error code, never an
+    authoritative ``empty`` or a complete ``ok``. ``empty`` is reserved for a
+    valid, present, empty list with no continuation token. An empty page that
+    still carries a continuation token is ``incomplete``.
+
+    A *mixed* collection (some valid dict rows alongside discarded non-dict or
+    wholly-invalid rows) retains the bounded valid rows but is reported as
+    ``incomplete``/``malformed_response`` and ``truncated``: the view is partial
+    because rows were dropped, so it must never be ``ok``. ``ok`` is reserved for
+    a wholly valid, complete payload with nothing discarded and no continuation
+    token.
     """
+    # A non-mapping top-level response (None, list, str, int, ...) is itself
+    # malformed. Classify it as typed incomplete rather than raising on ``.get``.
+    if not isinstance(response, dict):
+        return {
+            "status": STATUS_INCOMPLETE,
+            collection_key: [],
+            "error": {"code": ERROR_MALFORMED_RESPONSE},
+        }
+
     raw_items = response.get(collection_key)
     has_more_pages = bool(response.get("NextToken"))
 
@@ -363,12 +421,18 @@ def _project_collection(
         return {"status": STATUS_EMPTY, collection_key: []}
 
     dict_items = [item for item in raw_items if isinstance(item, dict)]
+    # Track whether ANY row was discarded as malformed: non-dict entries, or dict
+    # entries that projected to nothing usable. A discarded row means the view is
+    # partial, so the result must be incomplete/malformed_response, never ok.
+    non_dict_dropped = len(dict_items) != len(raw_items)
 
     capped = len(dict_items) > GAMELIFT_MAX_PROJECTED_ITEMS
-    projected = [project_item(item) for item in dict_items[:GAMELIFT_MAX_PROJECTED_ITEMS]]
+    considered = dict_items[:GAMELIFT_MAX_PROJECTED_ITEMS]
+    projected_all = [project_item(item) for item in considered]
     # Drop rows that projected to nothing usable (every operational value failed
     # validation); they carry no signal and could hide a malformed row.
-    projected = [row for row in projected if row]
+    projected = [row for row in projected_all if row]
+    invalid_row_dropped = len(projected) != len(projected_all)
 
     if not projected:
         # The provider returned items, but none survived projection (wrong item
@@ -394,7 +458,14 @@ def _project_collection(
 
     result: dict[str, Any] = {collection_key: projected}
 
-    if capped or payload_capped:
+    # A mixed collection retains bounded valid rows but is partial by
+    # construction: some rows were discarded as malformed. Report it as typed
+    # incomplete/malformed_response and truncated — never ok.
+    if non_dict_dropped or invalid_row_dropped:
+        result["status"] = STATUS_INCOMPLETE
+        result["truncated"] = True
+        result["error"] = {"code": ERROR_MALFORMED_RESPONSE}
+    elif capped or payload_capped:
         result["status"] = STATUS_TRUNCATED
         result["truncated"] = True
     elif has_more_pages:

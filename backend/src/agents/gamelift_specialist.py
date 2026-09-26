@@ -356,8 +356,9 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
 
 # The ONE runtime tool-registration collection. Model access to GameLift tools
 # is defined by exactly this list — it is what create_specialist_agent receives
-# and therefore what the agent can call. Tests assert on this collection (not
-# ``__all__``) so dropping or renaming a tool here is caught as a regression.
+# and therefore what the agent can call. Tests assert on the tools actually
+# handed to the factory (captured below), so dropping or renaming a tool here is
+# caught as a regression.
 GAMELIFT_AGENT_TOOLS = [
     list_gamelift_fleets,
     get_fleet_utilization,
@@ -365,17 +366,48 @@ GAMELIFT_AGENT_TOOLS = [
     get_scaling_policies,
 ]
 
-gamelift_agent = create_specialist_agent(
-    service_name="GameLift",
-    emoji="🎮",
-    mcp_server_names=None,  # GameLift uses boto3 directly
-    kb_id=GAMELIFT_KB_ID,
-    prompt_fn=get_optimized_gamelift_prompt,
-    fallback_fn=None,  # No fallback needed (boto3 is primary)
-    additional_tools=GAMELIFT_AGENT_TOOLS,
-)
+# Import-time capture of the exact arguments handed to create_specialist_agent.
+# Tests read this to observe what the runtime agent was actually built from —
+# not a post-construction alias that could silently drift from the factory call.
+# Removing a tool from ``additional_tools`` changes this captured record and so
+# fails the registration test.
+_CAPTURED_SPECIALIST_REGISTRATION: dict[str, Any] | None = None
 
-# Bind the exact object handed to the factory so a test can prove the asserted
-# registration collection is the same one the runtime agent was built from —
-# not a parallel list that could silently drift.
-_REGISTERED_TOOLS_FOR_AGENT = GAMELIFT_AGENT_TOOLS
+
+def get_captured_specialist_registration() -> dict[str, Any] | None:
+    """Return the arguments captured from the most recent specialist build.
+
+    Contains ``service_name`` and the exact ``additional_tools`` list passed to
+    :func:`create_specialist_agent`. Used by tests to prove the runtime agent is
+    registered with precisely the intended tool collection.
+    """
+    return _CAPTURED_SPECIALIST_REGISTRATION
+
+
+def build_gamelift_agent(additional_tools: list | None = None):
+    """Build the GameLift specialist agent and capture its registration.
+
+    This is the single construction path for the runtime agent. It records the
+    exact ``additional_tools`` collection (and service name) handed to
+    :func:`create_specialist_agent` in ``_CAPTURED_SPECIALIST_REGISTRATION`` so a
+    test can observe the actual factory argument. Callers that omit
+    ``additional_tools`` get the canonical :data:`GAMELIFT_AGENT_TOOLS`.
+    """
+    global _CAPTURED_SPECIALIST_REGISTRATION
+    tools = GAMELIFT_AGENT_TOOLS if additional_tools is None else additional_tools
+    _CAPTURED_SPECIALIST_REGISTRATION = {
+        "service_name": "GameLift",
+        "additional_tools": tools,
+    }
+    return create_specialist_agent(
+        service_name="GameLift",
+        emoji="🎮",
+        mcp_server_names=None,  # GameLift uses boto3 directly
+        kb_id=GAMELIFT_KB_ID,
+        prompt_fn=get_optimized_gamelift_prompt,
+        fallback_fn=None,  # No fallback needed (boto3 is primary)
+        additional_tools=tools,
+    )
+
+
+gamelift_agent = build_gamelift_agent()

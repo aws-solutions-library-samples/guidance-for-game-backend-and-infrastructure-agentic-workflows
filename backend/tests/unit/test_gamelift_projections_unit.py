@@ -678,6 +678,153 @@ class TestFieldSpecificGrammar:
 
 
 # ---------------------------------------------------------------------------
+# Embedded sensitive-coordinate detection (review issue #1).
+#
+# A 12-digit account ID or an IPv4/CIDR coordinate must be rejected even when it
+# is *decorated* — adjacent to letters/underscores/dashes inside an otherwise
+# grammar-valid value. Word boundaries and whole-token parsing miss these
+# evasions. These adversarial cases attack every relevant allowed string class
+# (identifier, name, region, token) with decorated coordinates.
+# ---------------------------------------------------------------------------
+class TestEmbeddedSensitiveCoordinateDetection:
+    def _patch(self, describe_return):
+        mock_gamelift = MagicMock()
+        mock_gamelift.describe_fleet_utilization.return_value = describe_return
+        mock_gamelift.describe_scaling_policies.return_value = describe_return
+        mock_gamelift.describe_fleet_capacity.return_value = describe_return
+        return mock_gamelift
+
+    def test_account_id_wrapped_in_letters_in_name_is_rejected(self):
+        # `prodX123456789012Y` — 12 digits flanked by letters, so a \b boundary
+        # never matches. Must still be rejected.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "prodX123456789012Y", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert SYNTHETIC_ACCOUNT_ID not in json.dumps(result)
+        assert row["Status"] == "ACTIVE"
+
+    def test_decorated_account_id_underscores_in_name_is_rejected(self):
+        # `acct_123456789012_prod` — 12 digits flanked by underscores.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "acct_123456789012_prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert SYNTHETIC_ACCOUNT_ID not in json.dumps(result)
+
+    def test_decorated_account_id_in_identifier_is_rejected(self):
+        # Identifier grammar (FleetId) decorated account id.
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {"FleetUtilization": [{"FleetId": "fleet-123456789012-prod", "Location": "us-west-2"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "FleetId" not in row
+        assert SYNTHETIC_ACCOUNT_ID not in json.dumps(result)
+
+    def test_decorated_account_id_in_token_is_rejected(self):
+        # Token grammar (Status/enum-like) decorated account id.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "p", "MetricName": "metric.123456789012.x"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "MetricName" not in row
+        assert SYNTHETIC_ACCOUNT_ID not in json.dumps(result)
+
+    def test_embedded_ipv4_in_name_is_rejected(self):
+        # `host-10.11.12.13-prod` — IPv4 wrapped in valid name characters, so
+        # whole-value and whitespace-token parsing both miss it.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "host-10.11.12.13-prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert SYNTHETIC_IP not in json.dumps(result)
+        assert "10.11.12.13" not in json.dumps(result)
+
+    def test_embedded_ipv4_in_identifier_is_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {"FleetUtilization": [{"FleetId": "node-10.11.12.13", "Location": "us-west-2"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        row = result["FleetUtilization"][0]
+        assert "FleetId" not in row
+        assert "10.11.12.13" not in json.dumps(result)
+
+    def test_embedded_cidr_in_name_is_rejected(self):
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "net-10.11.12.0-24-prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        assert "Name" not in result["ScalingPolicies"][0]
+
+    def test_embedded_ipv4_in_region_is_rejected(self):
+        # Region grammar is numeric-permissive; a dotted quad wrapped in a
+        # region-shaped token must still be rejected.
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                {"FleetId": FLEET_ID, "Location": "us-10.11.12.13", "ActiveServerProcessCount": 1},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        assert "Location" not in result["FleetUtilization"][0]
+        assert "10.11.12.13" not in json.dumps(result)
+
+    def test_thirteen_digit_run_is_not_falsely_flagged_but_twelve_is(self):
+        # Discriminating: exactly 12 consecutive digits (an account id) inside a
+        # value is rejected; a legitimate shorter numeric suffix survives.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {"FleetId": FLEET_ID, "Name": "scale-up-v2", "Status": "ACTIVE"},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        # Legitimate short numeric suffix is preserved.
+        assert result["ScalingPolicies"][0]["Name"] == "scale-up-v2"
+
+    def test_embedded_ipv6_in_name_is_rejected(self):
+        # A colon-hex IPv6 address wrapped in valid name characters must be
+        # rejected; the surrounding dashes keep it inside the name grammar.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {"ScalingPolicies": [{"Name": "host-fe80::1-prod", "Status": "ACTIVE"}]}
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        row = result["ScalingPolicies"][0]
+        assert "Name" not in row
+        assert "fe80::1" not in json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
 # Log redaction: the failure log must never contain raw provider text or the
 # caller fleet id (review issue #1). We capture the actual Loguru sink.
 # ---------------------------------------------------------------------------
@@ -885,9 +1032,12 @@ class TestMalformedCollectionSemantics:
         assert result["FleetCapacity"] == []
         assert "error" not in result
 
-    def test_mixed_valid_and_non_dict_items_projects_valid_only(self):
-        # A malformed item mixed with a valid one yields the valid row (ok),
-        # not incomplete — at least one usable operational row was returned.
+    def test_mixed_valid_and_non_dict_items_retains_valid_but_is_incomplete(self):
+        # A malformed (non-dict) item mixed with a valid one may RETAIN the valid
+        # row (bounded), but the result must be status=incomplete with
+        # malformed_response — never ``ok``. ``ok`` is reserved for a wholly
+        # valid, complete payload; a discarded malformed row makes the view
+        # partial and the model must be told so.
         # Local modules
         from agents.gamelift_specialist import get_fleet_utilization
 
@@ -899,6 +1049,76 @@ class TestMalformedCollectionSemantics:
         }
         with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
             result = get_fleet_utilization(FLEET_ID)
-        assert result["status"] == "ok"
+        assert result["status"] == "incomplete"
+        assert result["error"]["code"] == "malformed_response"
+        assert result["status"] != "ok"
+        # Bounded valid rows are retained.
         assert len(result["FleetUtilization"]) == 1
         assert result["FleetUtilization"][0]["ActiveServerProcessCount"] == 3
+
+    def test_mixed_valid_and_non_dict_items_marks_truncated(self):
+        # The retained-but-partial view is flagged truncated so downstream
+        # consumers treat it as a partial result, not a complete inventory.
+        # Local modules
+        from agents.gamelift_specialist import get_scaling_policies
+
+        raw = {
+            "ScalingPolicies": [
+                {"FleetId": FLEET_ID, "Name": "scale-up", "Status": "ACTIVE"},
+                42,
+                None,
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_scaling_policies(FLEET_ID)
+        assert result["status"] == "incomplete"
+        assert result["error"]["code"] == "malformed_response"
+        assert result.get("truncated") is True
+        assert len(result["ScalingPolicies"]) == 1
+        assert result["ScalingPolicies"][0]["Name"] == "scale-up"
+
+    def test_non_mapping_top_level_response_is_typed_incomplete_not_raised(self):
+        # A non-mapping top-level provider response (None, list, str, int) must
+        # NOT raise: it is classified as a typed, sanitized incomplete
+        # malformed_response with an empty bounded collection.
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        for bad in (None, [], ["x"], "nope", 123, 4.5):
+            with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(bad)):
+                result = get_fleet_utilization(FLEET_ID)
+            assert result["status"] == "incomplete", f"top-level {bad!r} must be incomplete"
+            assert result["error"]["code"] == "malformed_response", f"top-level {bad!r}"
+            assert result["FleetUtilization"] == []
+            assert result["status"] != "ok"
+            assert result["status"] != "empty"
+
+    def test_project_collection_rejects_non_mapping_without_raising(self):
+        # Direct probe of the projection helper: a non-mapping response returns a
+        # typed result rather than raising AttributeError on ``.get``.
+        # Local modules
+        from agents.gamelift_projections import project_fleet_utilization
+
+        for bad in (None, [], ["a", "b"], "str", 7, 3.14, True):
+            result = project_fleet_utilization(bad)  # type: ignore[arg-type]
+            assert result["status"] == "incomplete"
+            assert result["error"]["code"] == "malformed_response"
+            assert result["FleetUtilization"] == []
+
+    def test_wholly_valid_complete_payload_is_ok(self):
+        # Regression guard: a payload with only valid dict rows and no discarded
+        # items and no continuation token remains ``ok``.
+        # Local modules
+        from agents.gamelift_specialist import get_fleet_utilization
+
+        raw = {
+            "FleetUtilization": [
+                {"FleetId": FLEET_ID, "ActiveServerProcessCount": 3, "Location": "us-west-2"},
+                {"FleetId": FLEET_ID, "ActiveServerProcessCount": 5, "Location": "eu-west-1"},
+            ]
+        }
+        with patch("agents.gamelift_specialist.boto3.client", return_value=self._patch(raw)):
+            result = get_fleet_utilization(FLEET_ID)
+        assert result["status"] == "ok"
+        assert "error" not in result
+        assert len(result["FleetUtilization"]) == 2

@@ -39,10 +39,64 @@ FLEET_B = "fleet-bbbb-0002"
 # Routing / registration compatibility
 # ---------------------------------------------------------------------------
 class TestRoutingRegistrationCompatibility:
+    def test_factory_receives_the_four_runtime_tools(self):
+        # Observe the ACTUAL additional_tools argument handed to
+        # create_specialist_agent at module construction time via an import-time
+        # capture hook, NOT a post-construction alias. Dropping a tool from
+        # additional_tools must fail here.
+        # Local modules
+        import agents.gamelift_specialist as gls
+
+        captured = gls.get_captured_specialist_registration()
+        assert captured is not None, "no create_specialist_agent call was captured at import time"
+        registered = captured["additional_tools"]
+        names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
+        for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
+            assert name in names, f"{name} missing from the tools handed to create_specialist_agent"
+        assert len(registered) == 4
+        # The captured service name confirms this is the GameLift specialist.
+        assert captured["service_name"] == "GameLift"
+
+    def test_dropping_a_tool_from_additional_tools_is_observed(self):
+        # Discriminating: rebuild the specialist through the SAME factory path
+        # with one tool removed and prove the capture reflects the reduced list.
+        # This is what makes the test fail when additional_tools loses a tool.
+        # Local modules
+        import agents.gamelift_specialist as gls
+
+        baseline = gls.get_captured_specialist_registration()
+        full = list(baseline["additional_tools"])
+        assert len(full) == 4
+
+        reduced = full[:-1]
+        gls.build_gamelift_agent(additional_tools=reduced)
+        after = gls.get_captured_specialist_registration()
+        assert len(after["additional_tools"]) == 3
+        dropped_name = getattr(full[-1], "__name__", getattr(full[-1], "tool_name", None))
+        after_names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in after["additional_tools"]}
+        assert dropped_name not in after_names
+
+        # Restore the canonical registration so module state is not left reduced
+        # for other tests importing this module.
+        gls.build_gamelift_agent(additional_tools=gls.GAMELIFT_AGENT_TOOLS)
+        restored = gls.get_captured_specialist_registration()
+        assert len(restored["additional_tools"]) == 4
+
+    def test_runtime_agent_is_built_from_the_captured_tools(self):
+        # Prove the tools that were captured are the ones the runtime agent is
+        # built from: the module-level gamelift_agent is produced by the same
+        # build path that records the capture.
+        # Local modules
+        import agents.gamelift_specialist as gls
+
+        # Ensure canonical state.
+        gls.build_gamelift_agent(additional_tools=gls.GAMELIFT_AGENT_TOOLS)
+        captured = gls.get_captured_specialist_registration()
+        assert captured["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
+
     def test_registration_collection_holds_the_four_runtime_tools(self):
         # Model access is controlled by the exact tool collection passed to
-        # create_specialist_agent, NOT by __all__. Assert the runtime
-        # registration collection so dropping a tool from the agent fails here.
+        # create_specialist_agent, NOT by __all__.
         # Local modules
         import agents.gamelift_specialist as gls
 
@@ -51,14 +105,6 @@ class TestRoutingRegistrationCompatibility:
         for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
             assert name in names, f"{name} missing from GAMELIFT_AGENT_TOOLS (runtime registration contract)"
         assert len(registered) == 4
-
-    def test_agent_is_created_from_the_registration_collection(self):
-        # Prove the collection asserted above is the SAME object handed to the
-        # factory — not a parallel list that could drift from what the agent runs.
-        # Local modules
-        import agents.gamelift_specialist as gls
-
-        assert gls._REGISTERED_TOOLS_FOR_AGENT is gls.GAMELIFT_AGENT_TOOLS
 
     def test_projected_field_names_the_router_and_charts_depend_on_are_stable(self):
         # These operational field names are the axis/series source for charts and
