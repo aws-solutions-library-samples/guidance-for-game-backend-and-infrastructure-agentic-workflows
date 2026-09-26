@@ -192,18 +192,10 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 # value is unnecessary for these model-visible operational fields.
 _ACCOUNT_ID = re.compile(r"\d{12}")
 
-# Dotted-quad IPv4 detection is performed inside
-# :func:`_looks_like_network_coordinate` by sliding a 4-octet window over each
-# maximal dotted-numeric run, so a valid quad is rejected even when embedded in a
-# longer dotted run (``host-10.11.12.13.14-prod``) or flanked by name characters
-# (``host-10.11.12.13-prod``, ``net-10.11.12.0-24-prod``). Each candidate quad's
-# octets are validated exactly (0-255) so a version-like token is only rejected
-# when it is genuinely a legal IPv4 address.
-
-# A dotted-quad-shaped numeric run is a network coordinate candidate even when
-# octets use noncanonical padding or oversized prefixes accepted by legacy host
-# parsers. GameLift's model-visible operational strings do not need four numeric
-# components, so reject this shape before any value crosses the boundary.
+# Conservatively treat every four-component numeric dotted run as a network
+# coordinate candidate, including embedded, padded, and oversized spellings.
+# These model-visible GameLift operational strings do not need that shape, so
+# rejecting it avoids parser-dependent interpretations at the trust boundary.
 _DOTTED_QUAD_TEXT = re.compile(r"\d+(?:\.\d+){3}")
 
 # URL / URI schemes (http, https, s3, file, ftp, ...) — the "scheme://" shape.
@@ -264,10 +256,9 @@ def _looks_like_network_coordinate(value: str) -> bool:
             return True
         except ValueError:
             continue
-    # Reject every dotted-quad-shaped numeric run before canonical parsing.
-    # This catches zero-padded and oversized components that legacy host parsers
-    # can normalize as IPv4 even though Python's strict ipaddress parser rejects
-    # their spelling.
+    # Conservatively reject every four-component numeric dotted run before
+    # canonical parsing. The operational fields do not require this shape, and
+    # treating it uniformly avoids parser-dependent network interpretations.
     if _DOTTED_QUAD_TEXT.search(value):
         return True
     # Embedded colon-hex IPv6 runs. Any colon-bearing hextet sequence that parses
