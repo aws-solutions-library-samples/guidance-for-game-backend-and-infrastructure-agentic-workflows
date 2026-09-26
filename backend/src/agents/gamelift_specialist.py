@@ -14,9 +14,26 @@ from strands import tool
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.gamelift_projections import (
+    GAMELIFT_MAX_PROJECTED_ITEMS,
+    error_result,
+    log_sanitized_failure,
+    project_fleet_capacity,
+    project_fleet_utilization,
+    project_scaling_policies,
+)
 from agents.optimized_prompts import get_optimized_gamelift_prompt
 from config.settings import AWS_REGION, BOTO3_CLIENT_CONFIG, GAMELIFT_KB_ID
 from utils.logger import logger
+
+# Re-exported for callers/tests that reason about the projection item bound.
+__all__ = [
+    "GAMELIFT_MAX_PROJECTED_ITEMS",
+    "get_fleet_capacity",
+    "get_fleet_utilization",
+    "get_scaling_policies",
+    "list_gamelift_fleets",
+]
 
 # ============================================================================
 # Boto3 Tools for GameLift Operations
@@ -280,35 +297,56 @@ def list_gamelift_fleets() -> dict:  # type: ignore
 
 @tool
 def get_fleet_utilization(fleet_id: str) -> dict:  # type: ignore
-    """Get current utilization metrics for a specific fleet."""
+    """Get current utilization metrics for a specific fleet.
+
+    Returns a bounded, code-owned projection with a distinct ``status`` of
+    ok / empty / denied / incomplete / truncated. Full ARNs, account IDs, and
+    arbitrary provider fields never reach model context; provider exceptions are
+    reduced to a typed, sanitized error code.
+    """
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        return client.describe_fleet_utilization(FleetIds=[fleet_id])  # type: ignore
+        response = client.describe_fleet_utilization(FleetIds=[fleet_id])
     except Exception as e:
-        logger.error(f"Failed to get fleet utilization for {fleet_id}: {e}")
-        return {"error": str(e), "FleetUtilization": []}
+        log_sanitized_failure("describe_fleet_utilization", fleet_id, e)
+        return error_result("FleetUtilization", e)
+    return project_fleet_utilization(response)
 
 
 @tool
 def get_fleet_capacity(fleet_id: str) -> dict:  # type: ignore
-    """Get instance capacity information for a specific fleet."""
+    """Get instance capacity information for a specific fleet.
+
+    Returns a bounded, code-owned projection with a distinct ``status`` of
+    ok / empty / denied / incomplete / truncated. Full ARNs, account IDs, and
+    arbitrary provider fields never reach model context; provider exceptions are
+    reduced to a typed, sanitized error code.
+    """
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        return client.describe_fleet_capacity(FleetIds=[fleet_id])  # type: ignore
+        response = client.describe_fleet_capacity(FleetIds=[fleet_id])
     except Exception as e:
-        logger.error(f"Failed to get fleet capacity for {fleet_id}: {e}")
-        return {"error": str(e), "FleetCapacity": []}
+        log_sanitized_failure("describe_fleet_capacity", fleet_id, e)
+        return error_result("FleetCapacity", e)
+    return project_fleet_capacity(response)
 
 
 @tool
 def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
-    """Get auto-scaling policies for a specific fleet."""
+    """Get auto-scaling policies for a specific fleet.
+
+    Returns a bounded, code-owned projection with a distinct ``status`` of
+    ok / empty / denied / incomplete / truncated. Full ARNs, account IDs, and
+    arbitrary provider fields never reach model context; provider exceptions are
+    reduced to a typed, sanitized error code.
+    """
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        return client.describe_scaling_policies(FleetId=fleet_id)  # type: ignore
+        response = client.describe_scaling_policies(FleetId=fleet_id)
     except Exception as e:
-        logger.error(f"Failed to get scaling policies for {fleet_id}: {e}")
-        return {"error": str(e), "ScalingPolicies": []}
+        log_sanitized_failure("describe_scaling_policies", fleet_id, e)
+        return error_result("ScalingPolicies", e)
+    return project_scaling_policies(response)
 
 
 # ============================================================================
