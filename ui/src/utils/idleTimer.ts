@@ -113,6 +113,27 @@ interface SessionRecord {
   loggedOut: boolean;
 }
 
+function parseSessionRecord(raw: string | null): SessionRecord | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<SessionRecord>;
+    if (
+      typeof parsed?.epoch !== 'number' ||
+      !Number.isFinite(parsed.epoch) ||
+      typeof parsed?.generation !== 'number' ||
+      !Number.isFinite(parsed.generation) ||
+      typeof parsed?.deadline !== 'number' ||
+      !Number.isFinite(parsed.deadline) ||
+      typeof parsed?.loggedOut !== 'boolean'
+    ) {
+      return null;
+    }
+    return parsed as SessionRecord;
+  } catch {
+    return null;
+  }
+}
+
 export interface IdleController {
   start(): void;
   stop(): void;
@@ -168,18 +189,7 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
 
   function readRecord(): SessionRecord | null {
     try {
-      const raw = window.localStorage.getItem(SESSION_KEY);
-      if (raw === null) return null;
-      const parsed = JSON.parse(raw) as Partial<SessionRecord>;
-      if (
-        typeof parsed?.epoch !== 'number' ||
-        typeof parsed?.generation !== 'number' ||
-        typeof parsed?.deadline !== 'number' ||
-        typeof parsed?.loggedOut !== 'boolean'
-      ) {
-        return null;
-      }
-      return parsed as SessionRecord;
+      return parseSessionRecord(window.localStorage.getItem(SESSION_KEY));
     } catch {
       return null;
     }
@@ -327,7 +337,10 @@ export function createIdleController(config: ResolvedIdleConfig): IdleController
         // not receive its own event, so this only fires for peer writes.
         storageListener = (event: StorageEvent) => {
           if (event.key !== SESSION_KEY) return;
-          const record = readRecord();
+          // Consume the immutable payload carried by this event. Re-reading the
+          // mutable key can observe a later competing write and lose a terminal
+          // logout that arrived with the same generation as an extension.
+          const record = parseSessionRecord(event.newValue);
           if (record) applyIncomingRecord(record);
         };
         window.addEventListener('storage', storageListener);
@@ -456,18 +469,7 @@ export function resetIdleCoordinatorForTests(): void {
 // the epoch allocator can read the same source of truth the controller writes).
 function readPersistedSessionRecord(): SessionRecord | null {
   try {
-    const raw = window.localStorage.getItem(SESSION_KEY);
-    if (raw === null) return null;
-    const parsed = JSON.parse(raw) as Partial<SessionRecord>;
-    if (
-      typeof parsed?.epoch !== 'number' ||
-      typeof parsed?.generation !== 'number' ||
-      typeof parsed?.deadline !== 'number' ||
-      typeof parsed?.loggedOut !== 'boolean'
-    ) {
-      return null;
-    }
-    return parsed as SessionRecord;
+    return parseSessionRecord(window.localStorage.getItem(SESSION_KEY));
   } catch {
     return null;
   }

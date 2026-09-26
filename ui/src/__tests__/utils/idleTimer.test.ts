@@ -600,6 +600,49 @@ describe('idle controller', () => {
     tabB.stop();
   });
 
+  it('applies a delayed terminal storage event even after an equal-generation extension overwrites the key', () => {
+    Object.defineProperty(global, 'BroadcastChannel', {
+      configurable: true,
+      writable: true,
+      value: undefined,
+    });
+
+    const tabA = createIdleController(config);
+    const tabB = createIdleController(config);
+    const onLogoutB = jest.fn();
+    tabA.start();
+    tabB.start();
+    tabB.onLogout(onLogoutB);
+
+    // Tab A writes a terminal generation-1 record, but its storage event is
+    // delayed before Tab B processes it.
+    tabA.logout();
+    const delayedLogoutRecord = window.localStorage.getItem('game-agent-idle-session');
+    expect(JSON.parse(delayedLogoutRecord as string).loggedOut).toBe(true);
+
+    // Tab B has not seen the logout yet and writes an active generation-1
+    // extension, overwriting the mutable key.
+    tabB.extend();
+    expect(JSON.parse(window.localStorage.getItem('game-agent-idle-session') as string).loggedOut).toBe(false);
+
+    // A real StorageEvent carries the immutable value from the terminal write.
+    // The listener must parse newValue rather than re-read the overwritten key;
+    // terminal state wins when logout and extension share a generation.
+    window.dispatchEvent(
+      new StorageEvent('storage', {
+        key: 'game-agent-idle-session',
+        newValue: delayedLogoutRecord,
+        storageArea: window.localStorage,
+      }),
+    );
+
+    expect(onLogoutB).toHaveBeenCalledTimes(1);
+    expect(tabB.isLoggedOut()).toBe(true);
+    expect(tabB.phase()).toBe('expired');
+    tabA.stop();
+    tabB.stop();
+  });
+
   it('removes the storage listener on stop()', () => {
     Object.defineProperty(global, 'BroadcastChannel', {
       configurable: true,
