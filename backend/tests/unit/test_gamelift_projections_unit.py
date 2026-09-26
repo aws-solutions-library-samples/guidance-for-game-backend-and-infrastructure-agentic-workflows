@@ -904,6 +904,45 @@ class TestEmbeddedSensitiveCoordinateDetection:
         assert "10.11.12.13" not in json.dumps(result)
         assert row["Status"] == "ACTIVE"
 
+    def test_zero_padded_ipv4_is_rejected_across_allowed_string_grammars(self):
+        # Host/network parsers may accept zero-padded dotted quads even though
+        # Python's strict ipaddress parser rejects them. They must not survive
+        # through name, token, or identifier fields.
+        # Local modules
+        from agents.gamelift_projections import project_fleet_utilization, project_scaling_policies
+
+        padded = "010.011.012.013"
+        scaling = project_scaling_policies(
+            {
+                "ScalingPolicies": [
+                    {
+                        "Name": f"host-{padded}-prod",
+                        "MetricName": f"metric.{padded}",
+                        "Status": "ACTIVE",
+                    }
+                ]
+            }
+        )
+        utilization = project_fleet_utilization(
+            {
+                "FleetUtilization": [
+                    {
+                        "FleetId": f"node-{padded}",
+                        "Location": "us-west-2",
+                    }
+                ]
+            }
+        )
+
+        scaling_row = scaling["ScalingPolicies"][0]
+        utilization_row = utilization["FleetUtilization"][0]
+        assert "Name" not in scaling_row
+        assert "MetricName" not in scaling_row
+        assert scaling_row["Status"] == "ACTIVE"
+        assert "FleetId" not in utilization_row
+        assert utilization_row["Location"] == "us-west-2"
+        assert padded not in json.dumps({"scaling": scaling, "utilization": utilization})
+
 
 # ---------------------------------------------------------------------------
 # Log redaction: the failure log must never contain raw provider text or the

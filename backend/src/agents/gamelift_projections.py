@@ -265,11 +265,13 @@ def _looks_like_network_coordinate(value: str) -> bool:
     # dotted components. Validate each candidate's octets exactly.
     for match in re.finditer(r"(?=(\d{1,3}(?:\.\d{1,3}){3}))", value):
         candidate = match.group(1)
-        try:
-            ipaddress.IPv4Address(candidate)
+        octets = candidate.split(".")
+        # Parse the decimal octets ourselves so zero-padded spellings such as
+        # 010.011.012.013 are rejected too. Some host/network parsers accept
+        # those spellings even though ipaddress.IPv4Address intentionally does
+        # not, so relying only on that library leaves a model-visible bypass.
+        if len(octets) == 4 and all(0 <= int(octet, 10) <= 255 for octet in octets):
             return True
-        except ValueError:
-            continue
     # Embedded colon-hex IPv6 runs. Any colon-bearing hextet sequence that parses
     # as an IPv6 address is a network coordinate.
     for token in re.split(r"[^0-9A-Fa-f:]+", value):
