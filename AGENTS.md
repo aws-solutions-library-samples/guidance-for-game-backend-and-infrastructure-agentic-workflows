@@ -11,9 +11,12 @@
   mutations, or cleanup of resources you did not create.
 - Preserve user changes and unrelated worktree state. Never rewrite history,
   delete branches, force-push, or discard files without explicit authorization.
-- Contribute through your fork and a pull request (see `CONTRIBUTING.md`); treat
-  any remote write as requiring an explicitly selected fork and task-specific
-  approval.
+- Use pull requests for repository changes and follow `CONTRIBUTING.md` for
+  external contributions. On an explicitly scoped maintainer branch or existing
+  pull request, normal commits and non-force pushes to the verified task branch
+  are permitted. Before pushing, verify that the repository, remote, and branch
+  match the current task. Ask before using another remote target, force-pushing,
+  rewriting remote history, or changing branch protections.
 
 ## Repository Reality
 
@@ -58,10 +61,7 @@ relevant ADRs before changing code.
 - Hosted requests require a verified Cognito access token at both the frontend
   proxy and runtime. Trusted tenant, workspace, and actor values are
   server-owned; never derive authorization from request-body fields, model
-  output, or browser-supplied identity. When changing either side of this
-  boundary, run the focused frontend API tests and `uv run pytest
-  tests/unit/test_runtime_jwt_identity_unit.py
-  tests/unit/test_agentcore_startup_unit.py`.
+  output, or browser-supplied identity.
 - `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS` is a local-development-only setting made
   by `dev-start.sh`. Do not enable it in a hosted environment.
 - `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID` are independent
@@ -78,11 +78,6 @@ relevant ADRs before changing code.
 - Each specialist has its own Bedrock Knowledge Base. Infrastructure creation
   alone is insufficient: source documents must be seeded before retrieval can
   return results.
-- Cost totals and service breakdowns come from the owned deterministic Cost
-  Explorer rendering path, not from unvalidated model prose. Preserve that path
-  when changing cost behavior and cover it with
-  `backend/tests/unit/test_cost_report_unit.py` and the focused cost-report
-  integration tests.
 - The AgentCore container runs with a read-only home and working directory. The
   AWS API MCP server writes a log under `$HOME` and needs a writable working
   dir, so `backend/src/utils/mcp_client_factory.py` redirects `HOME` and
@@ -156,6 +151,36 @@ credentials/tokens. `./test-cloud.sh`, `./test-ai-evals.sh`, and
 - Treat examples, tests, documentation, logs, and generated diagnostics as
   public content. Use synthetic identifiers and never expose credentials,
   customer data, JWTs, account IDs, or deployment-specific ARNs.
+
+## Change Impact Map
+
+- For an authenticated chat-path change, trace both sides of the boundary:
+  `ui/src/pages/api/copilot/chat.ts` verifies the access token and builds the
+  trusted principal; `backend/src/agentcore_main.py` verifies the runtime
+  context. Preserve the rule that body fields, browser headers, and model
+  output cannot establish actor, tenant, workspace, group, or authorization
+  values. Run the focused frontend API tests and
+  `uv run pytest tests/unit/test_runtime_jwt_identity_unit.py tests/unit/test_agentcore_startup_unit.py`.
+- For an agent behavior or prompt change, inspect the relevant specialist,
+  orchestrator, `backend/src/agents/optimized_prompts.py`, and focused tests.
+  Follow the managed-prompt publication and runtime-update boundary above.
+- For a provider integration, project model-visible responses into bounded,
+  code-owned schemas. Preserve truthful empty, denied, partial, and truncated
+  states, and keep raw provider payloads and exception text out of model
+  context and logs.
+- For deterministic cost-report behavior, preserve the owned Cost Explorer
+  rendering path rather than allowing financial figures from unvalidated model
+  prose. Run `backend/tests/unit/test_cost_report_unit.py` and the focused
+  cost-report integration tests.
+- For operations-contract changes, update the versioned schemas, fixtures,
+  implementation, contract tests, and corresponding documentation or ADR
+  together. The operations layer remains an optional, disabled control-plane
+  design and must not broaden chat-runtime permissions.
+- For deployment workflow changes, keep the shell and PowerShell implementations
+  aligned where both intentionally cover the same behavior. Prefer the
+  read-only `scripts/infrastructure/check-deployment.sh` and
+  `validate-deployment.sh` for validation; deployment, teardown, cloud,
+  AI-eval, and stress scripts target live resources and require explicit scope.
 
 ## Completion
 

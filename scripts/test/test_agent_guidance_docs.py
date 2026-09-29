@@ -18,6 +18,20 @@ RETIRED_DOC = "CLAUDE.md"
 # This regression check names the retired doc on purpose; it is not a stray
 # reference that would drift the guidance back apart.
 SELF_PATH = Path(__file__).resolve().relative_to(REPOSITORY_ROOT).as_posix()
+AGENT_GUIDANCE_FILENAMES = frozenset({"agents.md", "claude.md", "gemini.md"})
+AGENT_GUIDANCE_EXACT_PATHS = frozenset({".cursorrules", ".github/copilot-instructions.md"})
+AGENT_GUIDANCE_PREFIXES = (".claude/", ".cursor/rules/", ".github/instructions/", ".kiro/steering/")
+
+
+def _is_agent_guidance_path(path: str) -> bool:
+    """Return whether a tracked path is a recognized agent instruction file."""
+    normalized_path = path.casefold()
+    filename = normalized_path.rsplit("/", maxsplit=1)[-1]
+    return (
+        filename in AGENT_GUIDANCE_FILENAMES
+        or normalized_path in AGENT_GUIDANCE_EXACT_PATHS
+        or normalized_path.startswith(AGENT_GUIDANCE_PREFIXES)
+    )
 
 
 def _tracked_files() -> list[str]:
@@ -39,6 +53,14 @@ class AgentGuidanceDocChecks(unittest.TestCase):
     def test_agents_md_exists_and_is_nonempty(self) -> None:
         self.assertTrue(AGENTS_PATH.is_file(), "AGENTS.md must exist at the repository root")
         self.assertTrue(AGENTS_PATH.read_text(encoding="utf-8").strip(), "AGENTS.md must not be empty")
+
+    def test_agents_md_is_the_only_tracked_agent_instruction_file(self) -> None:
+        guidance_paths = sorted(path for path in self.tracked if _is_agent_guidance_path(path))
+        self.assertEqual(
+            guidance_paths,
+            ["AGENTS.md"],
+            f"AGENTS.md must be the sole tracked agent instruction file: {guidance_paths}",
+        )
 
     def test_retired_claude_doc_is_absent(self) -> None:
         self.assertNotIn(RETIRED_DOC, self.tracked, "CLAUDE.md must remain retired")
