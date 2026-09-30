@@ -194,9 +194,6 @@ jobs:
     - name: Open or update alert issue (scheduled runs)
       env:
         GH_TOKEN: ${{ github.token }}
-        # The alert job intentionally has no checkout. Give gh explicit
-        # repository context so issue reads and writes do not depend on .git.
-        GH_REPO: ${{ github.repository }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
         TITLE="Scheduled vulnerability scan: high/critical findings on main"
@@ -213,11 +210,11 @@ jobs:
           echo ""
           echo "Fix guidance: bump the affected package (pyproject.toml + uv.lock + regenerated requirements.txt, or ui/package.json + package-lock.json) — do not add grype ignore rules."
         } > "$BODY_FILE"
-        EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+        EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
         if [ -n "$EXISTING" ]; then
-          gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+          gh issue comment --repo "$GITHUB_REPOSITORY" "$EXISTING" --body-file "$BODY_FILE"
         else
-          gh issue create --title "$TITLE" --label security --body-file "$BODY_FILE"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --label security --body-file "$BODY_FILE"
         fi
 
   powershell-tests:
