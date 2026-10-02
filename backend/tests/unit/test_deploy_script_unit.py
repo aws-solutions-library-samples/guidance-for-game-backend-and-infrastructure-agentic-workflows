@@ -5,6 +5,7 @@ import os
 import pathlib
 import re
 import subprocess
+import tempfile
 
 # Third-party packages
 import pytest
@@ -17,6 +18,13 @@ FUNCTION_NAMES = (
     "is_resolved_deployment_value",
     "append_agentcore_env_if_resolved",
     "build_agentcore_env_args",
+)
+WAF_FUNCTION_NAMES = (
+    "is_resolved_deployment_value",
+    "is_transient_waf_error",
+    "get_active_web_acl_arn",
+    "web_acl_has_required_rules",
+    "reconcile_waf_association",
 )
 OPTIONAL_VARIABLES = (
     "GUARDRAIL_ID",
@@ -67,6 +75,110 @@ def _build_agentcore_env_args(overrides: dict[str, str] | None = None) -> list[s
         check=True,
     )
     return result.stdout.splitlines()
+
+
+def _run_waf_reconciliation(
+    active_sequence: str,
+    *,
+    rule_names: str = (
+        "RateLimitAuthPaths RateLimitAdminPaths RateLimitPerIP "
+        "AWSManagedRulesCommonRuleSet AWSManagedRulesSQLiRuleSet AWSManagedRulesKnownBadInputsRuleSet"
+    ),
+    transient_association_failures: int = 0,
+    association_error_marker: str = "TRANSIENT_UNAVAILABLE",
+    association_max_attempts: int = 3,
+    verification_max_attempts: int = 3,
+) -> subprocess.CompletedProcess[str]:
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    functions = "\n".join(_function_source(content, name) for name in WAF_FUNCTION_NAMES)
+    command = "\n".join(
+        (
+            functions,
+            r"""
+state_dir="$WAF_TEST_STATE_DIR"
+next_sequence_value() {
+  local sequence="$1"
+  local counter_name="$2"
+  local count_file="$state_dir/$counter_name"
+  local count=0
+  local values
+  if [ -f "$count_file" ]; then
+    count="$(<"$count_file")"
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$count_file"
+  IFS=',' read -r -a values <<< "$sequence"
+  if [ "$count" -gt "${#values[@]}" ]; then
+    count="${#values[@]}"
+  fi
+  printf '%s\n' "${values[$((count - 1))]}"
+}
+aws() {
+  local count
+  local value
+  if [ "$1" = "wafv2" ] && [ "$2" = "get-web-acl-for-resource" ]; then
+    value="$(next_sequence_value "$WAF_TEST_ACTIVE_SEQUENCE" active_count)"
+    case "$value" in
+      TRANSIENT_UNAVAILABLE)
+        echo 'WAFUnavailableEntityException' >&2
+        return 255
+        ;;
+      TRANSIENT_INTERNAL)
+        echo 'WAFInternalErrorException' >&2
+        return 255
+        ;;
+    esac
+    printf '%s\n' "$value"
+    return 0
+  fi
+  if [ "$1" = "wafv2" ] && [ "$2" = "get-web-acl" ]; then
+    printf '%s\n' "$WAF_TEST_RULE_NAMES"
+    return 0
+  fi
+  if [ "$1" = "wafv2" ] && [ "$2" = "associate-web-acl" ]; then
+    count="$(next_sequence_value '1,2,3,4,5' association_count)"
+    if [ "$count" -le "$WAF_TEST_TRANSIENT_ASSOCIATION_FAILURES" ]; then
+      case "$WAF_TEST_ASSOCIATION_ERROR_MARKER" in
+        TRANSIENT_INTERNAL) echo 'WAFInternalErrorException' >&2 ;;
+        *) echo 'WAFUnavailableEntityException' >&2 ;;
+      esac
+      return 255
+    fi
+    return 0
+  fi
+  return 1
+}
+sleep() { :; }
+GBAW_WAF_ASSOCIATION_MAX_ATTEMPTS="$WAF_TEST_ASSOCIATION_MAX_ATTEMPTS"
+GBAW_WAF_VERIFICATION_MAX_ATTEMPTS="$WAF_TEST_VERIFICATION_MAX_ATTEMPTS"
+GBAW_WAF_RETRY_SECONDS=0
+reconcile_waf_association expected-acl resource-arn
+exit_code=$?
+for count_name in association_count active_count; do
+  count=0
+  if [ -f "$state_dir/$count_name" ]; then
+    count="$(<"$state_dir/$count_name")"
+  fi
+  printf '%s=%s\n' "$count_name" "$count"
+done
+exit "$exit_code"
+""",
+        )
+    )
+    with tempfile.TemporaryDirectory() as state_dir:
+        env = os.environ.copy()
+        env.update(
+            {
+                "WAF_TEST_STATE_DIR": state_dir,
+                "WAF_TEST_ACTIVE_SEQUENCE": active_sequence,
+                "WAF_TEST_RULE_NAMES": rule_names,
+                "WAF_TEST_TRANSIENT_ASSOCIATION_FAILURES": str(transient_association_failures),
+                "WAF_TEST_ASSOCIATION_ERROR_MARKER": association_error_marker,
+                "WAF_TEST_ASSOCIATION_MAX_ATTEMPTS": str(association_max_attempts),
+                "WAF_TEST_VERIFICATION_MAX_ATTEMPTS": str(verification_max_attempts),
+            }
+        )
+        return subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True)
 
 
 def test_deploy_script_has_valid_bash_syntax():
@@ -180,3 +292,53 @@ def test_agentcore_env_args_filter_optional_values_independently():
         "-env",
         "GBAW_COST_KB_ID=cost-kb",
     ]
+
+
+def test_waf_reconciliation_skips_association_when_expected_acl_and_rules_are_active():
+    result = _run_waf_reconciliation("expected-acl")
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[-2:] == ["association_count=0", "active_count=1"]
+
+
+@pytest.mark.parametrize("transient_marker", ["TRANSIENT_UNAVAILABLE", "TRANSIENT_INTERNAL"])
+def test_waf_reconciliation_recovers_from_retryable_association_and_lookup_failures(transient_marker):
+    result = _run_waf_reconciliation(
+        f"platform-acl,{transient_marker},expected-acl",
+        transient_association_failures=1,
+        association_error_marker=transient_marker,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.splitlines()[-2:] == ["association_count=2", "active_count=3"]
+
+
+@pytest.mark.parametrize("transient_marker", ["TRANSIENT_UNAVAILABLE", "TRANSIENT_INTERNAL"])
+def test_waf_reconciliation_fails_when_retryable_association_errors_exhaust_budget(transient_marker):
+    result = _run_waf_reconciliation(
+        "platform-acl",
+        transient_association_failures=3,
+        association_error_marker=transient_marker,
+        association_max_attempts=3,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines()[-2:] == ["association_count=3", "active_count=1"]
+
+
+def test_waf_reconciliation_fails_when_expected_acl_does_not_converge():
+    result = _run_waf_reconciliation("platform-acl", verification_max_attempts=3)
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines()[-2:] == ["association_count=1", "active_count=4"]
+
+
+def test_waf_reconciliation_fails_when_required_rules_are_missing():
+    result = _run_waf_reconciliation(
+        "expected-acl",
+        rule_names="RateLimitPerIP AWSManagedRulesCommonRuleSet",
+        verification_max_attempts=3,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout.splitlines()[-2:] == ["association_count=0", "active_count=4"]
