@@ -24,8 +24,8 @@ dependencies = [
     # Environment variables
     "python-dotenv>=1.2.2",
 
-    # JWT authentication (floor raised to the patched version, CVE fix)
-    "PyJWT[crypto]>=2.13.0",
+    # JWT authentication (floor raised to the patched version, vulnerability fix)
+    "PyJWT[crypto]>=2.14.0",
 
     # AgentCore SDK with Strands integration
     "bedrock-agentcore[strands-agents]>=1.19.0",
