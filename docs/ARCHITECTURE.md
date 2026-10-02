@@ -311,8 +311,18 @@ def invoke_agent(prompt, context=None):
     return str(response)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Shared entrypoint: local binds 127.0.0.1; hosted AgentCore binds
+    # 0.0.0.0 only when the local identity bypass is disabled.
+    run_server()
 ```
+
+`run_server()` uses `resolve_runtime_host()` from `backend/src/config/settings.py`.
+Local development always binds to loopback. The deployment sets
+`GBAW_HOSTED_RUNTIME=true` and leaves `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS` unset,
+which selects the private-container all-interface bind required by AgentCore.
+The process refuses to start if hosted mode and the local bypass are both set —
+a defense-in-depth guard against config drift, since request handling already
+ignores the bypass whenever hosted mode is on.
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)

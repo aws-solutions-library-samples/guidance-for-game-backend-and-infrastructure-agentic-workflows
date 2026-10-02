@@ -71,6 +71,8 @@
     "typescript": "6.0.3"
   },
   "overrides": {
+    "brace-expansion@<2.0.0": "^1.1.21",
+    "brace-expansion@>=5.0.0 <6.0.0": "^5.0.12",
     "prismjs": "^1.30.0",
     "sharp": "^0.35.4",
     "postcss": "^8.5.18",

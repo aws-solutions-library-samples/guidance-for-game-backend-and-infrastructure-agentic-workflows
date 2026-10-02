@@ -278,6 +278,179 @@ build_agentcore_env_args() {
   return 0
 }
 
+is_transient_waf_error() {
+  local error_text="$1"
+  [[ "$error_text" == *"WAFNonexistentItemException"* \
+    || "$error_text" == *"WAFUnavailableEntityException"* \
+    || "$error_text" == *"WAFInternalErrorException"* ]]
+}
+
+get_active_web_acl_arn() {
+  local resource_arn="$1"
+  local query_result
+
+  if query_result=$(aws wafv2 get-web-acl-for-resource \
+    --resource-arn "$resource_arn" \
+    --region "$AWS_REGION" \
+    --query 'WebACL.ARN' \
+    --output text 2>&1); then
+    if [ "$query_result" != "None" ]; then
+      printf '%s\n' "$query_result"
+    fi
+    return 0
+  fi
+
+  if is_transient_waf_error "$query_result"; then
+    return 75
+  fi
+  echo "❌ Unable to inspect the active WAF association" >&2
+  return 1
+}
+
+web_acl_has_required_rules() {
+  local web_acl_arn="$1"
+  local web_acl_id="${web_acl_arn##*/}"
+  local web_acl_path="${web_acl_arn%/*}"
+  local web_acl_name="${web_acl_path##*/}"
+  local query_result
+  local normalized_rule_names
+  local required_rule
+  local required_rules=(
+    RateLimitAuthPaths
+    RateLimitAdminPaths
+    RateLimitPerIP
+    AWSManagedRulesCommonRuleSet
+    AWSManagedRulesSQLiRuleSet
+    AWSManagedRulesKnownBadInputsRuleSet
+  )
+
+  if ! query_result=$(aws wafv2 get-web-acl \
+    --scope REGIONAL \
+    --id "$web_acl_id" \
+    --name "$web_acl_name" \
+    --region "$AWS_REGION" \
+    --query 'WebACL.Rules[].Name' \
+    --output text 2>&1); then
+    if is_transient_waf_error "$query_result"; then
+      return 75
+    fi
+    echo "❌ Unable to inspect the project WebACL rules" >&2
+    return 1
+  fi
+
+  normalized_rule_names=" ${query_result//$'\t'/ } "
+  for required_rule in "${required_rules[@]}"; do
+    if [[ "$normalized_rule_names" != *" $required_rule "* ]]; then
+      return 2
+    fi
+  done
+  return 0
+}
+
+reconcile_waf_association() {
+  local expected_web_acl_arn="$1"
+  local resource_arn="$2"
+  local association_max_attempts="${GBAW_WAF_ASSOCIATION_MAX_ATTEMPTS:-36}"
+  local verification_max_attempts="${GBAW_WAF_VERIFICATION_MAX_ATTEMPTS:-36}"
+  local retry_seconds="${GBAW_WAF_RETRY_SECONDS:-5}"
+  local active_web_acl_arn=""
+  local command_output
+  local lookup_status
+  local rule_status
+  local attempt
+  local associated=false
+
+  if ! is_resolved_deployment_value "$expected_web_acl_arn" \
+    || ! is_resolved_deployment_value "$resource_arn"; then
+    echo "❌ Cannot reconcile WAF without resolved WebACL and frontend ALB ARNs" >&2
+    return 1
+  fi
+  if ! [[ "$association_max_attempts" =~ ^[1-9][0-9]*$ ]] \
+    || ! [[ "$verification_max_attempts" =~ ^[1-9][0-9]*$ ]] \
+    || ! [[ "$retry_seconds" =~ ^[0-9]+$ ]]; then
+    echo "❌ WAF retry settings must use positive attempts and non-negative seconds" >&2
+    return 1
+  fi
+
+  if active_web_acl_arn=$(get_active_web_acl_arn "$resource_arn"); then
+    lookup_status=0
+  else
+    lookup_status=$?
+    if [ "$lookup_status" -ne 75 ]; then
+      return 1
+    fi
+  fi
+
+  if [ "$lookup_status" -eq 0 ] && [ "$active_web_acl_arn" = "$expected_web_acl_arn" ]; then
+    if web_acl_has_required_rules "$expected_web_acl_arn"; then
+      echo "✅ Expected WAF and required rules are already active on the frontend ALB"
+      return 0
+    else
+      rule_status=$?
+      if [ "$rule_status" -eq 1 ]; then
+        return 1
+      fi
+    fi
+  else
+    if [ -n "$active_web_acl_arn" ]; then
+      echo "🔄 Replacing a different active WAF association with the project WebACL"
+    else
+      echo "🔄 Associating the project WebACL with the frontend ALB"
+    fi
+
+    for ((attempt = 1; attempt <= association_max_attempts; attempt++)); do
+      if command_output=$(aws wafv2 associate-web-acl \
+        --web-acl-arn "$expected_web_acl_arn" \
+        --resource-arn "$resource_arn" \
+        --region "$AWS_REGION" 2>&1); then
+        associated=true
+        break
+      fi
+      if ! is_transient_waf_error "$command_output"; then
+        echo "❌ Unable to associate the project WebACL" >&2
+        return 1
+      fi
+      if [ "$attempt" -lt "$association_max_attempts" ]; then
+        sleep "$retry_seconds"
+      fi
+    done
+    if [ "$associated" != true ]; then
+      echo "❌ Project WAF association did not succeed within the retry budget" >&2
+      return 1
+    fi
+  fi
+
+  for ((attempt = 1; attempt <= verification_max_attempts; attempt++)); do
+    active_web_acl_arn=""
+    if active_web_acl_arn=$(get_active_web_acl_arn "$resource_arn"); then
+      lookup_status=0
+    else
+      lookup_status=$?
+      if [ "$lookup_status" -ne 75 ]; then
+        return 1
+      fi
+    fi
+
+    if [ "$lookup_status" -eq 0 ] && [ "$active_web_acl_arn" = "$expected_web_acl_arn" ]; then
+      if web_acl_has_required_rules "$expected_web_acl_arn"; then
+        echo "✅ Project WAF association and required rules converged after ${attempt} check(s)"
+        return 0
+      else
+        rule_status=$?
+        if [ "$rule_status" -eq 1 ]; then
+          return 1
+        fi
+      fi
+    fi
+    if [ "$attempt" -lt "$verification_max_attempts" ]; then
+      sleep "$retry_seconds"
+    fi
+  done
+
+  echo "❌ Project WAF association and required rules did not converge" >&2
+  return 1
+}
+
 build_agentcore_env_args
 
 # Get execution role from CloudFormation
@@ -595,6 +768,13 @@ WAF_ACL_ARN=$(aws cloudformation describe-stacks \
   --region $AWS_REGION \
   --query 'Stacks[0].Outputs[?OutputKey==`WebACLArn`].OutputValue' \
   --output text 2>/dev/null || echo "")
+
+# ECS Express owns the ALB lifecycle and can leave a platform WAF attached even
+# when CloudFormation reports this association as complete. Reassert and verify
+# the project ACL after the frontend deployment so the declared auth/admin and
+# application rate limits are the active controls.
+echo "🔗 Step 8c: Reconciling WAF association..."
+reconcile_waf_association "$WAF_ACL_ARN" "$FRONTEND_ALB_ARN"
 
 CLOUDTRAIL_ARN=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-security" \
