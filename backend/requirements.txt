@@ -103,7 +103,7 @@ cryptography==50.0.0
     #   joserfc
     #   pyjwt
     #   secretstorage
-cyclopts==4.18.0
+cyclopts==5.1.0
     # via fastmcp-slim
 dill==0.4.0
     # via strands-agents-tools
