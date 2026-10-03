@@ -60,6 +60,25 @@ Parameters:
     MaxValue: 3600
     Description: Maximum idle time that still permits an automatic token refresh
 
+  SessionIdleTimeoutSeconds:
+    Type: Number
+    Default: 1800
+    MinValue: 300
+    MaxValue: 28800
+    Description: >-
+      Inactivity timeout in seconds before the client shows the idle warning and
+      then signs the user out (#310). A UX/local-exposure control only; the
+      server still verifies tokens on every request.
+
+  SessionIdleWarningSeconds:
+    Type: Number
+    Default: 120
+    MinValue: 30
+    MaxValue: 600
+    Description: >-
+      Seconds before the idle timeout that the accessible countdown warning
+      opens so a present user can choose to stay signed in.
+
 Resources:
   FrontendService:
     Type: AWS::ECS::ExpressGatewayService
@@ -95,6 +114,10 @@ Resources:
               Fn::ImportValue: !Sub '${ProjectName}-SessionAbsoluteLifetimeHours'
           - Name: GBAW_SESSION_IDLE_REFRESH_SECONDS
             Value: !Ref SessionIdleRefreshSeconds
+          - Name: GBAW_SESSION_IDLE_TIMEOUT_SECONDS
+            Value: !Ref SessionIdleTimeoutSeconds
+          - Name: GBAW_SESSION_IDLE_WARNING_SECONDS
+            Value: !Ref SessionIdleWarningSeconds
           - Name: GBAW_COGNITO_AUDIENCE
             Value:
               Fn::ImportValue: !Sub '${ProjectName}-UserPoolClientId'
