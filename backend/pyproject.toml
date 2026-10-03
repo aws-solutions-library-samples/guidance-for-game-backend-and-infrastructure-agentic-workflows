@@ -63,7 +63,10 @@ dependencies = [
     # Replaces the YANKED awslabs.cost-explorer-mcp-server (#105). Its SQLite
     # session DB path is hardcoded in the package dir (read-only on container);
     # mcp_client_factory relocates it to /tmp via a startup patch.
-    "awslabs.billing-cost-management-mcp-server>=0.0.29",
+    # Keep the reviewed tool catalog pinned until #465 adds bounded,
+    # operation-specific projections for Billing MCP forecast and optimization
+    # responses. Later releases add model-visible tools that are not yet guarded.
+    "awslabs.billing-cost-management-mcp-server==0.0.29",
     "awslabs.eks-mcp-server>=0.1.35",
 
     # Documentation scraper dependencies
