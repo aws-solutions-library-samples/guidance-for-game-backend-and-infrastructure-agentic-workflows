@@ -435,7 +435,34 @@ Resources:
                   - !GetAtt CostReportSnapshotTable.Arn
 
   # IAM Role for ECS Tasks (Application Permissions)
-  # Security: Uses least-privilege permissions instead of FullAccess managed policies
+  # Security (#458): Least Privilege Design — the frontend is a Next.js proxy,
+  # and this role has ZERO identity policies. It exists only so ECS can vend task
+  # credentials to the container (the AWS SDK needs a credential provider to
+  # sign any call at all); it deliberately carries no inline or managed policy.
+  #
+  # Why zero, not "just STS": the one supported task-credential call in the
+  # deployed chat path is sts:GetCallerIdentity
+  # (ui/src/pages/api/copilot/chat.ts, getAccountId), used to build the
+  # AgentCore runtime ARN. sts:GetCallerIdentity is a special STS action that
+  # requires NO IAM allow — it returns the caller's identity even under an
+  # explicit deny — so granting it would add attack surface (a real policy
+  # statement to audit and drift-check) for a permission the call never needs.
+  # The justified STS caller therefore does not imply an STS grant; the correct
+  # least-privilege shape is an empty role.
+  #
+  # The dormant admin routes still reference IAM-authorized Cognito Admin/List
+  # operations, but the default deployment has never granted those actions and
+  # they are not a supported account-provisioning path. Issue #473 removes that
+  # surface after its #469 dependency; do not grant cognito-idp permissions here.
+  #
+  # AgentCore is invoked with the end user's Cognito JWT as a bearer token over
+  # HTTPS fetch (not the AWS SDK / SigV4), so no bedrock or bedrock-agentcore
+  # grant is required. Cognito JWT verification uses aws-jwt-verify (public JWKS
+  # over HTTPS, no IAM). Container stdout/stderr is shipped to CloudWatch by the
+  # awslogs driver via the ECSTaskExecutionRole
+  # (AmazonECSTaskExecutionRolePolicy), not this role. GameLift/EKS/Cost
+  # Explorer/CloudWatch-metrics are backend/AgentCore specialist concerns with
+  # no frontend caller and are intentionally NOT granted here.
   ECSTaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -455,122 +482,9 @@ Resources:
           Value: !Ref ProjectName
         - Key: ManagedBy
           Value: cloudformation
-      # Security: Removed CloudWatchLogsFullAccess, using scoped permissions
-      Policies:
-        # Security: Scoped CloudWatch Logs access
-        - PolicyName: CloudWatchLogsScopedAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: CloudWatchLogsWrite
-                Effect: Allow
-                Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                  - logs:DescribeLogGroups
-                  - logs:DescribeLogStreams
-                Resource:
-                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}*'
-                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}*:*'
-        # Security: Scoped AgentCore access
-        - PolicyName: BedrockAgentCoreAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: BedrockModelInvoke
-                Effect: Allow
-                Action:
-                  - bedrock:InvokeModel
-                Resource:
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
-                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
-        # Security: Scoped AWS service read access
-        - PolicyName: AWSServiceReadAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: EKSReadAccess
-                Effect: Allow
-                Action:
-                  - eks:ListClusters
-                  - eks:DescribeCluster
-                  - eks:ListNodegroups
-                  - eks:DescribeNodegroup
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    aws:RequestedRegion: !Ref AWS::Region
-              - Sid: GameLiftReadAccess
-                Effect: Allow
-                Action:
-                  - gamelift:DescribeContainerFleet
-                  - gamelift:DescribeContainerGroupDefinition
-                  - gamelift:ListFleets
-                  - gamelift:DescribeFleetAttributes
-                  - gamelift:DescribeFleetDeployment
-                  - gamelift:DescribeFleetUtilization
-                  - gamelift:ListContainerFleets
-                  - gamelift:ListContainerGroupDefinitions
-                  - gamelift:ListFleetDeployments
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    aws:RequestedRegion: !Ref AWS::Region
-              - Sid: CostExplorerAccess
-                Effect: Allow
-                Action:
-                  - ce:GetCostAndUsage
-                  - ce:GetCostForecast
-                  - ce:GetAnomalies
-                Resource: '*'
-                Condition:
-                  StringEquals:
-                    aws:RequestedRegion: !Ref AWS::Region
-              - Sid: BudgetsAccess
-                Effect: Allow
-                Action:
-                  - budgets:ViewBudget
-                  - budgets:DescribeBudgets
-                Resource:
-                  - !Sub 'arn:aws:budgets::${AWS::AccountId}:budget/*'
-              - Sid: ComputeOptimizerAccess
-                Effect: Allow
-                Action:
-                  - compute-optimizer:GetEC2InstanceRecommendations
-                  - compute-optimizer:GetLambdaFunctionRecommendations
-                  - compute-optimizer:GetEBSVolumeRecommendations
-                  - compute-optimizer:GetAutoScalingGroupRecommendations
-                Resource: '*'
-              - Sid: CostOptimizationHubAccess
-                Effect: Allow
-                Action:
-                  - cost-optimization-hub:ListRecommendations
-                  - cost-optimization-hub:GetRecommendation
-                Resource: '*'
-              - Sid: MiscReadAccess
-                Effect: Allow
-                Action:
-                  - s3:GetStorageLensConfiguration
-                  - freetier:GetFreeTierUsage
-                  - pricing:GetProducts
-                Resource: '*'
-              - Sid: CloudWatchMetricsAccess
-                Effect: Allow
-                Action:
-                  - cloudwatch:GetMetricStatistics
-                  - cloudwatch:ListMetrics
-                Resource: '*'
-        # Security: STS access for identity verification
-        - PolicyName: STSAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Sid: GetCallerIdentity
-                Effect: Allow
-                Action:
-                  - sts:GetCallerIdentity
-                Resource: '*'
+      # No Policies and no ManagedPolicyArns: the frontend proxy needs no
+      # task-role permission (see the least-privilege rationale above). The role
+      # is retained solely as the task credential provider.
 
   # IAM Role for ECS Task Execution (ECR pulls + CloudWatch logs)
   ECSTaskExecutionRole:
