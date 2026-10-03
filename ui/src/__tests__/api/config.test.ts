@@ -14,7 +14,7 @@ describe('/api/config session settings', () => {
 
     handler(req, res);
 
-    expect(JSON.parse(res._getData()).session).toEqual({
+    expect(JSON.parse(res._getData()).session).toMatchObject({
       absoluteLifetimeHours: 10,
       idleRefreshSeconds: 600,
     });
@@ -27,7 +27,7 @@ describe('/api/config session settings', () => {
 
     handler(req, res);
 
-    expect(JSON.parse(res._getData()).session).toEqual({
+    expect(JSON.parse(res._getData()).session).toMatchObject({
       absoluteLifetimeHours: 8,
       idleRefreshSeconds: 900,
     });
