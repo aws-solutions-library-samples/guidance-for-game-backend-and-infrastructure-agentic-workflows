@@ -54,7 +54,10 @@ All data in transit is encrypted using TLS:
 
 **API Gateway / AgentCore:**
 - TLS 1.2+ enforced by AWS Bedrock AgentCore
-- All API calls use HTTPS with AWS SigV4 authentication
+- All hops use HTTPS. The frontend→AgentCore invocation authenticates with the
+  end user's Cognito access token as an `Authorization: Bearer` header (verified
+  independently by the runtime), not SigV4. AgentCore→AWS service calls use AWS
+  SigV4 under the AgentCore execution role.
 
 **AWS Documentation**:
 - [ECS Security Best Practices](https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/security.html)
@@ -431,9 +434,9 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
                         TRUST BOUNDARY 1               TRUST BOUNDARY 2
                      (Internet → Frontend)         (Frontend → Backend)
                               │                             │
-  ┌──────────┐    HTTPS/TLS   │   ┌──────────────┐  SigV4   │   ┌──────────────────┐
+  ┌──────────┐    HTTPS/TLS   │   ┌──────────────┐  Bearer  │   ┌──────────────────┐
   │  User    │───────────────►│──►│  ECS Express  │─────────►│──►│  Bedrock         │
-  │  Browser │  JWT in cookie  │   │  (Frontend)   │  (IAM)   │   │  AgentCore       │
+  │  Browser │  JWT in cookie  │   │  (Frontend)   │  (JWT)   │   │  AgentCore       │
   └──────────┘                 │   └──────────────┘          │   │  Runtime         │
                                │                             │   └────────┬─────────┘
                                │                             │            │
@@ -457,7 +460,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | Boundary | From → To | Mechanism | Details |
 |----------|-----------|-----------|---------|
 | **1** | User → ECS Express (ALB) | **Cognito JWT** | HttpOnly/Secure/SameSite cookies; `CognitoJwtVerifier` validates signature, expiration, and audience. Users must be in `admin` or `users` group. |
-| **2** | ECS Express → AgentCore | **AWS SigV4** | ECS task role signs requests automatically via AWS SDK. No tokens on the wire — signature covers URL, headers, and body. Timestamp prevents replay. |
+| **2** | ECS Express → AgentCore | **Cognito JWT (bearer)** | The proxy forwards the end user's verified Cognito **access token** as an `Authorization: Bearer` header over HTTPS (TLS 1.2+). The AgentCore runtime independently verifies the token and reconstructs authority. No SigV4 and no task-role signing — the bearer token is the credential, so the ECS task role needs no `bedrock-agentcore` grant and has no identity policies. |
 | **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` condition. Read-only for GameLift, EKS, Cost Explorer. Scoped by region. |
 | **4** | Prompts → Model | **Bedrock Guardrails** | Input/output content filtering: topic blocking, PII anonymization, prompt injection detection, profanity filtering. |
 
@@ -480,9 +483,9 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 
 ### Service-to-Service Credentials
 
-No static credentials (access keys, passwords, tokens) exist in the codebase or deployment configuration. All service-to-service authentication uses IAM roles with automatic credential rotation:
+No static credentials (access keys, passwords, tokens) exist in the codebase or deployment configuration. Service-to-service authentication uses IAM roles with automatic credential rotation, except the frontend→AgentCore hop, which carries the end user's short-lived Cognito access token:
 
-- **ECS Express → AgentCore**: ECS task role (`ecs-tasks.amazonaws.com`) with `aws:SourceAccount` condition
+- **ECS Express → AgentCore**: the user's verified Cognito access token as a bearer token over HTTPS (no SigV4, no task-role grant). The ECS task role (`ecs-tasks.amazonaws.com`, `aws:SourceAccount` condition) has no identity-based permissions; it exists only so ECS can vend task credentials to the container. The supported chat path's one AWS call, `sts:GetCallerIdentity` (to build the runtime ARN), requires no IAM allow, so no policy is attached. Dormant Cognito Admin/List routes remain intentionally unprivileged pending removal in #473.
 - **AgentCore → AWS Services**: AgentCore execution role (`bedrock-agentcore.amazonaws.com`) with `aws:SourceAccount` condition
 - **MCP Servers**: Run as subprocesses via stdio transport (no network access), inherit the AgentCore execution role credentials
 
@@ -605,21 +608,64 @@ When a CI/CD pipeline is introduced, the existing scripts (`scripts/generate-sbo
 
 ### Network Binding Configuration
 
-**AgentCore Runtime 0.0.0.0 Binding:**
+**Local development binds to loopback (`127.0.0.1`).**
 
-Game Agent's AgentCore Runtime binds to `0.0.0.0:8080` to accept external connections. This is an **intentional design requirement** for the following reasons:
+Local development enables an identity-verification bypass
+(`GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true`, set by `scripts/dev/start.sh`) so a
+developer can exercise the runtime without Cognito. Because that backend is
+unauthenticated, it must not be reachable from other machines: local execution
+always binds to `127.0.0.1`. A machine that could reach a non-loopback bind
+would be able to invoke agents using the developer's active AWS credentials.
+There is no host or port override — the listen address is decided solely by
+the runtime mode, and the port is the fixed AgentCore platform port `8080`.
 
-- **AgentCore Architecture**: AWS Bedrock AgentCore Runtime requires binding to all interfaces (`0.0.0.0`) to accept connections from the AWS-managed infrastructure
-- **Container Environment**: The application runs in a containerized environment where `0.0.0.0` binding is necessary for proper network routing
-- **Security Controls**: Network access is protected by multiple layers:
-  - AWS-managed VPC with security groups
-  - ECS Express service-level access controls
-  - Amazon Cognito authentication (production mode)
-  - WAF rate limiting and attack protection
+The bind decision is made in one place — `resolve_runtime_host()` in
+`backend/src/config/settings.py` — and both entrypoints
+(`backend/src/agentcore_main.py` and the thin wrapper
+`backend/agentcore_main.py`) call the shared `run_server()`, so they cannot
+diverge.
 
-**Configuration Location**: `backend/src/agentcore_main.py` and `backend/agentcore_main.py`
+**Hosted AgentCore Runtime binds to all interfaces (`0.0.0.0`) — intentionally.**
 
-**Security Scanners**: Tools like Bandit (B104) and Semgrep may flag `0.0.0.0` binding as a potential security risk. This is a false positive in the context of AgentCore Runtime's architecture.
+The hosted runtime selects the all-interface bind through an explicit
+condition (`GBAW_HOSTED_RUNTIME=true`). Inside the AWS-managed AgentCore
+container the port is **not published** to the host or the internet, so the
+in-container `0.0.0.0` bind is not exposure — it lets the AWS-managed container
+network route to the application. Narrowing it would break that routing. The
+real boundary is the unpublished container network plus the AgentCore JWT
+verifier (a Cognito access token checked per request), backed by:
+
+- AWS-managed VPC with security groups
+- ECS Express service-level access controls
+- Amazon Cognito authentication (verified per request in application code)
+- WAF rate limiting and attack protection
+
+**Fail-closed invariant (defense-in-depth).** The all-interface bind is never
+granted while the identity bypass is active. If `GBAW_HOSTED_RUNTIME=true` is
+combined with `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true`, `resolve_runtime_host()`
+raises `RuntimeBindError` and the process refuses to start. This is a
+config-drift guard rather than the sole barrier to exposure: `invoke_agent`
+already disregards the bypass whenever `GBAW_HOSTED_RUNTIME=true` (it computes
+`ALLOW_LOCAL_IDENTITY_BYPASS and not HOSTED_RUNTIME`), so the per-request
+Cognito JWT verifier runs in hosted mode regardless of the bypass flag.
+Refusing the contradictory combination at startup keeps a drifted configuration
+from taking effect silently. The deployment selectors set the hosted flag and
+never set the bypass, so hosted configuration cannot reach this combination.
+
+| Mode | Selector | Bind | Boundary |
+|------|----------|------|----------|
+| Local development | default (bypass on) | `127.0.0.1` | Loopback only — not reachable off-host |
+| Hosted AgentCore | `GBAW_HOSTED_RUNTIME=true`, bypass off | `0.0.0.0` | Unpublished container network + per-request JWT verifier |
+| Hosted + bypass | contradictory (config drift) | refuses to start | Fail-closed guard (`RuntimeBindError`); hosted mode ignores the bypass anyway |
+
+**Configuration Location**: `backend/src/config/settings.py` (`resolve_runtime_host`),
+`backend/src/agentcore_main.py` (`run_server`), and `backend/agentcore_main.py`.
+
+**Security Scanners**: Tools like Bandit (B104) and Semgrep may flag the
+`0.0.0.0` constant used for the hosted container bind. In that hosted,
+port-unpublished context it is a false positive; the local default is loopback.
+The constant is annotated `# nosec B104` at its single definition with a
+reference to `resolve_runtime_host`.
 
 **AWS Documentation**:
 - [Amazon ECS Security](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/security.html)

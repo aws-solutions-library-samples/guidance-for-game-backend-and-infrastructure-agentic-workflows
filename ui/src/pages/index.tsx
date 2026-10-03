@@ -15,12 +15,21 @@ interface HomeProps {
     email?: string;
     isAdmin?: boolean;
   };
+  /** True once idle-session logout begins (#310); blocks new chat submissions. */
+  loggingOut?: boolean;
+  /**
+   * Application-level sign-out (#310, Blocker 3). Routes the header manual
+   * sign-out through the shared session coordinator so it waits for any
+   * in-flight refresh and clears cookies last, instead of posting logout and
+   * reloading independently.
+   */
+  onSignOut?: () => void;
 }
 
 /**
  * Home page component with Command Center layout
  */
-export default function Home({ user }: HomeProps) {
+export default function Home({ user, loggingOut = false, onSignOut }: HomeProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [userInfo, setUserInfo] = useState<{ username: string; email: string; isAdmin: boolean } | null>(null);
   const [isAIThinking, setIsAIThinking] = useState(false);
@@ -44,18 +53,21 @@ export default function Home({ user }: HomeProps) {
 
   const username = userInfo?.username || user?.username || 'User';
 
-  const handleSignOut = async () => {
-    try {
-      await fetchWithTimeout('/api/auth/logout', { method: 'POST' });
-      // Clear local state
-      setUserInfo(null);
-      // Force reload to clear all state
-      window.location.href = '/';
-    } catch (error) {
-      console.error('Logout failed:', error);
-      // Force reload anyway
-      window.location.href = '/';
+  const handleSignOut = () => {
+    setShowMenu(false);
+    setUserInfo(null);
+    // Route through the shared coordinator (#310, Blocker 3): it serializes the
+    // cookie-clearing logout behind any in-flight refresh and updates React
+    // state, so no independent logout POST or full-page reload is needed.
+    if (onSignOut) {
+      onSignOut();
+      return;
     }
+    // Fallback for contexts without a coordinator (e.g. dev skip-auth): clear
+    // cookies then reload.
+    void fetchWithTimeout('/api/auth/logout', { method: 'POST' }).finally(() => {
+      window.location.href = '/';
+    });
   };
 
   // Close menu when clicking outside
@@ -169,7 +181,7 @@ export default function Home({ user }: HomeProps) {
               <div className="ga-chat-subtitle">Ready to help with your game infrastructure</div>
             </div>
           </div>
-          <Chat onThinkingChange={setIsAIThinking} />
+          <Chat onThinkingChange={setIsAIThinking} disabled={loggingOut} />
         </div>
       </main>
 

@@ -51,7 +51,9 @@ from config.settings import (
     HOSTED_RUNTIME,
     RATE_LIMIT_MAX_REQUESTS,
     RATE_LIMIT_WINDOW_SECONDS,
+    RUNTIME_PORT,
     USE_BEDROCK_SESSIONS,
+    resolve_runtime_host,
 )
 from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
 from utils.logger import logger
@@ -425,16 +427,52 @@ def invoke_agent(prompt, context=None):
         )
 
 
-# Configure for local development
-if __name__ == "__main__":
-    logger.info("🤖 Starting AgentCore Runtime...")
-    logger.info("🔧 Environment: development")
-    logger.info("🌐 Server will be available at: http://localhost:8080")
-    logger.info(
-        "💡 Test with: curl -X POST http://localhost:8080/invocations -H 'Content-Type: application/json' -d '{\"prompt\": \"Hello\"}'"
+def run_server():
+    """Start the AgentCore application server.
+
+    The listen address is resolved by ``resolve_runtime_host`` (config.settings):
+    loopback for local execution, all-interfaces only inside the hosted
+    AgentCore container. This is a shared entrypoint so both
+    ``backend/src/agentcore_main.py`` and the thin wrapper
+    ``backend/agentcore_main.py`` make an identical, tested bind decision.
+    """
+    host = resolve_runtime_host(
+        hosted_runtime=HOSTED_RUNTIME,
+        allow_local_identity_bypass=ALLOW_LOCAL_IDENTITY_BYPASS,
     )
+
+    logger.info("🤖 Starting AgentCore Runtime...")
+    logger.info(f"🔧 Mode: {'hosted (all-interfaces container bind)' if HOSTED_RUNTIME else 'local (loopback)'}")
+
+    # Invocation guidance must be truthful about the boundary in front of the
+    # process. The copy-paste anonymous curl is only correct when the identity
+    # bypass is active on a loopback listener (the local dev backend): there the
+    # request needs no Cognito access token. In hosted mode the JWT verifier
+    # runs per request, so an unauthenticated curl would be rejected; we must
+    # not print one, and we must never advertise the bind host in a URL when it
+    # is 0.0.0.0 (that is a bind wildcard, not a reachable address).
+    local_dev_backend = (not HOSTED_RUNTIME) and ALLOW_LOCAL_IDENTITY_BYPASS
+    if local_dev_backend:
+        logger.info(f"🌐 Listening on: http://{host}:{RUNTIME_PORT}")
+        logger.info(
+            f"💡 Test with: curl -X POST http://{host}:{RUNTIME_PORT}/invocations "
+            "-H 'Content-Type: application/json' -d '{\"prompt\": \"Hello\"}'"
+        )
+    else:
+        # Report the bind address as a bind, not as a browsable URL: a 0.0.0.0
+        # bind is a wildcard, not somewhere a client connects.
+        logger.info(f"🌐 Bound to {host}:{RUNTIME_PORT}")
+        logger.info(
+            "💡 Invocations require a verified Cognito access token; invoke through "
+            "AgentCore with that token rather than an unauthenticated request."
+        )
 
     # MCP connections handled by MCP Server Pool
     logger.info("🚀 MCP connections will use MCP Server Pool")
 
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host=host, port=RUNTIME_PORT)
+
+
+# Configure for local development
+if __name__ == "__main__":
+    run_server()

@@ -66,6 +66,15 @@ start_agentcore() {
     # bypass and therefore require a cryptographically verified Cognito JWT.
     export PYTHONPATH=$(pwd)
     export GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true
+    # Force local runtime mode unconditionally. The backend reads settings from
+    # the process environment first and only falls back to ui/.env.local for
+    # values it does not already have (load_dotenv does not override). Exporting
+    # the hosted flag to "false" here guarantees an inherited GBAW_HOSTED_RUNTIME
+    # or a stray GBAW_HOSTED_RUNTIME=true in ui/.env.local cannot flip this
+    # bypass-enabled dev backend into the all-interface hosted bind. Combined
+    # with the bypass above, that combination would fail closed anyway, but this
+    # keeps `./dev-start.sh` binding loopback (127.0.0.1) rather than refusing.
+    export GBAW_HOSTED_RUNTIME=false
 
     # Auto-detect and set Memory ID if available
     if [ -f ".bedrock_agentcore.yaml" ]; then
