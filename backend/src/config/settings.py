@@ -143,6 +143,94 @@ COGNITO_CLIENT_ID = os.getenv("GBAW_COGNITO_CLIENT_ID", "").strip()
 HOSTED_RUNTIME = os.getenv("GBAW_HOSTED_RUNTIME", "false").lower() == "true"
 ALLOW_LOCAL_IDENTITY_BYPASS = os.getenv("GBAW_ALLOW_LOCAL_IDENTITY_BYPASS", "false").lower() == "true"
 
+# =============================================================================
+# RUNTIME LISTENER BIND (#470)
+# =============================================================================
+# The AgentCore application listens on loopback (127.0.0.1) for every local
+# run so an unauthenticated developer backend is never reachable from other
+# machines. The all-interface bind (0.0.0.0) is correct ONLY inside the hosted
+# AgentCore container, whose unpublished network plus per-request JWT verifier
+# form the boundary — there the in-container bind must accept the platform's
+# own routing.
+#
+# Local development also bypasses identity verification
+# (GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true, set by scripts/dev/start.sh). An
+# unauthenticated backend reachable beyond the host would let any machine that
+# can reach it invoke agents using the developer's live AWS credentials.
+#
+# An environment flag cannot, by itself, prove that a real AgentCore JWT
+# boundary is in front of the process. So the two dangerous inputs are not
+# allowed to combine: hosted mode grants the all-interface bind only when the
+# local identity bypass is off. hosted_runtime=true together with
+# allow_local_identity_bypass=true fails closed. This is defense-in-depth:
+# invoke_agent already ignores the bypass whenever HOSTED_RUNTIME is true
+# (ALLOW_LOCAL_IDENTITY_BYPASS and not HOSTED_RUNTIME), so the JWT verifier
+# runs on every request in hosted mode regardless of the bypass flag. Refusing
+# the combination at startup prevents a contradictory, drifted configuration
+# from taking effect silently rather than being the sole barrier to exposure.
+RUNTIME_LOOPBACK_HOST = "127.0.0.1"
+RUNTIME_ALL_INTERFACES_HOST = "0.0.0.0"  # nosec B104 - hosted container bind only; see resolve_runtime_host
+# AgentCore serves on the fixed platform port 8080 (see scripts/dev/start.sh,
+# scripts/deploy.sh, and the AgentCore SDK default). It is intentionally not
+# configurable.
+RUNTIME_PORT = 8080
+
+
+class RuntimeBindError(RuntimeError):
+    """Raised when the requested listener bind is unsafe for the current mode.
+
+    Specifically, when the hosted all-interface bind is requested while the
+    local identity bypass is active. This is a defense-in-depth / config-drift
+    guard: ``invoke_agent`` already ignores the bypass whenever
+    ``HOSTED_RUNTIME`` is true (it computes
+    ``ALLOW_LOCAL_IDENTITY_BYPASS and not HOSTED_RUNTIME``), so the per-request
+    JWT verifier runs regardless. Refusing this combination at startup keeps a
+    contradictory configuration from silently taking effect rather than being
+    the only thing standing between the bypass and an exposed backend.
+    """
+
+
+def resolve_runtime_host(
+    *,
+    hosted_runtime: bool,
+    allow_local_identity_bypass: bool,
+) -> str:
+    """Resolve the listener host for an AgentCore entrypoint.
+
+    Rules (see the module comment above and issue #470):
+
+    - Local execution always binds loopback (``127.0.0.1``).
+    - Hosted AgentCore (``hosted_runtime=True``) binds all interfaces
+      (``0.0.0.0``) so the AWS-managed container network can route to it — but
+      only when the local identity bypass is off. The unpublished container
+      network and per-request JWT verifier are the boundary.
+    - ``hosted_runtime=True`` combined with ``allow_local_identity_bypass=True``
+      fails closed (raises ``RuntimeBindError``). This is defense-in-depth
+      against config drift: ``invoke_agent`` already disregards the bypass while
+      hosted (``ALLOW_LOCAL_IDENTITY_BYPASS and not HOSTED_RUNTIME``), so the
+      JWT verifier runs regardless. Refusing the contradictory combination at
+      startup keeps it from taking effect silently.
+
+    Returns the host string to pass to ``app.run(host=...)``.
+    """
+    if not hosted_runtime:
+        return RUNTIME_LOOPBACK_HOST
+
+    if allow_local_identity_bypass:
+        raise RuntimeBindError(
+            "Refusing to start: GBAW_HOSTED_RUNTIME=true selects the "
+            "all-interface (0.0.0.0) container bind, but "
+            "GBAW_ALLOW_LOCAL_IDENTITY_BYPASS is also true. These settings "
+            "contradict each other: hosted mode already ignores the bypass and "
+            "verifies a Cognito JWT per request, so this combination indicates "
+            "configuration drift rather than an intended state. Unset the "
+            "bypass in the hosted container, or leave GBAW_HOSTED_RUNTIME unset "
+            "for local development (binds 127.0.0.1)."
+        )
+
+    return RUNTIME_ALL_INTERFACES_HOST
+
+
 # Memory layer configuration
 MEMORY_SESSION_TTL_HOURS = int(os.getenv("GBAW_MEMORY_SESSION_TTL_HOURS", "24"))  # Conversation memory
 MEMORY_USER_TTL_DAYS = int(os.getenv("GBAW_MEMORY_USER_TTL_DAYS", "30"))  # User memory

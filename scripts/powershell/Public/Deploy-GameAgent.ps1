@@ -454,6 +454,25 @@ function Deploy-GameAgent {
         try { Invoke-Aws inspector2 enable --resource-types ECR --region $Region | Out-Null }
         catch { Write-GameAgentStatus 'Inspector could not be enabled (may not be available)' -Type Warning }
 
+        # ECS Express owns the ALB lifecycle and can leave a different WebACL
+        # active after a frontend update. Reassert the project ACL, tolerate
+        # bounded WAF propagation delays, and verify its required rules.
+        Write-GameAgentStatus 'Step 8c: Reconciling WAF association...' -Type Info
+        $wafAclArn = Get-StackOutput "$ProjectName-security" 'WebACLArn'
+        $profileArgsForWaf = @($profileArgs)
+        $invokeAwsForWaf = {
+            param([string[]]$AwsArgs)
+            $allArgs = $AwsArgs + $profileArgsForWaf
+            $result = & aws @allArgs 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "AWS WAF command failed: $result" }
+            return $result
+        }.GetNewClosure()
+        Invoke-GameAgentWafReconciliation `
+            -ExpectedWebAclArn $wafAclArn `
+            -ResourceArn $frontendAlbArn `
+            -Region $Region `
+            -InvokeAws $invokeAwsForWaf
+
         Write-GameAgentStatus 'Security infrastructure deployed' -Type Success
         Write-Host ''
     } else {

@@ -24,8 +24,8 @@ dependencies = [
     # Environment variables
     "python-dotenv>=1.2.2",
 
-    # JWT authentication (floor raised to the patched version, CVE fix)
-    "PyJWT[crypto]>=2.13.0",
+    # JWT authentication (floor raised to the patched version, vulnerability fix)
+    "PyJWT[crypto]>=2.15.0",
 
     # AgentCore SDK with Strands integration
     "bedrock-agentcore[strands-agents]>=1.19.0",
@@ -70,7 +70,7 @@ dependencies = [
     "requests>=2.34.2",
     "beautifulsoup4>=4.15.0",
     "html2text>=2024.2.26",
-    "pypdf>=6.15.0",
+    "pypdf>=6.19.0",
 ]
 
 [dependency-groups]

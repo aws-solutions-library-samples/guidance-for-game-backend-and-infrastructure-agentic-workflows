@@ -28,7 +28,7 @@ class _CostExplorerOperationGuard(AgentTool):
 
     @property
     def tool_name(self) -> str:
-        return self._delegate.tool_name
+        return str(self._delegate.tool_name)
 
     @property
     def tool_spec(self) -> ToolSpec:
@@ -38,7 +38,7 @@ class _CostExplorerOperationGuard(AgentTool):
 
     @property
     def tool_type(self) -> str:
-        return self._delegate.tool_type
+        return str(self._delegate.tool_type)
 
     async def stream(self, tool_use: ToolUse, invocation_state: dict[str, Any], **kwargs: Any) -> ToolGenerator:
         operation = tool_use.get("input", {}).get("operation")

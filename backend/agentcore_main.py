@@ -3,6 +3,7 @@
 AgentCore entrypoint wrapper.
 Delegates to the actual implementation in src/agentcore_main.py
 """
+
 # Standard library
 import importlib.util
 import os
@@ -21,4 +22,7 @@ spec.loader.exec_module(src_module)
 app = src_module.app
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Delegate to the shared server entrypoint so the bind decision (loopback
+    # for local, all-interfaces only inside the hosted container) is identical
+    # to backend/src/agentcore_main.py and covered by one set of tests (#470).
+    src_module.run_server()
