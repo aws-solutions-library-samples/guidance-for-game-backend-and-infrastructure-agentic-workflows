@@ -55,9 +55,18 @@ def test_agentcore_pricing_access_supports_service_discovery():
     assert "pricing:GetProducts" in statement
 
 
-def test_ecs_task_cost_access_remains_region_scoped():
+def test_ecs_task_role_has_no_cost_explorer_access():
+    """Frontend least privilege (#458): the ECS task role no longer carries any
+    Cost Explorer grant. Cost queries are a backend/AgentCore specialist concern;
+    the frontend proxy has no Cost Explorer caller, so ``CostExplorerAccess`` was
+    removed from ``ECSTaskRole`` entirely (it survives only on
+    ``AgentCoreExecutionRole``)."""
     template = BASE_INFRASTRUCTURE_TEMPLATE.read_text(encoding="utf-8")
     task_role = _cloudformation_resource(template, "ECSTaskRole")
-    statement = _iam_statement(task_role, "CostExplorerAccess")
 
-    assert "aws:RequestedRegion" in statement
+    assert "CostExplorerAccess" not in task_role
+    assert "ce:GetCostAndUsage" not in task_role
+
+    # The AgentCore execution role keeps its (globally-scoped) Cost Explorer grant.
+    execution_role = _cloudformation_resource(template, "AgentCoreExecutionRole")
+    assert "ce:GetCostAndUsage" in execution_role

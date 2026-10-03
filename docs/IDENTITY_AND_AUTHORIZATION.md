@@ -12,7 +12,7 @@ The production request path is:
 Cognito access token
   -> Next.js API adapter
   -> immutable principal context
-  -> SigV4 AgentCore invocation
+  -> bearer-token AgentCore invocation (Cognito access token)
   -> sanitized backend request context
 ```
 
