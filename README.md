@@ -114,6 +114,48 @@ The following table provides a sample cost breakdown for deploying this Guidance
 
 > **Note:** The dominant cost driver is model token usage (Sonnet + Haiku = $630, or 84% of total). Infrastructure costs are minimal at this query volume. Token volumes above are estimates based on ~8 model turns per query; actual costs depend on conversation length and specialist complexity. HTTP request volume is estimated at ~100K/month (10K agent queries × ~10 HTTP requests each for auth, polling, streaming, and static assets); ALB and WAF rows use this shared assumption. Prompt caching break-even requires a cache-read share above ~22% of cached tokens — monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch. Minimum cache checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5).
 
+### Optional operations control plane (E1)
+
+The optional E1 operations control plane is **default-disabled and adds no
+incremental cost** to the numbers above. Nothing in the table changes unless an
+owner explicitly enables operations. When enabled, E1 deploys the accepted
+synchronous, read-only GameLift observation design
+([ADR 0005](docs/adr/0005-persist-operations-and-recover-workflows.md)): an
+API Gateway HTTP API route, request-scoped compute (modelled as AWS Lambda,
+x86, 512 MB), an Amazon DynamoDB on-demand table (with PITR) for operation
+state, idempotency, and the append-only ledger, an Amazon S3 bucket for
+content-addressed observation records, and CloudWatch logs, metrics, and
+alarms with X-Ray tracing. There is **no queue, worker, dead-letter queue, or
+Step Functions** in the observation path — Step Functions is deferred to the
+future approval/write workflow and is **not** part of this estimate. No
+provider-write permission is deployed.
+
+Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**, AWS
+Price List us-west-2 rates; free-tier allowances intentionally excluded):
+
+| Scenario | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- |
+| Default-disabled | $0.00 | $0.00 | **$0.00** |
+| Enabled, idle (0 requests) | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations | $1.84 | $3.49 | **$5.33** |
+
+> **Note:** These E1 numbers are computed from
+> [`docs/operations-cost-model.json`](docs/operations-cost-model.json), which
+> records every rate, source URL, and assumption (per-request DynamoDB
+> transactional write/read units, ~8 KB object/log sizes, 1.0 s billed Lambda
+> duration, 4 custom metrics, and 4 alarms). A unit test
+> (`backend/tests/unit/test_operations_cost_model_unit.py`) recomputes each total
+> from the formulas and asserts the JSON and this table cannot drift. Variable
+> cost scales linearly at ~$0.0000349 per observation request, so 1,000,000
+> requests/month is ~$34.90 variable + $1.84 fixed. DynamoDB transactional
+> writes dominate the variable cost; CloudWatch metrics and alarms dominate the
+> fixed cost. Denial-of-wallet controls: AWS Budgets on the stack's
+> cost-allocation tag, DynamoDB on-demand per-table maximum request units, HTTP
+> API stage throttling, and CloudWatch volume/error alarms. E1 rollout
+> ([#413](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/413))
+> is blocked on this reviewed cost evidence. This documents an optional design;
+> it does not assert the operations stack is deployed.
+
 ## Prerequisites
 
 ### Required Tools

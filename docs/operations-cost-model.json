@@ -1,0 +1,203 @@
+{
+  "$comment": "Machine-checkable incremental cost model for the OPTIONAL E1 operations control plane (GitHub issue #281). This file is the single source of truth for the E1 cost numbers published in README.md and docs/DEPLOYMENT_GUIDE.md. backend/tests/unit/test_operations_cost_model_unit.py recomputes every scenario total from the formulas below and asserts the published totals here — and the numbers in the public docs — match, so documentation cannot drift from the pricing inputs. It describes the accepted synchronous observation design in docs/adr/0005-persist-operations-and-recover-workflows.md; it does NOT assert any operations infrastructure is deployed.",
+  "schema_version": "1.0",
+  "issue": 281,
+  "design": {
+    "adr": "docs/adr/0005-persist-operations-and-recover-workflows.md",
+    "adr_status": "Accepted",
+    "execution_shape": "synchronous",
+    "e1_scope_issue": 413,
+    "notes": "E1 is one exact, deterministic, read-only GameLift observation committed synchronously behind an API Gateway HTTP API. The accepted design has NO queue, worker, dead-letter queue, or Step Functions in the observation path; Step Functions is deferred to the future approval/write workflow and is therefore excluded from this baseline. No provider-write permission is deployed."
+  },
+  "pricing": {
+    "region": "us-west-2",
+    "currency": "USD",
+    "as_of": "2026-09-21",
+    "source": "AWS Price List Bulk API, per-service us-west-2 offer files",
+    "sources": {
+      "api_gateway": {
+        "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonApiGateway/current/us-west-2/index.json",
+        "human_url": "https://aws.amazon.com/api-gateway/pricing/",
+        "publication_date": "2026-09-11"
+      },
+      "lambda": {
+        "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSLambda/current/us-west-2/index.json",
+        "human_url": "https://aws.amazon.com/lambda/pricing/",
+        "publication_date": "2026-09-19"
+      },
+      "dynamodb": {
+        "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonDynamoDB/current/us-west-2/index.json",
+        "human_url": "https://aws.amazon.com/dynamodb/pricing/on-demand/",
+        "publication_date": "2026-09-11"
+      },
+      "s3": {
+        "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/us-west-2/index.json",
+        "human_url": "https://aws.amazon.com/s3/pricing/",
+        "publication_date": "2026-09-18"
+      },
+      "cloudwatch": {
+        "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonCloudWatch/current/us-west-2/index.json",
+        "human_url": "https://aws.amazon.com/cloudwatch/pricing/",
+        "publication_date": "2026-09-18"
+      },
+      "xray": {
+        "url": "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSXRay/current/us-west-2/index.json",
+        "human_url": "https://aws.amazon.com/xray/pricing/",
+        "publication_date": "2026-09-11"
+      }
+    },
+    "rates": {
+      "apigw_http_request_usd_per_request": 0.000001,
+      "lambda_request_usd_per_request": 0.0000002,
+      "lambda_gb_second_usd_x86": 0.0000166667,
+      "ddb_write_request_unit_usd": 0.000000625,
+      "ddb_read_request_unit_usd": 0.000000125,
+      "ddb_storage_usd_per_gb_month": 0.25,
+      "ddb_pitr_usd_per_gb_month": 0.20,
+      "s3_storage_usd_per_gb_month": 0.023,
+      "s3_put_usd_per_request": 0.000005,
+      "s3_get_usd_per_request": 0.0000004,
+      "cw_log_ingest_usd_per_gb": 0.50,
+      "cw_log_storage_usd_per_gb_month": 0.03,
+      "cw_custom_metric_usd_per_metric_month": 0.30,
+      "cw_alarm_usd_per_alarm_month": 0.10,
+      "xray_trace_recorded_usd_per_trace": 0.000005,
+      "data_transfer_out_usd_per_gb": 0.09,
+      "kms_cmk_usd_per_month": 1.00,
+      "kms_request_usd_per_10k": 0.03
+    },
+    "rate_notes": {
+      "gb_definition": "Storage and data-transfer conversions use 1 GB = 1024^3 bytes and 1 KB = 1024 bytes, matching AWS binary-GB billing for storage and log ingestion.",
+      "ddb_transactional_multiplier": "Transactional reads and writes consume 2x the request units of a standard operation. TransactWriteItems item <=1 KB = 2 WRU; strongly-consistent read <=4 KB = 1 RRU, transactional read = 2 RRU.",
+      "ddb_storage_free_tier_excluded": "Standard-class storage rate 0.25 USD/GB-month is applied to all modelled storage; the 25 GB always-free allowance is intentionally NOT subtracted (conservative).",
+      "free_tier": "All free-tier allowances (Lambda 1M requests + 400,000 GB-s, API Gateway 1M HTTP calls for 12 months, DynamoDB 25 GB + 2.5M stream reads, X-Ray 100k traces, CloudWatch 10 metrics/10 alarms) are intentionally EXCLUDED so the estimate does not depend on account age or shared consumption with the base stack.",
+      "kms": "KMS is listed as an optional line. If the optional stack reuses the base-stack customer-managed key, no incremental KMS key charge applies; only per-request charges (well under 0.01 USD at these volumes) would accrue. KMS is not included in the modelled scenario totals."
+    }
+  },
+  "assumptions": {
+    "default_disabled": {
+      "operations_mode": "disabled",
+      "resources_created": 0,
+      "description": "Default deployment sets operations mode to disabled and creates no HTTP API route, compute, table, bucket, metric, or alarm for operations."
+    },
+    "compute_choice": {
+      "selected": "lambda_x86",
+      "rationale": "The accepted ADR leaves the concrete compute resource to the implementing issue (a deferred decision). AWS Lambda is modelled because it scales to zero, which makes the enabled-idle cost near zero as required by issue #281, and it fits the request-scoped synchronous observation behind the HTTP API. Alternative: reuse the existing Fargate service, which adds no new fixed compute cost but also does not scale to zero; that alternative is noted in the docs, not modelled as the baseline.",
+      "lambda_memory_mb": 512,
+      "lambda_billed_seconds_per_request": 1.0,
+      "lambda_billed_seconds_note": "1.0 s billed duration is a conservative modelling value. The accepted E0 latency evidence measured request-completion p50 159.753 ms / p99 403.194 ms for the three-read-plus-persist path; 1.0 s leaves headroom for cold starts and model-free server overhead and stays far under the 15 s request deadline."
+    },
+    "per_observation_request": {
+      "apigw_requests": 1,
+      "lambda_invocations": 1,
+      "gamelift_read_calls": 3,
+      "gamelift_charge": "GameLift describe_fleet_utilization, describe_fleet_capacity, and describe_scaling_policies are read-only control-plane calls with no per-call AWS charge.",
+      "ddb_transactional_write_items_per_request": 8,
+      "ddb_transactional_write_items_note": "Idempotency creation commits the idempotency mapping, prepared-operation metadata, current-state snapshot, and the initial ledger event atomically (4 items); observation completion commits the STATE#current update, one STATE#<sequence> transition, and two ledger events (4 items). All are <=1 KB transactional writes: 8 items x 2 WRU = 16 WRU per request.",
+      "ddb_write_request_units_per_request": 16,
+      "ddb_transactional_read_units_per_request": 2,
+      "ddb_transactional_read_units_note": "Idempotency resolution performs one transactional get of the mapping on the create path: 1 item <=4 KB transactional read = 2 RRU.",
+      "status_reads_per_observation": 1,
+      "ddb_read_request_units_per_status_read": 2,
+      "ddb_read_request_units_note": "One status retrieval reads the current-state snapshot and a bounded ledger query; modelled as 2 strongly-consistent reads <=4 KB = 2 RRU. Total read units per observation = 2 (create-path) + 1 status read x 2 = 4 RRU.",
+      "s3_puts_per_request": 1,
+      "s3_gets_per_request": 1,
+      "s3_object_kb": 8,
+      "s3_note": "The bounded observation record is written once as a content-addressed object (1 PUT) and re-read once for hash verification on status/rebind (1 GET). Large-diff externalization does not occur in the read-only observation path, so 8 KB is a conservative small-object size.",
+      "cw_log_kb_per_request": 8,
+      "cw_log_note": "Structured JSON request/audit log lines, ~8 KB ingested per observation request.",
+      "xray_traces_per_request": 1,
+      "response_kb": 8,
+      "data_transfer_note": "Observation response payload ~8 KB out; data-transfer-out is modelled but negligible at these volumes."
+    },
+    "enabled_idle": {
+      "description": "Operations enabled but receiving zero observation requests for the month. Only always-on resources bill.",
+      "cw_custom_metrics": 4,
+      "cw_alarms": 4,
+      "cw_metrics_note": "Four custom metrics (failures, timeouts, stuck/lease-expired operations, request latency) and four alarms detecting failures, timeouts, and stuck operations, per E1 acceptance criteria.",
+      "ddb_stored_gb": 0.1,
+      "s3_stored_gb": 0.1,
+      "storage_note": "0.1 GB retained metadata/ledger and 0.1 GB content objects represent a small standing footprint from prior enablement; a truly fresh enable starts near 0 GB.",
+      "pitr_enabled": true,
+      "kms_dedicated_key": false
+    },
+    "representative_load": {
+      "description": "Representative read-only observation workload for one month.",
+      "observation_requests_per_month": 100000,
+      "requests_note": "100,000 observation requests/month (~139/hour sustained) is the representative operator/automation polling volume, chosen to align with the base stack's ~100K/month HTTP request assumption for comparability.",
+      "ddb_stored_gb": 0.5,
+      "s3_stored_gb": 0.5,
+      "cw_custom_metrics": 4,
+      "cw_alarms": 4,
+      "pitr_enabled": true
+    }
+  },
+  "scenarios": {
+    "default_disabled": {
+      "fixed_usd": 0.0,
+      "variable_usd": 0.0,
+      "total_usd": 0.0
+    },
+    "enabled_idle": {
+      "note": "Totals are computed and asserted by the test from the rates and assumptions above.",
+      "line_items_usd": {
+        "cloudwatch_metrics": 1.2,
+        "cloudwatch_alarms": 0.4,
+        "ddb_storage": 0.025,
+        "ddb_pitr": 0.02,
+        "s3_storage": 0.0023
+      },
+      "fixed_usd": 1.65,
+      "variable_usd": 0.0,
+      "total_usd": 1.65
+    },
+    "representative_load": {
+      "note": "Totals are computed and asserted by the test from the rates and assumptions above.",
+      "line_items_usd": {
+        "apigw_requests": 0.1,
+        "lambda_requests": 0.02,
+        "lambda_duration": 0.83,
+        "ddb_writes": 1.0,
+        "ddb_reads": 0.05,
+        "s3_puts": 0.5,
+        "s3_gets": 0.04,
+        "cloudwatch_log_ingest": 0.38,
+        "xray_traces": 0.5,
+        "data_transfer_out": 0.07,
+        "cloudwatch_metrics": 1.2,
+        "cloudwatch_alarms": 0.4,
+        "ddb_storage": 0.125,
+        "ddb_pitr": 0.1,
+        "s3_storage": 0.0115
+      },
+      "variable_usd": 3.49,
+      "fixed_usd": 1.84,
+      "total_usd": 5.33
+    }
+  },
+  "rounding": {
+    "policy": "Intermediate arithmetic uses full floating precision. Published per-scenario totals are rounded half-up to cents (2 decimals). The test asserts each computed total rounds to the published total. Individual line_items_usd are shown rounded for readability and are asserted to 2 decimals (5 minor decimals for sub-cent lines).",
+    "tolerance_usd": 0.01
+  },
+  "sensitivity": {
+    "dominant_variable_driver": "DynamoDB transactional writes (ddb_writes) dominate the variable cost; CloudWatch metrics and alarms dominate the fixed cost. At representative load the variable cost is ~USD 3.49/month and the fixed cost ~USD 1.84/month.",
+    "break_even_notes": [
+      "Variable cost scales linearly at approximately USD 0.0000349 per observation request (representative variable_usd / 100,000).",
+      "At 1,000,000 requests/month the variable cost is ~10x (~USD 34.9) while fixed cost is unchanged (~USD 1.84).",
+      "Switching Lambda from x86 to Arm reduces lambda_duration by ~20% (rate 0.0000133334 vs 0.0000166667 GB-s).",
+      "Reusing the base-stack KMS key and Fargate compute removes the KMS key line and the Lambda lines respectively; the Fargate alternative trades per-request Lambda cost for already-provisioned always-on capacity."
+    ],
+    "denial_of_wallet_controls": [
+      "AWS Budgets alert on the optional stack cost-allocation tag.",
+      "DynamoDB on-demand per-table maximum read/write request units (OnDemandThroughput MaxReadRequestUnits/MaxWriteRequestUnits) cap runaway spend.",
+      "API Gateway HTTP API stage throttling (burst and rate limits) bounds request volume.",
+      "CloudWatch alarms on request count and error/timeout rate detect abnormal volume.",
+      "The stack is default-disabled and torn down by setting operations mode to disabled."
+    ]
+  },
+  "documentation_targets": {
+    "public_cost_table": "README.md (Cost section) and docs/DEPLOYMENT_GUIDE.md (Cost Estimates section) — a new 'Optional operations control plane (E1)' subsection.",
+    "deployment_guide": "docs/DEPLOYMENT_GUIDE.md Cost Estimates section.",
+    "rollout_gate": "E1 rollout (issue #413) is blocked on this reviewed cost evidence per issue #281 acceptance."
+  }
+}
