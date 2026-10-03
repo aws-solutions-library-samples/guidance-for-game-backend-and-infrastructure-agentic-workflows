@@ -210,11 +210,11 @@ jobs:
           echo ""
           echo "Fix guidance: bump the affected package (pyproject.toml + uv.lock + regenerated requirements.txt, or ui/package.json + package-lock.json) — do not add grype ignore rules."
         } > "$BODY_FILE"
-        EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+        EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
         if [ -n "$EXISTING" ]; then
-          gh issue comment "$EXISTING" --body-file "$BODY_FILE"
+          gh issue comment --repo "$GITHUB_REPOSITORY" "$EXISTING" --body-file "$BODY_FILE"
         else
-          gh issue create --title "$TITLE" --label security --body-file "$BODY_FILE"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --label security --body-file "$BODY_FILE"
         fi
 
   powershell-tests:

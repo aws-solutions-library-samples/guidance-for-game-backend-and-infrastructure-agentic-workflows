@@ -1,9 +1,13 @@
 # E0 Synchronous-Observation Latency Validation (issue #412)
 
 This directory holds the **disposable** validation spike for the intended E1
-synchronous GameLift observation. It produces measured evidence for the latency
-acceptance gate that keeps [ADR 0005](../adr/0005-persist-operations-and-recover-workflows.md)
-in `Proposed`.
+synchronous GameLift observation. It produced the measured evidence for the
+latency acceptance gate that previously kept
+[ADR 0005](../adr/0005-persist-operations-and-recover-workflows.md) in
+`Proposed`. That gate is now **met**: the accepted measurement in
+[`e0-latency-2026-09-21-dynamodb.json`](e0-latency-2026-09-21-dynamodb.json)
+moves ADR 0005 to `Accepted` for the synchronous-observation latency claim (see
+[Status: measurement complete](#status-measurement-complete--adr-0005-accepted)).
 
 Nothing here deploys production infrastructure, grants provider write
 permissions, or enables operations. Every provider call is read-only
@@ -222,38 +226,69 @@ python3 scripts/check_public_content.py docs/evidence/e0-latency-<YYYY-MM-DD>.js
 python3 scripts/check_public_content.py
 ```
 
-## Status: live measurement PENDING — do not accept the ADR yet
+## Status: measurement complete — ADR 0005 Accepted
 
-**The harness and its full test suite are complete and green**, but a
-representative **live** measurement has **not** been produced, because it
-requires a GameLift resource this read-only wave must not create.
+**The harness and its full test suite are complete and green, and a
+representative live measurement has been produced, reviewed, and independently
+accepted.** The recorded evidence is
+[`e0-latency-2026-09-21-dynamodb.json`](e0-latency-2026-09-21-dynamodb.json)
+(measured `2026-09-21T19:11:52Z`).
 
-Verified on the `demo` profile in `us-west-2` (read-only, `2026-09` wave):
+The measurement ran the real **DynamoDB transactional** persistence mode over a
+**clean** sample (zero failures, zero timeouts, zero partial denials) at
+concurrency 4 under the declared closed-loop arrival model, against one classic
+GameLift fleet in a non-production account.
 
-- `aws gamelift list-fleets` returns **no classic fleets**.
-- The only fleet present is a **container** fleet, and
-  `describe_fleet_utilization` rejects it with
-  `InvalidRequestException: Operation only supports Fleet resource`. The exact
-  three-read observation therefore cannot run against the available fleet.
-- Running the harness with no `--fleet-id` exits `3` and prints the remaining
-  live step rather than fabricating a measurement.
+### Accepted sample and percentiles (public-safe)
 
-### Exact remaining live step
+| Field | Value |
+|---|---|
+| Sample size | 200 |
+| Successes | 200 |
+| Failures | 0 |
+| Timeouts | 0 |
+| Partial denials | 0 |
+| `clean_run` | `true` |
+| Percentile method | nearest-rank |
+| p50 | 159.753 ms |
+| p95 | 250.094 ms |
+| p99 | 403.194 ms |
+| max | 414.698 ms |
+| Persistence mode | `dynamodb-transactional` |
+| `persistence_acceptable` | `true` |
+| `synchronous_accepted` | `true` |
 
-Provision (or point at) **one classic GameLift fleet** in a non-production
-account, create a disposable, task-owned, on-demand persistence table (see
-[Persistence modes](#persistence-modes-and-the-disposable-table)), then run the
-reproduction command above with that fleet's id, `--persistence-mode
-dynamodb-transactional`, and `--persistence-table` to capture
-`e0-latency-<date>.json`. Provisioning a fleet and a table are AWS mutations and
-are **out of scope for this read-only wave**; they are the remaining actions
-before ADR 0005 can be evaluated. A run under the in-memory (test-only)
-persistence mode is **not** acceptance evidence.
+The measured **p99 of 403.194 ms** clears the **27.0 s acceptance ceiling**
+(`gateway_integration_timeout − cancellation_margin`) by a **26.6 s margin**
+(26596.806 ms). The acceptance rule
+(`persistence_acceptable AND clean_run AND p99 ≤ ceiling`) evaluates to
+accepted.
 
-Until that live evidence exists and is reviewed:
+### Assumptions and caveats retained
 
-- ADR 0005 stays **Proposed**.
-- Issue #279's remaining acceptance checkbox stays open.
+This measurement validates the **latency claim only**, under these declared
+conditions — they remain in force and are recorded in the evidence document:
 
-No measured percentile is asserted anywhere in this spike. A synthetic timing
-test is **not** the acceptance measurement (issue #412, Out of Scope).
+- **Closed-loop concurrency** arrival model — a bounded-concurrency,
+  back-to-back stand-in for the single-request synchronous path, **not** a model
+  of production request rate or an open (Poisson-arrival) load test
+  (`assumptions.arrival_model`).
+- **Synthetic, task-owned DynamoDB transaction** — each sample wrote synthetic,
+  per-sample-unique operation-state and append-only ledger items to a
+  disposable, task-owned table in one `TransactWriteItems` call; no fleet id,
+  account id, ARN, or provider payload was written.
+- **Model inference is excluded** from the measured path.
+- **No provider writes** — every GameLift call was read-only
+  (`describe`/`list`); the spike created no operations infrastructure and
+  granted no write permissions.
+
+The measured fleet appears only as a non-reversible short hash (`target_ref`);
+the document carries latency statistics and declared assumptions only and
+conforms to [`e0-latency-evidence.schema.json`](e0-latency-evidence.schema.json).
+
+With this accepted evidence:
+
+- ADR 0005 is **Accepted** for the synchronous-observation latency claim.
+- The spike's disposable table and fleet are AWS mutations that were created and
+  torn down outside version control; nothing here deploys or retains
+  infrastructure.

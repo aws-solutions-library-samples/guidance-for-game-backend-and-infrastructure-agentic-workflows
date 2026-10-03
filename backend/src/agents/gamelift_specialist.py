@@ -6,6 +6,7 @@ using boto3 for AWS GameLift operations.
 """
 
 # Standard library
+import uuid
 from typing import Any
 
 # Third-party packages
@@ -14,9 +15,26 @@ from strands import tool
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.gamelift_projections import (
+    GAMELIFT_MAX_PROJECTED_ITEMS,
+    error_result,
+    log_sanitized_failure,
+    project_fleet_capacity,
+    project_fleet_utilization,
+    project_scaling_policies,
+)
 from agents.optimized_prompts import get_optimized_gamelift_prompt
 from config.settings import AWS_REGION, BOTO3_CLIENT_CONFIG, GAMELIFT_KB_ID
 from utils.logger import logger
+
+# Re-exported for callers/tests that reason about the projection item bound.
+__all__ = [
+    "GAMELIFT_MAX_PROJECTED_ITEMS",
+    "get_fleet_capacity",
+    "get_fleet_utilization",
+    "get_scaling_policies",
+    "list_gamelift_fleets",
+]
 
 # ============================================================================
 # Boto3 Tools for GameLift Operations
@@ -280,47 +298,100 @@ def list_gamelift_fleets() -> dict:  # type: ignore
 
 @tool
 def get_fleet_utilization(fleet_id: str) -> dict:  # type: ignore
-    """Get current utilization metrics for a specific fleet."""
+    """Get current utilization metrics for a specific fleet.
+
+    Returns a bounded, code-owned projection with a distinct ``status`` of
+    ok / empty / denied / incomplete / truncated. Full ARNs, account IDs, and
+    arbitrary provider fields never reach model context; provider exceptions are
+    reduced to a typed, sanitized error code.
+    """
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        return client.describe_fleet_utilization(FleetIds=[fleet_id])  # type: ignore
+        response = client.describe_fleet_utilization(FleetIds=[fleet_id])
     except Exception as e:
-        logger.error(f"Failed to get fleet utilization for {fleet_id}: {e}")
-        return {"error": str(e), "FleetUtilization": []}
+        log_sanitized_failure("describe_fleet_utilization", uuid.uuid4().hex, e)
+        return error_result("FleetUtilization", e)
+    return project_fleet_utilization(response)
 
 
 @tool
 def get_fleet_capacity(fleet_id: str) -> dict:  # type: ignore
-    """Get instance capacity information for a specific fleet."""
+    """Get instance capacity information for a specific fleet.
+
+    Returns a bounded, code-owned projection with a distinct ``status`` of
+    ok / empty / denied / incomplete / truncated. Full ARNs, account IDs, and
+    arbitrary provider fields never reach model context; provider exceptions are
+    reduced to a typed, sanitized error code.
+    """
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        return client.describe_fleet_capacity(FleetIds=[fleet_id])  # type: ignore
+        response = client.describe_fleet_capacity(FleetIds=[fleet_id])
     except Exception as e:
-        logger.error(f"Failed to get fleet capacity for {fleet_id}: {e}")
-        return {"error": str(e), "FleetCapacity": []}
+        log_sanitized_failure("describe_fleet_capacity", uuid.uuid4().hex, e)
+        return error_result("FleetCapacity", e)
+    return project_fleet_capacity(response)
 
 
 @tool
 def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
-    """Get auto-scaling policies for a specific fleet."""
+    """Get auto-scaling policies for a specific fleet.
+
+    Returns a bounded, code-owned projection with a distinct ``status`` of
+    ok / empty / denied / incomplete / truncated. Full ARNs, account IDs, and
+    arbitrary provider fields never reach model context; provider exceptions are
+    reduced to a typed, sanitized error code.
+    """
     try:
         client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
-        return client.describe_scaling_policies(FleetId=fleet_id)  # type: ignore
+        response = client.describe_scaling_policies(FleetId=fleet_id)
     except Exception as e:
-        logger.error(f"Failed to get scaling policies for {fleet_id}: {e}")
-        return {"error": str(e), "ScalingPolicies": []}
+        log_sanitized_failure("describe_scaling_policies", uuid.uuid4().hex, e)
+        return error_result("ScalingPolicies", e)
+    return project_scaling_policies(response)
 
 
 # ============================================================================
 # GameLift Agent (using factory pattern)
 # ============================================================================
 
-gamelift_agent = create_specialist_agent(
-    service_name="GameLift",
-    emoji="🎮",
-    mcp_server_names=None,  # GameLift uses boto3 directly
-    kb_id=GAMELIFT_KB_ID,
-    prompt_fn=get_optimized_gamelift_prompt,
-    fallback_fn=None,  # No fallback needed (boto3 is primary)
-    additional_tools=[list_gamelift_fleets, get_fleet_utilization, get_fleet_capacity, get_scaling_policies],
-)
+# The ONE runtime tool-registration collection. Model access to GameLift tools
+# is defined by exactly this list — it is what create_specialist_agent receives
+# and therefore what the agent can call. Tests inject a fake ``agent_factory``
+# into :func:`build_gamelift_agent` and assert on the ACTUAL kwargs the builder
+# passes to it, so dropping or renaming a tool here is caught as a regression.
+GAMELIFT_AGENT_TOOLS = [
+    list_gamelift_fleets,
+    get_fleet_utilization,
+    get_fleet_capacity,
+    get_scaling_policies,
+]
+
+
+def build_gamelift_agent(additional_tools: list | None = None, agent_factory: Any = None):
+    """Build the GameLift specialist agent through an injectable factory.
+
+    This is the single construction path for the runtime agent. ``agent_factory``
+    defaults to the real :func:`create_specialist_agent`; production always uses
+    that default. Tests inject a fake factory and assert on its recorded
+    ``call_args`` to observe the EXACT keyword arguments — service name and the
+    ``additional_tools`` collection — the builder hands to the factory. There is
+    no pre-call alias to drift from the real call: whatever is passed to the
+    factory is exactly what these arguments describe.
+
+    Callers that omit ``additional_tools`` get the canonical
+    :data:`GAMELIFT_AGENT_TOOLS`.
+    """
+    factory = create_specialist_agent if agent_factory is None else agent_factory
+    tools = GAMELIFT_AGENT_TOOLS if additional_tools is None else additional_tools
+    return factory(
+        service_name="GameLift",
+        emoji="🎮",
+        mcp_server_names=None,  # GameLift uses boto3 directly
+        kb_id=GAMELIFT_KB_ID,
+        prompt_fn=get_optimized_gamelift_prompt,
+        fallback_fn=None,  # No fallback needed (boto3 is primary)
+        additional_tools=tools,
+    )
+
+
+gamelift_agent = build_gamelift_agent()

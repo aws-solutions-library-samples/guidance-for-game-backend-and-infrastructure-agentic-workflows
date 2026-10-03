@@ -52,7 +52,7 @@ The architecture follows these 12 steps:
 |:----:|-------------|
 | **1** | User authenticates with **Amazon Cognito** User Pool. The frontend validates JWT tokens and stores them in HttpOnly cookies. Password policies enforce strong credentials, and admin approval is required for new users. |
 | **2** | User sends a natural language query (e.g., "What's the status of my EKS clusters?") through the **Next.js frontend** hosted on **Amazon ECS Express** (Fargate + ALB). The frontend provides a conversational chat interface powered by CopilotKit. |
-| **3** | The frontend constructs trusted principal context from the verified Cognito access token and deployment-bound tenant/workspace, then invokes **Bedrock AgentCore Runtime** using the AWS SDK with SigV4 authentication. Browser and model input cannot supply principal fields. |
+| **3** | The frontend constructs trusted principal context from the verified Cognito access token and deployment-bound tenant/workspace, then invokes **Bedrock AgentCore Runtime** over HTTPS, passing the user's Cognito access token as an `Authorization: Bearer` header (`fetch`, not an AWS SDK invoke client / SigV4); the runtime verifies the token independently. Browser and model input cannot supply principal fields. |
 | **4** | AgentCore routes the request to the **Orchestrator** agent, which analyzes the query intent and determines the appropriate specialist to handle the request. The orchestrator maintains conversation context across turns. |
 | **5** | **Bedrock Guardrails** filter both input and output. Inbound filtering detects prompt injection attempts, blocks off-topic requests, and warns about sensitive data. Outbound filtering anonymizes PII and blocks credential exposure. |
 | **6** | The Orchestrator delegates to the appropriate **Specialist Agent** based on query classification: GameLift Specialist for fleet management, EKS Specialist for Kubernetes clusters, or Cost Specialist for billing analysis. |
@@ -82,12 +82,13 @@ The architecture follows these 12 steps:
 │  │  Next.js Application (Port 3000)                        │  │
 │  │  • CopilotKit UI                                        │  │
 │  │  • API Route: /api/copilot/chat.ts                      │  │
-│  │  • Uses @aws-sdk/client-bedrock-agentcore               │  │
+│  │  • Invokes AgentCore over HTTPS with a Cognito JWT       │  │
+│  │    bearer token (fetch) — no AWS SDK invoke client       │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬─────────────────────────────────┘
-                              │ AWS SDK
-                              │ InvokeAgentRuntimeCommand
-                              │ (Signed SigV4)
+                              │ HTTPS POST /runtimes/{arn}/invocations
+                              │ Authorization: Bearer <Cognito access token>
+                              │ (verified independently by the runtime)
                               ▼
 ┌───────────────────────────────────────────────────────────────┐
 │                AWS Bedrock AgentCore Runtime                  │
@@ -256,14 +257,21 @@ not trusted.
 
 **Frontend Detection Logic**:
 ```typescript
-const useAgentCoreSDK = !!process.env.AGENTCORE_RUNTIME_ID;
+const isProduction = process.env.NODE_ENV === 'production';
 
-if (useAgentCoreSDK) {
-  // Production: AWS SDK to cloud runtime
+if (isProduction) {
+  // Production: HTTPS fetch to the AgentCore runtime endpoint with the user's
+  // Cognito access token as an Authorization: Bearer header (no AWS SDK / SigV4).
+  // AGENTCORE_RUNTIME_ID is required here and is used to build the runtime ARN;
+  // the request fails if it is unset.
 } else {
   // Development: HTTP to localhost:8080
 }
 ```
+
+`NODE_ENV === 'production'` selects the mode; `AGENTCORE_RUNTIME_ID` is a
+required input *within* production (used to construct the AgentCore runtime
+ARN), not the mode selector itself.
 
 ### Backend (AgentCore Runtime)
 
@@ -303,8 +311,18 @@ def invoke_agent(prompt, context=None):
     return str(response)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Shared entrypoint: local binds 127.0.0.1; hosted AgentCore binds
+    # 0.0.0.0 only when the local identity bypass is disabled.
+    run_server()
 ```
+
+`run_server()` uses `resolve_runtime_host()` from `backend/src/config/settings.py`.
+Local development always binds to loopback. The deployment sets
+`GBAW_HOSTED_RUNTIME=true` and leaves `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS` unset,
+which selects the private-container all-interface bind required by AgentCore.
+The process refuses to start if hosted mode and the local bypass are both set —
+a defense-in-depth guard against config drift, since request handling already
+ignores the bypass whenever hosted mode is on.
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
@@ -383,7 +401,7 @@ from utils.mcp_client_factory import create_mcp_client
 This architecture implements the following security measures:
 
 - IAM least privilege with scoped policies
-- SigV4 authentication for all AWS API calls
+- SigV4 authentication for AgentCore→AWS service API calls (the frontend→AgentCore hop uses a Cognito bearer token, not SigV4)
 - Secrets management via environment injection
 - S3 access logging for audit trails
 - Security integration tests
@@ -415,7 +433,7 @@ Local Machine:
 ```
 AWS Cloud:
 ├── Frontend: ECS Express / Fargate + ALB (AMD64 container)
-│   └── Invokes AgentCore Runtime via AWS SDK
+│   └── Invokes AgentCore Runtime over HTTPS with a Cognito bearer token (no AWS SDK / SigV4)
 ├── Backend: AgentCore Runtime (ARM64 container)
 │   └── Managed by AWS Bedrock
 │   └── Embedded MCP Servers (stdio processes)
@@ -434,12 +452,31 @@ AWS Cloud:
 6. **Built-in Observability**: Agent-specific tracing
 7. **MCP Integration**: Native support for Model Context Protocol
 
-### Why AWS SDK in Frontend?
+### How the Frontend Invokes AgentCore
 
-AgentCore Runtime **does not expose HTTP endpoints**. It only supports:
-- AWS SDK invocation via `InvokeAgentRuntime` API
-- Signed SigV4 requests for security
-- Streaming responses for real-time interaction
+The AgentCore Runtime exposes an HTTPS invocation endpoint
+(`/runtimes/{runtimeArn}/invocations`). The frontend proxy
+(`pages/api/copilot/chat.ts`) calls it with a plain `fetch`, passing the end
+user's verified **Cognito access token as an `Authorization: Bearer` header** —
+not an AWS SDK invoke client and not SigV4. The runtime independently verifies
+that token and reconstructs the caller's authority.
+
+Consequences for IAM: the ECS **task role** needs no `bedrock-agentcore` or
+`bedrock` permission to reach AgentCore — the bearer token, not the task role,
+is the credential. In fact the task role has no identity-based permissions:
+its one supported task-credential call in the deployed chat path is
+`sts:GetCallerIdentity`, used once to build the runtime ARN from the account id
+(see `getAccountId()`), and that call requires **no IAM allow** (STS returns the
+caller's identity even under an explicit deny). A justified STS *caller*
+therefore does not imply an STS *grant* — the role is retained only as the task
+credential provider and carries no inline or managed policy. Cognito JWT
+verification uses `aws-jwt-verify`, which fetches the public JWKS over HTTPS and
+requires no IAM permission.
+
+The dormant account-administration routes still reference IAM-authorized Cognito
+Admin/List operations, but the default deployment has never granted them and
+they are not a supported provisioning path. Issue #473 removes that surface
+after #469; this role deliberately does not make it reachable.
 
 ---
 
@@ -452,12 +489,14 @@ AgentCore Runtime **does not expose HTTP endpoints**. It only supports:
 {"response": "actual content"}
 ```
 
-**Production (AgentCore SDK)**:
+**Production (HTTPS/JWT invocation)**:
 ```json
 "\"actual content\""
 ```
 
-Frontend automatically handles both by detecting `AGENTCORE_RUNTIME_ID` environment variable.
+Frontend automatically handles both by selecting its mode on
+`NODE_ENV === 'production'`. In production it parses the JSON-string form; the
+local development path reads the `{"response": ...}` object.
 
 ### Critical: .bedrock_agentcore.yaml
 
@@ -481,8 +520,10 @@ MEMORY_ID=$(yq eval '.agents.gameagentruntime.memory.memory_id' .bedrock_agentco
 1. `agentcore launch` generates runtime and updates `.bedrock_agentcore.yaml`
 2. Deploy script extracts runtime ID from YAML file
 3. CloudFormation passes runtime ID to frontend stack
-4. Frontend uses `AGENTCORE_RUNTIME_ID` environment variable
-5. Development falls back to local HTTP when env var not set
+4. In production (`NODE_ENV === 'production'`), the frontend requires
+   `AGENTCORE_RUNTIME_ID` to build the runtime ARN and fails if it is unset
+5. Outside production mode (`NODE_ENV !== 'production'`), the frontend uses the
+   local HTTP endpoint (`BACKEND_URL`, default `http://localhost:8080`)
 
 ---
 
@@ -551,7 +592,10 @@ If "Local AgentCore responded with status: 404":
 
 1. Verify `AGENTCORE_RUNTIME_ID` is set in the ECS task definition
 2. Check runtime ARN is correct
-3. Ensure ECS task role has `bedrock-agentcore:InvokeAgentRuntime`
+3. Confirm the browser presented a valid Cognito session — the proxy forwards
+   the user's access token as a bearer token, and the runtime rejects an
+   invalid or missing token. (The ECS task role does **not** need
+   `bedrock-agentcore:InvokeAgentRuntime`; the bearer token is the credential.)
 
 ### Throttling
 
