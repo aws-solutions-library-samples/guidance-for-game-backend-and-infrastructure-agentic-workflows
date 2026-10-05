@@ -37,6 +37,41 @@ DOCS_CONFIG = {
             "url": "https://aws.amazon.com/blogs/gametech/how-to-host-your-unreal-engine-game-for-under-1-per-player-with-amazon-gamelift/",
             "output": "blog-unreal-under-1-dollar.md",
             "title": "How to Host Your Unreal Engine Game for Under $1 per Player with Amazon GameLift"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/faster-multiplayer-hosting-with-containers-on-amazon-gamelift-servers/",
+            "output": "blog-gamelift-container-fleets.md",
+            "title": "Faster Multiplayer Hosting with Containers on Amazon GameLift Servers"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/leverage-fully-managed-containers-to-host-multiplayer-games-at-global-scale-on-amazon-gamelift/",
+            "output": "blog-gamelift-managed-containers.md",
+            "title": "Leverage Fully-Managed Containers to Host Multiplayer Games at Global Scale on Amazon GameLift"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/hybrid-game-server-hosting-with-amazon-gamelift-anywhere/",
+            "output": "blog-gamelift-anywhere-hybrid.md",
+            "title": "Hybrid Game Server Hosting with Amazon GameLift Anywhere"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/development-phase-steps-for-successful-launches-on-amazon-gamelift-servers/",
+            "output": "blog-gamelift-dev-phase.md",
+            "title": "Development Phase Steps for Successful Launches on Amazon GameLift Servers"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/launch-phase-steps-for-successful-launches-on-amazon-gamelift-servers/",
+            "output": "blog-gamelift-launch-phase.md",
+            "title": "Launch Phase Steps for Successful Launches on Amazon GameLift Servers"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/introducing-the-gamelift-fleetiq-adapter-for-agones/",
+            "output": "blog-gamelift-agones-fleetiq-adapter.md",
+            "title": "Introducing the Amazon GameLift FleetIQ Adapter for Agones"
+        },
+        {
+            "url": "https://aws.amazon.com/blogs/gametech/apex-legends-migrates-to-amazon-gamelift-servers-in-just-10-days/",
+            "output": "blog-gamelift-apex-migration.md",
+            "title": "Apex Legends Migrates to Amazon GameLift Servers in Just 10 Days"
         }
     ],
     "eks": [
