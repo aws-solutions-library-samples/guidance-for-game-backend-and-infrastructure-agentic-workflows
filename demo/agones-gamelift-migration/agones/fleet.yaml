@@ -1,0 +1,37 @@
+# Agones Fleet running the standard simple-game-server (UDP echo).
+# This is the workload we migrate FROM. Dynamic host ports land in 7000-8000.
+apiVersion: agones.dev/v1
+kind: Fleet
+metadata:
+  name: simple-game-server
+  labels:
+    demo: agones-gamelift-migration
+spec:
+  replicas: 3
+  template:
+    spec:
+      ports:
+        - name: default
+          portPolicy: Dynamic
+          containerPort: 7654
+          protocol: UDP
+      health:
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      template:
+        metadata:
+          labels:
+            demo: agones-gamelift-migration
+        spec:
+          containers:
+            - name: simple-game-server
+              # Pin to a known-good Agones example image tag; bump to match the
+              # installed Agones version if needed.
+              image: us-docker.pkg.dev/agones-images/examples/simple-game-server:0.37
+              resources:
+                requests:
+                  memory: 64Mi
+                  cpu: 20m
+                limits:
+                  memory: 64Mi
+                  cpu: 20m

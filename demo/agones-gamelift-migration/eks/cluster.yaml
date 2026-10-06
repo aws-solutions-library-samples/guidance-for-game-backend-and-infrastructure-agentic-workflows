@@ -1,0 +1,29 @@
+# eksctl config for the Agones→GameLift migration demo.
+# Minimal and cost-conscious. Game-server nodes get public IPs so UDP players
+# can reach Agones host ports (7000-8000/UDP). Delete after recording:
+#   eksctl delete cluster -f eks/cluster.yaml --disable-nodegroup-eviction
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: agones-demo
+  region: us-east-1
+  tags:
+    demo: agones-gamelift-migration
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: agones-gameservers
+    instanceType: m5.large
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 3
+    volumeSize: 30
+    # Public IPs required: players connect directly to node host ports.
+    privateNetworking: false
+    labels:
+      agones.dev/role: gameserver
+    tags:
+      demo: agones-gamelift-migration
