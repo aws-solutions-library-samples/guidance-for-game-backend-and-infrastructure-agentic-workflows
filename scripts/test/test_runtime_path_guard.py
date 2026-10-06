@@ -24,7 +24,9 @@ These tests prove behavior, not restate assumptions:
 
 from __future__ import annotations
 
+# Standard library
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -107,6 +109,88 @@ class RuntimePathPredicate(unittest.TestCase):
         self.assertIn(".venv", resolved)
 
 
+class RuntimeInterpreterSelection(unittest.TestCase):
+    """The guard must measure the interpreter uv actually selected, not a
+    reconstructed ``<backend>/.venv`` path.
+
+    uv 0.12.0 honors ``UV_PROJECT_ENVIRONMENT``, so the real project environment
+    (the one whose interpreter path ``agentcore launch`` embeds) can live outside
+    ``<backend>/.venv``. Both deploy paths run this guard via
+    ``uv run --project <backend>``, which executes it *inside* that selected
+    environment; the running ``sys.executable`` is therefore the authoritative
+    path. These tests pin that selection by controlling ``sys.executable`` and
+    ``VIRTUAL_ENV`` exactly as ``uv run`` sets them -- no uv or real venv needed.
+    """
+
+    def setUp(self) -> None:
+        self._orig_executable = guard.sys.executable
+        self._orig_virtual_env = os.environ.get("VIRTUAL_ENV")
+
+    def tearDown(self) -> None:
+        guard.sys.executable = self._orig_executable
+        if self._orig_virtual_env is None:
+            os.environ.pop("VIRTUAL_ENV", None)
+        else:
+            os.environ["VIRTUAL_ENV"] = self._orig_virtual_env
+
+    def _simulate_uv_run(self, env_dir: str) -> None:
+        """Mimic ``uv run``: VIRTUAL_ENV is the env, sys.executable is inside it."""
+        os.environ["VIRTUAL_ENV"] = env_dir
+        guard.sys.executable = str(Path(env_dir) / "bin" / "python3")
+
+    def test_long_project_environment_overrides_short_backend_venv(self) -> None:
+        # The release-path mismatch: a SHORT backend/.venv path (would pass the
+        # old reconstructing guard) while uv actually selected a LONG project
+        # environment via UV_PROJECT_ENVIRONMENT. The guard must measure the
+        # real selected interpreter and REJECT it. RED against the old
+        # resolve_venv_interpreter-only guard; GREEN once sys.executable wins.
+        short_backend = Path("/srv/app/backend")
+        self.assertLessEqual(
+            guard.interpreter_path_bytes(guard.resolve_venv_interpreter(short_backend)),
+            INTERPRETER_BYTE_LIMIT,
+            "precondition: the reconstructed backend/.venv path is short enough to pass",
+        )
+        long_env = "/" + "e" * 200 + "/env"
+        self._simulate_uv_run(long_env)
+
+        resolved = guard.resolve_runtime_interpreter(short_backend)
+        self.assertTrue(resolved.startswith(long_env), resolved)
+        self.assertGreater(guard.interpreter_path_bytes(resolved), INTERPRETER_BYTE_LIMIT)
+        self.assertFalse(
+            guard.venv_python_is_bootable(resolved, os_name="posix"),
+            "guard must reject the real long project-environment interpreter",
+        )
+
+    def test_short_project_environment_is_not_falsely_rejected(self) -> None:
+        # The inverse: uv selected a SHORT environment. The guard must accept it
+        # even if some other path on disk is long. Prevents a false rejection.
+        short_env = "/srv/app/.venv"
+        self._simulate_uv_run(short_env)
+        resolved = guard.resolve_runtime_interpreter(Path("/srv/app/backend"))
+        self.assertTrue(resolved.startswith(short_env), resolved)
+        self.assertTrue(guard.venv_python_is_bootable(resolved, os_name="posix"))
+
+    def test_falls_back_to_backend_venv_outside_project_environment(self) -> None:
+        # A bare system python3 (no VIRTUAL_ENV, executable not under
+        # backend/.venv) is not trusted to represent the runtime, so the guard
+        # falls back to the deterministic backend/.venv reconstruction.
+        os.environ.pop("VIRTUAL_ENV", None)
+        guard.sys.executable = "/usr/bin/python3"
+        backend = REPOSITORY_ROOT / "backend"
+        resolved = guard.resolve_runtime_interpreter(backend)
+        self.assertEqual(resolved, guard.resolve_venv_interpreter(backend))
+
+    def test_default_venv_layout_is_trusted_without_virtual_env(self) -> None:
+        # A direct `<backend>/.venv/bin/python3 check_runtime_path.py` call sets
+        # no VIRTUAL_ENV but still runs the real runtime interpreter; the guard
+        # must trust it via the default-layout check and measure sys.executable.
+        os.environ.pop("VIRTUAL_ENV", None)
+        backend = Path("/srv/app/backend")
+        guard.sys.executable = str(backend / ".venv" / "bin" / "python3")
+        resolved = guard.resolve_runtime_interpreter(backend)
+        self.assertEqual(resolved, os.path.abspath(guard.sys.executable))
+
+
 class RuntimePathCli(unittest.TestCase):
     """The fail-fast CLI contract the deploy scripts invoke."""
 
@@ -135,6 +219,50 @@ class RuntimePathCli(unittest.TestCase):
         result = self._run("/opt/My App/backend/.venv/bin/python3")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("space", (result.stdout + result.stderr).lower())
+
+    def _run_default_path(self, *, virtual_env: str, executable_env: str) -> subprocess.CompletedProcess:
+        """Invoke the CLI with NO ``--interpreter`` so it exercises the default
+        ``resolve_runtime_interpreter`` path, with ``VIRTUAL_ENV`` and a
+        bootstrap interpreter chosen to mimic ``uv run`` selecting ``executable_env``.
+        """
+        # A tiny bootstrap re-execs the guard's main() after pointing
+        # sys.executable at the simulated uv-selected environment interpreter,
+        # exactly as `uv run` would present it to the guard process.
+        bootstrap = (
+            "import os, sys, runpy;"
+            f"sys.executable = {executable_env!r};"
+            f"sys.argv = [{str(GUARD_PY)!r}, '--backend-dir', '/srv/app/backend'];"
+            f"runpy.run_path({str(GUARD_PY)!r}, run_name='__main__')"
+        )
+        env = dict(os.environ, VIRTUAL_ENV=virtual_env)
+        return subprocess.run(
+            [sys.executable, "-c", bootstrap],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    def test_default_path_rejects_long_uv_selected_environment(self) -> None:
+        # End-to-end: short backend dir, long uv-selected project environment.
+        # The default resolution path (no --interpreter) must fail. This is the
+        # exact release-path mismatch the previous iteration missed.
+        long_env = "/" + "e" * 200 + "/env"
+        result = self._run_default_path(
+            virtual_env=long_env,
+            executable_env=f"{long_env}/bin/python3",
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("124", result.stdout + result.stderr)
+
+    def test_default_path_accepts_short_uv_selected_environment(self) -> None:
+        # Inverse: a short uv-selected environment must not be falsely rejected.
+        short_env = "/srv/app/.venv"
+        result = self._run_default_path(
+            virtual_env=short_env,
+            executable_env=f"{short_env}/bin/python3",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 def _strip_shell_comments(text: str) -> str:
@@ -250,6 +378,22 @@ class PreflightOrdering(unittest.TestCase):
             guard_text,
             r"\b127\b",
             "PowerShell guard must not hard-code the 127 char limit; delegate to the shared guard",
+        )
+
+    def test_powershell_default_runner_runs_inside_uv_selected_environment(self) -> None:
+        # The PowerShell guard's selection correctness depends on running the
+        # shared Python guard INSIDE the uv-selected project environment, so the
+        # guard measures the real `sys.executable` (honoring
+        # UV_PROJECT_ENVIRONMENT) rather than a reconstructed `.venv` path. The
+        # default GuardRunner must therefore invoke `uv run --project <backend>`.
+        # This pins the same selection fix as the Python-side regression on the
+        # PowerShell deploy path. RED if the runner is changed to a bare
+        # `python` / direct-path invocation that bypasses the selected env.
+        guard_text = GUARD_PS1.read_text(encoding="utf-8")
+        self.assertRegex(
+            guard_text,
+            r"uv\s+run\s+--project\s+\$Backend\s+python\s+\$Script",
+            "default PowerShell GuardRunner must run the shared guard via `uv run --project`",
         )
 
     def test_powershell_whatif_short_circuits_before_mutation(self) -> None:
