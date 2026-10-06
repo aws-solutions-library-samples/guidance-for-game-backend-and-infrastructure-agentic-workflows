@@ -60,4 +60,14 @@ Describe 'Test-GameAgentRuntimePath' {
             Should -Throw '*Runtime path guard not found*'
         $calls.Count | Should -Be 0
     }
+
+    It 'Default runner invokes the shared guard inside the uv-selected environment' {
+        # Selection correctness: the default GuardRunner must run the shared
+        # Python guard via `uv run --project <backend>`, so the guard measures
+        # the real sys.executable (honoring UV_PROJECT_ENVIRONMENT), not a
+        # reconstructed .venv path. Assert against the function body so the test
+        # needs no uv or real venv.
+        $body = (Get-Command Test-GameAgentRuntimePath).ScriptBlock.ToString()
+        $body | Should -Match 'uv run --project \$Backend python \$Script'
+    }
 }

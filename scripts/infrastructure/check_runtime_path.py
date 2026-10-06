@@ -41,14 +41,21 @@ Three facts drive this guard and were the root causes of the first rejected fix:
    (``uv_trampoline_builder::windows_script_launcher``) that natively supports
    long and relocatable paths, so a POSIX shebang predicate must **not** reject
    a Windows interpreter path.
-3. The path that matters is the **actual venv interpreter** that uv wrote the
-   scripts against (``layout.sys_executable``), so we resolve the real venv
-   interpreter rather than assuming a fixed string.
+3. The path that matters is the **actual interpreter uv selected** for the
+   project environment and wrote the console scripts against
+   (``layout.sys_executable``). uv 0.12.0 lets ``UV_PROJECT_ENVIRONMENT``
+   redirect that environment away from ``<backend>/.venv``, so a guard that
+   reconstructs ``.venv/bin/python3`` from the backend directory can measure a
+   *different* interpreter than the one that ships -- passing a short synthetic
+   path while uv packages a long real one. Both deploy paths invoke this guard
+   with ``uv run --project <backend>``, which runs it *inside* that selected
+   environment, so the running ``sys.executable`` IS the interpreter uv embeds.
+   The guard therefore measures ``sys.executable`` by default and treats the
+   backend ``.venv`` reconstruction only as a fallback for a non-uv invocation.
 
 This module is both an importable predicate (for tests) and a CLI the shell and
 PowerShell deploy paths invoke right after local ``uv sync`` and before the
-first AWS-mutating command. Standard library only: the plain-shell deploy path
-runs it with a bare ``python3`` before the venv is guaranteed usable.
+first AWS-mutating command. Standard library only.
 """
 
 from __future__ import annotations
@@ -110,17 +117,14 @@ def venv_python_is_bootable(interpreter_path: str, *, os_name: str | None = None
 
 
 def resolve_venv_interpreter(backend_dir: Path) -> str:
-    """Resolve the interpreter path uv wrote the venv's console scripts against.
+    """Reconstruct the deterministic ``.venv`` interpreter path under ``backend_dir``.
 
-    Prefer the venv's own recorded interpreter so the guard measures exactly
-    what ``agentcore launch`` will package:
-
-    * ``pyvenv.cfg``'s ``home`` is informational only; the launched scripts use
-      the venv's own ``bin/python3`` (POSIX) / ``Scripts/python.exe`` (Windows),
-      whose path is what uv embeds. We return that concrete interpreter path.
-    * If the venv is absent (guard invoked before ``uv sync``), fall back to the
-      deterministic path uv would create, so the length/space check is still
-      meaningful.
+    This is a **fallback** for a non-uv invocation only. It assumes uv's default
+    project environment layout (``.venv/bin/python3`` on POSIX,
+    ``.venv/Scripts/python.exe`` on Windows). It must NOT be used when the guard
+    runs inside the uv-selected environment, because ``UV_PROJECT_ENVIRONMENT``
+    can point the real environment elsewhere; use :func:`resolve_runtime_interpreter`
+    for the authoritative selection.
 
     The path is returned absolute and unresolved: uv embeds the path as invoked
     (``layout.sys_executable``), and symlink resolution could mask the real
@@ -132,6 +136,47 @@ def resolve_venv_interpreter(backend_dir: Path) -> str:
     else:
         interpreter = venv_dir / "bin" / "python3"
     return os.path.abspath(interpreter)
+
+
+def _running_in_project_environment(backend_dir: Path) -> bool:
+    """True when the running interpreter belongs to a uv-selected environment.
+
+    ``uv run`` sets ``VIRTUAL_ENV`` to the environment it selected (honoring
+    ``UV_PROJECT_ENVIRONMENT``), and ``sys.executable`` then lives inside it.
+    We also accept the plain default ``<backend>/.venv`` layout so a direct
+    ``<backend>/.venv/bin/python3 check_runtime_path.py`` invocation is trusted.
+    A bare system ``python3`` (no venv) is not trusted to represent the runtime.
+
+    Paths are compared with ``abspath`` (not ``resolve``): the venv's
+    ``bin/python3`` is itself a symlink to the base interpreter, so resolving it
+    would walk *out* of the environment and break the containment check. uv
+    likewise embeds the unresolved ``sys.executable`` path.
+    """
+    executable = Path(os.path.abspath(sys.executable))
+    candidates = []
+    virtual_env = os.environ.get("VIRTUAL_ENV")
+    if virtual_env:
+        candidates.append(Path(os.path.abspath(virtual_env)))
+    candidates.append(Path(os.path.abspath(backend_dir / ".venv")))
+    return any(candidate in executable.parents for candidate in candidates)
+
+
+def resolve_runtime_interpreter(backend_dir: Path) -> str:
+    """Resolve the interpreter uv wrote the venv's console scripts against.
+
+    Prefer the running ``sys.executable`` when the guard is executing inside the
+    uv-selected project environment: that is exactly the interpreter whose path
+    uv embeds into the console scripts that ``agentcore launch`` packages,
+    including any ``UV_PROJECT_ENVIRONMENT`` redirect. Only when the guard is
+    *not* running inside that environment (a bare ``python3`` fallback before
+    the venv is usable) do we reconstruct the deterministic ``.venv`` path, so
+    the length/space check stays meaningful.
+
+    Returned absolute and unresolved (see :func:`resolve_venv_interpreter`).
+    """
+    if _running_in_project_environment(backend_dir):
+        return os.path.abspath(sys.executable)
+    return resolve_venv_interpreter(backend_dir)
 
 
 def remediation_message(interpreter_path: str) -> str:
@@ -183,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    interpreter_path = args.interpreter or resolve_venv_interpreter(args.backend_dir)
+    interpreter_path = args.interpreter or resolve_runtime_interpreter(args.backend_dir)
 
     if venv_python_is_bootable(interpreter_path):
         return 0
