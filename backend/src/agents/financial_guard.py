@@ -153,6 +153,11 @@ _SHELL_LINE_RE = re.compile(r"^.*\b(?:awk|bash|printf|sed|xargs)\b.*$", re.IGNOR
 # financial vocabulary in ordinary prose (for example, an "AWS Costs" capability
 # bullet followed by a Python 3 tutorial URL). URLs are references, not claims.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# Markdown ordered-list markers ("6. ", "2) ") are numbering, not values. Left in
+# place, "6. **Rollback thresholds** — placement success rate" read as the value
+# 6 next to "rate". Only a marker at the start of a line is neutralized, so any
+# amount later on the line ("1. Monthly cost: $5") is still detected.
+_LIST_MARKER_RE = re.compile(r"^(\s*)\d{1,3}[.)][ \t]+", re.MULTILINE)
 
 
 def _neutralize_shell_positionals(text: str) -> str:
@@ -185,6 +190,7 @@ def contains_unvalidated_financial_content(text: str) -> bool:
         return False
     scannable = _neutralize_shell_positionals(text)
     scannable = _URL_RE.sub("", scannable)
+    scannable = _LIST_MARKER_RE.sub(r"\1- ", scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)

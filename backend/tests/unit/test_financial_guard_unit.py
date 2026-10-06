@@ -50,6 +50,9 @@ class TestContainsUnvalidatedFinancialContent:
             "```bash\nprintf '%s\\n' '$5'\n```",
             '```json\n{"cost": 999}\n```',
             '```json\n{"cost": "$5"}\n```',
+            "1. Monthly cost: $5",
+            "2. Spend 999 per month on Spot",
+            "3. Monthly cost:\n\n999",
         ],
     )
     def test_flags_financial_content(self, text):
@@ -72,6 +75,8 @@ class TestContainsUnvalidatedFinancialContent:
             "Load balancing keeps p99 under 120 ms",
             "Each container group gets 2 vCPU and 3.5 GiB to balance density",
             "Set the queue timeout to 60 seconds to balance wait time and placement",
+            "6. **Pre-defined rollback thresholds** — Placement success rate and P99 wait time",
+            "  2) Track the rate of abnormal terminations",
             "Time was spent restarting pods",
             "Dollars and yen are currency names",
             "AWS Costs and billing help are available. See https://docs.python.org/3/tutorial/controlflow.html",

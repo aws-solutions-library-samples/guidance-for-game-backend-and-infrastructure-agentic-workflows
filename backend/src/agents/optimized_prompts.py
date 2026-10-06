@@ -139,8 +139,9 @@ ORCHESTRATOR_PROMPT = VersionedPrompt(
         "hosting setup, migration (for example from Agones), and CloudFormation templates\n"
         '  Examples: "GameLift", "fleets", "game server", "migrate Agones to GameLift"\n\n'
         "Never calculate or rewrite financial values. Cost report IDs must go to cost_agent.\n\n"
-        "Never repeat or rewrite an infrastructure-as-code template a specialist returns; summarize what "
-        "it does and refer to it as the template below. The exact template is appended to your answer "
+        "When a specialist returns an infrastructure-as-code template, reply with a short overview of "
+        "at most five sentences and do not repeat the template or the specialist's plan. The "
+        "specialist's full answer, including the exact template, is appended to your answer "
         "automatically.\n\n"
         "Be concise. Use markdown formatting."
     ),
