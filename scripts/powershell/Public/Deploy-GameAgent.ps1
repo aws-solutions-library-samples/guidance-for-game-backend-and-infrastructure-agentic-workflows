@@ -205,6 +205,26 @@ function Deploy-GameAgent {
         uv sync 2>$null
         if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
 
+        # Guard against an unbootable long-path runtime before CodeBuild runs
+        # (#517). The launch step packages this venv's console scripts into
+        # dependencies.zip; when the venv interpreter path exceeds the 127-char
+        # kernel shebang limit, uv emits a /bin/sh trampoline embedding the
+        # absolute local path instead of a portable shebang, producing a runtime
+        # that cannot start. Fail fast with a clear remediation. Mirror of
+        # scripts/infrastructure/check-runtime-path.sh.
+        $runtimeShebangLimit = 127
+        $venvPython = if ($IsWindows) {
+            Join-Path $backendPath '.venv/Scripts/python.exe'
+        } else {
+            Join-Path $backendPath '.venv/bin/python3'
+        }
+        if ($venvPython.Length -gt $runtimeShebangLimit) {
+            throw ("Backend venv interpreter path length {0} exceeds the {1}-char shebang limit. " -f $venvPython.Length, $runtimeShebangLimit) +
+                  "Path: $venvPython. uv emits a /bin/sh trampoline embedding this absolute local path " +
+                  "instead of a portable shebang, producing an AgentCore runtime that cannot start (issue #517). " +
+                  "Deploy from a checkout with a shorter path so backend/.venv/bin/python3 is <= $runtimeShebangLimit characters, then re-run."
+        }
+
         # Resolve both model roles through the canonical Python configuration.
         $settingsLoader = Join-Path $repoRoot 'config/load_deployment_settings.py'
         $modelSettingsJson = (uv run python $settingsLoader --format json --models-only) | Out-String

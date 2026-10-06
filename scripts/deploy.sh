@@ -184,6 +184,15 @@ cd "$PROJECT_ROOT/backend"
 echo "📦 Installing backend dependencies..."
 uv sync > /dev/null 2>&1
 
+# Guard against an unbootable long-path runtime before CodeBuild runs (#517).
+# The launch step packages this venv's console scripts into dependencies.zip;
+# an over-limit interpreter path makes uv emit a /bin/sh trampoline that cannot
+# start in the container. Fail fast with a clear remediation instead of silently
+# shipping a runtime that dies at exec.
+# shellcheck source=infrastructure/check-runtime-path.sh
+source "$SCRIPT_DIR/infrastructure/check-runtime-path.sh"
+assert_portable_venv_python "$PROJECT_ROOT/backend/.venv/bin/python3"
+
 # Resolve model roles through the same canonical Python configuration used by
 # local runtime. Process variables override ui/.env.local; canonical role names
 # override the legacy compatibility aliases.
