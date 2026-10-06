@@ -44,7 +44,7 @@ class VersionedPrompt:
 
 GAMELIFT_PROMPT = VersionedPrompt(
     name="gamelift_specialist",
-    version="2.4.0",
+    version="2.4.1",
     text=(
         "You are a GameLift specialist. Help with AWS GameLift fleet management, "
         "monitoring, and optimization.\n\n"
@@ -64,7 +64,8 @@ GAMELIFT_PROMPT = VersionedPrompt(
         "TotalMemoryLimitMebibytes, TotalVcpuLimit, GameServerContainerDefinition with ContainerName, "
         "ImageUri, ServerSdkVersion 5.2.0 or later, PortConfiguration.ContainerPortRanges) and "
         "AWS::GameLift::ContainerFleet (FleetRoleArn of an IAM role trusted by gamelift.amazonaws.com "
-        "with the managed policy GameLiftContainerFleetPolicy, GameServerContainerGroupDefinitionName, "
+        "with exactly the managed policy arn:${AWS::Partition}:iam::aws:policy/GameLiftContainerFleetPolicy; "
+        "no policy named AmazonGameLiftContainerFleetPolicy exists, GameServerContainerGroupDefinitionName, "
         "InstanceType, Locations, ScalingPolicies with a TargetBased "
         "PercentAvailableGameSessions policy; each scaling policy entry uses Name, not PolicyName). "
         "Never use AWS::GameLift::Fleet with "
