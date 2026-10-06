@@ -14,6 +14,20 @@ These tests prove behavior, not restate assumptions:
   an unbootable path and zero on a bootable one — the fail-fast contract both
   deploy paths rely on.
 
+* ``UvGeneratedEntrypointBoundary`` proves the guard against uv's REAL generated
+  console-script artifact: it builds a minimal local wheel (no network),
+  installs it with uv into venvs whose interpreter path we control to 124 bytes,
+  125 bytes, and a short space-bearing path, reads the first line uv actually
+  wrote, and requires the guard verdict to agree with uv's shebang/trampoline
+  choice. It also runs the guard via ``uv run --project`` against a long external
+  ``UV_PROJECT_ENVIRONMENT`` to prove end-to-end selection + measurement. This is
+  the artifact boundary that caused #517, which the first iteration only asserted
+  about.
+
+* ``RemediationMessage`` proves the failure text matches where the unbootable
+  interpreter came from — shorten-the-checkout for a default ``.venv`` path, but
+  unset/relocate ``UV_PROJECT_ENVIRONMENT`` for an external uv-selected env.
+
 * ``PreflightOrdering`` proves the guard runs AFTER local dependency setup but
   BEFORE the first AWS-mutating command in both ``deploy.sh`` and
   ``Deploy-GameAgent.ps1`` — the ordering whose absence was the headline defect
@@ -30,6 +44,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -91,11 +106,28 @@ class RuntimePathPredicate(unittest.TestCase):
         self.assertGreater(guard.interpreter_path_bytes(path), INTERPRETER_BYTE_LIMIT)
         self.assertTrue(guard.venv_python_is_bootable(path, os_name="nt"))
 
-    def test_windows_launcher_recognized_from_posix_host(self) -> None:
-        # A POSIX test host probing a Windows .exe path must still treat it as a
-        # launcher target (not reject it with the POSIX byte rule).
-        path = "C:\\" + "a" * 300 + "\\Scripts\\python.exe"
-        self.assertTrue(guard.venv_python_is_bootable(path, os_name="posix"))
+    def test_posix_host_rejects_long_exe_path_no_suffix_shortcut(self) -> None:
+        # Root-cause regression for the first rejected fix: a POSIX host NEVER
+        # emits a Windows launcher. uv's gate is `os_name == "posix"` only, so a
+        # long `.exe` interpreter path on POSIX still gets the unbootable
+        # `/bin/sh` trampoline. The guard must NOT treat the `.exe` suffix as a
+        # launcher and wrongly pass it. RED against the removed suffix heuristic.
+        path = "/" + "a" * 300 + "/Scripts/python.exe"
+        self.assertGreater(guard.interpreter_path_bytes(path), INTERPRETER_BYTE_LIMIT)
+        self.assertFalse(guard.venv_python_is_bootable(path, os_name="posix"))
+
+    def test_posix_host_rejects_space_exe_path(self) -> None:
+        # The same for a short space-bearing `.exe` path on POSIX: uv trampolines
+        # on the space; the `.exe` suffix must not short-circuit the check.
+        path = "/opt/My App/.venv/Scripts/python.exe"
+        self.assertLessEqual(guard.interpreter_path_bytes(path), INTERPRETER_BYTE_LIMIT)
+        self.assertFalse(guard.venv_python_is_bootable(path, os_name="posix"))
+
+    def test_launcher_decision_is_os_only_not_path(self) -> None:
+        # The launcher decision is a pure function of the OS uv runs under, not
+        # of the interpreter path string.
+        self.assertTrue(guard.uses_native_windows_launcher("nt"))
+        self.assertFalse(guard.uses_native_windows_launcher("posix"))
 
     def test_windows_space_in_launcher_is_bootable(self) -> None:
         # Spaces are fatal only for the POSIX shebang; the Windows launcher
@@ -191,6 +223,52 @@ class RuntimeInterpreterSelection(unittest.TestCase):
         self.assertEqual(resolved, os.path.abspath(guard.sys.executable))
 
 
+class RemediationMessage(unittest.TestCase):
+    """Remediation must match where the unbootable interpreter came from.
+
+    A path under the default ``<backend>/.venv`` is repaired by a shorter
+    checkout. An interpreter uv selected via ``UV_PROJECT_ENVIRONMENT`` (outside
+    ``<backend>/.venv``) cannot be fixed by moving the checkout, so the message
+    must point at the override instead -- the first fix always recommended
+    shortening the checkout and the literal ``backend/.venv/bin/python3`` path,
+    which is wrong for the external-environment case the resolver now detects.
+    """
+
+    def test_default_venv_path_advises_shortening_checkout(self) -> None:
+        backend = Path("/srv/app/backend")
+        interp = str(backend / ".venv" / "bin" / ("p" * 200))
+        msg = guard.remediation_message(interp, backend_dir=backend)
+        self.assertIn("shorter", msg.lower())
+        self.assertNotIn("UV_PROJECT_ENVIRONMENT", msg)
+
+    def test_external_environment_advises_unsetting_override(self) -> None:
+        # The interpreter uv selected lives outside backend/.venv -> override.
+        backend = Path("/srv/app/backend")
+        interp = "/" + "e" * 200 + "/bin/python3"
+        msg = guard.remediation_message(interp, backend_dir=backend)
+        self.assertIn("UV_PROJECT_ENVIRONMENT", msg)
+        # Must not misdirect the user to shorten the checkout for an override.
+        self.assertNotRegex(msg.lower(), r"deploy from a checkout")
+
+    def test_external_detection_true_for_outside_path(self) -> None:
+        backend = Path("/srv/app/backend")
+        self.assertTrue(
+            guard._interpreter_is_external_override("/other/env/bin/python3", backend)
+        )
+
+    def test_external_detection_false_for_default_venv_path(self) -> None:
+        backend = Path("/srv/app/backend")
+        interp = str(backend / ".venv" / "bin" / "python3")
+        self.assertFalse(guard._interpreter_is_external_override(interp, backend))
+
+    def test_external_detection_false_without_backend_context(self) -> None:
+        # A direct --interpreter probe carries no backend context; the override
+        # branch must not fire (we cannot know, so default-checkout wording).
+        self.assertFalse(
+            guard._interpreter_is_external_override("/other/env/bin/python3", None)
+        )
+
+
 class RuntimePathCli(unittest.TestCase):
     """The fail-fast CLI contract the deploy scripts invoke."""
 
@@ -263,6 +341,212 @@ class RuntimePathCli(unittest.TestCase):
             executable_env=f"{short_env}/bin/python3",
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+def _uv_available() -> bool:
+    try:
+        subprocess.run(["uv", "--version"], capture_output=True, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
+@unittest.skipUnless(_uv_available(), "uv is required to generate real console scripts")
+class UvGeneratedEntrypointBoundary(unittest.TestCase):
+    """Prove the guard against uv's REAL generated console-script artifact.
+
+    This is the boundary that caused #517 and that the first iteration's tests
+    only *asserted* about: ``agentcore launch`` packages the venv's uv-generated
+    console scripts, and uv's ``format_shebang`` decides at install time whether
+    each script is a portable ``#!`` shebang or an unbootable ``/bin/sh``
+    trampoline. These tests build a minimal local wheel (no network), install it
+    with uv into venvs whose interpreter path length/content we control, read
+    the FIRST LINE uv actually wrote, and require the guard's verdict to agree
+    with uv's artifact. If uv's rule ever shifts, these go red -- they are not a
+    restatement of the guard's own arithmetic.
+
+    Grounded in uv source: ``crates/uv-install-wheel/src/wheel.rs``
+    ``format_shebang`` (identical rule across 0.10.x and 0.12.x): on POSIX the
+    ``/bin/sh`` trampoline fires when ``2 + executable.len() + 1 > 127`` (path
+    over 124 bytes) or the path contains a space.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="rt_guard_uv_")
+        root = Path(cls._tmp.name)
+        pkg = root / "samplepkg"
+        (pkg / "samplepkg").mkdir(parents=True)
+        (pkg / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "samplepkg"\n'
+            'version = "0.0.1"\n'
+            'requires-python = ">=3.8"\n'
+            "[project.scripts]\n"
+            'sampletool = "samplepkg:main"\n'
+            "[build-system]\n"
+            'requires = ["hatchling"]\n'
+            'build-backend = "hatchling.build"\n',
+            encoding="utf-8",
+        )
+        (pkg / "samplepkg" / "__init__.py").write_text(
+            "def main():\n    print('hi')\n", encoding="utf-8"
+        )
+        dist = root / "dist"
+        proc = subprocess.run(
+            ["uv", "build", "--wheel", "--out-dir", str(dist), str(pkg)],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise unittest.SkipTest(f"uv build failed, cannot exercise artifact: {proc.stderr}")
+        wheels = list(dist.glob("*.whl"))
+        if not wheels:
+            raise unittest.SkipTest("uv build produced no wheel")
+        cls._wheel = wheels[0]
+        cls._root = root
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _make_venv_with_interpreter_bytes(self, target_bytes: int) -> tuple[str, str] | None:
+        """Create a uv venv whose POSIX ``bin/python3`` path is ``target_bytes``.
+
+        Returns ``(interpreter_path, first_line_of_console_script)`` or ``None``
+        when the system temp base is already too long to hit ``target_bytes``.
+        """
+        base = Path(tempfile.mkdtemp(prefix="e", dir=self._root))
+        tail = "/bin/python3"
+        # path = base + "/" + name + tail
+        name_len = target_bytes - len(os.fsencode(str(base))) - 1 - len(tail)
+        if name_len < 1:
+            return None
+        venv_dir = base / ("v" * name_len)
+        interpreter = str(venv_dir / "bin" / "python3")
+        if len(os.fsencode(interpreter)) != target_bytes:
+            return None
+        return self._install_and_read(venv_dir, interpreter)
+
+    def _install_and_read(self, venv_dir: Path, interpreter: str) -> tuple[str, str] | None:
+        created = subprocess.run(
+            ["uv", "venv", str(venv_dir)],
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            return None
+        installed = subprocess.run(
+            ["uv", "pip", "install", "--python", interpreter, str(self._wheel)],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, VIRTUAL_ENV=str(venv_dir)),
+        )
+        if installed.returncode != 0:
+            return None
+        script = venv_dir / "bin" / "sampletool"
+        if not script.exists():
+            return None
+        first_line = script.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        return interpreter, first_line
+
+    def _is_portable_shebang(self, first_line: str, interpreter: str) -> bool:
+        # uv emits `#!<interpreter>` for a portable shebang, or `#!/bin/sh` for
+        # the trampoline. Distinguish by whether the real interpreter path is on
+        # the shebang line (the trampoline uses /bin/sh instead).
+        return first_line.startswith("#!") and interpreter in first_line
+
+    def test_guard_agrees_with_uv_at_124_bytes(self) -> None:
+        made = self._make_venv_with_interpreter_bytes(124)
+        if made is None:
+            self.skipTest("temp base too long to construct a 124-byte interpreter path")
+        interpreter, first_line = made
+        uv_portable = self._is_portable_shebang(first_line, interpreter)
+        self.assertTrue(uv_portable, f"expected uv to emit a portable shebang at 124 bytes: {first_line!r}")
+        self.assertEqual(
+            guard.venv_python_is_bootable(interpreter, os_name="posix"),
+            uv_portable,
+            "guard verdict must match uv's generated console script at 124 bytes",
+        )
+
+    def test_guard_agrees_with_uv_at_125_bytes(self) -> None:
+        made = self._make_venv_with_interpreter_bytes(125)
+        if made is None:
+            self.skipTest("temp base too long to construct a 125-byte interpreter path")
+        interpreter, first_line = made
+        uv_portable = self._is_portable_shebang(first_line, interpreter)
+        self.assertFalse(uv_portable, f"expected uv to emit a /bin/sh trampoline at 125 bytes: {first_line!r}")
+        self.assertEqual(
+            guard.venv_python_is_bootable(interpreter, os_name="posix"),
+            uv_portable,
+            "guard verdict must match uv's generated console script at 125 bytes",
+        )
+
+    def test_guard_agrees_with_uv_for_space_bearing_short_path(self) -> None:
+        venv_dir = Path(tempfile.mkdtemp(prefix="s", dir=self._root)) / "My Env"
+        interpreter = str(venv_dir / "bin" / "python3")
+        made = self._install_and_read(venv_dir, interpreter)
+        if made is None:
+            self.skipTest("uv could not create the space-bearing venv")
+        interpreter, first_line = made
+        self.assertLessEqual(
+            guard.interpreter_path_bytes(interpreter),
+            INTERPRETER_BYTE_LIMIT,
+            "precondition: the space-bearing path is short enough that only the space can trip uv",
+        )
+        uv_portable = self._is_portable_shebang(first_line, interpreter)
+        self.assertFalse(uv_portable, f"expected uv to trampoline on the space: {first_line!r}")
+        self.assertFalse(
+            guard.venv_python_is_bootable(interpreter, os_name="posix"),
+            "guard must reject a space-bearing interpreter path uv trampolines",
+        )
+
+    def test_guard_cli_rejects_real_long_external_project_environment(self) -> None:
+        # End-to-end on the release path: a SHORT backend dir with a LONG
+        # external UV_PROJECT_ENVIRONMENT. The guard is run exactly as the
+        # deploy scripts run it -- `uv run --project <backend>` -- so it executes
+        # inside the uv-selected environment and measures the real
+        # `sys.executable` uv embeds into the console scripts. uv selects the
+        # long external env; the guard must fail. This is the mismatch the first
+        # iteration missed, proven against uv's own environment selection.
+        backend = Path(tempfile.mkdtemp(prefix="be", dir=self._root)) / "backend"
+        backend.mkdir()
+        (backend / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "be"\n'
+            'version = "0.0.1"\n'
+            'requires-python = ">=3.8"\n',
+            encoding="utf-8",
+        )
+        ext_base = Path(tempfile.mkdtemp(prefix="ext", dir=self._root))
+        # Pad the external env name so the selected interpreter is well over 124
+        # bytes regardless of the temp base length.
+        long_env = ext_base / ("e" * 160)
+        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(long_env))
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(backend),
+                "python",
+                str(GUARD_PY),
+                "--backend-dir",
+                str(backend),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            f"guard must reject the long uv-selected external environment: {result.stdout}{result.stderr}",
+        )
+        combined = result.stdout + result.stderr
+        self.assertIn("124", combined)
+        # Remediation must name the override, not misdirect to shortening the checkout.
+        self.assertIn("UV_PROJECT_ENVIRONMENT", combined)
 
 
 def _strip_shell_comments(text: str) -> str:

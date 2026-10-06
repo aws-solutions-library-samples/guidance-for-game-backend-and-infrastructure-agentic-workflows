@@ -87,29 +87,40 @@ def interpreter_path_bytes(interpreter_path: str) -> int:
     return len(os.fsencode(interpreter_path))
 
 
-def is_windows_launcher(interpreter_path: str, *, os_name: str | None = None) -> bool:
-    """True when the interpreter is a native Windows launcher target.
+def uses_native_windows_launcher(os_name: str | None = None) -> bool:
+    """True when uv wraps console scripts in a native Windows launcher binary.
 
-    On Windows uv emits a native launcher binary that natively supports long and
-    relocatable interpreter paths -- the POSIX shebang trampoline never applies.
-    Detection keys off the running OS first (authoritative when the deploy runs
-    on Windows) and falls back to a ``.exe`` suffix so a caller can probe a
-    Windows path from a POSIX test host.
+    uv's shebang rule is gated entirely on the target environment's OS
+    (``format_shebang`` runs its length/space check only under
+    ``os_name == "posix"``), and on Windows ``write_script_entrypoints`` wraps
+    each launcher in a native ``.exe`` trampoline
+    (``uv_trampoline_builder::windows_script_launcher``) that natively supports
+    long and relocatable interpreter paths. So the decision is purely the OS uv
+    runs under -- NOT a property of the interpreter path string.
+
+    The ``.exe`` suffix is deliberately NOT consulted: on a POSIX host uv never
+    emits a Windows launcher, so a long or space-bearing ``/.../python.exe`` path
+    still gets the unbootable ``/bin/sh`` trampoline. Keying off the suffix would
+    wrongly pass exactly that path (the first fix's root-cause defect).
+
+    ``os_name`` defaults to the running ``os.name``: the deploy host that runs
+    ``agentcore launch`` is the host whose uv packages the venv, so its OS is
+    authoritative for whether the shipped scripts are launchers or shebangs.
     """
     resolved_os_name = os_name if os_name is not None else os.name
-    if resolved_os_name == "nt":
-        return True
-    return interpreter_path.lower().endswith(".exe")
+    return resolved_os_name == "nt"
 
 
 def venv_python_is_bootable(interpreter_path: str, *, os_name: str | None = None) -> bool:
-    """Return True when uv would emit a portable ``#!`` shebang for this path.
+    """Return True when uv would emit a portable, bootable console script.
 
-    Returns False only for the POSIX case uv turns into the unbootable
-    ``/bin/sh`` trampoline: an interpreter path over 124 filesystem bytes, or
-    one containing a space. Native Windows launcher targets are always bootable.
+    On a native-Windows target uv ships a native launcher binary, so any
+    interpreter path is bootable regardless of length or spaces. On POSIX,
+    returns False exactly for the case uv turns into the unbootable ``/bin/sh``
+    trampoline: an interpreter path over 124 filesystem bytes, or one containing
+    a space.
     """
-    if is_windows_launcher(interpreter_path, os_name=os_name):
+    if uses_native_windows_launcher(os_name):
         return True
     if " " in interpreter_path:
         return False
@@ -179,16 +190,55 @@ def resolve_runtime_interpreter(backend_dir: Path) -> str:
     return resolve_venv_interpreter(backend_dir)
 
 
-def remediation_message(interpreter_path: str) -> str:
-    """Actionable failure text naming the real limit and a concrete fix."""
+def _interpreter_is_external_override(interpreter_path: str, backend_dir: Path | None) -> bool:
+    """True when ``interpreter_path`` lives outside ``<backend>/.venv``.
+
+    When uv honors ``UV_PROJECT_ENVIRONMENT`` the selected interpreter can be an
+    absolute path with no relationship to ``<backend>/.venv``. Shortening the
+    checkout cannot repair such a path, so remediation must be tailored. When
+    ``backend_dir`` is unknown (a direct ``--interpreter`` probe) we cannot make
+    the determination and treat the path as the default-layout case.
+    """
+    if backend_dir is None:
+        return False
+    default_venv = Path(os.path.abspath(backend_dir / ".venv"))
+    measured = Path(os.path.abspath(interpreter_path))
+    return default_venv not in measured.parents and measured != default_venv
+
+
+def remediation_message(interpreter_path: str, *, backend_dir: Path | None = None) -> str:
+    """Actionable failure text naming the real limit and the right concrete fix.
+
+    The fix differs by where the unbootable interpreter came from. A path under
+    the default ``<backend>/.venv`` is repaired by deploying from a shorter,
+    space-free checkout. An interpreter uv selected via ``UV_PROJECT_ENVIRONMENT``
+    (outside ``<backend>/.venv``) cannot be fixed by moving the checkout; the
+    override itself must be unset or pointed at a short, space-free directory.
+    """
     byte_length = interpreter_path_bytes(interpreter_path)
     has_space = " " in interpreter_path
     if has_space:
         cause = "contains a space"
     else:
         cause = f"is {byte_length} filesystem bytes (over the {INTERPRETER_BYTE_LIMIT}-byte limit)"
+
+    if _interpreter_is_external_override(interpreter_path, backend_dir):
+        fix = (
+            "   uv selected this interpreter via UV_PROJECT_ENVIRONMENT (it is not\n"
+            "   under backend/.venv), so shortening the checkout will not help.\n"
+            "   Unset UV_PROJECT_ENVIRONMENT, or point it at a shorter, space-free\n"
+            f"   directory so the selected interpreter is at most {INTERPRETER_BYTE_LIMIT} bytes and\n"
+            "   contains no space, then re-run the deployment."
+        )
+    else:
+        fix = (
+            "   Deploy from a checkout whose path is shorter and space-free so that\n"
+            f"   the backend .venv interpreter is at most {INTERPRETER_BYTE_LIMIT} bytes, then\n"
+            "   re-run the deployment."
+        )
+
     return (
-        f"Backend venv interpreter path {cause}.\n"
+        f"Backend runtime interpreter path {cause}.\n"
         f"   Path: {interpreter_path}\n"
         "\n"
         "   uv writes the venv's console scripts with a /bin/sh trampoline that\n"
@@ -197,9 +247,7 @@ def remediation_message(interpreter_path: str) -> str:
         "   launch packages those scripts into dependencies.zip, producing an\n"
         "   AgentCore runtime that cannot start (issue #517).\n"
         "\n"
-        "   Deploy from a checkout whose path is shorter and space-free so that\n"
-        f"   backend/.venv/bin/python3 is at most {INTERPRETER_BYTE_LIMIT} bytes, then re-run the\n"
-        "   deployment."
+        f"{fix}"
     )
 
 
@@ -228,12 +276,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    interpreter_path = args.interpreter or resolve_runtime_interpreter(args.backend_dir)
+    if args.interpreter:
+        interpreter_path = args.interpreter
+        # A direct probe carries no backend context, so remediation uses the
+        # default-checkout wording rather than guessing at an override.
+        remediation_backend_dir: Path | None = None
+    else:
+        interpreter_path = resolve_runtime_interpreter(args.backend_dir)
+        remediation_backend_dir = args.backend_dir
 
     if venv_python_is_bootable(interpreter_path):
         return 0
 
-    sys.stderr.write("\u274c " + remediation_message(interpreter_path) + "\n")
+    sys.stderr.write(
+        "\u274c " + remediation_message(interpreter_path, backend_dir=remediation_backend_dir) + "\n"
+    )
     return 1
 
 
