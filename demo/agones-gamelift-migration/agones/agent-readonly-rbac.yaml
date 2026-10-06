@@ -1,0 +1,43 @@
+# Read-only Kubernetes visibility for the Sentinel agent's runtime role.
+#
+# Lets the (read-only) agent inspect the Agones setup it is migrating — fleets,
+# game servers, autoscalers, pods, nodes, services, events. No write verbs and
+# no access to Secrets. Bound to a Kubernetes group that an EKS access entry
+# maps the AgentCore execution role into (see README "Agent visibility").
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: game-agent-readonly
+  labels:
+    demo: agones-gamelift-migration
+rules:
+  - apiGroups: ["agones.dev"]
+    resources: ["fleets", "gameservers", "gameserversets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling.agones.dev"]
+    resources: ["fleetautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "services", "namespaces", "events", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: game-agent-readonly
+  labels:
+    demo: agones-gamelift-migration
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: game-agent-readonly
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: game-agent-readonly
