@@ -333,7 +333,7 @@ def test_orchestrator_keeps_all_specialists_for_non_report_queries():
 
 
 def test_orchestrator_prompt_prioritizes_cost_report_followups():
-    assert ORCHESTRATOR_PROMPT.version == "2.2.0"
+    assert ORCHESTRATOR_PROMPT.version == "2.3.0"
     assert "cost-report follow-up" in ORCHESTRATOR_PROMPT.text
     assert "takes precedence even when EKS or GameLift is named" in ORCHESTRATOR_PROMPT.text
     assert "Cost report IDs must go to cost_agent" in ORCHESTRATOR_PROMPT.text

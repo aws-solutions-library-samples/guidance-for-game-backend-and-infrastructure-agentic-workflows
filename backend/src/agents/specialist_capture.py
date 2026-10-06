@@ -39,6 +39,11 @@ _COMPOSE_ORDER: tuple[str, ...] = ("gamelift", "eks", "cost")
 _active_capture_id: ContextVar[str | None] = ContextVar("specialist_capture_id", default=None)
 # capture_id -> {normalized_service_name -> (display_service_name, output)}
 _captured_outputs: dict[str, dict[str, tuple[str, str]]] = {}
+# capture_id -> every non-empty (display_service_name, output) in record order.
+# Composition stays last-write-wins per service; the history exists so artifact
+# relay (agents.iac_relay) sees every specialist answer when the orchestrator
+# calls the same specialist more than once in a request.
+_capture_history: dict[str, list[tuple[str, str]]] = {}
 _capture_lock = threading.RLock()
 
 
@@ -67,6 +72,7 @@ def begin_specialist_capture() -> SpecialistCapture:
     token = _active_capture_id.set(capture_id)
     with _capture_lock:
         _captured_outputs[capture_id] = {}
+        _capture_history[capture_id] = []
     return SpecialistCapture(capture_id=capture_id, token=token)
 
 
@@ -80,14 +86,28 @@ def finish_specialist_capture(capture: SpecialistCapture) -> list[tuple[str, str
     a :class:`~contextvars.Token` may be reset exactly once — resetting it again
     would raise ``RuntimeError``.
     """
+    return finish_specialist_capture_with_history(capture)[0]
+
+
+def finish_specialist_capture_with_history(
+    capture: SpecialistCapture,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Finish a capture; return composed outputs plus the full record-order history.
+
+    The first element is exactly what :func:`finish_specialist_capture` returns.
+    The second lists every non-empty recorded output in the order recorded,
+    including earlier outputs for a service that was called more than once.
+    Idempotent in the same way as :func:`finish_specialist_capture`.
+    """
     with _capture_lock:
         recorded = _captured_outputs.pop(capture.capture_id, None)
+        history = _capture_history.pop(capture.capture_id, [])
     if recorded is None:
         # Already finished (or never began): the token was reset on the first
         # finish and must not be reset again.
-        return []
+        return [], []
     _active_capture_id.reset(capture.token)
-    return [recorded[name] for name in _ordered_services(set(recorded))]
+    return [recorded[name] for name in _ordered_services(set(recorded))], history
 
 
 def record_specialist_output(service_name: str, output: str) -> None:
@@ -106,3 +126,5 @@ def record_specialist_output(service_name: str, output: str) -> None:
         bucket = _captured_outputs.get(capture_id)
         if bucket is not None:
             bucket[_normalize(service_name)] = (service_name, output)
+            if output:
+                _capture_history.setdefault(capture_id, []).append((service_name, output))

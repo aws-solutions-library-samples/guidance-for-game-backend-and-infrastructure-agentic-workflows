@@ -121,14 +121,23 @@ def relay_specialist_iac(response_text: str, specialist_outputs: Iterable[tuple[
     cutover steps) is relayed so the routing model only needs a short overview.
     Otherwise only the IaC blocks are relayed. Blocks that carry unvalidated
     financial content are dropped (fail closed), matching the rule that only the
-    cost report may present monetary values. Returns ``response_text`` unchanged
-    when no relayable IaC exists.
+    cost report may present monetary values. ``specialist_outputs`` is in call
+    order and may repeat a service; at most one answer per service is relayed
+    (the earliest with relayable IaC). Returns ``response_text`` unchanged when
+    no relayable IaC exists.
     """
     sections: list[str] = []
     relayed = 0
+    # One relayed answer per service. ``specialist_outputs`` may hold several
+    # answers from the same specialist (the orchestrator can call it more than
+    # once); the earliest answer with relayable IaC wins because it carries the
+    # user's original requirements, while later calls are narrower follow-ups
+    # whose templates (if any) were built from paraphrased inputs.
+    relayed_services: set[str] = set()
+    withheld_services: dict[str, str] = {}
     for service_name, output in specialist_outputs:
         normalized = (service_name or "").strip().lower()
-        if normalized not in _RELAY_SERVICES or not output:
+        if normalized not in _RELAY_SERVICES or not output or normalized in relayed_services:
             continue
         display = service_name.strip() or "specialist"
         found = extract_iac_blocks(output)
@@ -136,10 +145,12 @@ def relay_specialist_iac(response_text: str, specialist_outputs: Iterable[tuple[
         blocks = blocks[: max(0, MAX_RELAYED_BLOCKS - relayed)]
         if not blocks:
             if found:
-                # Make the fail-closed outcome visible instead of silently
-                # returning an answer that refers to a template the user never sees.
-                sections.append(WITHHELD_NOTICE.format(service=display))
+                # Remember the fail-closed outcome so it is made visible if no
+                # other answer from this service can be relayed.
+                withheld_services.setdefault(normalized, display)
             continue
+        relayed_services.add(normalized)
+        withheld_services.pop(normalized, None)
         relayed += len(blocks)
         answer = output.strip()
         if len(answer) <= MAX_RELAYED_ANSWER_CHARS and not contains_unvalidated_financial_content(answer):
@@ -149,6 +160,9 @@ def relay_specialist_iac(response_text: str, specialist_outputs: Iterable[tuple[
         if relayed >= MAX_RELAYED_BLOCKS:
             break
 
+    # Make a fail-closed outcome visible instead of silently returning an answer
+    # that refers to a template the user never sees.
+    sections.extend(WITHHELD_NOTICE.format(service=display) for display in withheld_services.values())
     if not sections:
         return response_text
 
