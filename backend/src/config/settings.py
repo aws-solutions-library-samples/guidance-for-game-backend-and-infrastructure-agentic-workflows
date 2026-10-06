@@ -304,9 +304,14 @@ class AgentInferenceConfig(TypedDict):
     model_id: str
 
 
+# The GameLift specialist generates complete CloudFormation templates (for
+# example Agones-to-GameLift migrations). At 4096 tokens a full container-fleet
+# template was cut off mid-resource, so it gets a larger output budget.
+GAMELIFT_MAX_TOKENS = int(os.getenv("GBAW_GAMELIFT_MAX_TOKENS", "16000"))
+
 INFERENCE_CONFIG: dict[str, AgentInferenceConfig] = {
     "orchestrator": {"temperature": 0.0, "max_tokens": 4096, "model_id": ORCHESTRATOR_MODEL_ID},
-    "gamelift": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
+    "gamelift": {"temperature": 0.1, "max_tokens": GAMELIFT_MAX_TOKENS, "model_id": SPECIALIST_MODEL_ID},
     "eks": {"temperature": 0.1, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
     "cost": {"temperature": 0.0, "max_tokens": 4096, "model_id": SPECIALIST_MODEL_ID},
 }

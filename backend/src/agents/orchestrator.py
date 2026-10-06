@@ -31,6 +31,7 @@ from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.financial_guard import contains_unvalidated_financial_content, sanitize_advisory_section
 from agents.gamelift_specialist import gamelift_agent
+from agents.iac_relay import relay_specialist_iac
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
 from agents.specialist_capture import begin_specialist_capture, finish_specialist_capture
 from config.settings import (
@@ -451,6 +452,11 @@ def run_orchestrator(query: str, context: dict = None):
                     response = _COST_ADVISORY_GUIDANCE
                 elif contains_unvalidated_financial_content(str(response)):
                     response = sanitize_advisory_section("Cost", str(response))
+                else:
+                    # Specialist-generated IaC is the authoritative artifact:
+                    # relay it verbatim instead of trusting the routing model to
+                    # re-type (and truncate or paraphrase) a full template.
+                    response = relay_specialist_iac(str(response), specialist_outputs)
 
         # Extract and save semantic memories for LTM (non-blocking)
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:
