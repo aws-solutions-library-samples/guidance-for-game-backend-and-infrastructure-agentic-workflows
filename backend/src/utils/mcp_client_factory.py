@@ -47,34 +47,25 @@ MCP_CREATE_RETRY_DELAY = 1.0  # seconds between attempts
 _EKS_LOG_SUPPRESSED_SERVERS = frozenset({"aws-api-mcp-server", "eks-mcp-server"})
 
 
-class _DiscardingErrLog(io.TextIOBase):
-    """A bounded, code-owned sink that discards everything written to it.
+class _DiscardingErrLog(io.TextIOWrapper):
+    """A code-owned sink that discards everything written to it.
 
     ``mcp.stdio_client(server, errlog=...)`` wires the child transport's stderr
     to ``errlog`` (default ``sys.stderr``). ``mcp_wrapper.py`` forwards the
     provider child's stderr to its own stderr, so provider-/Kubernetes-authored
     error BODIES would otherwise reach the parent logs. For the two EKS stdio
     servers ONLY we pass this discarding sink so that provider-authored child
-    stderr can never enter parent logs. It is a text sink (the transport writes
-    ``str``); writes are counted and dropped, never buffered or re-emitted. The
-    ``FASTMCP_LOG_LEVEL=CRITICAL`` env pin remains as defense in depth.
+    stderr can never enter parent logs. The ``FASTMCP_LOG_LEVEL=CRITICAL`` env
+    pin remains as defense in depth.
+
+    The sink is passed to ``subprocess.Popen`` as the child's ``stderr``, which
+    requires a real file descriptor (``fileno()``). It is therefore backed by
+    ``os.devnull``: the operating system discards every byte, and nothing is
+    buffered, retained, or re-emitted in this process.
     """
 
     def __init__(self) -> None:
-        super().__init__()
-        self._dropped_chars = 0
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, s: str) -> int:
-        # Discard. Bound memory: only a counter is retained, never the content.
-        n = len(s)
-        self._dropped_chars += n
-        return n
-
-    def flush(self) -> None:  # pragma: no cover - nothing buffered
-        return None
+        super().__init__(open(os.devnull, "wb"), encoding="utf-8", write_through=True)
 
 
 def _errlog_for(server_name: str) -> "io.TextIOBase | None":

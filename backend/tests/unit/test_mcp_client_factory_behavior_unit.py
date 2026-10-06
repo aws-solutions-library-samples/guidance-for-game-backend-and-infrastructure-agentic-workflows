@@ -515,3 +515,25 @@ class TestEksTransportErrlogSink:
         # (sys.stderr) is used, i.e. no errlog is passed by our factory.
         assert not isinstance(errlog, _DiscardingErrLog)
         assert errlog is None
+
+    def test_discarding_errlog_is_usable_as_subprocess_stderr(self):
+        """Regression: stdio_client hands errlog to subprocess.Popen as stderr,
+        which needs a real file descriptor. A pure in-memory sink raised
+        io.UnsupportedOperation: fileno and broke every EKS MCP server start."""
+        # Standard library
+        import subprocess
+        import sys as _sys
+
+        # Local modules
+        from utils.mcp_client_factory import _DiscardingErrLog
+
+        errlog = _DiscardingErrLog()
+        assert errlog.fileno() >= 0
+        proc = subprocess.run(
+            [_sys.executable, "-c", "import sys; sys.stderr.write('AccessDenied arn:aws:eks:secret\\n')"],
+            stderr=errlog,
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+        assert proc.returncode == 0
+        assert proc.stdout == b""
