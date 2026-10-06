@@ -48,8 +48,9 @@ Describe 'Test-GameAgentRuntimePath' {
 
         Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner
 
-        $calls[0] | Should -BeLike '*scripts/infrastructure/check_runtime_path.py*'
-        $calls[0] | Should -BeLike "*$BackendPath*"
+        $parts = $calls[0] -split '\|', 2
+        $parts[0] | Should -Be (Join-Path $RepoRoot 'scripts/infrastructure/check_runtime_path.py')
+        $parts[1] | Should -Be $BackendPath
     }
 
     It 'Throws before any guard run when the shared guard script is missing' {
