@@ -39,9 +39,21 @@ Resources:
               - 'What should I do about my relationship?'
               - 'Give me medical advice for a headache.'
 
+          # The two SCOPE topics below are enforced on user input only. On
+          # output they are detect-only (OutputAction NONE, still traced): the
+          # topic classifier labels the assistant's own in-scope answers as
+          # off-topic — kubectl blocks, GameLift Server SDK integration steps
+          # (InitSDK/ProcessReady), even comments in a CloudFormation template —
+          # and blocking them cut generated IaC off mid-template. Scope is a
+          # property of what users ask; content, PII, prompt-attack, word, and
+          # personal-advice protections stay enforced on output.
           - Name: 'General Programming Help'
             Definition: 'Requests to write, debug or explain general application source code, programming-language tutorials, or non-Amazon platforms like Azure, Google Cloud, or on-premise data centers.'
             Type: 'DENY'
+            InputEnabled: true
+            InputAction: 'BLOCK'
+            OutputEnabled: true
+            OutputAction: 'NONE'
             Examples:
               - 'How do I write a Python function?'
               - 'How do I set up Azure Kubernetes Service?'
@@ -50,6 +62,10 @@ Resources:
           - Name: 'Entertainment and Casual Chat'
             Definition: 'Requests for jokes, poems, stories, songs, trivia, games, or casual small talk.'
             Type: 'DENY'
+            InputEnabled: true
+            InputAction: 'BLOCK'
+            OutputEnabled: true
+            OutputAction: 'NONE'
             Examples:
               - 'Tell me a joke'
               - 'Write me a poem about pirates'
