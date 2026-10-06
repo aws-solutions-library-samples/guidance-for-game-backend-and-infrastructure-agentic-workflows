@@ -10,7 +10,7 @@ check and deploy that output.
 |---|---|
 | `server/` | GameLift-ready game server image (same UDP echo logic as the Agones `simple-game-server`) |
 | `container-fleet.reference.yaml` | Hand-checked baseline template. Used to validate the agent's output and as a fallback target. Not the on-camera artifact. |
-| `container-fleet.generated.yaml` | The template the agent produced (saved at record time) |
+| `container-fleet.generated.yaml` | A template the agent produced from the Scenario 1 prompt, deployed unedited (see [Validated run](#validated-run)) |
 
 ## 1. Build and push the game server image
 
@@ -51,10 +51,14 @@ Things to check in the agent's output (all covered by the reference template):
 
 ## 3. Deploy
 
+The image parameter name is whatever the agent chose (`ContainerImageUri` in
+the saved template); every other parameter has a working default. The fleet
+role has a fixed name, so pass `CAPABILITY_NAMED_IAM`.
+
 ```bash
 aws cloudformation deploy --stack-name gl-demo-migration \
-  --template-file container-fleet.generated.yaml --capabilities CAPABILITY_IAM \
-  --parameter-overrides GameServerImageUri="$URI:v1"
+  --template-file container-fleet.generated.yaml --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides ContainerImageUri="$URI:v1"
 ```
 
 The container group definition first copies the image (`COPYING` → `READY`),
@@ -74,3 +78,31 @@ IP and port: the same players that were connected to Agones are now served by
 GameLift. For a zero-downtime cutover, keep Agones serving existing sessions,
 route new sessions to the GameLift queue, and drain Agones as its sessions end
 (the GameLift Anywhere hybrid post in the KB describes the pattern).
+
+## Validated run
+
+`container-fleet.generated.yaml` came from one invocation of the deployed
+runtime with the Scenario 1 prompt. Before answering, the GameLift specialist
+checked it with its read-only `validate_cloudformation_template` tool. It was
+then deployed without edits:
+
+| Check | Result |
+|---|---|
+| `cfn-lint` 1.57.1 | No errors (one W3005 redundant `DependsOn` warning) |
+| `aws cloudformation validate-template` | Passed |
+| Stack create (`CAPABILITY_NAMED_IAM`, image URI only) | `CREATE_COMPLETE` |
+| Fleet | `ACTIVE`, one c6i.large instance in the stack's Region |
+| Players (in-cluster load job, 8 players for 30 s) | 8/8 receiving echoes |
+
+What the template contains: a container group definition for UDP 7654 (the
+Agones container port), a container fleet whose role has
+`GameLiftContainerFleetPolicy`, a game session queue, and a target-based
+`PercentAvailableGameSessions` scaling policy. It omits the connection port
+range and inbound permissions, so GameLift computes and opens them.
+
+The saved file is the template body that CloudFormation stored for the stack.
+CloudFormation stores non-ASCII characters as `?`, so the agent's
+box-drawing characters in comment lines show up as `??`. Nothing else differs.
+
+Agent output varies from run to run, so validate each new template (step 2)
+before you deploy it.
