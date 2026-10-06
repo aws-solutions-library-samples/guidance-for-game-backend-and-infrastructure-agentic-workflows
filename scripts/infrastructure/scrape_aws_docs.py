@@ -28,6 +28,23 @@ DOCS_CONFIG = {
             "output": "developer-guide.md",
             "title": "GameLift Developer Guide"
         },
+        # Unreal Engine integration: grounds fresh-setup answers for Unreal
+        # projects (Server SDK plugin, packaging, and container fleet deployment).
+        {
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/unreal-plugin.html",
+            "output": "unreal-plugin.md",
+            "title": "Amazon GameLift Servers plugin for Unreal Engine"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/integration-engines-setup-unreal.html",
+            "output": "unreal-integration.md",
+            "title": "Integrate Amazon GameLift Servers into an Unreal Engine project"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/unreal-plugin-container.html",
+            "output": "unreal-plugin-container.md",
+            "title": "Plugin for Unreal: Deploy your game to a managed container fleet"
+        },
         # CloudFormation reference for container fleets: grounds IaC generation
         # in the current resource schema (AWS::GameLift::ContainerFleet, not the
         # deprecated AWS::GameLift::Fleet ContainerGroupsConfiguration shape).

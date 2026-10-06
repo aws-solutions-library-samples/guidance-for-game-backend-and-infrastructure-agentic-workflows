@@ -47,6 +47,10 @@ class ScrapeCodeFormatTests(unittest.TestCase):
         code_docs = [d for d in self.mod.DOCS_CONFIG["gamelift"] if d.get("format") == "code"]
         self.assertTrue(all(d.get("language") for d in code_docs))
 
+    def test_gamelift_kb_includes_unreal_engine_integration_docs(self):
+        outputs = {doc["output"] for doc in self.mod.DOCS_CONFIG["gamelift"]}
+        self.assertTrue({"unreal-plugin.md", "unreal-integration.md", "unreal-plugin-container.md"} <= outputs)
+
 
 if __name__ == "__main__":
     unittest.main()
