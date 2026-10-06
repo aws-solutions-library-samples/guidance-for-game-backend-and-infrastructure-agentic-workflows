@@ -146,10 +146,34 @@ def test_cloudformation_substitutions_do_not_trip_financial_guard():
     assert not contains_unvalidated_financial_content(TEMPLATE)
 
 
-def test_block_with_financial_content_is_dropped():
+def test_block_with_financial_content_is_withheld_visibly():
     priced = TEMPLATE.replace("InstanceType: c6i.large", "InstanceType: c6i.large  # costs $85.00 per month")
-    answer = "Plan."
-    assert relay_specialist_iac(answer, [("GameLift", priced)]) == answer
+    result = relay_specialist_iac("Plan.", [("GameLift", priced)])
+    assert "$85.00" not in result
+    assert "AWSTemplateFormatVersion" not in result
+    assert result.startswith("Plan.")
+    assert "was withheld because it contained a monetary value" in result
+
+
+def test_anywhere_cost_literal_is_withheld():
+    anywhere = TEMPLATE.replace(
+        "  Queue:",
+        "  AnywhereFleet:\n    Type: AWS::GameLift::Fleet\n    Properties:\n"
+        '      ComputeType: ANYWHERE\n      AnywhereConfiguration:\n        Cost: "0.1"\n  Queue:',
+    )
+    result = relay_specialist_iac("Plan.", [("GameLift", anywhere)])
+    assert 'Cost: "0.1"' not in result
+    assert "was withheld" in result
+
+
+def test_anywhere_cost_parameter_is_relayed():
+    anywhere = TEMPLATE.replace(
+        "  Queue:",
+        "  AnywhereFleet:\n    Type: AWS::GameLift::Fleet\n    Properties:\n"
+        "      ComputeType: ANYWHERE\n      AnywhereConfiguration:\n        Cost: !Ref AnywhereHourlyCost\n  Queue:",
+    )
+    result = relay_specialist_iac("Plan.", [("GameLift", anywhere)])
+    assert "Cost: !Ref AnywhereHourlyCost" in result
 
 
 def test_clean_specialist_answer_is_relayed_in_full():
