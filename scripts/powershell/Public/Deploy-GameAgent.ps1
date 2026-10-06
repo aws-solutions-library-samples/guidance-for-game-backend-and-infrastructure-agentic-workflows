@@ -119,6 +119,27 @@ function Deploy-GameAgent {
         return
     }
 
+    # ── Preflight: local dependency setup + runtime path guard (#517) ──
+    # Install backend dependencies locally and verify the venv interpreter path
+    # is bootable BEFORE any AWS-mutating command. agentcore launch (Step 2)
+    # packages this venv's console scripts into dependencies.zip; an over-limit
+    # or space-bearing POSIX interpreter path makes uv emit a /bin/sh trampoline
+    # that dies at exec in the container — silently, since deploy still exits 0
+    # and the control plane reaches READY. Running the guard here, after local
+    # `uv sync` and before Step 1 (the first stack deploy), fails a doomed
+    # deploy fast with zero AWS side effects. On native Windows the shared guard
+    # is a no-op (uv ships a native launcher binary, not a shebang trampoline).
+    Write-GameAgentStatus 'Preflight: Installing backend dependencies...' -Type Info
+    Push-Location $backendPath
+    try {
+        uv sync 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
+    } finally { Pop-Location }
+    Write-GameAgentStatus 'Preflight: Verifying the runtime interpreter path is bootable...' -Type Info
+    Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
+    Write-GameAgentStatus 'Runtime interpreter path is portable' -Type Success
+    Write-Host ''
+
     # ── Step 0: Download KB documentation ──
     Write-GameAgentStatus 'Step 0: Downloading KB documentation...' -Type Info
     Invoke-GameAgentKBDocDownload -Region $Region -ProfileArgs $profileArgs
@@ -204,26 +225,8 @@ function Deploy-GameAgent {
         Write-GameAgentStatus 'Installing backend dependencies...' -Type Info
         uv sync 2>$null
         if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
-
-        # Guard against an unbootable long-path runtime before CodeBuild runs
-        # (#517). The launch step packages this venv's console scripts into
-        # dependencies.zip; when the venv interpreter path exceeds the 127-char
-        # kernel shebang limit, uv emits a /bin/sh trampoline embedding the
-        # absolute local path instead of a portable shebang, producing a runtime
-        # that cannot start. Fail fast with a clear remediation. Mirror of
-        # scripts/infrastructure/check-runtime-path.sh.
-        $runtimeShebangLimit = 127
-        $venvPython = if ($IsWindows) {
-            Join-Path $backendPath '.venv/Scripts/python.exe'
-        } else {
-            Join-Path $backendPath '.venv/bin/python3'
-        }
-        if ($venvPython.Length -gt $runtimeShebangLimit) {
-            throw ("Backend venv interpreter path length {0} exceeds the {1}-char shebang limit. " -f $venvPython.Length, $runtimeShebangLimit) +
-                  "Path: $venvPython. uv emits a /bin/sh trampoline embedding this absolute local path " +
-                  "instead of a portable shebang, producing an AgentCore runtime that cannot start (issue #517). " +
-                  "Deploy from a checkout with a shorter path so backend/.venv/bin/python3 is <= $runtimeShebangLimit characters, then re-run."
-        }
+        # The preflight already synced and verified this venv is bootable (#517);
+        # this re-sync is idempotent and keeps Step 2 self-contained.
 
         # Resolve both model roles through the canonical Python configuration.
         $settingsLoader = Join-Path $repoRoot 'config/load_deployment_settings.py'
