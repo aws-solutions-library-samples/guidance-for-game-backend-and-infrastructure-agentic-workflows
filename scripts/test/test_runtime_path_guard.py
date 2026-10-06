@@ -252,9 +252,7 @@ class RemediationMessage(unittest.TestCase):
 
     def test_external_detection_true_for_outside_path(self) -> None:
         backend = Path("/srv/app/backend")
-        self.assertTrue(
-            guard._interpreter_is_external_override("/other/env/bin/python3", backend)
-        )
+        self.assertTrue(guard._interpreter_is_external_override("/other/env/bin/python3", backend))
 
     def test_external_detection_false_for_default_venv_path(self) -> None:
         backend = Path("/srv/app/backend")
@@ -264,9 +262,7 @@ class RemediationMessage(unittest.TestCase):
     def test_external_detection_false_without_backend_context(self) -> None:
         # A direct --interpreter probe carries no backend context; the override
         # branch must not fire (we cannot know, so default-checkout wording).
-        self.assertFalse(
-            guard._interpreter_is_external_override("/other/env/bin/python3", None)
-        )
+        self.assertFalse(guard._interpreter_is_external_override("/other/env/bin/python3", None))
 
 
 class RuntimePathCli(unittest.TestCase):
@@ -371,6 +367,10 @@ class UvGeneratedEntrypointBoundary(unittest.TestCase):
     over 124 bytes) or the path contains a space.
     """
 
+    _tmp: tempfile.TemporaryDirectory[str]
+    _wheel: Path
+    _root: Path
+
     @classmethod
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory(prefix="rt_guard_uv_")
@@ -389,9 +389,7 @@ class UvGeneratedEntrypointBoundary(unittest.TestCase):
             'build-backend = "hatchling.build"\n',
             encoding="utf-8",
         )
-        (pkg / "samplepkg" / "__init__.py").write_text(
-            "def main():\n    print('hi')\n", encoding="utf-8"
-        )
+        (pkg / "samplepkg" / "__init__.py").write_text("def main():\n    print('hi')\n", encoding="utf-8")
         dist = root / "dist"
         proc = subprocess.run(
             ["uv", "build", "--wheel", "--out-dir", str(dist), str(pkg)],
@@ -512,10 +510,7 @@ class UvGeneratedEntrypointBoundary(unittest.TestCase):
         backend = Path(tempfile.mkdtemp(prefix="be", dir=self._root)) / "backend"
         backend.mkdir()
         (backend / "pyproject.toml").write_text(
-            "[project]\n"
-            'name = "be"\n'
-            'version = "0.0.1"\n'
-            'requires-python = ">=3.8"\n',
+            "[project]\n" 'name = "be"\n' 'version = "0.0.1"\n' 'requires-python = ">=3.8"\n',
             encoding="utf-8",
         )
         ext_base = Path(tempfile.mkdtemp(prefix="ext", dir=self._root))

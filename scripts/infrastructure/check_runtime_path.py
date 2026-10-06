@@ -288,9 +288,7 @@ def main(argv: list[str] | None = None) -> int:
     if venv_python_is_bootable(interpreter_path):
         return 0
 
-    sys.stderr.write(
-        "\u274c " + remediation_message(interpreter_path, backend_dir=remediation_backend_dir) + "\n"
-    )
+    sys.stderr.write("\u274c " + remediation_message(interpreter_path, backend_dir=remediation_backend_dir) + "\n")
     return 1
 
 
