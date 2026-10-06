@@ -165,6 +165,26 @@ _LIST_MARKER_RE = re.compile(r"^(\s*)\d{1,3}[.)][ \t]+", re.MULTILINE)
 # templates. Only the exact uppercase enum alone on a list line is neutralized;
 # "- COST: 5", "- Cost", and any currency symbol or code are still detected.
 _PRIORITY_ENUM_RE = re.compile(r"^([ \t]*-[ \t]*)COST[ \t]*$", re.MULTILINE)
+# Network ports ("port 7654", "UDP 7654", "ports 7000-8000", "7654/UDP") are
+# never monetary values. Without this, "error rate and UDP connectivity on port
+# 7654" withheld a migration plan because "rate" sat next to a port number.
+_PORT_NUMBER_RE = re.compile(
+    r"\b(?P<lead>(?:UDP|TCP)[ \t]+(?:ports?[ \t]+)?|ports?[ \t]+)\d{1,5}(?:[ \t]*[-–][ \t]*\d{1,5})?\b"
+    r"|\b\d{1,5}(?:[ \t]*[-–][ \t]*\d{1,5})?/(?P<proto>UDP|TCP)\b",
+    re.IGNORECASE,
+)
+# Operational rate metrics ("error rate", "placement success rate") are not
+# prices. Only these qualified forms are neutralized; a bare "rate" or a
+# "rate: 0.20" label is still detected.
+_OPERATIONAL_RATE_RE = re.compile(
+    r"\b(?:error|success|failure|crash|placement|connection|disconnect|drop|retry|fill|match|"
+    r"tick|frame|packet[- ]loss|request|timeout)[ \t]+rates?\b",
+    re.IGNORECASE,
+)
+
+
+def _neutralize_port(match: re.Match[str]) -> str:
+    return f"{match.group('lead')}PORT" if match.group("lead") else f"PORT/{match.group('proto')}"
 
 
 def _neutralize_shell_positionals(text: str) -> str:
@@ -199,6 +219,8 @@ def contains_unvalidated_financial_content(text: str) -> bool:
     scannable = _URL_RE.sub("", scannable)
     scannable = _LIST_MARKER_RE.sub(r"\1- ", scannable)
     scannable = _PRIORITY_ENUM_RE.sub(r"\1PRIORITY_ENUM", scannable)
+    scannable = _PORT_NUMBER_RE.sub(_neutralize_port, scannable)
+    scannable = _OPERATIONAL_RATE_RE.sub("operational metric", scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)

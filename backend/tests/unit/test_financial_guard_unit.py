@@ -248,3 +248,30 @@ class TestGameLiftQueuePriorityEnum:
     )
     def test_cost_values_near_list_items_are_still_flagged(self, text):
         assert contains_unvalidated_financial_content(text) is True
+
+
+class TestOperationalPortsAndRates:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Watch the placement success rate, error rate, and UDP connectivity on port 7654.",
+            "Open ports 7000-8000 for players; the server listens on 7654/UDP.",
+            "- Error rate\n  - P50/P99 connection latency to UDP 7654\n- Increase to 25% then 50%",
+            "Rollback if the crash rate exceeds 2 in 10 minutes.",
+        ],
+    )
+    def test_ports_and_operational_rates_are_clean(self, text):
+        assert contains_unvalidated_financial_content(text) is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "The hourly rate is 0.20 for port 7654.",
+            "Rate: 0.20",
+            "Error rate is low, and it costs $5 per hour.",
+            "aws gamelift create-fleet --anywhere-configuration Cost=0.10",
+            "Port 7654 instances cost 85 per month.",
+        ],
+    )
+    def test_prices_near_ports_or_rates_are_still_flagged(self, text):
+        assert contains_unvalidated_financial_content(text) is True
