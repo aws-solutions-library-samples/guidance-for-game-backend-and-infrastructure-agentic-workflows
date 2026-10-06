@@ -158,6 +158,13 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # 6 next to "rate". Only a marker at the start of a line is neutralized, so any
 # amount later on the line ("1. Monthly cost: $5") is still detected.
 _LIST_MARKER_RE = re.compile(r"^(\s*)\d{1,3}[.)][ \t]+", re.MULTILINE)
+# The GameLift queue enum value COST as a bare YAML list item
+# (PriorityConfiguration.PriorityOrder: [LATENCY, COST, DESTINATION, LOCATION]).
+# On its own line it looks like a "Cost" label and was linked to unrelated
+# numbers below it (PlayerLatencyPolicies milliseconds), withholding valid
+# templates. Only the exact uppercase enum alone on a list line is neutralized;
+# "- COST: 5", "- Cost", and any currency symbol or code are still detected.
+_PRIORITY_ENUM_RE = re.compile(r"^([ \t]*-[ \t]*)COST[ \t]*$", re.MULTILINE)
 
 
 def _neutralize_shell_positionals(text: str) -> str:
@@ -191,6 +198,7 @@ def contains_unvalidated_financial_content(text: str) -> bool:
     scannable = _neutralize_shell_positionals(text)
     scannable = _URL_RE.sub("", scannable)
     scannable = _LIST_MARKER_RE.sub(r"\1- ", scannable)
+    scannable = _PRIORITY_ENUM_RE.sub(r"\1PRIORITY_ENUM", scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)

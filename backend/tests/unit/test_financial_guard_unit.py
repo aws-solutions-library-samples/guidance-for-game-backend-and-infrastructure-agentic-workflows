@@ -220,3 +220,31 @@ class TestOperationalOutputWithFinancialVocabulary:
     )
     def test_labelled_or_same_line_financial_values_still_flagged(self, text):
         assert contains_unvalidated_financial_content(text) is True
+
+
+class TestGameLiftQueuePriorityEnum:
+    _QUEUE = (
+        "      PriorityConfiguration:\n"
+        "        PriorityOrder:\n"
+        "          - LATENCY\n"
+        "          - COST\n"
+        "          - DESTINATION\n"
+        "      PlayerLatencyPolicies:\n"
+        "        - MaximumIndividualPlayerLatencyMilliseconds: 150\n"
+        "          PolicyDurationSeconds: 60\n"
+    )
+
+    def test_cost_priority_enum_is_not_a_financial_label(self):
+        assert contains_unvalidated_financial_content(self._QUEUE) is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "- COST: 5",
+            "- Cost\n999",
+            "- COST\n$5",
+            "- COST\nUSD 5",
+        ],
+    )
+    def test_cost_values_near_list_items_are_still_flagged(self, text):
+        assert contains_unvalidated_financial_content(text) is True
