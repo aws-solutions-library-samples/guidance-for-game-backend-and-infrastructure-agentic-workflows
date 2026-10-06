@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Reference target for the Agones-to-GameLift migration demo: an Amazon
+  GameLift Servers container fleet hosting the same UDP game server that runs
+  on the Agones simple-game-server fleet. Used to validate the template the
+  Sentinel agent generates; not the demo's on-camera artifact.
+
+Parameters:
+  GameServerImageUri:
+    Type: String
+    Description: ECR image URI (with tag) of the GameLift-ready game server.
+  GameServerPort:
+    Type: Number
+    Default: 7654
+    Description: UDP port the game server listens on inside the container.
+  InstanceType:
+    Type: String
+    Default: c6i.large
+  GameServerGroupsPerInstance:
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+Resources:
+  FleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: gamelift.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/GameLiftContainerFleetPolicy
+
+  GameServerContainerGroup:
+    Type: AWS::GameLift::ContainerGroupDefinition
+    Properties:
+      Name: !Sub ${AWS::StackName}-game-server
+      ContainerGroupType: GAME_SERVER
+      OperatingSystem: AMAZON_LINUX_2023
+      TotalMemoryLimitMebibytes: 512
+      TotalVcpuLimit: 0.5
+      GameServerContainerDefinition:
+        ContainerName: game-server
+        ImageUri: !Ref GameServerImageUri
+        ServerSdkVersion: "5.2.0"
+        PortConfiguration:
+          ContainerPortRanges:
+            - FromPort: !Ref GameServerPort
+              ToPort: !Ref GameServerPort
+              Protocol: UDP
+
+  ContainerFleet:
+    Type: AWS::GameLift::ContainerFleet
+    Properties:
+      Description: !Sub Migrated from Agones (${AWS::StackName})
+      FleetRoleArn: !GetAtt FleetRole.Arn
+      GameServerContainerGroupDefinitionName: !GetAtt GameServerContainerGroup.ContainerGroupDefinitionArn
+      GameServerContainerGroupsPerInstance: !Ref GameServerGroupsPerInstance
+      InstanceType: !Ref InstanceType
+      BillingType: ON_DEMAND
+      NewGameSessionProtectionPolicy: FullProtection
+      Locations:
+        - Location: !Ref AWS::Region
+          LocationCapacity:
+            DesiredEC2Instances: 1
+            MinSize: 1
+            MaxSize: 3
+      ScalingPolicies:
+        - Name: keep-20-percent-available
+          PolicyType: TargetBased
+          MetricName: PercentAvailableGameSessions
+          TargetConfiguration:
+            TargetValue: 20
+
+  GameSessionQueue:
+    Type: AWS::GameLift::GameSessionQueue
+    Properties:
+      Name: !Sub ${AWS::StackName}-queue
+      TimeoutInSeconds: 60
+      Destinations:
+        - DestinationArn: !GetAtt ContainerFleet.FleetArn
+
+Outputs:
+  FleetId:
+    Value: !GetAtt ContainerFleet.FleetId
+  QueueArn:
+    Value: !GetAtt GameSessionQueue.Arn

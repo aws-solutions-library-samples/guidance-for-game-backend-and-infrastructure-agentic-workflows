@@ -8,11 +8,13 @@ and the supporting assets to record a compelling before/after.
 ## Layout
 
 ```
-eks/cluster.yaml          eksctl config for a small Agones-ready EKS cluster
-agones/fleet.yaml         Agones Fleet running the simple-game-server (UDP echo)
-agones/allocation.yaml    GameServerAllocation to "start a match"
-client/udp_load.py        UDP load generator — simulates N connected players
-gamelift/README.md        The GameLift container-fleet target (agent-generated in-demo)
+eks/cluster.yaml                eksctl config for a small Agones-ready EKS cluster
+agones/fleet.yaml               Agones Fleet running the simple-game-server (UDP echo)
+agones/allocation.yaml          GameServerAllocation to "start a match"
+agones/agent-readonly-rbac.yaml Read-only K8s access for the agent (no writes, no Secrets)
+client/udp_load.py              UDP load generator (workstation)
+client/load-job.yaml            UDP load generator (in-cluster, recommended)
+gamelift/                       GameLift side: game server image, reference template, deploy + cutover
 ```
 
 ## Prerequisites
@@ -28,14 +30,13 @@ gamelift/README.md        The GameLift container-fleet target (agent-generated i
 eksctl create cluster -f eks/cluster.yaml
 ```
 
-### 2. Open the Agones game-server UDP port range on the node security group
+### 2. Open the Agones game-server UDP port range
 Agones assigns dynamic host ports in **7000–8000/UDP**; players must reach them.
+eksctl managed nodes use the EKS cluster security group:
 ```bash
-CLUSTER=agones-demo
-NODE_SG=$(aws ec2 describe-security-groups \
-  --filters "Name=tag:aws:eks:cluster-name,Values=$CLUSTER" "Name=group-name,Values=*node*" \
-  --query 'SecurityGroups[0].GroupId' --output text)
-aws ec2 authorize-security-group-ingress --group-id "$NODE_SG" \
+CLUSTER_SG=$(aws eks describe-cluster --name agones-demo \
+  --query 'cluster.resourcesVpcConfig.clusterSecurityGroupId' --output text)
+aws ec2 authorize-security-group-ingress --group-id "$CLUSTER_SG" \
   --ip-permissions 'IpProtocol=udp,FromPort=7000,ToPort=8000,IpRanges=[{CidrIp=0.0.0.0/0,Description=agones-gameservers}]'
 ```
 
@@ -80,13 +81,31 @@ PORT=$(kubectl get gameserver "$GS" -o jsonpath='{.status.ports[0].port}')
 python3 client/udp_load.py "$NODE" "$PORT" 10 120
 ```
 
-### 7. Record the migration
-Drive the agent with the Scenario 1 prompt (see the demo prompts artifact),
-download its generated GameLift CloudFormation, deploy it, then re-point the
-client at the GameLift fleet endpoint for the cutover.
-
-## Teardown (do this after recording — the cluster costs money)
+### 7. Let the agent see the cluster (read-only)
+The agent's runtime role needs Kubernetes read access to inspect the Agones
+fleet it is migrating. This grants `get/list/watch` only — no write verbs and
+no Secrets:
 ```bash
+kubectl apply -f agones/agent-readonly-rbac.yaml
+aws eks create-access-entry --cluster-name agones-demo --type STANDARD \
+  --principal-arn "arn:aws:iam::<account-id>:role/game-agent-agentcore-execution-role" \
+  --kubernetes-groups game-agent-readonly
+kubectl auth can-i list fleets.agones.dev --as=probe --as-group=game-agent-readonly   # yes
+kubectl auth can-i delete pods --as=probe --as-group=game-agent-readonly              # no
+```
+
+### 8. Record the migration
+Drive the agent with the Scenario 1 prompt (see the demo prompts artifact). Its
+answer ends with a **Generated infrastructure as code** section containing the
+CloudFormation template exactly as the GameLift specialist produced it; use the
+download button on the code block. Then follow [`gamelift/README.md`](gamelift/README.md)
+to validate, deploy, and cut players over to GameLift.
+
+## Teardown (do this after recording — the cluster and fleets cost money)
+```bash
+aws cloudformation delete-stack --stack-name gl-demo-migration
+aws cloudformation delete-stack --stack-name gl-demo-reference
 kubectl delete -f agones/fleet.yaml --ignore-not-found
 eksctl delete cluster -f eks/cluster.yaml --disable-nodegroup-eviction
+aws ecr delete-repository --repository-name game-agent-demo/gamelift-echo-server --force
 ```
