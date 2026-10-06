@@ -451,7 +451,12 @@ def run_orchestrator(query: str, context: dict = None):
                 if _has_cost_topic(query):
                     response = _COST_ADVISORY_GUIDANCE
                 elif contains_unvalidated_financial_content(str(response)):
-                    response = sanitize_advisory_section("Cost", str(response))
+                    # Withhold the routing model's prose (fail closed), but still
+                    # deliver specialist IaC: each relayed block is checked by the
+                    # same financial guard on its own.
+                    response = relay_specialist_iac(
+                        sanitize_advisory_section("Cost", str(response)), specialist_outputs
+                    )
                 else:
                     # Specialist-generated IaC is the authoritative artifact:
                     # relay it verbatim instead of trusting the routing model to

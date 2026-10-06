@@ -66,7 +66,8 @@ GAMELIFT_PROMPT = VersionedPrompt(
         "AWS::GameLift::ContainerFleet (FleetRoleArn of an IAM role trusted by gamelift.amazonaws.com "
         "with the managed policy GameLiftContainerFleetPolicy, GameServerContainerGroupDefinitionName, "
         "InstanceType, InstanceConnectionPortRange, Locations, ScalingPolicies with a TargetBased "
-        "PercentAvailableGameSessions policy). Never use AWS::GameLift::Fleet with "
+        "PercentAvailableGameSessions policy; each scaling policy entry uses Name, not PolicyName). "
+        "Never use AWS::GameLift::Fleet with "
         "ContainerGroupsConfiguration; that shape is deprecated.\n"
         "- Add an AWS::GameLift::GameSessionQueue whose Destinations reference the fleet ARN.\n"
         "- Take the container image URI as a parameter. Never write literal IP addresses, CIDR ranges, "
@@ -135,7 +136,8 @@ ORCHESTRATOR_PROMPT = VersionedPrompt(
         '  Examples: "GameLift", "fleets", "game server", "migrate Agones to GameLift"\n\n'
         "Never calculate or rewrite financial values. Cost report IDs must go to cost_agent.\n\n"
         "Never repeat or rewrite an infrastructure-as-code template a specialist returns; summarize what "
-        "it does. The exact template is appended to your answer automatically.\n\n"
+        "it does and refer to it as the template below. The exact template is appended to your answer "
+        "automatically.\n\n"
         "Be concise. Use markdown formatting."
     ),
 )

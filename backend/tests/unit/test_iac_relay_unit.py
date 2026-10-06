@@ -183,6 +183,23 @@ def test_orchestrator_relays_gamelift_template_on_operational_path(_fake_orchest
     assert TEMPLATE in result
 
 
+def test_orchestrator_withholds_financial_prose_but_still_relays_template(_fake_orchestrator_agent):
+    prose = "Migration summary. This will save you $400 per month."
+    with _fake_orchestrator_agent(prose, ("GameLift", SPECIALIST_OUTPUT)):
+        result = _real_run_orchestrator("Migrate my Agones fleet on EKS to GameLift container fleets")
+    assert "$400" not in result
+    assert "Unvalidated financial figures were withheld" in result
+    assert TEMPLATE in result
+
+
+def test_operational_latency_prose_is_not_withheld(_fake_orchestrator_agent):
+    prose = "Placement policies balance quality and availability (200 ms, then 500 ms)."
+    with _fake_orchestrator_agent(prose, ("GameLift", SPECIALIST_OUTPUT)):
+        result = _real_run_orchestrator("Migrate my Agones fleet on EKS to GameLift container fleets")
+    assert result.startswith(prose)
+    assert TEMPLATE in result
+
+
 def test_orchestrator_does_not_relay_on_cost_topic(_fake_orchestrator_agent):
     with _fake_orchestrator_agent("Cost summary.", ("GameLift", SPECIALIST_OUTPUT)):
         result = _real_run_orchestrator("How much will this GameLift migration cost me per month?")

@@ -73,7 +73,16 @@ _CODE_AMOUNT_RE = re.compile(
 # Explicit currency words require an adjacent value; a bare discussion of
 # "dollars" or "yen" is not itself a financial figure.
 _CURRENCY_WORD = r"dollars?|cents?|euros?|yen"
-_MONEY_NUMBER = r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)" r"(?![A-Za-z0-9]|,\d|\.\d|\s*%)"
+# A number followed by a time or data-size unit ("200 ms", "60 seconds",
+# "4 GiB") is a duration or capacity, never a monetary value. Without this,
+# operational prose such as "balance latency and availability (200 ms)" or
+# "load balancing keeps p99 under 120 ms" was withheld as financial content.
+_NON_MONETARY_UNIT = (
+    r"ms|milliseconds?|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|" r"KiB|MiB|GiB|TiB|KB|MB|GB|TB|vCPUs?"
+)
+_MONEY_NUMBER = (
+    r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)" rf"(?![A-Za-z0-9]|,\d|\.\d|\s*%|\s+(?:{_NON_MONETARY_UNIT})\b)"
+)
 _CURRENCY_WORD_AMOUNT_RE = re.compile(
     rf"(?:\b(?:{_CURRENCY_WORD})\b[^\n]{{0,20}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,20}}\b(?:{_CURRENCY_WORD})\b)",
