@@ -462,7 +462,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | **1** | User → ECS Express (ALB) | **Cognito JWT** | HttpOnly/Secure/SameSite cookies; `CognitoJwtVerifier` validates signature, expiration, and audience. Users must be in `admin` or `users` group. |
 | **2** | ECS Express → AgentCore | **Cognito JWT (bearer)** | The proxy forwards the end user's verified Cognito **access token** as an `Authorization: Bearer` header over HTTPS (TLS 1.2+). The AgentCore runtime independently verifies the token and reconstructs authority. No SigV4 and no task-role signing — the bearer token is the credential, so the ECS task role needs no `bedrock-agentcore` grant and has no identity policies. |
 | **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` condition. Read-only for GameLift, EKS, Cost Explorer. Scoped by region. |
-| **4** | Prompts → Model | **Bedrock Guardrails** | Input/output content filtering: topic blocking, PII anonymization, prompt injection detection, profanity filtering. |
+| **4** | Prompts → Model | **Bedrock Guardrails** | Input and output: Personal Advice topic blocking, harmful-content filters, PII anonymization, profanity, regex, and word filters. Input only: prompt injection detection. The scope topics (General Programming Help, Entertainment and Casual Chat) block on input only; on output they are detect-only (`OutputAction: NONE`, still traced). |
 
 **Configuration Locations**:
 - Cognito: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 12-73)
