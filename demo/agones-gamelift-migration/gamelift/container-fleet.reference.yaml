@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Reference target for the Agones-to-GameLift migration demo: an Amazon
+  Reference target for the Agones-to-GameLift reference environment: an Amazon
   GameLift Servers container fleet hosting the same UDP game server that runs
-  on the Agones simple-game-server fleet. Used to validate the template the
-  Sentinel agent generates; not the demo's on-camera artifact.
+  on the Agones simple-game-server fleet. A hand-checked baseline for
+  comparing generated templates.
 
 Parameters:
   GameServerImageUri:

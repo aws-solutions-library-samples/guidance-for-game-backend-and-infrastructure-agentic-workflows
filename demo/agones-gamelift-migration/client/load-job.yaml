@@ -1,8 +1,9 @@
-# In-cluster UDP load generator — the reliable way to show "connected players"
-# during the demo (independent of local/corporate networks that block outbound
-# UDP). Point TARGET_HOST at the allocated GameServer's pod IP (container port
-# 7654), or at a node internal IP + its host port. Then:
-#   kubectl logs -f job/udp-load
+# In-cluster UDP load generator. It simulates players from inside the private
+# cluster, so no game port is published to the internet. `scripts/demo.sh load`
+# fills in TARGET_HOST and TARGET_PORT:
+#   * Agones: the allocated GameServer's pod IP and container port 7654.
+#   * GameLift: the game session's IP and port; the fleet's inbound rule allows
+#     only the cluster's NAT gateway address (`scripts/demo.sh restrict-fleet-ingress`).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -19,7 +20,7 @@ spec:
       restartPolicy: Never
       containers:
         - name: load
-          image: python:3.12-alpine
+          image: python:3.12.15-alpine3.24
           env:
             - name: TARGET_HOST
               value: "REPLACE_WITH_GAMESERVER_POD_IP"
