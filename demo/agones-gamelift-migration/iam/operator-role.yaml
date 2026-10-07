@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Least-privilege operator role for the Agones-to-GameLift reference
+  environment. It can create and delete only the demo's own EKS cluster
+  (through eksctl), the demo's GameLift container-fleet stacks, and the demo's
+  ECR repository, in one Region. Deploy it in a non-production account, assume
+  it for the demo, and delete it afterwards. It is never used by the assistant.
+
+Parameters:
+  OperatorPrincipalArn:
+    Type: String
+    Description: IAM role or user ARN allowed to assume this role (the person or pipeline running the demo).
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$"
+  ClusterName:
+    Type: String
+    Default: agones-demo
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+  StackPrefix:
+    Type: String
+    Default: gl-demo
+    Description: Name prefix of the GameLift container-fleet stacks.
+    AllowedPattern: "^[a-z][a-z0-9-]{2,20}$"
+  RepositoryName:
+    Type: String
+    Default: agones-gamelift-demo/game-server
+    AllowedPattern: "^[a-z0-9][a-z0-9/_-]{2,100}$"
+  AgentRoleName:
+    Type: String
+    Default: game-agent-agentcore-execution-role
+    Description: The assistant's runtime role, which enroll-agent maps to read-only Kubernetes access.
+    AllowedPattern: "^[A-Za-z0-9+=,.@_-]{1,64}$"
+
+Resources:
+  OperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-operator"
+      Description: Operator role for the Agones-to-GameLift reference environment (demo only).
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref OperatorPrincipalArn
+            Action: sts:AssumeRole
+      Tags:
+        - Key: demo
+          Value: agones-gamelift-migration
+      Policies:
+        - PolicyName: demo-operator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Everything below is confined to the stack's Region.
+              - Sid: DenyOtherRegions
+                Effect: Deny
+                NotAction:
+                  - iam:*
+                  - sts:*
+                Resource: "*"
+                Condition:
+                  StringNotEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+
+              # eksctl manages the VPC, subnets, NAT gateway, security groups,
+              # launch templates, and node instances through CloudFormation.
+              # Mirrors the eksctl minimum policy (AmazonEC2FullAccess), limited
+              # to one Region by the statement above.
+              - Sid: Ec2ForEksctl
+                Effect: Allow
+                Action:
+                  - ec2:*
+                  - elasticloadbalancing:Describe*
+                  - autoscaling:Describe*
+                Resource: "*"
+
+              - Sid: CloudFormationDemoStacks
+                Effect: Allow
+                Action: cloudformation:*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/eksctl-${ClusterName}-*/*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackPrefix}-*/*"
+              - Sid: CloudFormationReadAndValidate
+                Effect: Allow
+                Action:
+                  - cloudformation:ListStacks
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:DescribeType
+                  - cloudformation:DescribeEvents
+                Resource: "*"
+
+              - Sid: EksDemoCluster
+                Effect: Allow
+                Action: eks:*
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
+                  - !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/${ClusterName}/*/*"
+                  - !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:addon/${ClusterName}/*/*"
+                  - !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:access-entry/${ClusterName}/*"
+                  - !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:podidentityassociation/${ClusterName}/*"
+                  - !Sub "arn:${AWS::Partition}:eks::aws:cluster-access-policy/*"
+              - Sid: EksAccountReads
+                Effect: Allow
+                Action:
+                  - eks:CreateCluster
+                  - eks:ListClusters
+                  - eks:DescribeAddonVersions
+                  - eks:DescribeAddonConfiguration
+                  - eks:DescribeClusterVersions
+                  - eks:ListAccessPolicies
+                Resource: "*"
+              - Sid: EksAmiLookup
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::parameter/aws/*"
+              - Sid: EksctlLogRetention
+                Effect: Allow
+                Action: logs:PutRetentionPolicy
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/*"
+
+              # IAM: only eksctl-created roles and instance profiles for this
+              # cluster, and the GameLift fleet roles created by demo stacks.
+              - Sid: IamDemoRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:ListInstanceProfilesForRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:CreateInstanceProfile
+                  - iam:DeleteInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/eksctl-${ClusterName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackPrefix}-*"
+              - Sid: PassDemoRolesToTheirServices
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackPrefix}-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - eks.amazonaws.com
+                      - ec2.amazonaws.com
+                      - gamelift.amazonaws.com
+              # enroll-agent resolves the assistant's role ARN; it never changes that role.
+              - Sid: ReadAgentRole
+                Effect: Allow
+                Action: iam:GetRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AgentRoleName}"
+              # EKS checks whether its service-linked roles already exist using
+              # the caller's permissions before it creates a cluster or node group.
+              - Sid: ReadEksServiceLinkedRoles
+                Effect: Allow
+                Action: iam:GetRole
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/eks.amazonaws.com/*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/eks-nodegroup.amazonaws.com/*"
+              - Sid: EksctlManagedPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:ListPolicyVersions
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/eksctl-${ClusterName}-*"
+              - Sid: IamReadManagedPolicies
+                Effect: Allow
+                Action:
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                Resource: !Sub "arn:${AWS::Partition}:iam::aws:policy/*"
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - eks.amazonaws.com
+                      - eks-nodegroup.amazonaws.com
+                      - autoscaling.amazonaws.com
+
+              # GameLift container fleets, container group definitions, and
+              # queues created by the demo stacks, plus test game sessions. The
+              # first block is the union of the CloudFormation registry handler
+              # permissions for AWS::GameLift::ContainerFleet,
+              # ContainerGroupDefinition, and GameSessionQueue.
+              - Sid: GameLiftContainerHosting
+                Effect: Allow
+                Action:
+                  - gamelift:CreateContainerGroupDefinition
+                  - gamelift:UpdateContainerGroupDefinition
+                  - gamelift:DeleteContainerGroupDefinition
+                  - gamelift:DescribeContainerGroupDefinition
+                  - gamelift:ListContainerGroupDefinitions
+                  - gamelift:CreateContainerFleet
+                  - gamelift:UpdateContainerFleet
+                  - gamelift:DeleteContainerFleet
+                  - gamelift:DescribeContainerFleet
+                  - gamelift:ListContainerFleets
+                  - gamelift:CreateFleetLocations
+                  - gamelift:DeleteFleetLocations
+                  - gamelift:DescribeFleetDeployment
+                  - gamelift:DescribeFleetLocationAttributes
+                  - gamelift:DescribeFleetLocationCapacity
+                  - gamelift:UpdateFleetCapacity
+                  - gamelift:StartFleetActions
+                  - gamelift:StopFleetActions
+                  - gamelift:DescribeScalingPolicies
+                  - gamelift:PutScalingPolicy
+                  - gamelift:DeleteScalingPolicy
+                  - gamelift:CreateGameSessionQueue
+                  - gamelift:UpdateGameSessionQueue
+                  - gamelift:DeleteGameSessionQueue
+                  - gamelift:DescribeGameSessionQueues
+                  - gamelift:TagResource
+                  - gamelift:UntagResource
+                  - gamelift:ListTagsForResource
+                  # Operator checks and test sessions (not used by CloudFormation).
+                  - gamelift:DescribeFleetCapacity
+                  - gamelift:CreateGameSession
+                  - gamelift:DescribeGameSessions
+                Resource: "*"
+
+              - Sid: EcrDemoRepository
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                  - ecr:ListImages
+                  - ecr:BatchGetImage
+                  - ecr:BatchDeleteImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:TagResource
+                  - ecr:PutImageScanningConfiguration
+                Resource: !Sub "arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${RepositoryName}"
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+
+              - Sid: ResourceDiscoveryForCleanupCheck
+                Effect: Allow
+                Action:
+                  - tag:GetResources
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+Outputs:
+  OperatorRoleArn:
+    Value: !GetAtt OperatorRole.Arn

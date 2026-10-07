@@ -1,0 +1,60 @@
+# In-cluster UDP load generator. It simulates players from inside the private
+# cluster, so no game port is published to the internet. `scripts/demo.sh load`
+# fills in TARGET_HOST and TARGET_PORT:
+#   * Agones: the allocated GameServer's pod IP and container port 7654.
+#   * GameLift: the game session's IP and port; the fleet's inbound rule allows
+#     only the cluster's NAT gateway address (`scripts/demo.sh restrict-fleet-ingress`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: udp-load
+  labels:
+    demo: agones-gamelift-migration
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        demo: agones-gamelift-migration
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: load
+          image: python:3.12.15-alpine3.24
+          env:
+            - name: TARGET_HOST
+              value: "REPLACE_WITH_GAMESERVER_POD_IP"
+            - name: TARGET_PORT
+              value: "7654"
+            - name: PLAYERS
+              value: "10"
+            - name: SECONDS
+              value: "120"
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, socket, threading, time
+              host = os.environ["TARGET_HOST"]; port = int(os.environ["TARGET_PORT"])
+              players = int(os.environ.get("PLAYERS", "10"))
+              seconds = int(os.environ.get("SECONDS", "120"))
+              stats = {}
+              stop = threading.Event()
+              def play(i):
+                  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+                  n = 0
+                  while not stop.is_set():
+                      try:
+                          s.sendto(f"player{i}-ping-{n}".encode(), (host, port))
+                          s.recvfrom(1024); stats[i] = stats.get(i, 0) + 1
+                      except Exception:
+                          pass
+                      n += 1; time.sleep(1)
+                  s.close()
+              for i in range(players):
+                  threading.Thread(target=play, args=(i,), daemon=True).start()
+              print(f"{players} players connecting to {host}:{port} for {seconds}s", flush=True)
+              for _ in range(seconds):
+                  time.sleep(1)
+                  print(f"active players (receiving echoes): {sum(1 for v in stats.values() if v)}/{players}", flush=True)
+              stop.set(); time.sleep(0.5)
+              print(f"total echoes: {sum(stats.values())}", flush=True)

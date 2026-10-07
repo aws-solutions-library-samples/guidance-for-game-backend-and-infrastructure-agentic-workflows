@@ -1,0 +1,13 @@
+# Helm values for Agones 1.61.0 (chart agones/agones, version pinned in
+# scripts/demo.sh). The chart's defaults publish the allocator and ping services
+# through internet-facing load balancers; the demo needs neither, so every
+# Agones service stays cluster-internal.
+agones:
+  allocator:
+    service:
+      serviceType: ClusterIP
+  ping:
+    http:
+      serviceType: ClusterIP
+    udp:
+      serviceType: ClusterIP

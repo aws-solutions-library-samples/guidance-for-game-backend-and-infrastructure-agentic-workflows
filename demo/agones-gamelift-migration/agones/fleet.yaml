@@ -1,0 +1,37 @@
+# Agones Fleet running the standard simple-game-server (UDP echo).
+# This is the workload migrated FROM. Agones assigns host ports in 7000-8000,
+# but no security group opens them: players are simulated in-cluster.
+apiVersion: agones.dev/v1
+kind: Fleet
+metadata:
+  name: simple-game-server
+  labels:
+    demo: agones-gamelift-migration
+spec:
+  replicas: 3
+  template:
+    spec:
+      ports:
+        - name: default
+          portPolicy: Dynamic
+          containerPort: 7654
+          protocol: UDP
+      health:
+        initialDelaySeconds: 30
+        periodSeconds: 10
+      template:
+        metadata:
+          labels:
+            demo: agones-gamelift-migration
+        spec:
+          containers:
+            - name: simple-game-server
+              # Example image released with Agones 1.61 (tested with chart 1.61.0).
+              image: us-docker.pkg.dev/agones-images/examples/simple-game-server:0.43
+              resources:
+                requests:
+                  memory: 64Mi
+                  cpu: 20m
+                limits:
+                  memory: 64Mi
+                  cpu: 20m
