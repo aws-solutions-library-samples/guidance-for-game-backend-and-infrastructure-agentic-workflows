@@ -20,8 +20,7 @@ gamelift/                       GameLift side: game server image, reference temp
 ## Prerequisites
 
 - `eksctl`, `kubectl`, `helm`, `aws` on PATH
-- Sandbox creds: `export AWS_PROFILE=ubi-eba-sandbox AWS_REGION=us-east-1`
-  (refresh with `ada credentials update --account=742301976366 --provider=isengard --role=Admin-OneClick --once`)
+- Credentials for a non-production AWS account: `export AWS_PROFILE=<your-profile> AWS_REGION=us-east-1`
 
 ## Runbook
 
@@ -95,7 +94,7 @@ kubectl auth can-i delete pods --as=probe --as-group=game-agent-readonly        
 ```
 
 ### 8. Record the migration
-Drive the agent with the Scenario 1 prompt (see the demo prompts artifact). Its
+Drive the agent with the Scenario 1 prompt (see [`../RECORDING.md`](../RECORDING.md)). Its
 answer ends with a **Generated infrastructure as code** section containing the
 CloudFormation template exactly as the GameLift specialist produced it; use the
 download button on the code block. Then follow [`gamelift/README.md`](gamelift/README.md)
@@ -105,6 +104,7 @@ to validate, deploy, and cut players over to GameLift.
 ```bash
 aws cloudformation delete-stack --stack-name gl-demo-migration
 aws cloudformation delete-stack --stack-name gl-demo-reference
+aws cloudformation delete-stack --stack-name gl-demo-unreal      # Scenario 2
 kubectl delete -f agones/fleet.yaml --ignore-not-found
 eksctl delete cluster -f eks/cluster.yaml --disable-nodegroup-eviction
 aws ecr delete-repository --repository-name game-agent-demo/gamelift-echo-server --force

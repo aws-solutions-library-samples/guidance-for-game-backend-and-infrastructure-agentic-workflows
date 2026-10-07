@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  GameLift Container Fleet for an Unreal Engine 5 dedicated server.
+  UDP 7777, 16 players per session, us-east-1, c6i.large, target-tracking scaling.
+
+Parameters:
+  ContainerImageUri:
+    Type: String
+    Description: >
+      ECR image URI for the UE5 dedicated server
+      e.g. {AWS Account ID}.dkr.ecr.us-east-1.amazonaws.com/ue5-gameserver:latest
+
+  ContainerGroupName:
+    Type: String
+    Default: UE5GameServerGroup
+    Description: Name for the ContainerGroupDefinition
+
+  FleetDescription:
+    Type: String
+    Default: UE5 Dedicated Server Container Fleet
+
+  InstanceType:
+    Type: String
+    Default: c6i.large
+    Description: EC2 instance type for the fleet
+
+  # Sized for c6i.large (2 vCPU / ~3.8 GiB) leaving headroom for the OS
+  TotalVcpuLimit:
+    Type: Number
+    Default: 1.5
+    Description: vCPU limit for the container group
+
+  TotalMemoryLimitMebibytes:
+    Type: Number
+    Default: 3072
+    Description: Memory limit (MiB) for the container group
+
+  ScalingTargetValue:
+    Type: Number
+    Default: 30
+    Description: >
+      Target % of available game session slots to keep free.
+      30 % provides a healthy buffer before capacity is exhausted.
+
+  QueueTimeoutSeconds:
+    Type: Number
+    Default: 120
+    Description: Max seconds the queue waits for a placement before timing out
+
+Resources:
+
+  # ── IAM role trusted by GameLift ──────────────────────────────────────────
+  FleetIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: gamelift.amazonaws.com
+            Action: sts:AssumeRole
+      # Exactly the managed policy required for container fleets
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/GameLiftContainerFleetPolicy
+      Tags:
+        - Key: Project
+          Value: UE5GameServer
+
+  # ── Container Group Definition ────────────────────────────────────────────
+  # Describes the container image and its resource/port requirements.
+  # SDK 5.2.0+ is mandatory for container fleet compatibility.
+  GameServerContainerGroup:
+    Type: AWS::GameLift::ContainerGroupDefinition
+    Properties:
+      Name: !Ref ContainerGroupName
+      OperatingSystem: AMAZON_LINUX_2023
+      TotalMemoryLimitMebibytes: !Ref TotalMemoryLimitMebibytes
+      TotalVcpuLimit: !Ref TotalVcpuLimit
+      GameServerContainerDefinition:
+        ContainerName: ue5-gameserver
+        ImageUri: !Ref ContainerImageUri
+        ServerSdkVersion: "5.2.0"          # Minimum for container fleets
+        PortConfiguration:
+          ContainerPortRanges:
+            - FromPort: 7777
+              ToPort: 7777
+              Protocol: UDP               # UE5 default game port
+      Tags:
+        - Key: Project
+          Value: UE5GameServer
+
+  # ── Container Fleet ───────────────────────────────────────────────────────
+  # InstanceConnectionPortRange and InstanceInboundPermissions are intentionally
+  # omitted: GameLift computes the connection port range automatically and opens
+  # it to players. Setting the port range without inbound permissions would leave
+  # the fleet unreachable.
+  GameServerFleet:
+    Type: AWS::GameLift::ContainerFleet
+    Properties:
+      Description: !Ref FleetDescription
+      FleetRoleArn: !GetAtt FleetIAMRole.Arn
+      GameServerContainerGroupDefinitionName: !Ref ContainerGroupName
+      InstanceType: !Ref InstanceType
+      # Single location – the stack's home Region (deploy to us-east-1)
+      Locations:
+        - Location: !Ref AWS::Region
+      # Target-tracking policy: scale so that ≥30 % of game session slots stay free
+      ScalingPolicies:
+        - Name: KeepBufferAvailable
+          PolicyType: TargetBased
+          TargetConfiguration:
+            TargetValue: !Ref ScalingTargetValue
+          MetricName: PercentAvailableGameSessions
+      Tags:
+        - Key: Project
+          Value: UE5GameServer
+    DependsOn: GameServerContainerGroup
+
+  # ── Game Session Queue ────────────────────────────────────────────────────
+  # Clients call StartGameSessionPlacement against this queue name.
+  # PriorityConfiguration is omitted (no LOCATION in PriorityOrder) so
+  # GameLift uses its default FleetIQ placement algorithm.
+  GameSessionQueue:
+    Type: AWS::GameLift::GameSessionQueue
+    Properties:
+      Name: UE5GameSessionQueue
+      TimeoutInSeconds: !Ref QueueTimeoutSeconds
+      Destinations:
+        - DestinationArn: !GetAtt GameServerFleet.FleetArn
+      Tags:
+        - Key: Project
+          Value: UE5GameServer
+    DependsOn: GameServerFleet
+
+Outputs:
+  FleetId:
+    Description: GameLift Container Fleet ID
+    Value: !Ref GameServerFleet
+
+  FleetArn:
+    Description: GameLift Container Fleet ARN
+    Value: !GetAtt GameServerFleet.FleetArn
+
+  QueueName:
+    Description: Queue name to use in StartGameSessionPlacement API calls
+    Value: !Ref GameSessionQueue
+
+  ContainerGroupDefinitionName:
+    Description: Container Group Definition name
+    Value: !Ref GameServerContainerGroup
