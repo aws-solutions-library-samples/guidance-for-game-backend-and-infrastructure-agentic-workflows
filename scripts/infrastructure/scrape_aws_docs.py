@@ -8,6 +8,7 @@ Uses HTTP ETags and Last-Modified headers to avoid unnecessary downloads.
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -62,11 +63,6 @@ DOCS_CONFIG = {
             "url": "https://aws.amazon.com/blogs/gametech/launch-phase-steps-for-successful-launches-on-amazon-gamelift-servers/",
             "output": "blog-gamelift-launch-phase.md",
             "title": "Launch Phase Steps for Successful Launches on Amazon GameLift Servers"
-        },
-        {
-            "url": "https://aws.amazon.com/blogs/gametech/introducing-the-gamelift-fleetiq-adapter-for-agones/",
-            "output": "blog-gamelift-agones-fleetiq-adapter.md",
-            "title": "Introducing the Amazon GameLift FleetIQ Adapter for Agones"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/apex-legends-migrates-to-amazon-gamelift-servers-in-just-10-days/",
@@ -144,7 +140,10 @@ class DocScraper:
         self.h2t = html2text.HTML2Text()
         self.h2t.ignore_links = False
         self.h2t.body_width = 0
-        self.h2t.ignore_images = False
+        # Images carry no retrievable text. Their alt attributes can be huge (one
+        # blog image repeats ~10k characters of the article), which the KB's
+        # fixed-size chunking turns into many duplicate, context-poor vectors.
+        self.h2t.ignore_images = True
 
     def _load_cache(self) -> Dict:
         if self.cache_file.exists():
@@ -203,6 +202,27 @@ class DocScraper:
             print(f"  ❌ Fetch failed: {e}")
             return None
 
+    @staticmethod
+    def _published_date(html: str) -> Optional[str]:
+        """Return the page's publication date (YYYY-MM-DD) when it declares one."""
+        soup = BeautifulSoup(html, 'html.parser')
+        meta = soup.find('meta', {'property': 'article:published_time'})
+        value = meta.get('content') if meta else None
+        if not value:
+            time_tag = soup.find('time')
+            value = time_tag.get('datetime') if time_tag else None
+        match = re.match(r'(\d{4}-\d{2}-\d{2})', value or '')
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _drop_images(content) -> None:
+        """Remove images, and links whose only content was an image."""
+        for img in content.find_all('img'):
+            link = img.find_parent('a')
+            img.decompose()
+            if link is not None and not link.get_text(strip=True) and not link.find('img'):
+                link.decompose()
+
     def _extract_content(self, html: str) -> Optional[str]:
         soup = BeautifulSoup(html, 'html.parser')
 
@@ -215,6 +235,7 @@ class DocScraper:
         if blog_content:
             for tag in blog_content.find_all(['nav', 'footer', 'script', 'style']):
                 tag.decompose()
+            self._drop_images(blog_content)
             return str(blog_content)
 
         selectors = [
@@ -230,10 +251,12 @@ class DocScraper:
             if content:
                 for tag in content.find_all(['nav', 'footer', 'script', 'style']):
                     tag.decompose()
+                self._drop_images(content)
                 return str(content)
 
         body = soup.find('body')
         if body:
+            self._drop_images(body)
             return str(body)
 
         return None
@@ -279,7 +302,13 @@ class DocScraper:
                 return True
             return False
 
-        header = f"# {doc_config['title']}\n\n"
+        # Source and publication date give retrieval enough context to tell a
+        # current recommendation from an older post.
+        header = f"# {doc_config['title']}\n\nSource: {url}\n"
+        published = self._published_date(html)
+        if published:
+            header += f"Published: {published}\n"
+        header += "\n"
         full_content = header + markdown
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
