@@ -21,107 +21,138 @@ import html2text
 # Cache duration: 7 days
 CACHE_DAYS = 7
 
-# AWS Documentation URLs (HTML only - S3 Vectors has size limits)
+# Reviewed lifecycle status of each source, written into the document header so
+# retrieval cannot present older guidance as the current recommended path.
+LIFECYCLE_NOTES = {
+    "current": "Current guidance.",
+    "historical": (
+        "Historical. Kept for background; details may be out of date. "
+        "Current AWS documentation takes precedence."
+    ),
+}
+
+# AWS Documentation URLs (HTML only - S3 Vectors has size limits).
+# The domain key is the owning specialist; every entry declares a lifecycle.
 DOCS_CONFIG = {
     "gamelift": [
         {
             "url": "https://docs.aws.amazon.com/gamelift/latest/developerguide/gamelift-intro.html",
             "output": "developer-guide.md",
-            "title": "GameLift Developer Guide"
+            "title": "GameLift Developer Guide",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/reduce-cost-by-up-to-90-with-amazon-gamelift-fleetiq-and-spot-instances/",
             "output": "blog-fleetiq-spot-cost.md",
-            "title": "Reduce Cost by up to 90% with Amazon GameLift FleetIQ and Spot Instances"
+            "title": "Reduce Cost by up to 90% with Amazon GameLift FleetIQ and Spot Instances",
+            # 2018 post; pricing and feature details predate GameLift Servers.
+            "lifecycle": "historical"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/how-to-host-your-unreal-engine-game-for-under-1-per-player-with-amazon-gamelift/",
             "output": "blog-unreal-under-1-dollar.md",
-            "title": "How to Host Your Unreal Engine Game for Under $1 per Player with Amazon GameLift"
+            "title": "How to Host Your Unreal Engine Game for Under $1 per Player with Amazon GameLift",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/faster-multiplayer-hosting-with-containers-on-amazon-gamelift-servers/",
             "output": "blog-gamelift-container-fleets.md",
-            "title": "Faster Multiplayer Hosting with Containers on Amazon GameLift Servers"
+            "title": "Faster Multiplayer Hosting with Containers on Amazon GameLift Servers",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/leverage-fully-managed-containers-to-host-multiplayer-games-at-global-scale-on-amazon-gamelift/",
             "output": "blog-gamelift-managed-containers.md",
-            "title": "Leverage Fully-Managed Containers to Host Multiplayer Games at Global Scale on Amazon GameLift"
+            "title": "Leverage Fully-Managed Containers to Host Multiplayer Games at Global Scale on Amazon GameLift",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/hybrid-game-server-hosting-with-amazon-gamelift-anywhere/",
             "output": "blog-gamelift-anywhere-hybrid.md",
-            "title": "Hybrid Game Server Hosting with Amazon GameLift Anywhere"
+            "title": "Hybrid Game Server Hosting with Amazon GameLift Anywhere",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/development-phase-steps-for-successful-launches-on-amazon-gamelift-servers/",
             "output": "blog-gamelift-dev-phase.md",
-            "title": "Development Phase Steps for Successful Launches on Amazon GameLift Servers"
+            "title": "Development Phase Steps for Successful Launches on Amazon GameLift Servers",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/launch-phase-steps-for-successful-launches-on-amazon-gamelift-servers/",
             "output": "blog-gamelift-launch-phase.md",
-            "title": "Launch Phase Steps for Successful Launches on Amazon GameLift Servers"
+            "title": "Launch Phase Steps for Successful Launches on Amazon GameLift Servers",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/apex-legends-migrates-to-amazon-gamelift-servers-in-just-10-days/",
             "output": "blog-gamelift-apex-migration.md",
-            "title": "Apex Legends Migrates to Amazon GameLift Servers in Just 10 Days"
+            "title": "Apex Legends Migrates to Amazon GameLift Servers in Just 10 Days",
+            "lifecycle": "current"
         }
     ],
     "eks": [
         {
             "url": "https://docs.aws.amazon.com/eks/latest/userguide/what-is-eks.html",
             "output": "user-guide.md",
-            "title": "EKS User Guide"
+            "title": "EKS User Guide",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.github.io/aws-eks-best-practices/",
             "output": "best-practices.md",
-            "title": "EKS Best Practices"
+            "title": "EKS Best Practices",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/developers-guide-to-operate-game-servers-on-kubernetes-part-1/",
             "output": "blog-game-servers-kubernetes.md",
-            "title": "Developer's Guide to Operate Game Servers on Kubernetes (Part 1)"
+            "title": "Developer's Guide to Operate Game Servers on Kubernetes (Part 1)",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/optimize-game-servers-hosting-with-containers/",
             "output": "blog-optimize-containers.md",
-            "title": "Optimize Game Servers Hosting with Containers"
+            "title": "Optimize Game Servers Hosting with Containers",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/new-solution-guidance-for-building-scalable-cross-platform-game-backends-on-aws/",
             "output": "blog-game-backend-framework.md",
-            "title": "Guidance for Building Scalable Cross-Platform Game Backends on AWS (Game Backend Framework)"
+            "title": "Guidance for Building Scalable Cross-Platform Game Backends on AWS (Game Backend Framework)",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/modernize-game-backend-services-with-aws-global-accelerator/",
             "output": "blog-modernize-aga.md",
-            "title": "Modernize Game Backend Services with AWS Global Accelerator"
+            "title": "Modernize Game Backend Services with AWS Global Accelerator",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/building-resilient-and-secure-game-backends-with-amazon-cloudfront/",
             "output": "blog-resilient-cloudfront.md",
-            "title": "Building Resilient and Secure Game Backends with Amazon CloudFront"
+            "title": "Building Resilient and Secure Game Backends with Amazon CloudFront",
+            "lifecycle": "current"
         }
     ],
     "cost": [
         {
             "url": "https://docs.aws.amazon.com/cost-management/latest/userguide/what-is-costmanagement.html",
             "output": "cost-management.md",
-            "title": "Cost Management Guide"
+            "title": "Cost Management Guide",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/choose-the-right-compute-strategy-for-your-global-game-servers/",
             "output": "blog-global-compute-strategy.md",
-            "title": "Choose the Right Compute Strategy for Your Global Game Servers"
+            "title": "Choose the Right Compute Strategy for Your Global Game Servers",
+            "lifecycle": "current"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/cost-optimize-your-minecraft-java-ec2-server/",
             "output": "blog-cost-optimize-minecraft-ec2.md",
-            "title": "Cost Optimize Your Minecraft Java EC2 Server"
+            "title": "Cost Optimize Your Minecraft Java EC2 Server",
+            "lifecycle": "current"
         }
     ]
 }
@@ -308,6 +339,7 @@ class DocScraper:
         published = self._published_date(html)
         if published:
             header += f"Published: {published}\n"
+        header += f"Status: {LIFECYCLE_NOTES[doc_config.get('lifecycle', 'current')]}\n"
         header += "\n"
         full_content = header + markdown
 
