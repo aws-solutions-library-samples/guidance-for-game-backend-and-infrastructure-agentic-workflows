@@ -82,6 +82,25 @@ fi
 echo "✅ All required prerequisites met"
 echo ""
 
+# Preflight: install backend dependencies locally, then guard against an
+# unbootable long-path runtime BEFORE any AWS-mutating command runs (#517).
+#
+# `agentcore launch` (Step 2) packages this venv's console scripts into
+# dependencies.zip. When the venv interpreter path is over the uv shebang byte
+# limit or contains a space, uv emits a /bin/sh trampoline embedding the
+# absolute local path instead of a portable shebang, producing a runtime that
+# dies at exec — silently, because deploy still exits 0 and the control plane
+# reaches READY. Running the check here, right after local `uv sync` and before
+# Step 0.5 (the first `aws cloudformation deploy`), means a doomed deploy fails
+# fast with a clear remediation and leaves zero AWS side effects behind.
+echo "📦 Preflight: Installing backend dependencies..."
+(cd "$PROJECT_ROOT/backend" && uv sync > /dev/null 2>&1)
+echo "🔎 Preflight: Verifying the runtime interpreter path is bootable..."
+uv run --project "$PROJECT_ROOT/backend" python \
+  "$SCRIPT_DIR/infrastructure/check_runtime_path.py" --backend-dir "$PROJECT_ROOT/backend"
+echo "✅ Runtime interpreter path is portable"
+echo ""
+
 # Step 0: Download KB documentation
 echo "📥 Step 0: Downloading KB documentation..."
 bash "$SCRIPT_DIR/infrastructure/download-kb-docs.sh"
@@ -180,7 +199,9 @@ echo ""
 echo "🤖 Step 2: Launching AgentCore Runtime..."
 cd "$PROJECT_ROOT/backend"
 
-# Ensure backend dependencies (including agentcore CLI) are installed
+# Ensure backend dependencies (including agentcore CLI) are installed.
+# The preflight already synced and verified the venv is bootable (#517); this
+# re-sync is idempotent and keeps Step 2 self-contained.
 echo "📦 Installing backend dependencies..."
 uv sync > /dev/null 2>&1
 
