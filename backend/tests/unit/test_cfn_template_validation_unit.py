@@ -229,3 +229,36 @@ def test_tool_client_failure_is_sanitized():
         result = validate_cloudformation_template(VALID)
     assert result["status"] == "incomplete"
     assert "example.invalid" not in json.dumps(result)
+
+
+def test_getatt_of_a_declared_attribute_is_valid():
+    template = VALID + "Outputs:\n  FleetId:\n    Value: !GetAtt Fleet.FleetId\n"
+    assert validate_template_text(template, _client())["status"] == "valid"
+
+
+def test_getatt_of_a_missing_attribute_is_reported_with_allowed_names():
+    template = VALID + "Outputs:\n  FleetName:\n    Value: !GetAtt Fleet.Name\n"
+    result = validate_template_text(template, _client())
+    assert result["status"] == "invalid"
+    (problem,) = result["problems"]
+    assert problem["problem"] == "unknown_getatt_attribute"
+    assert problem["resource"] == "FleetName"
+    assert "GetAtt Fleet.Name" in problem["path"]
+    assert problem["allowed"] == ["FleetId"]
+
+
+def test_getatt_long_form_inside_resources_is_checked():
+    template = VALID.replace("InstanceType: c6i.large", 'InstanceType: {"Fn::GetAtt": ["Fleet", "Bogus"]}')
+    result = validate_template_text(template, _client())
+    assert {p["problem"] for p in result["problems"]} == {"unknown_getatt_attribute"}
+
+
+def test_getatt_to_undeclared_resource_is_left_to_validate_template():
+    # VALID references Role, which the template does not declare; ValidateTemplate owns that error.
+    assert validate_template_text(VALID, _client())["problems"] == []
+
+
+def test_getatt_is_not_checked_when_schema_declares_no_attributes():
+    schema = {key: value for key, value in FLEET_SCHEMA.items() if key != "readOnlyProperties"}
+    template = VALID + "Outputs:\n  X:\n    Value: !GetAtt Fleet.Anything\n"
+    assert validate_template_text(template, _client(schema=schema))["status"] == "valid"

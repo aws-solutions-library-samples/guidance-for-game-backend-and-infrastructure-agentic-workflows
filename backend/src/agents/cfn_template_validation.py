@@ -51,6 +51,7 @@ PROBLEM_READ_ONLY = "read_only_property"
 PROBLEM_INVALID_VALUE = "invalid_enum_value"
 PROBLEM_WRONG_SHAPE = "wrong_value_shape"
 PROBLEM_UNKNOWN_TYPE = "unknown_resource_type"
+PROBLEM_UNKNOWN_ATTRIBUTE = "unknown_getatt_attribute"
 
 _RESOURCE_TYPE_RE = re.compile(r"^AWS::[A-Za-z0-9]+::[A-Za-z0-9]+$")
 _SAFE_TEXT_RE = re.compile(r"[^A-Za-z0-9 _.,:;()\[\]{}'\"/=<>+*#|-]")
@@ -214,6 +215,34 @@ def _check_resource(schema: dict[str, Any], logical_id: str, properties: Any, ou
     _check_value(schema, root, properties, logical_id, "", out)
 
 
+def _collect_getatts(node: Any, path: str, found: list[tuple[str, str, str]], depth: int = 0) -> None:
+    """Collect (location, target logical ID, attribute) for every literal Fn::GetAtt."""
+    if depth > 40 or len(found) >= 500:
+        return
+    if isinstance(node, dict):
+        getatt = node.get("Fn::GetAtt") if len(node) == 1 else None
+        if isinstance(getatt, list) and len(getatt) == 2 and all(isinstance(part, str) for part in getatt):
+            found.append((path, getatt[0], getatt[1]))
+            return
+        for key, child in node.items():
+            _collect_getatts(child, f"{path}.{key}" if path else str(key), found, depth + 1)
+    elif isinstance(node, list):
+        for index, child in enumerate(node):
+            _collect_getatts(child, f"{path}[{index}]", found, depth + 1)
+
+
+def _getatt_attributes(schema: dict[str, Any]) -> set[str] | None:
+    """Attributes Fn::GetAtt can return: the schema's read-only properties, dotted."""
+    pointers = schema.get("readOnlyProperties")
+    if not isinstance(pointers, list) or not pointers:
+        return None  # Schema does not declare attributes; do not guess.
+    return {
+        pointer[len("/properties/") :].replace("/", ".")
+        for pointer in pointers
+        if isinstance(pointer, str) and pointer.startswith("/properties/")
+    }
+
+
 def _get_schema(client: Any, type_name: str) -> dict[str, Any]:
     with _schema_lock:
         cached = _schema_cache.get(type_name)
@@ -266,6 +295,7 @@ def validate_template_text(template: str, client: Any) -> dict[str, Any]:
     checked: list[str] = []
     unchecked: list[str] = []
     by_type: dict[str, list[tuple[str, Any]]] = {}
+    schemas: dict[str, dict[str, Any]] = {}
     for logical_id, resource in resources.items():
         if not isinstance(resource, dict):
             out.add(str(logical_id), "", PROBLEM_WRONG_SHAPE)
@@ -294,8 +324,23 @@ def validate_template_text(template: str, client: Any) -> dict[str, Any]:
                 unchecked.append(type_name)
             continue
         checked.append(type_name)
+        schemas[type_name] = schema
         for logical_id, properties in entries:
             _check_resource(schema, logical_id, properties, out)
+
+    # Fn::GetAtt attributes must exist on the target resource type. ValidateTemplate
+    # checks that the target resource exists, not that the attribute does.
+    getatts: list[tuple[str, str, str]] = []
+    for section in ("Resources", "Outputs"):
+        _collect_getatts(parsed.get(section), section, getatts)
+    for location, target, attribute in getatts:
+        target_resource = resources.get(target)
+        target_type = target_resource.get("Type") if isinstance(target_resource, dict) else None
+        schema = schemas.get(target_type) if isinstance(target_type, str) else None
+        attributes = _getatt_attributes(schema) if schema else None
+        if attributes is not None and attribute not in attributes:
+            owner = location.split(".", 2)[1] if location.count(".") >= 1 else location
+            out.add(owner, f"{location} (GetAtt {target}.{attribute})", PROBLEM_UNKNOWN_ATTRIBUTE, list(attributes))
 
     result["problems"] = out.problems
     result["checkedResourceTypes"] = checked
