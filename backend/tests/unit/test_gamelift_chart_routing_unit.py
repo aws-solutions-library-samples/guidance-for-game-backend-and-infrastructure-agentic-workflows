@@ -56,9 +56,15 @@ class TestRoutingRegistrationCompatibility:
         assert kwargs["service_name"] == "GameLift"
         registered = kwargs["additional_tools"]
         names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
-        for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
+        for name in (
+            "list_gamelift_fleets",
+            "get_fleet_utilization",
+            "get_fleet_capacity",
+            "get_scaling_policies",
+            "validate_cloudformation_template",
+        ):
             assert name in names, f"{name} missing from the tools passed to the factory"
-        assert len(registered) == 4
+        assert len(registered) == 5
         # The canonical collection is what the runtime is built from.
         assert kwargs["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
 
@@ -75,7 +81,7 @@ class TestRoutingRegistrationCompatibility:
 
         _, kwargs = fake_factory.call_args
         observed = kwargs["additional_tools"]
-        assert len(observed) == 3
+        assert len(observed) == len(gls.GAMELIFT_AGENT_TOOLS) - 1
         dropped_name = getattr(
             gls.GAMELIFT_AGENT_TOOLS[-1], "__name__", getattr(gls.GAMELIFT_AGENT_TOOLS[-1], "tool_name", None)
         )
@@ -98,7 +104,7 @@ class TestRoutingRegistrationCompatibility:
         assert kwargs["service_name"] == "GameLift"
         assert kwargs["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
 
-    def test_registration_collection_holds_the_four_runtime_tools(self):
+    def test_registration_collection_holds_the_five_runtime_tools(self):
         # Model access is controlled by the exact tool collection passed to
         # create_specialist_agent, NOT by __all__.
         # Local modules
@@ -106,9 +112,15 @@ class TestRoutingRegistrationCompatibility:
 
         registered = gls.GAMELIFT_AGENT_TOOLS
         names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
-        for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
+        for name in (
+            "list_gamelift_fleets",
+            "get_fleet_utilization",
+            "get_fleet_capacity",
+            "get_scaling_policies",
+            "validate_cloudformation_template",
+        ):
             assert name in names, f"{name} missing from GAMELIFT_AGENT_TOOLS (runtime registration contract)"
-        assert len(registered) == 4
+        assert len(registered) == 5
 
     def test_projected_field_names_the_router_and_charts_depend_on_are_stable(self):
         # These operational field names are the axis/series source for charts and

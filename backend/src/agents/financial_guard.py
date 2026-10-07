@@ -73,7 +73,16 @@ _CODE_AMOUNT_RE = re.compile(
 # Explicit currency words require an adjacent value; a bare discussion of
 # "dollars" or "yen" is not itself a financial figure.
 _CURRENCY_WORD = r"dollars?|cents?|euros?|yen"
-_MONEY_NUMBER = r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)" r"(?![A-Za-z0-9]|,\d|\.\d|\s*%)"
+# A number followed by a time or data-size unit ("200 ms", "60 seconds",
+# "4 GiB") is a duration or capacity, never a monetary value. Without this,
+# operational prose such as "balance latency and availability (200 ms)" or
+# "load balancing keeps p99 under 120 ms" was withheld as financial content.
+_NON_MONETARY_UNIT = (
+    r"ms|milliseconds?|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|" r"KiB|MiB|GiB|TiB|KB|MB|GB|TB|vCPUs?"
+)
+_MONEY_NUMBER = (
+    r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)" rf"(?![A-Za-z0-9]|,\d|\.\d|\s*%|\s+(?:{_NON_MONETARY_UNIT})\b)"
+)
 _CURRENCY_WORD_AMOUNT_RE = re.compile(
     rf"(?:\b(?:{_CURRENCY_WORD})\b[^\n]{{0,20}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,20}}\b(?:{_CURRENCY_WORD})\b)",
@@ -144,6 +153,38 @@ _SHELL_LINE_RE = re.compile(r"^.*\b(?:awk|bash|printf|sed|xargs)\b.*$", re.IGNOR
 # financial vocabulary in ordinary prose (for example, an "AWS Costs" capability
 # bullet followed by a Python 3 tutorial URL). URLs are references, not claims.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# Markdown ordered-list markers ("6. ", "2) ") are numbering, not values. Left in
+# place, "6. **Rollback thresholds** — placement success rate" read as the value
+# 6 next to "rate". Only a marker at the start of a line is neutralized, so any
+# amount later on the line ("1. Monthly cost: $5") is still detected.
+_LIST_MARKER_RE = re.compile(r"^(\s*)\d{1,3}[.)][ \t]+", re.MULTILINE)
+# The GameLift queue enum value COST as a bare YAML list item
+# (PriorityConfiguration.PriorityOrder: [LATENCY, COST, DESTINATION, LOCATION]).
+# On its own line it looks like a "Cost" label and was linked to unrelated
+# numbers below it (PlayerLatencyPolicies milliseconds), withholding valid
+# templates. Only the exact uppercase enum alone on a list line is neutralized;
+# "- COST: 5", "- Cost", and any currency symbol or code are still detected.
+_PRIORITY_ENUM_RE = re.compile(r"^([ \t]*-[ \t]*)COST[ \t]*$", re.MULTILINE)
+# Network ports ("port 7654", "UDP 7654", "ports 7000-8000", "7654/UDP") are
+# never monetary values. Without this, "error rate and UDP connectivity on port
+# 7654" withheld a migration plan because "rate" sat next to a port number.
+_PORT_NUMBER_RE = re.compile(
+    r"\b(?P<lead>(?:UDP|TCP)[ \t]+(?:ports?[ \t]+)?|ports?[ \t]+)\d{1,5}(?:[ \t]*[-–][ \t]*\d{1,5})?\b"
+    r"|\b\d{1,5}(?:[ \t]*[-–][ \t]*\d{1,5})?/(?P<proto>UDP|TCP)\b",
+    re.IGNORECASE,
+)
+# Operational rate metrics ("error rate", "placement success rate") are not
+# prices. Only these qualified forms are neutralized; a bare "rate" or a
+# "rate: 0.20" label is still detected.
+_OPERATIONAL_RATE_RE = re.compile(
+    r"\b(?:error|success|failure|crash|placement|connection|disconnect|drop|retry|fill|match|"
+    r"tick|frame|packet[- ]loss|request|timeout)[ \t]+rates?\b",
+    re.IGNORECASE,
+)
+
+
+def _neutralize_port(match: re.Match[str]) -> str:
+    return f"{match.group('lead')}PORT" if match.group("lead") else f"PORT/{match.group('proto')}"
 
 
 def _neutralize_shell_positionals(text: str) -> str:
@@ -176,6 +217,10 @@ def contains_unvalidated_financial_content(text: str) -> bool:
         return False
     scannable = _neutralize_shell_positionals(text)
     scannable = _URL_RE.sub("", scannable)
+    scannable = _LIST_MARKER_RE.sub(r"\1- ", scannable)
+    scannable = _PRIORITY_ENUM_RE.sub(r"\1PRIORITY_ENUM", scannable)
+    scannable = _PORT_NUMBER_RE.sub(_neutralize_port, scannable)
+    scannable = _OPERATIONAL_RATE_RE.sub("operational metric", scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)
