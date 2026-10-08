@@ -39,6 +39,13 @@ _COMPOSE_ORDER: tuple[str, ...] = ("gamelift", "eks", "cost")
 _active_capture_id: ContextVar[str | None] = ContextVar("specialist_capture_id", default=None)
 # capture_id -> {normalized_service_name -> (display_service_name, output)}
 _captured_outputs: dict[str, dict[str, tuple[str, str]]] = {}
+# capture_id -> {call_sequence -> (display_service_name, output)}. The sequence
+# is assigned when a specialist call *starts* (begin_specialist_call), so the
+# history is in invocation order no matter which parallel call finishes first.
+# Composition above stays last-write-wins per service; the history exists for
+# artifact relay (agents.iac_relay), which must see every call's answer.
+_call_history: dict[str, dict[int, tuple[str, str]]] = {}
+_next_sequence: dict[str, int] = {}
 _capture_lock = threading.RLock()
 
 
@@ -67,6 +74,8 @@ def begin_specialist_capture() -> SpecialistCapture:
     token = _active_capture_id.set(capture_id)
     with _capture_lock:
         _captured_outputs[capture_id] = {}
+        _call_history[capture_id] = {}
+        _next_sequence[capture_id] = 0
     return SpecialistCapture(capture_id=capture_id, token=token)
 
 
@@ -80,24 +89,61 @@ def finish_specialist_capture(capture: SpecialistCapture) -> list[tuple[str, str
     a :class:`~contextvars.Token` may be reset exactly once — resetting it again
     would raise ``RuntimeError``.
     """
+    return finish_specialist_capture_with_history(capture)[0]
+
+
+def finish_specialist_capture_with_history(
+    capture: SpecialistCapture,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Finish a capture; return composed outputs plus the invocation-ordered history.
+
+    The first element is exactly what :func:`finish_specialist_capture` returns.
+    The second lists one ``(service_name, output)`` per specialist call that
+    returned text, ordered by when each call *started*. Idempotent in the same
+    way as :func:`finish_specialist_capture`.
+    """
     with _capture_lock:
         recorded = _captured_outputs.pop(capture.capture_id, None)
+        calls = _call_history.pop(capture.capture_id, {})
+        _next_sequence.pop(capture.capture_id, None)
     if recorded is None:
         # Already finished (or never began): the token was reset on the first
         # finish and must not be reset again.
-        return []
+        return [], []
     _active_capture_id.reset(capture.token)
-    return [recorded[name] for name in _ordered_services(set(recorded))]
+    composed = [recorded[name] for name in _ordered_services(set(recorded))]
+    history = [calls[sequence] for sequence in sorted(calls) if calls[sequence][1]]
+    return composed, history
 
 
-def record_specialist_output(service_name: str, output: str) -> None:
+def begin_specialist_call(service_name: str) -> int | None:
+    """Reserve the invocation-order slot for one specialist call.
+
+    Call this when a specialist call starts and pass the returned value to
+    :func:`record_specialist_output`. Returns ``None`` when no capture is active.
+    """
+    capture_id = _active_capture_id.get()
+    if not capture_id:
+        return None
+    with _capture_lock:
+        if capture_id not in _next_sequence:
+            return None
+        sequence = _next_sequence[capture_id]
+        _next_sequence[capture_id] = sequence + 1
+        _call_history[capture_id][sequence] = (service_name, "")
+        return sequence
+
+
+def record_specialist_output(service_name: str, output: str, call: int | None = None) -> None:
     """Record one specialist's returned text for the active request, if any.
 
     Keyed by normalized service name with last-write-wins semantics, so a
     duplicate call for the same service overwrites the earlier output and only
     one section per service is composed. A no-op when no capture is active, so
     specialists remain safe to call outside an orchestrated request (e.g. in
-    isolated unit tests).
+    isolated unit tests). When ``call`` is the slot from
+    :func:`begin_specialist_call`, the output is also stored in that call's
+    invocation-order history entry.
     """
     capture_id = _active_capture_id.get()
     if not capture_id:
@@ -106,3 +152,6 @@ def record_specialist_output(service_name: str, output: str) -> None:
         bucket = _captured_outputs.get(capture_id)
         if bucket is not None:
             bucket[_normalize(service_name)] = (service_name, output)
+            calls = _call_history.get(capture_id)
+            if call is not None and calls is not None and call in calls:
+                calls[call] = (service_name, output)

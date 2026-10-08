@@ -31,8 +31,13 @@ from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.financial_guard import contains_unvalidated_financial_content, sanitize_advisory_section
 from agents.gamelift_specialist import gamelift_agent
+from agents.iac_relay import relay_specialist_iac
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
-from agents.specialist_capture import begin_specialist_capture, finish_specialist_capture
+from agents.specialist_capture import (
+    begin_specialist_capture,
+    finish_specialist_capture,
+    finish_specialist_capture_with_history,
+)
 from config.settings import (
     AGENT_MAX_TURNS_ORCHESTRATOR,
     AGENT_TIMEOUT_ORCHESTRATOR_SECONDS,
@@ -412,7 +417,10 @@ def run_orchestrator(query: str, context: dict = None):
                 raise
         else:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
-            specialist_outputs = finish_specialist_capture(specialist_capture)
+            # Composition uses one (latest) output per service; IaC relay sees
+            # every output in call order so a later narrower call (for example a
+            # cutover follow-up) cannot replace the template the first call made.
+            specialist_outputs, specialist_history = finish_specialist_capture_with_history(specialist_capture)
             if authoritative_cost_response is not None:
                 # A cost-report tool produced the authoritative financial section.
                 # Compose it deterministically with any captured GameLift/EKS
@@ -450,7 +458,17 @@ def run_orchestrator(query: str, context: dict = None):
                 if _has_cost_topic(query):
                     response = _COST_ADVISORY_GUIDANCE
                 elif contains_unvalidated_financial_content(str(response)):
-                    response = sanitize_advisory_section("Cost", str(response))
+                    # Withhold the routing model's prose (fail closed), but still
+                    # deliver specialist IaC: each relayed block is checked by the
+                    # same financial guard on its own.
+                    response = relay_specialist_iac(
+                        sanitize_advisory_section("Cost", str(response)), specialist_history
+                    )
+                else:
+                    # Specialist-generated IaC is the authoritative artifact:
+                    # relay it verbatim instead of trusting the routing model to
+                    # re-type (and truncate or paraphrase) a full template.
+                    response = relay_specialist_iac(str(response), specialist_history)
 
         # Extract and save semantic memories for LTM (non-blocking)
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:
