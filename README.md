@@ -483,6 +483,14 @@ The teardown script is idempotent and removes resources in reverse deployment or
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs, suggesting features, and submitting pull requests.
 
+## Releases
+
+Milestone releases are immutable annotated tags published by the manually
+dispatched [`.github/workflows/release.yml`](.github/workflows/release.yml)
+workflow. A release records an exact accepted `main` source state and never
+deploys to AWS. See [docs/RELEASING.md](docs/RELEASING.md) for the release
+policy, evidence-comment format, attached artifacts, and rollback guidance.
+
 ## License
 
 This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
