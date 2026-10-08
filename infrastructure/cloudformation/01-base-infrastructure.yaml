@@ -174,15 +174,26 @@ Resources:
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
-      # Security: Removed FullAccess policies, using scoped read-only where needed
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AWSBillingReadOnlyAccess
-        - arn:aws:iam::aws:policy/AWSCloudFormationReadOnlyAccess
-        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
-        - arn:aws:iam::aws:policy/CloudWatchLogsReadOnlyAccess
-        - arn:aws:iam::aws:policy/CostOptimizationHubReadOnlyAccess
+      # Least privilege (#482): NO account-wide AWS managed read policies.
+      # AWSBillingReadOnlyAccess, AWSCloudFormationReadOnlyAccess,
+      # CloudWatchReadOnlyAccess, CloudWatchLogsReadOnlyAccess, and
+      # CostOptimizationHubReadOnlyAccess were removed — they allowed reading any
+      # log group, stack template/parameter, and metric in the account. Every
+      # action below is rebuilt from a concrete reviewed caller (see SECURITY.md,
+      # "AgentCore Execution Role (Least Privilege)"). Actions a reviewed path
+      # needs but that never worked on the prior role — either no prior policy
+      # granted them (ce:GetUsageForecast, eks:ListInsights/DescribeInsight,
+      # eks-mcpserver:QueryKnowledgeBase, ec2:DescribeRouteTables), or their only
+      # caller was non-functional (the eks-mcp VPC tool shares DescribeRouteTables'
+      # error path, so its ec2:DescribeVpcs/DescribeSubnets reads, granted on the
+      # prior role, ran, but the tool always failed at DescribeRouteTables, so
+      # their results never reached the model) — are NOT added here: that would
+      # expand provider capability (out of scope). Every action that remains had
+      # a caller that worked on the prior role.
       Policies:
-        # Security: Scoped Bedrock access - only invoke models and access knowledge bases
+        # Caller: Strands Bedrock model (models/cached_bedrock.py) for model
+        # invocation + guardrails; kb_tools.py for direct KB retrieve;
+        # optimized_prompts.py for Prompt Management GetPrompt.
         - PolicyName: BedrockScopedAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -203,18 +214,22 @@ Resources:
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
                   # Account-specific application profiles created by profile helpers
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*'
+              # Caller: kb_tools.py bedrock-agent-runtime.retrieve(). Only
+              # Retrieve is called; RetrieveAndGenerate has no caller (and no
+              # resource-type support in SAR), so it is removed.
               - Sid: BedrockKnowledgeBaseAccess
                 Effect: Allow
                 Action:
                   - bedrock:Retrieve
-                  - bedrock:RetrieveAndGenerate
                 Resource:
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+              # Caller: Guardrails applied on model invocation (cached_bedrock.py
+              # sets guardrail_id on the Converse config => ApplyGuardrail only).
+              # GetGuardrail has no caller and is removed.
               - Sid: BedrockGuardrailAccess
                 Effect: Allow
                 Action:
                   - bedrock:ApplyGuardrail
-                  - bedrock:GetGuardrail
                 Resource:
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*'
               - Sid: BedrockPromptManagementAccess
@@ -223,98 +238,143 @@ Resources:
                   - bedrock:GetPrompt
                 Resource:
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/*'
-        # Security: Scoped AgentCore access
+        # Caller: Strands AgentCoreMemorySessionManager (STM session events) and
+        # semantic_memory.py (LTM record write). The frontend invokes the runtime
+        # with a Cognito bearer token over HTTPS (handled by the AgentCore
+        # service), so this role self-invokes nothing: AgentCoreRuntimeAccess
+        # (InvokeAgentRuntime/GetAgentRuntime) had no caller and is removed (the
+        # toolkit reference grants InvokeAgentRuntime only under the A2A protocol,
+        # which this runtime does not use).
         - PolicyName: AgentCoreScopedAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # Least-privilege (#151): scope to Game Agent resources and limit
-              # access to the actions the request path actually needs. Memory/runtime
-              # LIFECYCLE (create/update/delete) belongs to deploy/teardown, not
-              # the runtime role — removed here so a compromised/jailbroken
-              # runtime can't delete its own or another project's memory.
-              - Sid: AgentCoreRuntimeAccess
-                Effect: Allow
-                Action:
-                  - bedrock-agentcore:InvokeAgentRuntime
-                  - bedrock-agentcore:GetAgentRuntime
-                Resource:
-                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/gameagent*'
+              # Least-privilege (#151, #482): scope to Game Agent memory and the
+              # exact actions the session manager + semantic memory call. Memory
+              # record LIFECYCLE (create/update/delete memory) stays out, so a
+              # compromised runtime cannot create or destroy a memory resource, and
+              # memory RECORDS cannot be deleted (no DeleteMemoryRecord /
+              # BatchDeleteMemoryRecords). The session manager does delete session
+              # EVENTS (DeleteEvent) when it replaces a message or migrates legacy
+              # events, but only within this project's own gameagent* memory.
+              # GetMemory, ListMemories, ListActors, ListSessions,
+              # BatchUpdateMemoryRecords, GetMemoryRecord, and ListMemoryRecords had
+              # no reviewed caller and are removed.
               - Sid: AgentCoreMemoryAccess
                 Effect: Allow
                 Action:
-                  # Read own memory config
-                  - bedrock-agentcore:GetMemory
-                  - bedrock-agentcore:ListMemories
-                  # Memory record operations (LTM read + write; NO delete)
-                  - bedrock-agentcore:BatchCreateMemoryRecords
-                  - bedrock-agentcore:BatchUpdateMemoryRecords
-                  - bedrock-agentcore:GetMemoryRecord
-                  - bedrock-agentcore:ListMemoryRecords
-                  - bedrock-agentcore:RetrieveMemoryRecords
-                  # Event operations (STM session memory — the strands session
-                  # manager creates/lists/deletes events within a session)
+                  # STM session memory: the strands session manager
+                  # creates/reads/lists/prunes events within a session.
                   - bedrock-agentcore:CreateEvent
                   - bedrock-agentcore:GetEvent
-                  - bedrock-agentcore:DeleteEvent
                   - bedrock-agentcore:ListEvents
-                  # Session and actor enumeration
-                  - bedrock-agentcore:ListActors
-                  - bedrock-agentcore:ListSessions
+                  - bedrock-agentcore:DeleteEvent
+                  # LTM: retrieve (retrieve_customer_context) + write
+                  # (semantic_memory.py batch_create_memory_records). NO delete.
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:BatchCreateMemoryRecords
                 Resource:
                   - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/gameagent*'
-        # Security: Scoped service access for MCP servers
+        # Caller: Cost specialist (owned deterministic report + Billing MCP
+        # forecast/recommendation tools), GameLift/EKS specialists, and the
+        # eks-mcp VPC/metrics tools. CloudControl (legacy ccapi, replaced in #92)
+        # and all unreviewed collection reads were removed.
         - PolicyName: AgentCoreServiceAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # Caller: owned deterministic report (ce:GetCostAndUsage,
+              # cost_report.py) + Billing MCP cost-explorer forecast tool
+              # (getCostForecast). The Service Authorization Reference operation
+              # table lists aws-portal:ViewBilling as a dependent action of each
+              # Cost Explorer read, so it is granted explicitly (it was previously
+              # supplied only by the now-removed AWSBillingReadOnlyAccess managed
+              # policy). ce:GetUsageForecast was granted by no policy on the prior
+              # role, so usage forecasts never worked; it is NOT added here (that
+              # would expand provider capability — see SECURITY.md pre-existing
+              # gaps). Account-scoped exception: Cost Explorer uses the global
+              # us-east-1 endpoint, so NO aws:RequestedRegion condition is applied
+              # (and SAR exposes only an optional billingview resource, not a
+              # per-report ARN). Historical Billing reads (GetTags/GetAnomalies/
+              # GetUsageReport) were removed — they leave the reviewed
+              # deterministic-report surface.
               - Sid: CostExplorerReadAccess
                 Effect: Allow
                 Action:
-                  - ce:GetCostForecast
                   - ce:GetCostAndUsage
-                  - ce:GetTags
-                  - ce:GetAnomalies
-                  - ce:GetUsageReport
+                  - ce:GetCostForecast
+                  - aws-portal:ViewBilling
                 Resource: '*'
-              - Sid: CloudControlReadAccess
+              # Caller: Billing MCP cost-optimization tool. Global service;
+              # SAR exposes no resource types and no dependent actions.
+              - Sid: CostOptimizationHubReadAccess
                 Effect: Allow
                 Action:
-                  - cloudcontrol:ListResources
-                  - cloudcontrol:GetResource
+                  - cost-optimization-hub:ListRecommendationSummaries
+                  - cost-optimization-hub:ListRecommendations
+                  - cost-optimization-hub:GetRecommendation
+                Resource: '*'
+              # Caller: Billing MCP compute-optimizer tool. Only the EC2 and Auto
+              # Scaling rightsizing operations are on the reviewed surface; EBS and
+              # Lambda rightsizing never worked on the previous role (their
+              # dependent reads were never granted) and are left off to avoid
+              # expanding provider capability. Compute Optimizer is a regional
+              # service, so Resource '*' is region-conditioned (unlike the global
+              # Cost Explorer and Cost Optimization Hub endpoints above). The
+              # Service Authorization Reference operation table and the Compute
+              # Optimizer IAM user guide list ec2:DescribeInstances and the Auto
+              # Scaling describes as dependent reads; they are granted below with
+              # the other region-conditioned EC2/Auto Scaling collection reads.
+              - Sid: ComputeOptimizerReadAccess
+                Effect: Allow
+                Action:
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
                 Resource: '*'
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
+              # Caller: Compute Optimizer dependent reads (above). Auto Scaling has
+              # no scopable resource type for these describes, so Resource '*' is
+              # region-conditioned.
+              - Sid: AutoScalingReadAccess
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              # Caller: GameLift specialist (gamelift_specialist.py). Exactly the
+              # ten reviewed operations; every other GameLift read was removed.
+              # Account-scoped exception: collection and capacity reads do not
+              # support fleet-ARN scoping, so Resource '*' is region-conditioned
+              # instead.
               - Sid: GameLiftReadAccess
                 Effect: Allow
                 Action:
-                  - gamelift:DescribeContainerFleet
-                  - gamelift:DescribeContainerGroupDefinition
+                  - gamelift:ListFleets
                   - gamelift:DescribeFleetAttributes
-                  - gamelift:DescribeFleetCapacity
-                  - gamelift:DescribeFleetDeployment
-                  - gamelift:DescribeFleetEvents
-                  - gamelift:DescribeFleetPortSettings
-                  - gamelift:DescribeFleetUtilization
-                  - gamelift:DescribeGameSessions
-                  - gamelift:DescribeInstances
-                  - gamelift:DescribePlayerSessions
-                  - gamelift:DescribeRuntimeConfiguration
-                  - gamelift:DescribeScalingPolicies
                   - gamelift:ListContainerFleets
                   - gamelift:ListContainerGroupDefinitions
+                  - gamelift:DescribeContainerFleet
+                  - gamelift:DescribeContainerGroupDefinition
                   - gamelift:ListFleetDeployments
-                  - gamelift:ListFleets
-                  - gamelift:ListAliases
-                  - gamelift:ListBuilds
-                  - gamelift:ListScripts
-                  - gamelift:ListGameServers
-                  - gamelift:DescribeGameServer
+                  - gamelift:DescribeFleetUtilization
+                  - gamelift:DescribeFleetCapacity
+                  - gamelift:DescribeScalingPolicies
                 Resource: '*'
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
+              # Caller: aws-api-mcp call_aws eks verb table (eks_mcp_guard.py) +
+              # eks-mcp DescribeCluster. IdentityProviderConfig reads and
+              # AccessKubernetesApi were removed (no caller; k8s API access via the
+              # MCP uses an STS presigned GetCallerIdentity token, which needs no
+              # IAM action). Account-scoped exception: ListClusters has no resource
+              # type and cluster names are dynamic, so Resource '*' is
+              # region-conditioned.
               - Sid: EKSReadAccess
                 Effect: Allow
                 Action:
@@ -326,63 +386,57 @@ Resources:
                   - eks:DescribeFargateProfile
                   - eks:ListAddons
                   - eks:DescribeAddon
-                  - eks:ListIdentityProviderConfigs
-                  - eks:DescribeIdentityProviderConfig
-                  - eks:AccessKubernetesApi
                 Resource: '*'
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
+              # Caller: Compute Optimizer's ec2:DescribeInstances dependent read
+              # (GetEC2InstanceRecommendations, above). EC2 describes have no
+              # resource-type support (SAR), so Resource '*' is region-conditioned.
+              # The eks-mcp get_eks_vpc_config tool (DescribeVpcs/DescribeSubnets/
+              # DescribeRouteTables) is wholly non-functional on this role —
+              # ec2:DescribeRouteTables shares its error path and was never granted
+              # — so DescribeVpcs/DescribeSubnets had no working caller and were
+              # removed (see SECURITY.md pre-existing gaps). DescribeSecurityGroups/
+              # NetworkInterfaces were likewise removed (no caller).
               - Sid: EC2ReadAccess
                 Effect: Allow
                 Action:
                   - ec2:DescribeInstances
-                  - ec2:DescribeSecurityGroups
-                  - ec2:DescribeNetworkInterfaces
-                  - ec2:DescribeSubnets
-                  - ec2:DescribeVpcs
                 Resource: '*'
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
-              - Sid: ECRReadAccess
+              # Caller: container-mode runtime image pull (AgentCore toolkit
+              # reference execution_role_policy.json.j2). direct_code_deploy does
+              # not pull an image, but the toolkit prints a warning and continues
+              # with container deployment when zip is missing (native-Windows
+              # path), so the pull grant is retained — scoped to the
+              # toolkit-created runtime repository.
+              # DescribeRepositories/ListImages had no caller and were removed.
+              - Sid: ECRImageAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-agentcore-gameagentruntime'
+              # ecr:GetAuthorizationToken has no resource-type support (SAR), so it
+              # must be granted on '*'. Scoped by the account's own registry and
+              # constrained to the deployment region.
+              - Sid: ECRTokenAccess
                 Effect: Allow
                 Action:
                   - ecr:GetAuthorizationToken
-                  - ecr:BatchCheckLayerAvailability
-                  - ecr:GetDownloadUrlForLayer
-                  - ecr:BatchGetImage
-                  - ecr:DescribeRepositories
-                  - ecr:ListImages
                 Resource: '*'
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
-              - Sid: BudgetsReadAccess
-                Effect: Allow
-                Action:
-                  - budgets:ViewBudget
-                  - budgets:DescribeBudgets
-                Resource:
-                  - !Sub 'arn:aws:budgets::${AWS::AccountId}:budget/*'
-              - Sid: ComputeOptimizerReadAccess
-                Effect: Allow
-                Action:
-                  - compute-optimizer:GetEC2InstanceRecommendations
-                  - compute-optimizer:GetLambdaFunctionRecommendations
-                  - compute-optimizer:GetEBSVolumeRecommendations
-                  - compute-optimizer:GetAutoScalingGroupRecommendations
-                Resource: '*'
-              - Sid: MiscReadAccess
-                Effect: Allow
-                Action:
-                  - s3:GetStorageLensConfiguration
-                  - freetier:GetFreeTierUsage
-                  - pricing:DescribeServices
-                  - pricing:GetAttributeValues
-                  - pricing:GetProducts
-                Resource: '*'
-        # Security: Scoped logging access
+        # Caller: runtime log emission + ADOT/X-Ray tracing + eks-mcp metrics
+        # (AgentCore toolkit reference execution_role_policy.json.j2 and
+        # CloudWatchHandler.get_cloudwatch_metrics). No runtime path reads log
+        # CONTENT, so logs:GetLogEvents was removed entirely.
         - PolicyName: ObservabilityAccess
           PolicyDocument:
             Version: '2012-10-17'
@@ -399,25 +453,52 @@ Resources:
                   - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*'
                   - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/spans/*'
                   - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/spans/*:*'
-              - Sid: CloudWatchLogsRead
+              # Stream metadata (NOT content) scoped to this runtime's own log
+              # group. The runtime group is
+              # /aws/bedrock-agentcore/runtimes/gameagentruntime-<id>-DEFAULT, so
+              # the pattern is restricted to runtimes/gameagentruntime-* (not every
+              # /aws/bedrock-agentcore/* group in the account).
+              - Sid: CloudWatchLogsDescribeStreams
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/gameagentruntime-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/gameagentruntime-*:*'
+              # Account-scoped exception: logs:DescribeLogGroups returns only group
+              # METADATA (names/ARNs), never log content, and the AgentCore toolkit
+              # reference grants it on log-group:* for group discovery. This is the
+              # ONLY log read allowed on the account-wide resource.
+              - Sid: CloudWatchLogsDescribeGroups
                 Effect: Allow
                 Action:
                   - logs:DescribeLogGroups
-                  - logs:DescribeLogStreams
-                  - logs:GetLogEvents
                 Resource:
                   - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              # Caller: eks-mcp get_cloudwatch_metrics
+              # (CloudWatchHandler.get_cloudwatch_metrics => GetMetricData).
+              # GetMetricData has no scopable resource (SAR). The only caller runs
+              # in the deployment region, so Resource '*' is region-conditioned.
+              # GetMetricStatistics/ListMetrics had no caller and were removed.
               - Sid: CloudWatchMetricsRead
                 Effect: Allow
                 Action:
-                  - cloudwatch:GetMetricStatistics
-                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricData
                 Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              # Caller: ADOT/X-Ray tracing (toolkit reference). GetSamplingRules/
+              # GetSamplingTargets were previously supplied only via
+              # CloudWatchReadOnlyAccess (now removed) and are made explicit so the
+              # sampler keeps working. None support a scopable resource (SAR).
               - Sid: XRayTracing
                 Effect: Allow
                 Action:
                   - xray:PutTraceSegments
                   - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
                 Resource: '*'
         # Security: Scoped shared cost report snapshot store access (#365)
         # Least-privilege: only GetItem/PutItem on this project's snapshot table.
