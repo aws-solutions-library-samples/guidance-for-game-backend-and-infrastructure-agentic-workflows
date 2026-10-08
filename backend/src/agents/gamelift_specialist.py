@@ -15,6 +15,7 @@ from strands import tool
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.cfn_template_validation import validate_template_text
 from agents.gamelift_projections import (
     GAMELIFT_MAX_PROJECTED_ITEMS,
     error_result,
@@ -34,6 +35,7 @@ __all__ = [
     "get_fleet_utilization",
     "get_scaling_policies",
     "list_gamelift_fleets",
+    "validate_cloudformation_template",
 ]
 
 # ============================================================================
@@ -350,6 +352,38 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
     return project_scaling_policies(response)
 
 
+@tool
+def validate_cloudformation_template(template: str) -> dict:  # type: ignore
+    """Check an untrusted CloudFormation draft before you return it. Read-only; creates nothing.
+
+    Pass the complete template text (YAML or JSON). Reports four checks
+    separately: safe parsing (syntax), CloudFormation ValidateTemplate, the live
+    registry schema for every AWS:: resource (property names with the allowed
+    names, required and read-only properties, enum values, value shapes, GetAtt
+    attributes), and product policy (deprecated shapes, literal account IDs,
+    open ingress, literal IPs). ``status`` is valid, invalid, or incomplete (a
+    check could not run; never treat that as valid). Fix every reported problem
+    and validate again. Even a valid draft is untrusted and not applied; tell
+    the user which checks passed and what ``notValidated`` lists.
+    """
+    try:
+        client = boto3.client("cloudformation", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+    except Exception as e:
+        log_sanitized_failure("validate_cloudformation_template", uuid.uuid4().hex, e)
+        return validate_template_text(template, _UnavailableCloudFormation())
+    return validate_template_text(template, client)
+
+
+class _UnavailableCloudFormation:
+    """Stand-in client when one cannot be built: every provider check is unavailable."""
+
+    def validate_template(self, **_kwargs: Any) -> None:
+        raise RuntimeError("cloudformation client unavailable")
+
+    def describe_type(self, **_kwargs: Any) -> None:
+        raise RuntimeError("cloudformation client unavailable")
+
+
 # ============================================================================
 # GameLift Agent (using factory pattern)
 # ============================================================================
@@ -364,6 +398,7 @@ GAMELIFT_AGENT_TOOLS = [
     get_fleet_utilization,
     get_fleet_capacity,
     get_scaling_policies,
+    validate_cloudformation_template,
 ]
 
 
