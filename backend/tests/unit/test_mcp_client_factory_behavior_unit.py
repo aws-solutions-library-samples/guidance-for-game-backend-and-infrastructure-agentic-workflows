@@ -445,15 +445,18 @@ class TestEksProviderErrorLogSuppression:
 
     @patch("utils.mcp_client_factory.stdio_client")
     @patch("utils.mcp_client_factory.MCPClient")
-    def test_billing_server_is_not_affected_by_eks_suppression(self, mock_mcp_client, mock_stdio):
+    def test_billing_server_subprocess_logging_is_pinned_above_error(self, mock_mcp_client, mock_stdio):
         mock_mcp_client.side_effect = lambda factory: factory() or Mock()
         create_mcp_client("billing-cost-management-mcp-server")
         env = mock_stdio.call_args[0][0].env
-        # Billing keeps its own FASTMCP_LOG_FILE and is not force-silenced by the
-        # EKS boundary (no CRITICAL override, no LOGURU_LEVEL override).
-        assert env.get("FASTMCP_LOG_LEVEL") != "CRITICAL"
-        assert "LOGURU_LEVEL" not in env
+        # The Billing subprocess is pinned above ERROR on both its loguru sinks
+        # so it never emits provider-authored error bodies, while keeping its own
+        # relocated FASTMCP_LOG_FILE. It is NOT routed through the EKS boundary's
+        # discarding errlog sink (that remains EKS-only).
+        assert env["FASTMCP_LOG_LEVEL"] == "CRITICAL"
+        assert env["LOGURU_LEVEL"] == "CRITICAL"
         assert env["FASTMCP_LOG_FILE"].endswith("billing-cost-management-mcp-server.log")
+        assert "billing-cost-mcp" in env["FASTMCP_LOG_FILE"]
 
 
 class TestEksTransportErrlogSink:

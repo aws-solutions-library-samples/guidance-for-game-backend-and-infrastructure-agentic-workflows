@@ -264,9 +264,9 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
             # subprocesses to a level ABOVE ERROR so provider-authored error text
             # is never emitted. This is a log-verbosity setting only: it does NOT
             # touch READ_OPERATIONS_ONLY, auth, or any behavior, and it is scoped
-            # by server name so Billing (which owns its own FASTMCP_LOG_FILE) is
-            # unaffected. The EKS-owned guard remains the source of typed,
-            # sanitized outcomes the model sees.
+            # by server name; the Billing subprocess receives the same loguru
+            # level pin in its own env block below. The EKS-owned guard remains
+            # the source of typed, sanitized outcomes the model sees.
             if server_name in _EKS_LOG_SUPPRESSED_SERVERS:
                 env["FASTMCP_LOG_LEVEL"] = "CRITICAL"
                 env["LOGURU_LEVEL"] = "CRITICAL"
@@ -289,6 +289,16 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
                 os.makedirs(billing_log_dir, exist_ok=True)
                 env["GBAW_BILLING_MCP_DB_DIR"] = billing_db_dir
                 env["FASTMCP_LOG_FILE"] = os.path.join(billing_log_dir, "billing-cost-management-mcp-server.log")
+                # The Billing MCP server's handlers log raw provider error bodies
+                # (ARNs, account IDs) at INFO/ERROR via loguru on BOTH its stderr
+                # and file sinks, whose level is taken from FASTMCP_LOG_LEVEL.
+                # mcp_wrapper.py forwards the child's stderr to the parent, so
+                # those bodies would reach the runtime's logs. Pin the subprocess
+                # above ERROR so the server never emits provider-authored error
+                # text (issue #465). This is a log-verbosity setting only; it does
+                # not change behavior. LOGURU_LEVEL is set as defense in depth.
+                env["FASTMCP_LOG_LEVEL"] = "CRITICAL"
+                env["LOGURU_LEVEL"] = "CRITICAL"
 
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
             wrapper_path = os.path.join(os.path.dirname(__file__), "mcp_wrapper.py")
