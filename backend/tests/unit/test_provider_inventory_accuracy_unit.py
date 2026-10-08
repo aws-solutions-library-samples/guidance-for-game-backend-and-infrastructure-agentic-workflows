@@ -130,3 +130,152 @@ class TestMalformedDispositionInventoryAccuracy:
         # unconditional guarantee that a reader could read as un-scoped).
         text = _inventory_text().lower()
         assert "final" in text and "serialized" in text
+
+
+class TestBillingMcpMigrationInventoryAccuracy:
+    """Bind the inventory's Billing MCP claims to production behavior (#465).
+
+    The model-visible Billing MCP catalog is exactly three tools and the allowed
+    forecast/optimization operations are projected by code we own. These tests
+    pin the inventory's claims to the guard and projection modules so the
+    document cannot drift from the code.
+    """
+
+    def test_only_three_billing_tools_are_model_visible_in_code(self):
+        # Local modules
+        from agents import cost_mcp_guard as guard
+
+        assert guard._ALLOWED_TOOLS == {"cost-explorer", "compute-optimizer", "cost-optimization"}
+        # Blocked historical ops still carry a get_cost_report redirect.
+        assert "getCostAndUsage" in guard._CE_BLOCKED_OPS
+        assert "getCostAndUsageWithResources" in guard._CE_BLOCKED_OPS
+        assert "get_cost_report" in guard._MSG_BLOCKED_HISTORICAL
+        # AccountId is excluded from the allowed Cost Optimization Hub group_by.
+        assert "AccountId" not in guard._COH_GROUP_BY
+        # Reviewed Compute Optimizer ops are EC2 + Auto Scaling rightsizing only;
+        # EBS and Lambda rightsizing are not model-visible (their dependent read
+        # permissions were never granted to the chat runtime).
+        assert guard._CO_OPS == {
+            "get_ec2_instance_recommendations",
+            "get_auto_scaling_group_recommendations",
+        }
+        assert "get_ebs_volume_recommendations" not in guard._CO_OPS
+        assert "get_lambda_function_recommendations" not in guard._CO_OPS
+
+    def test_inventory_states_compute_optimizer_narrowed_and_region_bound(self):
+        low = _inventory_text().lower()
+        # The doc must reflect the EC2+ASG-only surface and the region binding,
+        # not the earlier "four rightsizing operations" claim.
+        assert "four rightsizing operations" not in low
+        assert "get_ec2_instance_recommendations" in low
+        assert "get_auto_scaling_group_recommendations" in low
+        assert "deployment region" in low
+
+    def test_projection_module_exposes_bounded_projectors(self):
+        # Local modules
+        from agents import cost_projections as proj
+
+        for name in (
+            "project_forecast",
+            "project_compute_optimizer",
+            "project_cost_optimization_recommendations",
+            "project_cost_optimization_summaries",
+            "project_cost_optimization_detail",
+        ):
+            assert hasattr(proj, name)
+        # Finite numeric + aggregate bounds exist.
+        assert proj.MAX_ITEMS > 0 and proj.MAX_ABS_NUMBER > 0
+
+    def test_inventory_states_billing_forecast_optimization_migrated(self):
+        text = _inventory_text()
+        low = text.lower()
+        # The Cost section must no longer call the allowed Billing ops a follow-up.
+        assert "forecast/optimization operations return raw mcp json" not in low
+        assert "migrated" in low
+        # The removed tools (historical-spend bypass risk) are called out.
+        assert "removed" in low
+        assert "no longer model-visible" in low or "dropped from the model-visible catalog" in low
+
+    def test_inventory_removes_billing_from_remaining_followups(self):
+        text = _inventory_text().lower()
+        # The "Remaining" bullet must no longer list Billing forecast/optimization.
+        remaining = text.split("remaining (explicit follow-ups", 1)[-1]
+        assert "no longer a follow-up" in remaining
+
+
+class TestBillingScopedForecastInventoryAccuracy:
+    """Pin the corrected Billing MCP inventory claims to the code they describe
+    (#465): cost-forecast-only with code-owned scope, Hub truncation now
+    flagged, the Compute Optimizer mixed-row wording, the Auto Scaling
+    identifier being a customer-chosen group name, and the IAM narrowing being
+    tracked separately in #482 rather than 'removed by #482'."""
+
+    def test_cost_explorer_surface_is_cost_forecast_only_in_code(self):
+        # Local modules
+        from agents import cost_mcp_guard as guard
+
+        assert guard._CE_FORECAST_OPS == {"getCostForecast"}
+        assert "getUsageForecast" not in guard._CE_FORECAST_OPS
+
+    def test_not_found_error_code_exists(self):
+        # Local modules
+        from agents import cost_projections as proj
+
+        assert proj.ERROR_NOT_FOUND == "not_found"
+
+    def test_per_granularity_forecast_horizon_in_code(self):
+        # Local modules
+        from agents import cost_mcp_guard as guard
+
+        # 3 months DAILY, 18 months MONTHLY (public Cost Explorer API limits).
+        assert guard._MAX_FORECAST_DAYS_DAILY <= 100
+        assert 540 <= guard._MAX_FORECAST_DAYS_MONTHLY <= 560
+        assert guard._MAX_FORECAST_DAYS_MONTHLY > guard._MAX_FORECAST_DAYS_DAILY
+
+    def test_inventory_states_cost_forecast_only_with_scope(self):
+        low = _inventory_text().lower()
+        assert "getusageforecast" in low  # it is explicitly called out as not model-visible
+        assert "only `getcostforecast` is model-visible" in low
+        assert "services" in low and "regions" in low
+        assert "canonical `dimensions`" in low
+
+    def test_inventory_states_hub_truncation_flagged(self):
+        low = _inventory_text().lower()
+        assert "bound + 1" in low
+        assert "never a silent `ok`" in low
+
+    def test_inventory_states_asg_identifier_is_group_name(self):
+        low = _inventory_text().lower()
+        assert "customer-chosen group name" in low
+
+    def test_inventory_tracks_iam_narrowing_separately_not_removed_by_482(self):
+        low = _inventory_text().lower()
+        assert "iam grant removed by #482" not in low
+        assert "tracked separately in #482" in low
+
+
+class TestBillingErrorVocabularyAndProbeRowInventory:
+    """Pin the Cost error-code vocabulary and probe-row disposition in the
+    inventory (#465): the Cost error-code list includes the typed codes
+    data_unavailable and credentials_unavailable, and the Compute Optimizer
+    disposition sentence no longer claims a hard-item-cap `truncated` state that
+    the over-fetch guard path cannot produce from a single probe row."""
+
+    def test_new_typed_error_codes_exist_in_code(self):
+        # Local modules
+        from agents import cost_projections as proj
+
+        assert proj.ERROR_DATA_UNAVAILABLE == "data_unavailable"
+        assert proj.ERROR_CREDENTIALS_UNAVAILABLE == "credentials_unavailable"
+
+    def test_inventory_lists_new_typed_error_codes(self):
+        low = _inventory_text().lower()
+        assert "data_unavailable" in low
+        assert "credentials_unavailable" in low
+
+    def test_inventory_probe_row_sentence_corrected(self):
+        low = _inventory_text().lower()
+        # The old wording claimed a wholly-valid payload bounded only by the hard
+        # item cap yields `truncated`; through the over-fetch guard a single probe
+        # row cannot do that, so the misleading sentence must be gone.
+        assert "a wholly valid payload bounded only by the hard item cap" not in low
