@@ -193,15 +193,22 @@ detail in [`SECURITY.md`](../SECURITY.md#trust-boundaries--data-flow).
 | EoP4 | Agent tool abuse | AI Backend | Tool allowlists, limited read-only capabilities | Deployed |
 
 > **Note on EoP2.** The deployed AgentCore execution role grants only
-> `Describe`/`Get`/`List` provider actions (GameLift, EKS, Cost Explorer,
-> CloudControl read) plus read-plus-append memory access and read/write to the
-> product's *own* cost-snapshot DynamoDB table and log buckets. It grants **no**
-> GameLift/EKS mutation, no `iam:PassRole`, no Step Functions, and no executor
-> role. Provider writes are introduced only by the optional control plane in
-> Part II, behind a **separate** role. This applies the Amazon *Least Privilege
-> Design* best practice (start from zero permissions and add only what a
-> component needs) and *Prevent Privilege Escalation* (no mutating IAM actions,
-> `PassRole` scoped and conditional).
+> `Describe`/`Get`/`List` provider reads (GameLift, EKS, EC2, Auto Scaling,
+> Cost Explorer, Cost Optimization Hub, Compute Optimizer, CloudWatch
+> `GetMetricData`) plus scoped memory access and read/write to the product's
+> *own* cost-snapshot DynamoDB table and log groups. The memory grant creates,
+> reads, lists, and prunes session **events** (the session manager deletes an
+> event only when it replaces a message or migrates a legacy event, and only
+> within this project's own `gameagent*` memory) and creates/retrieves LTM
+> **records**; it cannot create or destroy a memory resource and cannot delete a
+> memory record. After #482 it attaches **no** AWS
+> managed read policies and no account-wide CloudFormation, CloudControl, or
+> log-content reads. It grants **no** GameLift/EKS mutation, no `iam:PassRole`,
+> no Step Functions, and no executor role. Provider writes are introduced only
+> by the optional control plane in Part II, behind a **separate** role. This
+> applies the Amazon *Least Privilege Design* best practice (start from zero
+> permissions and add only what a component needs) and *Prevent Privilege
+> Escalation* (no mutating IAM actions, `PassRole` scoped and conditional).
 
 ---
 

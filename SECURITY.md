@@ -461,13 +461,13 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 |----------|-----------|-----------|---------|
 | **1** | User → ECS Express (ALB) | **Cognito JWT** | HttpOnly/Secure/SameSite cookies; `CognitoJwtVerifier` validates signature, expiration, and audience. Users must be in `admin` or `users` group. |
 | **2** | ECS Express → AgentCore | **Cognito JWT (bearer)** | The proxy forwards the end user's verified Cognito **access token** as an `Authorization: Bearer` header over HTTPS (TLS 1.2+). The AgentCore runtime independently verifies the token and reconstructs authority. No SigV4 and no task-role signing — the bearer token is the credential, so the ECS task role needs no `bedrock-agentcore` grant and has no identity policies. |
-| **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` condition. Read-only for GameLift, EKS, Cost Explorer. Scoped by region. |
+| **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with an `aws:SourceAccount` condition. Rebuilt from reviewed callers (#482): no AWS managed read policies; scoped Bedrock, AgentCore memory, Cost Explorer / Cost Optimization Hub / Compute Optimizer, GameLift, EKS, EC2, ECR, logs, and X-Ray reads. See **AgentCore Execution Role (Least Privilege)** below. |
 | **4** | Prompts → Model | **Bedrock Guardrails** | Input/output content filtering: topic blocking, PII anonymization, prompt injection detection, profanity filtering. |
 
 **Configuration Locations**:
 - Cognito: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 12-73)
 - ECS task role: `infrastructure/cloudformation/01-base-infrastructure.yaml`
-- AgentCore execution role: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 145-399)
+- AgentCore execution role: `infrastructure/cloudformation/01-base-infrastructure.yaml` (`AgentCoreExecutionRole`)
 - Guardrails: `infrastructure/cloudformation/04-bedrock-guardrails.yaml`
 
 ### Data Classification by Stage
@@ -488,6 +488,136 @@ No static credentials (access keys, passwords, tokens) exist in the codebase or 
 - **ECS Express → AgentCore**: the user's verified Cognito access token as a bearer token over HTTPS (no SigV4, no task-role grant). The ECS task role (`ecs-tasks.amazonaws.com`, `aws:SourceAccount` condition) has no identity-based permissions; it exists only so ECS can vend task credentials to the container. The supported chat path's one AWS call, `sts:GetCallerIdentity` (to build the runtime ARN), requires no IAM allow, so no policy is attached. Dormant Cognito Admin/List routes remain intentionally unprivileged pending removal in #473.
 - **AgentCore → AWS Services**: AgentCore execution role (`bedrock-agentcore.amazonaws.com`) with `aws:SourceAccount` condition
 - **MCP Servers**: Run as subprocesses via stdio transport (no network access), inherit the AgentCore execution role credentials
+
+### AgentCore Execution Role (Least Privilege)
+
+Issue #482 rebuilt `AgentCoreExecutionRole` from its reviewed callers upward. It
+attaches **no AWS managed read policies** (the former
+`AWSBillingReadOnlyAccess`, `AWSCloudFormationReadOnlyAccess`,
+`CloudWatchReadOnlyAccess`, `CloudWatchLogsReadOnlyAccess`, and
+`CostOptimizationHubReadOnlyAccess` grants allowed reading any log group, stack
+template/parameter, and metric in the account). Every statement below names a
+concrete caller that worked on the prior role, so the rebuild **adds no net-new
+provider capability** — it only removes, scopes, or makes explicit what the
+managed policies previously supplied implicitly. No runtime path reads log
+**content** or deletes memory **records**; the only provider mutations are the
+scoped memory/event writes (including session-event `DeleteEvent` within this
+project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
+`PutItem`.
+
+| Statement | Actions | Caller | Resource scope |
+|-----------|---------|--------|----------------|
+| BedrockModelInvocation | `bedrock:InvokeModel`, `InvokeModelWithResponseStream` | Strands Bedrock model | foundation-model + account inference-profile ARNs |
+| BedrockKnowledgeBaseAccess | `bedrock:Retrieve` | Knowledge Base RAG (`kb_tools.py`) | `knowledge-base/*` |
+| BedrockGuardrailAccess | `bedrock:ApplyGuardrail` | Guardrails on model invocation | `guardrail/*` |
+| BedrockPromptManagementAccess | `bedrock:GetPrompt` | Managed prompts (`optimized_prompts.py`) | `prompt/*` |
+| AgentCoreMemoryAccess | `bedrock-agentcore:CreateEvent`, `GetEvent`, `ListEvents`, `DeleteEvent`, `RetrieveMemoryRecords`, `BatchCreateMemoryRecords` | Strands session manager (STM events) + `semantic_memory.py` (LTM write/retrieve) | `memory/gameagent*` |
+| CostExplorerReadAccess | `ce:GetCostAndUsage`, `GetCostForecast`, `aws-portal:ViewBilling` | Owned deterministic report + Billing MCP cost forecast | `*` (global endpoint) |
+| CostOptimizationHubReadAccess | `cost-optimization-hub:ListRecommendationSummaries`, `ListRecommendations`, `GetRecommendation` | Billing MCP cost-optimization | `*` (global; no resource type) |
+| ComputeOptimizerReadAccess | `compute-optimizer:GetEC2InstanceRecommendations`, `GetAutoScalingGroupRecommendations` | Billing MCP compute-optimizer (EC2 + Auto Scaling rightsizing) | `*` + `aws:RequestedRegion` (regional service, no resource type) |
+| AutoScalingReadAccess | `autoscaling:DescribeAutoScalingGroups`, `DescribeAutoScalingInstances` | Compute Optimizer Auto Scaling dependent reads | `*` + `aws:RequestedRegion` (no resource type) |
+| GameLiftReadAccess | 10 reviewed `gamelift:List*/Describe*` ops | GameLift specialist | `*` + `aws:RequestedRegion` (no fleet-ARN scoping for collection/capacity reads) |
+| EKSReadAccess | `eks:ListClusters`, `DescribeCluster`, `List/DescribeNodegroup(s)`, `List/DescribeFargateProfile(s)`, `List/DescribeAddon(s)` | aws-api-mcp `call_aws` + eks-mcp | `*` + `aws:RequestedRegion` (dynamic cluster names) |
+| EC2ReadAccess | `ec2:DescribeInstances` | Compute Optimizer EC2 dependent read | `*` + `aws:RequestedRegion` (EC2 describes have no resource type) |
+| ECRImageAccess | `ecr:BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability` | container-mode image pull | `repository/bedrock-agentcore-gameagentruntime` |
+| ECRTokenAccess | `ecr:GetAuthorizationToken` | container-mode registry auth | `*` + `aws:RequestedRegion` (no resource type) |
+| ObservabilityAccess | `logs:CreateLogGroup/CreateLogStream/PutLogEvents`, `DescribeLogStreams` (this runtime's `runtimes/gameagentruntime-*` group only), `DescribeLogGroups` (metadata), `cloudwatch:GetMetricData`, `xray:PutTraceSegments/PutTelemetryRecords/GetSamplingRules/GetSamplingTargets` | Runtime logging, eks-mcp metrics, ADOT/X-Ray | runtime log groups; `DescribeLogStreams` scoped to `runtimes/gameagentruntime-*`; `log-group:*` for `DescribeLogGroups` metadata only; `*` + `aws:RequestedRegion` for GetMetricData; `*` for X-Ray |
+| CostReportSnapshotStoreAccess | `dynamodb:GetItem`, `PutItem` | Shared cost-report snapshot store (#365) | snapshot table ARN |
+
+**Justification for remaining account-scoped (`Resource: '*'`) reads.** Two
+distinct reasons apply, and the role never mixes them silently:
+
+*Actions with no resource-level scoping in the AWS Service Authorization
+Reference, or that address a global endpoint:*
+
+- **Cost Explorer** (`ce:GetCostAndUsage`, `ce:GetCostForecast`, with their
+  dependent `aws-portal:ViewBilling`) and **Cost Optimization Hub** — global
+  us-east-1 endpoints; no `aws:RequestedRegion` condition is applied and the SAR
+  exposes no per-report resource type. `aws-portal:ViewBilling` is listed by the
+  SAR operation table as a dependent action of every Cost Explorer read; it was
+  previously supplied only by the now-removed `AWSBillingReadOnlyAccess` managed
+  policy.
+- **`cloudwatch:GetMetricData`**, **`ecr:GetAuthorizationToken`**, and **X-Ray
+  sampling/put** — no scopable resource type. GetMetricData and the ECR token
+  are additionally constrained with an `aws:RequestedRegion` condition (their
+  only callers run in the deployment region); the ECR token is implicitly scoped
+  to the caller's own registry.
+- **`logs:DescribeLogGroups` on `log-group:*`** — returns only group metadata
+  (names/ARNs), never log content; required by the AgentCore toolkit for group
+  discovery and is the only log read on the account-wide resource.
+- **EC2** `DescribeInstances` — no resource-type support; constrained by an
+  `aws:RequestedRegion` condition.
+- **Compute Optimizer** `GetEC2InstanceRecommendations` /
+  `GetAutoScalingGroupRecommendations` and the **Auto Scaling** describes
+  (`DescribeAutoScalingGroups`, `DescribeAutoScalingInstances`) — no resource
+  types; constrained by an `aws:RequestedRegion` condition.
+
+*Actions that DO support ARNs but use `*` because the resource names are dynamic
+and account-owned, constrained instead by an `aws:RequestedRegion` condition to
+the deployment region:*
+
+- **GameLift** `DescribeContainerFleet`, `DescribeContainerGroupDefinition`, and
+  `DescribeScalingPolicies` support ARNs, but fleet/definition names are created
+  at runtime; the collection and capacity reads (`List*`, `DescribeFleetCapacity`,
+  `DescribeFleetUtilization`) have no ARN scoping at all.
+- **EKS** per-resource reads support an ARN of the matching resource type
+  (`DescribeCluster` a `cluster*` ARN; `DescribeNodegroup`, `DescribeFargateProfile`,
+  and `DescribeAddon` their nodegroup, fargateprofile, and addon ARNs), but those
+  names are dynamic. Among the `List*` reads, only `ListClusters` has no resource
+  type; `ListNodegroups`, `ListFargateProfiles`, and `ListAddons` take a `cluster`
+  ARN but use `*` because cluster names are created at runtime, constrained
+  instead by the `aws:RequestedRegion` condition.
+
+> **Region narrowing (behavior change from the prior role).** On the prior role
+> the Compute Optimizer and Auto Scaling grants carried no region condition (the
+> latter came unconditioned from `CloudWatchReadOnlyAccess`), so a model-supplied
+> `region` could run rightsizing in another region. The reviewed role constrains
+> both to the deployment region, matching the single-region posture of the
+> GameLift and EKS reads. Cross-region rightsizing is no longer available.
+
+**Not granted (pre-existing gaps).** These actions were either never granted on
+the prior role, or had a reviewed caller that never actually worked on it, so
+adding them now would expand provider capability and is out of scope for the
+least-privilege rebuild. Each is tracked as a follow-up, with its runtime
+impact:
+
+- `ce:GetUsageForecast` — the Billing MCP cost-explorer **usage** forecast.
+  `AWSBillingReadOnlyAccess` carried no forecast action, so usage forecasts never
+  worked on the prior role; only cost forecasts (`ce:GetCostForecast`) are
+  granted. Impact: the operation is removed from the model-visible catalog by the
+  Billing MCP guard, and is denied if called.
+- EBS and Lambda rightsizing — the Billing MCP compute-optimizer
+  `GetEBSVolumeRecommendations` / `GetLambdaFunctionRecommendations` operations
+  and their SAR-dependent reads (`ec2:DescribeVolumes`, `lambda:ListFunctions`,
+  `lambda:ListProvisionedConcurrencyConfigs`) never worked. Impact: these two
+  rightsizing categories are off the reviewed surface and are removed from the
+  model-visible catalog by the Billing MCP guard.
+- `eks:ListInsights` / `eks:DescribeInsight` (the EKS insights tool). Impact: an
+  insights request fails with access denied.
+- `eks-mcpserver:QueryKnowledgeBase` (the EKS troubleshooting-guide search tool).
+  Impact: the troubleshooting-guide search returns nothing / fails.
+- `get_eks_vpc_config` (the eks-mcp VPC tool) is **wholly non-functional**: it
+  reads VPCs, subnets, **and** route tables in one error path, and
+  `ec2:DescribeRouteTables` was never granted, so the whole tool always failed.
+  Its `ec2:DescribeVpcs` / `ec2:DescribeSubnets` reads therefore had no working
+  caller and are not granted; restoring the tool needs all three EC2 reads (or a
+  decision to remove the tool). Impact: any VPC-config request fails.
+- `cloudwatch:PutMetricData` (namespace `bedrock-agentcore`) and
+  `logs:PutResourcePolicy` — listed by the AgentCore direct-deploy execution-role
+  documentation but granted by neither the prior nor the reviewed role. Impact:
+  if the platform ever emits these, they would be denied; no reviewed caller
+  needs them today.
+- `compute-optimizer:GetEnrollmentStatus` — the Billing MCP compute-optimizer
+  tool probes it before each operation; neither the prior nor the reviewed role
+  grants it. Impact: the probe is denied and the tool logs the denial and
+  continues (a tolerated, non-fatal denial).
+
+**Container-fallback ECR grant.** The deployed runtime uses AgentCore
+`direct_code_deploy` and pulls no image, but the toolkit prints a warning and
+continues with container deployment when `zip` is unavailable (e.g. the
+native-Windows PowerShell path). The scoped ECR pull/auth grant is retained so
+that fallback keeps working; making the Windows path force `direct_code_deploy`
+would let the grant be dropped later.
 
 ---
 
