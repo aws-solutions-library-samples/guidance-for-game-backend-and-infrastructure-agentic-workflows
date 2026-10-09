@@ -84,7 +84,7 @@ def _observation() -> dict[str, Any]:
 # metadata and separated by " | " so tests can split the message off the prefix
 # exactly as they did for the real sink. A datum only "survives to CloudWatch"
 # if it lands in ``%(message)s`` — a field passed via ``extra`` would render
-# nowhere here, which is precisely the #413 diagnostic loss these tests guard.
+# nowhere here, which is exactly the diagnostic gap these tests guard against.
 _PRODUCTION_STDLIB_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 
 
@@ -375,7 +375,7 @@ def test_get_boundary_logs_and_raises_typed_retryable_error() -> None:
     assert "Traceback (most recent call last)" not in output
 
 
-# --- production-sink survival (the #413 diagnostic loss) ---------------------
+# --- production-sink survival (message-only rendering) ----------------------
 
 
 def test_diagnostic_survives_message_only_production_sink() -> None:

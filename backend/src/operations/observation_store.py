@@ -872,8 +872,7 @@ def _log_store_exception(operation: str, exc: Exception, *, classification: str)
     The fields are embedded directly into a fixed ``key=value`` message string
     rather than passed as ``logging`` args or ``extra``: a Lambda/CloudWatch
     handler renders ``%(message)s`` only, so anything carried in ``extra`` is
-    silently dropped before it reaches CloudWatch (the diagnostic loss #413
-    root-caused). ``exception_type`` is a Python class name and ``operation`` /
+    dropped before it reaches CloudWatch. ``exception_type`` is a Python class name and ``operation`` /
     ``classification`` are static literals we pass, so only the two
     provider-controlled tokens (the AWS error code and each cancellation-reason
     code) are passed through :func:`_safe_token`.
