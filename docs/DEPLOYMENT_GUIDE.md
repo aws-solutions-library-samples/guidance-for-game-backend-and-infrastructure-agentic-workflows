@@ -23,7 +23,7 @@ Before you begin, ensure you have the following installed and configured:
 ### AWS Account Requirements
 
 Your AWS account needs the following:
-- **Bedrock Model Access**: Claude Sonnet 4.6 and Claude Haiku 4.5 enabled in your region
+- **Bedrock Model Access**: Claude Sonnet 5.5 and Claude Haiku 5.5 enabled in your region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
@@ -33,8 +33,8 @@ Your AWS account needs the following:
 2. Navigate to **Model access** in the left sidebar
 3. Click **Manage model access**
 4. Enable:
-   - Anthropic Claude Sonnet 4.6
-   - Anthropic Claude 4.5 Haiku
+   - Anthropic Claude Sonnet 5.5
+   - Anthropic Claude Haiku 5.5
 5. Click **Save changes**
 
 ## Quick Start
@@ -107,8 +107,8 @@ cp ui/.env.local.example ui/.env.local
 
 Edit `ui/.env.local` if you need to customize:
 - `AWS_REGION`: Your deployment region
-- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 4.5)
-- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 4.6)
+- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 5.5)
 - `GBAW_TENANT_ID`: Trusted tenant binding for this deployment (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID`: Trusted workspace binding for this deployment (default: `default-workspace`)
 
@@ -167,7 +167,7 @@ Log in with the admin credentials you created.
 | Frontend | ECS Express (Fargate + ALB) | Web UI with chat interface |
 | Backend | Bedrock AgentCore | AI agents and orchestration |
 | Auth | Cognito | User authentication |
-| AI Models | Bedrock | Claude Haiku 4.5 orchestrator and Claude Sonnet 4.6 specialists |
+| AI Models | Bedrock | Claude Haiku 5.5 orchestrator and Claude Sonnet 5.5 specialists |
 | Knowledge Bases | Bedrock | RAG for GameLift, EKS, Cost |
 | Guardrails | Bedrock | AI safety controls |
 | Observability | CloudWatch | Logging and monitoring |
@@ -212,7 +212,7 @@ aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
   --filter-pattern '"Orchestrator model" || "Specialist model"'
 ```
 
-For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 4.5 for the orchestrator and Sonnet 4.6 for specialists. Response text alone is not sufficient evidence of model or tool selection.
+For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 5.5 for the orchestrator and Sonnet 5.5 for specialists. Response text alone is not sufficient evidence of model or tool selection.
 
 ## Teardown
 
@@ -264,7 +264,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet 4.6 + Haiku 4.5) | $20-630+ | Dominant cost; uses `global.*` cross-region model IDs (~$3/M input, ~$15/M output for Sonnet 4.6; ~$1/M input, ~$5/M output for Haiku 4.5) |
+| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | Dominant cost | Uses `global.*` cross-region model IDs; per-token rates pending confirmation from the [Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/) |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
 | Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
@@ -282,7 +282,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 ### Cost Optimization Tips
 
-- Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
+- Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5. Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
 - Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage — near-zero cost at small scale
 - ECS Fargate scales between 1-4 tasks based on load (configurable via MinTasks/MaxTasks)
 - AgentCore Runtime only charges for active CPU time; memory is billed for full session duration regardless of I/O wait
@@ -294,8 +294,8 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 |----------|----------|---------|-------------|
 | `AWS_REGION` | No | us-west-2 | AWS deployment region |
 | `AWS_PROFILE` | No | default | AWS credentials profile |
-| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Orchestrator model/profile |
-| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-4-6` | All specialist models/profiles |
+| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-5-5` | Orchestrator model/profile |
+| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-5-5` | All specialist models/profiles |
 | `GBAW_BEDROCK_MODEL_ID` | No | unset | Legacy orchestrator alias |
 | `GBAW_BEDROCK_MODEL_ID_SECONDARY` | No | unset | Legacy specialist alias |
 | `GBAW_TENANT_ID` | No | `default-tenant` | Server-side trusted tenant binding |

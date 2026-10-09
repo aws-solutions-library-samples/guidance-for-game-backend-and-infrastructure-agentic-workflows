@@ -14,11 +14,11 @@ fi
 eval "$MODEL_EXPORTS"
 
 ORCHESTRATOR_ID=$(aws bedrock list-inference-profiles --region "$REGION" --type-equals APPLICATION \
-    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Orchestrator-Claude-Haiku-4-5'].inferenceProfileId" \
+    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Orchestrator-Claude-Haiku-5-5'].inferenceProfileId" \
     --output text)
 
 SPECIALIST_ID=$(aws bedrock list-inference-profiles --region "$REGION" --type-equals APPLICATION \
-    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Specialist-Claude-Sonnet-4-6'].inferenceProfileId" \
+    --query "inferenceProfileSummaries[?inferenceProfileName=='GameAgent-Specialist-Claude-Sonnet-5-5'].inferenceProfileId" \
     --output text)
 
 if [ -n "$ORCHESTRATOR_ID" ]; then

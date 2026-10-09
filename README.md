@@ -67,7 +67,7 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 |-------|------------|
 | Frontend | Next.js, TypeScript, CopilotKit, AWS SDK v3 |
 | Backend | Python 3.13, Strands Agents, Bedrock AgentCore SDK |
-| AI Models | Amazon Bedrock (Claude Haiku 4.5 for orchestration, Claude Sonnet 4.6 for specialists) |
+| AI Models | Amazon Bedrock (Claude Haiku 5.5 for orchestration, Claude Sonnet 5.5 for specialists) |
 | MCP Servers | AWS Labs MCP servers (EKS, CCAPI, Cost Explorer) via stdio transport |
 | Authentication | Amazon Cognito with group-based authorization |
 | Infrastructure | AWS CloudFormation, ECS Express (Fargate + ALB), ECR |
@@ -75,7 +75,7 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 
 ### Model strategy and overrides
 
-The orchestrator uses Claude Haiku 4.5 for low-latency routing. GameLift, EKS, and Cost specialists use Claude Sonnet 4.6 for deeper reasoning and client-side tool use. Both roles retain prompt caching, streaming behavior, and Bedrock Guardrails.
+The orchestrator uses Claude Haiku 5.5 for low-latency routing. GameLift, EKS, and Cost specialists use Claude Sonnet 5.5 for deeper reasoning and client-side tool use. Both roles retain prompt caching, streaming behavior, and Bedrock Guardrails.
 
 Override the roles with `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID`. Existing deployments may continue using `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; a non-empty role-based variable takes precedence over its legacy alias, followed by the repository default. Process environment values take precedence over `ui/.env.local`. Foundation, system inference profile, and application inference profile IDs are accepted.
 
@@ -83,18 +83,18 @@ The roles are not a failover order. Botocore adaptive retries apply to both conf
 
 ## Cost
 
-You are responsible for the cost of the AWS services used while running this Guidance. As of August 2026, the cost for running this Guidance with the default settings in the US West (Oregon) Region is approximately **~$752/month** for processing approximately 10,000 agent queries per month.
+You are responsible for the cost of the AWS services used while running this Guidance. As of August 2026, the cost for running this Guidance with the default settings in the US West (Oregon) Region is approximately **~$122/month in fixed and infrastructure services, plus model token usage** for processing approximately 10,000 agent queries per month. The Claude Haiku 5.5 and Claude Sonnet 5.5 per-token rates must be confirmed from the current [Amazon Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/) before the combined monthly total is finalized (see the sample cost table below).
 
 We recommend creating a [Budget](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) through [AWS Cost Explorer](https://aws.amazon.com/aws-cost-management/aws-cost-explorer/) to help manage costs. Prices are subject to change. For full details, refer to the pricing webpage for each AWS service used in this Guidance.
 
 ### Sample Cost Table
 
-The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US West (Oregon) Region (`us-west-2`) for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context, ~8 model turns per query). Token costs shown are at standard (uncached) rates using the default `global.*` cross-region inference model IDs. Prompt caching is enabled by default; cache reads cost 0.1× standard input while cache writes cost 1.25× (5-min TTL). Break-even requires a cache-read share above ~22% of total cached tokens (R/W ratio > 0.28). Minimum cache checkpoint: 1,024 tokens for Claude Sonnet 4.6, 4,096 tokens for Claude Haiku 4.5.
+The following table provides a sample cost breakdown for deploying this Guidance with the default parameters in the US West (Oregon) Region (`us-west-2`) for one month, assuming approximately 10,000 agent queries (each query invokes the Haiku orchestrator and one Sonnet specialist with RAG context, ~8 model turns per query). Token costs use the default `global.*` cross-region inference model IDs; the Claude Haiku 5.5 and Claude Sonnet 5.5 per-token rates are marked as pending confirmation from the current [Amazon Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/). Prompt caching is enabled by default; cache reads cost 0.1× standard input while cache writes cost 1.25× (5-min TTL). Break-even requires a cache-read share above ~22% of total cached tokens (R/W ratio > 0.28). Minimum cache checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5, each supporting a 5-minute or 1-hour TTL (per the Bedrock [prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) supported-models table).
 
 | AWS service | Dimensions | Cost [USD] |
 | ----------- | ------------ | ------------ |
-| Amazon Bedrock (Claude Sonnet 4.6) | 80M input tokens @ $3.00/M + 20M output tokens @ $15.00/M (specialist agents, global cross-region endpoint) | $540.00 |
-| Amazon Bedrock (Claude Haiku 4.5) | 40M input tokens @ $1.00/M + 10M output tokens @ $5.00/M (orchestrator, global cross-region endpoint) | $90.00 |
+| Amazon Bedrock (Claude Sonnet 5.5) | 80M input tokens + 20M output tokens (specialist agents, global cross-region endpoint). Per-token rates pending confirmation from the Bedrock pricing page. | TBD |
+| Amazon Bedrock (Claude Haiku 5.5) | 40M input tokens + 10M output tokens (orchestrator, global cross-region endpoint). Per-token rates pending confirmation from the Bedrock pricing page. | TBD |
 | Amazon ECS (Fargate) | 1 vCPU + 2 GB task. At MinTasks: 1 running 730 hrs/mo = $36.04. Autoscaling may average ~1.3 tasks under moderate load (~950 task-hrs/mo ≈ $47). [Pricing](https://aws.amazon.com/fargate/pricing/) | $36.04 |
 | Amazon Bedrock Guardrails | 10K queries × 4 guarded calls/query × ≤1K input chars + ≤1K output chars = 40K input TU + 40K output TU. Each TU evaluated by: content filters ($0.15/1K) + denied topics ($0.15/1K) + PII ($0.10/1K). Total: (40,000 + 40,000) / 1,000 × ($0.15 + $0.15 + $0.10). [Pricing](https://aws.amazon.com/bedrock/pricing/) | $32.00 |
 | Elastic Load Balancing (ALB) | 1 ALB @ $0.0225/hr × 730 hrs = $16.43 fixed. LCU variable: ~100K requests/mo, 1 new conn/req, 30s duration, 100 KB total request+response data/req, ≤10 listener rules, no mutual TLS. Max LCU dimension is processed bytes (~10 LCU-hrs × $0.008 = $0.08). [Pricing](https://aws.amazon.com/elasticloadbalancing/pricing/) | $16.51 |
@@ -110,9 +110,9 @@ The following table provides a sample cost breakdown for deploying this Guidance
 | Amazon ECR | Image storage (~2 GB) @ $0.10/GB-month | $0.20 |
 | Amazon S3 Vectors (Knowledge Bases) | 3 indexes, ~50 vectors (1024-dim), 10K queries/mo @ [$2.50/M requests](https://aws.amazon.com/s3/pricing/) + data processed | ~$0.10 |
 | Amazon Cognito | 1,000 monthly active users (within free tier) | $0.00 |
-| **Total** | | **~$752/month** |
+| **Total** | | **~$122/month infrastructure + model token usage (TBD)** |
 
-> **Note:** The dominant cost driver is model token usage (Sonnet + Haiku = $630, or 84% of total). Infrastructure costs are minimal at this query volume. Token volumes above are estimates based on ~8 model turns per query; actual costs depend on conversation length and specialist complexity. HTTP request volume is estimated at ~100K/month (10K agent queries × ~10 HTTP requests each for auth, polling, streaming, and static assets); ALB and WAF rows use this shared assumption. Prompt caching break-even requires a cache-read share above ~22% of cached tokens — monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch. Minimum cache checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5).
+> **Note:** Model token usage is normally the dominant cost driver, but the Claude Haiku 5.5 and Claude Sonnet 5.5 per-token rates must be confirmed from the current [Amazon Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/) before the model rows and combined total are finalized; the ~$122/month figure covers only the fixed and infrastructure services. Token volumes above are estimates based on ~8 model turns per query; actual costs depend on conversation length and specialist complexity. HTTP request volume is estimated at ~100K/month (10K agent queries × ~10 HTTP requests each for auth, polling, streaming, and static assets); ALB and WAF rows use this shared assumption. Prompt caching break-even requires a cache-read share above ~22% of cached tokens — monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch. Minimum cache checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5.
 
 ## Prerequisites
 
@@ -131,7 +131,7 @@ Python 3.13 and the AgentCore CLI are automatically installed by `uv` during set
 
 ### AWS Account Requirements
 
-- **Bedrock Model Access**: Claude Sonnet 4.6 and Claude Haiku 4.5 enabled in your target region
+- **Bedrock Model Access**: Claude Sonnet 5.5 and Claude Haiku 5.5 enabled in your target region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
@@ -165,7 +165,7 @@ To enable Bedrock models:
 
 1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock/)
 2. Navigate to **Model access**
-3. Enable Anthropic Claude Sonnet 4.6 and Anthropic Claude 4.5 Haiku
+3. Enable Anthropic Claude Sonnet 5.5 and Anthropic Claude Haiku 5.5
 4. Save changes
 
 ### Windows Users

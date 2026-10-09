@@ -11,8 +11,8 @@ from collections.abc import Mapping
 # Third-party packages
 from loguru import logger
 
-DEFAULT_ORCHESTRATOR_MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
-DEFAULT_SPECIALIST_MODEL_ID = "global.anthropic.claude-sonnet-4-6"
+DEFAULT_ORCHESTRATOR_MODEL_ID = "global.anthropic.claude-haiku-5-5"
+DEFAULT_SPECIALIST_MODEL_ID = "global.anthropic.claude-sonnet-5-5"
 
 ORCHESTRATOR_MODEL_ENV = "GBAW_ORCHESTRATOR_MODEL_ID"
 SPECIALIST_MODEL_ENV = "GBAW_SPECIALIST_MODEL_ID"
