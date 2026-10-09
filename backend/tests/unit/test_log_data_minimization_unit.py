@@ -387,6 +387,125 @@ def test_records_carry_a_request_id_extra_without_raising():
     assert "req=req-1234 | inside a request" in output
 
 
+class _RequestIdAndLocationSink:
+    """A sink whose format surfaces the request-ID extra and the record source
+    location, so a test can assert both correlation and caller attribution."""
+
+    def __init__(self) -> None:
+        self._buffer = io.StringIO()
+        self._sink_id = logger.add(
+            self._buffer,
+            level="DEBUG",
+            format="{name}:{function}:{line} | req={extra[request_id]} | {message}",
+            backtrace=False,
+            diagnose=False,
+        )
+
+    def __enter__(self) -> "io.StringIO":
+        return self._buffer
+
+    def __exit__(self, *_exc: object) -> None:
+        logger.remove(self._sink_id)
+
+
+def test_sanitized_exception_without_request_id_uses_bound_request_id(monkeypatch):
+    """A swallowed error logged without an explicit request_id still correlates.
+
+    A stub orchestrator mirrors a real swallowed-error site: inside
+    ``invoke_agent`` (which binds the runtime request ID), it calls
+    ``log_sanitized_exception`` with no ``request_id``. The record must carry the
+    bound request ID — not the ``<none>`` sentinel — and must be attributed to
+    the calling module, not to the helper in ``utils.security``.
+    """
+    # Local modules
+    from utils.security import log_sanitized_exception
+
+    def _orchestrator_that_swallows(*_a, **_k):
+        try:
+            raise RuntimeError("memory setup failed")
+        except Exception as exc:
+            # No request_id passed: the helper must fall back to the bound ID.
+            log_sanitized_exception(logger, "⚠️ Memory setup failed, using fallback", exc)
+        return "ok"
+
+    payload = {
+        "prompt": "a normal question",
+        "thread_id": "thread-ok",
+        "user_context": {"user_id": "u-1", "session_id": "s-1"},
+    }
+
+    # Force a known runtime request ID for the invocation.
+    with patch("agentcore_main._current_request_id", return_value="req-CAFE0001"):
+        with _RequestIdAndLocationSink() as buffer:
+            result = _run_invoke(monkeypatch, payload, orchestrator=_orchestrator_that_swallows)
+            output = buffer.getvalue()
+
+    assert result == "ok"
+    # Find the swallowed-error record among the invocation's lines.
+    error_line = next(line for line in output.splitlines() if "Memory setup failed" in line)
+    # Correlation: the bound runtime request ID, not the <none> sentinel.
+    assert "req=req-CAFE0001" in error_line
+    assert "request_id=req-CAFE0001" in error_line
+    assert "<none>" not in error_line
+    # Attribution: the caller's module, not utils.security.
+    assert error_line.startswith("test_log_data_minimization_unit:_orchestrator_that_swallows:")
+    assert "utils.security:" not in error_line
+
+
+def test_orchestrator_model_loop_failure_hides_prompt_bearing_exception(monkeypatch):
+    """When ``agent(query)`` fails on a cost-report follow-up, the orchestrator
+    records only the sanitized class/code/request-id, never the exception
+    message, which can quote the user prompt or a provider validation payload."""
+    # Standard library
+    import importlib
+
+    # Local modules
+    import agents.orchestrator as orch
+
+    # The shared autouse fixture replaces ``agents.orchestrator.run_orchestrator``
+    # with a stub. Reload the module to obtain the genuine implementation under
+    # test (all of its heavy dependencies are stubbed below).
+    orch = importlib.reload(orch)
+
+    # Force the cost-report-followup branch (the simplest route to the two
+    # changed sites) and keep memory off so the fallback agent is used.
+    monkeypatch.setattr(orch, "_is_cost_report_followup", lambda _q: True)
+    monkeypatch.setattr(orch, "USE_BEDROCK_SESSIONS", False, raising=False)
+    monkeypatch.setattr(orch, "create_cached_bedrock_model", lambda: object(), raising=False)
+    monkeypatch.setattr(orch, "create_bedrock_model_with_overrides", lambda **k: object(), raising=False)
+    monkeypatch.setattr(orch, "INFERENCE_CONFIG", {}, raising=False)
+    monkeypatch.setattr(orch, "get_optimized_orchestrator_prompt", lambda: "sys", raising=False)
+    monkeypatch.setattr(orch, "get_prompt_versions", lambda: {}, raising=False)
+    # The capture helpers return "no authoritative report / no specialist output"
+    # so the followup branch is taken.
+    monkeypatch.setattr(orch, "begin_cost_report_capture", lambda: None, raising=False)
+    monkeypatch.setattr(orch, "finish_cost_report_capture", lambda _c: None, raising=False)
+    monkeypatch.setattr(orch, "begin_specialist_capture", lambda: None, raising=False)
+    monkeypatch.setattr(orch, "finish_specialist_capture", lambda _c: {}, raising=False)
+
+    class _RaisingAgent:
+        def __init__(self, *a, **k):
+            pass
+
+        def __call__(self, _query):
+            raise RuntimeError(f"ValidationException: input '{PROMPT_MARKER}' actor={SUBJECT_MARKER}\nFORGED-LINE")
+
+    monkeypatch.setattr(orch, "Agent", _RaisingAgent, raising=False)
+
+    with _CaptureSink() as buffer:
+        response = orch.run_orchestrator(query="show me cost report rpt-123", context={})
+        output = buffer.getvalue()
+
+    # The deterministic follow-up failure response is returned, not a raise.
+    assert response == orch._COST_REPORT_FOLLOWUP_FAILURE
+    # The sanitized record is present; the raw message/prompt/actor are not.
+    assert "RuntimeError" in output
+    assert "code=provider_error" in output
+    assert PROMPT_MARKER not in output
+    assert SUBJECT_MARKER not in output
+    assert "FORGED-LINE" not in output
+
+
 def test_sink_patcher_normalizes_crlf_from_any_interpolated_value():
     """A CR/LF carried by an interpolated value is collapsed at the sink, even
     when the originating call site did not sanitize it."""

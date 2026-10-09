@@ -48,7 +48,11 @@ def test_sdk_handler_redacts_raw_session_id_but_keeps_request_id():
     buffer = io.StringIO()
     for handler in sdk_logger.handlers:
         handler.stream = buffer  # type: ignore[attr-defined]
-    agentcore_main._redact_agentcore_sdk_session_id()
+    # Call the installer twice: the module-level wrapper type makes this
+    # idempotent, so a second call must not stack a second wrapper (which would
+    # re-tokenize an already-redacted sessionId).
+    agentcore_main._install_sdk_session_redaction()
+    agentcore_main._install_sdk_session_redaction()
 
     BedrockAgentCoreContext.set_request_context(REQUEST_ID, RAW_SESSION_MARKER)
     try:
@@ -65,3 +69,33 @@ def test_sdk_handler_redacts_raw_session_id_but_keeps_request_id():
     payload = json.loads(last_line)
     assert payload.get("requestId") == REQUEST_ID
     assert payload.get("sessionId", "").startswith("id:")
+
+
+def test_sdk_session_redaction_is_idempotent():
+    """A repeated install must leave the redaction token stable, matching the
+    application's ``Session:`` line (a double-wrap would change it)."""
+    # Third-party packages
+    from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+
+    agentcore_main = _import_agentcore_main()
+    sdk_logger = logging.getLogger("bedrock_agentcore.app")
+
+    def _emit() -> str:
+        buffer = io.StringIO()
+        for handler in sdk_logger.handlers:
+            handler.stream = buffer  # type: ignore[attr-defined]
+        BedrockAgentCoreContext.set_request_context(REQUEST_ID, RAW_SESSION_MARKER)
+        try:
+            sdk_logger.info("Invocation completed successfully")
+        finally:
+            BedrockAgentCoreContext.set_request_context(REQUEST_ID, None)
+        last_line = [line for line in buffer.getvalue().splitlines() if line.strip()][-1]
+        return json.loads(last_line).get("sessionId", "")
+
+    agentcore_main._install_sdk_session_redaction()
+    first = _emit()
+    agentcore_main._install_sdk_session_redaction()
+    second = _emit()
+
+    assert first.startswith("id:")
+    assert first == second, "a repeated install double-wrapped the formatter and changed the token"

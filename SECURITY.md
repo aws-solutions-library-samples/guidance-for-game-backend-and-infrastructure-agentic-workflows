@@ -694,8 +694,10 @@ or raw session/thread identifiers.
   the frontend. The HMAC key is random per process and is never read from the
   environment, so a token is stable only within a single process and does not
   correlate across processes, restarts, or tiers. The frontend additionally
-  records the runtime's own request ID from the `x-amzn-RequestId` response
-  header so a request can be traced across tiers.
+  records the runtime's own server-generated trace ID from the `X-Amzn-Trace-Id`
+  response header (modeled by the AgentCore InvokeAgentRuntime response) so a
+  request can be traced across tiers. That trace ID is not derived from caller
+  identity or content and is logged normalized rather than redacted.
 - Externally influenced fields are normalized before emission so carriage
   returns, line feeds, other C0/C1/DEL control characters, the Unicode line and
   paragraph separators, and bidirectional-formatting controls cannot inject
@@ -709,14 +711,18 @@ or raw session/thread identifiers.
   formatter so the serialized `sessionId` is replaced with a bounded token while
   `requestId` is preserved.
 - Semantic-memory logging records only outcomes and counts.
-- Error logs record the exception class name and a typed, sanitized error code
-  (and the request ID), never the exception message, which can embed a provider
-  validation payload or caller value. The full traceback is emitted only when
-  debug logging is explicitly enabled (a non-production switch). The
-  Cost Explorer diagnostic path is a deliberate, separately governed exception:
-  it retains the exception message because the message is required to classify
-  Cost Explorer failures, and that path does not carry prompt or identity
-  values.
+- The request-handling error paths that can see prompt or identity values — the
+  AgentCore entrypoint, the orchestrator (including the model-loop failure over
+  the user prompt), the specialists, agent timing, and semantic memory — record
+  the exception class name and a typed, sanitized error code (and the request
+  ID) through `log_sanitized_exception()`, never the exception message, which
+  can embed a provider validation payload or caller value. The full traceback is
+  emitted only when debug logging is explicitly enabled (a non-production
+  switch). Separately governed diagnostic paths that cannot carry prompt or
+  identity values do retain the exception message to classify the failure:
+  startup credential and container pre-warm checks and the memory-ID config read
+  in `agentcore_main`, the GameLift specialist's AWS SDK describe/list calls, and
+  the Cost Explorer diagnostic path.
 
 ### Secrets Management
 

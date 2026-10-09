@@ -459,7 +459,9 @@ def log_sanitized_exception(
             provider values.
         exc: The exception to classify and record.
         request_id: Optional bounded correlation ID (safe, non-reversible or
-            server-generated) to tie the record to a request.
+            server-generated) to tie the record to a request. When ``None``, the
+            request ID bound for the current invocation is used so a swallowed
+            error still correlates to its request.
         debug_traceback: Force traceback on/off; defaults to the debug-logging
             setting.
     """
@@ -474,7 +476,21 @@ def log_sanitized_exception(
 
     error_class = type(exc).__name__
     error_code = classify_exception(exc)
-    rid = request_id or "<none>"
+
+    # Resolve the correlation ID. When the caller does not pass one explicitly,
+    # fall back to the request ID bound for the current invocation so a swallowed
+    # error (memory-setup fallback, extraction-skipped, specialist fallback, or
+    # a semantic-memory save failure) is still tied to its request. Only when no
+    # request is in scope does the record read ``<none>``.
+    if request_id is None:
+        try:
+            # Local modules
+            from utils.logger import _REQUEST_ID_VAR
+
+            request_id = _REQUEST_ID_VAR.get()
+        except Exception:
+            request_id = None
+    rid = request_id if request_id else "<none>"
 
     # Compose the correlation fields into the message so they appear in the
     # human-readable stdout format (which renders {message}); also bind them as
@@ -483,10 +499,13 @@ def log_sanitized_exception(
     # provider text.
     composed = f"{message} [class={error_class} code={error_code} request_id={rid}]"
     bound = log.bind(error_class=error_class, error_code=error_code, request_id=rid)
+    # ``opt(depth=1)`` makes Loguru attribute the record to this helper's caller
+    # (the error site in the orchestrator/specialist/entrypoint), not to this
+    # helper, so ``{name}:{function}:{line}`` points back to the source.
     if debug_traceback:
-        bound.opt(exception=exc).error(composed)
+        bound.opt(depth=1, exception=exc).error(composed)
     else:
-        bound.error(composed)
+        bound.opt(depth=1).error(composed)
 
 
 def verify_request_authorization(

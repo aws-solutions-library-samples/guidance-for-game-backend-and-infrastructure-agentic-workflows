@@ -9,18 +9,27 @@ The guard inspects every argument of a logger call — positional and keyword,
 and across chained ``logger.opt(...)`` / ``logger.bind(...)`` receivers — and
 flags an argument that references a forbidden identity/prompt value, whether it
 is interpolated through an f-string, ``%`` / ``+`` / ``.format()`` formatting,
-or passed as a Loguru brace-style argument. A forbidden value is detected as a
-bare name (``actor_id``), an attribute access whose final name is forbidden
-(``context.session_id``), or a mapping lookup for a forbidden key
-(``user_context.get("email")`` / ``payload["prompt"]``).
+or passed as a Loguru brace-style argument. The logger receiver may be the
+``logger`` name or the ``_get_logger()`` lazy accessor. The message argument of
+``log_sanitized_exception(log, message, exc)`` is treated as a sink as well. A
+forbidden value is detected as a bare name (``actor_id``), an attribute access
+whose final name is forbidden (``context.session_id``), or a mapping lookup for
+a forbidden key (``user_context.get("email")`` / ``payload["prompt"]``).
+
+``name`` and ``content`` are forbidden only in ``semantic_memory.py`` (the
+extracted user name and memory text); elsewhere they are ordinary locals.
 
 Only two escapes are allowed: a value first wrapped in an approved
 non-reversible/bounding helper (``redact_identifier``, ``len``) or a reference
 to a forbidden *key name as a string literal* (which is data, not the value).
-``sanitize_log_data`` and ``normalize_log_value`` are **not** treated as safe
-wrappers here: they keep the value's content (merely redacting known patterns or
-stripping control characters), so logging a prompt or raw identifier through
-them still discloses it.
+A presence/identity check (``x is not None``), a membership test
+(``'prompt' in data``), and a boolean coercion (``bool(...)``) reveal only
+whether a value exists, not the value, so they are not flagged; reading a plain
+attribute off a bare name (``prompt.arn``) discloses that attribute, not the
+base object. ``sanitize_log_data`` and ``normalize_log_value`` are **not**
+treated as safe wrappers here: they keep the value's content (merely redacting
+known patterns or stripping control characters), so logging a prompt or raw
+identifier through them still discloses it.
 
 The module ends with self-tests that run known bypass snippets through the
 scanner so the guard itself cannot silently stop catching them.
@@ -54,6 +63,17 @@ FORBIDDEN_NAMES = {
     "email",
     "memory_content",
     "user_info",
+    "user_context",
+    "user_id",
+    "claims",
+}
+
+# Names that are forbidden only in modules that actually carry that value. ``name``
+# and ``content`` are far too common as ordinary locals (a resource name, HTTP
+# content) to flag everywhere, but in semantic memory they are the extracted
+# user name and the memory text, which must never be logged.
+MODULE_SCOPED_FORBIDDEN = {
+    "semantic_memory.py": {"name", "content"},
 }
 
 # Helpers whose return value is safe to log: a bounded, non-reversible token, a
@@ -73,10 +93,11 @@ LOGGER_BUILDERS = {"opt", "bind", "contextualize", "patch", "level"}
 
 
 def _receiver_is_logger(func: ast.expr) -> bool:
-    """Resolve ``logger``, ``logger.opt(...).bind(...)`` etc. back to ``logger``.
+    """Resolve ``logger``, ``logger.opt(...).bind(...)`` etc. back to a logger.
 
-    Returns True if the attribute chain's ultimate receiver is the ``logger``
-    name reached only through known logger-builder calls.
+    Returns True if the attribute chain's ultimate receiver is a logger — either
+    the ``logger`` name or a ``_get_logger()`` call (the lazy accessor
+    ``security.py`` uses) — reached only through known logger-builder calls.
     """
     node: ast.AST = func
     # Walk down through builder calls: logger.opt(...).bind(...).error
@@ -85,12 +106,32 @@ def _receiver_is_logger(func: ast.expr) -> bool:
         # A builder call in the chain: unwrap the call back to its own func.
         while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in LOGGER_BUILDERS:
             node = node.func.value
-    return isinstance(node, ast.Name) and node.id == "logger"
+    if isinstance(node, ast.Name) and node.id == "logger":
+        return True
+    # ``_get_logger().warning(...)`` — the receiver is the accessor call.
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_get_logger":
+        return True
+    return False
 
 
 def _is_logger_call(node: ast.Call) -> bool:
     func = node.func
     return isinstance(func, ast.Attribute) and func.attr in LOG_LEVELS and _receiver_is_logger(func)
+
+
+# The sanitized-exception helper is itself a sink: its second positional
+# argument is the message that reaches the logger, so a forbidden value
+# interpolated there would be logged.
+_SANITIZED_HELPER = "log_sanitized_exception"
+
+
+def _is_sanitized_helper_call(node: ast.Call) -> bool:
+    func = node.func
+    if isinstance(func, ast.Name) and func.id == _SANITIZED_HELPER:
+        return True
+    if isinstance(func, ast.Attribute) and func.attr == _SANITIZED_HELPER:
+        return True
+    return False
 
 
 def _safe_wrapped(node: ast.AST) -> bool:
@@ -110,7 +151,7 @@ def _safe_wrapped(node: ast.AST) -> bool:
     return False
 
 
-def _forbidden_in_expression(expr: ast.AST) -> set[str]:
+def _forbidden_in_expression(expr: ast.AST, forbidden: set[str]) -> set[str]:
     """Return forbidden identity/prompt references inside a logged expression.
 
     Flags:
@@ -121,7 +162,9 @@ def _forbidden_in_expression(expr: ast.AST) -> set[str]:
 
     Does not descend into an approved safe wrapper. A forbidden *key name* that
     appears only as a string literal argument is data, not the value, and is not
-    flagged on its own.
+    flagged on its own. A presence/identity check (``x is not None``,
+    ``'prompt' in data``) and a boolean coercion (``bool(data.get('prompt'))``)
+    disclose only whether a value exists, not the value, so they are skipped.
     """
     found: set[str] = set()
 
@@ -129,26 +172,40 @@ def _forbidden_in_expression(expr: ast.AST) -> set[str]:
         def visit_Call(self, call: ast.Call) -> None:
             if _safe_wrapped(call):
                 return  # redact_identifier(...)/len(...) output is safe.
+            # ``bool(...)`` yields only existence, not the underlying value.
+            if isinstance(call.func, ast.Name) and call.func.id == "bool":
+                return
             # Detect dict.get("<forbidden>") -> logs the forbidden value.
             func = call.func
             if isinstance(func, ast.Attribute) and func.attr == "get" and call.args:
                 key = call.args[0]
-                if isinstance(key, ast.Constant) and key.value in FORBIDDEN_NAMES:
+                if isinstance(key, ast.Constant) and key.value in forbidden:
                     found.add(str(key.value))
             self.generic_visit(call)
 
+        def visit_Compare(self, node: ast.Compare) -> None:
+            # A comparison (``x is not None``, ``x == 'default'``) reveals only
+            # the comparison outcome, not the value. Skip the whole node.
+            return
+
         def visit_Name(self, name: ast.Name) -> None:
-            if name.id in FORBIDDEN_NAMES:
+            if name.id in forbidden:
                 found.add(name.id)
 
         def visit_Attribute(self, attr: ast.Attribute) -> None:
-            if attr.attr in FORBIDDEN_NAMES:
+            if attr.attr in forbidden:
                 found.add(attr.attr)
-            self.generic_visit(attr)
+            # Reading an attribute off a bare name discloses that attribute, not
+            # the base object, so ``prompt.arn`` is safe while ``ctx.session_id``
+            # is caught by the tail check above. Only descend when the base is
+            # itself a compound expression (a nested attribute, subscript, or
+            # call) that could independently carry a forbidden value.
+            if not isinstance(attr.value, ast.Name):
+                self.visit(attr.value)
 
         def visit_Subscript(self, sub: ast.Subscript) -> None:
             key = sub.slice
-            if isinstance(key, ast.Constant) and key.value in FORBIDDEN_NAMES:
+            if isinstance(key, ast.Constant) and key.value in forbidden:
                 found.add(str(key.value))
             self.generic_visit(sub)
 
@@ -156,7 +213,7 @@ def _forbidden_in_expression(expr: ast.AST) -> set[str]:
     return found
 
 
-def _logged_expressions(call: ast.Call):
+def _logged_expressions(call: ast.Call, *, sanitized_helper: bool = False):
     """Yield every sub-expression that could carry a forbidden value into the sink.
 
     Covers: f-strings (JoinedStr formatted values); ``%`` and ``+`` operands;
@@ -164,6 +221,11 @@ def _logged_expressions(call: ast.Call):
     (Loguru brace-style ``logger.info("{}", actor_id)`` and
     ``logger.bind(x=actor_id)``). The format-string literal itself is skipped;
     its substituted values are what we inspect.
+
+    For a ``log_sanitized_exception(log, message, exc, ...)`` call the sink is the
+    second positional argument (the message). The first positional is the logger
+    and the third is the exception object (deliberately not rendered), so only
+    the message and any keyword message pieces are inspected.
     """
     nodes: list[ast.AST] = []
 
@@ -185,6 +247,13 @@ def _logged_expressions(call: ast.Call):
             return  # a bare literal carries nothing
         else:
             nodes.append(node)
+
+    if sanitized_helper:
+        # Inspect only the message argument (second positional).
+        if len(call.args) >= 2:
+            _expand(call.args[1])
+        yield from nodes
+        return
 
     # First positional arg is the message/format; remaining positional and all
     # keyword args are Loguru brace substitutions / bound extras.
@@ -210,12 +279,21 @@ def _logged_expressions(call: ast.Call):
 
 def _scan_source(source: str, filename: str = "<test>") -> list[str]:
     tree = ast.parse(source, filename=filename)
+    # ``name`` and ``content`` are forbidden only in the module that carries the
+    # extracted user name and memory text.
+    forbidden = set(FORBIDDEN_NAMES) | MODULE_SCOPED_FORBIDDEN.get(filename, set())
     violations: list[str] = []
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and _is_logger_call(node)):
+        if not isinstance(node, ast.Call):
             continue
-        for expr in _logged_expressions(node):
-            bad = _forbidden_in_expression(expr)
+        if _is_logger_call(node):
+            exprs = _logged_expressions(node)
+        elif _is_sanitized_helper_call(node):
+            exprs = _logged_expressions(node, sanitized_helper=True)
+        else:
+            continue
+        for expr in exprs:
+            bad = _forbidden_in_expression(expr, forbidden)
             if bad:
                 violations.append(f"{filename}:{getattr(node, 'lineno', '?')} logs raw {sorted(bad)}")
     return violations
@@ -252,6 +330,19 @@ _BYPASS_SNIPPETS = [
     'logger.opt(exception=e).error(f"...{actor_id}")',
     "logger.bind(x=actor_id).info('x')",
     'logger.info(f"...{user_prompt[:50]}")',
+    # Newly covered receivers, names, and sinks.
+    "logger.info(f\"...{user_context.get('user_id')}\")",
+    "logger.info(f\"...{claims['sub']}\" )",
+    'logger.info(f"...{user_id}")',
+    'logger.info(f"...{user_context}")',
+    '_get_logger().warning(f"...{actor_id}")',
+    'log_sanitized_exception(logger, f"... {actor_id}", e)',
+]
+
+# Snippets that must flag only when scanned as the module that owns the value.
+_MODULE_SCOPED_SNIPPETS = [
+    ('logger.info(f"name: {name}")', "semantic_memory.py"),
+    ('logger.info(f"content: {content[:50]}")', "semantic_memory.py"),
 ]
 
 _SAFE_SNIPPETS = [
@@ -261,12 +352,30 @@ _SAFE_SNIPPETS = [
     'logger.bind(request_id=redact_identifier(actor_id)).info("x")',
     'logger.info("a constant message")',
     'logger.info(f"...{response_text}")',
+    # Presence/identity checks and boolean coercions reveal existence, not value.
+    "logger.info(f\"...{bool(data.get('prompt'))}\")",
+    'logger.info(f"...{query is not None}")',
+    'logger.info(f"...{self.session_id is not None}")',
+    'logger.info(f"...{prompt.arn}")',
+    # ``name`` / ``content`` are ordinary locals outside semantic_memory.py.
+    'logger.info(f"resource name: {name}")',
+    'logger.info(f"http content: {content}")',
+    # The exception object passed to the helper is not a rendered value.
+    'log_sanitized_exception(logger, "a constant message", e)',
 ]
 
 
 @pytest.mark.parametrize("snippet", _BYPASS_SNIPPETS)
 def test_scanner_catches_known_bypass(snippet: str):
     assert _scan_source(snippet), f"guard failed to flag a known leak: {snippet}"
+
+
+@pytest.mark.parametrize("snippet,filename", _MODULE_SCOPED_SNIPPETS)
+def test_scanner_catches_module_scoped_leak(snippet: str, filename: str):
+    # Flagged in the owning module...
+    assert _scan_source(snippet, filename), f"guard failed to flag a module-scoped leak: {snippet}"
+    # ...but not in an unrelated module, where ``name``/``content`` are common.
+    assert not _scan_source(snippet, "some_other_module.py"), f"guard over-flagged outside its module: {snippet}"
 
 
 @pytest.mark.parametrize("snippet", _SAFE_SNIPPETS)

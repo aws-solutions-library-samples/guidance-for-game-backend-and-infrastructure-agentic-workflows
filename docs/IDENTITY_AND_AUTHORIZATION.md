@@ -157,8 +157,10 @@ or raw session/thread identifiers.
   `redact()` in `ui/src/utils/logger.ts`. The HMAC key is random per process and
   is never read from the environment, so a token is stable only within a single
   process and does not correlate across processes, restarts, or tiers. The
-  frontend also logs the runtime's own request ID from the `x-amzn-RequestId`
-  response header so a request can be followed across tiers.
+  frontend also logs the runtime's own server-generated trace ID from the
+  `X-Amzn-Trace-Id` response header (modeled by the AgentCore InvokeAgentRuntime
+  response) so a request can be followed across tiers; that value is not derived
+  from caller identity or content and is logged normalized rather than redacted.
 - Every externally influenced log field is normalized before emission so
   carriage returns, line feeds, other C0/C1/DEL control characters, the Unicode
   line and paragraph separators, and bidirectional-formatting controls cannot
@@ -172,15 +174,20 @@ or raw session/thread identifiers.
   kept.
 - Semantic-memory logging records only outcomes and counts, never extracted
   names, memory content, or raw actor identifiers.
-- Error logs record the exception class name and a typed, sanitized error code
-  (plus the request ID), never the exception message — a provider or SDK error
-  body can quote caller values. The full traceback is emitted only when debug
-  logging is explicitly enabled (a non-production switch). Authentication errors
-  are generic to clients and logs. The Cost Explorer diagnostic path is a
-  deliberate, separately governed exception that retains the exception message
-  to classify Cost Explorer failures and does not carry prompt or identity
-  values. Prepared operations and executor payloads must not contain tokens,
-  email addresses, or display names.
+- The request-handling error paths that can see prompt or identity values — the
+  AgentCore entrypoint, the orchestrator (including the model-loop failure over
+  the user prompt), the specialists, agent timing, and semantic memory — record
+  the exception class name and a typed, sanitized error code (plus the request
+  ID) through `log_sanitized_exception()`, never the exception message, since a
+  provider or SDK error body can quote caller values. The full traceback is
+  emitted only when debug logging is explicitly enabled (a non-production
+  switch). Authentication errors are generic to clients and logs. Separately
+  governed diagnostic paths that do not carry prompt or identity values retain
+  the exception message to classify the failure: startup credential and
+  container pre-warm checks and the memory-ID config read in `agentcore_main`,
+  the GameLift specialist's AWS SDK describe/list calls, and the Cost Explorer
+  diagnostic path. Prepared operations and executor payloads must not contain
+  tokens, email addresses, or display names.
 
 A static regression test
 (`backend/tests/unit/test_log_static_regression_unit.py`) scans every module in

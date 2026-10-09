@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { logInfo, logError, logDebug, redact } from '@/utils/logger';
+import { logInfo, logError, logDebug, redact, normalizeLogValue } from '@/utils/logger';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
@@ -572,13 +572,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       responseContent = await runtimeResponse.text();
-      // Correlate the proxy requestId with the runtime's own request ID so a
-      // single invocation can be traced across tiers without logging any raw
-      // identifier. The value is a server-generated AWS request ID (not derived
-      // from caller identity), carried in the standard x-amzn-RequestId response
-      // header.
-      const runtimeRequestId = runtimeResponse.headers?.get?.('x-amzn-RequestId') ?? 'unknown';
-      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed (runtime request ${redact(runtimeRequestId)})`);
+      // Correlate the proxy requestId with the runtime's own request tracking so
+      // a single invocation can be traced across tiers without logging any raw
+      // identifier. The runtime response models a server-generated trace ID in
+      // the standard `X-Amzn-Trace-Id` header (AgentCore InvokeAgentRuntime
+      // response). It is not derived from caller identity or content, so it is
+      // logged normalized (control characters collapsed) rather than redacted.
+      // The runtime session-id response header is the environment-isolated
+      // thread ID and is deliberately NOT logged.
+      const runtimeTraceId = runtimeResponse.headers?.get?.('x-amzn-trace-id') ?? 'unknown';
+      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed (runtime trace ${normalizeLogValue(runtimeTraceId)})`);
 
       // AgentCore serializes a string return value as a JSON string.
       try {

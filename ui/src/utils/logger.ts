@@ -12,7 +12,7 @@
 // U+2066–U+2069) that can reorder how a line renders to hide injected content.
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
-function normalizeLogValue(value: unknown): string {
+export function normalizeLogValue(value: unknown): string {
   return String(value).replace(CONTROL_CHARS, ' ');
 }
 
@@ -26,9 +26,11 @@ export function logInfo(message: string): void {
 
 // An Error object reaching the sink would print its message and stack verbatim;
 // an AWS SDK error message, for example, can name the caller ARN. In production
-// only a normalized error name and (for AWS SDK errors) the HTTP status code are
-// emitted; the full stack is kept only in development. Everything is forwarded
-// behind the fixed "%s" specifier and normalized.
+// only a stable error identifier (name or concrete class name) and safe
+// diagnostic codes (AWS SDK HTTP status, and a `code`/`cause.code` matching a
+// fixed uppercase token pattern) are emitted; the full stack is kept only in
+// development. Everything is forwarded behind the fixed "%s" specifier and
+// normalized.
 export function logError(message: string, error?: unknown): void {
   if (error === undefined) {
     console.error('%s', normalizeLogValue(message));
@@ -49,8 +51,15 @@ export function logDebug(message: string): void {
 }
 
 // Render an error for logging without disclosing provider payloads. In
-// development the stack aids debugging; in production only the error name and,
-// for AWS SDK errors, the HTTP status code are kept.
+// development the stack aids debugging; in production only a stable error
+// identifier and safe diagnostic codes are kept: the error name (falling back
+// to the concrete class name when `name` is the generic "Error", so an
+// aws-jwt-verify error like JwtExpiredError is still distinguishable), the AWS
+// SDK HTTP status code, and a `code`/`cause.code` that matches a fixed
+// uppercase token pattern (for example ERR_JWT_EXPIRED or ECONNREFUSED). None
+// of these carry caller values or free-form provider text.
+const SAFE_CODE = /^[A-Z][A-Z0-9_]{1,40}$/;
+
 function describeError(error: unknown): string {
   if (process.env.NODE_ENV === 'development') {
     if (error instanceof Error) {
@@ -59,8 +68,26 @@ function describeError(error: unknown): string {
     return String(error);
   }
   if (error instanceof Error) {
+    // Prefer a specific name: subclasses whose `name` was never overridden
+    // report the generic "Error", so fall back to the concrete constructor name.
+    let label = error.name;
+    if (!label || label === 'Error') {
+      label = error.constructor?.name || 'Error';
+    }
+    const parts: string[] = [label];
     const status = (error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
-    return status !== undefined ? `${error.name} (httpStatusCode=${status})` : error.name;
+    if (status !== undefined) {
+      parts.push(`httpStatusCode=${status}`);
+    }
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === 'string' && SAFE_CODE.test(code)) {
+      parts.push(`code=${code}`);
+    }
+    const causeCode = (error as { cause?: { code?: unknown } }).cause?.code;
+    if (typeof causeCode === 'string' && SAFE_CODE.test(causeCode)) {
+      parts.push(`cause.code=${causeCode}`);
+    }
+    return parts.length > 1 ? `${parts[0]} (${parts.slice(1).join(', ')})` : parts[0];
   }
   return typeof error;
 }
