@@ -17,10 +17,10 @@ import { ThemeProvider } from '../../components/ThemeProvider';
 
 jest.mock('next/router', () => ({
   useRouter: () => ({
-    route: '/admin/users',
-    pathname: '/admin/users',
+    route: '/',
+    pathname: '/',
     query: {},
-    asPath: '/admin/users',
+    asPath: '/',
     push: jest.fn(),
   }),
 }));

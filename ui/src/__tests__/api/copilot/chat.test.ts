@@ -106,7 +106,7 @@ describe('/api/copilot/chat - JWT decoding', () => {
     expect(res._getStatusCode()).not.toBe(400);
   });
 
-  it('returns 403 when user not approved', async () => {
+  it('returns 403 when caller is not in an authorized group', async () => {
     process.env.NODE_ENV = 'production';
     process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';
     process.env.COGNITO_CLIENT_ID = 'web-client';
@@ -142,14 +142,14 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
     expect(res._getStatusCode()).toBe(403);
     const data = JSON.parse(res._getData());
-    expect(data.error).toBe('Account pending approval');
+    expect(data.error).toBe('Access not provisioned');
 
   });
 
   it('fails closed with 401 when auth is real but no trusted principal is built', async () => {
-    // Regression guard for the #320 approval-gate finding: the admin/users gate must not be
-    // silently skipped when the access token verifies "ok" but yields no payload/principal
-    // outside the local-dev bypass. Simulate a non-prod HOSTED env (no SKIP_AUTH) where the
+    // The admin-or-users group gate must not be silently skipped when the access token
+    // verifies "ok" but yields no payload/principal outside the local-dev bypass.
+    // Simulate a non-prod HOSTED env (no SKIP_AUTH) where the
     // verifier resolves to a null-ish payload — the request must be rejected, not proceed.
     process.env.NODE_ENV = 'production';
     process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';

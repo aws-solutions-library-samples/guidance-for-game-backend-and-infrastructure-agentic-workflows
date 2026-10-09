@@ -50,7 +50,7 @@ The architecture follows these 12 steps:
 
 | Step | Description |
 |:----:|-------------|
-| **1** | User authenticates with **Amazon Cognito** User Pool. The frontend validates JWT tokens and stores them in HttpOnly cookies. Password policies enforce strong credentials, and admin approval is required for new users. |
+| **1** | User authenticates with **Amazon Cognito** User Pool. The frontend validates JWT tokens and stores them in HttpOnly cookies. Password policies enforce strong credentials. Self-signup is disabled; accounts are administrator-provisioned (see `add-admin-user.sh` or the PowerShell `Add-GameAgentAdmin`) and placed directly in the `admin` or `users` group. |
 | **2** | User sends a natural language query (e.g., "What's the status of my EKS clusters?") through the **Next.js frontend** hosted on **Amazon ECS Express** (Fargate + ALB). The frontend provides a conversational chat interface powered by CopilotKit. |
 | **3** | The frontend constructs trusted principal context from the verified Cognito access token and deployment-bound tenant/workspace, then invokes **Bedrock AgentCore Runtime** over HTTPS, passing the user's Cognito access token as an `Authorization: Bearer` header (`fetch`, not an AWS SDK invoke client / SigV4); the runtime verifies the token independently. Browser and model input cannot supply principal fields. |
 | **4** | AgentCore routes the request to the **Orchestrator** agent, which analyzes the query intent and determines the appropriate specialist to handle the request. The orchestrator maintains conversation context across turns. |
@@ -473,10 +473,11 @@ credential provider and carries no inline or managed policy. Cognito JWT
 verification uses `aws-jwt-verify`, which fetches the public JWKS over HTTPS and
 requires no IAM permission.
 
-The dormant account-administration routes still reference IAM-authorized Cognito
-Admin/List operations, but the default deployment has never granted them and
-they are not a supported provisioning path. Issue #473 removes that surface
-after #469; this role deliberately does not make it reachable.
+Access is administrator-provisioned: an operator runs `add-admin-user.sh` (or
+the PowerShell `Add-GameAgentAdmin`) to create a confirmed user and place it in
+the `admin` or `users` group. The sample ships no in-app account-management
+page or Cognito administrator API, so this role is never granted Cognito
+Admin/List permissions and the chat path reaches no such operation.
 
 ---
 

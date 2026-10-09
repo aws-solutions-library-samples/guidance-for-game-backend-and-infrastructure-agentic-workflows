@@ -123,16 +123,6 @@ export default function Navigation({ pageTitle, showBackButton = false, onSignOu
                     <div className="ga-user-email">{userInfo.email || username}</div>
                   </div>
 
-                  {(userInfo.isAdmin) && router.pathname !== '/admin/users' && (
-                    <Link
-                      href="/admin/users"
-                      className="ga-admin-link"
-                      onClick={() => setShowMenu(false)}
-                    >
-                      Manage Users
-                    </Link>
-                  )}
-
                   <button
                     className="ga-signout-button"
                     onClick={handleSignOut}
@@ -464,22 +454,6 @@ export default function Navigation({ pageTitle, showBackButton = false, onSignOu
         .ga-user-email {
           color: var(--ga-text-muted);
           font-size: 13px;
-        }
-
-        .ga-admin-link {
-          display: block;
-          padding: 8px 12px;
-          color: var(--ga-accent);
-          text-decoration: none;
-          font-size: 14px;
-          font-weight: 500;
-          border-radius: 6px;
-          margin-bottom: 8px;
-          transition: background 0.2s;
-        }
-
-        .ga-admin-link:hover {
-          background: var(--ga-control-hover-bg);
         }
 
         .ga-signout-button {

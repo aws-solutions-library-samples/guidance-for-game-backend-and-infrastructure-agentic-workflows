@@ -8,9 +8,9 @@ identity-based permissions:
 * Container log delivery is performed by the separate ECS task execution role.
 * The one supported task-credential call, ``sts:GetCallerIdentity``, requires no
   IAM allow.
-* Dormant account-administration routes reference Cognito Admin/List operations,
-  but the default deployment has never granted them. Issue #473 removes that
-  unsupported surface after #469; this role must not make it reachable.
+* The sample provisions access out-of-band with ``add-admin-user.sh`` (or the
+  PowerShell ``Add-GameAgentAdmin``), so the frontend never performs Cognito
+  administrator operations and this role carries no ``cognito-idp:`` grant.
 
 The base template models role grants inline. This test therefore prohibits both
 policy properties on ``ECSTaskRole`` and standalone ``AWS::IAM::Policy`` or
@@ -84,17 +84,13 @@ def test_get_caller_identity_call_remains_without_an_sts_grant():
     assert "sts:GetCallerIdentity" not in str(_resource("ECSTaskRole"))
 
 
-def test_dormant_cognito_admin_routes_remain_unprivileged():
-    """Do not make the unsupported account-administration surface reachable."""
-    admin_source = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (
-            PROJECT_ROOT / "ui/src/pages/api/admin/users.ts",
-            PROJECT_ROOT / "ui/src/pages/api/admin/approve.ts",
-        )
-    )
-    assert "AdminListGroupsForUserCommand" in admin_source
-    assert "AdminConfirmSignUpCommand" in admin_source
+def test_task_role_has_no_cognito_administrator_grant():
+    """The internet-facing frontend task role must never gain Cognito admin actions.
+
+    Access is administrator-provisioned out-of-band, so the proxy performs no
+    Cognito administrator call. This fails if any ``cognito-idp:`` action is
+    added to the role (an unused, high-privilege surface on a public component).
+    """
     assert "cognito-idp:" not in str(_resource("ECSTaskRole"))
 
 
