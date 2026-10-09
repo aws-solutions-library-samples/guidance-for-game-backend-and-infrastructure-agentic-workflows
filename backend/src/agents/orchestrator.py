@@ -44,6 +44,7 @@ from config.settings import (
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
+from utils.security import redact_identifier
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 
 # Optional memory integration imports (may not be available in all environments)
@@ -300,13 +301,15 @@ def run_orchestrator(query: str, context: dict = None):
         if context and isinstance(context, dict):
             actor_id = context.get("user_id") or context.get("actor_id")
             session_id = context.get("session_id")
-            display_name = context.get("display_name", "user")
-            logger.debug(f"👤 User: {display_name}, Actor: {actor_id}, Session: {session_id}")
+            logger.debug(
+                f"👤 Memory context resolved (actor={redact_identifier(actor_id)}, "
+                f"session={redact_identifier(session_id)})"
+            )
 
         # Create agent with or without memory
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id and session_id:
             # Use native AgentCore Memory integration
-            logger.debug(f"🧠 Creating agent with AgentCore Memory: {BEDROCK_AGENTCORE_MEMORY_ID}")
+            logger.debug("🧠 Creating agent with AgentCore Memory")
 
             try:
                 # Create memory config with retrieval config for LTM
@@ -334,7 +337,7 @@ def run_orchestrator(query: str, context: dict = None):
                     filter_restored_tool_context=True,
                 )
                 logger.debug(f"✅ Config created with LTM retrieval enabled")
-                logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {actor_id})")
+                logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {redact_identifier(actor_id)})")
                 logger.debug(f"   Retrieval: top_k=10, relevance_score=0.25, strategy=user_facts")
 
                 # Create session manager and agent with memory

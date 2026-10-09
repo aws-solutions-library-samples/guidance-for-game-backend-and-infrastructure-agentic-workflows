@@ -143,10 +143,35 @@ owns that implementation.
 
 ## Logging
 
-Do not log raw tokens, cookies, email addresses, or display names.
-Authentication errors are generic to clients and logs; correlation uses a
-request ID and redacted identifiers. Prepared operations and executor payloads
-must not contain tokens, email addresses, or display names.
+Application logs record request/correlation IDs, bounded metrics, and
+operation outcomes only. They do not contain prompt text, extracted names,
+semantic-memory content, email addresses, display names, raw Cognito subjects,
+or raw session/thread identifiers.
+
+- Correlation uses a per-request ID. Where a log line must stay tied to a
+  specific principal or session across lines, it carries a bounded,
+  non-reversible token rather than the raw value: the backend uses
+  `redact_identifier()` in `backend/src/utils/security.py` (a salted SHA-256
+  prefix keyed by `GBAW_LOG_REDACTION_SALT`, random per process when unset) and
+  the frontend uses `redact()` in `ui/src/utils/logger.ts`.
+- Every externally influenced log field is normalized before emission so
+  carriage returns, line feeds, and other control characters cannot create
+  additional log records. The backend normalizes through
+  `normalize_log_value()` / `sanitize_log_data()`; the frontend logger strips
+  control characters in `logInfo`, `logError`, `logWarning`, `logDebug`, and
+  `redact`.
+- Semantic-memory logging records only outcomes and counts, never extracted
+  names, memory content, or raw actor identifiers.
+- Error logs preserve the exception class and a traceback via Loguru's
+  exception API with `diagnose=False`, so local variable values (prompts,
+  tokens, identifiers) and provider error payloads are not disclosed.
+  Authentication errors are generic to clients and logs. Prepared operations
+  and executor payloads must not contain tokens, email addresses, or display
+  names.
+
+A static regression test
+(`backend/tests/unit/test_log_static_regression_unit.py`) scans the high-risk
+call sites so a future prompt/identity/session log is caught in review.
 
 ## References
 

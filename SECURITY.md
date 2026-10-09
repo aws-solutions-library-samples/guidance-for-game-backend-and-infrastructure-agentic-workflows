@@ -478,7 +478,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | Frontend (ECS Express) | JWT claims, validated prompt | **Authenticated** | HttpOnly cookies, Cognito verification |
 | Backend (AgentCore) | Sanitized prompt, user context | **Validated** | Input validation, rate limiting, guardrails |
 | AWS service responses | Fleet/cluster info, costs | **Internal** | IAM-scoped read-only access |
-| Logs (CloudWatch) | Sanitized excerpts | **Redacted** | PII/credentials stripped by `sanitize_log_data()`, encrypted at rest |
+| Logs (CloudWatch) | Request IDs, bounded metrics, outcomes | **Redacted** | No prompt text or raw identifiers; sensitive patterns and control characters stripped by `sanitize_log_data()`/`normalize_log_value()`, correlation via `redact_identifier()`, encrypted at rest |
 | Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation (`actor_id`), encrypted at rest, TTL-enforced |
 
 ### Service-to-Service Credentials
@@ -677,6 +677,27 @@ reference to `resolve_runtime_host`.
 - CloudWatch logs all application activity
 - Logs retained per compliance requirements
 
+### Application Log Minimization
+
+Application logs are limited to request/correlation IDs, bounded metrics, and
+operation outcomes. They do not contain prompt text, extracted names,
+semantic-memory content, email addresses, display names, raw Cognito subjects,
+or raw session/thread identifiers.
+
+- Correlation uses a per-request ID. A value that must stay tied to a principal
+  or session across lines is emitted as a bounded, non-reversible token:
+  `redact_identifier()` (`backend/src/utils/security.py`, salted SHA-256 prefix
+  keyed by `GBAW_LOG_REDACTION_SALT`) on the backend and `redact()`
+  (`ui/src/utils/logger.ts`) on the frontend.
+- Externally influenced fields are normalized before emission so carriage
+  returns, line feeds, and other control characters cannot inject additional
+  log records (`normalize_log_value()` / `sanitize_log_data()` on the backend;
+  control-character stripping in the frontend logger).
+- Semantic-memory logging records only outcomes and counts.
+- Error logs preserve the exception class and traceback via Loguru's exception
+  API with `diagnose=False`; local variable values and provider error payloads
+  are not disclosed.
+
 ### Secrets Management
 
 - No hardcoded credentials in code
@@ -697,7 +718,7 @@ reference to `resolve_runtime_host`.
 
 - User data isolated per actor_id
 - Memory can be cleared via API (`/api/memory/clear`)
-- No PII stored in logs (filtered by guardrails)
+- No PII stored in logs (prompt text and identifiers excluded; see Application Log Minimization)
 
 ### SOC 2 / ISO 27001
 

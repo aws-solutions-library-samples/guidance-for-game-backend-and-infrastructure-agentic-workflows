@@ -12,6 +12,7 @@ from __future__ import annotations
 
 # Standard library
 import hashlib
+import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -261,6 +262,63 @@ def hash_sensitive_data(data: str, salt: str = "") -> str:
     return hashlib.sha256((salt + data).encode()).hexdigest()
 
 
+# Per-process redaction salt. A keyed/salted digest keeps correlation possible
+# within a deployment while making the emitted token a non-reversible, non-
+# dictionary-attackable value rather than a plain hash of a guessable identifier
+# (a bare SHA-256 of a Cognito subject or thread id can be precomputed). Operators
+# may pin GBAW_LOG_REDACTION_SALT for cross-restart correlation; otherwise a random
+# per-process salt is generated so tokens are stable within a process only.
+_LOG_REDACTION_SALT = os.getenv("GBAW_LOG_REDACTION_SALT") or os.urandom(16).hex()
+
+# Control characters that must never reach a log sink verbatim: a CR or LF would
+# let an externally influenced value forge an additional, attacker-controlled log
+# line. All C0 controls and DEL are collapsed.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def normalize_log_value(value: Any) -> str:
+    """
+    Normalize a value for single-line, injection-safe logging.
+
+    Replaces carriage returns, line feeds, tabs, and other C0/DEL control
+    characters with a single space so an externally influenced field cannot
+    create additional log records or smuggle control sequences into a sink.
+
+    Args:
+        value: Any value to be rendered into a log message.
+
+    Returns:
+        A single-line string with control characters removed.
+    """
+    if value is None:
+        return "None"
+    return _CONTROL_CHARS_RE.sub(" ", str(value))
+
+
+def redact_identifier(value: Any, length: int = 12) -> str:
+    """
+    Produce a bounded, non-reversible correlation token for an identifier.
+
+    Use for values that must stay stable across log lines for correlation
+    (actor/subject, session/thread id) but must never appear in plaintext.
+    The token is a salted digest prefix, so it is not a plain reversible hash
+    of a guessable value. Prefer request IDs where correlation does not require
+    tying log lines to a specific principal.
+
+    Args:
+        value: Identifier to redact (may be None/empty).
+        length: Number of hex characters to keep (bounded correlation token).
+
+    Returns:
+        A short ``id:<hex>`` token, or ``<none>`` for empty values.
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return "<none>"
+    digest = hashlib.sha256((_LOG_REDACTION_SALT + text).encode()).hexdigest()
+    return f"id:{digest[:length]}"
+
+
 def sanitize_log_data(data: Any, max_length: int = 200) -> str:
     """
     Sanitize data for safe logging, redacting sensitive information.
@@ -280,6 +338,9 @@ def sanitize_log_data(data: Any, max_length: int = 200) -> str:
     # Redact sensitive patterns
     for data_type, pattern in SENSITIVE_PATTERNS.items():
         text = re.sub(pattern, f"[REDACTED_{data_type.upper()}]", text)
+
+    # Normalize control characters so a redacted value cannot inject log lines.
+    text = normalize_log_value(text)
 
     # Truncate if too long
     if len(text) > max_length:
@@ -353,7 +414,6 @@ def get_rate_limit_key(user_id: str | None, endpoint: str) -> str:
 # Addresses Well-Architected GenAI Lens: Operational Excellence 2.2
 # ---------------------------------------------------------------------------
 import collections
-import os
 import threading
 import time as _time
 
