@@ -13,11 +13,12 @@ identity-based permissions:
   administrator operations and this role carries no ``cognito-idp:`` grant.
 
 The base template models role grants inline. This test therefore prohibits both
-policy properties on ``ECSTaskRole`` and standalone ``AWS::IAM::Policy`` or
-``AWS::IAM::ManagedPolicy`` resources in this template. The latter conservative
-rule makes dynamic ``!If``/``!Join`` attachment forms fail closed without a
-partial IAM evaluator. If the template later needs standalone policies, that
-change must introduce an equally reviewable attachment analysis.
+policy properties on ``ECSTaskRole`` and standalone ``AWS::IAM::Policy``,
+``AWS::IAM::ManagedPolicy``, or ``AWS::IAM::RolePolicy`` resources in this
+template. The latter conservative rule makes dynamic ``!If``/``!Join``
+attachment forms fail closed without a partial IAM evaluator. If the template
+later needs standalone policies, that change must introduce an equally
+reviewable attachment analysis.
 
 This contract is intentionally scoped to identity-based policies. Resource-based
 ``Principal`` grants are separate authorization surfaces.
@@ -68,13 +69,44 @@ def test_task_role_has_no_inline_or_managed_identity_policies():
 
 def test_base_template_has_no_standalone_identity_policy_resources():
     """Disallow every alternate role-policy attachment form in this template."""
-    forbidden_types = {"AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"}
+    forbidden_types = {"AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"}
     offenders = sorted(
         logical_id
         for logical_id, resource in _template()["Resources"].items()
         if isinstance(resource, dict) and resource.get("Type") in forbidden_types
     )
     assert offenders == [], f"Standalone identity policies bypass the inline-role invariant: {offenders}"
+
+
+def test_standalone_role_policy_resource_is_rejected():
+    """A standalone ``AWS::IAM::RolePolicy`` is an attachment form the guard must reject.
+
+    Such a resource grants actions to a role by name without appearing in the
+    role's own ``Policies``/``ManagedPolicyArns``. Mirror the guard's own type
+    set against a synthetic template so the invariant stays explicit.
+    """
+    forbidden_types = {"AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"}
+    synthetic = {
+        "Resources": {
+            "ECSTaskRole": {"Type": "AWS::IAM::Role", "Properties": {}},
+            "SneakyRolePolicy": {
+                "Type": "AWS::IAM::RolePolicy",
+                "Properties": {
+                    "RoleName": {"Ref": "ECSTaskRole"},
+                    "PolicyName": "cognito-admin",
+                    "PolicyDocument": {
+                        "Statement": [{"Effect": "Allow", "Action": "cognito-idp:AdminListGroupsForUser"}]
+                    },
+                },
+            },
+        }
+    }
+    offenders = sorted(
+        logical_id
+        for logical_id, resource in synthetic["Resources"].items()
+        if isinstance(resource, dict) and resource.get("Type") in forbidden_types
+    )
+    assert offenders == ["SneakyRolePolicy"]
 
 
 def test_get_caller_identity_call_remains_without_an_sts_grant():
@@ -88,8 +120,10 @@ def test_task_role_has_no_cognito_administrator_grant():
     """The internet-facing frontend task role must never gain Cognito admin actions.
 
     Access is administrator-provisioned out-of-band, so the proxy performs no
-    Cognito administrator call. This fails if any ``cognito-idp:`` action is
-    added to the role (an unused, high-privilege surface on a public component).
+    Cognito administrator call. This asserts no ``cognito-idp:`` action is
+    written on the role resource itself. Standalone attachment forms that grant
+    actions to the role by name are rejected separately by
+    ``test_base_template_has_no_standalone_identity_policy_resources``.
     """
     assert "cognito-idp:" not in str(_resource("ECSTaskRole"))
 

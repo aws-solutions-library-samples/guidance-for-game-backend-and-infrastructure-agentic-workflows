@@ -8,18 +8,24 @@
  * self-signup account, and the internet-facing frontend task role is not
  * granted the Cognito administrator permissions such a flow would require.
  *
- * Two independent checks keep that true:
- *   1. Source tree — none of the account-management modules exist, and no
- *      source file links to `/admin/users`.
- *   2. Production build — when `.next` route manifests are present (CI runs
- *      `npm run build` before the Jest suite), neither the page manifest nor
- *      the serverless/edge function manifest exposes an `/admin/*` route.
+ * Three checks keep that true:
+ *   1. Source modules — none of the account-management modules exist.
+ *   2. Source tree — `src/pages` and `src/pages/api` contain no `admin` entry,
+ *      and no source file links to an `/admin/*` route. The Pages Router maps
+ *      files on disk directly to routes and `next.config.mjs` adds no rewrites,
+ *      so an absent `admin` directory means an absent route. This runs on every
+ *      unit run, with no build required.
+ *   3. Production build — the `.next` route manifests, when present, expose no
+ *      `/admin/*` page or API. This leg is a build-time backstop. Plain unit
+ *      runs have no `.next`, so it is skipped there; set
+ *      REQUIRE_NEXT_BUILD_MANIFEST=true (the e2e job does, after the build) to
+ *      require the page manifest to be present and to fail if it is missing.
  *
  * Cross-platform: discovery uses Node's fs APIs, not a shell `grep`, so it runs
  * identically on Linux, macOS, and Windows.
  */
 import { existsSync, readFileSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { join, relative } from 'path';
 
 const uiRoot = join(__dirname, '..', '..');
 const srcDir = join(uiRoot, 'src');
@@ -32,6 +38,14 @@ const REMOVED_MODULES = [
 ];
 
 const SOURCE_EXTENSIONS = ['.ts', '.tsx'];
+
+// Pages Router directories whose entries map directly to public routes.
+const ROUTE_DIRS = ['src/pages', 'src/pages/api'];
+
+const ADMIN_ROUTE = /^\/(api\/)?admin(\/|$)/;
+// A source reference to any /admin or /api/admin route in a string, template
+// literal, or JSX href.
+const ADMIN_LINK = /['"`]\/(api\/)?admin(\/|['"`])/;
 
 function collectSourceFiles(dir: string): string[] {
   const out: string[] = [];
@@ -49,7 +63,12 @@ function collectSourceFiles(dir: string): string[] {
   return out;
 }
 
-/** Collect every admin route key from a Next.js route manifest object. */
+/**
+ * Collect every admin route from a Next.js route manifest object. Covers both
+ * manifest shapes: `pages-manifest.json` keys routes by path, while
+ * `routes-manifest.json` lists them as `page` string values under
+ * `staticRoutes[]`/`dynamicRoutes[]`.
+ */
 function adminRouteKeys(manifest: unknown): string[] {
   const keys = new Set<string>();
   const visit = (node: unknown) => {
@@ -61,6 +80,9 @@ function adminRouteKeys(manifest: unknown): string[] {
       for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
         if (key.startsWith('/admin') || key.startsWith('/api/admin')) {
           keys.add(key);
+        }
+        if (key === 'page' && typeof value === 'string' && ADMIN_ROUTE.test(value)) {
+          keys.add(value);
         }
         visit(value);
       }
@@ -75,29 +97,48 @@ describe('no admin user-management surface (#473)', () => {
     expect(existsSync(join(uiRoot, relPath))).toBe(false);
   });
 
-  it('no source file links to the /admin/users page', () => {
+  it.each(ROUTE_DIRS)('%s has no admin route entry', (rel) => {
+    const names = readdirSync(join(uiRoot, rel)).map((n) => n.replace(/\.(t|j)sx?$/, ''));
+    expect(names).not.toContain('admin');
+  });
+
+  it('no source file links to an /admin route', () => {
     const offenders = collectSourceFiles(srcDir)
       .filter((file) => !file.includes(`${join('src', '__tests__')}`))
-      .filter((file) => /['"]\/admin\/users['"]/.test(readFileSync(file, 'utf8')));
+      .filter((file) => ADMIN_LINK.test(readFileSync(file, 'utf8')))
+      .map((file) => relative(uiRoot, file));
     expect(offenders).toEqual([]);
   });
 
-  // The production build manifests only exist after `npm run build`. CI builds
-  // before running Jest; when they are absent (plain unit run) the assertion is
-  // skipped rather than passing vacuously under a false "no manifest" branch.
+  // The production build manifests only exist after `npm run build`. A plain
+  // unit run (CI's frontend-tests job, or `npm test`) has no `.next`, so the
+  // backstop below is skipped and the source checks above carry the guarantee.
+  // Set REQUIRE_NEXT_BUILD_MANIFEST=true to require the page manifest and fail
+  // if it is absent; the e2e job sets it when running this suite after the
+  // build.
   const pagesManifest = join(nextDir, 'server', 'pages-manifest.json');
-  const describeBuild = existsSync(pagesManifest) ? describe : describe.skip;
+  const requireManifest = process.env.REQUIRE_NEXT_BUILD_MANIFEST === 'true';
+  const describeBuild = requireManifest || existsSync(pagesManifest) ? describe : describe.skip;
 
   describeBuild('production build route manifests', () => {
+    if (requireManifest) {
+      it('page manifest exists (REQUIRE_NEXT_BUILD_MANIFEST=true)', () => {
+        expect(existsSync(pagesManifest)).toBe(true);
+      });
+    }
+
     const manifestFiles = [
       join(nextDir, 'server', 'pages-manifest.json'),
       join(nextDir, 'server', 'middleware-manifest.json'),
       join(nextDir, 'routes-manifest.json'),
     ].filter(existsSync);
 
-    it.each(manifestFiles)('%s exposes no /admin route', (file) => {
-      const manifest = JSON.parse(readFileSync(file, 'utf8'));
-      expect(adminRouteKeys(manifest)).toEqual([]);
-    });
+    it.each(manifestFiles.map((file) => [relative(uiRoot, file), file]))(
+      '%s exposes no /admin route',
+      (_label, file) => {
+        const manifest = JSON.parse(readFileSync(file, 'utf8'));
+        expect(adminRouteKeys(manifest)).toEqual([]);
+      }
+    );
   });
 });

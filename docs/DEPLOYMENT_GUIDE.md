@@ -150,6 +150,11 @@ You'll be prompted for:
 - Email address
 - Password (min 8 characters, uppercase, lowercase, number, symbol)
 
+Self-signup is disabled and the app has no in-app user management. To add
+another administrator, re-run this script. To grant chat-only access, add an
+existing user to the `users` group with the Cognito console or
+`aws cognito-idp admin-add-user-to-group --group-name users`.
+
 ### Step 6: Access Your Deployment
 
 The deployment script outputs your frontend URL:
@@ -202,7 +207,8 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 ./scripts/infrastructure/test-kb.sh
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
-# short-lived access token from an approved Cognito test user
+# short-lived access token from a provisioned Cognito test user (in the
+# `admin` or `users` group)
 export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
 ./test-ai-evals.sh
 

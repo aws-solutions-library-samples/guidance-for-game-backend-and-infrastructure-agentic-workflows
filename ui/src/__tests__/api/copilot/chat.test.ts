@@ -35,7 +35,7 @@ describe('/api/copilot/chat - JWT decoding', () => {
     // (NEXT_PUBLIC_SKIP_AUTH=true), which is what .env.local ships. NODE_ENV alone
     // no longer skips. ID-token verification still runs regardless of this flag.
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
-    // Default: a valid, approved ID token (tests override as needed).
+    // Default: a valid ID token for a provisioned user (tests override as needed).
     mockVerify.mockResolvedValue({
       sub: 'user123',
       email: 'test@example.com',
@@ -113,7 +113,7 @@ describe('/api/copilot/chat - JWT decoding', () => {
     process.env.GBAW_TENANT_ID = 'tenant-a';
     process.env.GBAW_WORKSPACE_ID = 'workspace-a';
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
-    // Verified access token, but no approved group.
+    // Verified access token, but not in the admin or users group.
     mockVerify.mockResolvedValue({
       token_use: 'access',
       sub: 'user123',
@@ -143,6 +143,10 @@ describe('/api/copilot/chat - JWT decoding', () => {
     expect(res._getStatusCode()).toBe(403);
     const data = JSON.parse(res._getData());
     expect(data.error).toBe('Access not provisioned');
+    expect(data.message).toBe(
+      'Your account is not provisioned for access. Contact an administrator to be granted access.'
+    );
+    expect(JSON.stringify(data)).not.toMatch(/approv/i);
 
   });
 

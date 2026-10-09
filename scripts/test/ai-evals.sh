@@ -36,7 +36,7 @@ fi
 
 if [ -z "${GBAW_TEST_ACCESS_TOKEN:-}" ]; then
     echo -e "${RED}❌ GBAW_TEST_ACCESS_TOKEN is required for JWT-authorized deployed AI evals${NC}"
-    echo -e "${BLUE}💡 Export a short-lived Cognito access token for an approved test user${NC}"
+    echo -e "${BLUE}💡 Export a short-lived Cognito access token for a provisioned test user (in the admin or users group)${NC}"
     exit 1
 fi
 
