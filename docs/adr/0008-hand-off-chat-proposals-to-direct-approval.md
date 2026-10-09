@@ -44,71 +44,143 @@ In the current hosted design a single Cognito **access token** is forwarded by
 the chat path to the AgentCore runtime
 ([`ui/src/pages/api/copilot/chat.ts`](../../ui/src/pages/api/copilot/chat.ts),
 Authorization bearer; the runtime reads the raw header from its request
-context). The E2 operations HTTP API authorizer is configured to accept the
-**same** Cognito app-client audience. The AgentCore chat role holds no IAM
-permission for the operations stack, but a forwarded bearer token is itself a
-usable credential: runtime code that can make an authenticated HTTP call could
-replay that token against `POST /operations/prepare` and `/cancel`, and for an
-`admin` user against `/approve` and `/reject` on another requester's pending
-operation. IAM separation does not close this; token-audience separation does.
+context). As built on the E1/E2 branches, every operations HTTP API authorizer
+is configured to accept the **same** Cognito app-client audience. The AgentCore
+chat role holds no IAM permission for the operations stack, but a forwarded
+bearer token is itself a usable credential: runtime code that can make an
+authenticated HTTP call could replay that token against
+`POST /operations/prepare` and `/cancel`, and for an `admin` user against
+`/approve` and `/reject` on another requester's pending operation. As the E3 and
+E4 branches add the dispatch and control-plane APIs under the same shared
+audience, that same forwarded token would also reach
+`POST /operations/{operationId}/dispatch` and `POST /operations/control` (the
+kill switch) for an admin. IAM separation does not close this; token-audience
+separation does.
 
 Decision 1 therefore makes token-audience separation a **blocker** of E2
 proposal activation (#441), and this record stops asserting that the chat
 runtime holds "no credential" until that separation is implemented. The same
-residual already applies to the E1 read-only observation API today, because it
-shares the same authorizer audience, and the same mechanism closes both.
+residual already applies to the read-only observation routes as built on the
+E1/E2 branches, because they share the same authorizer audience, and the same
+mechanism closes all of them.
 
 ## Decision
 
 ### 1. The operations API must accept only a token the chat runtime never receives
 
-The operations HTTP API (observe, prepare, approve, reject, cancel, and the
-evidence read) MUST authorize only a bearer token whose audience or scope the
-chat-forwarded token cannot carry. This is a **blocker of E2 proposal
-activation (#441)** and also closes the equivalent residual on the E1
-observation API deployed under the same authorizer today.
+**Every** operations HTTP API MUST authorize only a bearer token whose audience
+the chat-forwarded token cannot carry. The operations stack is three separate
+API Gateway HTTP APIs, each with its own Cognito JWT authorizer, and the chat
+token is accepted by all three:
 
-**Chosen mechanism — a separate operations Cognito app client (audience),
-obtained server-side by the frontend through the OAuth 2.0 authorization-code
-grant with PKCE.**
+- the E1/E2 action API — observe, prepare, approve, reject, cancel, and the
+  evidence read;
+- the E3 dispatch API — `POST /operations/{operationId}/dispatch`, an admin
+  action that starts the approved workflow;
+- the E4 control-plane API — capabilities, list, detail, and
+  `POST /operations/control` (the kill switch), whose handler additionally
+  requires the token's `client_id` to equal the authorizer's trusted audience.
 
-- A second Cognito app client is provisioned for the operations API. The E2/E1
-  API Gateway JWT authorizer lists **only** that operations client in its
-  `Audience`; the AgentCore authorizer keeps **only** the existing chat client.
-  A token minted for the chat client is rejected (401) by every operations
-  route, and a token minted for the operations client is never forwarded to the
-  AgentCore runtime.
-- The frontend already signs the user in to the chat client with SRP via
-  `amazon-cognito-identity-js`. To obtain the operations-audience token without
-  exposing it to the browser, the trusted frontend server performs a server-side
-  OAuth 2.0 authorization-code exchange with PKCE against the Cognito
-  [managed login / Hosted UI](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-app-integration.html)
-  `/oauth2/authorize` and `/oauth2/token` endpoints for the operations client,
-  using the user's existing authenticated Cognito session, and keeps the
-  resulting access token server-side in an `HttpOnly`, `Secure`, `SameSite=Lax`
-  cookie scoped to the operations proxies. Browser JavaScript never receives
-  either token. The authorization-code grant with PKCE is Cognito's documented
-  flow for a confidential/public web client obtaining tokens via the managed
-  login endpoints; it works on the user pool's standard feature plan and adds no
-  per-feature plan cost beyond user-pool MAU pricing.
-- **Trade-offs.** This adds a managed-login/Hosted-UI domain and a second app
-  client to the base stack, and a short server-side code-exchange step on first
-  operations use. It introduces no token into the browser and no new per-request
-  cost. It is reversible: removing the operations client and its proxies returns
-  the deployment to chat-only.
+Each authorizer's audience and each handler's trusted audience
+(`GBAW_OPERATIONS_TRUSTED_AUDIENCE`) default to the single `CognitoClientId` the
+operator supplies, so a chat-forwarded admin token reaches dispatch and the kill
+switch as well as prepare. This decision is a **blocker of E2 proposal
+activation (#441)** and also closes the equivalent residual on the read-only
+observation routes, which share the same authorizer audience.
+
+**Chosen mechanism — a separate, confidential operations Cognito app client
+(audience) whose token the frontend server obtains without the operations
+client's own credentials from within a managed-login session.**
+
+- A second Cognito app client is provisioned for the operations API. **Every**
+  operations JWT authorizer (E1/E2 action, E3 dispatch, E4 control plane) lists
+  **only** that operations client in its `Audience`, and every handler that
+  checks a trusted audience (the E4 control handler) is given the operations
+  client. The AgentCore authorizer keeps **only** the existing chat client. A
+  token minted for the chat client is rejected (401) by every operations route —
+  action, dispatch, and control — and a token minted for the operations client
+  is never forwarded to the AgentCore runtime.
+- The `deploy-operations-observation`, `deploy-operations-execution`, and
+  `deploy-operations-control-plane` shell scripts and their PowerShell
+  counterparts take the authorizer audience and the trusted audience from
+  operator input (`CognitoClientId`); they MUST be given the operations client
+  ID, not the chat client ID.
+- **Every** operator-console proxy moves to the operations token. The
+  console proxies that today forward the chat client's access token
+  ([`ui/src/operations/proxyAuth.ts`](../../ui/src/operations/proxyAuth.ts))
+  — including the existing cancel proxy and the capability-discovery proxy —
+  read the server-side operations cookie instead. Moving only the E1/E2
+  authorizer would break the existing console cancel proxy, which forwards the
+  chat token.
+- **Obtaining the operations token (chosen path (b)): move the application's
+  primary sign-in to Cognito managed login.** Cognito's `/oauth2/authorize`
+  endpoint is an interactive browser redirect, and its managed-login session
+  cookie is set only when the user signs in through the login pages; a refresh
+  token works only with the client that issued it. An SRP sign-in through
+  `amazon-cognito-identity-js` creates no managed-login session, so no token for
+  a second client can be obtained from it silently. The application therefore
+  moves its primary sign-in from in-browser SRP to managed login using the
+  authorization-code grant with PKCE for the **chat** client, completed by the
+  frontend server. Within that one-hour managed-login session the server then
+  runs an authorization-code + PKCE exchange for the separate **operations**
+  client (using `prompt=none` where the managed-login branding version supports
+  it, so no second credential prompt is shown), and keeps the operations access
+  and refresh tokens server-side in `HttpOnly`, `Secure`, `SameSite=Lax` cookies
+  scoped to the operations proxies. Neither client's tokens reach browser
+  JavaScript.
+- **Consequences of path (b).** It requires the managed-login branding version
+  (available on the Essentials plan, which the base user pool already defaults
+  to), a managed-login domain, callback and logout routes, and replaces
+  `CognitoAuth.tsx` and the `/api/auth/login` and `/api/auth/refresh` token
+  posting. Logout must call Cognito `/logout`. It must be coordinated with the
+  Cloudscape app-frame work
+  ([#548](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/548)),
+  which rebuilds the sign-in experience. As a side benefit, both clients' tokens
+  stay out of browser JavaScript.
+- **Acceptable interim (path (a)).** If activation (#441) precedes the sign-in
+  change, the operations client may instead use a step-up interactive sign-in at
+  first operations use: the browser is redirected to managed login for the
+  operations client, the user signs in there, and the frontend server keeps the
+  operations client's own refresh token server-side in an `HttpOnly` cookie to
+  mint subsequent operations access tokens. This works with the hosted login on
+  the pool's default plan.
+- **For whichever path runs.** The operations refresh token is bound to the
+  operations client, stored `HttpOnly`, and revoked on logout. The OAuth `state`
+  value and the PKCE verifier are bound to the existing session. The operations
+  proxies require the operations token's `sub` to equal the verified chat
+  session's `sub`, so a step-up sign-in cannot authorize as a different account.
+- **The operations app client is confidential.** Its secret lives only on the
+  frontend server, and its allowed OAuth flows are limited to authorization code
+  and refresh. A public operations client would let any pool user run the
+  authorize flow in their own browser and redeem the code with their own PKCE
+  verifier, which would make `requester.client_id` mean "some holder of an
+  operations token" rather than "the trusted proposal proxy"; a confidential
+  client is what makes `client_id` attribution (decision 9) meaningful.
+- **Trade-offs.** Path (b) adds a managed-login domain, a second confidential
+  app client, callback and logout routes, and replaces the SRP sign-in UI; it
+  removes both clients' tokens from the browser. Path (a) is smaller but leaves
+  the chat tokens in browser storage and shows a second sign-in. Both are
+  reversible: removing the operations client and its proxies returns the
+  deployment to chat-only.
 
 **Alternatives (recorded, not chosen):**
 
 - **A required custom OAuth scope on the operations routes
-  (`AuthorizationScopes`), carried only by the operations token.** For the chat
-  SRP sign-in to carry a custom scope on its **access** token would require a
-  pre-token-generation Lambda trigger (V2) that customizes the access token.
-  Access-token customization is a Cognito **Plus feature-plan** capability and
-  bills per monthly active user at the Plus tier, so it raises the user-pool
-  cost. It is also the wrong shape here: the goal is that the chat token
-  **cannot** carry the operations entitlement, which a separate audience
-  expresses directly without a Lambda. Rejected as the primary mechanism for
-  cost and because audience separation is a cleaner invariant.
+  (`AuthorizationScopes`), carried only by the operations token.** Tokens issued
+  through `InitiateAuth` (the SRP sign-in) never carry custom scopes, so the
+  chat token already cannot carry an operations scope; the hard part is issuing a
+  token that **does** carry one, which needs the same move to a managed-login
+  authorization-code flow as audience separation. Carrying a custom claim on the
+  access token would also require a pre-token-generation Lambda trigger (V2);
+  access-token customization needs the Essentials or Plus feature plan, and the
+  base pool already defaults to Essentials, so this adds no plan change — but it
+  is the wrong shape, because the goal is that the chat token **cannot** carry
+  the operations entitlement, which a separate audience expresses directly
+  without a Lambda. Rejected because audience separation is a cleaner invariant.
+- **A second SRP authentication against the operations client in the browser
+  (path (c)).** Rejected: the operations tokens would then pass through browser
+  JavaScript and the library's `localStorage` cache, contradicting this record's
+  property that neither client's tokens reach the browser.
 - **Accept the residual and compensate.** Keep one audience and rely on: the raw
   token never being exposed to tools or the model, no generic authenticated-HTTP
   tool existing in the runtime, and restricted runtime egress. Rejected: these
@@ -119,9 +191,10 @@ grant with PKCE.**
   list those compensating controls instead of "closed".
 
 Until decision 1 is implemented, the chat runtime **does** hold a bearer token
-the operations API accepts. This record and the threat model state that plainly
-and track it as OP-H7 with a live exercise (a token captured at the AgentCore
-boundary is rejected (401) by every operations route).
+every operations API accepts. This record and the threat model state that
+plainly and track it as OP-H7 with a live exercise (a token captured at the
+AgentCore boundary is rejected (401) by every operations route — action,
+dispatch, and control).
 
 ### 2. The trusted frontend server proxy submits the proposal
 
@@ -143,11 +216,11 @@ continues to hold for the chat runtime until #441 activation.
 The proxy derives the requester identity from the verified operations access
 token and reads `cognito:groups` from that **access** token (not an ID token),
 consistent with [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md#approval-identity).
-It requires the server-owned proposer group `operations-proposer` (decision 3),
+It requires the server-owned proposer group `operations-proposer` (decision 4),
 enforces same-origin writes, rejects redirects, bounds response bytes, and
 rate-limits per subject. The proxy group check is UI defense in depth; the
 authoritative proposer decision is server-owned in the application service
-(decision 3).
+(decision 4).
 
 ### 3. Model output becomes a typed, untrusted proposal through a fenced contract
 
@@ -174,7 +247,7 @@ versioned, fail-closed fenced contract, mirroring
   the conversation. The proposal proxy therefore calls `POST /operations/observe`
   for the confirmed target fleet and location, obtains a succeeded, unexpired,
   workspace-scoped observation, and uses **that** `observation_id`. Neither
-  `observation_id` nor the idempotency token (decision 4) is ever taken from
+  `observation_id` nor the idempotency token (decision 8) is ever taken from
   model output or a request-body field.
 - **One explicit user gesture, no auto-submit.** Trusted UI code renders a
   confirmation card from the fence values **and** the trusted current state from
@@ -188,7 +261,7 @@ versioned, fail-closed fenced contract, mirroring
 
 The proxy maps the confirmed fields to the versioned
 `gamelift-capacity-proposal-request` body plus the proxy-obtained
-`observation_id` (decision 1 of M1 below). The `PrepareOrchestrator` enforces
+`observation_id` (see Contract Impact). The `PrepareOrchestrator` enforces
 the exact key set, recomputes advice from the trusted current-state read,
 selects the playbook in code, binds identity from the verified principal, and
 stores one immutable prepared operation with its canonical hash. Free text never
@@ -229,9 +302,11 @@ child issue:
 Approval is a direct, authenticated UI or API action outside the chat and model
 tool path. After a successful preparation the proxy returns the `operation_id`
 and reads the stored preview from `GET /operations/{operationId}`, whose
-response carries `{operation_contract_version, operation_id, decision,
-prepared_hash, persisted, replayed}` and the bounded evidence record (there is
-no preview field on the prepare response itself). Trusted UI code deep-links the
+response carries `{evidence_contract_version, operation_id, state, prepared_hash,
+preview, approval, ledger, handoff}`, where `preview` holds the action, target,
+requested triple, risk, authority, and expiry (the prepare response itself has
+no preview field; its fields are `{operation_contract_version, operation_id,
+decision, prepared_hash, persisted, replayed}`). Trusted UI code deep-links the
 user to the operator approval view planned in
 [#554](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/554),
 which loads the preview from the immutable record by ID and renders the action,
@@ -261,9 +336,9 @@ bindings. The frontend chat path binds `GBAW_TENANT_ID` and `GBAW_WORKSPACE_ID`;
 the operations API binds `GBAW_OPERATIONS_TENANT_ID` and
 `GBAW_OPERATIONS_WORKSPACE_ID`. The proposal proxy sends **no** tenant or
 workspace in the body; the operations API resolves both from its own bindings.
-`validate-deployment.sh` should check that the chat and operations tenant and
-workspace bindings are equal in a single-workspace deployment, or the record
-must state that they are intentionally independent. The operations API reads
+`validate-deployment.sh` checks that the chat and operations tenant and
+workspace bindings are equal in a single-workspace deployment. The operations
+API reads
 identity solely from its API Gateway JWT authorizer context, never from the
 body, query string, or a custom header. Request-body fields, CopilotKit data,
 chat text, model output, tool arguments, and browser-supplied identity cannot
@@ -277,12 +352,16 @@ the approve route, and separation of duties follows the server-owned policy in
 The frontend discovers operations availability from the existing
 `operations-capability-discovery` 1.0 contract, which exposes per-capability
 `enabled`, `effective_authority`, and `phases.prepare`. Trusted UI code renders
-the proposal and in-chat affordance only when
-`capabilities["gamelift.capacity-adjustment"].phases.prepare === true`.
+the proposal and in-chat affordance only when the discovery `capabilities`
+array contains an entry whose `capability_id` is `gamelift.capacity-adjustment`
+with `phases.prepare === true`.
 Discovery is served from the control-plane base (`GBAW_OPERATIONS_API_BASE_URL`)
-through an admin-only proxy; an E2-only (`advise`) deployment without the E4
-discovery control plane therefore never renders the affordance, which is the
-intended fail-closed dependency. A trusted UI notice — not model output — tells
+through a proposer-scoped proxy: the `operations-proposer` group may read
+capability discovery (not only `admin`), so a non-admin proposer sees the
+affordance for which it is authorized. The proposer-scoped discovery proxy is
+part of the proposal-proxy child issue (child 2). An E2-only (`advise`)
+deployment without the E4 discovery control plane therefore never renders the
+affordance, which is the intended fail-closed dependency. A trusted UI notice — not model output — tells
 the user that the assistant can describe but not start a change, and the prompt
 directive (decision 3) tells the model it never starts a change itself; the
 runtime is not told operations availability and should not be. A hidden or stale
@@ -294,11 +373,15 @@ provisioned-but-disabled stack throttles its API stage to zero.
 ### 8. Submission idempotency
 
 The trusted confirmation component mints a CSPRNG idempotency token
-(`idem_` followed by 20–128 URL-safe characters, matching
-`^idem_[A-Za-z0-9_-]{20,128}$`, with at least 128 bits of entropy) when the
-confirmation card is created, and the proxy forwards it unchanged; a transport
-retry reuses the same token. The token is never derived from proposal fields or
-model output. The operations API enforces workspace-scoped idempotency: a
+(`idem_` followed by at least 22 URL-safe characters, within the contract
+pattern `^idem_[A-Za-z0-9_-]{20,128}$`) when the confirmation card is created,
+and the proxy forwards it unchanged; a transport retry reuses the same token. At
+least 22 base64url characters are minted because 20 give only about 120 bits,
+below the 128-bit floor. The token is never derived from proposal fields or
+model output. The confirmation component mints a **new** token when the user
+edits the proposed fields after a definitive failure, so an edited intent is not
+submitted under a token already bound to the earlier intent. The operations API
+enforces workspace-scoped idempotency: a
 byte-identical retry under the same token replays the stored operation, and a
 changed intent under the same token fails with `IDEMPOTENCY_CONFLICT`
 ([Operations Contracts](../OPERATIONS_CONTRACTS.md#workflow-identity-and-idempotency)).
@@ -329,8 +412,12 @@ which does not distinguish a chat-originated, human-confirmed proposal from a
 console one. The chosen attribution signal is the distinct operations app
 `client_id` from decision 1, which lands in `requester.client_id` on the
 operation; a chat-originated submission therefore carries the operations client
-rather than any body field. Changing `recommendation.source_type` semantics
-would require a new contract version and is not adopted here.
+rather than any body field. This signal is meaningful only because the
+operations app client is **confidential** (decision 1): a public client would
+let any pool user mint an operations token in their own browser, so
+`requester.client_id` would mean "some holder of an operations token" rather
+than "the trusted proposal proxy". Changing `recommendation.source_type`
+semantics would require a new contract version and is not adopted here.
 
 ## Preserved Invariants
 
@@ -391,15 +478,31 @@ with blockers is satisfied by the children below. The ADR is Proposed; a
 maintainer accepts it and files these as issues, so the PR is **Part of #555**,
 not Closes.
 
-1. **Operations token-audience separation (blocker of E2 activation #441).**
-   Second Cognito app client for the operations API; E2/E1 authorizer audience
-   lists only that client; server-side authorization-code + PKCE exchange and
-   `HttpOnly` operations cookie; AgentCore authorizer keeps only the chat client.
-   Blockers: base-stack app-client and managed-login domain; #441.
+1. **Operations token-audience separation (blocks E2 activation #441).** A
+   second, **confidential** Cognito app client for the operations API; **every**
+   operations JWT authorizer (E1/E2 action, E3 dispatch, E4 control plane) and
+   every handler trusted audience (`GBAW_OPERATIONS_TRUSTED_AUDIENCE`, the E4
+   control handler) lists only that client; the `deploy-operations-observation`,
+   `deploy-operations-execution`, and `deploy-operations-control-plane` shell and
+   PowerShell wrappers that take `CognitoClientId` are given the operations
+   client ID; every operator-console proxy (including the existing cancel proxy
+   and the discovery proxy) moves to the server-side operations token; the
+   AgentCore authorizer keeps only the chat client. Primary sign-in moves to
+   Cognito managed login (authorization-code + PKCE for the chat client), and the
+   frontend server obtains the operations client's token within that session
+   (`prompt=none` where available), keeping both tokens off browser JavaScript;
+   the operations refresh token is client-bound, `HttpOnly`, revoked on logout,
+   and the proxy requires the operations token's `sub` to equal the chat
+   session's `sub`. Blockers: a base-stack confidential operations app client, a
+   managed-login domain, callback and logout routes, the managed-login branding
+   version (Essentials default), and coordination with the Cloudscape sign-in
+   rebuild (#548). This child blocks #441; it is not blocked by it.
 2. **Proposal proxy.** Server-side submit-to-prepare proxy that observes first,
    forwards the operations token and the CSPRNG idempotency token, enforces
-   same-origin and the proposer-group defense-in-depth check.
-   Blockers: child 1; the E4 admin-only discovery proxy; #554 proxy tier parity.
+   same-origin and the proposer-group defense-in-depth check; includes the
+   proposer-scoped capability-discovery proxy that lets the `operations-proposer`
+   group read discovery.
+   Blockers: child 1; #554 proxy tier parity.
 3. **Proposal fence and confirmation card.** The versioned `proposal` fence,
    its shared frontend validator (fail closed), the confirmation card showing
    server-observed current state, one-gesture submit, and `denied` rendering.
@@ -422,9 +525,12 @@ not Closes.
 
 ## Consequences
 
-- Closing the shared-token exposure (decision 1) adds a second Cognito app
-  client, a managed-login domain, and a server-side token exchange, and also
-  closes the equivalent residual on the E1 read-only observation API.
+- Closing the shared-token exposure (decision 1) adds a second confidential
+  Cognito app client, a managed-login domain, callback and logout routes, moves
+  the primary sign-in to managed login (coordinated with #548), moves every
+  operator-console proxy to the operations token, and covers all three
+  operations authorizers (action, dispatch, control). It also closes the
+  equivalent residual on the read-only observation routes.
 - The handoff reuses the trusted frontend proxy tier and the #554 approval view,
   so no new service and no new trust boundary type is introduced; a single new
   trust boundary (chat proposal submission) is added to the threat model.
@@ -477,8 +583,9 @@ not Closes.
   #429 forbids. A governed public MCP facade remains a separate, remote-client
   decision under ADR 0004, not the chat handoff.
 - **A required custom access-token scope on the operations routes.** Rejected as
-  the primary mechanism (recorded under decision 1): carrying a custom scope on
-  the SRP access token needs a pre-token-generation Lambda V2 access-token
-  customization, a Cognito Plus feature-plan capability billed per MAU, and
+  the primary mechanism (recorded under decision 1): tokens from the SRP
+  `InitiateAuth` sign-in never carry custom scopes, carrying a custom claim on
+  the access token needs a pre-token-generation Lambda V2 (available on the
+  Essentials or Plus feature plan, which the base pool already defaults to), and
   audience separation expresses the "chat token cannot carry it" invariant more
   directly.
