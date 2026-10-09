@@ -9,12 +9,17 @@ MCP operation logging and error classification capabilities.
 import json
 import os
 import sys
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 # Third-party packages
 from loguru import logger
+
+if TYPE_CHECKING:
+    # Third-party packages
+    from loguru import Record
 
 # Local modules
 from config import settings
@@ -31,13 +36,52 @@ _STDOUT_LEVEL = "DEBUG" if _DEBUG_LOGGING else settings.LOG_LEVEL
 # Configure logger with more detailed formatting
 logger.remove()  # Remove default handler
 
+
+# Per-request correlation ID, read by the sink patcher so every record emitted
+# while handling one request carries the same ID without each call site passing
+# it. The AgentCore entrypoint sets it to the runtime request ID at the start of
+# an invocation; outside a request it stays at the default.
+_REQUEST_ID_VAR: "ContextVar[str]" = ContextVar("gbaw_log_request_id", default="-")
+
+
+def _sink_patcher(record: "Record") -> None:
+    """Normalize every record at the sink boundary.
+
+    Two invariants are enforced for all handlers, regardless of the call site:
+
+    * ``message`` has carriage returns, line feeds, and other control characters
+      collapsed to a single space, so an externally influenced value interpolated
+      into any log statement cannot forge an additional log line. This is the
+      single backend choke point for CR/LF normalization, so individual call
+      sites do not each have to sanitize.
+    * ``extra["request_id"]`` always exists, so the stdout format can reference
+      ``{extra[request_id]}`` without a per-call ``KeyError``. The entrypoint
+      binds the real AgentCore request ID for the duration of an invocation;
+      outside a request it is ``-``.
+    """
+    # Imported lazily to avoid a circular import at module load (security imports
+    # the logger).
+    # Local modules
+    from utils.security import normalize_log_value
+
+    record["message"] = normalize_log_value(record["message"])
+    record["extra"].setdefault("request_id", _REQUEST_ID_VAR.get())
+
+
+logger.configure(patcher=_sink_patcher)
+
 # ALWAYS log to stdout (ADOT will capture it). In production: honor LOG_LEVEL
 # (default INFO) and disable diagnose/backtrace so exception logs can't dump
-# local variable values (credentials, tokens, prompts) into CloudWatch.
+# local variable values (credentials, tokens, prompts) into CloudWatch. The
+# request-ID field is bound per request at the entrypoint so lines from one
+# invocation can be correlated without emitting any raw identifier.
 logger.add(
     sys.stdout,
     level=_STDOUT_LEVEL,
-    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+    format=(
+        "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
+        "{name}:{function}:{line} | req={extra[request_id]} | {message}"
+    ),
     backtrace=_DEBUG_LOGGING,
     diagnose=_DEBUG_LOGGING,
 )
@@ -225,6 +269,7 @@ def log_mcp_health_check(server_type: str, status: str, metrics: Dict[str, Any])
 
 __all__ = [
     "logger",
+    "_REQUEST_ID_VAR",
     "log_mcp_operation",
     "log_mcp_error",
     "log_mcp_performance",

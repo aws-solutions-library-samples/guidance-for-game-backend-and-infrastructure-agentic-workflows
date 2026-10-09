@@ -23,6 +23,7 @@ from cachetools import TTLCache
 # Local modules
 from config.settings import AWS_REGION, BEDROCK_AGENTCORE_MEMORY_ID, BOTO3_CLIENT_CONFIG
 from utils.logger import logger
+from utils.security import log_sanitized_exception
 
 # Module-level boto3 client cache for performance
 _memory_client = None
@@ -95,8 +96,9 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
     try:
         client = _get_memory_client()
         request_id = str(uuid.uuid4())
+        short_request_id = request_id[:8]
 
-        logger.info("💾 Saving semantic memory record")
+        logger.info(f"💾 Saving semantic memory record (req {short_request_id})")
 
         # Create memory record using AWS SDK
         response = client.batch_create_memory_records(
@@ -113,11 +115,15 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
 
         # Mark as saved after successful API call
         _mark_memory_saved(actor_id, content)
-        logger.info("✅ Semantic memory saved")
+        logger.info(f"✅ Semantic memory saved (req {short_request_id})")
         return True
 
     except Exception as e:
-        logger.opt(exception=e).error(f"❌ Failed to save semantic memory ({type(e).__name__})")
+        # Record only the exception class and a sanitized error code. The raw
+        # message is withheld: an AgentCore Memory validation error can quote the
+        # record text or actor namespace, which are exactly the values this
+        # function must keep out of logs.
+        log_sanitized_exception(logger, "❌ Failed to save semantic memory", e)
         return False
 
 
@@ -419,6 +425,6 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
                     extracted_any = True
 
     if extracted_any:
-        logger.info(f"📝 Extracted and persisted {saved_count} user info fact(s)")
+        logger.info(f"📝 Extracted and saved-or-already-present {saved_count} user info fact(s)")
     else:
         logger.debug("ℹ️ No user info patterns matched")

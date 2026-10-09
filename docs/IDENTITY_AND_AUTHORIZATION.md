@@ -148,30 +148,45 @@ operation outcomes only. They do not contain prompt text, extracted names,
 semantic-memory content, email addresses, display names, raw Cognito subjects,
 or raw session/thread identifiers.
 
-- Correlation uses a per-request ID. Where a log line must stay tied to a
-  specific principal or session across lines, it carries a bounded,
-  non-reversible token rather than the raw value: the backend uses
-  `redact_identifier()` in `backend/src/utils/security.py` (a salted SHA-256
-  prefix keyed by `GBAW_LOG_REDACTION_SALT`, random per process when unset) and
-  the frontend uses `redact()` in `ui/src/utils/logger.ts`.
+- Correlation uses a per-request ID. The backend binds the AgentCore runtime
+  request ID into every log record for the duration of an invocation. Where a
+  log line must stay tied to a specific principal or session across lines, it
+  carries a bounded, non-reversible token rather than the raw value: the backend
+  uses `redact_identifier()` in `backend/src/utils/security.py` (a keyed
+  HMAC-SHA-256 prefix over a random per-process key) and the frontend uses
+  `redact()` in `ui/src/utils/logger.ts`. The HMAC key is random per process and
+  is never read from the environment, so a token is stable only within a single
+  process and does not correlate across processes, restarts, or tiers. The
+  frontend also logs the runtime's own request ID from the `x-amzn-RequestId`
+  response header so a request can be followed across tiers.
 - Every externally influenced log field is normalized before emission so
-  carriage returns, line feeds, and other control characters cannot create
-  additional log records. The backend normalizes through
-  `normalize_log_value()` / `sanitize_log_data()`; the frontend logger strips
-  control characters in `logInfo`, `logError`, `logWarning`, `logDebug`, and
-  `redact`.
+  carriage returns, line feeds, other C0/C1/DEL control characters, the Unicode
+  line and paragraph separators, and bidirectional-formatting controls cannot
+  create additional log records or reorder a rendered line. The backend
+  normalizes every record once at the logging sink (the logger patcher applies
+  `normalize_log_value()`); the frontend logger strips the same classes in
+  `logInfo`, `logError`, `logWarning`, `logDebug`, and `redact`.
+- The AgentCore SDK's own log handler would otherwise emit the raw runtime
+  session ID on every invocation; `agentcore_main` wraps its formatter so the
+  serialized `sessionId` is replaced with a bounded token while `requestId` is
+  kept.
 - Semantic-memory logging records only outcomes and counts, never extracted
   names, memory content, or raw actor identifiers.
-- Error logs preserve the exception class and a traceback via Loguru's
-  exception API with `diagnose=False`, so local variable values (prompts,
-  tokens, identifiers) and provider error payloads are not disclosed.
-  Authentication errors are generic to clients and logs. Prepared operations
-  and executor payloads must not contain tokens, email addresses, or display
-  names.
+- Error logs record the exception class name and a typed, sanitized error code
+  (plus the request ID), never the exception message — a provider or SDK error
+  body can quote caller values. The full traceback is emitted only when debug
+  logging is explicitly enabled (a non-production switch). Authentication errors
+  are generic to clients and logs. The Cost Explorer diagnostic path is a
+  deliberate, separately governed exception that retains the exception message
+  to classify Cost Explorer failures and does not carry prompt or identity
+  values. Prepared operations and executor payloads must not contain tokens,
+  email addresses, or display names.
 
 A static regression test
-(`backend/tests/unit/test_log_static_regression_unit.py`) scans the high-risk
-call sites so a future prompt/identity/session log is caught in review.
+(`backend/tests/unit/test_log_static_regression_unit.py`) scans every module in
+`backend/src` so a future prompt/identity/session log is caught in review, and
+includes self-tests over known bypass shapes so the guard cannot quietly stop
+working.
 
 ## References
 
