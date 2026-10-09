@@ -49,7 +49,9 @@ function Invoke-GameAgentKBSeed {
 
     # Upload docs
     Write-GameAgentStatus "Uploading $KBName documentation..." -Type Info
-    & aws s3 sync $docsDir "s3://$bucket/$KBName/" --region $Region --exclude '.*' @ProfileArgs
+    # --delete keeps the prefix identical to the generated sources, so a source
+    # removed from scrape_aws_docs.py also leaves the Knowledge Base.
+    & aws s3 sync $docsDir "s3://$bucket/$KBName/" --region $Region --exclude '.*' --delete @ProfileArgs
     if ($LASTEXITCODE -ne 0) { throw 'Failed to upload documents to S3' }
 
     # Start ingestion

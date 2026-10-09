@@ -75,9 +75,12 @@ fi
 
 # Upload documentation
 echo "📤 Uploading GameLift documentation..."
+# --delete keeps the gamelift/ prefix identical to the generated sources, so a
+# source removed from scrape_aws_docs.py also leaves the Knowledge Base.
 if ! aws s3 sync "$DOCS_DIR" "s3://$BUCKET_NAME/gamelift/" \
   --region "$REGION" \
-  --exclude ".*"; then
+  --exclude ".*" \
+  --delete; then
   echo "❌ Failed to upload documents to S3"
   exit 1
 fi
