@@ -803,6 +803,85 @@ def test_terminal_failed_replay_is_not_retryable_and_reruns_nothing() -> None:
     assert store.complete_calls == []
 
 
+@pytest.mark.parametrize(
+    ("stored_reason", "expected_code", "expected_retryable"),
+    [
+        ("not_found", ObservationErrorCode.NOT_FOUND, False),
+        ("contract_invalid", ObservationErrorCode.CONTRACT_INVALID, False),
+        ("provider_contract_invalid", ObservationErrorCode.INTERNAL_ERROR, False),
+        ("provider_unavailable", ObservationErrorCode.PROVIDER_UNAVAILABLE, False),
+    ],
+)
+def test_terminal_failed_replay_maps_the_stored_reason_to_the_first_responses_code(
+    stored_reason: str, expected_code: ObservationErrorCode, expected_retryable: bool
+) -> None:
+    # A same-token retry after a terminal failure replays the SAME typed code the
+    # first response returned, not a blanket PROVIDER_UNAVAILABLE. The stored
+    # bounded failure reason drives the code so a lost 404/400/500 does not
+    # become a 503 on retry.
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_FAILED)
+    store.failure_reason = stored_reason
+    service, reader, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is expected_code
+    assert exc.value.retryable is expected_retryable
+    assert reader.calls == []
+    assert store.complete_calls == []
+
+
+def test_terminal_failed_replay_without_a_stored_reason_is_provider_unavailable() -> None:
+    # An older record with no stored reason falls back to the non-retryable
+    # provider-unavailable terminal response.
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_FAILED)
+    store.failure_reason = None
+    service, _, _, _ = _service(store=store)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is False
+
+
+# --- Budget spent during begin, before the first read (minor) --------------
+
+
+def test_budget_spent_during_begin_is_retryable_without_a_terminal_record() -> None:
+    # If begin itself consumes the request budget (a slow conflict/reclaim
+    # chain), the service returns the retryable budget error BEFORE the first
+    # read, without burning the token on a terminal provider failure. No read
+    # runs and no fail transition is recorded.
+    mono = {"t": 0.0}
+
+    def monotonic() -> float:
+        return mono["t"]
+
+    class SlowBeginStore(FakeStore):
+        def begin_observation(self, **kwargs: Any) -> ObservationBegin:
+            # begin advances the monotonic clock past the whole-request deadline.
+            mono["t"] += 20.0
+            return super().begin_observation(**kwargs)
+
+    store = SlowBeginStore(begin=ObservationBeginOutcome.CREATED)
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe"})
+    service = ObservationService(
+        settings=settings,
+        identity_boundary=_boundary(),
+        reader=FakeReader(),
+        store=store,
+        clock=lambda: NOW,
+        monotonic=monotonic,
+        operation_id_factory=lambda: OPERATION_ID,
+        metrics=RecordingMetrics(),
+    )
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is True
+    assert store.fail_calls == []  # the token is not burned terminally
+    assert store.complete_calls == []
+    assert service._reader.calls == []  # no provider read ran
+
+
 def test_new_idempotency_token_after_terminal_failure_starts_new_operation() -> None:
     # Documented behavior: a NEW idempotency token is a new fingerprint, so the
     # store creates a brand-new operation rather than replaying the failure.
@@ -974,22 +1053,80 @@ def test_provider_data_failing_contract_is_a_5xx_not_client_400() -> None:
 
 
 def test_metrics_failure_does_not_mask_the_typed_outcome() -> None:
-    class ExplodingMetrics(RecordingMetrics):
-        def record(self, name: str, value: float, *, dimensions: dict[str, str] | None = None) -> None:
-            super().record(name, value, dimensions=dimensions)
-            if name in ("observation.failed", "observation.timeout"):
-                raise RuntimeError("cloudwatch down")
+    # With the production-shaped sink that swallows CloudWatch errors, a metrics
+    # fault during a terminal failure never surfaces: the request raises ONLY the
+    # typed ObservationBoundaryError. The service also records the failed
+    # transition BEFORE emitting metrics, so the snapshot is never stranded.
+    # Local modules
+    from operations.observe.metrics import CloudWatchObservationMetrics
+
+    class RaisingCloudWatch:
+        def put_metric_data(self, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("cloudwatch down")
+
+    sink = CloudWatchObservationMetrics(client=RaisingCloudWatch(), namespace="GBAW/Operations")
 
     class BoomReader(FakeReader):
         def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
             raise RuntimeError("provider boom")
 
-    # The service records the failed transition BEFORE emitting metrics, so a
-    # metrics backend fault cannot strand the snapshot or replace the typed
-    # error. (With the CloudWatch sink the publish is swallowed; here the fake
-    # raises to prove the fail transition already happened.)
-    service, _, store, _ = _service(reader=BoomReader(), metrics=ExplodingMetrics())
-    with pytest.raises((ObservationBoundaryError, RuntimeError)):
+    service, _, store, _ = _service(reader=BoomReader(), metrics=sink)
+    with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
-    # The failed transition was recorded before the metrics raise.
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    # The failed transition was recorded before the metrics publish was attempted.
     assert len(store.fail_calls) == 1
+    # The sink swallowed the CloudWatch error and counted the drop.
+    assert sink.dropped == 1
+
+
+def test_commit_and_lease_deadlines_are_the_single_request_lease() -> None:
+    # The begin call carries commit_not_after == lease_not_after == NOW + the
+    # whole-request deadline (15 s with defaults), so the reclaim lease and the
+    # commit fence share one request-scoped horizon rather than a far-off window.
+    service, _, store, _ = _service()
+    service.observe(_request(), _context())
+    begin = store.begin_calls[0]
+    expected = NOW + timedelta(seconds=15)
+    assert begin["commit_not_after"] == expected
+    assert begin["lease_not_after"] == expected
+
+
+def test_cumulative_read_time_from_request_start_abandons_a_later_read() -> None:
+    # The per-read remaining budget is measured from the single request-entry
+    # clock, so time already spent earlier in the request counts against a later
+    # read. A read whose start is past the whole-request deadline is abandoned
+    # (never submitted to the provider) rather than run with a fresh full budget.
+    # monotonic calls: request_start(0), begin-check(0), read-check(0),
+    # read0 start(1)+elapsed(1), read1 start(2)+elapsed(2), read2 start(16) ->
+    # remaining_total = 15 - 16 < 0 so read2 is abandoned before it runs.
+    reader = FakeReader()
+    service, _, store, metrics = _service(
+        reader=reader,
+        monotonic_times=[0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 16.0, 16.0],
+    )
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert store.complete_calls == []
+    assert "observation.timeout" in metrics.names()
+    # The third read was abandoned before it was ever submitted to the provider:
+    # the earlier read time is charged against it via the request-entry clock.
+    assert reader.calls == ["utilization", "capacity"]
+
+
+def test_budget_spent_after_the_reads_is_retryable_with_no_complete() -> None:
+    # Time advances past the request deadline between the reads and the finalize
+    # transaction. The service returns a retryable 503 and never issues the
+    # complete, so the Lambda deadline cannot race the commit.
+    # monotonic calls: request_start, begin-check, read-check, then per read a
+    # call_start + call_elapsed (6), then the complete-check which is spent.
+    service, _, store, metrics = _service(
+        monotonic_times=[0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 13.0, 13.0],
+    )
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is True
+    assert store.complete_calls == []
+    assert "observation.timeout" in metrics.names()

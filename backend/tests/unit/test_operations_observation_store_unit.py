@@ -719,6 +719,89 @@ def test_reclaim_condition_expression_is_pinned() -> None:
     )
 
 
+def test_reclaim_update_expression_and_values_are_pinned() -> None:
+    # Golden assertions on the reclaim UpdateExpression and the :now / :new_lease
+    # values. The stateful fake applies updates from the value map and ignores
+    # the expression text, so these pin what a lease-advancing mutation would
+    # otherwise leave uncaught.
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    store = _store(client, clock=NOW)
+    _begin(store, operation_id="obs_" + "b" * 26)
+    update = next(e for e in client.transactions[-1] if "Update" in e)["Update"]
+    assert update["UpdateExpression"] == ("SET #gen = :new_gen, lease_holder = :holder, lease_not_after = :new_lease")
+    values = update["ExpressionAttributeValues"]
+    # :now is the store clock in epoch seconds; the lease fence is <= :now.
+    assert int(values[":now"]["N"]) == int(NOW.timestamp())
+    # :new_lease is the caller's own request lease (NOW + 15 s here), not the
+    # far-off commit deadline.
+    assert int(values[":new_lease"]["N"]) == int((NOW + timedelta(seconds=15)).timestamp())
+
+
+def test_reclaim_omits_client_request_token() -> None:
+    # The reclaim transaction carries NO ClientRequestToken: competing reclaimers
+    # that observed the same expired generation would otherwise derive the same
+    # deterministic token with different lease/holder/now values, which DynamoDB
+    # rejects as IdempotentParameterMismatch. The generation fence alone makes it
+    # idempotent.
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    store = _store(client, clock=NOW)
+    _begin(store, operation_id="obs_" + "b" * 26)
+    # The last transaction is the reclaim; its request token is None, while the
+    # seed begin carried a token.
+    assert client.request_tokens[-1] is None
+    assert client.request_tokens[0] is not None
+
+
+def test_reclaimed_lease_is_the_callers_lease_even_with_a_far_commit_deadline() -> None:
+    # When the commit deadline is far beyond the caller's request lease, the
+    # reclaimed lease is the caller's own request lease, so a reclaimer that dies
+    # frees the operation within one request lease rather than the whole commit
+    # window.
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    store = _store(client, clock=NOW)
+    reclaim = store.begin_observation(
+        operation_id="obs_" + "d" * 26,
+        idempotency_fingerprint=FINGERPRINT,
+        workspace_id=WORKSPACE,
+        idempotency_token=TOKEN,
+        lease_holder=HOLDER,
+        commit_not_after=NOW + timedelta(minutes=30),  # far beyond the lease
+        lease_not_after=NOW + timedelta(seconds=15),  # the caller's request lease
+        intent=INTENT,
+    )
+    assert reclaim.outcome is ObservationBeginOutcome.RECLAIMED
+    reclaimed_lease = int(client.items[(f"OP#{OPERATION_ID}", "STATE#current")]["lease_not_after"]["N"])
+    assert reclaimed_lease == int((NOW + timedelta(seconds=15)).timestamp())
+
+
+def test_begin_resolution_fails_closed_when_the_deadline_passes_between_subcalls() -> None:
+    # The conflict-resolution path makes several key lookups, each with its own
+    # wall-clock cost. If the request deadline passes between the idempotency
+    # mapping read and the snapshot read, the store fails closed with
+    # DEADLINE_EXPIRED rather than issuing another sub-call past the budget.
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW + timedelta(seconds=15)).timestamp()))
+    # A clock that advances on each call: the mapping read happens before the
+    # deadline, but the between-subcall check sees a time at/after it.
+    deadline = NOW + timedelta(seconds=5)
+    ticks = iter([NOW, NOW, deadline + timedelta(seconds=1), deadline + timedelta(seconds=2)])
+    store = DynamoDbObservationStore(client=client, table_name=TABLE, clock=lambda: next(ticks))
+    result = store.begin_observation(
+        operation_id="obs_" + "e" * 26,
+        idempotency_fingerprint=FINGERPRINT,
+        workspace_id=WORKSPACE,
+        idempotency_token=TOKEN,
+        lease_holder=HOLDER,
+        commit_not_after=deadline,
+        lease_not_after=deadline,
+        intent=INTENT,
+    )
+    assert result.outcome is ObservationBeginOutcome.DEADLINE_EXPIRED
+
+
 # --- Deterministic ClientRequestToken on every transaction -----------------
 
 

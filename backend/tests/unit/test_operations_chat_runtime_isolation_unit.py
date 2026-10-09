@@ -48,12 +48,25 @@ def _imported_modules(source: str) -> set[str]:
             modules.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
             modules.add(node.module)
+            # ``from pkg import name`` binds ``name``; if it is a submodule the
+            # dotted path is what the forbidden-prefix check must see, so record
+            # ``pkg.name`` for each imported name as well as the bare package.
+            modules.update(f"{node.module}.{alias.name}" for alias in node.names)
     return modules
 
 
 def test_chat_runtime_files_exist() -> None:
     files = _chat_runtime_files()
     assert any(path.name == "agentcore_main.py" for path in files), "chat entrypoint not found"
+
+
+def test_from_package_import_submodule_is_detected() -> None:
+    # ``from operations import observation`` binds the submodule ``observation``,
+    # so the scan must record ``operations.observation`` — not only the bare
+    # package ``operations`` — or a forbidden observe import slips through.
+    modules = _imported_modules("from operations import observation, claims\n")
+    assert "operations.observation" in modules
+    assert "operations.claims" in modules
 
 
 def test_chat_runtime_never_imports_observe_operations() -> None:

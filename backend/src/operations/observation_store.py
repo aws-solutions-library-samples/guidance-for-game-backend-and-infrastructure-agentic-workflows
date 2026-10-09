@@ -269,12 +269,19 @@ class DynamoDbObservationStore(ObservationStore):
         if not isinstance(operation_id, str):
             return ObservationBegin(ObservationBeginOutcome.STATE_CONFLICT)
         op_pk = f"OP#{operation_id}"
+        # Re-check the request deadline between the two key lookups: each sub-call
+        # has its own wall-clock cost, so a slow conflict/reclaim chain fails
+        # closed with DEADLINE_EXPIRED before it can outlast the request budget.
+        if self._clock() >= _utc(deadline, "commit_not_after"):
+            return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
         snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
         if not snapshot:
             return ObservationBegin(ObservationBeginOutcome.STATE_CONFLICT)
 
         state = snapshot.get("state")
         if state == STATE_SUCCEEDED:
+            if self._clock() >= _utc(deadline, "commit_not_after"):
+                return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
             observation, observation_hash = self._load_result(op_pk)
             if observation is None:
                 return ObservationBegin(ObservationBeginOutcome.STATE_CONFLICT)
@@ -398,10 +405,17 @@ class DynamoDbObservationStore(ObservationStore):
             }
         }
         transact_items = [snapshot_update, self._conditional_put(ledger_item, "attribute_not_exists(SK)")]
+        # No ClientRequestToken on the reclaim: the persistence client makes a
+        # single attempt (``max_attempts: 1``), so there is no transparent retry
+        # for an idempotency token to protect, and two reclaimers that observed
+        # the same expired generation would otherwise derive the SAME token with
+        # different lease/holder/now values — which DynamoDB rejects as
+        # ``IdempotentParameterMismatch``, turning the losing reclaimer's
+        # expected 409 in-progress into a spurious 503. The generation fence
+        # alone makes the reclaim idempotent and safe.
         try:
             self._client.transact_write_items(
                 TransactItems=transact_items,
-                ClientRequestToken=self._request_token(operation_id, "reclaim", new_generation),
             )
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if not _is_conditional_failure(exc):
@@ -702,14 +716,18 @@ class DynamoDbObservationStore(ObservationStore):
 
     @staticmethod
     def _request_token(operation_id: str, phase: str, generation: int) -> str:
-        """A deterministic ``ClientRequestToken`` for a transaction attempt.
+        """A deterministic ``ClientRequestToken`` for a begin/complete/fail write.
 
-        botocore may transparently retry a ``TransactWriteItems`` call once. A
-        deterministic idempotency token (bound to the operation, phase, and
-        generation) makes a transparent retry of a transaction whose first
-        attempt already committed a no-op on the server, so a lost response can
-        never resurface as a spurious ``STATE_CONFLICT`` for the caller's own
-        write. It is a bounded hex digest and carries no identity.
+        These three writes carry parameters that are fixed for one
+        operation/phase/generation, so a deterministic idempotency token makes a
+        repeated submission of the same transaction a server-side no-op rather
+        than a spurious ``STATE_CONFLICT``. The default persistence client makes
+        a single attempt, but keeping the token means a deployment that enables
+        SDK retries, or an at-least-once invocation of the same phase, cannot
+        resurface a committed write as a false conflict. The reclaim transaction
+        deliberately omits a token: its lease, holder, and ``:now`` differ
+        per caller, so a shared deterministic token would collide. It is a
+        bounded hex digest and carries no identity.
         """
         digest = canonical_sha256({"operation_id": operation_id, "phase": phase, "generation": generation})
         # ClientRequestToken accepts 1..36 chars; take a bounded hex slice.
