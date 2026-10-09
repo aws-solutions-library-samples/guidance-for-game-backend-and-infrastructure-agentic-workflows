@@ -466,40 +466,54 @@ reconcile_waf_association() {
 # Classify a CloudWatch Logs delivery CLI error from its combined output.
 # Prints one of: conflict | retryable | fatal. The output text is consumed
 # locally and never re-emitted, so account IDs and ARNs are not printed.
+#
+# Classification keys off the modeled AWS error CODE extracted from the standard
+# "An error occurred (<Code>) when calling ..." form, so free text such as an
+# account ID that happens to contain "500" or a validation message that mentions
+# "already exists" cannot be misread. CLI transport failures (which carry no
+# error code) are matched on their fixed phrasing and treated as retryable.
 classify_delivery_error() {
   local error_text="$1"
-  if [[ "$error_text" == *"ConflictException"* \
-    || "$error_text" == *"ResourceAlreadyExistsException"* \
-    || "$error_text" == *"already exists"* \
-    || "$error_text" == *"AlreadyExists"* ]]; then
-    printf 'conflict\n'
-    return 0
+  local code=""
+  if [[ "$error_text" =~ \(([A-Za-z]+)\) ]]; then
+    code="${BASH_REMATCH[1]}"
   fi
-  if [[ "$error_text" == *"ThrottlingException"* \
-    || "$error_text" == *"Throttling"* \
-    || "$error_text" == *"TooManyRequestsException"* \
-    || "$error_text" == *"RequestLimitExceeded"* \
-    || "$error_text" == *"ServiceUnavailable"* \
-    || "$error_text" == *"ServiceUnavailableException"* \
-    || "$error_text" == *"InternalFailure"* \
-    || "$error_text" == *"InternalServerException"* \
-    || "$error_text" == *"500"* \
-    || "$error_text" == *"503"* ]]; then
+
+  case "$code" in
+    ConflictException | ResourceAlreadyExistsException)
+      printf 'conflict\n'
+      return 0
+      ;;
+    ThrottlingException | ServiceUnavailableException | InternalFailure \
+      | 500 | 502 | 503 | 504)
+      printf 'retryable\n'
+      return 0
+      ;;
+  esac
+
+  # Transport-level CLI failures have no modeled error code.
+  if [[ "$error_text" == *"Could not connect to the endpoint URL"* \
+    || "$error_text" == *"Read timeout"* ]]; then
     printf 'retryable\n'
     return 0
   fi
+
   printf 'fatal\n'
   return 0
 }
 
 # Run a single CloudWatch Logs delivery mutation with bounded retry on
-# retryable errors. A genuine conflict is treated as idempotent success; a
-# fatal error (authorization, validation, service) fails with a bounded,
-# public-safe diagnostic naming only the operation.
+# retryable errors. A fatal error (authorization, validation, service) fails
+# with a bounded, public-safe diagnostic naming only the operation. A conflict
+# is NOT auto-resolved here: it returns 2 so the caller can decide whether the
+# operation is a safe idempotent rerun (create-delivery) or needs a follow-up
+# check (the put upserts).
 #   $1 label (public-safe operation name, e.g. "delivery source")
 #   $2.. the aws CLI arguments
-# Honors GBAW_DELIVERY_MAX_ATTEMPTS (default 4) and GBAW_DELIVERY_RETRY_SECONDS
-# (default 5). On success the captured stdout is available in DELIVERY_LAST_STDOUT.
+# Honors GBAW_DELIVERY_MAX_ATTEMPTS (default 4, capped at 20) and
+# GBAW_DELIVERY_RETRY_SECONDS (default 5, capped at 60). On success the captured
+# stdout is available in DELIVERY_LAST_STDOUT.
+# Returns: 0 success | 1 fatal/exhausted | 2 conflict.
 run_delivery_mutation() {
   local label="$1"
   shift
@@ -514,6 +528,9 @@ run_delivery_mutation() {
     echo "❌ Delivery retry settings must use positive attempts and non-negative seconds" >&2
     return 1
   fi
+  # Cap at the same bounds the PowerShell path enforces (attempts 1-20, delay 0-60).
+  [ "$max_attempts" -gt 20 ] && max_attempts=20
+  [ "$retry_seconds" -gt 60 ] && retry_seconds=60
 
   for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     if command_output=$(aws "$@" 2>&1); then
@@ -523,8 +540,7 @@ run_delivery_mutation() {
     classification=$(classify_delivery_error "$command_output")
     case "$classification" in
       conflict)
-        echo "  ✅ ${label} already exists"
-        return 0
+        return 2
         ;;
       retryable)
         if [ "$attempt" -lt "$max_attempts" ]; then
@@ -545,36 +561,51 @@ run_delivery_mutation() {
   return 1
 }
 
-# Query the delivery and fail unless the intended source and destination are
-# bound and active. Expects a JSON array of delivery objects on stdin-equivalent
-# argument $1 (as produced by `aws logs describe-deliveries`), the expected
-# source name $2, and the expected destination ARN $3.
+# Verify that a delivery binding matches the intended runtime. Reads only
+# stdout. Checks, from `describe-deliveries` JSON ($1): a delivery whose
+# deliverySourceName is $2, deliveryDestinationArn is $3, and
+# deliveryDestinationType is XRAY; and, from `get-delivery-source` JSON ($5),
+# that the source's resourceArns contains the runtime ARN $4.
 delivery_is_active() {
   local deliveries_json="$1"
   local expected_source="$2"
   local expected_dest_arn="$3"
+  local runtime_arn="$4"
+  local source_json="$5"
 
   if ! is_resolved_deployment_value "$expected_source" \
-    || ! is_resolved_deployment_value "$expected_dest_arn"; then
+    || ! is_resolved_deployment_value "$expected_dest_arn" \
+    || ! is_resolved_deployment_value "$runtime_arn"; then
     return 1
   fi
 
-  SOURCE="$expected_source" DEST="$expected_dest_arn" python3 -c '
+  SOURCE="$expected_source" DEST="$expected_dest_arn" RUNTIME="$runtime_arn" \
+    SOURCE_JSON="$source_json" python3 -c '
 import json
 import os
 import sys
 
-try:
-    payload = json.load(sys.stdin)
-except (ValueError, TypeError):
-    sys.exit(1)
 
-deliveries = payload.get("deliveries", payload) if isinstance(payload, dict) else payload
+def _load(text):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+deliveries_payload = _load(sys.stdin.read())
+if isinstance(deliveries_payload, dict):
+    deliveries = deliveries_payload.get("deliveries", [])
+else:
+    deliveries = deliveries_payload
 if not isinstance(deliveries, list):
     sys.exit(1)
 
 expected_source = os.environ["SOURCE"]
 expected_dest = os.environ["DEST"]
+runtime_arn = os.environ["RUNTIME"]
+
+matched = False
 for delivery in deliveries:
     if not isinstance(delivery, dict):
         continue
@@ -582,70 +613,190 @@ for delivery in deliveries:
         continue
     if delivery.get("deliveryDestinationArn") != expected_dest:
         continue
-    sys.exit(0)
-sys.exit(1)
+    if delivery.get("deliveryDestinationType") != "XRAY":
+        continue
+    matched = True
+    break
+if not matched:
+    sys.exit(1)
+
+# The delivery source must actually be bound to the runtime ARN.
+source_payload = _load(os.environ.get("SOURCE_JSON", ""))
+source = source_payload.get("deliverySource") if isinstance(source_payload, dict) else None
+if not isinstance(source, dict):
+    sys.exit(1)
+resource_arns = source.get("resourceArns", [])
+if not isinstance(resource_arns, list) or runtime_arn not in resource_arns:
+    sys.exit(1)
+sys.exit(0)
 ' <<< "$deliveries_json"
 }
 
+# Read account state to confirm an already-existing delivery resource matches
+# the intended runtime after a conflict. Returns 0 only when the resource is
+# ours. Output is consumed locally.
+#   $1 "source"|"destination", $2 resource name, $3 runtime arn
+delivery_resource_matches_runtime() {
+  local kind="$1"
+  local name="$2"
+  local runtime_arn="$3"
+  local json
+
+  if [ "$kind" = "source" ]; then
+    if ! json=$(aws logs get-delivery-source --name "$name" --region "$AWS_REGION" --output json 2>/dev/null); then
+      return 1
+    fi
+    RESOURCE_JSON="$json" RUNTIME="$runtime_arn" python3 -c '
+import json, os, sys
+try:
+    source = json.loads(os.environ["RESOURCE_JSON"]).get("deliverySource", {})
+except (ValueError, KeyError):
+    sys.exit(1)
+if source.get("logType") not in (None, "TRACES"):
+    sys.exit(1)
+arns = source.get("resourceArns", [])
+sys.exit(0 if isinstance(arns, list) and os.environ["RUNTIME"] in arns else 1)
+'
+    return $?
+  fi
+
+  if ! json=$(aws logs get-delivery-destination --name "$name" --region "$AWS_REGION" --output json 2>/dev/null); then
+    return 1
+  fi
+  RESOURCE_JSON="$json" python3 -c '
+import json, os, sys
+try:
+    dest = json.loads(os.environ["RESOURCE_JSON"]).get("deliveryDestination", {})
+except (ValueError, KeyError):
+    sys.exit(1)
+sys.exit(0 if dest.get("deliveryDestinationType") == "XRAY" else 1)
+'
+}
+
+# Resolve a project-owned delivery destination ARN from the AWS API rather than
+# fabricating it. Prints the ARN on success; returns non-zero if it cannot be
+# resolved.
+resolve_delivery_destination_arn() {
+  local name="$1"
+  local arn
+  arn=$(aws logs get-delivery-destination \
+    --name "$name" \
+    --region "$AWS_REGION" \
+    --query 'deliveryDestination.arn' \
+    --output text 2>/dev/null || echo "")
+  if [ -z "$arn" ] || [ "$arn" = "None" ]; then
+    return 1
+  fi
+  printf '%s\n' "$arn"
+}
+
 # Full Step 2b workflow: create source, destination, and delivery with
-# classification + bounded retry, then verify the delivery is active.
-# Fails (returns non-zero) on any real error or on verification failure.
-#   $1 runtime id, $2 runtime arn, $3 account id
+# classification + bounded retry, then verify the delivery is active. Fails
+# (returns non-zero) on any real error or on verification failure.
+#   $1 runtime id, $2 runtime arn
 ensure_runtime_trace_delivery() {
   local runtime_id="$1"
   local runtime_arn="$2"
-  local account_id="$3"
   local delivery_source_name="${runtime_id}-traces-source"
   local delivery_dest_name="${runtime_id}-traces-destination"
   local delivery_dest_arn=""
   local deliveries_json=""
+  local source_json=""
+  local rc
 
-  if ! run_delivery_mutation "Delivery source" \
+  # Delivery source (upsert). A conflict here means a differing source already
+  # covers this runtime, which is only safe if it is actually bound to us.
+  run_delivery_mutation "Delivery source" \
     logs put-delivery-source \
     --name "$delivery_source_name" \
     --log-type "TRACES" \
     --resource-arn "$runtime_arn" \
-    --region "$AWS_REGION"; then
+    --region "$AWS_REGION"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    if ! delivery_resource_matches_runtime "source" "$delivery_source_name" "$runtime_arn"; then
+      echo "❌ A conflicting delivery source exists for this runtime" >&2
+      return 1
+    fi
+    echo "  ✅ Delivery source already present for this runtime"
+  elif [ "$rc" -ne 0 ]; then
     return 1
+  else
+    echo "  ✅ Delivery source ready"
   fi
-  echo "  ✅ Delivery source ready"
 
-  if ! run_delivery_mutation "Delivery destination" \
+  # Delivery destination (upsert). Same conflict rule applies.
+  run_delivery_mutation "Delivery destination" \
     logs put-delivery-destination \
     --name "$delivery_dest_name" \
     --delivery-destination-type "XRAY" \
-    --region "$AWS_REGION"; then
+    --region "$AWS_REGION"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    if ! delivery_resource_matches_runtime "destination" "$delivery_dest_name" "$runtime_arn"; then
+      echo "❌ A conflicting delivery destination exists for this runtime" >&2
+      return 1
+    fi
+    echo "  ✅ Delivery destination already present"
+  elif [ "$rc" -ne 0 ]; then
     return 1
+  else
+    echo "  ✅ Delivery destination ready"
   fi
+
+  # Resolve the destination ARN from the API; never fabricate it.
   if [ -n "$DELIVERY_LAST_STDOUT" ]; then
     delivery_dest_arn=$(printf '%s' "$DELIVERY_LAST_STDOUT" \
       | python3 -c "import json,sys; print(json.load(sys.stdin)['deliveryDestination']['arn'])" 2>/dev/null || echo "")
   fi
   if [ -z "$delivery_dest_arn" ]; then
-    # Destination already existed (conflict path returns no stdout) — derive the
-    # project-owned ARN from the known naming convention.
-    delivery_dest_arn="arn:aws:logs:${AWS_REGION}:${account_id}:delivery-destination:${delivery_dest_name}"
+    if ! delivery_dest_arn=$(resolve_delivery_destination_arn "$delivery_dest_name"); then
+      echo "❌ Unable to resolve the delivery destination ARN" >&2
+      return 1
+    fi
   fi
-  echo "  ✅ Delivery destination ready"
 
-  if ! run_delivery_mutation "Delivery" \
+  # Delivery binding (create). A conflict here is a safe idempotent rerun of the
+  # same source/destination pair.
+  run_delivery_mutation "Delivery" \
     logs create-delivery \
     --delivery-source-name "$delivery_source_name" \
     --delivery-destination-arn "$delivery_dest_arn" \
-    --region "$AWS_REGION"; then
+    --region "$AWS_REGION"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "  ✅ Delivery already exists"
+  elif [ "$rc" -ne 0 ]; then
     return 1
+  else
+    echo "  ✅ Delivery ready"
   fi
-  echo "  ✅ Delivery ready"
 
-  # Verification: the deployment must not succeed unless the intended source and
-  # destination are actually bound.
-  if ! deliveries_json=$(aws logs describe-deliveries \
-    --region "$AWS_REGION" \
-    --output json 2>&1); then
-    echo "❌ Unable to verify runtime trace delivery" >&2
-    return 1
-  fi
-  if ! delivery_is_active "$deliveries_json" "$delivery_source_name" "$delivery_dest_arn"; then
+  # Verification (bounded retry; stdout only): the deployment must not succeed
+  # unless the intended source and destination are actually bound to the runtime.
+  local verify_attempts="${GBAW_DELIVERY_MAX_ATTEMPTS:-4}"
+  local verify_delay="${GBAW_DELIVERY_RETRY_SECONDS:-5}"
+  [[ "$verify_attempts" =~ ^[1-9][0-9]*$ ]] || verify_attempts=4
+  [[ "$verify_delay" =~ ^[0-9]+$ ]] || verify_delay=5
+  [ "$verify_attempts" -gt 20 ] && verify_attempts=20
+  [ "$verify_delay" -gt 60 ] && verify_delay=60
+
+  local attempt verified=false
+  for ((attempt = 1; attempt <= verify_attempts; attempt++)); do
+    if deliveries_json=$(aws logs describe-deliveries \
+      --region "$AWS_REGION" --output json 2>/dev/null) \
+      && source_json=$(aws logs get-delivery-source \
+        --name "$delivery_source_name" --region "$AWS_REGION" --output json 2>/dev/null) \
+      && delivery_is_active "$deliveries_json" "$delivery_source_name" \
+        "$delivery_dest_arn" "$runtime_arn" "$source_json"; then
+      verified=true
+      break
+    fi
+    if [ "$attempt" -lt "$verify_attempts" ]; then
+      sleep "$verify_delay"
+    fi
+  done
+  if [ "$verified" != true ]; then
     echo "❌ Runtime trace delivery is not active for the intended source and destination" >&2
     return 1
   fi
@@ -730,8 +881,7 @@ echo ""
 # Also skipped when --auto-update-on-conflict updates an existing runtime.
 # See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
 echo "📡 Step 2b: Ensuring CloudWatch delivery for runtime traces..."
-DELIVERY_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-if ! ensure_runtime_trace_delivery "$RUNTIME_ID" "$RUNTIME_ARN" "$DELIVERY_ACCOUNT_ID"; then
+if ! ensure_runtime_trace_delivery "$RUNTIME_ID" "$RUNTIME_ARN"; then
   echo "❌ Runtime traces delivery could not be configured and verified" >&2
   exit 1
 fi

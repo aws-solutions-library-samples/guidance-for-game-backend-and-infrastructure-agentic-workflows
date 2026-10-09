@@ -205,23 +205,48 @@ Deploy-GameAgent -ConfigureAccountObservability
 Before applying anything, the opt-in path prints exactly which shared settings
 may change.
 
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` and `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
+are read from the process environment only; they are not read from
+`ui/.env.local`. The PowerShell switch `-ConfigureAccountObservability` and the
+environment variable are equivalent opt-in triggers.
+
 **Ownership and preservation.** The deployment reads existing state first and
 preserves it. It enables Transaction Search only additively (it never performs a
 disable/re-enable toggle of the shared destination) and leaves an already-enabled
-`CloudWatchLogs` destination unchanged. The shared Logs resource policy uses a
-project-owned name (`GameAgentTransactionSearchXRayAccess`) so it never overwrites
-an unrelated policy.
+`CloudWatchLogs` destination unchanged. If it cannot read the current trace
+destination, the opt-in refuses to change it and fails rather than guessing. The
+account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
+modified only when you set `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` to an integer in
+`[0, 100]`, and only then is a rollback command printed with the prior value. The
+shared Logs resource policy uses a project-owned name
+(`GameAgentTransactionSearchXRayAccess`). Before writing it, the deployment lists
+existing resource policies: if another policy (including a legacy
+`TransactionSearchXRayAccess` written by earlier deploys) already grants
+`xray.amazonaws.com` `logs:PutLogEvents` on `aws/spans`, it is left in place and
+the write is skipped; if the account is already at the 10-policy limit, the
+deployment fails with a bounded message instead of adding a duplicate.
+
+**Legacy policy migration.** Some earlier versions of this project wrote a shared
+policy named `TransactionSearchXRayAccess`. The current opt-in writes its own
+project-owned policy name and leaves any `TransactionSearchXRayAccess` policy
+untouched. If such a policy exists and already grants the needed access, it
+continues to work and the opt-in skips its own write. Delete the legacy
+`TransactionSearchXRayAccess` policy only once you have confirmed no other
+workload relies on it.
 
 **Validation.** The per-runtime trace delivery step (delivery source →
 destination → delivery) distinguishes a genuine already-exists conflict from
-authorization, validation, throttling, and service errors. Retryable errors are
-retried with a small bounded backoff; a real error fails the deployment with a
-bounded diagnostic. The deployment then queries the delivery and fails unless the
-intended source and destination are active.
+authorization, validation, throttling, and service errors by the AWS error code.
+Retryable errors are retried with a small bounded backoff; a real error fails the
+deployment with a bounded diagnostic. The deployment then queries the delivery
+(retrying a transient read) and fails unless a delivery with destination type
+`XRAY` binds the intended source — whose resources include the runtime — to the
+intended destination.
 
-**Rollback.** Account-wide changes are only made under the opt-in and the opt-in
-path prints a rollback command for each shared setting it changes (trace
-destination and indexing rule). To remove the project-owned resource policy:
+**Rollback.** Account-wide changes are only made under the opt-in. The opt-in
+prints a rollback command for the trace destination when it enables Transaction
+Search, and for the default indexing rule only when you explicitly change it
+(with the prior percentage). To remove the project-owned resource policy:
 
 ```bash
 aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAccess --region <region>

@@ -22,6 +22,9 @@ function Deploy-GameAgent {
         Deploy-GameAgent
     .EXAMPLE
         Deploy-GameAgent -Profile demo -Region us-east-1
+    .EXAMPLE
+        Deploy-GameAgent -ConfigureAccountObservability
+        Opts in to the account-wide X-Ray / CloudWatch Logs changes.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -33,6 +36,29 @@ function Deploy-GameAgent {
     )
 
     $ErrorActionPreference = 'Stop'
+
+    # Honor the shell-equivalent opt-in environment variable when the switch is
+    # not explicitly supplied, so both shells share one opt-in trigger.
+    if (-not $PSBoundParameters.ContainsKey('ConfigureAccountObservability') -and
+        $env:GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -eq 'true') {
+        $ConfigureAccountObservability = $true
+    }
+
+    # Resolve the delivery retry knobs from the environment with the same bounds
+    # the shell path enforces (attempts 1-20, delay 0-60). Invalid or missing
+    # values fall back to the function defaults.
+    $deliveryRetryArgs = @{}
+    $parsedAttempts = 0
+    if ([int]::TryParse($env:GBAW_DELIVERY_MAX_ATTEMPTS, [ref]$parsedAttempts) -and
+        $parsedAttempts -ge 1 -and $parsedAttempts -le 20) {
+        $deliveryRetryArgs['MaxAttempts'] = $parsedAttempts
+    }
+    $parsedDelay = 0
+    if ([int]::TryParse($env:GBAW_DELIVERY_RETRY_SECONDS, [ref]$parsedDelay) -and
+        $parsedDelay -ge 0 -and $parsedDelay -le 60) {
+        $deliveryRetryArgs['RetrySeconds'] = $parsedDelay
+    }
+
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
     $infraPath = Join-Path $repoRoot 'infrastructure/cloudformation'
     $backendPath = Join-Path $repoRoot 'backend'
@@ -309,16 +335,13 @@ function Deploy-GameAgent {
 
         # ── Step 2b: CloudWatch delivery for runtime traces ──
         Write-GameAgentStatus 'Step 2b: Ensuring CloudWatch delivery for runtime traces...' -Type Info
-        $deliveryInvoker = {
-            param([string[]]$AwsArgs)
-            Invoke-Aws @AwsArgs
-        }.GetNewClosure()
+        $deliveryInvoker = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS delivery command'
         Invoke-GameAgentTraceDelivery `
             -RuntimeId $runtimeId `
             -RuntimeArn $runtimeArn `
-            -AccountId $identity.Account `
             -Region $Region `
-            -InvokeAws $deliveryInvoker
+            -InvokeAws $deliveryInvoker `
+            @deliveryRetryArgs
         Write-GameAgentStatus 'Runtime traces delivery configured' -Type Success
         Write-Host ''
     } finally { Pop-Location }
@@ -452,14 +475,7 @@ function Deploy-GameAgent {
         # bounded WAF propagation delays, and verify its required rules.
         Write-GameAgentStatus 'Step 8c: Reconciling WAF association...' -Type Info
         $wafAclArn = Get-StackOutput "$ProjectName-security" 'WebACLArn'
-        $profileArgsForWaf = @($profileArgs)
-        $invokeAwsForWaf = {
-            param([string[]]$AwsArgs)
-            $allArgs = $AwsArgs + $profileArgsForWaf
-            $result = & aws @allArgs 2>&1
-            if ($LASTEXITCODE -ne 0) { throw "AWS WAF command failed: $result" }
-            return $result
-        }.GetNewClosure()
+        $invokeAwsForWaf = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS WAF command'
         Invoke-GameAgentWafReconciliation `
             -ExpectedWebAclArn $wafAclArn `
             -ResourceArn $frontendAlbArn `
