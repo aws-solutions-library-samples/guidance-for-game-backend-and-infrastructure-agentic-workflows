@@ -289,8 +289,12 @@ same way `scripts/deploy.sh` resolves it (the environment value, then
 to each `aws` invocation only when set. Before any upload or stack write the
 wrapper checks `AWS_PROFILE`/`AWS_REGION` and the caller account
 (`aws sts get-caller-identity`), printing only a masked account and the role
-name; when `GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID` is set the resolved account must
-match it or the wrapper refuses to write.
+name. When `GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID` is set the resolved account must
+match it or the wrapper refuses to write. When it is unset the wrapper binds the
+write to a confirmed account anyway: on an interactive terminal it prompts to
+confirm the masked account, and in a non-interactive run it refuses rather than
+writing to an unverified account — so set the variable to bind the write without
+a prompt.
 
 ### Real packaging path (no placeholder code)
 
@@ -624,13 +628,14 @@ the runtime kill switch and leaves all data in place.
 ### 1. IAM negatives (no write/escape path)
 
 Confirm the runtime role is denied every action outside its read-only grant.
-Resolve the role name from the stack and simulate the actions that must be
+Resolve the role ARN from the stack output (``simulate-principal-policy``
+requires an ARN, not the role name) and simulate the actions that must be
 denied:
 
 ```bash
-ROLE_ARN=$(aws cloudformation describe-stack-resources \
+ROLE_ARN=$(aws cloudformation describe-stacks \
   --stack-name game-agent-operations --region us-west-2 \
-  --query "StackResources[?ResourceType=='AWS::IAM::Role'].PhysicalResourceId | [0]" \
+  --query "Stacks[0].Outputs[?OutputKey=='ObservationRoleArn'].OutputValue | [0]" \
   --output text)
 
 aws iam simulate-principal-policy \
@@ -679,15 +684,20 @@ BEFORE=$(aws dynamodb scan --table-name "$TABLE" --select COUNT --region us-west
 
 ./scripts/infrastructure/deploy-operations.sh --disable
 # Probe the disabled plane: the authorizer still guards both routes and an
-# authenticated observe is refused (never a 200 observation).
-GBAW_E1_ENDPOINT=<endpoint> GBAW_E1_ACCESS_TOKEN=<access-token> \
-GBAW_E1_FLEET_ID=<fleet> GBAW_E1_ALT_FLEET_ID=<alt-fleet> \
-  PYTHONPATH=src uv run python -m operations.validation.e1_shakedown --expect-disabled
+# authenticated observe is refused (never a 200 observation). The shakedown runs
+# from the backend/ package directory so PYTHONPATH=src resolves.
+( cd backend && GBAW_E1_ENDPOINT=<endpoint> GBAW_E1_ACCESS_TOKEN=<access-token> \
+  GBAW_E1_FLEET_ID=<fleet> GBAW_E1_ALT_FLEET_ID=<alt-fleet> \
+  PYTHONPATH=src uv run python -m operations.validation.e1_shakedown --expect-disabled )
 
+# Re-enable with the SAME environment the stack was created with. The binding
+# guard refuses a re-enable that would change Environment (for example a prod
+# stack re-enabled with the default beta), so pass --environment explicitly.
 GBAW_OPERATIONS_MODE=observe COGNITO_ISSUER=<issuer> COGNITO_CLIENT_ID=<client> \
   TENANT_ID=<tenant> WORKSPACE_ID=<workspace> \
   GBAW_OPERATIONS_ARTIFACT_BUCKET=<bucket> \
-  ./scripts/infrastructure/deploy-operations.sh --enable
+  GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID=<account-id> \
+  ./scripts/infrastructure/deploy-operations.sh --enable --environment prod
 
 AFTER=$(aws dynamodb scan --table-name "$TABLE" --select COUNT --region us-west-2 --query Count)
 # BEFORE and AFTER must be equal: disable/enable preserves all data.

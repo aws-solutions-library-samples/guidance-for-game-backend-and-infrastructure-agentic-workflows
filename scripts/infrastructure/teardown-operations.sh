@@ -26,7 +26,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ui/.env.local, otherwise unset. The profile flag is passed only when set, so an
 # operator on ambient credentials is not forced onto a "default" profile.
 if [ -z "${AWS_PROFILE:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
-    _profile="$(grep '^AWS_PROFILE=' "$PROJECT_ROOT/ui/.env.local" | cut -d= -f2 | tr -d '[:space:]')"
+    _profile="$(grep '^AWS_PROFILE=' "$PROJECT_ROOT/ui/.env.local" | cut -d= -f2 | tr -d '[:space:]' || true)"
     [ -n "$_profile" ] && export AWS_PROFILE="$_profile"
 fi
 if [ -n "${AWS_PROFILE:-}" ]; then
@@ -88,10 +88,33 @@ if ! ACCOUNT_ID="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region
     exit 4
 fi
 echo "   Caller: account=****${ACCOUNT_ID: -4}"
+MASKED_ACCOUNT="****${ACCOUNT_ID: -4}"
 if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
     echo "❌ Resolved account (****${ACCOUNT_ID: -4}) does not match the expected account." >&2
     echo "   Refusing to tear down in a different account from the main deployment." >&2
     exit 4
+fi
+# When the expected account is NOT pre-set, bind the delete to a confirmed
+# account: prompt on a TTY, else refuse (a non-interactive delete against an
+# unverified account is the cross-account hazard the binding prevents).
+if [ -z "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
+    if [ -t 0 ]; then
+        printf '   Confirm deleting the operations stack in account %s [y/N]: ' "$MASKED_ACCOUNT" >&2
+        read -r _confirm_account
+        case "$_confirm_account" in
+            y | Y | yes | YES) : ;;
+            *)
+                echo "❌ Account not confirmed; refusing to tear down. Set" >&2
+                echo "   GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID to bind the delete non-interactively." >&2
+                exit 4
+                ;;
+        esac
+    else
+        echo "❌ GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID is unset and stdin is not a TTY." >&2
+        echo "   Set it to the expected account id so the teardown is bound non-interactively;" >&2
+        echo "   this wrapper refuses to delete in an unconfirmed account." >&2
+        exit 4
+    fi
 fi
 
 if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
@@ -109,7 +132,7 @@ RETAINED="$(aws cloudformation describe-stack-resources \
     "${AWS_PROFILE_ARGS[@]}" \
     --stack-name "$STACK_NAME" \
     --region "$AWS_REGION" \
-    --query "StackResources[?DeletionPolicy=='Retain' || ResourceType=='AWS::DynamoDB::Table' || ResourceType=='AWS::KMS::Key' || ResourceType=='AWS::Logs::LogGroup'].[ResourceType,PhysicalResourceId]" \
+    --query "StackResources[?ResourceType=='AWS::DynamoDB::Table' || ResourceType=='AWS::KMS::Key' || ResourceType=='AWS::Logs::LogGroup'].[ResourceType,PhysicalResourceId]" \
     --output text 2>/dev/null || true)"
 if [ -n "$RETAINED" ]; then
     printf '%s\n' "$RETAINED" | sed 's/^/      /'

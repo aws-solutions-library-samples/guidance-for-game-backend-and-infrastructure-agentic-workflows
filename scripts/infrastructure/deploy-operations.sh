@@ -85,7 +85,7 @@ GBAW_OPERATIONS_ARTIFACT_BUCKET="${GBAW_OPERATIONS_ARTIFACT_BUCKET:-}"
 # "default" profile that could resolve to a different account from the main
 # deployment.
 if [ -z "${AWS_PROFILE:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
-    _profile="$(grep '^AWS_PROFILE=' "$PROJECT_ROOT/ui/.env.local" | cut -d= -f2 | tr -d '[:space:]')"
+    _profile="$(grep '^AWS_PROFILE=' "$PROJECT_ROOT/ui/.env.local" | cut -d= -f2 | tr -d '[:space:]' || true)"
     [ -n "$_profile" ] && export AWS_PROFILE="$_profile"
 fi
 if [ -n "${AWS_PROFILE:-}" ]; then
@@ -277,7 +277,19 @@ CALLER_ARN="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AW
 # Print only a masked account (last 4 digits) and the role/last ARN segment —
 # never the full ARN (which can carry a username/email) or the UserId.
 MASKED_ACCOUNT="****${ACCOUNT_ID: -4}"
-ROLE_NAME="${CALLER_ARN##*/}"
+# Extract the ROLE segment, not the session name. An assumed-role ARN is
+# arn:…:assumed-role/<role>/<session>; the trailing session is often the user's
+# email, so print the <role> segment (the part after "assumed-role/" up to the
+# next "/"). For other ARN shapes fall back to the last segment.
+case "$CALLER_ARN" in
+    *:assumed-role/*)
+        _after_role="${CALLER_ARN##*:assumed-role/}"
+        ROLE_NAME="${_after_role%%/*}"
+        ;;
+    *)
+        ROLE_NAME="${CALLER_ARN##*/}"
+        ;;
+esac
 echo "   Caller: account=$MASKED_ACCOUNT role=${ROLE_NAME:-<unknown>}"
 
 if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
@@ -285,6 +297,87 @@ if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$GBAW_OP
     echo "   GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID (****${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID: -4})." >&2
     echo "   Refusing to upload or write to a different account from the main deployment." >&2
     exit 4
+fi
+
+# When the expected account is NOT pre-set, bind the write to a confirmed
+# account rather than silently trusting whichever profile resolved. If stdin is
+# a TTY, prompt the operator to confirm the masked account; otherwise refuse,
+# because a non-interactive write to an unverified account is exactly the
+# cross-account hazard the expected-account binding prevents.
+if [ -z "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
+    if [ -t 0 ]; then
+        printf '   Confirm writing to account %s [y/N]: ' "$MASKED_ACCOUNT" >&2
+        read -r _confirm_account
+        case "$_confirm_account" in
+            y | Y | yes | YES) : ;;
+            *)
+                echo "❌ Account not confirmed; refusing to write. Set" >&2
+                echo "   GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID to bind the write non-interactively." >&2
+                exit 4
+                ;;
+        esac
+    else
+        echo "❌ GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID is unset and stdin is not a TTY." >&2
+        echo "   Set it to the expected account id so the write is bound non-interactively;" >&2
+        echo "   this wrapper refuses to write to an unconfirmed account." >&2
+        exit 4
+    fi
+fi
+# bindings BEFORE building or uploading anything, so a refused binding change
+# never leaves a stray artifact in the bucket. A describe-stacks failure for any
+# reason other than "stack does not exist" fails closed rather than defaulting to
+# "no stack" and sending the full binding set (including the beta default) to an
+# existing stack.
+# --------------------------------------------------------------------------- #
+STACK_EXISTS="false"
+TRUSTED_AUDIENCE_EFFECTIVE="${TRUSTED_AUDIENCE:-$COGNITO_CLIENT_ID}"
+
+_current_param() {
+    aws cloudformation describe-stacks \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --stack-name "$STACK_NAME" \
+        --region "$AWS_REGION" \
+        --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue | [0]" \
+        --output text 2>/dev/null || true
+}
+
+if [ "$ACTION" = "enable" ]; then
+    DESCRIBE_ERR="$(mktemp "${TMPDIR:-/tmp}/gbaw-ops-describe.XXXXXXXX")"
+    if aws cloudformation describe-stacks \
+            "${AWS_PROFILE_ARGS[@]}" \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" >/dev/null 2>"$DESCRIBE_ERR"; then
+        STACK_EXISTS="true"
+    elif grep -qi "does not exist" "$DESCRIBE_ERR"; then
+        STACK_EXISTS="false"
+    else
+        echo "❌ Unable to determine whether stack '$STACK_NAME' exists (describe-stacks" >&2
+        echo "   failed for a reason other than a missing stack). Refusing to proceed so a" >&2
+        echo "   transient error cannot send the default bindings to an existing stack." >&2
+        cat "$DESCRIBE_ERR" >&2
+        rm -f "$DESCRIBE_ERR"
+        exit 4
+    fi
+    rm -f "$DESCRIBE_ERR"
+
+    if [ "$STACK_EXISTS" = "true" ]; then
+        CUR_ENV="$(_current_param Environment)"
+        CUR_TENANT="$(_current_param TenantId)"
+        CUR_WS="$(_current_param WorkspaceId)"
+        CUR_AUD="$(_current_param TrustedAudience)"
+        BINDING_CHANGES=""
+        [ -n "$CUR_ENV" ] && [ "$CUR_ENV" != "$ENVIRONMENT" ] && BINDING_CHANGES="${BINDING_CHANGES}Environment ($CUR_ENV -> $ENVIRONMENT) "
+        [ -n "$CUR_TENANT" ] && [ "$CUR_TENANT" != "$TENANT_ID" ] && BINDING_CHANGES="${BINDING_CHANGES}TenantId "
+        [ -n "$CUR_WS" ] && [ "$CUR_WS" != "$WORKSPACE_ID" ] && BINDING_CHANGES="${BINDING_CHANGES}WorkspaceId "
+        [ -n "$CUR_AUD" ] && [ "$CUR_AUD" != "$TRUSTED_AUDIENCE_EFFECTIVE" ] && BINDING_CHANGES="${BINDING_CHANGES}TrustedAudience "
+        if [ -n "$BINDING_CHANGES" ] && [ "$ALLOW_BINDING_CHANGE" != "true" ]; then
+            echo "❌ Refusing to re-enable: this would change trusted binding(s): $BINDING_CHANGES" >&2
+            echo "   Changing Environment can downgrade deletion protection and log retention;" >&2
+            echo "   changing TenantId/WorkspaceId/TrustedAudience rebinds the live function." >&2
+            echo "   Pass --allow-binding-change to proceed intentionally." >&2
+            exit 9
+        fi
+    fi
 fi
 
 if [ "$ACTION" = "enable" ]; then
@@ -332,7 +425,7 @@ if [ "$ACTION" = "enable" ]; then
     # git archive so only tracked content at the pinned commit is staged.
     ( cd "$PROJECT_ROOT/backend/src" && \
       git -C "$PROJECT_ROOT" archive "$PACKAGED_COMMIT" -- backend/src/operations \
-        | tar -x --strip-components=3 -C "$STAGE" \
+        | tar -x --strip-components=2 -C "$STAGE" \
             --exclude='*/__pycache__/*' --exclude='*/tests/*' --exclude='*/test/*' --exclude='*/docs/*' )
     # Keep only runtime file types (py + json); drop anything else git archive
     # may have carried.
@@ -345,14 +438,17 @@ if [ "$ACTION" = "enable" ]; then
     # first validated request. Require at least one, and require the whole
     # versioned set the validator binds.
     SCHEMA_STAGE_DIR="$STAGE/operations/contracts/schemas/v1"
-    STAGED_SCHEMAS="$(find "$SCHEMA_STAGE_DIR" -type f -name '*.schema.json' 2>/dev/null | wc -l | tr -d ' ')"
+    # Tolerate a missing directory (|| true) so a mis-staged tree reaches the
+    # explicit diagnostic below instead of aborting the script via pipefail on a
+    # failed ``find``.
+    STAGED_SCHEMAS="$(find "$SCHEMA_STAGE_DIR" -type f -name '*.schema.json' 2>/dev/null | wc -l | tr -d ' ' || true)"
     if [ "${STAGED_SCHEMAS:-0}" -eq 0 ]; then
         echo "❌ Refusing to enable: no versioned contract schemas were staged under" >&2
         echo "   operations/contracts/schemas/v1. The runtime contract validator loads" >&2
         echo "   these JSON resources; a schema-less package raises FileNotFoundError." >&2
         exit 5
     fi
-    SOURCE_SCHEMAS="$(find "$BACKEND_SRC/operations/contracts/schemas/v1" -type f -name '*.schema.json' 2>/dev/null | wc -l | tr -d ' ')"
+    SOURCE_SCHEMAS="$(find "$BACKEND_SRC/operations/contracts/schemas/v1" -type f -name '*.schema.json' 2>/dev/null | wc -l | tr -d ' ' || true)"
     if [ "${STAGED_SCHEMAS:-0}" -ne "${SOURCE_SCHEMAS:-0}" ]; then
         echo "❌ Refusing to enable: staged contract schema count ($STAGED_SCHEMAS) does not" >&2
         echo "   match the source set ($SOURCE_SCHEMAS). The runtime schema resources are" >&2
@@ -399,11 +495,16 @@ if [ "$ACTION" = "enable" ]; then
     find "$STAGE" -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
     rm -rf "${STAGE:?}/bin" 2>/dev/null || true
     # Fail closed if any staged file still embeds the build user's home path, so
-    # a host-specific path can never be uploaded in the artifact.
-    if grep -rlI --exclude='*.so' "$HOME" "$STAGE" 2>/dev/null | grep -q .; then
-        echo "❌ A staged file embeds the build host home path ($HOME); refusing to upload." >&2
-        grep -rlI --exclude='*.so' "$HOME" "$STAGE" 2>/dev/null | sed 's#^#   #' >&2
-        exit 5
+    # a host-specific path can never be uploaded in the artifact. Match HOME as a
+    # fixed string (grep -F), and skip the scan when HOME is empty or "/", where
+    # the pattern would match everything (or nothing meaningful) and wrongly
+    # refuse every build.
+    if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ]; then
+        if grep -rlIF --exclude='*.so' "$HOME" "$STAGE" 2>/dev/null | grep -q .; then
+            echo "❌ A staged file embeds the build host home path ($HOME); refusing to upload." >&2
+            grep -rlIF --exclude='*.so' "$HOME" "$STAGE" 2>/dev/null | sed 's#^#   #' >&2
+            exit 5
+        fi
     fi
     # Fixed epoch touch stamp assembled from parts (no 12-digit literal) so the
     # build is reproducible without tripping account-id content scanners.
@@ -532,7 +633,7 @@ PROBE
     # matches the deploy target before uploading. Never create a bucket.
     # ----------------------------------------------------------------------- #
     CODE_S3_BUCKET="$GBAW_OPERATIONS_ARTIFACT_BUCKET"
-    echo "🔎 Verifying artifact bucket '$CODE_S3_BUCKET' exists in account $ACCOUNT_ID ..."
+    echo "🔎 Verifying artifact bucket '$CODE_S3_BUCKET' exists in account $MASKED_ACCOUNT ..."
     # head-bucket confirms existence and that these credentials can access it.
     # The expected owner is asserted so a name-squatted foreign bucket is refused.
     if ! aws s3api head-bucket \
@@ -541,7 +642,7 @@ PROBE
             --expected-bucket-owner "$ACCOUNT_ID" \
             --region "$AWS_REGION" >/dev/null 2>&1; then
         echo "❌ Artifact bucket '$CODE_S3_BUCKET' does not exist, is inaccessible, or is" >&2
-        echo "   not owned by account $ACCOUNT_ID. This wrapper never creates a bucket." >&2
+        echo "   not owned by account $MASKED_ACCOUNT. This wrapper never creates a bucket." >&2
         exit 6
     fi
     # Confirm the bucket's Region matches the deploy Region (Lambda requires the
@@ -560,7 +661,7 @@ PROBE
         echo "   deploy region '$AWS_REGION'. Lambda requires the code bucket in-region." >&2
         exit 6
     fi
-    echo "   Bucket verified: owner=$ACCOUNT_ID region=$BUCKET_REGION"
+    echo "   Bucket verified: owner=$MASKED_ACCOUNT region=$BUCKET_REGION"
 
     echo "☁️  Uploading artifact to s3://$CODE_S3_BUCKET/$CODE_S3_KEY ..."
     aws s3 cp "$ARTIFACT" "s3://$CODE_S3_BUCKET/$CODE_S3_KEY" \
@@ -582,12 +683,12 @@ if [ "$ACTION" = "disable" ]; then
     # later --enable is reversible. The API stage additionally throttles to zero
     # (template kill switch) because OperationsMode is not "observe".
     # ----------------------------------------------------------------------- #
-    echo "🔎 Verifying target stack '$STACK_NAME' exists in account $ACCOUNT_ID / $AWS_REGION ..."
+    echo "🔎 Verifying target stack '$STACK_NAME' exists in account $MASKED_ACCOUNT / $AWS_REGION ..."
     if ! aws cloudformation describe-stacks \
             "${AWS_PROFILE_ARGS[@]}" \
             --stack-name "$STACK_NAME" \
             --region "$AWS_REGION" >/dev/null 2>&1; then
-        echo "❌ Stack '$STACK_NAME' does not exist in account $ACCOUNT_ID / $AWS_REGION." >&2
+        echo "❌ Stack '$STACK_NAME' does not exist in account $MASKED_ACCOUNT / $AWS_REGION." >&2
         echo "   Nothing to disable. (Disable operates on an already-provisioned stack;" >&2
         echo "   an unprovisioned/default deployment holds zero resources and no data.)" >&2
         exit 7
@@ -613,38 +714,35 @@ if [ "$ACTION" = "disable" ]; then
     echo "   OperationsMode=disabled, reusing every other parameter unchanged."
     echo "   No code rebuild, no Docker, no resource deletion."
 
-    # UsePreviousValue reuses the stack's existing artifact identifiers and every
-    # binding, so nothing is rebuilt and no value is blanked. Only the two safety
-    # levers are overridden. (aws cloudformation deploy does not support
-    # UsePreviousValue, so the disable path uses update-stack directly.)
+    # Build the UsePreviousValue list from the DEPLOYED stack's own parameter
+    # keys, not a list pinned to the local template. --use-previous-template
+    # validates --parameters against the deployed template, so a stack created
+    # from an earlier revision (with fewer or different keys) would reject a key
+    # the local template adds. Reading the stack's keys and overriding only
+    # Provisioned and OperationsMode keeps the kill switch working across
+    # template version skew.
+    DEPLOYED_PARAM_KEYS="$(aws cloudformation describe-stacks \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --stack-name "$STACK_NAME" \
+        --region "$AWS_REGION" \
+        --query "Stacks[0].Parameters[].ParameterKey" \
+        --output text 2>/dev/null || true)"
+    if [ -z "$DEPLOYED_PARAM_KEYS" ]; then
+        echo "❌ Could not read the deployed stack's parameter keys; refusing to disable" >&2
+        echo "   with a parameter list that may not match the deployed template." >&2
+        exit 8
+    fi
+    # Always override the two safety levers; reuse every other deployed key.
     DISABLE_PARAMS=(
         "ParameterKey=Provisioned,ParameterValue=true"
         "ParameterKey=OperationsMode,ParameterValue=disabled"
-        "ParameterKey=ProjectName,UsePreviousValue=true"
-        "ParameterKey=Environment,UsePreviousValue=true"
-        "ParameterKey=CognitoIssuer,UsePreviousValue=true"
-        "ParameterKey=CognitoClientId,UsePreviousValue=true"
-        "ParameterKey=TenantId,UsePreviousValue=true"
-        "ParameterKey=WorkspaceId,UsePreviousValue=true"
-        "ParameterKey=TrustedAudience,UsePreviousValue=true"
-        "ParameterKey=CodeS3Bucket,UsePreviousValue=true"
-        "ParameterKey=CodeS3Key,UsePreviousValue=true"
-        "ParameterKey=RequestDeadlineSeconds,UsePreviousValue=true"
-        "ParameterKey=LambdaTimeoutSeconds,UsePreviousValue=true"
-        "ParameterKey=PerReadBudgetSeconds,UsePreviousValue=true"
-        "ParameterKey=PersistenceBudgetSeconds,UsePreviousValue=true"
-        "ParameterKey=CancellationMarginSeconds,UsePreviousValue=true"
-        "ParameterKey=ObservationTtlSeconds,UsePreviousValue=true"
-        "ParameterKey=ObserverGroups,UsePreviousValue=true"
-        "ParameterKey=LatencyAlarmThresholdMs,UsePreviousValue=true"
-        "ParameterKey=AlarmTopicArn,UsePreviousValue=true"
-        "ParameterKey=LambdaMemoryMb,UsePreviousValue=true"
-        "ParameterKey=ReservedConcurrency,UsePreviousValue=true"
-        "ParameterKey=MaxReadRequestUnits,UsePreviousValue=true"
-        "ParameterKey=MaxWriteRequestUnits,UsePreviousValue=true"
-        "ParameterKey=ThrottlingBurstLimit,UsePreviousValue=true"
-        "ParameterKey=ThrottlingRateLimit,UsePreviousValue=true"
     )
+    for _key in $DEPLOYED_PARAM_KEYS; do
+        case "$_key" in
+            Provisioned | OperationsMode) : ;;  # overridden above
+            *) DISABLE_PARAMS+=("ParameterKey=${_key},UsePreviousValue=true") ;;
+        esac
+    done
 
     DISABLE_ERR="$(mktemp "${TMPDIR:-/tmp}/gbaw-ops-disable.XXXXXXXX")"
     trap 'rm -f "$DISABLE_ERR"' EXIT
@@ -676,50 +774,17 @@ fi
 
 # --------------------------------------------------------------------------- #
 # ENABLE path deploy: provision resources (Provisioned=true) and set the
-# runtime authority to observe. All enabling inputs were validated above and the
-# artifact was built and uploaded. On an EXISTING stack, the trusted bindings
-# (Environment, TenantId, WorkspaceId, TrustedAudience) are read and a change is
-# refused unless --allow-binding-change is passed, so a re-enable cannot silently
-# downgrade a prod stack or rebind its tenant/workspace.
+# runtime authority to observe. All enabling inputs were validated above, the
+# stack-existence and binding checks already ran before the build/upload, and
+# the artifact was built and uploaded. On an EXISTING stack the trusted bindings
+# are kept unchanged unless --allow-binding-change was passed.
 # --------------------------------------------------------------------------- #
-STACK_EXISTS="false"
-if aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
-    STACK_EXISTS="true"
-fi
-
-_current_param() {
-    aws cloudformation describe-stacks \
-        "${AWS_PROFILE_ARGS[@]}" \
-        --stack-name "$STACK_NAME" \
-        --region "$AWS_REGION" \
-        --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue | [0]" \
-        --output text 2>/dev/null || true
-}
-
-TRUSTED_AUDIENCE_EFFECTIVE="${TRUSTED_AUDIENCE:-$COGNITO_CLIENT_ID}"
-
-if [ "$STACK_EXISTS" = "true" ]; then
-    CUR_ENV="$(_current_param Environment)"
-    CUR_TENANT="$(_current_param TenantId)"
-    CUR_WS="$(_current_param WorkspaceId)"
-    CUR_AUD="$(_current_param TrustedAudience)"
-    BINDING_CHANGES=""
-    [ -n "$CUR_ENV" ] && [ "$CUR_ENV" != "$ENVIRONMENT" ] && BINDING_CHANGES="${BINDING_CHANGES}Environment ($CUR_ENV -> $ENVIRONMENT) "
-    [ -n "$CUR_TENANT" ] && [ "$CUR_TENANT" != "$TENANT_ID" ] && BINDING_CHANGES="${BINDING_CHANGES}TenantId "
-    [ -n "$CUR_WS" ] && [ "$CUR_WS" != "$WORKSPACE_ID" ] && BINDING_CHANGES="${BINDING_CHANGES}WorkspaceId "
-    [ -n "$CUR_AUD" ] && [ "$CUR_AUD" != "$TRUSTED_AUDIENCE_EFFECTIVE" ] && BINDING_CHANGES="${BINDING_CHANGES}TrustedAudience "
-    if [ -n "$BINDING_CHANGES" ] && [ "$ALLOW_BINDING_CHANGE" != "true" ]; then
-        echo "❌ Refusing to re-enable: this would change trusted binding(s): $BINDING_CHANGES" >&2
-        echo "   Changing Environment can downgrade deletion protection and log retention;" >&2
-        echo "   changing TenantId/WorkspaceId/TrustedAudience rebinds the live function." >&2
-        echo "   Pass --allow-binding-change to proceed intentionally." >&2
-        exit 9
-    fi
-fi
-
 # Build the override list. On an existing stack, send only the keys that change
 # (plus the always-updated Provisioned/OperationsMode/code identifiers), so an
-# unchanged binding is never resent and cannot be accidentally rewritten.
+# unchanged binding is never resent and cannot be accidentally rewritten. The
+# latency budget values validated above are sent too, so the stack actually
+# carries the values the wrapper checked against LambdaTimeoutSeconds rather than
+# silently falling back to template defaults.
 PARAM_OVERRIDES=(
     "ProjectName=${PROJECT_NAME}"
     "Provisioned=true"
@@ -728,6 +793,12 @@ PARAM_OVERRIDES=(
     "CognitoClientId=${COGNITO_CLIENT_ID}"
     "CodeS3Bucket=${CODE_S3_BUCKET:-}"
     "CodeS3Key=${CODE_S3_KEY}"
+    "RequestDeadlineSeconds=${_req}"
+    "LambdaTimeoutSeconds=${_lambda_timeout}"
+    "PerReadBudgetSeconds=${_read}"
+    "PersistenceBudgetSeconds=${_persist}"
+    "CancellationMarginSeconds=${_margin}"
+    "LatencyAlarmThresholdMs=${_latency_ms}"
 )
 if [ "$STACK_EXISTS" != "true" ] || [ "$ALLOW_BINDING_CHANGE" = "true" ]; then
     PARAM_OVERRIDES+=(

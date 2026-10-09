@@ -209,6 +209,10 @@ Parameters:
   ObserverGroups:
     Type: String
     Default: 'admin,users'
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(,[A-Za-z0-9][A-Za-z0-9._:-]{0,127})*$'
+    ConstraintDescription: >-
+      Comma-separated Cognito group names; each token matches the core group
+      pattern [A-Za-z0-9][A-Za-z0-9._:-]{0,127} with no spaces or empty entries.
     Description: >-
       Comma-separated, server-owned allowlist of Cognito groups permitted to
       observe, injected as GBAW_OPERATIONS_OBSERVER_GROUPS. A verified caller
@@ -224,7 +228,9 @@ Parameters:
     Description: >-
       p99 latency alarm threshold in milliseconds. Must be below the internal
       request deadline (RequestDeadlineSeconds * 1000) so the alarm can fire
-      before the handler fails closed; a template Rule enforces this.
+      before the handler fails closed. The deploy wrapper validates this
+      ordering before an enable (CloudFormation Rules cannot compare the scaled
+      numeric values).
 
   AlarmTopicArn:
     Type: String

@@ -63,6 +63,25 @@ def _write(path: pathlib.Path, text: str = "") -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def in_git_work_tree(repo_root: pathlib.Path) -> bool:
+    """True when ``repo_root`` is inside a git work tree.
+
+    The seam checks read the git index; outside a checkout (for example a
+    ``git archive`` extraction) ``git`` fails, so callers skip rather than treat
+    the failure as a result.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
 def _git_tracked_files(repo_root: pathlib.Path, pathspec: str) -> list[str]:
     """Files tracked in ``repo_root``'s index matching ``pathspec``.
 

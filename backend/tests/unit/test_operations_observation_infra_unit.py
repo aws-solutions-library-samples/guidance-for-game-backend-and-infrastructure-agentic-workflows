@@ -58,6 +58,7 @@ from _combined_tree import (
     HANDLER_IMPORT,
     HANDLER_REL,
     STORE_MODULE_REL,
+    in_git_work_tree,
     materialize_combined_operations_tree,
     module_defines_top_level_handler,
     observe_placeholder_seam_hits,
@@ -1305,6 +1306,8 @@ def test_no_placeholder_or_register_observer_seam_is_tracked():
     placeholder seam. It goes red only if an infra-style
     placeholder/register_observer seam is present where only the real handler
     belongs, which is exactly the add/add-conflict this guards against."""
+    if not in_git_work_tree(PROJECT_ROOT):
+        pytest.skip("not inside a git work tree; the tracked-seam check needs the git index")
     hits = observe_placeholder_seam_hits(PROJECT_ROOT)
     assert hits == [], (
         "no operations/observe placeholder or register_observer seam may be "

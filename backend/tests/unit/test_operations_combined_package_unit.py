@@ -41,6 +41,7 @@ import zipfile
 import pytest
 from _combined_tree import (
     HANDLER_DOTTED,
+    in_git_work_tree,
     materialize_combined_operations_tree,
     module_defines_top_level_handler,
     observe_placeholder_seam_hits,
@@ -171,6 +172,8 @@ def test_no_observe_placeholder_seam_is_tracked():
     both when the path is untracked (infra-only) and when core's real handler is
     tracked (combined). This is the invariant that keeps a core+infra merge free
     of add/add conflicts."""
+    if not in_git_work_tree(PROJECT_ROOT):
+        pytest.skip("not inside a git work tree; the tracked-seam check needs the git index")
     hits = observe_placeholder_seam_hits(PROJECT_ROOT)
     assert hits == [], f"no operations/observe placeholder or register_observer seam may be tracked; found: {hits}"
 

@@ -309,10 +309,18 @@ disabled, or torn down with data retained:
 | Scenario | Provisioned | Fixed | Variable | Total [USD] |
 | --- | --- | --- | --- | --- |
 | Default (no stack) | no | $0.00 | $0.00 | **$0.00** |
-| Enabled, 100,000 observations/mo | yes | $2.65 | $2.95 | **$5.60** |
-| Enabled, idle | yes | $2.65 | $0.00 | **$2.65** |
-| Disabled after provision (data retained) | yes | $2.65 | $0.00 | **$2.65** |
-| Torn down (data retained) | n/a | $2.65 | $0.00 | **$2.65** |
+| Enabled, 100,000 observations/mo | yes | $2.85 | $2.95 | **$5.80** |
+| Enabled, idle | yes | $1.65 | $0.00 | **$1.65** |
+| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
+| Torn down (data retained) | n/a | $1.05 | $0.00 | **$1.05** |
+
+The **$2.85** fixed charge for an actively serving stack is the KMS key
+($1.00), four custom metrics ($1.20), and six alarms ($0.60), plus small table
+and log storage. Custom metrics bill only while data is published, so an idle or
+disabled stack publishes nothing and drops the $1.20 metric charge, leaving the
+KMS key, the six alarms, and storage (about **$1.65**). Teardown deletes the
+function and all six alarms (so metric publishing stops) and retains only the
+KMS key plus table and log storage (about **$1.05**).
 
 Enabled resources and their charge basis:
 
@@ -323,7 +331,7 @@ Enabled resources and their charge basis:
 | DynamoDB (on-demand) | WRU $0.625/M, RRU $0.125/M | 16 WRU + 4 RRU per observation (transactional) |
 | DynamoDB storage + PITR | $0.25 + $0.20 / GB-mo | small standing footprint |
 | AWS KMS (customer-managed key) | $1.00 / key-mo + $0.03 / 10K requests | fixed while provisioned, disabled, or retained after teardown |
-| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 custom metrics + 6 alarms (always-on fixed cost) |
+| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 custom metrics (billed only while data is published) + 6 alarms (fixed while the stack exists) |
 | CloudWatch logs | $0.50 / GB ingest + $0.03 / GB-mo | ~8 KB per request |
 | X-Ray | $5.00 / million traces | 1 trace per observation |
 

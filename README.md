@@ -148,25 +148,28 @@ retained:
 | Scenario | Provisioned | Fixed | Variable | Total [USD] |
 | --- | --- | --- | --- | --- |
 | Default (no stack) | no | $0.00 | $0.00 | **$0.00** |
-| Enabled, 100,000 observations | yes | $2.65 | $2.95 | **$5.60** |
-| Enabled, idle (0 requests) | yes | $2.65 | $0.00 | **$2.65** |
-| Disabled after provision (data retained) | yes | $2.65 | $0.00 | **$2.65** |
-| Torn down (data retained) | n/a | $2.65 | $0.00 | **$2.65** |
+| Enabled, 100,000 observations | yes | $2.85 | $2.95 | **$5.80** |
+| Enabled, idle (0 requests) | yes | $1.65 | $0.00 | **$1.65** |
+| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
+| Torn down (data retained) | n/a | $1.05 | $0.00 | **$1.05** |
 
 > **No-stack vs. disabled vs. torn-down.** The **$0.00** row is the default:
 > this stack is never created unless an owner provisions it, so "unprovisioned"
-> means *no stack exists* rather than a deployed empty stack. A
-> *disabled-but-provisioned* stack (after an emergency `--disable`) keeps its
-> retained DynamoDB table (storage + PITR), the customer-managed KMS key, both
-> log groups, and the CloudWatch alarms/metrics, so it continues to cost the
-> **fixed** standing charges and to **retain audit data** — the same fixed cost
-> as "enabled, idle". Disabling stops serving requests; it does not stop the
-> standing cost. **Teardown does not remove all cost:** it deletes the stack but
-> deliberately **retains** the DynamoDB table, the KMS key, and both log groups
-> under their retain policy, so the fixed charges above continue after teardown
-> until those resources are removed by hand. Variable cost scales linearly with
-> request volume. This documents an optional design; it does not assert the
-> operations stack is deployed.
+> means *no stack exists* rather than a deployed empty stack. The **fixed**
+> column for an actively serving stack is the KMS customer-managed key ($1.00),
+> four custom metrics ($0.30 each = $1.20), and six alarms ($0.10 each = $0.60),
+> plus small table and log storage — about **$2.85**. Custom metrics bill only
+> while data is published, so a *disabled-but-provisioned* or *idle* stack
+> publishes nothing and drops the $1.20 metric charge, leaving the KMS key, the
+> six alarms, and storage (about **$1.65**); it still **retains audit data**.
+> Disabling stops serving requests; it does not stop the standing cost.
+> **Teardown does not remove all cost:** it deletes the stack — including the
+> function and all six alarms, so metric publishing stops — but deliberately
+> **retains** the DynamoDB table, the KMS key, and both log groups under their
+> retain policy. What remains is the KMS key plus table and log storage, about
+> **$1.05**, until those resources are removed by hand. Variable cost scales
+> linearly with request volume. This documents an optional design; it does not
+> assert the operations stack is deployed.
 
 ## Prerequisites
 

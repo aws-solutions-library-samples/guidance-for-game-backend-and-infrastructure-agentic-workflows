@@ -163,22 +163,33 @@ def test_disable_keeps_provisioned_true_and_sets_mode_disabled():
 
 
 def test_disable_reuses_existing_parameter_values():
-    """Every binding the provisioned resources reference must be reused via
-    UsePreviousValue, never blanked — blanking would violate the template Rules
-    and orphan/rename resources."""
+    """Every parameter the deployed stack carries must be reused via
+    UsePreviousValue. The list is built from the deployed stack's OWN parameter
+    keys (describe-stacks), overriding only the two safety levers, so it stays
+    correct across template version skew rather than being pinned to the local
+    template."""
     branch = _disable_branch()
-    for reused in (
-        "CognitoIssuer",
-        "CognitoClientId",
-        "TenantId",
-        "WorkspaceId",
-        "TrustedAudience",
-        "CodeS3Bucket",
-        "CodeS3Key",
-    ):
-        assert (
-            f"ParameterKey={reused},UsePreviousValue=true" in branch
-        ), f"disable must reuse {reused} via UsePreviousValue"
+    # The disable path reads the deployed stack's parameter keys and reuses each.
+    assert "Stacks[0].Parameters[].ParameterKey" in branch, "disable must read the deployed stack's parameter keys"
+    assert (
+        "ParameterKey=${_key},UsePreviousValue=true" in branch
+    ), "disable must reuse every deployed key via UsePreviousValue"
+    # Only Provisioned and OperationsMode are overridden; the rest are reused.
+    assert "Provisioned | OperationsMode" in branch, "only the two safety levers are overridden"
+
+
+def test_disable_builds_the_parameter_list_from_the_deployed_stack_keys():
+    """The disable path must NOT pin its parameter list to the local template:
+    building from the deployed keys is what keeps --use-previous-template valid
+    when the deployed template predates a newly added parameter."""
+    branch = _disable_branch()
+    # No long hard-coded ParameterKey=...,UsePreviousValue=true literal list.
+    # Standard library
+    import re as _re
+
+    literal_reused = _re.findall(r'"ParameterKey=[A-Za-z0-9]+,UsePreviousValue=true"', branch)
+    assert literal_reused == [], f"disable must not hard-code a reused-key list: {literal_reused}"
+    assert "describe-stacks" in branch and "ParameterKey" in branch
 
 
 def test_disable_does_not_rebuild_code_or_run_docker():
@@ -207,30 +218,6 @@ def test_disable_updates_through_cloudformation_reversibly():
     assert "--template-body" not in branch, "disable must not ship the local template"
     assert "stack-update-complete" in branch, "disable should wait for the update"
     assert "--enable" in branch, "disable messaging must point at the reversible re-enable"
-
-
-def test_disable_params_match_template_parameters():
-    """The disable path must send a value for EXACTLY the template's parameters
-    (nothing dropped, nothing stale), so a parameter added later is not silently
-    reset to its default on an emergency disable."""
-    # Standard library
-    import re
-
-    branch = _disable_branch()
-    disable_keys = set(re.findall(r"ParameterKey=([A-Za-z0-9]+),", branch))
-
-    template_text = (PROJECT_ROOT / "infrastructure/cloudformation/06-operations-observation.yaml").read_text(
-        encoding="utf-8"
-    )
-    # Parameters are the top-level keys under the Parameters: block (2-space
-    # indented names), up to the Conditions: block.
-    params_block = template_text.split("\nParameters:", 1)[1].split("\nConditions:", 1)[0]
-    template_params = set(re.findall(r"^  ([A-Za-z0-9]+):$", params_block, flags=re.MULTILINE))
-
-    assert disable_keys == template_params, (
-        "DISABLE_PARAMS must cover exactly the template parameters; "
-        f"missing={template_params - disable_keys} extra={disable_keys - template_params}"
-    )
 
 
 def test_enable_path_provisions_resources():
