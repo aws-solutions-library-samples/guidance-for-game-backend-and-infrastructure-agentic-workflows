@@ -245,7 +245,7 @@ A UI, a model, or a request body can never raise it.
 | O6 | Executor → source-control provider | Source-control executor → repository | **Separate write credential**, distinct from the read credential | All writes human-approved; deterministic proposal branch; provider-enforced uniqueness ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md), [Contracts](OPERATIONS_CONTRACTS.md)) |
 | O7 | Autonomy engine → operations services | Trusted autonomy code → prepare/approve/execute path | Runs as trusted code, re-observes current state | Selects an exact registered capability/playbook/executor; hard risk/rate/cost/concurrency/frequency/cooldown/blast-radius limits; fail-closed escalation |
 | O8 | Persistence & audit | Application services → DynamoDB + object storage + ledger | Fenced conditional/transactional writes | Append-only ledger by mandatory conditional `PutItem`; hash-verified externalized content; single-flight lease with fencing ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) |
-| O9 | Chat proposal handoff | Browser → trusted frontend proposal proxy → Operations HTTP API prepare | Verified Cognito access token forwarded by the proxy; API Gateway JWT authorizer builds the principal | Chat runtime is not on the path and gains no operations credential; model output is an untrusted proposal only; identity/tenant/workspace are server-owned; approval is never on this path ([ADR 0008](adr/0008-hand-off-chat-proposals-to-direct-approval.md)) |
+| O9 | Chat proposal handoff | Browser → trusted frontend proposal proxy → Operations HTTP API prepare | Verified Cognito access token forwarded by the proxy; API Gateway JWT authorizer builds the principal. Planned token-audience separation gives the operations API a token the chat runtime never receives (ADR 0008 decision 1); until it lands, the chat-forwarded token is accepted by the operations API (OP-H7) | Chat runtime is not on the proxy path; model output is an untrusted proposal only; identity/tenant/workspace are server-owned; approval is never on this path. The "chat gains no operations credential" invariant holds only once token-audience separation is implemented ([ADR 0008](adr/0008-hand-off-chat-proposals-to-direct-approval.md)) |
 
 ## Core Invariants (apply to all operations boundaries)
 
@@ -386,17 +386,23 @@ The chat assistant can describe observed state and propose a capacity change,
 but it hands that proposal to E2 preparation through a trusted frontend proxy
 and never reaches a provider write or an approval itself
 ([ADR 0008](adr/0008-hand-off-chat-proposals-to-direct-approval.md)). The chat
-runtime (the AgentCore role) is **not** on this path and holds no operations
-credential.
+runtime (the AgentCore role) is **not** on the proxy path and holds no
+operations IAM permission. It does, however, receive a forwarded Cognito access
+token that the operations API currently accepts; ADR 0008 decision 1 adds
+token-audience separation to close that, tracked below as OP-H7.
+
+Owners cite the issue that owns each control rather than a phase letter, because
+this file's phase table and #274's phase numbering differ.
 
 | ID | Threat (STRIDE) | Preventive control | Detective control | Residual risk | Owner |
 |---|---|---|---|---|---|
-| OP-H1 | (E) Chat runtime or a model tool call reaches the operations prepare API | Only the trusted frontend proposal proxy calls `POST /operations/prepare`, carrying the user's verified access token; the AgentCore chat role gains no operations credential and no network path to the control plane; preparation is unreachable from a chat/model tool | Proxy access logs; absence of operations permission on the chat role (IAM review) | — | E2 / [ADR 0008](adr/0008-hand-off-chat-proposals-to-direct-approval.md) |
-| OP-H2 | (T) Model output submitted as an executable or authoritative proposal | Trusted UI code renders the proposal affordance from displayed state and the user confirms typed fields; the proxy maps only to the `prepare-operation-request` body; the orchestrator re-derives advice, selects the playbook in code, and binds everything — model output never selects a capability, grants authority, or lowers risk | Decision/reason-code agreement; schema-rejection logs | Injection that changes *human* judgement at confirmation (see OP-CD2) | E2 / [Contracts](OPERATIONS_CONTRACTS.md#trusted-context) |
-| OP-H3 | (S) Proposal body supplies requester, approver, tenant, or workspace | `prepare-operation-request` carries only `observation_id` and the capacity proposal fields with `additionalProperties:false`; identity comes from the API Gateway JWT authorizer context; tenant/workspace are server-owned bindings | Schema-validation rejection logs | — | E2 / [Contracts](OPERATIONS_CONTRACTS.md#trusted-context) |
-| OP-H4 | (E) Approval triggered from the chat transcript or in-chat affordance | The in-chat affordance is presentational only and navigates to the #554 approval view; approve/reject are direct authenticated actions on the empty-bodied E2 routes and never travel through a chat message, model response, or model tool call (reinforces OP-A1) | Ledger records approver source; approval-path tests | — | E3 / [Identity](IDENTITY_AND_AUTHORIZATION.md#approval-identity) |
-| OP-H5 | (DoS) Proposal flooding from chat | Per-subject rate limiting at the proxy plus WAF edge limits; workspace-scoped idempotency replays a byte-identical retry and rejects a changed-intent reuse with `IDEMPOTENCY_CONFLICT`; preparation touches no provider | Rate-limit metrics; `IDEMPOTENCY_CONFLICT` metrics | Limits mis-tuned too high | E2 / [ADR 0005](adr/0005-persist-operations-and-recover-workflows.md#idempotency-and-independent-operations) |
-| OP-H6 | (E) Proposal affordance shown while operations are disabled or unprovisioned | Trusted UI code renders the affordance only after backend capability discovery confirms availability; the operations API and its JWT authorizer fail closed independently, and a provisioned-but-disabled stack throttles its stage to zero; a hidden UI control is never authorization | Capability-discovery checks; API-stage throttle; deny metrics | — | E2 / [ADR 0001](adr/0001-preserve-chat-and-add-optional-operations.md) |
+| OP-H1 | (E) Chat runtime or a model tool call reaches the operations prepare API | Only the trusted frontend proposal proxy calls `POST /operations/prepare`; the AgentCore chat role holds no operations IAM permission; preparation is unreachable from a chat/model tool (#429) | Proxy access logs; absence of operations permission on the chat role (IAM review); operations-authorizer audience/client check that rejects the chat client (see OP-H7) | A forwarded bearer token the operations API accepts remains usable until token-audience separation lands (OP-H7) | #414 / [ADR 0008](adr/0008-hand-off-chat-proposals-to-direct-approval.md) |
+| OP-H2 | (T) Model output submitted as an executable or authoritative proposal | The model emits only a fenced, versioned `proposal` carrying bounded capacity intent; trusted UI validates it fail-closed, observes current state server-side, and the user confirms typed fields; the proxy maps to `gamelift-capacity-proposal-request` 1.0 plus the proxy-obtained `observation_id`; the orchestrator re-derives advice, selects the playbook in code, and binds everything — model output never selects a capability, grants authority, lowers risk, or supplies `observation_id` or the idempotency token | Decision/reason-code agreement; schema-rejection and fence-rejection logs | Injection that changes *human* judgement at confirmation (see OP-CD2), bounded by the server-owned capacity band, a distinct approver, the preparation expiry, and requester cancel | #414 / [Contracts](OPERATIONS_CONTRACTS.md#trusted-context) |
+| OP-H3 | (S) Proposal body supplies requester, approver, tenant, or workspace | The prepare body is `gamelift-capacity-proposal-request` 1.0 plus `observation_id` only, with `additionalProperties:false`, enforced by an exact key-set check in the orchestrator; identity comes from the API Gateway JWT authorizer context; tenant/workspace are server-owned bindings; the source-control `prepare-operation-request` schema is untouched | Schema-validation and key-set rejection logs | — | #414 / [Contracts](OPERATIONS_CONTRACTS.md#trusted-context) |
+| OP-H4 | (E) Approval triggered from the chat transcript or in-chat affordance | The in-chat affordance is navigation-only and takes `operation_id` only from the proxy's prepare response; there is no approve/reject control in the transcript; approve/reject are direct authenticated actions on the E2 routes carrying only the path ID and at most `expected_prepared_hash`, and never travel through a chat message, model response, or model tool call (reinforces OP-A1) | Ledger records approver source; approval-path tests; chat-renderer test that no raw HTML from model output is rendered | Same-origin script injection on the chat page could POST to a same-origin approval proxy; `SameSite=Lax` and the same-origin check do not stop same-origin script (see Residual Risks) | #554 / [Identity](IDENTITY_AND_AUTHORIZATION.md#approval-identity) |
+| OP-H5 | (DoS) Proposal flooding from chat | The authoritative limits are server-side in the E2 application service: a per-requester cap on concurrent `pending_approval` operations and a `POST /operations/prepare` route throttle separate from the approval routes; the proxy per-subject limit and WAF edge limit are defense in depth only (WAF does not apply to HTTP APIs, and the frontend limiter is per ECS task); workspace-scoped idempotency replays a byte-identical retry and rejects a changed-intent reuse with `IDEMPOTENCY_CONFLICT`; preparation touches no provider | Per-requester cap metrics; prepare-route throttle metrics; `IDEMPOTENCY_CONFLICT` metrics | Limits mis-tuned too high; cross-requester idempotency replay under a known token in a shared workspace | #414 / [ADR 0005](adr/0005-persist-operations-and-recover-workflows.md#idempotency-and-independent-operations) |
+| OP-H6 | (E) Proposal affordance shown while operations are disabled or unprovisioned | Trusted UI code renders the affordance only when the existing `operations-capability-discovery` contract reports `phases.prepare === true`, served from the E4 admin-only discovery proxy; an E2-only (`advise`) deployment without E4 therefore never renders it; the operations API fails closed independently when its runtime mode is below the capability's required authority or the kill-switch prepare phase is engaged, and a provisioned-but-disabled stack throttles its API stage to zero; a trusted UI notice, not model output, tells the user it can describe but not start a change; a hidden UI control is never authorization | Capability-discovery checks; runtime mode check; kill-switch state; API-stage throttle; deny metrics | — | #414 / [ADR 0001](adr/0001-preserve-chat-and-add-optional-operations.md) |
+| OP-H7 | (S/E) Chat-forwarded token replayed to the operations API | **Planned:** a separate operations Cognito app client (audience) obtained server-side by the frontend through authorization-code + PKCE, kept in an `HttpOnly` operations cookie; the E2/E1 authorizer lists only the operations client and the AgentCore authorizer lists only the chat client, so a token minted for the chat client is rejected (401) by every operations route and the operations token is never forwarded to the runtime. The same mechanism closes the equivalent residual on the E1 read-only observation API | Operations-authorizer audience/client check; a live exercise that a token captured at the AgentCore boundary is rejected by every operations route | Until implemented, the chat runtime holds a bearer token the operations API accepts (prepare and cancel for any user; approve and reject for an admin) | #441 / [ADR 0008](adr/0008-hand-off-chat-proposals-to-direct-approval.md) |
 
 > **Deployed today:** There is **no** chat proposal handoff in the default
 > deployment. The chat path stays read-only; the proposal proxy, prepare API,
@@ -428,11 +434,13 @@ Unauthorized Provider Write [ROOT]
 │   └── [PREVENTED, Deployed] Chat role is provider-read-only (ADR 0003); no executor reachable
 ├── Via the chat proposal handoff
 │   ├── Chat/model tool calls the prepare API
-│   │   └── [PLANNED] Only the trusted frontend proxy submits; chat role has no operations credential (OP-H1)
+│   │   └── [PLANNED] Only the trusted frontend proxy submits; chat role has no operations IAM permission (OP-H1)
+│   ├── Chat-forwarded token replayed to the operations API
+│   │   └── [RESIDUAL, until #441] One Cognito audience is shared today; token-audience separation closes it (OP-H7)
 │   ├── Model output submitted as an authoritative proposal
-│   │   └── [PLANNED] Trusted UI confirms typed fields; preparation re-derives and binds (OP-H2)
+│   │   └── [PLANNED] Fenced proposal validated fail-closed; trusted UI confirms typed fields; preparation re-derives and binds (OP-H2)
 │   └── Approve from the chat transcript / in-chat affordance
-│       └── [PLANNED] Affordance is presentational; approval is a direct action on the E2 route (OP-H4)
+│       └── [PLANNED] Affordance is navigation-only; approval is a direct action on the E2 route (OP-H4)
 ├── Via an adapter (HTTP/MCP/chat/event) calling a provider directly
 │   └── [PLANNED] Adapters cannot mutate; only request operations (ADR 0002/0003)
 ├── Via a forged/guessed operation identifier
@@ -513,6 +521,23 @@ the issue requires:
 - **Trusted-storage tampering with hash recomputation (OP-L7).** An attacker who
   can both rewrite trusted storage and recompute every bound hash is outside the
   application-layer controls and requires infrastructure-level protection.
+- **Chat-forwarded token replay to the operations API (OP-H1/OP-H7).** Until
+  token-audience separation (ADR 0008 decision 1) lands, the chat runtime holds a
+  bearer token the operations API accepts. **Live exercise:** a token captured at
+  the AgentCore boundary is rejected (401) by every operations route after the
+  separate operations audience is deployed. The same exercise covers the E1
+  read-only observation API, which shares the authorizer audience today.
+- **Chat proposal CSRF and same-origin script (OP-H4).** The proposal and
+  approval proxies are same-origin writes guarded by `SameSite=Lax` cookies and
+  an `isSameOrigin` check, which stop cross-origin POSTs but not a same-origin
+  script injected into the chat page on an origin whose CSP permits inline
+  script. **Live exercise:** confirm a cross-origin POST to each proxy is refused,
+  and that the chat renderer never renders raw HTML from model output.
+- **Chat proposal flooding isolation (OP-H5).** A prepare flood from one subject
+  must not starve approve, reject, and cancel. **Live exercise:** drive the
+  per-requester `pending_approval` cap and confirm the dedicated prepare-route
+  throttle leaves the approval routes responsive, and that the disabled/denied UI
+  states render as read-only.
 
 ## GenAI-Specific Threats (both parts)
 
@@ -723,4 +748,4 @@ Append-only ledger (authoritative audit)
 |---------|------|--------|---------|
 | 1.0 | 2026-01-12 | Security Eng | Initial draft |
 | 2.0 | 2026-09-21 | Security Eng | Split into the deployed read-only chat path (Part I) and the optional, default-disabled operations control plane (Part II). Added trust boundaries O1-O8, per-boundary STRIDE, attack trees, and explicit residual risks for operations APIs, direct approval, immutable prepared operations, replay/stale-approval/cancellation, source-control prepare/executor, remote MCP clients, separate provider-write roles, bounded autonomy, emergency disablement, budget/authority limits, indirect prompt injection, confused deputy, audit integrity, and fail-closed recovery (issue #280). |
-| 2.1 | 2026-10-08 | Security Eng | Added the chat proposal handoff trust boundary O9 and threats OP-H1 through OP-H6, and an attack-tree branch for the handoff, consistent with the proposed ADR 0008 (issue #555). The chat runtime stays off the operations path and holds no operations credential; model output is an untrusted proposal; identity, tenant, and workspace are server-owned; approval never travels through chat or model output. |
+| 2.1 | 2026-10-08 | Security Eng | Added the chat proposal handoff trust boundary O9 and threats OP-H1 through OP-H7, and an attack-tree branch for the handoff, consistent with the proposed ADR 0008 (issue #555). The chat runtime stays off the proxy path; model output is an untrusted, fenced proposal; identity, tenant, and workspace are server-owned; approval never travels through chat or model output. The chat runtime still receives a Cognito access token the operations API accepts, so the "chat gains no operations credential" invariant holds only once token-audience separation (OP-H7) is implemented; the same residual applies to the E1 observation API today. |
