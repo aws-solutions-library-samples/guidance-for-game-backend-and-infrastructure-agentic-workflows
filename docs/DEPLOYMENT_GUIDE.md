@@ -266,7 +266,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$369 | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Both run with thinking off |
+| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$369 at ~10,000 queries/month | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Both run with thinking off. Scales with query volume |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
 | Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
@@ -293,6 +293,8 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 ### Optional: application inference profiles for cost attribution
 
 The optional helper scripts `scripts/infrastructure/manage-inference-profile.sh` and `scripts/infrastructure/get-inference-profile-ids.sh` create and resolve Game Agent application inference profiles so Cost Explorer can attribute token spend per role. They are not called by `scripts/deploy.sh`; run them by hand only if you want this attribution.
+
+> **Not supported as runtime model IDs yet.** Do not set `GBAW_ORCHESTRATOR_MODEL_ID` or `GBAW_SPECIALIST_MODEL_ID` to an application inference profile that wraps Claude Haiku 5.5 or Claude Sonnet 5.5 until the capability-aware model factory ([#421](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/421)). An application inference profile ID is opaque, so the runtime cannot tell which model it wraps and sends the earlier-generation request shape, which includes `temperature`. The 5.5 models reject `temperature`, so every request through such a profile fails. These profiles are for Cost Explorer attribution only until #421 lands; keep the role variables on the `global.` system inference profile IDs.
 
 The profile names track the current model generation (`GameAgent-Orchestrator-Claude-Haiku-5-5` and `GameAgent-Specialist-Claude-Sonnet-5-5`). If you created profiles under earlier names, run `manage-inference-profile.sh create <region>` to create the current ones and delete the previous-generation profiles manually; they are not removed automatically. When no profile exists under the current names, `get-inference-profile-ids.sh` prints a stderr notice and falls back to the resolved model IDs.
 

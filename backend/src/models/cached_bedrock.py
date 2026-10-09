@@ -126,5 +126,7 @@ def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: in
     """
     selected_model_id = model_id or ORCHESTRATOR_MODEL_ID
     model_config = _model_config(selected_model_id, temperature, max_tokens)
-    logger.info(f"Configured model: {selected_model_id} (temperature={temperature})")
+    shaped_temperature = model_config.get("temperature", "omitted")
+    shaped_thinking = model_config.get("additional_request_fields", {}).get("thinking", "none")
+    logger.info(f"Configured model: {selected_model_id} (temperature={shaped_temperature}, thinking={shaped_thinking})")
     return BedrockModel(**model_config)
