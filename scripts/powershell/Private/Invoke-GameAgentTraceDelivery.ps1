@@ -45,7 +45,7 @@ function Invoke-GameAgentTraceDelivery {
     function Get-DeliveryErrorClass {
         param([string]$ErrorText)
         $code = ''
-        if ($ErrorText -cmatch '\(([A-Za-z]+)\)') { $code = $Matches[1] }
+        if ($ErrorText -cmatch '\(([A-Za-z0-9]+)\)') { $code = $Matches[1] }
         switch -CaseSensitive ($code) {
             'ConflictException' { return 'conflict' }
             'ResourceAlreadyExistsException' { return 'conflict' }

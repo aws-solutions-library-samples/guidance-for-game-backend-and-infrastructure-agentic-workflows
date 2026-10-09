@@ -8,8 +8,11 @@ function New-GameAgentAwsInvoker {
         exits non-zero. Because the closure calls `& aws` directly (rather than a
         function nested inside the caller), it resolves correctly when passed to
         another function such as Invoke-GameAgentWafReconciliation or
-        Invoke-GameAgentTraceDelivery. The thrown message includes the CLI output
-        so the caller's error classifier can read the AWS error code.
+        Invoke-GameAgentTraceDelivery. stderr is merged with `2>&1` so native CLI
+        diagnostics are captured, then split back out: the closure returns stdout
+        only, so a CLI warning on stderr cannot corrupt the caller's JSON or ARN
+        parsing, and the thrown message carries the stderr text so the caller's
+        error classifier can read the AWS error code.
     .PARAMETER ProfileArgs
         The resolved AWS CLI profile arguments (for example @('--profile','demo')
         or an empty array).
@@ -27,10 +30,18 @@ function New-GameAgentAwsInvoker {
     return {
         param([string[]]$AwsArgs)
         $allArgs = $AwsArgs + $profileArgsLocal
-        $result = & aws @allArgs 2>&1
+        # Merge stderr into the stream so native CLI diagnostics are captured,
+        # then split the merged items: stderr surfaces as ErrorRecord objects
+        # while stdout is everything else. Returning stdout only keeps a CLI
+        # warning on stderr out of the caller's JSON/ARN parsing; the stderr
+        # text is carried in the thrown message for the error classifier.
+        $merged = & aws @allArgs 2>&1
+        $stdoutItems = @($merged | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+        $stderrItems = @($merged | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
         if ($LASTEXITCODE -ne 0) {
-            throw "$labelLocal failed: $result"
+            $stderrText = ($stderrItems | ForEach-Object { $_.ToString() }) -join "`n"
+            throw "$labelLocal failed: $stderrText"
         }
-        return $result
+        return $stdoutItems
     }.GetNewClosure()
 }

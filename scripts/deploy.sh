@@ -475,7 +475,7 @@ reconcile_waf_association() {
 classify_delivery_error() {
   local error_text="$1"
   local code=""
-  if [[ "$error_text" =~ \(([A-Za-z]+)\) ]]; then
+  if [[ "$error_text" =~ \(([A-Za-z0-9]+)\) ]]; then
     code="${BASH_REMATCH[1]}"
   fi
 
@@ -512,7 +512,9 @@ classify_delivery_error() {
 #   $2.. the aws CLI arguments
 # Honors GBAW_DELIVERY_MAX_ATTEMPTS (default 4, capped at 20) and
 # GBAW_DELIVERY_RETRY_SECONDS (default 5, capped at 60). On success the captured
-# stdout is available in DELIVERY_LAST_STDOUT.
+# combined output (stdout and stderr) is available in DELIVERY_LAST_STDOUT; the
+# caller parses it as JSON only with a safe fallback, so stderr noise cannot
+# produce a bad ARN.
 # Returns: 0 success | 1 fatal/exhausted | 2 conflict.
 run_delivery_mutation() {
   local label="$1"
@@ -744,7 +746,9 @@ ensure_runtime_trace_delivery() {
     echo "  ✅ Delivery destination ready"
   fi
 
-  # Resolve the destination ARN from the API; never fabricate it.
+  # Resolve the destination ARN from the put response when it parses as JSON;
+  # the capture may include stderr, so a failed parse falls back to the API read
+  # below rather than yielding a bad ARN. Never fabricate it.
   if [ -n "$DELIVERY_LAST_STDOUT" ]; then
     delivery_dest_arn=$(printf '%s' "$DELIVERY_LAST_STDOUT" \
       | python3 -c "import json,sys; print(json.load(sys.stdin)['deliveryDestination']['arn'])" 2>/dev/null || echo "")

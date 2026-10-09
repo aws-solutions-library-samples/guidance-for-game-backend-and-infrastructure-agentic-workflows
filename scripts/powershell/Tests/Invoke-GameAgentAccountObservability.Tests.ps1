@@ -84,9 +84,11 @@ Describe 'Invoke-GameAgentAccountObservability' {
     It 'Default mode prints unknown when the destination read fails' {
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -DestinationUnreadable $true -Mutations $mutations
-        # Default mode must not mutate even when it cannot read the destination.
+        # Default mode must not mutate even when it cannot read the destination,
+        # and it must still warn that the account does not yet support the runtime.
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
         $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
+        ($script:StatusMessages -join ' ') | Should -Match 'does NOT yet appear to support'
     }
 
     It 'Opt-in enables the shared settings, preserves the indexing rule, and never disables the destination' {
@@ -138,7 +140,7 @@ Describe 'Invoke-GameAgentAccountObservability' {
         Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $true -PoliciesJson $legacy -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
         $mutations | Should -Not -Contain 'logs put-resource-policy'
-        ($script:StatusMessages -join ' ') + ' done' | Should -Not -BeNullOrEmpty
+        ($script:StatusMessages -join ' ') | Should -Match 'configured \(opt-in\)'
     }
 
     It 'Opt-in fails when the account is already at the 10-policy limit' {
