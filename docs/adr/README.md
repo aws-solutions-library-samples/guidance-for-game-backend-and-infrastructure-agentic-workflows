@@ -16,6 +16,7 @@ existing Game Agent chat path remains the current product behavior.
 | [ADR 0003](0003-isolate-provider-writes.md) | Accepted | Isolate provider writes behind prepared executors |
 | [ADR 0004](0004-expose-governed-public-mcp-facade.md) | Proposed | Expose a governed public MCP facade |
 | [ADR 0005](0005-persist-operations-and-recover-workflows.md) | Accepted | Persist operations state and recover workflows |
+| [ADR 0008](0008-hand-off-chat-proposals-to-direct-approval.md) | Proposed | Hand off chat proposals to direct approval |
 
 Later architecture issues define versioned contracts, trusted principal
 context, and incremental cost. Those details must not weaken the boundaries
