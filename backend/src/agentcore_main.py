@@ -187,7 +187,40 @@ def _current_request_id() -> str:
     return normalize_log_value(request_id) if request_id else "-"
 
 
-def _redact_agentcore_sdk_session_id() -> None:
+# Standard library
+import json as _json
+import logging as _logging
+
+
+class _SessionRedactingFormatter(_logging.Formatter):
+    """Wrap the AgentCore SDK's JSON formatter to redact the session ID.
+
+    Defined at module level (not inside the installer) so the ``isinstance``
+    idempotence check in :func:`_install_sdk_session_redaction` recognizes a
+    formatter this process already wrapped and never double-wraps it. Wrapping
+    twice would re-tokenize an already-redacted ``sessionId`` and break the
+    match with the application's ``Session:`` line.
+    """
+
+    def __init__(self, inner: _logging.Formatter) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def format(self, record: "_logging.LogRecord") -> str:
+        rendered = self._inner.format(record)
+        # The SDK formatter emits JSON; redact sessionId in place and fall back
+        # to the untouched line if the shape is unexpected.
+        try:
+            payload = _json.loads(rendered)
+        except (ValueError, TypeError):
+            return rendered
+        if isinstance(payload, dict) and payload.get("sessionId"):
+            payload["sessionId"] = redact_identifier(payload["sessionId"])
+            return _json.dumps(payload, ensure_ascii=False)
+        return rendered
+
+
+def _install_sdk_session_redaction() -> None:
     """Stop the AgentCore SDK log handler from emitting the raw session ID.
 
     ``BedrockAgentCoreApp`` installs its own JSON handler on the
@@ -201,46 +234,25 @@ def _redact_agentcore_sdk_session_id() -> None:
     ``logging.Filter`` cannot strip the field. The narrowest fix is to wrap the
     existing formatter so the serialized ``sessionId`` is replaced with a
     bounded, non-reversible token while ``requestId`` and everything else are
-    preserved. If the SDK's handler shape changes, this degrades to a no-op
-    rather than breaking logging.
+    preserved. The wrapper type is module-level, so a repeat call recognizes an
+    already-wrapped formatter and does not stack a second wrapper. If the SDK's
+    handler shape changes, this degrades to a no-op rather than breaking logging.
     """
     try:
-        # Standard library
-        import json
-        import logging
-
-        sdk_logger = logging.getLogger("bedrock_agentcore.app")
+        sdk_logger = _logging.getLogger("bedrock_agentcore.app")
         for handler in list(sdk_logger.handlers):
             base_formatter = handler.formatter
             if base_formatter is None:
                 continue
-
-            class _SessionRedactingFormatter(logging.Formatter):
-                def __init__(self, inner: logging.Formatter) -> None:
-                    super().__init__()
-                    self._inner = inner
-
-                def format(self, record: logging.LogRecord) -> str:
-                    rendered = self._inner.format(record)
-                    # The SDK formatter emits JSON; redact sessionId in place and
-                    # fall back to the untouched line if the shape is unexpected.
-                    try:
-                        payload = json.loads(rendered)
-                    except (ValueError, TypeError):
-                        return rendered
-                    if isinstance(payload, dict) and payload.get("sessionId"):
-                        payload["sessionId"] = redact_identifier(payload["sessionId"])
-                        return json.dumps(payload, ensure_ascii=False)
-                    return rendered
-
-            if not isinstance(base_formatter, _SessionRedactingFormatter):
-                handler.setFormatter(_SessionRedactingFormatter(base_formatter))
+            if isinstance(base_formatter, _SessionRedactingFormatter):
+                continue
+            handler.setFormatter(_SessionRedactingFormatter(base_formatter))
     except Exception:
         # Logging hardening must never prevent the app from starting.
         pass
 
 
-_redact_agentcore_sdk_session_id()
+_install_sdk_session_redaction()
 
 # Memory ID from environment (set by AgentCore CLI or deployment)
 MEMORY_ID = os.getenv("BEDROCK_AGENTCORE_MEMORY_ID")

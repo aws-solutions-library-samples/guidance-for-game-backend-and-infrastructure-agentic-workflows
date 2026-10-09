@@ -92,6 +92,53 @@ describe('logError error argument', () => {
       Object.defineProperty(process.env, 'NODE_ENV', { value: prevEnv, configurable: true })
     }
   })
+
+  it('keeps a distinguishing name and safe code for an aws-jwt-verify error', () => {
+    const prevEnv = process.env.NODE_ENV
+    Object.defineProperty(process.env, 'NODE_ENV', { value: 'production', configurable: true })
+    try {
+      // aws-jwt-verify error classes leave `name` as the generic "Error", so a
+      // bare `error.name` cannot tell an expired token from a bad signature.
+      class JwtExpiredError extends Error {
+        code = 'ERR_JWT_EXPIRED'
+        constructor(message: string) {
+          super(message)
+          // name intentionally not overridden: it stays "Error".
+        }
+      }
+      const err = new JwtExpiredError('Token expired at 2026-01-01, subject ZZSECRET-SUBJECT')
+      expect(err.name).toBe('Error')
+
+      logError('id token verification failed', err)
+      const call = (console.error as jest.Mock).mock.calls[0]
+      for (const arg of call) {
+        expect(arg).not.toBeInstanceOf(Error)
+        expect(String(arg)).not.toContain('ZZSECRET-SUBJECT')
+      }
+      const joined = call.map((a: unknown) => String(a)).join(' ')
+      // The concrete class name distinguishes it, and the uppercase code is kept.
+      expect(joined).toContain('JwtExpiredError')
+      expect(joined).toContain('ERR_JWT_EXPIRED')
+    } finally {
+      Object.defineProperty(process.env, 'NODE_ENV', { value: prevEnv, configurable: true })
+    }
+  })
+
+  it('keeps a safe cause.code (fetch failures) but no free-form text', () => {
+    const prevEnv = process.env.NODE_ENV
+    Object.defineProperty(process.env, 'NODE_ENV', { value: 'production', configurable: true })
+    try {
+      const err = new Error('fetch failed to backend host ZZSECRET-HOST')
+      ;(err as unknown as { cause: { code: string } }).cause = { code: 'ECONNREFUSED' }
+      logError('backend call failed', err)
+      const call = (console.error as jest.Mock).mock.calls[0]
+      const joined = call.map((a: unknown) => String(a)).join(' ')
+      expect(joined).not.toContain('ZZSECRET-HOST')
+      expect(joined).toContain('ECONNREFUSED')
+    } finally {
+      Object.defineProperty(process.env, 'NODE_ENV', { value: prevEnv, configurable: true })
+    }
+  })
 })
 
 describe('redact', () => {

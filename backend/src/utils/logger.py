@@ -61,11 +61,18 @@ def _sink_patcher(record: "Record") -> None:
     """
     # Imported lazily to avoid a circular import at module load (security imports
     # the logger).
-    # Local modules
-    from utils.security import normalize_log_value
+    try:
+        # Local modules
+        from utils.security import normalize_log_value
 
-    record["message"] = normalize_log_value(record["message"])
-    record["extra"].setdefault("request_id", _REQUEST_ID_VAR.get())
+        record["message"] = normalize_log_value(record["message"])
+        record["extra"].setdefault("request_id", _REQUEST_ID_VAR.get())
+    except Exception:
+        # A patcher that raises would make every log call raise with it. Fail
+        # safe: guarantee the request_id field exists so the stdout format never
+        # raises a KeyError, and leave the message unmodified rather than losing
+        # the record.
+        record["extra"].setdefault("request_id", "-")
 
 
 logger.configure(patcher=_sink_patcher)

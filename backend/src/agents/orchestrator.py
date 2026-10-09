@@ -379,7 +379,7 @@ def run_orchestrator(query: str, context: dict = None):
         specialist_capture = begin_specialist_capture()
         try:
             response: Any = agent(query)
-        except Exception:
+        except Exception as exc:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
             if authoritative_cost_response is not None:
@@ -392,13 +392,21 @@ def run_orchestrator(query: str, context: dict = None):
                     cost_only=cost_report_followup,
                 )
             elif cost_report_followup:
-                logger.exception("Cost report ID follow-up failed before producing a deterministic rendering")
+                # The failing call is the orchestrator model loop over the user
+                # prompt; its exception message can quote the prompt or a
+                # provider validation payload, so record only the sanitized
+                # class/code/request-id rather than the raw message or traceback.
+                log_sanitized_exception(
+                    logger, "Cost report ID follow-up failed before producing a deterministic rendering", exc
+                )
                 response = _COST_REPORT_FOLLOWUP_FAILURE
             elif _cost_attempted(query, specialist_outputs):
                 # A fresh account-report request raised before producing an
                 # authoritative rendering. Fail closed and preserve only safe
                 # non-cost specialist sections.
-                logger.exception("Cost-bearing request raised before a validated cost report; failing closed")
+                log_sanitized_exception(
+                    logger, "Cost-bearing request raised before a validated cost report; failing closed", exc
+                )
                 response = _compose_final_response(
                     _COST_REPORT_UNAVAILABLE,
                     specialist_outputs,
