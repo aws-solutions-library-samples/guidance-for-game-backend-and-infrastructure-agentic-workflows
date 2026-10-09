@@ -462,13 +462,25 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | **1** | User → ECS Express (ALB) | **Cognito JWT** | HttpOnly/Secure/SameSite cookies; `CognitoJwtVerifier` validates signature, expiration, and audience. Users must be in `admin` or `users` group. |
 | **2** | ECS Express → AgentCore | **Cognito JWT (bearer)** | The proxy forwards the end user's verified Cognito **access token** as an `Authorization: Bearer` header over HTTPS (TLS 1.2+). The AgentCore runtime independently verifies the token and reconstructs authority. No SigV4 and no task-role signing — the bearer token is the credential, so the ECS task role needs no `bedrock-agentcore` grant and has no identity policies. |
 | **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` condition. Read-only for GameLift, EKS, Cost Explorer. Scoped by region. |
-| **4** | Prompts → Model | **Bedrock Guardrails** | Input and output: Personal Advice topic blocking, harmful-content filters, PII anonymization, profanity, regex, and word filters. Input only: prompt injection detection. The scope topics (General Programming Help, Entertainment and Casual Chat) block on input only; on output they are detect-only (`OutputAction: NONE`, still traced). |
+| **4** | Prompts → Model | **Bedrock Guardrails** | Input and output: Personal Advice topic blocking, harmful-content filters, the managed profanity word list, custom regex filters, and PII anonymization or blocking (credentials, card numbers, SSNs, and passwords are blocked). Input only: prompt-attack detection. The scope topics (General Programming Help, Entertainment and Casual Chat) block on input only; on output they are detect-only (`OutputAction: NONE`), and a match appears only in the per-request Guardrail trace. See [Guardrail residual risk](#guardrail-residual-risk). |
 
 **Configuration Locations**:
 - Cognito: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 12-73)
 - ECS task role: `infrastructure/cloudformation/01-base-infrastructure.yaml`
 - AgentCore execution role: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 145-399)
 - Guardrails: `infrastructure/cloudformation/04-bedrock-guardrails.yaml`
+
+### Guardrail Residual Risk
+
+The two scope topics (General Programming Help, Entertainment and Casual Chat) block on user input and are detect-only on model output (#530). Valid infrastructure answers (kubectl commands, GameLift Server SDK steps, CloudFormation templates) were being blocked on output as off-topic. Accepted residual risk:
+
+- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
+- **Language coverage.** The Guardrail uses the default CLASSIC topic tier, which supports English, French, and Spanish. An off-topic request in another language can pass the input check, and the output check will not catch it.
+- **No user-visible fallback for scope detections on output.** The answer is returned unchanged. Personal Advice, content-filter, PII, and regex blocks still replace the entire response with the blocked-output message.
+- **Detections are not recorded.** A scope-topic match on output appears only in the per-request Guardrail trace. The application does not log or store it.
+- **Masked values in generated templates.** `IP_ADDRESS` anonymization rewrites addresses and CIDR ranges in generated templates (for example `0.0.0.0/0` becomes `{IP_ADDRESS}`). Those templates do not deploy as written.
+
+Every other protection is unchanged and pinned by `backend/tests/unit/test_guardrail_template_unit.py`. `backend/tests/fixtures/guardrail_eval_corpus.json` is the evaluation corpus; `backend/tests/integration/test_guardrail_corpus_cloud.py` runs it against a deployed Guardrail with `ApplyGuardrail`.
 
 ### Data Classification by Stage
 

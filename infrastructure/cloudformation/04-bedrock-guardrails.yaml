@@ -40,13 +40,16 @@ Resources:
               - 'Give me medical advice for a headache.'
 
           # The two SCOPE topics below are enforced on user input only. On
-          # output they are detect-only (OutputAction NONE, still traced): the
+          # output they are detect-only (OutputAction NONE; the match appears
+          # only in the per-request Guardrail trace and is not logged): the
           # topic classifier labels the assistant's own in-scope answers as
           # off-topic — kubectl blocks, GameLift Server SDK integration steps
           # (InitSDK/ProcessReady), even comments in a CloudFormation template —
           # and blocking them cut generated IaC off mid-template. Scope is a
-          # property of what users ask; content, PII, prompt-attack, word, and
-          # personal-advice protections stay enforced on output.
+          # property of what users ask. Personal Advice, the content filters,
+          # PII, custom regexes, and the managed profanity list stay enforced on
+          # output; prompt-attack detection applies to input only
+          # (PROMPT_ATTACK OutputStrength NONE). See SECURITY.md residual risk.
           - Name: 'General Programming Help'
             Definition: 'Requests to write, debug or explain general application source code, programming-language tutorials, or non-Amazon platforms like Azure, Google Cloud, or on-premise data centers.'
             Type: 'DENY'
