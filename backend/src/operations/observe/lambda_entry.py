@@ -15,10 +15,12 @@ with its runtime dependencies:
 * the :class:`~operations.observation_handler.ObservationRequestHandler`, which
   dispatches ``POST`` observe and ``GET`` status on the verified JWT caller.
 
-The frozen environment contract is resolved and validated once at import time
-(fail closed). The module exposes a module-level ``handler(event, context)`` that
-AWS Lambda invokes; it measures request latency and publishes it after each
-request. There is no provider-write surface anywhere in this module.
+The frozen environment contract is resolved and validated on the first
+invocation (the per-container ``_handler`` cache is populated lazily, fail
+closed) and reused for the container's lifetime. The module exposes a
+module-level ``handler(event, context)`` that AWS Lambda invokes; it measures
+request latency and publishes it through the metrics sink after each request.
+There is no provider-write surface anywhere in this module.
 """
 
 from __future__ import annotations
@@ -46,10 +48,11 @@ from operations.settings import (
 _CAPABILITY_ID = "gamelift.observe-fleet"
 _CAPABILITY_VERSION = "1.0"
 
-# The request-side authority inputs a bare observe deployment presents. Every
-# value is at least ``observe``; the deployment mode and the verified principal
-# still cap the effective authority at the service. These are conservative
-# defaults, not a grant of higher authority.
+# The request-side authority inputs a bare observe deployment presents, except
+# principal authority, which the handler derives per request from the verified
+# access-token groups against the server-owned observer allowlist. These are the
+# tenant/workspace/capability/risk ceilings; the deployment mode and the derived
+# principal authority still cap the effective authority at the service.
 _DEFAULT_AUTHORITY_INPUTS = AuthorityInputs(
     tenant_policy="observe",
     workspace_policy="observe",
@@ -64,7 +67,27 @@ def _region() -> str:
 
 
 def _bounded_config(settings: ObservationDeploymentSettings) -> Any:
-    """A botocore config whose timeouts sit inside the observe budgets."""
+    """A botocore config whose timeouts sit inside the persistence budget.
+
+    The store and metrics clients are the persistence-phase callers, so their
+    timeouts derive from the persistence budget rather than the per-read budget,
+    and they make a single attempt: the service owns retry/reclaim through its
+    monotonic request deadline, so a transparent SDK retry must never let one
+    store call outlast the request budget.
+    """
+    # Third-party packages
+    from botocore.config import Config as BotocoreConfig
+
+    persistence = settings.operations.persistence_budget_s
+    return BotocoreConfig(
+        connect_timeout=min(2.0, max(0.5, persistence / 2.0)),
+        read_timeout=persistence,
+        retries={"mode": "standard", "max_attempts": 1},
+    )
+
+
+def _read_config(settings: ObservationDeploymentSettings) -> Any:
+    """A botocore config whose timeouts sit inside the per-read budget."""
     # Third-party packages
     from botocore.config import Config as BotocoreConfig
 
@@ -72,22 +95,25 @@ def _bounded_config(settings: ObservationDeploymentSettings) -> Any:
     return BotocoreConfig(
         connect_timeout=min(2.0, max(0.5, per_read / 2.0)),
         read_timeout=per_read,
-        retries={"mode": "adaptive", "max_attempts": 2},
+        retries={"mode": "standard", "max_attempts": 1},
     )
 
 
-def _build_handler(settings: ObservationDeploymentSettings) -> ObservationRequestHandler:
+def _build_handler(
+    settings: ObservationDeploymentSettings,
+) -> tuple[ObservationRequestHandler, CloudWatchObservationMetrics]:
     # Third-party packages
     import boto3
 
     # Local modules
     from operations.identity import ApprovalIdentityBoundary
 
-    config = _bounded_config(settings)
+    read_config = _read_config(settings)
+    persistence_config = _bounded_config(settings)
     session = boto3.Session(region_name=_region())
-    gamelift_client = session.client("gamelift", config=config)
-    dynamodb_client = session.client("dynamodb", config=config)
-    cloudwatch_client = session.client("cloudwatch", config=config)
+    gamelift_client = session.client("gamelift", config=read_config)
+    dynamodb_client = session.client("dynamodb", config=persistence_config)
+    cloudwatch_client = session.client("cloudwatch", config=persistence_config)
 
     metrics = CloudWatchObservationMetrics(client=cloudwatch_client, namespace=settings.metric_namespace)
     reader = GameLiftObservationAdapter(gamelift_client)
@@ -119,14 +145,13 @@ def _build_handler(settings: ObservationDeploymentSettings) -> ObservationReques
         capability_id=_CAPABILITY_ID,
         capability_version=_CAPABILITY_VERSION,
         authority_inputs=_DEFAULT_AUTHORITY_INPUTS,
+        observer_groups=settings.operations.observer_groups,
     )
-    # Retain the metrics sink so latency can be published per request.
-    setattr(handler, "_metrics_sink", metrics)
-    return handler
+    return handler, metrics
 
 
 @lru_cache(maxsize=1)
-def _handler() -> ObservationRequestHandler:
+def _handler() -> tuple[ObservationRequestHandler, CloudWatchObservationMetrics]:
     """Resolve settings and build the handler once per container (fail closed)."""
     settings = resolve_observation_deployment_settings()
     return _build_handler(settings)
@@ -134,15 +159,15 @@ def _handler() -> ObservationRequestHandler:
 
 def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
     """AWS Lambda entry: dispatch one request and publish request latency."""
-    request_handler = _handler()
+    request_handler, metrics_sink = _handler()
     started = time.monotonic()
     try:
         return request_handler.handle(event)
     finally:
         elapsed_ms = (time.monotonic() - started) * 1000.0
-        sink = getattr(request_handler, "_metrics_sink", None)
-        if sink is not None:
-            try:
-                sink.put_latency_ms(elapsed_ms)
-            except Exception:  # noqa: BLE001 - metrics must never break a request
-                pass
+        # The sink swallows its own CloudWatch errors; the guard here is a final
+        # backstop so publishing latency can never break a request.
+        try:
+            metrics_sink.put_latency_ms(elapsed_ms)
+        except Exception:  # noqa: BLE001 - metrics must never break a request
+            pass

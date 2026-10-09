@@ -1,4 +1,4 @@
-"""Read-only GameLift observation application service (issue #413, E1 Agent A).
+"""Read-only GameLift observation application service (issue #413).
 
 This protocol-neutral service performs the exact E1 observation described in
 ADR 0005 ("Persist operations state and recover workflows"): three bounded,
@@ -164,6 +164,66 @@ class ObservationBoundaryError(RuntimeError):
         self.safe_message = safe_message
         self.retryable = retryable
         super().__init__(safe_message)
+
+
+class ObservationStoreReadError(RuntimeError):
+    """A non-conditional store read failed and must be retried.
+
+    Raised at the store's read boundary so a read failure never collapses into a
+    false "not found" or a non-retryable 500. The service maps it to the
+    retryable ``PROVIDER_UNAVAILABLE`` outcome, matching how the write paths
+    classify a non-conditional store fault.
+    """
+
+
+class _ProviderClassifiedError(RuntimeError):
+    """A provider read failure already classified to a typed boundary outcome.
+
+    Carries the :class:`ObservationErrorCode` and retryability the handler must
+    report for a recognized provider condition — an unknown fleet
+    (``NOT_FOUND``) or an unsupported/invalid request (``CONTRACT_INVALID``) —
+    so the service records the right terminal reason and raises the right error
+    instead of collapsing every provider failure to a retryable 503.
+    """
+
+    def __init__(self, error_code: "ObservationErrorCode", safe_message: str, *, reason_code: str) -> None:
+        self.error_code = error_code
+        self.safe_message = safe_message
+        self.reason_code = reason_code
+        super().__init__(safe_message)
+
+
+# GameLift error codes mapped to a typed, non-retryable boundary outcome before
+# any terminal record. A mistyped or missing fleet is the caller's not-found; an
+# unsupported fleet type or malformed request is a contract failure.
+_PROVIDER_NOT_FOUND_CODES = frozenset({"NotFoundException"})
+_PROVIDER_INVALID_REQUEST_CODES = frozenset({"InvalidRequestException", "UnsupportedRegionException"})
+
+
+def _provider_error_code(exc: BaseException) -> str | None:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    code = response.get("Error", {}).get("Code")
+    return code if isinstance(code, str) and code else None
+
+
+def _classify_provider_error(exc: BaseException) -> "_ProviderClassifiedError | None":
+    """Map a recognized GameLift error to a typed boundary outcome, else None."""
+    code = _provider_error_code(exc)
+    if code is None:
+        return None
+    if code in _PROVIDER_NOT_FOUND_CODES:
+        return _ProviderClassifiedError(
+            ObservationErrorCode.NOT_FOUND, "the requested fleet was not found", reason_code="not_found"
+        )
+    if code in _PROVIDER_INVALID_REQUEST_CODES:
+        return _ProviderClassifiedError(
+            ObservationErrorCode.CONTRACT_INVALID,
+            "the requested observation is not supported for this fleet",
+            reason_code="contract_invalid",
+        )
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,7 +435,6 @@ class ObservationStore(Protocol):
         lease_holder: str,
         commit_not_after: datetime,
         lease_not_after: datetime,
-        ttl_epoch_s: int,
         intent: Mapping[str, Any],
     ) -> ObservationBegin:
         """Resolve or atomically create the operation before any read."""
@@ -388,7 +447,6 @@ class ObservationStore(Protocol):
         workspace_id: str,
         lease_holder: str,
         commit_not_after: datetime,
-        ttl_epoch_s: int,
         observation: Mapping[str, Any],
         generation: int = 1,
     ) -> ObservationComplete:
@@ -407,7 +465,6 @@ class ObservationStore(Protocol):
         workspace_id: str,
         lease_holder: str,
         reason_code: str,
-        ttl_epoch_s: int,
         generation: int = 1,
     ) -> None:
         """Record a bounded failed transition where possible (best effort).
@@ -471,6 +528,13 @@ class ObservationService:
 
     def observe(self, request: ObservationRequest, context: ObservationRequestContext) -> dict[str, Any]:
         """Resolve/create idempotency, then read, canonicalize, and persist."""
+        # One monotonic deadline taken at request entry bounds the whole request
+        # — begin, the three reads, metrics, and complete. The remaining budget
+        # is checked before each step so a slow step returns a typed retryable
+        # error before the Lambda itself is terminated.
+        request_start = self._monotonic()
+        total_deadline_s = self._budget.total_deadline_s
+
         requester_identity, effective_authority, authority_inputs = self._authorize(context)
 
         # Intent fingerprint: trusted workspace + exact request intent. It is
@@ -486,13 +550,17 @@ class ObservationService:
         )
 
         now = _utc(self._clock(), "clock")
+        # The single request lease: the whole-request deadline, capped at token
+        # expiry. ``expires_at`` is document freshness only; the commit is capped
+        # at the lease so a reclaimed lease and the commit fence share one
+        # request-scoped horizon (ADR 0005).
+        lease_not_after = min(now + timedelta(seconds=total_deadline_s), context.requester.expires_at)
+        commit_not_after = lease_not_after
         expires_at = now + timedelta(seconds=self._settings.observation_ttl_s)
-        commit_not_after = min(expires_at, context.requester.expires_at)
-        lease_not_after = min(now + timedelta(seconds=self._budget.total_deadline_s), context.requester.expires_at)
-        ttl_epoch_s = int(expires_at.timestamp())
         operation_id = self._operation_id_factory()
         lease_holder = context.request_id
 
+        self._check_budget(request_start, total_deadline_s, phase="begin")
         begin = self._store.begin_observation(
             operation_id=operation_id,
             idempotency_fingerprint=fingerprint,
@@ -501,7 +569,6 @@ class ObservationService:
             lease_holder=lease_holder,
             commit_not_after=commit_not_after,
             lease_not_after=lease_not_after,
-            ttl_epoch_s=ttl_epoch_s,
             intent=intent,
         )
         begin = self._require_begin(begin)
@@ -576,7 +643,8 @@ class ObservationService:
                 authority_inputs=authority_inputs,
                 expires_at=expires_at,
                 commit_not_after=commit_not_after,
-                ttl_epoch_s=ttl_epoch_s,
+                request_start=request_start,
+                total_deadline_s=total_deadline_s,
                 generation=begin.generation,
             )
 
@@ -597,7 +665,8 @@ class ObservationService:
             authority_inputs=authority_inputs,
             expires_at=expires_at,
             commit_not_after=commit_not_after,
-            ttl_epoch_s=ttl_epoch_s,
+            request_start=request_start,
+            total_deadline_s=total_deadline_s,
             generation=1,
         )
 
@@ -617,9 +686,17 @@ class ObservationService:
                 ObservationErrorCode.IDENTITY_CONTEXT_INVALID, "authenticated observation identity is invalid"
             ) from exc
 
-        status = self._store.load_status(
-            operation_id=request.operation_id, workspace_id=requester_identity["workspace_id"]
-        )
+        try:
+            status = self._store.load_status(
+                operation_id=request.operation_id, workspace_id=requester_identity["workspace_id"]
+            )
+        except ObservationStoreReadError as exc:
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "store"})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.PROVIDER_UNAVAILABLE,
+                "observation state store is temporarily unavailable",
+                retryable=True,
+            ) from exc
         # A missing record, or one owned by a different workspace, is NOT_FOUND:
         # ownership is enforced by the store's workspace-scoped key, and a
         # cross-workspace id is never disclosed as existing.
@@ -702,7 +779,8 @@ class ObservationService:
         authority_inputs: dict[str, str],
         expires_at: datetime,
         commit_not_after: datetime,
-        ttl_epoch_s: int,
+        request_start: float,
+        total_deadline_s: float,
         generation: int = 1,
     ) -> dict[str, Any]:
         reads: list[ProviderRead] = [
@@ -711,26 +789,50 @@ class ObservationService:
             lambda: self._reader.read_scaling_policies(request.fleet_id),
         ]
         try:
-            utilization, capacity, scaling_policies = self._run_reads(reads)
+            utilization, capacity, scaling_policies = self._run_reads(
+                reads, request_start=request_start, total_deadline_s=total_deadline_s
+            )
+        except _ProviderClassifiedError as exc:
+            # A recognized provider condition (unknown fleet / unsupported
+            # request) is typed and non-retryable: record the matching terminal
+            # reason, then raise the typed boundary error so the handler returns
+            # NOT_FOUND / CONTRACT_INVALID rather than a retryable 503.
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": exc.reason_code})
+            self._store.fail_observation(
+                operation_id=operation_id,
+                workspace_id=requester_identity["workspace_id"],
+                lease_holder=lease_holder,
+                reason_code=exc.reason_code,
+                generation=generation,
+            )
+            raise ObservationBoundaryError(exc.error_code, exc.safe_message, retryable=False) from exc
         except (DeadlineExceededError, PartialObservationError) as exc:
+            # Record the terminal failure transition BEFORE emitting metrics so a
+            # metrics backend fault can never leave the snapshot stranded in
+            # ``observing``; the metrics sink additionally swallows its own
+            # errors so a publish failure never masks this typed outcome.
+            self._store.fail_observation(
+                operation_id=operation_id,
+                workspace_id=requester_identity["workspace_id"],
+                lease_holder=lease_holder,
+                reason_code="provider_unavailable",
+                generation=generation,
+            )
             # A deadline overrun is a timeout; any other provider condition is a
             # failure. The two are reported through distinct metric events.
             if isinstance(exc, DeadlineExceededError):
                 self._metrics.record("observation.timeout", 1.0, dimensions={"reason": "provider"})
             else:
                 self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider"})
-            self._store.fail_observation(
-                operation_id=operation_id,
-                workspace_id=requester_identity["workspace_id"],
-                lease_holder=lease_holder,
-                reason_code="provider_unavailable",
-                ttl_epoch_s=ttl_epoch_s,
-                generation=generation,
-            )
+            # The provider failure is recorded terminally for this idempotency
+            # token, so the same token can never make progress. Report it as
+            # non-retryable on the FIRST response too, with the same guidance a
+            # same-token replay returns, so a client is never told to retry a
+            # token that is already terminal.
             raise ObservationBoundaryError(
                 ObservationErrorCode.PROVIDER_UNAVAILABLE,
-                "provider observation could not be completed",
-                retryable=True,
+                "provider observation could not be completed; " "start a new operation with a new idempotency token",
+                retryable=False,
             ) from exc
 
         observed_at = _utc(self._clock(), "clock")
@@ -763,25 +865,30 @@ class ObservationService:
         try:
             validate_observation(observation)
         except ObservationContractError as exc:
-            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "contract"})
+            # The provider's own data failed our observation contract. This is a
+            # server/provider-side fault, not a malformed client request, so it
+            # is reported as a 5xx rather than a 400 CONTRACT_INVALID.
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider_contract"})
             self._store.fail_observation(
                 operation_id=operation_id,
                 workspace_id=requester_identity["workspace_id"],
                 lease_holder=lease_holder,
-                reason_code="contract_invalid",
-                ttl_epoch_s=ttl_epoch_s,
+                reason_code="provider_contract_invalid",
                 generation=generation,
             )
             raise ObservationBoundaryError(
-                ObservationErrorCode.CONTRACT_INVALID, "observation result is invalid"
+                ObservationErrorCode.INTERNAL_ERROR, "observation result could not be produced"
             ) from exc
 
+        # Check the remaining request budget before the finalize transaction so
+        # a slow read phase returns a typed retryable error rather than letting
+        # the commit race the Lambda timeout.
+        self._check_budget(request_start, total_deadline_s, phase="complete")
         outcome = self._store.complete_observation(
             operation_id=operation_id,
             workspace_id=requester_identity["workspace_id"],
             lease_holder=lease_holder,
             commit_not_after=commit_not_after,
-            ttl_epoch_s=ttl_epoch_s,
             observation=deepcopy(observation),
             generation=generation,
         )
@@ -865,20 +972,48 @@ class ObservationService:
                 ObservationErrorCode.STATE_CONFLICT, "stored observation failed hash verification"
             )
 
+    def _check_budget(self, request_start: float, total_deadline_s: float, *, phase: str) -> None:
+        """Fail closed with a typed retryable error if the request budget is spent.
+
+        One monotonic deadline is taken at request entry; before each step the
+        remaining budget (less the cancellation margin) must still be positive so
+        the step returns a typed ``PROVIDER_UNAVAILABLE`` before the Lambda is
+        terminated.
+        """
+        elapsed = self._monotonic() - request_start
+        remaining = total_deadline_s - self._budget.cancellation_margin_s - elapsed
+        if remaining <= 0:
+            self._metrics.record("observation.timeout", 1.0, dimensions={"reason": phase})
+            raise ObservationBoundaryError(
+                ObservationErrorCode.PROVIDER_UNAVAILABLE,
+                "observation deadline elapsed before the operation could proceed",
+                retryable=True,
+            )
+
     def _run_reads(
-        self, reads: list[ProviderRead]
+        self, reads: list[ProviderRead], *, request_start: float, total_deadline_s: float
     ) -> tuple[dict[str, int], list[dict[str, Any]], list[dict[str, str]]]:
-        """Run the three reads under per-call wall-clock deadlines, failing closed."""
-        start = self._monotonic()
-        deadline_s = self._budget.total_deadline_s
+        """Run the three reads under per-call wall-clock deadlines, failing closed.
+
+        The remaining budget is measured from the single request-entry monotonic
+        clock, so time already spent in ``begin`` counts against the read budget
+        and a slow begin followed by slow reads still returns a typed error ahead
+        of the Lambda timeout. A provider ``NotFoundException`` or
+        ``InvalidRequestException`` is re-raised as a typed, non-retryable
+        condition so the handler maps it to ``NOT_FOUND`` / ``CONTRACT_INVALID``
+        before any terminal record, rather than burning the token as a 503.
+        """
         results: list[Any] = []
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="obs-read")
         abandoned = False
         try:
             for index, read in enumerate(reads):
                 call_start = self._monotonic()
-                remaining_total = deadline_s - (call_start - start)
+                remaining_total = total_deadline_s - (call_start - request_start)
                 read_budget = min(self._budget.per_read_s, remaining_total)
+                if read_budget <= 0:
+                    abandoned = True
+                    raise DeadlineExceededError(f"read[{index}]", 0.0, self._budget.per_read_s)
                 future = executor.submit(read)
                 try:
                     value = future.result(timeout=read_budget)
@@ -888,7 +1023,13 @@ class ObservationService:
                     raise DeadlineExceededError(
                         f"read[{index}]", self._monotonic() - call_start, self._budget.per_read_s
                     ) from exc
+                except _ProviderClassifiedError:
+                    # Already typed (not-found / invalid request): re-raise as-is.
+                    raise
                 except Exception as exc:  # a provider error is a fail-closed condition
+                    classified = _classify_provider_error(exc)
+                    if classified is not None:
+                        raise classified from exc
                     raise PartialObservationError("provider read failed") from exc
 
                 call_elapsed = self._monotonic() - call_start

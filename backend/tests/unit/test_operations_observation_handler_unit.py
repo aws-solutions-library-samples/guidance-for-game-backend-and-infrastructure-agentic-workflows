@@ -1,8 +1,8 @@
 """Unit tests for the API Gateway observation handler (issue #413).
 
-Covers POST observe and GET status route/method dispatch, JWT-only identity,
-body-identity rejection, typed error mapping, and catch-all sanitization of any
-unexpected internal exception.
+Covers POST observe and GET status routeKey dispatch, JWT-only identity,
+group-based authorization, body/header/query identity rejection, typed error
+mapping, and catch-all sanitization of any unexpected internal exception.
 """
 
 from __future__ import annotations
@@ -129,12 +129,23 @@ def _handler(
             capability_maximum="observe",
             risk_policy="observe",
         ),
+        observer_groups=frozenset({"admin", "users"}),
     )
     return handler, store
 
 
 def _claims() -> dict[str, Any]:
-    return {"sub": "subject.operator-1", "client_id": "client.web-console", "token_use": "access", "exp": EXP}
+    return {
+        "sub": "subject.operator-1",
+        "client_id": "client.web-console",
+        "token_use": "access",
+        "exp": EXP,
+        "cognito:groups": "[users]",
+    }
+
+
+def _route_key(method: str) -> str:
+    return "POST /operations/observe" if method == "POST" else "GET /operations/{operationId}"
 
 
 def _event(
@@ -144,11 +155,15 @@ def _event(
     body: Any = None,
     path_parameters: dict[str, Any] | None = None,
     with_authorizer: bool = True,
+    route_key: str | None = None,
 ) -> dict[str, Any]:
     request_context: dict[str, Any] = {"requestId": "abc123def456", "http": {"method": method}}
     if with_authorizer:
         request_context["authorizer"] = {"jwt": {"claims": claims if claims is not None else _claims()}}
-    event: dict[str, Any] = {"requestContext": request_context}
+    event: dict[str, Any] = {
+        "requestContext": request_context,
+        "routeKey": route_key if route_key is not None else _route_key(method),
+    }
     if method == "POST":
         event["body"] = json.dumps({"fleet_id": FLEET_ID, "idempotency_token": TOKEN}) if body is None else body
     if path_parameters is not None:
@@ -195,7 +210,13 @@ def test_non_access_token_is_rejected() -> None:
 
 def test_untrusted_client_is_denied() -> None:
     handler, store = _handler()
-    claims = {"sub": "subject.operator-1", "client_id": "client.attacker", "token_use": "access", "exp": EXP}
+    claims = {
+        "sub": "subject.operator-1",
+        "client_id": "client.attacker",
+        "token_use": "access",
+        "exp": EXP,
+        "cognito:groups": "[users]",
+    }
     response = handler.handle(_event(claims=claims))
     assert response["statusCode"] == 401
     assert store.begin_calls == 0
@@ -279,12 +300,122 @@ def test_get_status_without_authorizer_is_401() -> None:
     assert response["statusCode"] == 401
 
 
-# --- Method routing -------------------------------------------------------
+# --- Route dispatch -------------------------------------------------------
 
 
-def test_unsupported_method_is_400() -> None:
+def test_unknown_route_is_404() -> None:
     handler, _ = _handler()
-    response = handler.handle(_event(method="DELETE", path_parameters={"operationId": OPERATION_ID}))
+    response = handler.handle(
+        _event(method="DELETE", path_parameters={"operationId": OPERATION_ID}, route_key="DELETE /operations/{id}")
+    )
+    assert response["statusCode"] == 404
+    assert json.loads(response["body"])["error_code"] == "NOT_FOUND"
+
+
+# --- Group-based authorization (major) ------------------------------------
+
+
+def test_caller_with_no_group_is_denied_on_observe() -> None:
+    handler, store = _handler()
+    claims = {"sub": "subject.x", "client_id": "client.web-console", "token_use": "access", "exp": EXP}
+    response = handler.handle(_event(claims=claims))
+    assert response["statusCode"] == 403
+    assert json.loads(response["body"])["error_code"] == "AUTHORIZATION_DENIED"
+    assert store.begin_calls == 0
+
+
+def test_caller_with_unknown_group_is_denied_on_observe() -> None:
+    handler, store = _handler()
+    claims = {
+        "sub": "subject.x",
+        "client_id": "client.web-console",
+        "token_use": "access",
+        "exp": EXP,
+        "cognito:groups": "[guests]",
+    }
+    response = handler.handle(_event(claims=claims))
+    assert response["statusCode"] == 403
+    assert store.begin_calls == 0
+
+
+def test_caller_with_no_group_is_denied_on_status() -> None:
+    status = ObservationStatus(
+        operation_id=OPERATION_ID, workspace_id="workspace.default", state=ObservationStatusView.OBSERVING
+    )
+    handler, _ = _handler(FakeStore(status=status))
+    claims = {"sub": "subject.x", "client_id": "client.web-console", "token_use": "access", "exp": EXP}
+    response = handler.handle(_event(method="GET", path_parameters={"operationId": OPERATION_ID}, claims=claims))
+    assert response["statusCode"] == 403
+
+
+def test_admin_group_is_permitted() -> None:
+    handler, store = _handler()
+    claims = {
+        "sub": "subject.admin",
+        "client_id": "client.web-console",
+        "token_use": "access",
+        "exp": EXP,
+        "cognito:groups": "[admin guests]",
+    }
+    response = handler.handle(_event(claims=claims))
+    assert response["statusCode"] == 200
+    assert store.begin_calls == 1
+
+
+# --- Identity-injection channels (minor) ----------------------------------
+
+
+def test_identity_in_header_is_ignored() -> None:
+    handler, store = _handler()
+    event = _event()
+    event["headers"] = {"x-workspace-id": "workspace.attacker", "x-tenant-id": "tenant.attacker"}
+    response = handler.handle(event)
+    assert response["statusCode"] == 200
+    observation = json.loads(response["body"])
+    assert observation["requester"]["workspace_id"] == "workspace.default"
+    assert observation["requester"]["tenant_id"] == "tenant.default"
+
+
+def test_identity_in_query_string_is_ignored() -> None:
+    handler, _ = _handler()
+    event = _event()
+    event["queryStringParameters"] = {"workspace_id": "workspace.attacker"}
+    response = handler.handle(event)
+    assert response["statusCode"] == 200
+    observation = json.loads(response["body"])
+    assert observation["requester"]["workspace_id"] == "workspace.default"
+
+
+def test_extra_jwt_claims_do_not_override_server_binding() -> None:
+    handler, _ = _handler()
+    claims = {
+        "sub": "subject.operator-1",
+        "client_id": "client.web-console",
+        "token_use": "access",
+        "exp": EXP,
+        "cognito:groups": "[users]",
+        "custom:workspace_id": "workspace.attacker",
+        "custom:tenant_id": "tenant.attacker",
+    }
+    response = handler.handle(_event(claims=claims))
+    assert response["statusCode"] == 200
+    observation = json.loads(response["body"])
+    assert observation["requester"]["workspace_id"] == "workspace.default"
+    assert observation["requester"]["tenant_id"] == "tenant.default"
+
+
+def test_duplicate_keys_in_body_are_rejected() -> None:
+    handler, _ = _handler()
+    # Last-wins duplicate names are ambiguous: strict I-JSON rejects them.
+    body = '{"fleet_id": "' + FLEET_ID + '", "fleet_id": "fleet-other", "idempotency_token": "' + TOKEN + '"}'
+    response = handler.handle(_event(body=body))
+    assert response["statusCode"] == 400
+
+
+def test_oversized_body_is_rejected() -> None:
+    handler, _ = _handler()
+    body = json.dumps({"fleet_id": FLEET_ID, "idempotency_token": TOKEN, "padding": "x" * 5000})
+    response = handler.handle(_event(body=body))
     assert response["statusCode"] == 400
 
 

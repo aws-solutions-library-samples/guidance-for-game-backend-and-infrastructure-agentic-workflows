@@ -47,6 +47,7 @@ class CloudWatchObservationMetrics:
             raise ValueError("namespace must be a non-empty string")
         self._client = client
         self._namespace = namespace
+        self._dropped = 0
 
     def record(self, name: str, value: float, *, dimensions: Mapping[str, str] | None = None) -> None:
         reason = dimensions.get("reason") if isinstance(dimensions, Mapping) else None
@@ -56,15 +57,15 @@ class CloudWatchObservationMetrics:
             # timeout) is reported as a failure; only the deadline reason and an
             # explicit timeout event count as timeouts.
             if reason == "deadline":
-                self._put(METRIC_TIMEOUTS, 1.0)
+                self._safe_put(METRIC_TIMEOUTS, 1.0)
             else:
-                self._put(METRIC_FAILURES, 1.0)
+                self._safe_put(METRIC_FAILURES, 1.0)
             return
         if name == "observation.timeout":
-            self._put(METRIC_TIMEOUTS, 1.0)
+            self._safe_put(METRIC_TIMEOUTS, 1.0)
             return
         if name == "observation.in_progress":
-            self._put(METRIC_STUCK, 1.0)
+            self._safe_put(METRIC_STUCK, 1.0)
             return
         # observation.recorded / observation.replay / observation.reclaimed /
         # observation.denied carry no dedicated CloudWatch metric here; latency
@@ -72,7 +73,25 @@ class CloudWatchObservationMetrics:
 
     def put_latency_ms(self, latency_ms: float) -> None:
         """Publish end-to-end request latency in milliseconds."""
-        self._put(METRIC_LATENCY, float(latency_ms), unit="Milliseconds")
+        self._safe_put(METRIC_LATENCY, float(latency_ms), unit="Milliseconds")
+
+    def _safe_put(self, metric_name: str, value: float, *, unit: str = "Count") -> None:
+        """Publish one metric, swallowing any CloudWatch error.
+
+        Metrics are observability, never part of the request's success contract:
+        a ``put_metric_data`` failure must never replace a typed boundary error
+        with a 500 or leave a snapshot stranded in ``observing``. A failure is
+        swallowed and counted locally so the request's own outcome stands.
+        """
+        try:
+            self._put(metric_name, value, unit=unit)
+        except Exception:  # noqa: BLE001 - metrics must never break a request
+            self._dropped += 1
+
+    @property
+    def dropped(self) -> int:
+        """Count of metric publishes dropped because CloudWatch raised."""
+        return self._dropped
 
     def _put(self, metric_name: str, value: float, *, unit: str = "Count") -> None:
         self._client.put_metric_data(

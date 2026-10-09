@@ -50,11 +50,16 @@ ownership.
 
 The store never issues a ``Scan`` or an unconditional ``PutItem``, holds no
 write path to any provider, and enforces the exclusive ``commit_not_after``
-deadline before issuing each transaction. Observe-phase records are transient
-and carry a numeric ``ttl`` for safe expiry; the append-only and single-flight
-guarantees come from the conditional/transactional writes, not from IAM alone.
-Every DynamoDB item serializes below the 400 KB item-size limit; the canonical
-observation JSON is validated against that ceiling before it is written.
+deadline before issuing each transaction. The idempotency mapping, state
+snapshot, transitions, ledger events, and result are retained for the full audit
+and replay window: per ADR 0005 none of them carries a DynamoDB ``ttl`` and the
+table has no ``TimeToLiveSpecification``, so a late replay can never race an
+asynchronous deletion. Observation document freshness is expressed by the
+``expires_at`` field inside the result document, not by item expiry. The
+append-only and single-flight guarantees come from the conditional/transactional
+writes, not from IAM alone. Every DynamoDB item serializes below the 400 KB
+item-size limit; the canonical observation JSON is validated against that
+ceiling before it is written.
 """
 
 from __future__ import annotations
@@ -79,6 +84,7 @@ from operations.observation import (
     ObservationStatus,
     ObservationStatusView,
     ObservationStore,
+    ObservationStoreReadError,
 )
 
 _STATE_SNAPSHOT_SK = "STATE#current"
@@ -137,7 +143,6 @@ class DynamoDbObservationStore(ObservationStore):
         lease_holder: str,
         commit_not_after: datetime,
         lease_not_after: datetime,
-        ttl_epoch_s: int,
         intent: Mapping[str, Any],
     ) -> ObservationBegin:
         deadline = _utc(commit_not_after, "commit_not_after")
@@ -159,7 +164,6 @@ class DynamoDbObservationStore(ObservationStore):
             "workspace_id": workspace_id,
             "idempotency_fingerprint": idempotency_fingerprint,
             "intent_hash": intent_hash,
-            "ttl": int(ttl_epoch_s),
         }
         snapshot_item = {
             "PK": op_pk,
@@ -174,7 +178,6 @@ class DynamoDbObservationStore(ObservationStore):
             "lease_holder": lease_holder,
             "lease_not_after": lease_epoch_s,
             "intent_hash": intent_hash,
-            "ttl": int(ttl_epoch_s),
         }
         transition_item = {
             "PK": op_pk,
@@ -185,7 +188,6 @@ class DynamoDbObservationStore(ObservationStore):
             "previous_state": None,
             "new_state": STATE_OBSERVING,
             "sequence": 0,
-            "ttl": int(ttl_epoch_s),
         }
         ledger_item = {
             "PK": op_pk,
@@ -195,7 +197,6 @@ class DynamoDbObservationStore(ObservationStore):
             "operation_id": operation_id,
             "event_type": "observation.created",
             "sequence": 0,
-            "ttl": int(ttl_epoch_s),
         }
 
         transact_items = [
@@ -209,7 +210,10 @@ class DynamoDbObservationStore(ObservationStore):
             return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
 
         try:
-            self._client.transact_write_items(TransactItems=transact_items)
+            self._client.transact_write_items(
+                TransactItems=transact_items,
+                ClientRequestToken=self._request_token(operation_id, "begin", 1),
+            )
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             # Only a genuine ConditionalCheckFailed means the idempotency mapping
             # already exists: route it to idempotency resolution. A throttle,
@@ -218,12 +222,29 @@ class DynamoDbObservationStore(ObservationStore):
             if not _is_conditional_failure(exc):
                 _log_store_exception("begin_observation", exc, classification="unavailable")
                 return ObservationBegin(ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
-            return self._resolve_existing(idem_pk, idempotency_fingerprint, deadline, reclaim_lease_holder=lease_holder)
+            try:
+                return self._resolve_existing(
+                    idem_pk,
+                    idempotency_fingerprint,
+                    deadline,
+                    reclaim_lease_holder=lease_holder,
+                    reclaim_lease_not_after=lease_deadline,
+                )
+            except ObservationStoreReadError:
+                # A read during idempotency resolution failed: retryable, never a
+                # false conflict or not-found.
+                return ObservationBegin(ObservationBeginOutcome.PROVIDER_UNAVAILABLE)
 
         return ObservationBegin(ObservationBeginOutcome.CREATED, operation_id=operation_id)
 
     def _resolve_existing(
-        self, idem_pk: str, expected_fingerprint: str, deadline: datetime, *, reclaim_lease_holder: str
+        self,
+        idem_pk: str,
+        expected_fingerprint: str,
+        deadline: datetime,
+        *,
+        reclaim_lease_holder: str,
+        reclaim_lease_not_after: datetime,
     ) -> ObservationBegin:
         """A mapping already exists: resolve it by fingerprint and current state.
 
@@ -288,8 +309,8 @@ class DynamoDbObservationStore(ObservationStore):
                 operation_id=operation_id,
                 current_generation=current_generation,
                 new_lease_holder=reclaim_lease_holder,
+                new_lease_not_after=reclaim_lease_not_after,
                 deadline=deadline,
-                ttl_epoch_s=int(snapshot["ttl"]) if isinstance(snapshot.get("ttl"), int) else now_epoch_s,
             )
         return ObservationBegin(
             ObservationBeginOutcome.IN_PROGRESS,
@@ -305,15 +326,20 @@ class DynamoDbObservationStore(ObservationStore):
         operation_id: str,
         current_generation: int,
         new_lease_holder: str,
+        new_lease_not_after: datetime,
         deadline: datetime,
-        ttl_epoch_s: int,
     ) -> ObservationBegin:
         """Conditionally reclaim a stale-lease observing operation.
 
         The snapshot's fencing generation is advanced (and the lease taken) under
         a condition that still requires the observing state, sequence 0, the
-        observed generation, and an EXPIRED lease. A recovery ledger event keyed
-        by the new generation is appended in the same transaction. If the
+        observed generation, and an EXPIRED lease. The new lease is the
+        reclaiming caller's own request lease (``new_lease_not_after``), not the
+        far-off commit deadline, so a reclaiming invocation that dies frees the
+        operation again within one request lease rather than holding it for the
+        whole commit window. A recovery ledger event is appended in the same
+        transaction, keyed so it sorts strictly between the create event and the
+        terminal event and carries a strictly increasing ``sequence``. If the
         condition fails (another writer reclaimed or the op advanced), we fall
         back to in-progress rather than creating a second operation.
         """
@@ -322,10 +348,17 @@ class DynamoDbObservationStore(ObservationStore):
             return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
         now_epoch_s = int(now.timestamp())
         new_generation = current_generation + 1
-        # A new lease window bounded by the same commit deadline.
-        new_lease_epoch_s = int(_utc(deadline, "commit_not_after").timestamp())
+        # The new lease is the caller's own request lease, capped at the commit
+        # deadline, so a reclaimer that dies does not hold the operation open for
+        # the whole commit window.
+        new_lease = min(_utc(new_lease_not_after, "lease_not_after"), _utc(deadline, "commit_not_after"))
+        new_lease_epoch_s = int(new_lease.timestamp())
 
-        reclaim_ledger_sk = f"LEDGER#RECLAIM#{new_generation}"
+        # The recovery event sorts between ``LEDGER#0`` (create) and ``LEDGER#1``
+        # (terminal) and before any later reclaim, using a zero-padded ordinal,
+        # and carries a monotonic sub-sequence so the ledger order is strictly
+        # increasing per operation.
+        reclaim_ledger_sk = f"LEDGER#0#RECLAIM#{new_generation:04d}"
         ledger_item = {
             "PK": op_pk,
             "SK": reclaim_ledger_sk,
@@ -334,7 +367,8 @@ class DynamoDbObservationStore(ObservationStore):
             "operation_id": operation_id,
             "event_type": "observation.lease_reclaimed",
             "generation": new_generation,
-            "ttl": int(ttl_epoch_s),
+            "sequence": 0,
+            "sub_sequence": new_generation,
         }
         snapshot_update = {
             "Update": {
@@ -365,7 +399,10 @@ class DynamoDbObservationStore(ObservationStore):
         }
         transact_items = [snapshot_update, self._conditional_put(ledger_item, "attribute_not_exists(SK)")]
         try:
-            self._client.transact_write_items(TransactItems=transact_items)
+            self._client.transact_write_items(
+                TransactItems=transact_items,
+                ClientRequestToken=self._request_token(operation_id, "reclaim", new_generation),
+            )
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if not _is_conditional_failure(exc):
                 _log_store_exception("reclaim_observation", exc, classification="unavailable")
@@ -392,7 +429,6 @@ class DynamoDbObservationStore(ObservationStore):
         workspace_id: str,
         lease_holder: str,
         commit_not_after: datetime,
-        ttl_epoch_s: int,
         observation: Mapping[str, Any],
         generation: int = _INITIAL_GENERATION,
     ) -> ObservationComplete:
@@ -417,7 +453,6 @@ class DynamoDbObservationStore(ObservationStore):
             "operation_id": operation_id,
             "observation_hash": observation_hash,
             "observation_json": canonical_json,
-            "ttl": int(ttl_epoch_s),
         }
         transition_item = {
             "PK": op_pk,
@@ -429,7 +464,6 @@ class DynamoDbObservationStore(ObservationStore):
             "new_state": STATE_SUCCEEDED,
             "sequence": 1,
             "observation_hash": observation_hash,
-            "ttl": int(ttl_epoch_s),
         }
         ledger_item = {
             "PK": op_pk,
@@ -440,7 +474,6 @@ class DynamoDbObservationStore(ObservationStore):
             "event_type": "observation.succeeded",
             "sequence": 1,
             "observation_hash": observation_hash,
-            "ttl": int(ttl_epoch_s),
         }
 
         # The snapshot advance is fenced on the writer's lease: expected prior
@@ -450,8 +483,7 @@ class DynamoDbObservationStore(ObservationStore):
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": op_pk, "SK": _STATE_SNAPSHOT_SK}),
                 "UpdateExpression": (
-                    "SET #state = :succeeded, #seq = :one, last_transition = :state1, "
-                    "observation_hash = :hash, #ttl = :ttl"
+                    "SET #state = :succeeded, #seq = :one, last_transition = :state1, observation_hash = :hash"
                 ),
                 "ConditionExpression": (
                     "attribute_exists(PK) AND #state = :observing AND #seq = :zero "
@@ -461,7 +493,6 @@ class DynamoDbObservationStore(ObservationStore):
                     "#state": "state",
                     "#seq": "sequence",
                     "#gen": "generation",
-                    "#ttl": "ttl",
                 },
                 "ExpressionAttributeValues": _marshal_values(
                     {
@@ -474,7 +505,6 @@ class DynamoDbObservationStore(ObservationStore):
                         ":now": now_epoch_s,
                         ":state1": _STATE_TRANSITION_1_SK,
                         ":hash": observation_hash,
-                        ":ttl": int(ttl_epoch_s),
                     }
                 ),
             }
@@ -491,16 +521,25 @@ class DynamoDbObservationStore(ObservationStore):
             return ObservationComplete(ObservationCompleteOutcome.DEADLINE_EXPIRED)
 
         try:
-            self._client.transact_write_items(TransactItems=transact_items)
+            self._client.transact_write_items(
+                TransactItems=transact_items,
+                ClientRequestToken=self._request_token(operation_id, "complete", generation),
+            )
         except Exception as exc:  # noqa: BLE001 - classify by cancellation reason
             if not _is_conditional_failure(exc):
                 # Throttle/conflict/validation/provider fault: retryable, not 409.
                 _log_store_exception("complete_observation", exc, classification="unavailable")
                 return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
             # A racing writer may have already reached succeeded: replay it.
-            snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
+            try:
+                snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
+            except ObservationStoreReadError:
+                return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
             if snapshot and snapshot.get("state") == STATE_SUCCEEDED:
-                stored, stored_hash = self._load_result(op_pk)
+                try:
+                    stored, stored_hash = self._load_result(op_pk)
+                except ObservationStoreReadError:
+                    return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
                 if stored is not None:
                     return ObservationComplete(
                         ObservationCompleteOutcome.ALREADY_TERMINAL,
@@ -518,7 +557,6 @@ class DynamoDbObservationStore(ObservationStore):
         workspace_id: str,
         lease_holder: str,
         reason_code: str,
-        ttl_epoch_s: int,
         generation: int = _INITIAL_GENERATION,
     ) -> None:
         """Record a bounded failed transition where possible (best effort)."""
@@ -533,7 +571,6 @@ class DynamoDbObservationStore(ObservationStore):
             "new_state": STATE_FAILED,
             "sequence": 1,
             "reason_code": reason_code,
-            "ttl": int(ttl_epoch_s),
         }
         ledger_item = {
             "PK": op_pk,
@@ -544,13 +581,12 @@ class DynamoDbObservationStore(ObservationStore):
             "event_type": "observation.failed",
             "sequence": 1,
             "reason_code": reason_code,
-            "ttl": int(ttl_epoch_s),
         }
         snapshot_update = {
             "Update": {
                 "TableName": self._table_name,
                 "Key": _marshal({"PK": op_pk, "SK": _STATE_SNAPSHOT_SK}),
-                "UpdateExpression": "SET #state = :failed, #seq = :one, reason_code = :reason, #ttl = :ttl",
+                "UpdateExpression": "SET #state = :failed, #seq = :one, reason_code = :reason",
                 "ConditionExpression": (
                     "attribute_exists(PK) AND #state = :observing AND #seq = :zero "
                     "AND #gen = :gen AND lease_holder = :holder"
@@ -559,7 +595,6 @@ class DynamoDbObservationStore(ObservationStore):
                     "#state": "state",
                     "#seq": "sequence",
                     "#gen": "generation",
-                    "#ttl": "ttl",
                 },
                 "ExpressionAttributeValues": _marshal_values(
                     {
@@ -570,7 +605,6 @@ class DynamoDbObservationStore(ObservationStore):
                         ":gen": generation,
                         ":holder": lease_holder,
                         ":reason": reason_code,
-                        ":ttl": int(ttl_epoch_s),
                     }
                 ),
             }
@@ -581,7 +615,10 @@ class DynamoDbObservationStore(ObservationStore):
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
         try:
-            self._client.transact_write_items(TransactItems=transact_items)
+            self._client.transact_write_items(
+                TransactItems=transact_items,
+                ClientRequestToken=self._request_token(operation_id, "fail", generation),
+            )
         except Exception as exc:  # noqa: BLE001 - best effort; a fail record is not mandatory
             # Best-effort: a fail record is not mandatory, but leave a bounded
             # breadcrumb rather than vanishing silently.
@@ -645,11 +682,12 @@ class DynamoDbObservationStore(ObservationStore):
                 Key=_marshal({"PK": pk, "SK": sk}),
                 ConsistentRead=True,
             )
-        except Exception as exc:  # noqa: BLE001 - log a bounded breadcrumb, then re-raise
-            # A read failure must not vanish into a false "not found"; surface a
-            # bounded diagnostic and let the caller's own handling propagate it.
+        except Exception as exc:  # noqa: BLE001 - log a bounded breadcrumb, then raise typed
+            # A read failure must not vanish into a false "not found" or a
+            # non-retryable 500; surface a bounded diagnostic and raise a typed,
+            # retryable read error the caller maps to PROVIDER_UNAVAILABLE.
             _log_store_exception("read_item", exc, classification="read_error")
-            raise
+            raise ObservationStoreReadError("observation state read failed") from exc
         item = response.get("Item") if isinstance(response, dict) else None
         return _unmarshal(item) if item else None
 
@@ -661,6 +699,21 @@ class DynamoDbObservationStore(ObservationStore):
                 "ConditionExpression": condition,
             }
         }
+
+    @staticmethod
+    def _request_token(operation_id: str, phase: str, generation: int) -> str:
+        """A deterministic ``ClientRequestToken`` for a transaction attempt.
+
+        botocore may transparently retry a ``TransactWriteItems`` call once. A
+        deterministic idempotency token (bound to the operation, phase, and
+        generation) makes a transparent retry of a transaction whose first
+        attempt already committed a no-op on the server, so a lost response can
+        never resurface as a spurious ``STATE_CONFLICT`` for the caller's own
+        write. It is a bounded hex digest and carries no identity.
+        """
+        digest = canonical_sha256({"operation_id": operation_id, "phase": phase, "generation": generation})
+        # ClientRequestToken accepts 1..36 chars; take a bounded hex slice.
+        return digest.split(":", 1)[-1][:36]
 
 
 # Cancellation-reason codes DynamoDB reports on a TransactionCanceledException.
@@ -678,17 +731,9 @@ class DynamoDbObservationStore(ObservationStore):
 _CONDITIONAL_REASON = "ConditionalCheckFailed"
 _TRANSACTION_CANCELED_CODE = "TransactionCanceledException"
 _BARE_CONDITIONAL_CODE = "ConditionalCheckFailedException"
-# Reasons that make the whole transaction retryable/unavailable rather than a
-# genuine precondition failure. "None" is DynamoDB's marker for a leg that did
-# not fail and is inert here (a pure-conditional cancel is [CCF, None, ...]).
-_TRANSIENT_REASONS = frozenset(
-    {
-        "TransactionConflict",
-        "ThrottlingError",
-        "ProvisionedThroughputExceeded",
-        "ValidationError",
-    }
-)
+# "None" is DynamoDB's marker for a transaction leg that did not fail and is
+# inert here (a pure-conditional cancel is [CCF, None, ...]).
+_INERT_REASONS = frozenset({None, "None"})
 
 
 def _cancellation_reason_codes(response: dict[str, Any]) -> set[str] | None:
@@ -710,12 +755,12 @@ def _is_conditional_failure(exc: Exception) -> bool:
 
     * A bare ``ConditionalCheckFailedException`` (from a non-transactional
       conditional write) is conditional — an idempotency/state precondition.
-    * A ``TransactionCanceledException`` is conditional only when its
-      ``CancellationReasons`` contain ``ConditionalCheckFailed`` AND contain no
-      transient/validation reason. Any ``TransactionConflict``,
-      ``ThrottlingError``, ``ProvisionedThroughputExceeded``, ``ValidationError``,
-      unknown reason, absent/empty reasons, or a mix of conditional with a
-      transient reason fails closed as retryable/unavailable — never a false
+    * A ``TransactionCanceledException`` is conditional only when every
+      non-inert ``CancellationReasons`` code is ``ConditionalCheckFailed``. A
+      ``TransactionConflict``, ``ThrottlingError``,
+      ``ProvisionedThroughputExceeded``, ``ValidationError``, any other
+      unrecognized reason, absent/empty reasons, or a mix of conditional with
+      any such reason fails closed as retryable/unavailable — never a false
       idempotency/state 409.
 
     Every other error is non-conditional and maps to a retryable unavailable
@@ -724,40 +769,36 @@ def _is_conditional_failure(exc: Exception) -> bool:
     response = getattr(exc, "response", None)
     if not isinstance(response, dict):
         return False
-    code = response.get("Error", {}).get("Code", "")
-    if code == _BARE_CONDITIONAL_CODE:
+    error_code = response.get("Error", {}).get("Code", "")
+    if error_code == _BARE_CONDITIONAL_CODE:
         return True
-    if code != _TRANSACTION_CANCELED_CODE:
+    if error_code != _TRANSACTION_CANCELED_CODE:
         return False
     reason_codes = _cancellation_reason_codes(response)
     if reason_codes is None:
         # A TransactionCanceledException with no structured reasons cannot be
         # confirmed as conditional; fail closed as transient/retryable.
         return False
-    if reason_codes & _TRANSIENT_REASONS:
-        # A transient/validation reason anywhere makes the whole transaction
-        # retryable, even when another leg reports ConditionalCheckFailed.
+    # Conditional only when every non-inert reason is ConditionalCheckFailed: a
+    # transient/validation reason OR any unrecognized reason anywhere makes the
+    # whole transaction retryable, never a false idempotency/state 409.
+    meaningful = {reason for reason in reason_codes if reason not in _INERT_REASONS}
+    if not meaningful:
         return False
-    # Unknown reasons (neither conditional nor a recognized transient) also fail
-    # closed: only a pure, recognized ConditionalCheckFailed is conditional.
-    return _CONDITIONAL_REASON in reason_codes
+    return meaningful == {_CONDITIONAL_REASON}
 
 
 # -- Safe diagnostic logging at store exception boundaries (#413) -------------
 #
-# Live diagnosis of the demo E1 503 (PROVIDER_UNAVAILABLE, no item written)
-# found the store swallowed the underlying DynamoDB failure with no log line, so
-# only the AWS-layer signal (DynamoDB UserErrors) survived. These helpers emit a
-# BOUNDED structured record at each boundary: the store operation name, the
-# exception TYPE, the AWS error code, and the transaction cancellation-reason
-# codes — and nothing else.
+# The store maps a non-conditional DynamoDB failure to PROVIDER_UNAVAILABLE. To
+# keep that path observable, these helpers emit a BOUNDED structured record at
+# each boundary: the store operation name, the exception TYPE, the AWS error
+# code, and the transaction cancellation-reason codes — and nothing else.
 #
-# Reconciling #409: general call sites use ``logger.exception`` so the class,
-# message, and frames reach CloudWatch (with ``diagnose=False`` stripping local
-# VALUES). This boundary is deliberately stricter. The store handles idempotency
-# tokens, operation ids, canonical intent, and request items, any of which can
-# appear in a botocore exception MESSAGE or in stack locals. So this boundary
-# emits sanitized metadata ONLY: never the exception message, ``str(exc)``, a
+# This boundary is deliberately strict. The store handles idempotency tokens,
+# operation ids, canonical intent, and request items, any of which can appear in
+# a botocore exception MESSAGE or in stack locals. So this boundary emits
+# sanitized metadata ONLY: never the exception message, ``str(exc)``, a
 # traceback, or ``exc_info``. Bounded lengths cap any adversarial code/reason a
 # provider could return.
 _MAX_CODE_LEN = 128
@@ -797,17 +838,17 @@ def _bounded_reason_codes(exc: Exception) -> list[str]:
 
 # The store diagnostic uses the Python standard-library ``logging`` module, NOT
 # loguru. This boundary ships in the minimal E1 observe Lambda, whose dependency
-# closure deliberately excludes loguru; importing it here broke the real package
-# import before deployment. ``logging`` is always present in the Lambda runtime,
-# so the diagnostic stays Lambda-safe without expanding that closure.
+# closure deliberately excludes loguru; importing it here would break the real
+# package import at deployment. ``logging`` is always present in the Lambda
+# runtime, so the diagnostic stays Lambda-safe without expanding that closure.
 #
 # The whole record lives in the ``LogRecord`` message string: a CloudWatch/Lambda
 # handler renders ``%(message)s`` and carries no structured ``extra`` mapping, so
-# a datum bound as ``extra`` would be dropped before it reached CloudWatch (the
-# #413 diagnostic loss). Provider-defined codes are echoed into that string, so
-# each token is reduced to ``[A-Za-z0-9._-]`` (anything else becomes ``.``). That
-# keeps the record a single, unambiguous line and forecloses log-forging via an
-# embedded newline, separator, or brace in an adversarial code.
+# a datum bound as ``extra`` would be dropped before it reached CloudWatch.
+# Provider-defined codes are echoed into that string, so each token is reduced to
+# ``[A-Za-z0-9._-]`` (anything else becomes ``.``). That keeps the record a
+# single, unambiguous line and forecloses log-forging via an embedded newline,
+# separator, or brace in an adversarial code.
 _DIAG_FIELD_SEP = " "
 _SAFE_TOKEN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 

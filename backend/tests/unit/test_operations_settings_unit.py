@@ -70,4 +70,50 @@ def test_construct_rejects_unknown_mode() -> None:
             persistence_budget_s=3.0,
             cancellation_margin_s=3.0,
             observation_ttl_s=1800,
+            observer_groups=frozenset({"admin"}),
         )
+
+
+def test_observer_groups_default_to_admin_and_users() -> None:
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe"})
+    assert settings.observer_groups == frozenset({"admin", "users"})
+
+
+def test_observer_groups_parse_comma_separated_value() -> None:
+    settings = resolve_operations_settings(
+        env={"GBAW_OPERATIONS_MODE": "observe", "GBAW_OPERATIONS_OBSERVER_GROUPS": "ops, sre"}
+    )
+    assert settings.observer_groups == frozenset({"ops", "sre"})
+
+
+def test_observer_groups_blank_value_uses_default() -> None:
+    settings = resolve_operations_settings(
+        env={"GBAW_OPERATIONS_MODE": "observe", "GBAW_OPERATIONS_OBSERVER_GROUPS": "   "}
+    )
+    assert settings.observer_groups == frozenset({"admin", "users"})
+
+
+def test_observer_groups_invalid_token_fails_closed() -> None:
+    with pytest.raises(ValueError):
+        resolve_operations_settings(
+            env={"GBAW_OPERATIONS_MODE": "observe", "GBAW_OPERATIONS_OBSERVER_GROUPS": "ops,[bad]"}
+        )
+
+
+def test_construct_rejects_empty_observer_groups() -> None:
+    with pytest.raises(ValueError):
+        OperationsSettings(
+            mode="observe",
+            per_read_budget_s=3.0,
+            persistence_budget_s=3.0,
+            cancellation_margin_s=3.0,
+            observation_ttl_s=1800,
+            observer_groups=frozenset(),
+        )
+
+
+def test_total_deadline_matches_budget_components() -> None:
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe"})
+    expected = settings.per_read_budget_s * 3 + settings.persistence_budget_s + settings.cancellation_margin_s
+    assert settings.total_deadline_s == expected
+    assert settings.total_deadline_s == 15.0

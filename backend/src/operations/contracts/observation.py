@@ -1,4 +1,4 @@
-"""Additive read-only observation contract (issue #413, E1 Agent A).
+"""Additive read-only observation contract (issue #413).
 
 This module validates the ``gamelift-observation`` contract. It is **additive**:
 it reuses the immutable ``common`` ``$defs`` but never touches the published

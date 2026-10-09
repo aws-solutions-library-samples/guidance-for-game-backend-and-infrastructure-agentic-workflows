@@ -1,4 +1,4 @@
-"""Deployable read-only GameLift observation Lambda (issue #413, E1 Agent A).
+"""Deployable read-only GameLift observation Lambda (issue #413).
 
 This package wires the protocol-neutral :mod:`operations.observation` service to
 its real runtime dependencies: a bounded ``boto3`` GameLift read-only adapter, a

@@ -2,8 +2,8 @@
 
 Why this module exists
 ----------------------
-The E1 (observation) and E2 (approval) Lambda handlers trust identity **only**
-from the API Gateway HTTP API (payload format 2.0) JWT authorizer context at
+The observation Lambda handler trusts identity **only** from the API Gateway
+HTTP API (payload format 2.0) JWT authorizer context at
 ``requestContext.authorizer.jwt.claims``. API Gateway itself decodes the Cognito
 access token, verifies its signature and standard claims, and then forwards the
 claims to the Lambda integration. Crucially, that authorizer context is a flat
@@ -21,13 +21,14 @@ brackets are part of the delivered string, not JSON that the integration
 re-parses.
 
 A naive ``str.split()`` on that value keeps ``"[admin]"`` as a single token,
-which never matches the configured approver group ``"admin"``: a user whose
-decoded token carries ``groups=["admin"]`` would be denied with 403 at the live
-distinct-approver boundary even though the same claims authorize locally (where
+which never matches a configured observer group ``"admin"``: a user whose
+decoded token carries ``groups=["admin"]`` would be denied at the group
+authorization boundary even though the same claims authorize locally (where
 the identity is a real Python list off a JWKS-decoded token). This module is the
-single, shared, strict parser that both handlers use so the two representations —
-a genuine list/tuple and the authorizer's bracketed string — reduce to the same
-group set, while any malformed, nested, object, or oversized input fails closed.
+single, shared, strict parser the observation handler uses so the two
+representations — a genuine list/tuple and the authorizer's bracketed string —
+reduce to the same group set, while any malformed, nested, object, or oversized
+input fails closed.
 
 Representations accepted for ``cognito:groups`` (see ``parse_group_claim``):
 

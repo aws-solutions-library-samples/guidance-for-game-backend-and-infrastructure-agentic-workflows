@@ -10,8 +10,9 @@ provider write settings — the observe phase has no write path.
 The full deployment contract needed to bootstrap the deployable observe handler
 is frozen here so a misconfigured deployment fails closed at load rather than at
 request time. In addition to the ceiling and budgets it resolves the DynamoDB
-table name, the CloudWatch metric namespace, and the trusted tenant/workspace/
-audience binding the handler uses to construct verified principals.
+table name, the CloudWatch metric namespace, the trusted tenant/workspace/
+audience binding the handler uses to construct verified principals, and the
+server-owned allowlist of Cognito groups that may observe.
 
 Values are validated at load time and any invalid value fails closed (raises)
 rather than silently downgrading, so a misconfigured deployment cannot present a
@@ -40,12 +41,19 @@ DEFAULT_PER_READ_BUDGET_S = 3.0
 DEFAULT_PERSISTENCE_BUDGET_S = 3.0
 DEFAULT_CANCELLATION_MARGIN_S = 3.0
 
-# Observation freshness / DynamoDB TTL horizon for the transient state.
+# Observation freshness horizon for the transient state. It bounds the
+# ``expires_at`` document-freshness field on the observation result; it is NOT a
+# DynamoDB time-to-live. Per ADR 0005 the idempotency mapping, state snapshot,
+# transitions, ledger events, and result are retained for the full audit and
+# replay window and are never TTL-managed, so a late replay can never race an
+# asynchronous deletion.
 DEFAULT_OBSERVATION_TTL_S = 1800
 
-# The DynamoDB TTL attribute name is frozen: the table's TimeToLiveSpecification
-# and every written item agree on ``ttl``.
-TTL_ATTRIBUTE = "ttl"
+# The server-owned default allowlist of Cognito groups permitted to observe.
+# A verified caller whose access-token groups intersect this set derives
+# ``observe`` principal authority; a caller with no intersecting group is
+# denied. The deployment overrides it with ``GBAW_OPERATIONS_OBSERVER_GROUPS``.
+DEFAULT_OBSERVER_GROUPS = ("admin", "users")
 
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$")
 
@@ -90,6 +98,32 @@ def _required_identifier(env: Mapping[str, str], key: str) -> str:
     return value
 
 
+# A Cognito group name is a bounded token; this matches the per-token discipline
+# the claim parser enforces so the allowlist and the parsed groups compare on the
+# same alphabet.
+_GROUP_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _observer_groups(env: Mapping[str, str], key: str, default: tuple[str, ...]) -> frozenset[str]:
+    """Resolve the comma-separated observer-group allowlist, failing closed.
+
+    An unset or blank value uses ``default``. A supplied value is split on
+    commas, trimmed, and validated token by token; an empty list or any
+    malformed token raises rather than silently widening or emptying the
+    allowlist.
+    """
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        return frozenset(default)
+    groups = {fragment.strip() for fragment in raw.split(",") if fragment.strip()}
+    if not groups:
+        raise ValueError(f"{key} must list at least one group")
+    for group in groups:
+        if not _GROUP_NAME_PATTERN.fullmatch(group):
+            raise ValueError(f"{key} contains an invalid group name")
+    return frozenset(groups)
+
+
 @dataclass(frozen=True, slots=True)
 class OperationsSettings:
     """Resolved, validated operations deployment ceiling and observe budgets."""
@@ -99,10 +133,25 @@ class OperationsSettings:
     persistence_budget_s: float
     cancellation_margin_s: float
     observation_ttl_s: int
+    observer_groups: frozenset[str]
 
     def __post_init__(self) -> None:
         if self.mode not in _AUTHORITY_ORDER:
             raise ValueError(f"GBAW_OPERATIONS_MODE must be one of {OPERATIONS_MODES}")
+        if not self.observer_groups:
+            raise ValueError("observer_groups must list at least one group")
+
+    @property
+    def total_deadline_s(self) -> float:
+        """The whole-request wall-clock deadline covering begin, reads, and complete.
+
+        It is the sum of the three read budgets, the persistence budget, and the
+        cancellation margin, matching the E0-validated :class:`LatencyBudget`.
+        One monotonic deadline derived from this value bounds every step of a
+        request, so a slow begin, read, or complete returns a typed retryable
+        error before the Lambda itself is terminated.
+        """
+        return self.per_read_budget_s * 3 + self.persistence_budget_s + self.cancellation_margin_s
 
     @property
     def operations_enabled(self) -> bool:
@@ -162,6 +211,7 @@ def resolve_operations_settings(env: Mapping[str, str] | None = None) -> Operati
             source, "GBAW_OPERATIONS_CANCELLATION_MARGIN_S", DEFAULT_CANCELLATION_MARGIN_S
         ),
         observation_ttl_s=_positive_int(source, "GBAW_OPERATIONS_OBSERVATION_TTL_S", DEFAULT_OBSERVATION_TTL_S),
+        observer_groups=_observer_groups(source, "GBAW_OPERATIONS_OBSERVER_GROUPS", DEFAULT_OBSERVER_GROUPS),
     )
 
 
