@@ -22,12 +22,21 @@ pytestmark = pytest.mark.unit
 # whichever generation the role defaults currently resolve to.
 LEGACY_MODEL_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
+# A current-generation model ID that rejects the temperature parameter, used to
+# pin the temperature-omission path independently of the resolved role defaults.
+NO_TEMPERATURE_MODEL_ID = "global.anthropic.claude-haiku-5-5"
+
+
+def _pin_model(monkeypatch, deploy_prompts, agent_key, model_id):
+    """Point one agent key at an explicit model so the test is env-independent."""
+    config = dict(deploy_prompts.INFERENCE_CONFIG)
+    config[agent_key] = {**config[agent_key], "model_id": model_id}
+    monkeypatch.setattr(deploy_prompts, "INFERENCE_CONFIG", config)
+
 
 def _use_legacy_model(monkeypatch, deploy_prompts, agent_key):
     """Point one agent key at a legacy model so a temperature is published."""
-    config = dict(deploy_prompts.INFERENCE_CONFIG)
-    config[agent_key] = {**config[agent_key], "model_id": LEGACY_MODEL_ID}
-    monkeypatch.setattr(deploy_prompts, "INFERENCE_CONFIG", config)
+    _pin_model(monkeypatch, deploy_prompts, agent_key, LEGACY_MODEL_ID)
 
 
 def _client(existing_id=None):
@@ -71,11 +80,13 @@ def test_new_prompt_omits_temperature_for_models_that_reject_it(monkeypatch):
     vp = SimpleNamespace(name="orchestrator", text="prompt text", version="1")
     client = _client()
     monkeypatch.setattr(deploy_prompts, "_prompt_resource_name", lambda unused: "game-agent-test")
+    _pin_model(monkeypatch, deploy_prompts, "orchestrator", NO_TEMPERATURE_MODEL_ID)
 
     deploy_prompts.deploy_prompt(client, "unused", vp)
 
     variant = client.create_prompt.call_args.kwargs["variants"][0]
-    # The orchestrator default (Claude Haiku 5.5) rejects temperature.
+    # Claude Haiku 5.5 rejects temperature.
+    assert variant["modelId"] == NO_TEMPERATURE_MODEL_ID
     assert deploy_prompts.get_model_capabilities(variant["modelId"]).send_temperature is False
     assert "temperature" not in variant["inferenceConfiguration"]["text"]
 
@@ -104,6 +115,9 @@ def test_model_only_change_updates_and_publishes(monkeypatch):
     vp = SimpleNamespace(name="eks_specialist", text="same text", version="2")
     client = _client(existing_id="existing")
     monkeypatch.setattr(deploy_prompts, "_prompt_resource_name", lambda unused: "game-agent-test")
+    # Pin the current specialist model to Claude Sonnet 5.5 so the only change
+    # from the stored Sonnet 4.5 variant is the model, independent of the env.
+    _pin_model(monkeypatch, deploy_prompts, "eks", "global.anthropic.claude-sonnet-5-5")
     client.get_prompt.return_value = {
         "variants": [
             {
@@ -119,7 +133,7 @@ def test_model_only_change_updates_and_publishes(monkeypatch):
     deploy_prompts.deploy_prompt(client, "unused", vp)
 
     client.update_prompt.assert_called_once()
-    assert client.update_prompt.call_args.kwargs["variants"][0]["modelId"] == SPECIALIST_MODEL_ID
+    assert client.update_prompt.call_args.kwargs["variants"][0]["modelId"] == "global.anthropic.claude-sonnet-5-5"
     client.create_prompt_version.assert_called_once_with(promptIdentifier="existing")
 
 
@@ -130,13 +144,15 @@ def test_complete_variant_match_is_unchanged(monkeypatch):
     vp = SimpleNamespace(name="orchestrator", text="same text", version="2")
     client = _client(existing_id="existing")
     monkeypatch.setattr(deploy_prompts, "_prompt_resource_name", lambda unused: "game-agent-test")
-    # The orchestrator default rejects temperature, so a matching published
-    # variant records no temperature either.
+    # Pin the orchestrator model to Claude Haiku 5.5, which rejects temperature,
+    # so a matching published variant records no temperature either. Pinning
+    # keeps the assertion independent of the resolved role environment.
+    _pin_model(monkeypatch, deploy_prompts, "orchestrator", NO_TEMPERATURE_MODEL_ID)
     client.get_prompt.return_value = {
         "variants": [
             {
                 "name": "default",
-                "modelId": ORCHESTRATOR_MODEL_ID,
+                "modelId": NO_TEMPERATURE_MODEL_ID,
                 "templateType": "TEXT",
                 "inferenceConfiguration": {"text": {}},
                 "templateConfiguration": {"text": {"text": "same text"}},
