@@ -67,6 +67,7 @@ PINNED_DEPS=(
 
 ENVIRONMENT="beta"
 ACTION="preview"   # preview | enable | disable
+ALLOW_BINDING_CHANGE="false"
 COGNITO_ISSUER="${COGNITO_ISSUER:-}"
 COGNITO_CLIENT_ID="${COGNITO_CLIENT_ID:-}"
 TENANT_ID="${TENANT_ID:-}"
@@ -77,14 +78,30 @@ TRUSTED_AUDIENCE="${TRUSTED_AUDIENCE:-}"
 # that already exists in the target account/region.
 GBAW_OPERATIONS_ARTIFACT_BUCKET="${GBAW_OPERATIONS_ARTIFACT_BUCKET:-}"
 
-# AWS_PROFILE is passed EXPLICITLY to every aws call rather than relied on
-# ambiently. When unset we fall back to "default" so the flag is always present.
-AWS_PROFILE="${AWS_PROFILE:-default}"
-AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
+# AWS_PROFILE resolution mirrors scripts/deploy.sh: use the environment value if
+# set, otherwise read it from ui/.env.local, otherwise leave it unset. The
+# profile flag is passed to aws calls ONLY when a profile is actually set, so an
+# operator relying on ambient environment credentials or SSO is not forced onto a
+# "default" profile that could resolve to a different account from the main
+# deployment.
+if [ -z "${AWS_PROFILE:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
+    _profile="$(grep '^AWS_PROFILE=' "$PROJECT_ROOT/ui/.env.local" | cut -d= -f2 | tr -d '[:space:]')"
+    [ -n "$_profile" ] && export AWS_PROFILE="$_profile"
+fi
+if [ -n "${AWS_PROFILE:-}" ]; then
+    AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
+else
+    AWS_PROFILE_ARGS=()
+fi
+
+# The expected AWS account the operation must land in. When set, the resolved
+# caller account must match it before any upload or stack write; this binds the
+# write path to a known account rather than trusting whichever profile resolves.
+GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID="${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID:-}"
 
 usage() {
     cat <<'USAGE'
-Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod]
+Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod] [--allow-binding-change]
 
   (no flag)     Preview only (READ-ONLY): validates and lints the template and
                 creates nothing. No change set is created.
@@ -94,11 +111,16 @@ Usage: deploy-operations.sh [--enable | --disable] [--environment beta|prod]
   --disable     Emergency, data-preserving disable of an EXISTING provisioned
                 stack: keeps Provisioned=true and every resource under
                 CloudFormation (stable physical names, retained data), reuses all
-                current parameter values, and sets only OperationsMode=disabled so
-                the API and handler fail closed. Does NOT delete resources and
+                current parameter values via the deployed template
+                (--use-previous-template), and sets only OperationsMode=disabled
+                so the API and handler fail closed. Does NOT delete resources and
                 does NOT rebuild code or run Docker. Reversible via --enable.
   --environment Target environment (default: beta). "prod" enables DynamoDB
-                deletion protection and longer log retention.
+                deletion protection and longer log retention. Validated up front.
+  --allow-binding-change
+                Permit a re-enable to change the trusted bindings (Environment,
+                TenantId, WorkspaceId, TrustedAudience) on an existing stack.
+                Without it a re-enable that would change any binding is refused.
 
 Environment for --enable:
   GBAW_OPERATIONS_MODE=observe        Required confirmation.
@@ -108,9 +130,12 @@ Environment for --enable:
   GBAW_OPERATIONS_ARTIFACT_BUCKET     REQUIRED explicit, pre-existing artifact
                                       bucket. This wrapper verifies it and never
                                       discovers or creates a bucket.
-  AWS_PROFILE, AWS_REGION             Credentials/region. AWS_PROFILE is passed
-                                      explicitly to every aws call; both are
-                                      verified before any write.
+  GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID Optional; when set, the resolved caller
+                                      account must match it before any write.
+  AWS_PROFILE, AWS_REGION             Credentials/region. AWS_PROFILE is resolved
+                                      from the environment or ui/.env.local and
+                                      passed only when set; both are verified
+                                      before any write.
 USAGE
 }
 
@@ -118,18 +143,33 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --enable)  ACTION="enable" ;;
         --disable) ACTION="disable" ;;
-        --environment) shift; ENVIRONMENT="${1:-beta}" ;;
+        --allow-binding-change) ALLOW_BINDING_CHANGE="true" ;;
+        --environment)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "❌ --environment requires a value (beta|prod)." >&2
+                exit 2
+            fi
+            ENVIRONMENT="$1"
+            ;;
         -h|--help) usage; exit 0 ;;
         *) echo "❌ Unknown argument: $1" >&2; usage; exit 2 ;;
     esac
     shift
 done
 
+# Validate the environment up front, before any AWS call or upload, rather than
+# only when CloudFormation rejects it.
+if [ "$ENVIRONMENT" != "beta" ] && [ "$ENVIRONMENT" != "prod" ]; then
+    echo "❌ --environment must be 'beta' or 'prod' (got '$ENVIRONMENT')." >&2
+    exit 2
+fi
+
 echo "=================================================="
 echo " ⚙️  OPTIONAL E1 operations control plane"
 echo "=================================================="
 echo "Region:      $AWS_REGION"
-echo "Profile:     $AWS_PROFILE"
+echo "Profile:     ${AWS_PROFILE:-<ambient credentials>}"
 echo "Stack:       $STACK_NAME"
 echo "Environment: $ENVIRONMENT"
 echo "Action:      $ACTION"
@@ -188,22 +228,64 @@ if [ "$ACTION" = "enable" ]; then
         echo "   never discovers or creates a bucket; set it to a pre-existing bucket." >&2
         exit 6
     fi
+    # Enforce that the latency sub-budgets fit inside the request deadline:
+    # 3*read + persistence + margin <= RequestDeadlineSeconds. These mirror the
+    # template parameter defaults and may be overridden by the same-named env
+    # vars; a budget that does not fit would let the function be killed
+    # mid-transaction, so it is rejected here (CloudFormation Rules cannot do
+    # arithmetic).
+    _req="${RequestDeadlineSeconds:-15}"
+    _read="${PerReadBudgetSeconds:-3}"
+    _persist="${PersistenceBudgetSeconds:-3}"
+    _margin="${CancellationMarginSeconds:-3}"
+    _lambda_timeout="${LambdaTimeoutSeconds:-20}"
+    _sum=$(( 3 * _read + _persist + _margin ))
+    if [ "$_sum" -gt "$_req" ]; then
+        echo "❌ Latency budgets do not fit the request deadline: 3*${_read} + ${_persist} +" >&2
+        echo "   ${_margin} = ${_sum}s > RequestDeadlineSeconds=${_req}s. Raise the deadline or" >&2
+        echo "   lower a sub-budget so the function cannot be killed mid-transaction." >&2
+        exit 3
+    fi
+    if [ "$_lambda_timeout" -le "$_req" ]; then
+        echo "❌ LambdaTimeoutSeconds=${_lambda_timeout}s must be strictly greater than" >&2
+        echo "   RequestDeadlineSeconds=${_req}s so the handler fails closed before the" >&2
+        echo "   function is hard-killed." >&2
+        exit 3
+    fi
+    _latency_ms="${LatencyAlarmThresholdMs:-13000}"
+    if [ "$_latency_ms" -ge $(( _req * 1000 )) ]; then
+        echo "❌ LatencyAlarmThresholdMs=${_latency_ms} must be below the request deadline" >&2
+        echo "   (${_req}s) so the p99 alarm can fire before the handler fails closed." >&2
+        exit 3
+    fi
     OPERATIONS_MODE="observe"
 fi
 
 # --------------------------------------------------------------------------- #
-# Verify identity/region before any write path (enable or disable).
+# Verify identity/region before any write path (enable or disable). Only a
+# masked account and the role name are printed; the full ARN/UserId are not.
+# When GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID is set the resolved account MUST match
+# it before any upload or stack write, binding the write to a known account.
 # --------------------------------------------------------------------------- #
 echo "🔐 Verifying AWS credentials and region before any write ..."
-echo "   AWS_PROFILE=${AWS_PROFILE}  AWS_REGION=${AWS_REGION}"
-if ! CALLER_IDENTITY="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --output text 2>/dev/null)"; then
+echo "   Profile=${AWS_PROFILE:-<ambient credentials>}  Region=${AWS_REGION}"
+if ! ACCOUNT_ID="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --query Account --output text 2>/dev/null)"; then
     echo "❌ Unable to verify caller identity. Configure AWS_PROFILE/AWS_REGION and credentials." >&2
     exit 4
 fi
-echo "   Caller identity: $CALLER_IDENTITY"
-# The account the credentials resolve to; used to confirm the artifact bucket's
-# ownership context before upload.
-ACCOUNT_ID="$(printf '%s\n' "$CALLER_IDENTITY" | awk '{print $1}')"
+CALLER_ARN="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --query Arn --output text 2>/dev/null || true)"
+# Print only a masked account (last 4 digits) and the role/last ARN segment —
+# never the full ARN (which can carry a username/email) or the UserId.
+MASKED_ACCOUNT="****${ACCOUNT_ID: -4}"
+ROLE_NAME="${CALLER_ARN##*/}"
+echo "   Caller: account=$MASKED_ACCOUNT role=${ROLE_NAME:-<unknown>}"
+
+if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
+    echo "❌ Resolved account (****${ACCOUNT_ID: -4}) does not match the expected account" >&2
+    echo "   GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID (****${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID: -4})." >&2
+    echo "   Refusing to upload or write to a different account from the main deployment." >&2
+    exit 4
+fi
 
 if [ "$ACTION" = "enable" ]; then
     # ----------------------------------------------------------------------- #
@@ -225,24 +307,36 @@ if [ "$ACTION" = "enable" ]; then
     mkdir -p "$STAGE"
 
     echo "📦 Staging operations code and runtime resources ..."
-    # Ship the operations package: its Python modules AND the non-code runtime
-    # resources the handler loads at runtime. The contract validator resolves its
-    # versioned JSON Schemas via importlib.resources
-    # (operations.contracts.schemas.v1.*), so a .py-only package would omit them
-    # and every contract load would raise FileNotFoundError in the Lambda. We
-    # therefore stage *.py plus the versioned schema resources (and any other
-    # in-package JSON resource under operations/**), while excluding caches, test
-    # trees, and docs so no non-runtime file inflates or destabilizes the zip.
-    # A tar pipe copies the tree portably and dereferences any symlinks, avoiding
-    # pass-through copy tools that refuse to write through a symlinked temp prefix.
-    ( cd "$BACKEND_SRC" && \
-      find operations -type f \
-        \( -name '*.py' -o -name '*.json' \) \
-        -not -path '*/__pycache__/*' \
-        -not -path '*/tests/*' -not -path '*/test/*' \
-        -not -path '*/docs/*' \
-        -print0 \
-        | tar --null -cf - --files-from=- ) | ( cd "$STAGE" && tar -xf - )
+    # Stage from the committed HEAD revision, not the working tree, so an
+    # untracked or locally modified file can never ship and the artifact is tied
+    # to an exact commit. Refuse a dirty operations tree so the uploaded content
+    # always corresponds to a reviewable commit.
+    PACKAGED_COMMIT="$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$PACKAGED_COMMIT" ]; then
+        echo "❌ Refusing to enable: not a git checkout, so the packaged revision cannot" >&2
+        echo "   be pinned. Package from a committed tree." >&2
+        exit 5
+    fi
+    if ! ( cd "$PROJECT_ROOT" && git diff --quiet -- backend/src/operations && git diff --cached --quiet -- backend/src/operations ); then
+        echo "❌ Refusing to enable: backend/src/operations has uncommitted changes." >&2
+        echo "   Commit or stash them so the uploaded artifact matches commit $PACKAGED_COMMIT." >&2
+        exit 5
+    fi
+    if ( cd "$PROJECT_ROOT" && git ls-files --others --exclude-standard -- backend/src/operations | grep -q . ); then
+        echo "❌ Refusing to enable: backend/src/operations has untracked files that would" >&2
+        echo "   not be packaged from HEAD. Commit or remove them." >&2
+        exit 5
+    fi
+    # Materialize the committed operations tree (py + in-package JSON resources),
+    # excluding caches, test trees, and docs, from the HEAD revision via
+    # git archive so only tracked content at the pinned commit is staged.
+    ( cd "$PROJECT_ROOT/backend/src" && \
+      git -C "$PROJECT_ROOT" archive "$PACKAGED_COMMIT" -- backend/src/operations \
+        | tar -x --strip-components=3 -C "$STAGE" \
+            --exclude='*/__pycache__/*' --exclude='*/tests/*' --exclude='*/test/*' --exclude='*/docs/*' )
+    # Keep only runtime file types (py + json); drop anything else git archive
+    # may have carried.
+    find "$STAGE/operations" -type f ! -name '*.py' ! -name '*.json' -delete 2>/dev/null || true
 
     # Fail closed if the versioned contract schema resources did not make it into
     # the stage: the handler's contract load reads
@@ -280,6 +374,7 @@ if [ "$ACTION" = "enable" ]; then
             --python-platform x86_64-manylinux2014 \
             --python-version "$LAMBDA_PY_VERSION" \
             --only-binary :all: \
+            --no-deps \
             --target "$STAGE" \
             --no-cache \
             "${PINNED_DEPS[@]}"
@@ -290,38 +385,59 @@ if [ "$ACTION" = "enable" ]; then
             --implementation cp \
             --abi "$LAMBDA_PY_TAG" \
             --only-binary=:all: \
+            --no-deps \
             --no-compile \
             --target "$STAGE" \
             "${PINNED_DEPS[@]}"
     fi
 
-    # Normalize for determinism: strip pip metadata dirs and bytecode caches, and
-    # fix timestamps. .dist-info is not needed at runtime.
+    # Normalize for determinism: strip pip metadata dirs, bytecode caches, and
+    # the ``bin/`` directory (console scripts whose shebang embeds the build
+    # host's interpreter path), and fix timestamps. .dist-info is not needed at
+    # runtime.
     find "$STAGE" -depth -type d -name '*.dist-info' -exec rm -rf {} + 2>/dev/null || true
     find "$STAGE" -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+    rm -rf "${STAGE:?}/bin" 2>/dev/null || true
+    # Fail closed if any staged file still embeds the build user's home path, so
+    # a host-specific path can never be uploaded in the artifact.
+    if grep -rlI --exclude='*.so' "$HOME" "$STAGE" 2>/dev/null | grep -q .; then
+        echo "❌ A staged file embeds the build host home path ($HOME); refusing to upload." >&2
+        grep -rlI --exclude='*.so' "$HOME" "$STAGE" 2>/dev/null | sed 's#^#   #' >&2
+        exit 5
+    fi
     # Fixed epoch touch stamp assembled from parts (no 12-digit literal) so the
     # build is reproducible without tripping account-id content scanners.
     EPOCH_STAMP="2000""01010000.00"   # CCYYMMDDhhmm.SS
     find "$STAGE" -exec touch -h -t "$EPOCH_STAMP" {} +
 
     # ----------------------------------------------------------------------- #
-    # Fail closed if any native wheel was staged for a NON-Linux/x86 platform.
-    # rpds-py's compiled extension carries its platform tag in the filename; the
-    # only acceptable tag family is manylinux*_x86_64. A host wheel (macosx_*,
-    # *_arm64/aarch64, win_*) means the cross-platform install silently fell back
-    # to the host and must abort.
+    # Fail closed unless every staged native extension is a Linux/x86_64 wheel.
+    # A compiled extension carries its platform tag in the filename; the only
+    # acceptable native objects are ``*x86_64-linux-gnu.so``. Any other ``.so``
+    # (macosx_*, *_arm64/aarch64, win_*, musllinux, i686), or any ``.pyd``
+    # (Windows) or ``.dylib`` (macOS), means the cross-platform install silently
+    # fell back to the host and must abort.
     # ----------------------------------------------------------------------- #
-    echo "🔍 Verifying no host-architecture native wheels were packaged ..."
-    BAD_NATIVE="$(find "$STAGE" -type f -name '*.so' \
-        \( -name '*macosx*' -o -name '*arm64*' -o -name '*aarch64*' -o -name '*win_*' -o -name '*_i686*' \) 2>/dev/null || true)"
+    echo "🔍 Verifying every native extension is a Linux/x86_64 wheel ..."
+    BAD_NATIVE=""
+    while IFS= read -r sofile; do
+        case "$sofile" in
+            *x86_64-linux-gnu.so) : ;;             # the only acceptable form
+            *) BAD_NATIVE="${BAD_NATIVE}${sofile}"$'\n' ;;
+        esac
+    done < <(find "$STAGE" -type f -name '*.so' 2>/dev/null)
+    # Reject Windows/macOS dynamic objects outright.
+    while IFS= read -r other; do
+        BAD_NATIVE="${BAD_NATIVE}${other}"$'\n'
+    done < <(find "$STAGE" -type f \( -name '*.pyd' -o -name '*.dylib' \) 2>/dev/null)
     if [ -n "$BAD_NATIVE" ]; then
-        echo "❌ Host/non-x86_64 native wheel detected in package:" >&2
-        printf '   %s\n' "$BAD_NATIVE" >&2
+        echo "❌ Non-Linux/x86_64 native object detected in package:" >&2
+        printf '%s' "$BAD_NATIVE" | sed '/^$/d; s/^/   /' >&2
         exit 5
     fi
     # The native dependency MUST be present as a compiled Linux extension.
-    if ! find "$STAGE" -type f -name 'rpds*.so' | grep -q .; then
-        echo "❌ Native dependency rpds-py compiled extension is missing from the package." >&2
+    if ! find "$STAGE" -type f -name 'rpds*x86_64-linux-gnu.so' | grep -q .; then
+        echo "❌ Native dependency rpds-py Linux/x86_64 extension is missing from the package." >&2
         echo "   The manylinux x86_64 wheel did not install; refusing to deploy." >&2
         exit 5
     fi
@@ -395,7 +511,7 @@ PROBE
         # Every required top-level runtime dependency must be present so the
         # handler's transitive imports resolve at runtime.
         for required in rfc8785 jsonschema referencing rpds; do
-            if ! find "$STAGE" -maxdepth 2 \( -name "${required}" -o -name "${required}.py" -o -name "${required}*.so" \) | grep -q .; then
+            if ! find "$STAGE" -maxdepth 2 \( -name "${required}" -o -name "${required}.py" -o -name "${required}*x86_64-linux-gnu.so" \) | grep -q .; then
                 echo "❌ Required runtime dependency '$required' is absent from the package." >&2
                 exit 5
             fi
@@ -449,6 +565,7 @@ PROBE
     echo "☁️  Uploading artifact to s3://$CODE_S3_BUCKET/$CODE_S3_KEY ..."
     aws s3 cp "$ARTIFACT" "s3://$CODE_S3_BUCKET/$CODE_S3_KEY" \
         "${AWS_PROFILE_ARGS[@]}" \
+        --expected-bucket-owner "$ACCOUNT_ID" \
         --region "$AWS_REGION" --only-show-errors
 fi
 
@@ -513,10 +630,14 @@ if [ "$ACTION" = "disable" ]; then
         "ParameterKey=CodeS3Bucket,UsePreviousValue=true"
         "ParameterKey=CodeS3Key,UsePreviousValue=true"
         "ParameterKey=RequestDeadlineSeconds,UsePreviousValue=true"
+        "ParameterKey=LambdaTimeoutSeconds,UsePreviousValue=true"
         "ParameterKey=PerReadBudgetSeconds,UsePreviousValue=true"
         "ParameterKey=PersistenceBudgetSeconds,UsePreviousValue=true"
         "ParameterKey=CancellationMarginSeconds,UsePreviousValue=true"
         "ParameterKey=ObservationTtlSeconds,UsePreviousValue=true"
+        "ParameterKey=ObserverGroups,UsePreviousValue=true"
+        "ParameterKey=LatencyAlarmThresholdMs,UsePreviousValue=true"
+        "ParameterKey=AlarmTopicArn,UsePreviousValue=true"
         "ParameterKey=LambdaMemoryMb,UsePreviousValue=true"
         "ParameterKey=ReservedConcurrency,UsePreviousValue=true"
         "ParameterKey=MaxReadRequestUnits,UsePreviousValue=true"
@@ -531,7 +652,7 @@ if [ "$ACTION" = "disable" ]; then
     if ! aws cloudformation update-stack \
             "${AWS_PROFILE_ARGS[@]}" \
             --stack-name "$STACK_NAME" \
-            --template-body "file://$TEMPLATE" \
+            --use-previous-template \
             --capabilities CAPABILITY_NAMED_IAM \
             --region "$AWS_REGION" \
             --parameters "${DISABLE_PARAMS[@]}" 2>"$DISABLE_ERR"; then
@@ -556,21 +677,66 @@ fi
 # --------------------------------------------------------------------------- #
 # ENABLE path deploy: provision resources (Provisioned=true) and set the
 # runtime authority to observe. All enabling inputs were validated above and the
-# artifact was built and uploaded.
+# artifact was built and uploaded. On an EXISTING stack, the trusted bindings
+# (Environment, TenantId, WorkspaceId, TrustedAudience) are read and a change is
+# refused unless --allow-binding-change is passed, so a re-enable cannot silently
+# downgrade a prod stack or rebind its tenant/workspace.
 # --------------------------------------------------------------------------- #
+STACK_EXISTS="false"
+if aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+    STACK_EXISTS="true"
+fi
+
+_current_param() {
+    aws cloudformation describe-stacks \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --stack-name "$STACK_NAME" \
+        --region "$AWS_REGION" \
+        --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue | [0]" \
+        --output text 2>/dev/null || true
+}
+
+TRUSTED_AUDIENCE_EFFECTIVE="${TRUSTED_AUDIENCE:-$COGNITO_CLIENT_ID}"
+
+if [ "$STACK_EXISTS" = "true" ]; then
+    CUR_ENV="$(_current_param Environment)"
+    CUR_TENANT="$(_current_param TenantId)"
+    CUR_WS="$(_current_param WorkspaceId)"
+    CUR_AUD="$(_current_param TrustedAudience)"
+    BINDING_CHANGES=""
+    [ -n "$CUR_ENV" ] && [ "$CUR_ENV" != "$ENVIRONMENT" ] && BINDING_CHANGES="${BINDING_CHANGES}Environment ($CUR_ENV -> $ENVIRONMENT) "
+    [ -n "$CUR_TENANT" ] && [ "$CUR_TENANT" != "$TENANT_ID" ] && BINDING_CHANGES="${BINDING_CHANGES}TenantId "
+    [ -n "$CUR_WS" ] && [ "$CUR_WS" != "$WORKSPACE_ID" ] && BINDING_CHANGES="${BINDING_CHANGES}WorkspaceId "
+    [ -n "$CUR_AUD" ] && [ "$CUR_AUD" != "$TRUSTED_AUDIENCE_EFFECTIVE" ] && BINDING_CHANGES="${BINDING_CHANGES}TrustedAudience "
+    if [ -n "$BINDING_CHANGES" ] && [ "$ALLOW_BINDING_CHANGE" != "true" ]; then
+        echo "❌ Refusing to re-enable: this would change trusted binding(s): $BINDING_CHANGES" >&2
+        echo "   Changing Environment can downgrade deletion protection and log retention;" >&2
+        echo "   changing TenantId/WorkspaceId/TrustedAudience rebinds the live function." >&2
+        echo "   Pass --allow-binding-change to proceed intentionally." >&2
+        exit 9
+    fi
+fi
+
+# Build the override list. On an existing stack, send only the keys that change
+# (plus the always-updated Provisioned/OperationsMode/code identifiers), so an
+# unchanged binding is never resent and cannot be accidentally rewritten.
 PARAM_OVERRIDES=(
     "ProjectName=${PROJECT_NAME}"
     "Provisioned=true"
     "OperationsMode=${OPERATIONS_MODE}"
-    "Environment=${ENVIRONMENT}"
     "CognitoIssuer=${COGNITO_ISSUER}"
     "CognitoClientId=${COGNITO_CLIENT_ID}"
-    "TenantId=${TENANT_ID}"
-    "WorkspaceId=${WORKSPACE_ID}"
-    "TrustedAudience=${TRUSTED_AUDIENCE}"
     "CodeS3Bucket=${CODE_S3_BUCKET:-}"
     "CodeS3Key=${CODE_S3_KEY}"
 )
+if [ "$STACK_EXISTS" != "true" ] || [ "$ALLOW_BINDING_CHANGE" = "true" ]; then
+    PARAM_OVERRIDES+=(
+        "Environment=${ENVIRONMENT}"
+        "TenantId=${TENANT_ID}"
+        "WorkspaceId=${WORKSPACE_ID}"
+        "TrustedAudience=${TRUSTED_AUDIENCE_EFFECTIVE}"
+    )
+fi
 
 echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."
 aws cloudformation deploy \
@@ -579,6 +745,7 @@ aws cloudformation deploy \
     --stack-name "$STACK_NAME" \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "$AWS_REGION" \
+    --no-fail-on-empty-changeset \
     --parameter-overrides "${PARAM_OVERRIDES[@]}"
 
 echo "✅ Deploy complete (Provisioned=true, OperationsMode=$OPERATIONS_MODE)."

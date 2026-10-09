@@ -485,11 +485,15 @@ def test_lambda_has_reserved_concurrency_and_bounded_timeout(template):
     assert int(params["ReservedConcurrency"]["MinValue"]) >= 1
 
     timeout_ref = fn["Timeout"]
-    assert timeout_ref == "RequestDeadlineSeconds", "timeout must be bounded"
+    assert timeout_ref == "LambdaTimeoutSeconds", "Lambda Timeout must come from LambdaTimeoutSeconds"
+    assert int(params["LambdaTimeoutSeconds"]["MaxValue"]) <= 29, "timeout must sit below the 30s gateway ceiling"
+    # The Lambda timeout default MUST be strictly greater than the internal
+    # request-deadline default so the handler fails closed before a hard kill.
+    assert int(params["LambdaTimeoutSeconds"]["Default"]) > int(
+        params["RequestDeadlineSeconds"]["Default"]
+    ), "LambdaTimeoutSeconds must exceed RequestDeadlineSeconds"
     assert 1 <= int(params["RequestDeadlineSeconds"]["Default"]) <= 29
-    assert (
-        int(params["RequestDeadlineSeconds"]["MaxValue"]) <= 29
-    ), "timeout must be bounded below the 30s gateway ceiling"
+    assert int(params["RequestDeadlineSeconds"]["MaxValue"]) <= 29
 
 
 def test_lambda_runtime_is_python313_x86_64(template):
@@ -532,9 +536,9 @@ def test_dynamodb_table_is_secure_and_recoverable(template):
     assert key_types.get("HASH") == "PK", "partition key must be PK"
     assert key_types.get("RANGE") == "SK", "sort key must be SK"
 
-    ttl = table["TimeToLiveSpecification"]
-    assert ttl["Enabled"] is True
-    assert ttl["AttributeName"] == "ttl", "frozen TTL attribute must be 'ttl'"
+    # ADR 0005: the table has NO DynamoDB TimeToLiveSpecification. The audit
+    # records are retained for the full window and are never TTL-managed.
+    assert "TimeToLiveSpecification" not in table, "the operations table must not enable DynamoDB TTL"
     assert table["PointInTimeRecoverySpecification"]["PointInTimeRecoveryEnabled"] is True
     sse = table["SSESpecification"]
     assert sse["SSEEnabled"] is True
@@ -551,12 +555,35 @@ def test_no_s3_content_bucket_resource(template):
 
 def test_alarms_metrics_and_log_retention_present(template):
     alarms = _resources_of_type(template, "AWS::CloudWatch::Alarm")
-    assert len(alarms) >= 4, "expected at least four alarms"
+    assert len(alarms) >= 6, "expected the four custom alarms plus Lambda Errors/Throttles"
     alarm_metrics = {a["Properties"].get("MetricName") for a in alarms.values()}
     for required in ("ObservationFailures", "ObservationTimeouts", "StuckOperations"):
         assert required in alarm_metrics, f"missing alarm for {required}"
+    # Hard timeouts/crashes emit no custom metric, so the AWS/Lambda service
+    # metrics must be watched too.
+    for required in ("Errors", "Throttles"):
+        assert required in alarm_metrics, f"missing AWS/Lambda alarm for {required}"
+    lambda_alarms = [a["Properties"] for a in alarms.values() if a["Properties"]["Namespace"] == "AWS/Lambda"]
+    assert lambda_alarms, "expected AWS/Lambda alarms"
+    custom_alarms = [a["Properties"] for a in alarms.values() if a["Properties"]["Namespace"] == METRIC_NAMESPACE]
+    assert custom_alarms, "expected custom-metric alarms"
+
+    # Every alarm wires its action to the optional alarm topic (an Fn::If on
+    # the HasAlarmTopic condition), so a configured topic is notified. The
+    # template loader renders !If as a 3-element list [condition, true, false].
     for a in alarms.values():
-        assert a["Properties"]["Namespace"] == METRIC_NAMESPACE
+        actions = a["Properties"].get("AlarmActions")
+        assert (
+            isinstance(actions, list) and actions and actions[0] == "HasAlarmTopic"
+        ), "alarm must wire AlarmActions to the optional topic via Fn::If HasAlarmTopic"
+
+    # The p99 latency alarm threshold must be below the request deadline so it
+    # can fire before the handler fails closed.
+    params = template["Parameters"]
+    latency = [p for p in custom_alarms if p.get("MetricName") == "ObservationRequestLatency"]
+    assert latency, "expected a latency alarm"
+    assert latency[0]["Threshold"] == "LatencyAlarmThresholdMs"
+    assert int(params["LatencyAlarmThresholdMs"]["Default"]) < int(params["RequestDeadlineSeconds"]["Default"]) * 1000
 
     logs = _resources_of_type(template, "AWS::Logs::LogGroup")
     assert logs, "expected log groups"
@@ -673,9 +700,8 @@ _DIRECT_CALL_TO_UNDERLYING_ACTION = {
 # checkout (see ``resolve_deployed_store_src``): this branch's own ``backend/src``
 # ships the E1 store (operations.observation_store.DynamoDbObservationStore) and
 # its whole dependency subtree (operations.observation, operations.contracts.*,
-# operations.settings, operations.identity, operations.validation.*), so a normal
-# single combined checkout / CI resolves it with no sibling directories; a sibling
-# core worktree is only a fallback. Other tests in this suite import the
+# operations.settings, operations.identity, operations.validation.*), so the
+# single deployable checkout resolves it directly. Other tests in this suite import the
 # ``operations`` package in-process first -- binding it in ``sys.modules`` -- so a
 # subprocess with a clean interpreter is the faithful, order-independent way to
 # import and drive the real deployed module tree with no module mixing. It drives
@@ -790,7 +816,6 @@ store.begin_observation(
     lease_holder="holder-1",
     commit_not_after=future,
     lease_not_after=future,
-    ttl_epoch_s=ttl_epoch,
     intent={"kind": "observe"},
 )
 
@@ -831,7 +856,6 @@ store.begin_observation(
     lease_holder="holder-1",
     commit_not_after=future,
     lease_not_after=future,
-    ttl_epoch_s=ttl_epoch,
     intent={"kind": "observe"},
 )
 
@@ -863,7 +887,6 @@ store.begin_observation(
     lease_holder="holder-2",
     commit_not_after=future,
     lease_not_after=future,
-    ttl_epoch_s=ttl_epoch,
     intent={"kind": "observe"},
 )
 
@@ -873,7 +896,6 @@ store.complete_observation(
     workspace_id=ws,
     lease_holder="holder-1",
     commit_not_after=future,
-    ttl_epoch_s=ttl_epoch,
     observation={"ok": 1},
 )
 
@@ -883,7 +905,6 @@ store.fail_observation(
     workspace_id=ws,
     lease_holder="holder-1",
     reason_code="drift_probe",
-    ttl_epoch_s=ttl_epoch,
 )
 
 # 6) load_status: a GetItem read of the snapshot (+ result on succeeded).
@@ -899,9 +920,9 @@ def _underlying_actions_the_store_actually_requires():
     """Drive the *real deployed* E1 store through its full lifecycle and derive
     the exact underlying DynamoDB IAM action set it requires.
 
-    Resolves the deployed store's ``backend/src`` for the *current* checkout
-    (:func:`resolve_deployed_store_src` -- this branch's own ``backend/src``
-    first, a sibling core worktree only as fallback) and runs
+    Resolves the deployed store's ``backend/src`` for the current checkout
+    (:func:`resolve_deployed_store_src` -- this branch's own ``backend/src``)
+    and runs
     :data:`_STORE_DRIVE_SCRIPT` in a subprocess with that src first on
     ``PYTHONPATH`` so ``operations.observation_store.DynamoDbObservationStore``
     -- the module the CloudFormation Lambda ``Handler`` actually loads -- and its
@@ -998,11 +1019,10 @@ def test_iam_grants_exactly_the_underlying_actions_the_store_transacts(template)
 def test_store_src_resolves_to_the_current_checkout_without_any_sibling():
     """The deployed store must resolve from *this* checkout's own ``backend/src``.
 
-    Regression guard for the removed hardcoded sibling-worktree dependency: this
-    branch already ships the deployed E1 store under its own ``backend/src`` (from
-    the E1 base), so :func:`resolve_deployed_store_src` must return that path.
-    In a normal single combined checkout / CI there is no sibling ``issue-413-core``
-    directory, and the drift guard must still find the store to drive."""
+    This branch ships the deployed E1 store under its own ``backend/src``, so
+    :func:`resolve_deployed_store_src` must return that path. The single
+    deployable checkout carries no sibling ``issue-413-core`` directory, and the
+    drift guard must still find the store to drive."""
     resolved = resolve_deployed_store_src(PROJECT_ROOT)
     assert resolved is not None, "store src did not resolve from the current checkout"
     assert (
@@ -1250,33 +1270,41 @@ def test_stack_is_unwired_from_normal_deployment():
     for path in (MAIN_DEPLOY, DEPLOY_ALL):
         text = path.read_text(encoding="utf-8")
         assert "06-operations-observation" not in text, f"{path} must not reference the optional E1 stack"
+    # The PowerShell module must likewise never wire in the optional stack: no
+    # template, wrapper, or operations stack-name reference anywhere in it.
+    ps_root = PROJECT_ROOT / "scripts" / "powershell"
+    if ps_root.is_dir():
+        for ps_file in ps_root.rglob("*.ps*1"):
+            text = ps_file.read_text(encoding="utf-8")
+            for marker in ("06-operations-observation", "deploy-operations", "game-agent-operations"):
+                assert marker not in text, f"{ps_file} must not reference the optional E1 stack ({marker})"
 
 
 def test_teardown_all_never_invokes_operations_teardown():
     for path in (MAIN_TEARDOWN, TEARDOWN_ALL):
         text = path.read_text(encoding="utf-8")
         assert "teardown-operations" not in text, f"{path} must not auto-invoke E1 teardown"
+    ps_root = PROJECT_ROOT / "scripts" / "powershell"
+    if ps_root.is_dir():
+        for ps_file in ps_root.rglob("*.ps*1"):
+            assert "teardown-operations" not in ps_file.read_text(
+                encoding="utf-8"
+            ), f"{ps_file} must not auto-invoke E1 teardown"
 
 
 # --------------------------------------------------------------------------- #
-# Ownership seam: infra contributes NO placeholder/register_observer, core owns
-# the sole real handler (asserted against the tracked contribution + a
-# materialized combined tree, so it holds in both the infra-only and combined
-# contexts and never conflates "no placeholder" with "path must not exist").
+# Ownership seam: the infrastructure contributes NO placeholder/register_observer,
+# the core owns the sole real handler (asserted against the tracked contribution
+# plus a materialized deployable tree).
 # --------------------------------------------------------------------------- #
 def test_no_placeholder_or_register_observer_seam_is_tracked():
     """No tracked ``operations/observe`` source may carry an infra-style
     placeholder seam — a ``register_observer`` shim or a fail-closed placeholder
     stub. This is asserted by *content of the tracked files*, not by the on-disk
-    path, so it is correct in both contexts and never conflates "no placeholder"
-    with "path must not exist":
-
-    * infra-only — nothing is tracked under ``operations/observe`` (no hits); and
-    * combined — the tracked files are core's real handler, which carries no
-      placeholder seam (no hits).
-
-    It goes red only if the deleted infra placeholder/register_observer seam is
-    reintroduced, which is exactly the add/add-conflict this guards against."""
+    path: the tracked files are the core's real handler, which carries no
+    placeholder seam. It goes red only if an infra-style
+    placeholder/register_observer seam is present where only the real handler
+    belongs, which is exactly the add/add-conflict this guards against."""
     hits = observe_placeholder_seam_hits(PROJECT_ROOT)
     assert hits == [], (
         "no operations/observe placeholder or register_observer seam may be "
@@ -1285,10 +1313,11 @@ def test_no_placeholder_or_register_observer_seam_is_tracked():
 
 
 def test_combined_tree_carries_real_core_handler_the_template_points_at(tmp_path):
-    """On a materialized combined tree, ``operations/observe/lambda_entry.py``
+    """On a materialized deployable tree, ``operations/observe/lambda_entry.py``
     exists and defines a module-level ``handler`` — the exact CloudFormation
-    ``Handler`` — proving the infra template references core's real, deployable
-    entry point (not a placeholder). Always materialized, so never vacuous."""
+    ``Handler`` — proving the template references the real, deployable entry
+    point (not a placeholder). The materializer fails closed if the real handler
+    is absent, so this is never vacuous."""
     src = materialize_combined_operations_tree(tmp_path, PROJECT_ROOT)
     lambda_entry = src / HANDLER_REL
     assert lambda_entry.is_file(), "combined tree must carry core's real observe handler"
@@ -1443,16 +1472,16 @@ def test_teardown_wrapper_has_no_delete_data_claim():
 
 # --------------------------------------------------------------------------- #
 # Rollback-safe stateful resources + CloudWatch Logs / API Gateway authorization
-# regression suite (GitHub issue #413 beta-stack create failure).
+# suite.
 #
-# A real beta `create` failed at BOTH KMS-encrypted log groups with a CloudWatch
-# Logs AccessDenied because the CMK key policy granted the logs service principal
-# only kms:Decrypt + kms:GenerateDataKey, while CloudWatch Logs additionally
-# requires Encrypt / ReEncrypt* / Describe* to attach a KMS key to a log group.
-# The failed create then ORPHANED an empty DynamoDB table and CMK because
-# DeletionPolicy: Retain also retains on create-rollback. These tests reproduce
-# the exact missing-action failure structurally and enforce rollback-safe
-# stateful policies, the documented least-privilege logs grant scoped by
+# CloudWatch Logs requires Encrypt / Decrypt / ReEncrypt* / GenerateDataKey* /
+# Describe* on the CMK to attach a KMS key to a log group; a grant missing any of
+# these denies the log group with a CloudWatch Logs AccessDenied. Stateful
+# resources carry DeletionPolicy: Retain, which also retains on create-rollback,
+# so a grant that would fail the create must be prevented structurally to avoid
+# orphaning an empty DynamoDB table and CMK. These tests enforce the full logs
+# grant, rollback-safe stateful policies, the documented least-privilege logs
+# grant scoped by
 # encryption context to exactly the two log-group ARNs, and the API Gateway
 # access-log-delivery resource policy.
 # --------------------------------------------------------------------------- #
@@ -1460,7 +1489,7 @@ def test_teardown_wrapper_has_no_delete_data_claim():
 # The exact least-privilege action set the CloudWatch Logs service principal
 # needs to attach a CMK to a log group and read/write encrypted log data, per
 # the AWS "Encrypt log data in CloudWatch Logs using AWS KMS" guide. Encrypt and
-# ReEncrypt were the actions missing in the failed beta create.
+# ReEncrypt are required in addition to Decrypt and GenerateDataKey.
 REQUIRED_LOGS_KMS_ACTION_PREFIXES = (
     "kms:Encrypt",
     "kms:Decrypt",
@@ -1470,7 +1499,7 @@ REQUIRED_LOGS_KMS_ACTION_PREFIXES = (
 )
 
 # The two CMK-encrypted log groups whose ARNs the key-policy encryption-context
-# condition must scope to exactly. Both failed in the real create.
+# condition must scope to exactly.
 LAMBDA_LOG_GROUP_SUFFIX = "log-group:/aws/lambda/${ProjectName}-operations-observe"
 ACCESS_LOG_GROUP_SUFFIX = "log-group:/aws/apigateway/${ProjectName}-operations-access"
 
@@ -1509,10 +1538,10 @@ def _statement_action_set(stmt):
 
 
 def test_kms_key_policy_grants_full_cloudwatch_logs_action_set(template):
-    """RED against the failed beta create: the logs-principal grant carried only
-    Decrypt + GenerateDataKey. CloudWatch Logs also requires Encrypt, ReEncrypt*,
-    and Describe* to attach the CMK to a log group, so a grant missing any of
-    them reproduces the AccessDenied that failed the create."""
+    """The logs-principal grant must carry the full CloudWatch Logs action set.
+    CloudWatch Logs requires Encrypt, Decrypt, ReEncrypt*, GenerateDataKey*, and
+    Describe* to attach the CMK to a log group, so a grant missing any of them
+    would deny the log group with an AccessDenied."""
     logs_statements = _logs_key_statements(template)
     assert logs_statements, "KMS key policy must grant the CloudWatch Logs service principal"
     granted = set()
@@ -1623,10 +1652,16 @@ def test_api_gateway_access_log_delivery_resource_policy_present(template):
     assert "delivery.logs.amazonaws.com" in doc_text, "must grant the log-delivery service principal"
     assert "logs:CreateLogStream" in doc_text, "must allow CreateLogStream for delivery"
     assert "logs:PutLogEvents" in doc_text, "must allow PutLogEvents for delivery"
-    # Scoped to this account and this API where CloudFormation permits.
+    # Scoped to this account; the SourceArn uses the vended-log delivery form
+    # (arn:...:logs:region:account:*) that the delivery principal actually
+    # presents, not an apigateway ARN (which never matches and silently drops
+    # access logging into an out-of-band policy).
     assert "aws:SourceAccount" in doc_text, "delivery grant must be scoped by SourceAccount"
     assert "${AWS::AccountId}" in doc_text, "delivery grant must reference this account"
-    assert "HttpApi" in doc_text, "delivery grant must be scoped to this API (SourceArn)"
+    assert ":logs:" in doc_text, "delivery SourceArn must use the CloudWatch Logs form"
+    # The SourceArn condition must be the logs-service form, not an apigateway
+    # ARN. (The log-group Resource legitimately contains "/aws/apigateway/".)
+    assert '"arn:${AWS::Partition}:apigateway:' not in doc_text, "delivery SourceArn must not use an apigateway ARN"
 
 
 def test_access_log_resource_policy_is_gated_and_scoped_to_access_group(template):
@@ -1646,14 +1681,13 @@ def test_access_log_resource_policy_is_gated_and_scoped_to_access_group(template
 # --------------------------------------------------------------------------- #
 # Rollback design: separate initial PROVISIONING from runtime AUTHORITY.
 #
-# Defect being guarded against (live re-review): every resource was gated on a
-# single OperationsEnabled=(OperationsMode==observe) condition, so --disable
-# (OperationsMode=disabled) removed EVERY resource. Stateful resources retained
-# on that delete, so a later --enable failed on existing physical names and
-# CloudFormation lost ownership. The fix: a default-false Provisioned flag gates
-# resource existence, while OperationsMode is a runtime kill switch that leaves
-# resources in place. These tests are red against the old single-condition
-# design and green only against the split model.
+# Resource existence must be gated on a default-false Provisioned flag, while
+# OperationsMode is a runtime kill switch that leaves resources in place. If
+# every resource were instead gated on a single OperationsEnabled condition
+# (OperationsMode==observe), a --disable (OperationsMode=disabled) would remove
+# EVERY resource; stateful resources would retain on that delete, so a later
+# --enable would fail on existing physical names and CloudFormation would lose
+# ownership. These tests pass only against the split model.
 # --------------------------------------------------------------------------- #
 def _stage(template):
     stages = _resources_of_type(template, "AWS::ApiGatewayV2::Stage")

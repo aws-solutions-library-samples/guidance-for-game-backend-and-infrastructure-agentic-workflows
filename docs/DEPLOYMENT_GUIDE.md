@@ -282,50 +282,58 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 ### Optional operations control plane (E1)
 
-The optional E1 operations control plane is **default-unprovisioned** and adds
-**$0.00** incremental cost. A default deployment leaves `Provisioned=false` and
-creates no HTTP API route, compute, table, bucket, metric, or alarm. The stack is
-**not** wired into `deploy-all.sh`; it is deployed and torn down only by the
-dedicated shell wrappers (`scripts/infrastructure/deploy-operations.sh` and
-`scripts/infrastructure/teardown-operations.sh`). See
+The optional E1 operations control plane is **not part of the default
+deployment** and adds **$0.00** incremental cost. The default deployment does
+not create this stack at all, so there is no HTTP API, compute, table, metric,
+or alarm — "unprovisioned" means *no stack exists*, not a deployed empty stack.
+The stack is **not** wired into `deploy-all.sh`; it is deployed and torn down
+only by the dedicated shell wrappers (`scripts/infrastructure/deploy-operations.sh`
+and `scripts/infrastructure/teardown-operations.sh`). See
 [OPERATIONS_E1_DEPLOYMENT.md](OPERATIONS_E1_DEPLOYMENT.md) for the full runbook.
 
 When enabled it deploys the accepted synchronous, read-only GameLift observation
 design ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with
 **no queue, worker, dead-letter queue, or Step Functions** in the observation
-path and no provider-write permission. Provisioning and runtime authority are
-separate: an emergency `--disable` keeps every resource and its retained audit
-data under CloudFormation and flips only the runtime kill switch, so a disabled
-but still-provisioned stack continues to incur the fixed standing charges below.
+path and no provider-write permission. Observation records live in the DynamoDB
+table; there is **no Amazon S3 bucket** in the observation path. Provisioning and
+runtime authority are separate: an emergency `--disable` keeps every resource and
+its retained audit data under CloudFormation and flips only the runtime kill
+switch, so a disabled but still-provisioned stack continues to incur the fixed
+standing charges below.
 
 Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**;
-free-tier allowances excluded):
+free-tier allowances excluded). The fixed column includes the customer-managed
+KMS key ($1.00/key-month) that exists whenever the stack is provisioned,
+disabled, or torn down with data retained:
 
 | Scenario | Provisioned | Fixed | Variable | Total [USD] |
 | --- | --- | --- | --- | --- |
-| Default (unprovisioned) | no | $0.00 | $0.00 | **$0.00** |
-| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
-| Enabled, idle | yes | $1.65 | $0.00 | **$1.65** |
-| Enabled, 100,000 observations/mo | yes | $1.84 | $3.49 | **$5.33** |
+| Default (no stack) | no | $0.00 | $0.00 | **$0.00** |
+| Enabled, 100,000 observations/mo | yes | $2.65 | $2.95 | **$5.60** |
+| Enabled, idle | yes | $2.65 | $0.00 | **$2.65** |
+| Disabled after provision (data retained) | yes | $2.65 | $0.00 | **$2.65** |
+| Torn down (data retained) | n/a | $2.65 | $0.00 | **$2.65** |
 
 Enabled resources and their charge basis:
 
 | Service | Basis | Notes |
 | --- | --- | --- |
-| API Gateway (HTTP API) | $1.00 / million requests | 1 route; 100K req ≈ $0.10 |
+| API Gateway (HTTP API) | $1.00 / million requests | 2 routes; 100K req ≈ $0.10 |
 | Compute (Lambda, x86, 512 MB) | $0.20 / M requests + $0.0000166667 / GB-s | 1.0 s billed/req modelled; scales to zero when idle |
 | DynamoDB (on-demand) | WRU $0.625/M, RRU $0.125/M | 16 WRU + 4 RRU per observation (transactional) |
 | DynamoDB storage + PITR | $0.25 + $0.20 / GB-mo | small standing footprint |
-| S3 (content-addressed) | $0.023 / GB-mo + $0.005/1K PUT + $0.0004/1K GET | 1 PUT + 1 GET per observation, ~8 KB objects |
-| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 metrics + 4 alarms (always-on fixed cost) |
+| AWS KMS (customer-managed key) | $1.00 / key-mo + $0.03 / 10K requests | fixed while provisioned, disabled, or retained after teardown |
+| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 custom metrics + 6 alarms (always-on fixed cost) |
 | CloudWatch logs | $0.50 / GB ingest + $0.03 / GB-mo | ~8 KB per request |
 | X-Ray | $5.00 / million traces | 1 trace per observation |
 
 **Denial-of-wallet controls:** create an AWS Budget on the optional stack's
 cost-allocation tag; set DynamoDB on-demand per-table maximum read/write request
-units; enable HTTP API stage throttling; and alarm on request count and
-error/timeout rate. Disable by setting operations mode to `disabled`; remove all
-cost by tearing the optional stack down.
+units; enable HTTP API stage throttling; and alarm on error/timeout rate and the
+AWS/Lambda `Errors`/`Throttles` metrics. Disable by setting operations mode to
+`disabled`. **Teardown does not remove all cost:** it deletes the stack but
+deliberately retains the DynamoDB table, the KMS key, and both log groups, whose
+fixed charges continue until they are removed by hand.
 
 ### Cost Optimization Tips
 

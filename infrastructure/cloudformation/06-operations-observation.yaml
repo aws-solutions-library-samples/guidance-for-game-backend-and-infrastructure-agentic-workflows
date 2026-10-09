@@ -1,27 +1,34 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Game Agent - OPTIONAL E1 operations observation control plane (GitHub issue
-  #413). Default-unprovisioned: this stack is not wired into deploy-all.sh, and
-  every resource is gated on the ResourcesProvisioned condition (Provisioned
-  defaults to "false"), so a deploy with defaults creates ZERO E1 resources and
-  costs $0. Provisioning (Provisioned=true) and runtime authority (OperationsMode
-  observe|disabled) are SEPARATE: an emergency disable sets OperationsMode=disabled
-  while keeping Provisioned=true, so resources and their retained audit data stay
-  under CloudFormation with stable physical names and a later re-enable is
-  reversible. Implements the accepted synchronous, read-only GameLift observation
-  design in docs/adr/0005-persist-operations-and-recover-workflows.md. No
-  provider-write permission, no queue/worker/dead-letter queue, and no Step
-  Functions are created.
+  #413). Default-unprovisioned: this stack is not wired into deploy-all.sh and is
+  only ever created with Provisioned=true, so the default deployment creates no
+  stack at all (zero resources, zero cost, no data). Every resource is gated on
+  the ResourcesProvisioned condition. Provisioning (Provisioned=true) and runtime
+  authority (OperationsMode observe|disabled) are SEPARATE: an emergency disable
+  sets OperationsMode=disabled while keeping Provisioned=true, so resources and
+  their retained audit data stay under CloudFormation with stable physical names
+  and a later re-enable is reversible. Implements the accepted synchronous,
+  read-only GameLift observation design in
+  docs/adr/0005-persist-operations-and-recover-workflows.md. No provider-write
+  permission, no queue/worker/dead-letter queue, and no Step Functions are
+  created.
 
 # W1030 is suppressed below because CodeS3Bucket and CodeS3Key intentionally
-# default to '' in the unprovisioned state; the Rules section asserts both are
+# default to '' for template linting; the Rules section asserts both are
 # non-empty whenever Provisioned=true, which cfn-lint cannot see through when it
-# resolves the bare defaults.
+# resolves the bare defaults. W2001 on RequestDeadlineSeconds is suppressed
+# because that parameter is intentionally informational: the core settings module
+# derives the effective internal deadline from the per-read/persistence/margin
+# sub-budgets, and the deploy wrapper validates it against LambdaTimeoutSeconds;
+# it is carried on the stack (and reused on disable) rather than referenced by a
+# resource.
 Metadata:
   cfn-lint:
     config:
       ignore_checks:
         - W1030
+        - W2001
 
 Parameters:
   ProjectName:
@@ -37,16 +44,19 @@ Parameters:
       - 'true'
     Description: >-
       Initial-provisioning authority, SEPARATE from the runtime OperationsMode
-      kill switch. "false" (the default) creates ZERO E1 resources, so a default
-      new stack costs $0 and holds no data. "true" provisions the full E1
-      resource set (KMS key, DynamoDB table, log groups, role, Lambda, HTTP API,
-      alarms). Provisioning is a deliberate, owner-approved act. Once "true", it
-      MUST stay "true" for the life of the data: an emergency disable flips
-      OperationsMode to "disabled" but keeps Provisioned="true" so every resource
-      stays under CloudFormation with stable physical names and retained audit
-      data, and a later re-enable is reversible. Setting it back to "false"
-      REMOVES the resources (data-bearing ones detach under their retain policy)
-      and is a teardown decision, not a disable.
+      kill switch. This stack is only ever CREATED with Provisioned="true": the
+      default deployment does NOT create this stack at all, so "unprovisioned"
+      means no stack exists (zero resources, zero cost, no data) rather than a
+      deployed empty stack — CloudFormation does not support a stack with no
+      resources. "true" provisions the full E1 resource set (KMS key, DynamoDB
+      table, log groups, role, Lambda, HTTP API, alarms). Provisioning is a
+      deliberate, owner-approved act. Once "true", it stays "true" for the life
+      of the data: an emergency disable flips OperationsMode to "disabled" but
+      keeps Provisioned="true" so every resource stays under CloudFormation with
+      stable physical names and retained audit data, and a later re-enable is
+      reversible. To remove the control plane, delete the stack via the teardown
+      wrapper (data-bearing resources detach under their retain policy); there is
+      no supported path that deploys this stack with Provisioned="false".
 
   OperationsMode:
     Type: String
@@ -130,14 +140,29 @@ Parameters:
     Type: Number
     Default: 15
     MinValue: 5
+    MaxValue: 25
+    Description: >-
+      Total internal observation request budget in seconds (ADR 0005). It is NOT
+      injected as a runtime environment variable: the core settings module
+      derives the effective deadline from the per-read + persistence sub-budgets
+      plus the cancellation margin, which sum to this value. The Lambda function
+      Timeout is set separately (LambdaTimeoutSeconds) strictly ABOVE this value
+      so the handler returns a typed error before the function itself is killed.
+      Both sit below the 30 s API Gateway HTTP API integration ceiling.
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 20
+    MinValue: 6
     MaxValue: 29
     Description: >-
-      Total observation request budget in seconds (ADR 0005), used ONLY as the
-      Lambda function Timeout. It is NOT injected as a runtime environment
-      variable: the core settings module derives the effective deadline from the
-      per-read + persistence sub-budgets plus the cancellation margin. Bounded
-      below the 30 s API Gateway HTTP API integration ceiling so the request
-      fails closed before the gateway times out.
+      The Lambda function Timeout in seconds. It MUST be strictly greater than
+      RequestDeadlineSeconds so the handler's own monotonic deadline fires first
+      and returns a typed retryable error, rather than the function being hard-
+      terminated (which emits no custom metric). Kept below the 30 s API Gateway
+      integration ceiling. The default (20) exceeds the default
+      RequestDeadlineSeconds (15); the deploy wrapper validates the ordering,
+      since CloudFormation Rules cannot compare numbers.
 
   PerReadBudgetSeconds:
     Type: Number
@@ -173,11 +198,40 @@ Parameters:
     Default: 1800
     MinValue: 60
     Description: >-
-      Observation freshness / DynamoDB TTL horizon in seconds for the transient
-      observation records, injected as GBAW_OPERATIONS_OBSERVATION_TTL_S (the
-      value the handler stamps on the `ttl` attribute). Matches the core default
-      (1800 s = 30 min). The audit ledger and idempotency mapping are retained
-      for the full audit window and are not TTL-managed.
+      Observation freshness horizon in seconds for the transient observation
+      records, injected as GBAW_OPERATIONS_OBSERVATION_TTL_S (the value the
+      handler stamps on the result document's `expires_at` field). Matches the
+      core default (1800 s = 30 min). This is document freshness only: the table
+      has no DynamoDB TimeToLiveSpecification, and the idempotency mapping, state
+      snapshot, transitions, ledger events, and result are retained for the full
+      audit and replay window and are never TTL-managed (ADR 0005).
+
+  ObserverGroups:
+    Type: String
+    Default: 'admin,users'
+    Description: >-
+      Comma-separated, server-owned allowlist of Cognito groups permitted to
+      observe, injected as GBAW_OPERATIONS_OBSERVER_GROUPS. A verified caller
+      whose access-token groups intersect this set derives `observe` authority;
+      a caller with no intersecting group is denied on both the observe and the
+      status route. Matches the core default (admin,users).
+
+  LatencyAlarmThresholdMs:
+    Type: Number
+    Default: 13000
+    MinValue: 1000
+    MaxValue: 29000
+    Description: >-
+      p99 latency alarm threshold in milliseconds. Must be below the internal
+      request deadline (RequestDeadlineSeconds * 1000) so the alarm can fire
+      before the handler fails closed; a template Rule enforces this.
+
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional SNS topic ARN to notify on any alarm. When empty, alarms are
+      created without an action (state visible in CloudWatch, no notification).
 
   LambdaMemoryMb:
     Type: Number
@@ -234,6 +288,8 @@ Conditions:
   IsProd: !Equals [!Ref Environment, prod]
   # An explicit trusted audience overrides the Cognito client id fallback.
   HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
+  # An optional SNS topic for alarm notifications.
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, '']]
 
 Rules:
   # Reject the unsafe combination "observe without provisioning": the runtime
@@ -299,10 +355,10 @@ Resources:
             Resource: '*'
           # CloudWatch Logs needs the full encrypt/decrypt/describe action set to
           # attach this CMK to a log group; granting only Decrypt+GenerateDataKey
-          # is what caused the beta create to fail with AccessDenied at both log
-          # groups. These are the documented least-privilege service actions,
-          # scoped by encryption context to EXACTLY the two operations log groups
-          # (Lambda + API access) via their full ARNs (no account-wide wildcard).
+          # is insufficient and the log groups fail to create with AccessDenied.
+          # These are the documented least-privilege service actions, scoped by
+          # encryption context to EXACTLY the two operations log groups (Lambda +
+          # API access) via their full ARNs (no account-wide wildcard).
           - Sid: AllowCloudWatchLogsEncryptDecrypt
             Effect: Allow
             Principal:
@@ -360,9 +416,6 @@ Resources:
           KeyType: HASH
         - AttributeName: SK
           KeyType: RANGE
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -428,7 +481,7 @@ Resources:
               "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access:*",
               "Condition": {
                 "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
-                "ArnLike": { "aws:SourceArn": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApi}" }
+                "ArnLike": { "aws:SourceArn": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*" }
               }
             }
           ]
@@ -605,7 +658,7 @@ Resources:
       Handler: operations.observe.lambda_entry.handler
       Role: !GetAtt ObservationRole.Arn
       MemorySize: !Ref LambdaMemoryMb
-      Timeout: !Ref RequestDeadlineSeconds
+      Timeout: !Ref LambdaTimeoutSeconds
       ReservedConcurrentExecutions: !Ref ReservedConcurrency
       TracingConfig:
         Mode: Active
@@ -616,6 +669,7 @@ Resources:
           GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
           GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
           GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_OBSERVER_GROUPS: !Ref ObserverGroups
           GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
             - HasExplicitTrustedAudience
             - !Ref TrustedAudience
@@ -646,15 +700,8 @@ Resources:
     Properties:
       Name: !Sub '${ProjectName}-operations'
       ProtocolType: HTTP
-      # Restrictive CORS: no wildcard origin, credentials disabled by omission.
-      CorsConfiguration:
-        AllowMethods:
-          - POST
-          - GET
-        AllowHeaders:
-          - authorization
-          - content-type
-        MaxAge: 300
+      # No CorsConfiguration: this API has no browser consumer (it is called
+      # server-to-server with a bearer token), so no CORS preflight is served.
       Tags:
         Project: !Ref ProjectName
         Component: operations-observation
@@ -752,10 +799,13 @@ Resources:
       FunctionName: !Ref ObservationFunction
       Action: 'lambda:InvokeFunction'
       Principal: apigateway.amazonaws.com
-      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/$default/*/operations/*'
 
   # --------------------------------------------------------------------------- #
-  # CloudWatch alarms on the four frozen metrics.
+  # CloudWatch alarms on the four frozen metrics, plus AWS/Lambda Errors and
+  # Throttles (hard timeouts and crashes emit no custom metric, so the Lambda
+  # service metrics are watched too). Every alarm notifies the optional alarm
+  # topic when one is supplied.
   # --------------------------------------------------------------------------- #
   ObservationFailuresAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -771,6 +821,7 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
   ObservationTimeoutsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -786,6 +837,7 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
   StuckOperationsAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -801,30 +853,75 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
   ObservationLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-latency'
-      AlarmDescription: Observation request latency approaching the request deadline.
+      AlarmDescription: Observation request p99 latency approaching the request deadline.
       Namespace: 'GameAgent/Operations'
       MetricName: ObservationRequestLatency
       # p99 is a percentile and must be an ExtendedStatistic, not Statistic.
       ExtendedStatistic: p99
       Period: 300
       EvaluationPeriods: 1
-      # 27,000 ms acceptance ceiling from ADR 0005 (ceiling - margin).
-      Threshold: 27000
+      # A parameterized threshold BELOW the internal request deadline, so a
+      # breach can actually fire before the handler fails closed (the handler
+      # never emits this metric for a request the Lambda hard-kills).
+      Threshold: !Ref LatencyAlarmThresholdMs
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  # AWS/Lambda service metrics catch hard timeouts and crashes, which emit no
+  # custom metric and are therefore invisible to the four alarms above.
+  ObservationFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-lambda-errors'
+      AlarmDescription: The observation Lambda is erroring or being hard-killed at timeout.
+      Namespace: 'AWS/Lambda'
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ObservationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
+
+  ObservationFunctionThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-lambda-throttles'
+      AlarmDescription: The observation Lambda is being throttled (reserved concurrency exhausted).
+      Namespace: 'AWS/Lambda'
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ObservationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
 Outputs:
   Provisioned:
     Description: >-
-      Whether this stack has provisioned the E1 resource set. "false" means zero
-      resources ($0, no data). "true" means resources exist; a disabled-but-
-      provisioned stack keeps them (and their retained data) under CloudFormation.
+      Whether this stack has provisioned the E1 resource set. This stack exists
+      only when provisioned ("true"); the default deployment creates no stack at
+      all. A disabled-but-provisioned stack keeps its resources (and their
+      retained data) under CloudFormation.
     Value: !Ref Provisioned
 
   OperationsMode:

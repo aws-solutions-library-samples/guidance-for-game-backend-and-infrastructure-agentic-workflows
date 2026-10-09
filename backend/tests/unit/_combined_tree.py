@@ -13,26 +13,22 @@ the single combined deployable tree:
   context)``), which is exactly the CloudFormation ``Handler`` and the module the
   wrapper packages and import-probes.
 
-The packaging wrapper runs against the **combined** tree. Two properties are
-asserted, each designed to stay correct whether the ``operations/observe`` path
-is tracked (combined checkout) or untracked (never vacuous, never wrong):
+The packaging wrapper runs against the single deployable tree. Two properties
+are asserted:
 
 1. **No placeholder/register_observer seam.** The ownership invariant is about
    what the infrastructure side contributes, not *whether the path exists*.
-   Asserting the on-disk path is absent would be false on a legitimate combined
-   tree where the core backend owns and materializes ``operations/observe``.
-   Instead, :func:`observe_placeholder_seam_hits` scans the *tracked*
-   ``operations/observe`` source for the placeholder signatures (a
+   Asserting the on-disk path is absent would be false on this tree, where the
+   core backend owns and materializes ``operations/observe``. Instead,
+   :func:`observe_placeholder_seam_hits` scans the *tracked*
+   ``operations/observe`` source for placeholder signatures (a
    ``register_observer`` seam or a fail-closed placeholder stub). It returns
-   nothing when the path is untracked AND when the tracked files are the core
-   backend's real handler, and returns hits only if an infrastructure-style
-   placeholder was reintroduced.
+   nothing when the tracked files are the core backend's real handler, and
+   returns hits only if an infrastructure-style placeholder is present.
 
-2. **Combined tree carries the real handler.** :func:`materialize_combined_operations_tree`
-   always produces a tree whose ``operations/observe/lambda_entry.py`` defines a
-   module-level ``handler`` — preferring the real handler already on disk in the
-   combined checkout, else a faithful fixture — so the positive combined-tree
-   assertions always run.
+2. **Deployable tree carries the real handler.** :func:`materialize_combined_operations_tree`
+   produces a tree whose ``operations/observe/lambda_entry.py`` is the real,
+   on-disk handler, so the positive assertions bind to the deployed module.
 """
 
 # Standard library
@@ -49,30 +45,19 @@ HANDLER_DOTTED = "operations.observe.lambda_entry.handler"
 # drift guard drives to derive the DynamoDB actions the store actually requires.
 STORE_MODULE_REL = "operations/observation_store.py"
 
-# Signatures that mark an infra-style *placeholder* handler (never present in
-# core's real, deployable module). Any tracked observe source carrying one of
-# these means the deleted infra placeholder/register_observer seam was
-# reintroduced — an add/add-conflict risk on merge.
+# Signatures that mark an infra-style *placeholder* handler, which the core
+# backend's real, deployable module never carries. Any tracked observe source
+# carrying one of these means an infrastructure-style placeholder or
+# ``register_observer`` seam is present where only the real handler belongs.
 PLACEHOLDER_SEAM_MARKERS = (
     "register_observer",
     "core observation implementation is registered",
     "fails closed with a typed 503 until",
 )
 
-# A faithful stand-in for core's real handler: a module-level ``handler`` with a
-# ``(event, context)`` signature. This is NOT a fail-closed placeholder and it
-# carries no ``register_observer`` seam — it stands in for the deployable core
-# module in the infra-only context so the combined-tree contract is exercised.
-_FIXTURE_LAMBDA_ENTRY = (
-    '"""Combined-tree fixture standing in for core\'s real observe handler."""\n'
-    "\n"
-    "\n"
-    "def handler(event, context=None):\n"
-    '    """Module-level Lambda entry point (matches core\'s real signature)."""\n'
-    "    return {'statusCode': 200}\n"
-)
 
-
+# A module-level ``handler`` with a ``(event, context)`` signature marks the
+# real, deployable core module.
 def _write(path: pathlib.Path, text: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -109,13 +94,9 @@ def observe_placeholder_seam_hits(repo_root: pathlib.Path) -> list[str]:
     """Tracked ``operations/observe`` files that carry an infra-style placeholder
     seam (``register_observer`` or a fail-closed placeholder stub).
 
-    Empty in both intended contexts:
-
-    * infra-only — nothing is tracked under ``operations/observe``; and
-    * combined — the tracked files are core's real handler, which carries no
-      placeholder seam.
-
-    Non-empty only if an infra-style placeholder was (re)introduced.
+    Empty in the intended context: the tracked files are the core backend's real
+    handler, which carries no placeholder seam. Non-empty only if an infra-style
+    placeholder is present.
     """
     hits: list[str] = []
     for rel in _git_tracked_files(repo_root, "backend/src/operations/observe/**"):
@@ -132,11 +113,10 @@ def observe_placeholder_seam_hits(repo_root: pathlib.Path) -> list[str]:
 
 
 def combined_tree_handler_source(repo_root: pathlib.Path) -> pathlib.Path | None:
-    """If ``repo_root`` itself already IS a combined tree (core's real handler is
-    present on disk under ``backend/src``), return that handler path; else None.
+    """Return the real on-disk handler path under ``repo_root``'s ``backend/src``,
+    or ``None`` if it is absent.
 
-    Used so the combined-tree assertions bind to the real handler when the suite
-    is run inside a materialized combined checkout.
+    Used so the deployable-tree assertions bind to the real handler.
     """
     on_disk = repo_root / "backend" / "src" / HANDLER_REL
     if on_disk.is_file():
@@ -148,11 +128,9 @@ def resolve_deployed_store_src(repo_root: pathlib.Path) -> pathlib.Path | None:
     """Return the ``backend/src`` that contains the deployed E1 store module, or
     ``None`` if it cannot be located.
 
-    ``repo_root`` is the single combined checkout: its ``backend/src`` ships the
-    deployed store module (and the deployed handler), so the IAM drift guard
-    binds to the same module the packaging contract packages. In normal CI there
-    are no sibling directories and this resolves the real, current-checkout
-    store, so the guard executes non-vacuously.
+    ``repo_root``'s ``backend/src`` ships the deployed store module (and the
+    deployed handler), so the IAM drift guard binds to the same module the
+    packaging contract packages, and the guard executes non-vacuously.
     """
     src = repo_root / "backend" / "src"
     if (src / STORE_MODULE_REL).is_file():
@@ -164,32 +142,28 @@ def materialize_combined_operations_tree(
     tmp_root: pathlib.Path,
     infra_root: pathlib.Path,
 ) -> pathlib.Path:
-    """Return ``backend/src`` of a combined operations tree carrying a real
+    """Return ``backend/src`` of a deployable operations tree carrying the real
     module-level handler at :data:`HANDLER_REL`.
 
-    Resolution order for the real handler:
-
-    1. ``infra_root`` is itself a combined tree (core's handler already on disk);
-       else
-    2. a faithful synthesized fixture.
-
-    In every case the returned tree defines a module-level ``handler``, so the
-    combined-tree contract is always exercised and never becomes vacuous.
+    The real handler at ``infra_root``'s ``backend/src`` is vendored into the
+    tree. A missing handler is a hard failure, so the deployable-tree contract
+    can never pass against a synthesized stand-in.
     """
     src = tmp_root / "backend" / "src"
     _write(src / "operations" / "__init__.py")
-    _write(src / "operations" / "settings.py", "# frozen settings (core-owned in merge)\n")
+    _write(src / "operations" / "settings.py", "# frozen settings (core-owned)\n")
     _write(src / "operations" / "observe" / "__init__.py")
 
     real = combined_tree_handler_source(infra_root)
-    if real is not None:
-        _write(
-            src / HANDLER_REL,
-            "# vendored from the real core handler for the combined-tree contract\n\n"
-            + real.read_text(encoding="utf-8"),
+    if real is None:
+        raise AssertionError(
+            f"the real observe handler is absent under {infra_root}/backend/src/{HANDLER_REL}; "
+            "the deployable-tree contract requires the real handler, not a stand-in"
         )
-    else:
-        _write(src / HANDLER_REL, _FIXTURE_LAMBDA_ENTRY)
+    _write(
+        src / HANDLER_REL,
+        "# vendored from the real core handler for the deployable-tree contract\n\n" + real.read_text(encoding="utf-8"),
+    )
     return src
 
 

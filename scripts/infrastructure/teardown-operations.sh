@@ -19,10 +19,24 @@ AWS_REGION="${AWS_REGION:-us-west-2}"
 PROJECT_NAME="game-agent"
 STACK_NAME="${PROJECT_NAME}-operations"
 
-# AWS_PROFILE is passed EXPLICITLY to every aws call rather than relied on
-# ambiently. When unset we fall back to "default" so the flag is always present.
-AWS_PROFILE="${AWS_PROFILE:-default}"
-AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# AWS_PROFILE resolution mirrors scripts/deploy.sh: environment, then
+# ui/.env.local, otherwise unset. The profile flag is passed only when set, so an
+# operator on ambient credentials is not forced onto a "default" profile.
+if [ -z "${AWS_PROFILE:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
+    _profile="$(grep '^AWS_PROFILE=' "$PROJECT_ROOT/ui/.env.local" | cut -d= -f2 | tr -d '[:space:]')"
+    [ -n "$_profile" ] && export AWS_PROFILE="$_profile"
+fi
+if [ -n "${AWS_PROFILE:-}" ]; then
+    AWS_PROFILE_ARGS=(--profile "$AWS_PROFILE")
+else
+    AWS_PROFILE_ARGS=()
+fi
+
+# When set, the resolved caller account must match before any stack write.
+GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID="${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID:-}"
 
 CONFIRM=""
 
@@ -68,24 +82,53 @@ echo "Stack:  $STACK_NAME"
 echo ""
 
 echo "🔐 Verifying AWS credentials and region before any write ..."
-echo "   AWS_PROFILE=${AWS_PROFILE}  AWS_REGION=${AWS_REGION}"
-if ! CALLER_IDENTITY="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --output text 2>/dev/null)"; then
+echo "   Profile=${AWS_PROFILE:-<ambient credentials>}  Region=${AWS_REGION}"
+if ! ACCOUNT_ID="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --query Account --output text 2>/dev/null)"; then
     echo "❌ Unable to verify caller identity. Configure AWS_PROFILE/AWS_REGION and credentials." >&2
     exit 4
 fi
-echo "   Caller identity: $CALLER_IDENTITY"
+echo "   Caller: account=****${ACCOUNT_ID: -4}"
+if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
+    echo "❌ Resolved account (****${ACCOUNT_ID: -4}) does not match the expected account." >&2
+    echo "   Refusing to tear down in a different account from the main deployment." >&2
+    exit 4
+fi
 
 if ! aws cloudformation describe-stacks "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
     echo "⚠️  Stack $STACK_NAME does not exist; nothing to do."
     exit 0
 fi
 
-echo "ℹ️  Durable resources (DynamoDB table, KMS key) use a Retain policy and"
-echo "    will be LEFT IN PLACE with their audit data intact. This script does"
-echo "    not erase audit data; that is a separate, explicit, manual future step."
+echo "ℹ️  Durable resources use a Retain policy and will be LEFT IN PLACE with"
+echo "    their audit data intact. This script does not erase audit data; that is"
+echo "    a separate, explicit, manual future step. The following physical"
+echo "    resources are RETAINED after this teardown:"
+# Enumerate the retained physical resources (table, KMS key, and BOTH log groups)
+# so the operator sees exactly what remains and must clean up by hand later.
+RETAINED="$(aws cloudformation describe-stack-resources \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --stack-name "$STACK_NAME" \
+    --region "$AWS_REGION" \
+    --query "StackResources[?DeletionPolicy=='Retain' || ResourceType=='AWS::DynamoDB::Table' || ResourceType=='AWS::KMS::Key' || ResourceType=='AWS::Logs::LogGroup'].[ResourceType,PhysicalResourceId]" \
+    --output text 2>/dev/null || true)"
+if [ -n "$RETAINED" ]; then
+    printf '%s\n' "$RETAINED" | sed 's/^/      /'
+else
+    echo "      (unable to enumerate; the DynamoDB table, KMS key, and both log groups are retained by policy)"
+fi
 
 echo "🗑️  Deleting CloudFormation stack $STACK_NAME ..."
 aws cloudformation delete-stack "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION"
-aws cloudformation wait stack-delete-complete "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION" || true
+echo "⏳ Waiting for stack deletion to complete ..."
+# Do NOT swallow a delete failure: a DELETE_FAILED must surface a non-zero exit
+# rather than being reported as success.
+if ! aws cloudformation wait stack-delete-complete "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION"; then
+    echo "❌ Stack deletion did not complete. Inspect the stack events; retained audit" >&2
+    echo "   data (table, KMS key, log groups) is unaffected." >&2
+    exit 8
+fi
 
-echo "✅ Stack deletion requested. Retained audit data is unaffected."
+echo "✅ Stack deleted. Retained audit data (DynamoDB table, KMS key, log groups)"
+echo "   is unaffected and must be removed by hand once confirmed unneeded. A"
+echo "   later --enable fails until the retained fixed-name resources are deleted"
+echo "   or imported, because the table and log-group names are stable."

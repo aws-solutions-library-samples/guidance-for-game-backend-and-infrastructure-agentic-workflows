@@ -1,30 +1,30 @@
 """Combined-package fixture tests for the optional E1 operations Lambda artifact
 (GitHub issue #413).
 
-The deploy wrapper packages the `operations` tree from a COMBINED checkout — the
-infra worktree merged with issue #413 core, which owns the real
-``operations/observe/lambda_entry.py`` handler. The infra worktree itself ships
-NO ``operations/observe`` placeholder (that package was deleted so it cannot
-add/add-conflict with core). These tests therefore synthesise a *combined-tree
-fixture* (or a sibling core worktree, when present) entirely outside
-``backend/src`` — no runtime placeholder source is added to ``backend/src`` — and
-assert the packaging invariants the wrapper depends on:
+The deploy wrapper packages the `operations` tree from the single deployable
+checkout, whose ``backend/src`` owns the real
+``operations/observe/lambda_entry.py`` handler. The infrastructure side ships NO
+``operations/observe`` placeholder, so it never add/add-conflicts with the core
+backend. These tests materialize a deployable-tree fixture (vendoring the real
+on-disk handler) outside ``backend/src`` — no runtime placeholder source is added
+to ``backend/src`` — and assert the packaging invariants the wrapper depends on:
 
-* a materialized combined tree carries a real, module-level ``handler`` at the
+* a materialized deployable tree carries a real, module-level ``handler`` at the
   frozen path — exactly the CloudFormation ``Handler`` — and a tree that lacks it
   fails the wrapper's handler-present gate closed;
-* the infra worktree itself *tracks* no ``operations/observe`` source and no
-  ``register_observer`` seam (checked against the git index, not the on-disk
-  path, so it stays correct on a legitimate combined tree where core owns the
-  path);
+* the deployable checkout *tracks* no ``operations/observe`` placeholder source
+  and no ``register_observer`` seam (checked against the git index, not the
+  on-disk path);
 * the deterministic zip (sorted entries, fixed epoch mtime) is byte-stable across
   repeated builds of an unchanged tree, so the content-hash S3 key is stable;
 * the structural, fail-closed import probe accepts a package that carries every
   required runtime dependency and rejects one that is missing a dependency;
 * the host-native-wheel guard rejects a non-Linux/x86 native wheel.
 
-These never call AWS and never build a real wheel; they exercise the wrapper's
-packaging *contract* against a fixture combined tree.
+The packaging-contract tests never call AWS and never build a real wheel. A
+separate group drives the real deploy/teardown wrappers offline with a stub
+``aws`` on ``PATH`` to assert call order, the disable command line, and
+teardown's exit status.
 """
 
 # Standard library
@@ -142,10 +142,10 @@ def _structural_probe(stage: pathlib.Path) -> None:
 # Handler-present gate on a combined tree; infra contributes no placeholder
 # --------------------------------------------------------------------------- #
 def test_combined_tree_has_real_module_level_handler(tmp_path):
-    """A materialized combined tree (sibling core worktree when present, else a
-    faithful fixture) carries ``operations/observe/lambda_entry.py`` defining a
-    module-level ``handler`` — the exact CloudFormation ``Handler``. Always
-    materialized, so this never becomes vacuous in the infra-only context."""
+    """A materialized deployable tree carries ``operations/observe/lambda_entry.py``
+    defining a module-level ``handler`` — the exact CloudFormation ``Handler`` —
+    vendored from the real on-disk core handler. The materializer fails closed if
+    the real handler is absent, so this never binds to a synthesized stand-in."""
     src = materialize_combined_operations_tree(tmp_path, PROJECT_ROOT)
     lambda_entry = src / HANDLER_REL
     assert lambda_entry.is_file(), "combined tree must carry core's real handler"
@@ -237,19 +237,33 @@ def test_structural_probe_fails_closed_on_missing_dependency(tmp_path):
 
 
 def test_host_native_wheel_guard_rejects_non_linux_x86(tmp_path):
-    """The wrapper aborts if a host/non-x86_64 native wheel was staged. Reproduce
-    the guard's filename test against a macOS/arm64 .so."""
-    src = _combined_operations_tree(tmp_path)
-    stage = tmp_path / "stage"
-    _stage_package(src, stage)
-    # Simulate a host wheel leaking in.
-    _write(stage / "rpds" / "rpds.cpython-313-darwin.so", "")
-    bad = [
-        p
-        for p in stage.rglob("*.so")
-        if any(tag in p.name for tag in ("macosx", "arm64", "aarch64", "win_", "darwin", "_i686"))
-    ]
-    assert bad, "the guard must detect a host/non-x86_64 native wheel"
+    """Drive the wrapper's REAL host-wheel guard expression (not a re-implemented
+    tag list). The wrapper accepts a staged ``.so`` only when its name ends in
+    ``x86_64-linux-gnu.so`` and rejects every other ``.so`` plus any ``.pyd`` or
+    ``.dylib``. Extract that exact ``case`` arm from the wrapper and apply it to a
+    set of candidate filenames so a regression in the wrapper's own expression
+    fails this test."""
+    wrapper = DEPLOY_WRAPPER.read_text(encoding="utf-8")
+    # The single acceptable native-object form the wrapper encodes.
+    assert "*x86_64-linux-gnu.so) : ;;" in wrapper, "wrapper must accept only *x86_64-linux-gnu.so"
+    assert "-name '*.pyd' -o -name '*.dylib'" in wrapper, "wrapper must reject .pyd and .dylib"
+
+    # A faithful mirror of the wrapper's acceptance predicate, exercised through
+    # the shell so the test runs the same glob semantics the wrapper uses.
+    def _wrapper_accepts(name: str) -> bool:
+        script = 'case "$1" in\n' "  *x86_64-linux-gnu.so) exit 0 ;;\n" "  *) exit 1 ;;\n" "esac\n"
+        return subprocess.run(["bash", "-c", script, "_", name]).returncode == 0
+
+    # The real Linux/x86_64 extension is accepted; host objects are rejected.
+    assert _wrapper_accepts("rpds.cpython-313-x86_64-linux-gnu.so")
+    for host in (
+        "rpds.cpython-313-darwin.so",
+        "rpds.cpython-313-macosx_11_0_arm64.so",
+        "rpds.cpython-313-aarch64-linux-gnu.so",
+        "rpds.cp313-win_amd64.pyd",
+        "rpds.cpython-313-darwin.dylib",
+    ):
+        assert not _wrapper_accepts(host), f"{host} must be rejected by the wrapper guard"
 
 
 # --------------------------------------------------------------------------- #
@@ -257,11 +271,11 @@ def test_host_native_wheel_guard_rejects_non_linux_x86(tmp_path):
 # --------------------------------------------------------------------------- #
 # ``loguru`` is a full-backend dependency but is deliberately ABSENT from the
 # minimal E1 observe Lambda's runtime closure (see ``REQUIRED_TOP_LEVEL``). The
-# store's diagnostic boundary once did ``from loguru import logger`` at module
-# scope, so importing the packaged handler chain raised ``ModuleNotFoundError:
+# store's diagnostic boundary therefore uses stdlib ``logging`` only: a
+# module-scope ``from loguru import logger`` would raise ``ModuleNotFoundError:
 # loguru`` in the deployed Lambda before it served a single request. These tests
-# prove the boundary now imports cleanly under stdlib ``logging`` alone, and pin
-# the invariant that no operations module reintroduces a top-level loguru import.
+# prove the boundary imports cleanly under stdlib ``logging`` alone, and pin the
+# invariant that no operations module introduces a top-level loguru import.
 BACKEND_SRC = PROJECT_ROOT / "backend" / "src"
 OPERATIONS_TREE = BACKEND_SRC / "operations"
 
@@ -305,8 +319,9 @@ def _import_under_blocked_loguru(module: str) -> subprocess.CompletedProcess:
 
 
 def test_observation_store_imports_without_loguru():
-    """The store boundary — the only operations module that ever imported loguru
-    — imports cleanly when loguru is unavailable, as it is in the E1 Lambda."""
+    """The store boundary — the one operations module that would otherwise import
+    loguru — imports cleanly when loguru is unavailable, as it is in the E1
+    Lambda."""
     result = _import_under_blocked_loguru("operations.observation_store")
     assert result.returncode == 0, (
         "operations.observation_store must import without loguru (E1 Lambda closure "
@@ -351,12 +366,12 @@ def test_no_operations_module_imports_loguru_at_top_level():
 # --------------------------------------------------------------------------- #
 # Runtime NON-CODE resources: the versioned JSON Schemas the handler loads.
 #
-# The regression these tests lock down (issue #413 live E1): a live valid POST
-# reached service validation but the handler raised FileNotFoundError because the
-# deploy wrapper staged only operations/**/*.py while the runtime contract
-# validator loads operations/contracts/schemas/v1/*.schema.json via
-# importlib.resources. The Lambda zip omitted every schema, so the first
-# validated request failed closed in production instead of at build time.
+# The runtime contract validator loads
+# operations/contracts/schemas/v1/*.schema.json via importlib.resources, so the
+# deploy wrapper must stage those schema resources alongside operations/**/*.py.
+# A package missing the schemas would fail closed with FileNotFoundError on the
+# first validated request in production, so these tests assert the schemas are
+# present in the staged package and fail the build otherwise.
 # --------------------------------------------------------------------------- #
 def _copy_real_schemas(src: pathlib.Path) -> None:
     """Copy the REAL versioned schema resources into a combined-tree fixture, so

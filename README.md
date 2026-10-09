@@ -116,48 +116,57 @@ The following table provides a sample cost breakdown for deploying this Guidance
 
 ### Optional operations control plane (E1)
 
-The optional E1 operations control plane is **default-unprovisioned and adds no
-incremental cost** to the numbers above. A default deployment leaves
-`Provisioned=false`, so it creates **zero** resources, costs **$0.00**, and holds
-no data. Nothing in the table changes unless an owner explicitly **provisions and
-enables** operations. This stack is not wired into `deploy-all.sh`; it is deployed
-and torn down only by the dedicated shell wrappers documented in
+The optional E1 operations control plane is **not part of the default
+deployment and adds no incremental cost** to the numbers above. The default
+deployment does not create this stack at all, so there is **zero** cost and no
+data unless an owner explicitly **provisions and enables** operations. This
+stack is not wired into `deploy-all.sh`; it is deployed and torn down only by
+the dedicated shell wrappers documented in
 [docs/OPERATIONS_E1_DEPLOYMENT.md](docs/OPERATIONS_E1_DEPLOYMENT.md).
 
-Note that *disabling* an already-provisioned stack is **not** the $0 state: an
-emergency `--disable` keeps every resource (and its retained audit data) under
-CloudFormation and flips only the runtime kill switch, so the standing (fixed)
-charges below continue until the stack is torn down. When enabled, E1 deploys the
-accepted synchronous, read-only GameLift observation design
+Note that *disabling* an already-provisioned stack is **not** a zero-cost state:
+an emergency `--disable` keeps every resource (and its retained audit data)
+under CloudFormation and flips only the runtime kill switch, so the standing
+(fixed) charges below continue until the stack is torn down. When enabled, E1
+deploys the accepted synchronous, read-only GameLift observation design
 ([ADR 0005](docs/adr/0005-persist-operations-and-recover-workflows.md)): an
-API Gateway HTTP API route, request-scoped compute (modelled as AWS Lambda,
-x86, 512 MB), an Amazon DynamoDB on-demand table (with PITR) for operation
-state, idempotency, and the append-only ledger, an Amazon S3 bucket for
-content-addressed observation records, and CloudWatch logs, metrics, and
-alarms with X-Ray tracing. There is **no queue, worker, dead-letter queue, or
-Step Functions** in the observation path, and no provider-write permission is
-deployed.
+API Gateway HTTP API with two routes (`POST /operations/observe` and
+`GET /operations/{operationId}`), request-scoped compute (modelled as AWS
+Lambda, x86, 512 MB), an Amazon DynamoDB on-demand table (with PITR) for
+operation state, idempotency, and the append-only ledger, a customer-managed
+AWS KMS key, and CloudWatch logs, metrics, and alarms with X-Ray tracing. The
+observation records are persisted in the same DynamoDB table; **there is no
+Amazon S3 bucket** in the observation path, and there is **no queue, worker,
+dead-letter queue, or Step Functions** and no provider-write permission.
 
 Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**, AWS
-Price List us-west-2 rates; free-tier allowances intentionally excluded):
+Price List us-west-2 rates; free-tier allowances intentionally excluded). The
+fixed column includes the customer-managed KMS key ($1.00/key-month) that
+exists whenever the stack is provisioned, disabled, or torn down with data
+retained:
 
 | Scenario | Provisioned | Fixed | Variable | Total [USD] |
 | --- | --- | --- | --- | --- |
-| Default (unprovisioned) | no | $0.00 | $0.00 | **$0.00** |
-| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
-| Enabled, idle (0 requests) | yes | $1.65 | $0.00 | **$1.65** |
-| Enabled, 100,000 observations | yes | $1.84 | $3.49 | **$5.33** |
+| Default (no stack) | no | $0.00 | $0.00 | **$0.00** |
+| Enabled, 100,000 observations | yes | $2.65 | $2.95 | **$5.60** |
+| Enabled, idle (0 requests) | yes | $2.65 | $0.00 | **$2.65** |
+| Disabled after provision (data retained) | yes | $2.65 | $0.00 | **$2.65** |
+| Torn down (data retained) | n/a | $2.65 | $0.00 | **$2.65** |
 
-> **Default-unprovisioned vs. disabled-after-provision.** The **$0.00** row is
-> the *default, unprovisioned* stack — no resources, no data. A
+> **No-stack vs. disabled vs. torn-down.** The **$0.00** row is the default:
+> this stack is never created unless an owner provisions it, so "unprovisioned"
+> means *no stack exists* rather than a deployed empty stack. A
 > *disabled-but-provisioned* stack (after an emergency `--disable`) keeps its
-> retained DynamoDB table (storage + PITR), KMS key, log groups, and CloudWatch
-> alarms/metrics, so it continues to cost the **fixed** standing charges and to
-> **retain audit data** — the same fixed cost as "enabled, idle". Disabling stops
-> serving requests; it does not stop the standing cost. Only teardown removes the
-> resources. Variable cost scales linearly at ~$0.0000349 per observation
-> request. This documents an optional design; it does not assert the operations
-> stack is deployed.
+> retained DynamoDB table (storage + PITR), the customer-managed KMS key, both
+> log groups, and the CloudWatch alarms/metrics, so it continues to cost the
+> **fixed** standing charges and to **retain audit data** — the same fixed cost
+> as "enabled, idle". Disabling stops serving requests; it does not stop the
+> standing cost. **Teardown does not remove all cost:** it deletes the stack but
+> deliberately **retains** the DynamoDB table, the KMS key, and both log groups
+> under their retain policy, so the fixed charges above continue after teardown
+> until those resources are removed by hand. Variable cost scales linearly with
+> request volume. This documents an optional design; it does not assert the
+> operations stack is deployed.
 
 ## Prerequisites
 

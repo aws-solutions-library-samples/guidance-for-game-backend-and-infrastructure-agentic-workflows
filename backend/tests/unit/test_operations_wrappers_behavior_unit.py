@@ -201,9 +201,36 @@ def test_disable_verifies_target_stack_and_refuses_unprovisioned():
 def test_disable_updates_through_cloudformation_reversibly():
     branch = _disable_branch()
     assert "update-stack" in branch, "disable must update through CloudFormation"
-    assert "--template-body" in branch
+    # The disable must ship the DEPLOYED template, not the local checkout, so an
+    # emergency disable cannot also apply unrelated template drift.
+    assert "--use-previous-template" in branch, "disable must use the deployed template"
+    assert "--template-body" not in branch, "disable must not ship the local template"
     assert "stack-update-complete" in branch, "disable should wait for the update"
     assert "--enable" in branch, "disable messaging must point at the reversible re-enable"
+
+
+def test_disable_params_match_template_parameters():
+    """The disable path must send a value for EXACTLY the template's parameters
+    (nothing dropped, nothing stale), so a parameter added later is not silently
+    reset to its default on an emergency disable."""
+    # Standard library
+    import re
+
+    branch = _disable_branch()
+    disable_keys = set(re.findall(r"ParameterKey=([A-Za-z0-9]+),", branch))
+
+    template_text = (PROJECT_ROOT / "infrastructure/cloudformation/06-operations-observation.yaml").read_text(
+        encoding="utf-8"
+    )
+    # Parameters are the top-level keys under the Parameters: block (2-space
+    # indented names), up to the Conditions: block.
+    params_block = template_text.split("\nParameters:", 1)[1].split("\nConditions:", 1)[0]
+    template_params = set(re.findall(r"^  ([A-Za-z0-9]+):$", params_block, flags=re.MULTILINE))
+
+    assert disable_keys == template_params, (
+        "DISABLE_PARAMS must cover exactly the template parameters; "
+        f"missing={template_params - disable_keys} extra={disable_keys - template_params}"
+    )
 
 
 def test_enable_path_provisions_resources():

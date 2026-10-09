@@ -321,12 +321,13 @@ class ShakedownConfig:
     """Runtime inputs. Tokens are held only in memory and never serialized."""
 
     endpoint: str
-    access_token: str
-    fleet_id: str
-    alt_fleet_id: str
-    id_token: Optional[str] = None
+    access_token: str = field(repr=False)
+    fleet_id: str = ""
+    alt_fleet_id: str = ""
+    id_token: Optional[str] = field(default=None, repr=False)
     profile: Optional[str] = None
     region: Optional[str] = None
+    expect_disabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.endpoint or not self.endpoint.lower().startswith("https://"):
@@ -427,7 +428,7 @@ def response_is_bounded_and_clean(response: HttpResponse) -> tuple[bool, str]:
 
 
 class ShakedownRunner:
-    """Drives the nine deployed-boundary checks over an injected transport."""
+    """Drives the deployed-boundary checks over an injected transport."""
 
     def __init__(self, config: ShakedownConfig, transport: Transport) -> None:
         self._config = config
@@ -485,6 +486,21 @@ class ShakedownRunner:
             name="unauthenticated_post_denied_at_gateway",
             passed=denied and ok,
             detail="gateway denied unauthenticated POST" if denied else f"expected 401/403; {reason}",
+            observed_status=response.status,
+            response_size=response.size,
+        )
+
+    def check_unauthenticated_status_denied(self) -> CheckResult:
+        # The JWT authorizer must guard BOTH routes: an unauthenticated status
+        # GET is rejected at the gateway (401/403) exactly like the POST, so the
+        # live evidence shows the authorizer on the status route too.
+        response = self._get_status(_valid_unknown_operation_id(), bearer=None)
+        ok, reason = response_is_bounded_and_clean(response)
+        denied = response.status in (401, 403)
+        return CheckResult(
+            name="unauthenticated_status_denied_at_gateway",
+            passed=denied,
+            detail="gateway denied unauthenticated GET" if denied else f"expected 401/403; {reason}",
             observed_status=response.status,
             response_size=response.size,
         )
@@ -650,6 +666,32 @@ class ShakedownRunner:
             response_size=response.size,
         )
 
+    def check_disabled_does_not_serve_observations(self) -> CheckResult:
+        # When the control plane is disabled (OperationsMode=disabled, the stage
+        # throttled to zero), an authenticated observe POST must NOT succeed: the
+        # request is refused rather than performing a provider read. We accept any
+        # non-2xx status (a gateway throttle/5xx or a handler fail-closed error),
+        # and never a 200 observation. The body must stay bounded and leak-free.
+        body = self._observe_body(self._config.fleet_id, _new_idempotency_token())
+        response = self._post_observe(body=body, bearer=self._config.access_token)
+        ok, reason = response_is_bounded_and_clean(response)
+        # A disabled stage commonly returns a non-JSON gateway body; only require
+        # the clean/bounded contract when the body is JSON.
+        clean = ok or "application/json" not in response.content_type.lower()
+        refused = response.status >= 400
+        return CheckResult(
+            name="disabled_control_plane_refuses_observe",
+            passed=refused and clean,
+            detail=(
+                "disabled control plane refused the authenticated observe"
+                if refused
+                else f"expected a non-2xx refusal while disabled; got {response.status} ({reason})"
+            ),
+            observed_status=response.status,
+            observed_error_code=self._error_code(response),
+            response_size=response.size,
+        )
+
     def run(self) -> ShakedownReport:
         report = ShakedownReport(
             endpoint_ref=_short_ref("endpoint", self._config.endpoint),
@@ -658,7 +700,16 @@ class ShakedownRunner:
             started_at=_dt.datetime.now(_dt.timezone.utc).isoformat(),
         )
 
+        # Both routes stay behind the JWT authorizer regardless of mode.
         report.checks.append(self.check_unauthenticated_denied())
+        report.checks.append(self.check_unauthenticated_status_denied())
+
+        if self._config.expect_disabled:
+            # Disabled-mode shakedown: the authorizer still guards both routes
+            # (asserted above), but an authenticated observe must be refused.
+            report.checks.append(self.check_disabled_does_not_serve_observations())
+            return report
+
         report.checks.append(self.check_identity_injection_denied())
 
         token = _new_idempotency_token()
@@ -780,6 +831,7 @@ def build_config_from_env(args: argparse.Namespace) -> ShakedownConfig:
         id_token=id_token,
         profile=profile,
         region=region,
+        expect_disabled=bool(getattr(args, "expect_disabled", False)),
     )
 
 
@@ -811,6 +863,15 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--skip-postcheck",
         action="store_true",
         help="Skip the optional read-only CloudWatch metric-presence postcheck",
+    )
+    parser.add_argument(
+        "--expect-disabled",
+        action="store_true",
+        help=(
+            "Shakedown a DISABLED control plane: assert the JWT authorizer still "
+            "guards both routes and an authenticated observe is refused (never a "
+            "200 observation)."
+        ),
     )
     return parser.parse_args(list(argv))
 

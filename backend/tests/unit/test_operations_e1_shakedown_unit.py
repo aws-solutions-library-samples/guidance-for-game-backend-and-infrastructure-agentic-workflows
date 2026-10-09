@@ -115,12 +115,24 @@ class FakeE1App:
                 if method == "POST" and path == "/operations/observe":
                     return self._observe(body)
                 return self._error("", 401)[0], b'{"message":"Unauthorized"}'
+            if self.behavior == "allows_unauthenticated_status":
+                # broken: the status route is served without a bearer, so the
+                # authorizer is missing on the GET route specifically.
+                if method == "GET" and path.startswith("/operations/"):
+                    return self._status(path.rsplit("/", 1)[-1])
+                return self._error("", 401)[0], b'{"message":"Unauthorized"}'
             return self._error("", 401)[0], b'{"message":"Unauthorized"}'
         # An id token is rejected. Compliant deployments deny at the gateway
         # (audience mismatch) OR at the handler (token_use != access). We model
         # the handler denial path here.
         if bearer == ID_TOKEN and self.behavior != "id_token_allowed":
             return self._error("IDENTITY_CONTEXT_INVALID", 401)
+
+        if self.behavior == "disabled" and method == "POST" and path == "/operations/observe":
+            # A disabled control plane refuses an authenticated observe (the
+            # stage is throttled to zero / the handler fails closed). It never
+            # performs a provider read or returns a 200 observation.
+            return self._error("PROVIDER_UNAVAILABLE", 503)
 
         if method == "POST" and path == "/operations/observe":
             return self._observe(body)
@@ -351,7 +363,7 @@ def _in_process_transport(app: "FakeE1App"):
     return _do
 
 
-def _run_in_process(behavior: str, *, id_token: Optional[str] = None):
+def _run_in_process(behavior: str, *, id_token: Optional[str] = None, expect_disabled: bool = False):
     app = FakeE1App(behavior=behavior)
     # A syntactically valid https endpoint; the in-process transport only needs
     # the path, and ShakedownConfig requires https.
@@ -361,6 +373,7 @@ def _run_in_process(behavior: str, *, id_token: Optional[str] = None):
         fleet_id=FLEET_ID,
         alt_fleet_id=ALT_FLEET_ID,
         id_token=id_token,
+        expect_disabled=expect_disabled,
     )
     runner = ShakedownRunner(config, _in_process_transport(app))
     with _deterministic_tokens():
@@ -464,6 +477,69 @@ def test_success_returns_error_fails_the_success_check_and_dependents():
     assert success.passed is False
     assert success.observed_status == 500  # the response WAS bounded + JSON, but not a typed success
     assert report.accepted is False
+
+
+# --------------------------------------------------------------------------- #
+# Unauthenticated status GET: the authorizer must guard BOTH routes.
+# --------------------------------------------------------------------------- #
+
+
+def test_compliant_deployment_denies_unauthenticated_status_get():
+    report = _run_in_process("compliant", id_token=ID_TOKEN)
+    assert _check(report, "unauthenticated_status_denied_at_gateway").passed is True
+
+
+def test_unauthenticated_status_served_fails_the_status_authorizer_check():
+    # A deployment that serves the status GET without a bearer must fail the new
+    # status-authorizer check (and nothing cross-wires it to the POST check).
+    report = _run_in_process("allows_unauthenticated_status", id_token=ID_TOKEN)
+    assert _check(report, "unauthenticated_status_denied_at_gateway").passed is False
+    assert _check(report, "unauthenticated_post_denied_at_gateway").passed is True
+    assert report.accepted is False
+
+
+# --------------------------------------------------------------------------- #
+# --expect-disabled mode: a disabled control plane refuses observe.
+# --------------------------------------------------------------------------- #
+
+
+def test_expect_disabled_passes_against_a_disabled_control_plane():
+    report = _run_in_process("disabled", id_token=ID_TOKEN, expect_disabled=True)
+    # Only the authorizer checks and the disabled-refusal check run.
+    names = {c.name for c in report.checks}
+    assert names == {
+        "unauthenticated_post_denied_at_gateway",
+        "unauthenticated_status_denied_at_gateway",
+        "disabled_control_plane_refuses_observe",
+    }
+    assert _check(report, "disabled_control_plane_refuses_observe").passed is True
+    assert report.accepted is True
+
+
+def test_expect_disabled_fails_when_the_plane_still_serves_observations():
+    # A control plane that still serves a 200 observation while --expect-disabled
+    # is set must fail the disabled check.
+    report = _run_in_process("compliant", id_token=ID_TOKEN, expect_disabled=True)
+    assert _check(report, "disabled_control_plane_refuses_observe").passed is False
+    assert report.accepted is False
+
+
+# --------------------------------------------------------------------------- #
+# Token hygiene: bearer tokens never appear in the config repr.
+# --------------------------------------------------------------------------- #
+
+
+def test_config_repr_does_not_expose_tokens():
+    config = ShakedownConfig(
+        endpoint="https://in-process.example.com",
+        access_token="super-secret-access-token-value",
+        fleet_id=FLEET_ID,
+        alt_fleet_id=ALT_FLEET_ID,
+        id_token="super-secret-id-token-value",
+    )
+    rendered = repr(config)
+    assert "super-secret-access-token-value" not in rendered
+    assert "super-secret-id-token-value" not in rendered
 
 
 # --------------------------------------------------------------------------- #
