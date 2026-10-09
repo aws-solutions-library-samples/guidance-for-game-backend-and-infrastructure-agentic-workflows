@@ -57,9 +57,14 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
   shared settings may change;
 - read existing state first and preserve it: Transaction Search is enabled
   additively (never a disable/re-enable toggle), an already-enabled
-  `CloudWatchLogs` destination is left unchanged, and the shared Logs resource
-  policy uses the project-owned name `GameAgentTransactionSearchXRayAccess` so it
-  never overwrites an unrelated policy.
+  `CloudWatchLogs` destination is left unchanged, and an unreadable destination
+  makes the opt-in refuse to change it and fail rather than guess. The
+  account-wide default indexing (sampling) rule is left unchanged unless
+  `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` is set, in which case the prior value is
+  printed as a rollback. The shared Logs resource policy uses the project-owned
+  name `GameAgentTransactionSearchXRayAccess`; existing policies are listed first,
+  so an existing grant (including a legacy `TransactionSearchXRayAccess`) is
+  reused instead of duplicated, and the account's 10-policy limit is respected.
 
 ## Runtime trace delivery is verified
 
@@ -70,8 +75,10 @@ delivery. Each mutation distinguishes a genuine already-exists conflict
 errors. Retryable errors are retried with a small bounded backoff; a real error
 fails the deployment with a bounded, public-safe diagnostic that names only the
 operation. The deployment then queries the delivery with
-`aws logs describe-deliveries` and fails unless the intended source and
-destination are active.
+`aws logs describe-deliveries` (retrying a transient read) and fails unless a
+delivery with destination type `XRAY` binds the intended source — whose resources
+include the runtime ARN — to the intended destination. The destination ARN is
+resolved from the API rather than fabricated.
 
 
 ## Ownership and upstream tracking
@@ -197,14 +204,19 @@ revert that focused change; AgentCore-managed baseline observability continues t
 operate while the upstream timing behavior is tracked.
 
 Account-wide changes are made only under the
-`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in, and the opt-in path prints a
-rollback command for each shared setting it changes (the prior trace destination
-and the indexing rule). To remove the project-owned resource policy:
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in. The opt-in path prints a
+rollback command for the trace destination when it enables Transaction Search,
+and for the default indexing rule only when `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
+is set to explicitly change it (printing the prior percentage). To remove the
+project-owned resource policy:
 
 ```bash
 aws logs delete-resource-policy \
   --policy-name GameAgentTransactionSearchXRayAccess --region <region>
 ```
+
+A legacy `TransactionSearchXRayAccess` resource policy from earlier deploys is
+left in place. Delete it only once no other workload relies on it.
 
 Teardown intentionally preserves account-wide observability resources because
 they may be shared with other applications.
