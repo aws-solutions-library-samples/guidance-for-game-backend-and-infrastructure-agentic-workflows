@@ -386,6 +386,12 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
 | `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` | No | false | Opt in to account-wide X-Ray / CloudWatch Logs changes (trace destination, indexing rule, shared Logs resource policy). See [Account-wide Observability](#account-wide-observability-scoped-and-opt-in) |
+| `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` | No | unset | Opt-in only: X-Ray default indexing (sampling) percent, integer [0, 100]. Left unchanged when unset |
+| `GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME` | No | `GameAgentTransactionSearchXRayAccess` | Opt-in only: project-owned CloudWatch Logs resource policy name |
+| `GBAW_OBSERVABILITY_ACTIVE_MAX_ATTEMPTS` | No | 30 | Opt-in only: max polls for the trace destination to reach ACTIVE |
+| `GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS` | No | 10 | Opt-in only: delay between ACTIVE polls, in seconds |
+| `GBAW_DELIVERY_MAX_ATTEMPTS` | No | 4 (capped at 20) | Runtime trace-delivery retry attempts |
+| `GBAW_DELIVERY_RETRY_SECONDS` | No | 5 (capped at 60) | Delay between trace-delivery retries, in seconds |
 
 ## Security Notes
 

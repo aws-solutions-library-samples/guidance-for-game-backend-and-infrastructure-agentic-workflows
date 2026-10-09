@@ -43,8 +43,12 @@ OBS_LEGACY_POLICY_NAME="TransactionSearchXRayAccess"
 GBAW_XRAY_DEFAULT_INDEXING_PERCENT="${GBAW_XRAY_DEFAULT_INDEXING_PERCENT:-}"
 
 # Bounded poll for the trace destination to reach ACTIVE after an enable.
+# Non-numeric or empty values fall back to the defaults so the opt-in never
+# aborts mid-run on a bad knob (the destination may already have switched).
 OBS_ACTIVE_MAX_ATTEMPTS="${GBAW_OBSERVABILITY_ACTIVE_MAX_ATTEMPTS:-30}"
 OBS_ACTIVE_RETRY_SECONDS="${GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS:-10}"
+[[ "$OBS_ACTIVE_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || OBS_ACTIVE_MAX_ATTEMPTS=30
+[[ "$OBS_ACTIVE_RETRY_SECONDS" =~ ^[0-9]+$ ]] || OBS_ACTIVE_RETRY_SECONDS=10
 
 # --- Read-only state readers (safe in every mode) ---
 
@@ -140,13 +144,13 @@ report_without_mutation() {
 run_obs_mutation() {
   local label="$1"
   shift
-  local output code
-  if output="$(aws "$@" 2>&1)"; then
+  local output code=0
+  output="$(aws "$@" 2>&1)" || code=$?
+  if [ "$code" -eq 0 ]; then
     return 0
   fi
-  code=$?
   local error_code="unknown"
-  if [[ "$output" =~ \(([A-Za-z]+)\) ]]; then
+  if [[ "$output" =~ \(([A-Za-z0-9]+)\) ]]; then
     error_code="${BASH_REMATCH[1]}"
   fi
   echo "❌ ${label} failed (${error_code})" >&2
@@ -169,15 +173,17 @@ get_default_indexing_percent() {
 }
 
 # Return 0 if a resource policy already grants xray.amazonaws.com
-# logs:PutLogEvents on an 'aws/spans' log group. Prints the matching policy name
-# on stdout. Reads account state only.
+# logs:PutLogEvents on an 'aws/spans' log group with Effect Allow. Prints
+# COUNT (number of policies), MATCH (name of a matching policy, if any), and
+# OWNED (1 if a policy already uses the project-owned name). Reads account
+# state only.
 find_existing_spans_policy() {
   local policies_json
   if ! policies_json="$(aws logs describe-resource-policies \
     --region "$AWS_REGION" --output json 2>/dev/null)"; then
     return 2
   fi
-  POLICIES_JSON="$policies_json" python3 -c '
+  OWNED_POLICY_NAME="$OBS_RESOURCE_POLICY_NAME" POLICIES_JSON="$policies_json" python3 -c '
 import json
 import os
 import sys
@@ -187,14 +193,18 @@ try:
 except (ValueError, KeyError):
     sys.exit(2)
 
+owned_name = os.environ.get("OWNED_POLICY_NAME", "")
 policies = payload.get("resourcePolicies", []) if isinstance(payload, dict) else []
 match = None
+owned = False
 count = 0
 for policy in policies:
     if not isinstance(policy, dict):
         continue
     count += 1
     name = policy.get("policyName", "")
+    if name == owned_name:
+        owned = True
     document = policy.get("policyDocument", "")
     try:
         doc = json.loads(document) if isinstance(document, str) else document
@@ -205,6 +215,8 @@ for policy in policies:
         statements = [statements]
     for statement in statements:
         if not isinstance(statement, dict):
+            continue
+        if statement.get("Effect") != "Allow":
             continue
         principal = statement.get("Principal", {})
         service = principal.get("Service") if isinstance(principal, dict) else None
@@ -224,6 +236,7 @@ for policy in policies:
         break
 
 print(f"COUNT={count}")
+print(f"OWNED={1 if owned else 0}")
 if match:
     print(f"MATCH={match}")
 '
@@ -231,21 +244,10 @@ if match:
 
 configure_resource_policy() {
   local account_id="$1"
-  local scan existing_match policy_count
+  local existing_match="$2"
+  local policy_count="$3"
+  local owned="$4"
   echo "  📝 Ensuring project-owned CloudWatch Logs resource policy (${OBS_RESOURCE_POLICY_NAME})..."
-
-  # List existing policies first so we never add a duplicate grant and never
-  # exceed the account's 10-policy limit silently.
-  existing_match=""
-  policy_count=0
-  if scan="$(find_existing_spans_policy)"; then
-    policy_count="$(printf '%s\n' "$scan" | sed -n 's/^COUNT=//p')"
-    existing_match="$(printf '%s\n' "$scan" | sed -n 's/^MATCH=//p')"
-  else
-    echo "❌ Unable to read existing CloudWatch Logs resource policies" >&2
-    return 1
-  fi
-  : "${policy_count:=0}"
 
   if [ -n "$existing_match" ] && [ "$existing_match" != "$OBS_RESOURCE_POLICY_NAME" ]; then
     echo "  ✅ A resource policy ('${existing_match}') already grants xray.amazonaws.com"
@@ -254,7 +256,9 @@ configure_resource_policy() {
     return 0
   fi
 
-  if [ -z "$existing_match" ] && [ "$policy_count" -ge 10 ]; then
+  # The 10-policy limit only matters when we would ADD a policy. Updating a
+  # policy that already uses the project-owned name is an upsert, not an add.
+  if [ -z "$existing_match" ] && [ "$owned" != "1" ] && [ "$policy_count" -ge 10 ]; then
     echo "❌ The account already has the maximum of 10 CloudWatch Logs resource policies" >&2
     echo "   in this region; cannot create '${OBS_RESOURCE_POLICY_NAME}'. Remove an unused" >&2
     echo "   policy (for example a legacy '${OBS_LEGACY_POLICY_NAME}') and re-run." >&2
@@ -309,13 +313,7 @@ wait_for_destination_active() {
 }
 
 configure_indexing_rule() {
-  local current
-  current="$(get_default_indexing_percent)"
-
-  if [ "$current" = "UNREADABLE" ]; then
-    echo "❌ Unable to read the current X-Ray default indexing rule; not changing it" >&2
-    return 1
-  fi
+  local current="$1"
 
   if [ -z "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" ]; then
     echo "  ✅ X-Ray default indexing rule left unchanged (current: ${current}% sampling)."
@@ -323,13 +321,11 @@ configure_indexing_rule() {
     return 0
   fi
 
-  if ! [[ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" =~ ^[0-9]+$ ]] \
-    || [ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" -gt 100 ]; then
-    echo "❌ GBAW_XRAY_DEFAULT_INDEXING_PERCENT='${GBAW_XRAY_DEFAULT_INDEXING_PERCENT}' must be an integer in [0, 100]" >&2
-    return 1
-  fi
-
-  if [ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" = "$current" ]; then
+  # Compare as numbers: the CLI reports an integer rule as e.g. '1.0', so a
+  # string compare of '1' against '1.0' would wrongly send an identical update.
+  if [ "$current" != "UNREADABLE" ] \
+    && awk -v a="$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" -v b="$current" \
+      'BEGIN { exit !(a + 0 == b + 0) }'; then
     echo "  ✅ X-Ray default indexing rule already ${current}% — left unchanged"
     return 0
   fi
@@ -349,7 +345,8 @@ configure_indexing_rule() {
 configure_account_observability() {
   local account_id
   local destination
-  account_id="$(aws sts get-caller-identity --query Account --output text)"
+  local indexing_current
+  local scan existing_match policy_count owned
 
   echo "  ⚠️  Account-wide observability opt-in is ENABLED."
   echo "      The following SHARED, account-wide settings may be created or changed:"
@@ -357,12 +354,71 @@ configure_account_observability() {
   echo "      These affect every X-Ray / Transaction Search consumer in the account."
   echo ""
 
+  # ── Read and validate everything BEFORE the first write, so a refusal or a
+  #    bad input never leaves a shared setting half-changed. ──
+
+  # Account id via the bounded helper so a failure prints a public-safe label.
+  if ! account_id="$(run_obs_mutation "identity lookup" \
+    sts get-caller-identity --query Account --output text --region "$AWS_REGION")"; then
+    return 1
+  fi
+
   destination="$(get_trace_destination)"
   echo "  🔎 Current X-Ray trace segment destination (preserved unless changed below): ${destination}"
 
+  if [ "$destination" = "UNREADABLE" ]; then
+    echo "❌ Cannot read the current trace destination; not changing it" >&2
+    return 1
+  fi
+
+  # Validate the requested indexing percentage before any write.
+  if [ -n "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" ]; then
+    if ! [[ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" =~ ^[0-9]+$ ]] \
+      || [ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" -gt 100 ]; then
+      echo "❌ GBAW_XRAY_DEFAULT_INDEXING_PERCENT='${GBAW_XRAY_DEFAULT_INDEXING_PERCENT}' must be an integer in [0, 100]" >&2
+      return 1
+    fi
+  fi
+
+  # Read the indexing rule. It is only a hard requirement when a change is
+  # requested; a read failure with no change requested is non-fatal.
+  indexing_current="$(get_default_indexing_percent)"
+  if [ -n "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" ] && [ "$indexing_current" = "UNREADABLE" ]; then
+    echo "❌ Unable to read the current X-Ray default indexing rule; not changing it" >&2
+    return 1
+  fi
+
+  # Read the resource-policy list and decide the action before writing.
+  existing_match=""
+  policy_count=0
+  owned=0
+  if scan="$(find_existing_spans_policy)"; then
+    policy_count="$(printf '%s\n' "$scan" | sed -n 's/^COUNT=//p')"
+    owned="$(printf '%s\n' "$scan" | sed -n 's/^OWNED=//p')"
+    existing_match="$(printf '%s\n' "$scan" | sed -n 's/^MATCH=//p')"
+  else
+    echo "❌ Unable to read existing CloudWatch Logs resource policies" >&2
+    return 1
+  fi
+  : "${policy_count:=0}"
+  : "${owned:=0}"
+
+  # Fail the 10-policy limit before any mutation, so a refusal has no side effect.
+  if [ -z "$existing_match" ] && [ "$owned" != "1" ] && [ "$policy_count" -ge 10 ]; then
+    echo "❌ The account already has the maximum of 10 CloudWatch Logs resource policies" >&2
+    echo "   in this region; cannot create '${OBS_RESOURCE_POLICY_NAME}'. Remove an unused" >&2
+    echo "   policy (for example a legacy '${OBS_LEGACY_POLICY_NAME}') and re-run." >&2
+    return 1
+  fi
+
+  # ── All reads and validation passed; perform the writes in order. Any failed
+  #    write stops the run with a bounded, public-safe diagnostic. ──
+
   # Resource policy uses a project-owned name and is reconciled against existing
   # policies so it never overwrites an unrelated policy or adds a duplicate.
-  configure_resource_policy "$account_id"
+  if ! configure_resource_policy "$account_id" "$existing_match" "$policy_count" "$owned"; then
+    return 1
+  fi
 
   # Enable Transaction Search only if it is not already enabled. This is an
   # ADDITIVE enable, never a disable/re-enable toggle of a shared setting.
@@ -379,17 +435,15 @@ configure_account_observability() {
     fi
     echo "  ✅ X-Ray trace destination set to CloudWatchLogs"
     wait_for_destination_active
-  elif [ "$destination" = "UNREADABLE" ]; then
-    echo "❌ Cannot read the current trace destination; not changing it" >&2
-    return 1
   else
     echo "  ⚠️  Unexpected trace destination '${destination}'; leaving it unchanged."
     echo "     Enable Transaction Search in the console if the runtime needs it."
   fi
 
-  # The X-Ray default indexing rule is account-wide; read and preserve it, and
-  # change it only when an explicit percentage is set.
-  if ! configure_indexing_rule; then
+  # The X-Ray default indexing rule is account-wide; the current value was read
+  # above and is passed in, so it is changed only when an explicit percentage
+  # differs from the current one.
+  if ! configure_indexing_rule "$indexing_current"; then
     return 1
   fi
 

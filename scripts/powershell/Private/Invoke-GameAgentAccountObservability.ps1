@@ -31,8 +31,26 @@ function Invoke-GameAgentAccountObservability {
         # Optional explicit X-Ray default indexing percentage. The default rule is
         # account-wide, so it is left unchanged unless this is set to [0, 100].
         [string]$DefaultIndexingPercent = $env:GBAW_XRAY_DEFAULT_INDEXING_PERCENT,
-        [int]$ActiveMaxAttempts = 30,
-        [int]$ActiveRetrySeconds = 10
+        # Bounded poll for the trace destination to reach ACTIVE after an enable.
+        # Sourced from the same GBAW_OBSERVABILITY_ACTIVE_* environment variables
+        # the shell path reads; a non-numeric or out-of-range value falls back to
+        # the default so a bad knob never aborts the opt-in mid-run.
+        [int]$ActiveMaxAttempts = $(
+            $parsed = 0
+            if ([int]::TryParse($env:GBAW_OBSERVABILITY_ACTIVE_MAX_ATTEMPTS, [ref]$parsed) -and $parsed -ge 1) {
+                $parsed
+            } else {
+                30
+            }
+        ),
+        [int]$ActiveRetrySeconds = $(
+            $parsed = 0
+            if ([int]::TryParse($env:GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS, [ref]$parsed) -and $parsed -ge 0) {
+                $parsed
+            } else {
+                10
+            }
+        )
     )
 
     $legacyPolicyName = 'TransactionSearchXRayAccess'
@@ -89,7 +107,7 @@ function Invoke-GameAgentAccountObservability {
         $output = (& aws @Arguments @ProfileArgs 2>&1)
         if ($LASTEXITCODE -ne 0) {
             $code = 'unknown'
-            if ("$output" -match '\(([A-Za-z]+)\)') { $code = $Matches[1] }
+            if ("$output" -match '\(([A-Za-z0-9]+)\)') { $code = $Matches[1] }
             throw "$Label failed ($code)"
         }
         return $output

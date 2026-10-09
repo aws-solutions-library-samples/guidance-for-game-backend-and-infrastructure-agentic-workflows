@@ -97,6 +97,14 @@ def test_classify_delivery_error_ignores_500_in_free_text():
     assert result.stdout.strip() == "fatal"
 
 
+@pytest.mark.parametrize("code", ["500", "502", "503", "504"])
+def test_classify_delivery_error_numeric_http_codes_are_retryable(code):
+    """A modeled numeric HTTP status in the '(<code>)' form is retryable, not fatal."""
+    text = f"An error occurred ({code}) when calling CreateDelivery: service error"
+    result = _delivery_harness("", f'classify_delivery_error "{text}"')
+    assert result.stdout.strip() == "retryable"
+
+
 # ---------------------------------------------------------------------------
 # run_delivery_mutation (0 success | 1 fatal/exhausted | 2 conflict)
 # ---------------------------------------------------------------------------
@@ -405,6 +413,7 @@ def _account_obs_harness(
     configure: str,
     aws_mock: str,
     extra_env: str = "",
+    shell: str = "bash",
 ) -> "subprocess.CompletedProcess[str]":
     command = "\n".join(
         (
@@ -421,7 +430,12 @@ def _account_obs_harness(
             'echo "MUTATIONS:"; cat "$MUTATION_LOG"; rm -f "$MUTATION_LOG"',
         )
     )
-    return subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+# Shells the opt-in path is validated against: the login shell `bash` and the
+# macOS system `/bin/bash` (3.2), so a bash-4+ construct cannot regress 3.2.
+_OBS_SHELLS = ("bash", "/bin/bash")
 
 
 def _obs_mock(
@@ -431,8 +445,23 @@ def _obs_mock(
     indexing_percent: str = "5",
     policies_json: str = '{"resourcePolicies":[]}',
     status: str = "ACTIVE",
+    fail_operation: str = "",
+    fail_code: str = "AccessDeniedException",
 ) -> str:
     spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    # When fail_operation names a mutating "$1 $2" pair (e.g.
+    # "logs put-resource-policy"), the mock returns that AWS error on stderr
+    # with a non-zero exit, as the real CLI does, so the helper's exit-status
+    # handling is exercised rather than mocked away.
+    fail_block = ""
+    if fail_operation:
+        fail_block = (
+            f'  if [ "$1 $2" = "{fail_operation}" ]; then\n'
+            f'    echo "MUTATION: $1 $2 ${{3:-}}" >> "$MUTATION_LOG"\n'
+            f'    echo "An error occurred ({fail_code}) when calling the operation" >&2\n'
+            "    return 254\n"
+            "  fi\n"
+        )
     return (
         "aws() {\n"
         '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
@@ -446,6 +475,7 @@ def _obs_mock(
         f'echo "{indexing_percent}"; return 0; fi\n'
         f'  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{spans_json}\'; return 0; fi\n'
         f'  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{policies_json}\'; return 0; fi\n'
+        f"{fail_block}"
         '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"; return 0\n'
         "}"
     )
@@ -559,3 +589,55 @@ def test_account_obs_optin_fails_when_policy_limit_reached():
     assert "rc=1" in result.stdout
     assert "maximum of 10" in result.stderr
     assert "MUTATION: logs put-resource-policy" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Account-wide observability opt-in: a failed shared mutation must fail the run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_fails_when_resource_policy_mutation_fails(shell):
+    """A failed put-resource-policy must fail the opt-in, not report success.
+
+    The resource policy is a shared, account-wide grant. If the write fails, the
+    deployment must surface a bounded failure and stop, never print the
+    'configured' success banner.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(
+            destination="XRay",
+            spans=True,
+            fail_operation="logs put-resource-policy",
+            fail_code="LimitExceededException",
+        ),
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "resource policy failed (LimitExceededException)" in result.stderr
+    assert "Account-wide observability configured" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_fails_when_destination_mutation_fails(shell):
+    """A failed update-trace-segment-destination must fail the opt-in.
+
+    Enabling Transaction Search is a shared, account-wide change. A failed write
+    must stop with a bounded diagnostic rather than falling through to the
+    success banner, which would report Transaction Search as enabled when it is
+    not.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(
+            destination="XRay",
+            spans=True,
+            fail_operation="xray update-trace-segment-destination",
+            fail_code="AccessDeniedException",
+        ),
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "trace destination failed (AccessDeniedException)" in result.stderr
+    assert "Account-wide observability configured" not in result.stdout

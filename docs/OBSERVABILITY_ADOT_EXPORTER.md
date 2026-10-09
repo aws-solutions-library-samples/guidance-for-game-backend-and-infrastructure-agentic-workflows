@@ -65,6 +65,10 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
   name `GameAgentTransactionSearchXRayAccess`; existing policies are listed first,
   so an existing grant (including a legacy `TransactionSearchXRayAccess`) is
   reused instead of duplicated, and the account's 10-policy limit is respected.
+  All reads and input validation happen before the first write, and both shells
+  check the AWS CLI exit status on every shared mutation: a failed write stops
+  the opt-in with a bounded, public-safe diagnostic (operation name and error
+  code only) rather than reporting success.
 
 ## Runtime trace delivery is verified
 

@@ -45,17 +45,18 @@ function Deploy-GameAgent {
     }
 
     # Resolve the delivery retry knobs from the environment with the same bounds
-    # the shell path enforces (attempts 1-20, delay 0-60). Invalid or missing
-    # values fall back to the function defaults.
+    # the shell path enforces (attempts 1-20, delay 0-60). An out-of-range value
+    # is clamped to the cap, matching the shell; a non-numeric or missing value
+    # falls back to the function default.
     $deliveryRetryArgs = @{}
     $parsedAttempts = 0
-    if ([int]::TryParse($env:GBAW_DELIVERY_MAX_ATTEMPTS, [ref]$parsedAttempts) -and
-        $parsedAttempts -ge 1 -and $parsedAttempts -le 20) {
+    if ([int]::TryParse($env:GBAW_DELIVERY_MAX_ATTEMPTS, [ref]$parsedAttempts) -and $parsedAttempts -ge 1) {
+        if ($parsedAttempts -gt 20) { $parsedAttempts = 20 }
         $deliveryRetryArgs['MaxAttempts'] = $parsedAttempts
     }
     $parsedDelay = 0
-    if ([int]::TryParse($env:GBAW_DELIVERY_RETRY_SECONDS, [ref]$parsedDelay) -and
-        $parsedDelay -ge 0 -and $parsedDelay -le 60) {
+    if ([int]::TryParse($env:GBAW_DELIVERY_RETRY_SECONDS, [ref]$parsedDelay) -and $parsedDelay -ge 0) {
+        if ($parsedDelay -gt 60) { $parsedDelay = 60 }
         $deliveryRetryArgs['RetrySeconds'] = $parsedDelay
     }
 
