@@ -212,13 +212,15 @@ The deployment script provisions the following resources:
 1. Base infrastructure (Cognito user pool, IAM roles, ECR repositories)
 2. Bedrock Guardrails (content filtering, PII protection)
 3. Managed prompts (Bedrock Prompt Management)
-4. Account-level observability configuration
+4. Account-level observability configuration (scoped; account-wide X-Ray / CloudWatch Logs changes are opt-in via `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true`)
 5. AgentCore Runtime (backend container via CodeBuild)
 6. Bedrock Knowledge Bases (GameLift, EKS, Cost documentation)
 7. Frontend infrastructure (ECS Express + ALB)
 8. Security infrastructure (WAF, CloudTrail, Inspector)
 
 See [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) for detailed step-by-step deployment instructions and environment variable reference.
+
+By default the deployment makes no account-wide X-Ray or CloudWatch Logs changes; it detects whether the account already supports Transaction Search and prints the opt-in instruction if not. Set `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell: `Deploy-GameAgent -ConfigureAccountObservability`) to let it configure those shared settings. See [Account-wide Observability](docs/DEPLOYMENT_GUIDE.md#account-wide-observability-scoped-and-opt-in).
 
 ## Local Development
 

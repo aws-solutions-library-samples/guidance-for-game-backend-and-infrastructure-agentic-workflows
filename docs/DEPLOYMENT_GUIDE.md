@@ -174,6 +174,63 @@ Log in with the admin credentials you created.
 
 ADOT runtime telemetry is auto-configured by AgentCore. For a known cold-start exporter credential limitation (transient `403` on telemetry export) and the read-only detection check, see [`OBSERVABILITY_ADOT_EXPORTER.md`](OBSERVABILITY_ADOT_EXPORTER.md).
 
+### Account-wide Observability (Scoped and Opt-in)
+
+X-Ray Transaction Search relies on account-wide, cross-application settings: the
+X-Ray trace segment destination, the default X-Ray indexing (sampling) rule, and
+a shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log
+group. Changing these affects every X-Ray and Transaction Search consumer in the
+account.
+
+**Scope.** By default the deployment makes **no** account-wide X-Ray or
+CloudWatch Logs changes. It reads the current trace destination, detects whether
+the account already supports what the runtime needs, and — if it does not —
+prints an actionable warning with the opt-in instruction. A default deployment is
+**not** failed for a missing account configuration; the per-runtime trace
+delivery is still created and verified.
+
+**Opt-in.** To let the deployment configure the shared settings, set the
+purpose-named opt-in:
+
+```bash
+GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh
+```
+
+PowerShell uses the matching switch:
+
+```powershell
+Deploy-GameAgent -ConfigureAccountObservability
+```
+
+Before applying anything, the opt-in path prints exactly which shared settings
+may change.
+
+**Ownership and preservation.** The deployment reads existing state first and
+preserves it. It enables Transaction Search only additively (it never performs a
+disable/re-enable toggle of the shared destination) and leaves an already-enabled
+`CloudWatchLogs` destination unchanged. The shared Logs resource policy uses a
+project-owned name (`GameAgentTransactionSearchXRayAccess`) so it never overwrites
+an unrelated policy.
+
+**Validation.** The per-runtime trace delivery step (delivery source →
+destination → delivery) distinguishes a genuine already-exists conflict from
+authorization, validation, throttling, and service errors. Retryable errors are
+retried with a small bounded backoff; a real error fails the deployment with a
+bounded diagnostic. The deployment then queries the delivery and fails unless the
+intended source and destination are active.
+
+**Rollback.** Account-wide changes are only made under the opt-in and the opt-in
+path prints a rollback command for each shared setting it changes (trace
+destination and indexing rule). To remove the project-owned resource policy:
+
+```bash
+aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAccess --region <region>
+```
+
+Teardown intentionally preserves account-wide observability resources because
+they may be shared with other applications.
+
+
 ## Post-Deployment Configuration
 
 ### Enroll EKS Clusters (Optional)
@@ -303,6 +360,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
+| `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` | No | false | Opt in to account-wide X-Ray / CloudWatch Logs changes (trace destination, indexing rule, shared Logs resource policy). See [Account-wide Observability](#account-wide-observability-scoped-and-opt-in) |
 
 ## Security Notes
 

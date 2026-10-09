@@ -35,8 +35,44 @@ Characteristics of this **transient** behavior:
 - Only the affected in-flight batch may be dropped.
 
 This is distinct from the missing-`aws/spans`-log-group failure
-(`400 ResourceNotFoundException`), which the deployment already works around in
+(`400 ResourceNotFoundException`), which the deployment addresses in
 `scripts/infrastructure/setup-account-observability.sh` and `scripts/deploy.sh`.
+
+## Account-wide setup is scoped and opt-in
+
+The X-Ray trace segment destination, the default X-Ray indexing (sampling) rule,
+and the shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans`
+log group are **account-wide** settings shared by every X-Ray and Transaction
+Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and the
+`Invoke-GameAgentAccountObservability` PowerShell function) therefore:
+
+- make **no** account-wide change by default. The default path reads the current
+  trace destination, detects whether the account already supports Transaction
+  Search (destination `CloudWatchLogs` and `aws/spans` present), and prints an
+  actionable opt-in warning if it does not — without failing the deploy for that
+  reason alone;
+- apply changes only under the purpose-named opt-in
+  `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell:
+  `Deploy-GameAgent -ConfigureAccountObservability`), after printing exactly which
+  shared settings may change;
+- read existing state first and preserve it: Transaction Search is enabled
+  additively (never a disable/re-enable toggle), an already-enabled
+  `CloudWatchLogs` destination is left unchanged, and the shared Logs resource
+  policy uses the project-owned name `GameAgentTransactionSearchXRayAccess` so it
+  never overwrites an unrelated policy.
+
+## Runtime trace delivery is verified
+
+The per-runtime trace delivery in `scripts/deploy.sh` Step 2b (and
+`Invoke-GameAgentTraceDelivery`) creates the delivery source, destination, and
+delivery. Each mutation distinguishes a genuine already-exists conflict
+(idempotent success) from authorization, validation, throttling, and service
+errors. Retryable errors are retried with a small bounded backoff; a real error
+fails the deployment with a bounded, public-safe diagnostic that names only the
+operation. The deployment then queries the delivery with
+`aws logs describe-deliveries` and fails unless the intended source and
+destination are active.
+
 
 ## Ownership and upstream tracking
 
@@ -159,3 +195,16 @@ is platform-managed. If a future repository change to observability wiring (for
 example, the detection check or the account-observability setup) regresses,
 revert that focused change; AgentCore-managed baseline observability continues to
 operate while the upstream timing behavior is tracked.
+
+Account-wide changes are made only under the
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in, and the opt-in path prints a
+rollback command for each shared setting it changes (the prior trace destination
+and the indexing rule). To remove the project-owned resource policy:
+
+```bash
+aws logs delete-resource-policy \
+  --policy-name GameAgentTransactionSearchXRayAccess --region <region>
+```
+
+Teardown intentionally preserves account-wide observability resources because
+they may be shared with other applications.
