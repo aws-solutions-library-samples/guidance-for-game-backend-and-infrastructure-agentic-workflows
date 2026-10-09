@@ -408,7 +408,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const threadId = data.threadId || `thread-${Date.now()}`;
 
     logInfo(`[${requestId}] 📦 Messages array length: ${messages.length}`);
-    logInfo(`[${requestId}] 📦 ThreadId: ${threadId}`);
+    logInfo(`[${requestId}] 📦 Thread: ${redact(threadId)}`);
 
     // Convert CopilotKit messages to conversation history format
     const conversationHistory = messages
@@ -500,8 +500,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     logInfo(`[${requestId}] 🔗 Thread/Session:`);
     logInfo(`[${requestId}]   Environment: ${envPrefix}`);
-    logInfo(`[${requestId}]   Original Thread ID: ${threadId}`);
-    logInfo(`[${requestId}]   Isolated Thread ID: ${isolatedThreadId}`);
+    logInfo(`[${requestId}]   Thread: ${redact(threadId)}`);
+    logInfo(`[${requestId}]   Isolated thread: ${envPrefix}:${redact(isolatedThreadId)}`);
     logInfo(`[${requestId}]   Memory isolation: Dev and prod sessions are separate`);
 
     // Call AgentCore Runtime
@@ -550,7 +550,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 Payload to AgentCore:`);
       logInfo(`[${requestId}]   prompt: ${message.length} chars`);
-      logInfo(`[${requestId}]   thread_id: ${isolatedThreadId}`);
+      logInfo(`[${requestId}]   thread_id: ${redact(isolatedThreadId)}`);
       logInfo(`[${requestId}]   user_context.user_id: ${redact(payload.user_context.user_id)}`);
       logInfo(`[${requestId}]   user_context.session_id: ${redact(payload.user_context.session_id)}`);
 

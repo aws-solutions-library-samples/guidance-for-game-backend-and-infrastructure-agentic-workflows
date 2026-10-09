@@ -18,7 +18,6 @@ Performance Optimization:
 import os
 import sys
 import time
-import traceback
 
 # Third-party packages
 import boto3
@@ -65,7 +64,7 @@ from utils.security import (
     check_rate_limit,
     create_encryption_context,
     get_rate_limit_key,
-    sanitize_log_data,
+    redact_identifier,
     validate_conversation_history,
     validate_prompt,
     validate_user_context,
@@ -181,13 +180,13 @@ if not MEMORY_ID:
                 for line in f:
                     if "memory_id:" in line:
                         MEMORY_ID = line.split("memory_id:")[1].strip()
-                        logger.info(f"📋 Memory ID loaded from config file: {MEMORY_ID}")
+                        logger.info("📋 Memory ID loaded from config file")
                         break
     except Exception as e:
         logger.warning(f"⚠️ Could not read memory ID from config: {e}")
 
 if USE_BEDROCK_SESSIONS and MEMORY_ID:
-    logger.info(f"🧠 AgentCore Memory enabled: {MEMORY_ID}")
+    logger.info("🧠 AgentCore Memory enabled")
 elif USE_BEDROCK_SESSIONS:
     logger.warning("⚠️ BEDROCK_AGENTCORE_MEMORY_ID not set - memory disabled")
 else:
@@ -231,13 +230,13 @@ def invoke_agent(prompt, context=None):
         # application code independently verifies it before admitting claims.
         verified_runtime_identity = None
 
-        # DIAGNOSTIC: Check AgentCore context object. Never log token contents or
-        # raw identity values.
+        # DIAGNOSTIC: Check AgentCore context object. Never log token contents,
+        # raw identity values, or raw session identifiers.
         logger.info("🔍 AgentCore Context Inspection:")
         if context:
             logger.info(f"   Context type: {type(context)}")
             if hasattr(context, "session_id"):
-                logger.info(f"   context.session_id: {context.session_id}")
+                logger.info(f"   context.session_id: {redact_identifier(context.session_id)}")
         else:
             logger.info("   Context is None")
 
@@ -284,9 +283,10 @@ def invoke_agent(prompt, context=None):
                 logger.warning("⚠️ Rejected request: verified user is not in an approved group")
                 return "I'm sorry, but your request could not be processed due to an identity verification issue."
 
-        # Security: Log sanitized request info (redact sensitive data)
-        logger.info(f"📝 User prompt (sanitized): '{sanitize_log_data(user_prompt, 100)}'")
-        logger.info(f"🔗 Thread ID: {thread_id}")
+        # Security: Log sanitized request metadata only. The prompt itself is
+        # PII-bearing and is never logged; its length is a safe bounded metric.
+        logger.info(f"📝 User prompt accepted (length: {len(user_prompt)})")
+        logger.info(f"🔗 Thread: {redact_identifier(thread_id)}")
 
         # Hosted identity comes only from the cryptographically verified access
         # token. Local development keeps the existing body identity fallback
@@ -306,7 +306,7 @@ def invoke_agent(prompt, context=None):
             rl_key = get_rate_limit_key(persistent_user_id, "invoke_agent")
             check_rate_limit(rl_key, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
         except RateLimitExceeded as e:
-            logger.warning(f"⚠️ Rate limit hit for user {persistent_user_id}: {e}")
+            logger.warning(f"⚠️ Rate limit hit for user {redact_identifier(persistent_user_id)}: {e}")
             return str(e)
 
         # Use session_id from frontend (environment-isolated: dev-{threadId} or prod-{threadId})
@@ -314,9 +314,8 @@ def invoke_agent(prompt, context=None):
         session_id = user_context.get("session_id") or thread_id or "default"
 
         logger.info(f"👤 Authenticated user context [{auth_type}]")
-        logger.info(f"🆔 Actor ID: {actor_id}")
-        logger.info(f"📍 Session ID: {session_id} (environment-isolated)")
-        logger.info(f"🔑 Persistent User ID: {persistent_user_id}")
+        logger.info(f"🆔 Actor: {redact_identifier(actor_id)}")
+        logger.info(f"📍 Session: {redact_identifier(session_id)} (environment-isolated)")
 
         verified_groups = (
             sorted(verified_runtime_identity.groups)
@@ -358,9 +357,9 @@ def invoke_agent(prompt, context=None):
 
         logger.info(f"🧠 Memory Configuration:")
         logger.info(f"   USE_BEDROCK_SESSIONS: {USE_BEDROCK_SESSIONS}")
-        logger.info(f"   MEMORY_ID: {MEMORY_ID}")
-        logger.info(f"   Actor ID: {actor_id}")
-        logger.info(f"   Session ID: {session_id}")
+        logger.info(f"   Memory configured: {bool(MEMORY_ID)}")
+        logger.info(f"   Actor: {redact_identifier(actor_id)}")
+        logger.info(f"   Session: {redact_identifier(session_id)}")
 
         # Run the orchestrator inline. Timeouts are enforced INSIDE the agent loop
         # by WallClockTimeoutHook (orchestrator 150s, specialists 90s), which
@@ -413,13 +412,13 @@ def invoke_agent(prompt, context=None):
         return response_text
 
     except Exception as e:
-        error_msg = f"❌ AGENTCORE INVOCATION ERROR: {e}"
-        traceback_msg = f"Traceback: {traceback.format_exc()}"
-
-        # Log to logger (captured by CloudWatch via loguru)
+        # Preserve exception class + traceback for diagnosis via loguru's
+        # exception API. Production sinks run with diagnose=False, so local
+        # variable VALUES (prompts, tokens, identifiers) are not annotated into
+        # the traceback. The one-line message carries only the exception class,
+        # never its string payload, so provider error bodies cannot leak.
         logger.error("=" * 80)
-        logger.error(error_msg)
-        logger.error(traceback_msg)
+        logger.opt(exception=e).error(f"❌ AGENTCORE INVOCATION ERROR ({type(e).__name__})")
         logger.error("=" * 80)
 
         return (
