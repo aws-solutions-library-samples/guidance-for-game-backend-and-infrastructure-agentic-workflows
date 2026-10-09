@@ -47,7 +47,9 @@ class FakeDynamoClient:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def transact_write_items(
+        self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         for entry in TransactItems:
             if "Put" in entry:
                 put = entry["Put"]
@@ -222,9 +224,11 @@ def test_scenario_no_second_read_on_replay() -> None:
     assert reader.reads == reads_after_first
 
 
-# Scenario: two concurrent submissions of the same token race; one wins, the
-# other replays the winner's result — never a second operation.
-def test_scenario_concurrent_token_race_yields_single_operation() -> None:
+# Scenario: a token submitted again after a win replays the winner's completed
+# result through the shared store — never a second operation. (The two attempts
+# run sequentially; this models a retry resolving to an existing operation, not
+# true thread concurrency.)
+def test_scenario_second_submission_replays_single_operation() -> None:
     # Given two services sharing one store and one idempotency token
     client = FakeDynamoClient()
     reader = CountingReader()
@@ -233,10 +237,13 @@ def test_scenario_concurrent_token_race_yields_single_operation() -> None:
 
     # When the winner completes first
     first = winner.observe(_request(), _context())
+    reads_after_win = reader.reads
 
-    # Then the loser's retry resolves to the winner's completed operation
+    # Then the second submission resolves to the winner's completed operation
     replayed = loser.observe(_request(), _context())
     assert replayed == first
+    # No new provider read happened on the replay.
+    assert reader.reads == reads_after_win
     # Exactly one operation exists (one snapshot).
     snapshots = [k for k in client.items if k[1] == "STATE#current"]
     assert len(snapshots) == 1
@@ -248,10 +255,12 @@ def test_scenario_lost_response_returns_stored_result() -> None:
     reader = CountingReader()
     op_id = "obs_" + "a" * 26
     stored = _service(client, reader, op_id=op_id).observe(_request(), _context())
+    reads_after_first = reader.reads
     # The client never saw the response; it retries with the same token.
     again = _service(client, reader, op_id="obs_" + "c" * 26).observe(_request(), _context())
     assert again == stored
-    assert again["observation_hash"] if "observation_hash" in again else True
+    # The replay performed no new provider read.
+    assert reader.reads == reads_after_first
     # Verify the stored result's hash still matches (no corruption).
     result_item = client.items[("OP#" + op_id, "RESULT#current")]
     assert result_item["observation_hash"]["S"] == canonical_sha256(stored)
@@ -277,7 +286,6 @@ def test_scenario_stale_in_progress_retry_is_state_conflict_not_new_op() -> None
         lease_holder="request.stuck",
         commit_not_after=NOW + timedelta(minutes=30),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent={"phase": "observe", "provider": "gamelift", "target": {"provider": "gamelift", "fleet_id": FLEET_ID}},
     )
     # The seeded fingerprint differs from the real request's fingerprint, so a
@@ -378,7 +386,7 @@ def test_scenario_stale_lease_is_reclaimed_and_recovered() -> None:
     snapshot = client.items[("OP#" + op_id, "STATE#current")]
     assert snapshot["state"]["S"] == "succeeded"
     assert int(snapshot["generation"]["N"]) >= 2
-    assert ("OP#" + op_id, "LEDGER#RECLAIM#2") in client.items
+    assert ("OP#" + op_id, "LEDGER#0#RECLAIM#0002") in client.items
 
 
 # Scenario: before the lease expires, a retry returns a bounded in-progress
@@ -398,7 +406,6 @@ def test_scenario_live_lease_retry_is_bounded_in_progress() -> None:
         lease_holder="request.live",
         commit_not_after=NOW + timedelta(minutes=30),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent={"phase": "observe", "provider": "gamelift", "target": {"provider": "gamelift", "fleet_id": FLEET_ID}},
     )
     # A real-intent retry under the SAME fingerprint would be in-progress; here
@@ -408,7 +415,7 @@ def test_scenario_live_lease_retry_is_bounded_in_progress() -> None:
         _service(client, CountingReader(), op_id="obs_" + "d" * 26).observe(_request(), _context())
     snapshots = [k for k in client.items if k[1] == "STATE#current"]
     assert len(snapshots) == 1
-    assert ("OP#" + op_id, "LEDGER#RECLAIM#2") not in client.items
+    assert ("OP#" + op_id, "LEDGER#0#RECLAIM#0002") not in client.items
 
 
 # Scenario: the GET status route path parameter is operationId.
@@ -434,6 +441,7 @@ def test_scenario_status_route_uses_operation_id_path_parameter() -> None:
             capability_maximum="observe",
             risk_policy="observe",
         ),
+        observer_groups=frozenset({"admin", "users"}),
     )
     exp = int((NOW + timedelta(minutes=30)).timestamp())
     base = {
@@ -447,16 +455,19 @@ def test_scenario_status_route_uses_operation_id_path_parameter() -> None:
                         "client_id": "client.web-console",
                         "token_use": "access",
                         "exp": exp,
+                        "cognito:groups": "[users]",
                     }
                 }
             },
         },
+        "routeKey": "POST /operations/observe",
         "body": json.dumps({"fleet_id": FLEET_ID, "idempotency_token": TOKEN}),
     }
     assert handler.handle(base)["statusCode"] == 200
 
     get_event = json.loads(json.dumps(base))
     get_event["requestContext"]["http"]["method"] = "GET"
+    get_event["routeKey"] = "GET /operations/{operationId}"
     get_event.pop("body")
     # The camelCase 'operationId' path parameter is honored...
     get_event["pathParameters"] = {"operationId": op_id}

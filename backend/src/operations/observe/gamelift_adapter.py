@@ -46,6 +46,13 @@ def _int(value: object) -> int:
     return value
 
 
+def _require(record: dict[str, Any], key: str) -> object:
+    """Return ``record[key]`` or fail closed on a missing provider field."""
+    if key not in record:
+        raise ValueError("provider response is missing a required field")
+    return record[key]
+
+
 class GameLiftObservationAdapter:
     """Read-only GameLift adapter returning bounded, normalized domain values."""
 
@@ -60,17 +67,21 @@ class GameLiftObservationAdapter:
         record = records[0]
         if not isinstance(record, dict):
             raise ValueError("malformed fleet utilization record")
+        # Fail closed on a missing counter rather than substituting 0: a
+        # truncated or reshaped provider response must not become a valid-looking
+        # observation of zero activity.
         return {
-            "active_server_processes": _int(record.get("ActiveServerProcessCount", 0)),
-            "active_game_sessions": _int(record.get("ActiveGameSessionCount", 0)),
-            "current_player_sessions": _int(record.get("CurrentPlayerSessionCount", 0)),
-            "maximum_player_sessions": _int(record.get("MaximumPlayerSessionCount", 0)),
+            "active_server_processes": _int(_require(record, "ActiveServerProcessCount")),
+            "active_game_sessions": _int(_require(record, "ActiveGameSessionCount")),
+            "current_player_sessions": _int(_require(record, "CurrentPlayerSessionCount")),
+            "maximum_player_sessions": _int(_require(record, "MaximumPlayerSessionCount")),
         }
 
     def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
         # Use the exact E0-accepted read: describe_fleet_capacity(FleetIds=[...]).
-        # It returns FleetCapacity as a per-location list already, so normalize
-        # each entry into the bounded location list the contract expects.
+        # It returns FleetCapacity as a per-location list already (for a
+        # multi-location fleet the home Region's entry), so normalize each entry
+        # into the bounded location list the contract expects.
         response = self._client.describe_fleet_capacity(FleetIds=[fleet_id])
         capacities = response.get("FleetCapacity") if isinstance(response, dict) else None
         if not isinstance(capacities, list):
@@ -82,15 +93,18 @@ class GameLiftObservationAdapter:
             instances = entry.get("InstanceCounts")
             if not isinstance(instances, dict):
                 raise ValueError("malformed fleet capacity counts")
+            # Fail closed on a missing location rather than substituting "home".
             location = entry.get("Location")
+            if not isinstance(location, str) or not location:
+                raise ValueError("fleet capacity record has no location")
             result.append(
                 {
-                    "location": location if isinstance(location, str) and location else "home",
-                    "desired": _int(instances.get("DESIRED", 0)),
-                    "minimum": _int(instances.get("MINIMUM", 0)),
-                    "maximum": _int(instances.get("MAXIMUM", 0)),
-                    "active": _int(instances.get("ACTIVE", 0)),
-                    "idle": _int(instances.get("IDLE", 0)),
+                    "location": location,
+                    "desired": _int(_require(instances, "DESIRED")),
+                    "minimum": _int(_require(instances, "MINIMUM")),
+                    "maximum": _int(_require(instances, "MAXIMUM")),
+                    "active": _int(_require(instances, "ACTIVE")),
+                    "idle": _int(_require(instances, "IDLE")),
                 }
             )
         return result
@@ -98,8 +112,11 @@ class GameLiftObservationAdapter:
     def read_scaling_policies(self, fleet_id: str) -> list[dict[str, str]]:
         response = self._client.describe_scaling_policies(FleetId=fleet_id, StatusFilter="ACTIVE")
         policies = response.get("ScalingPolicies") if isinstance(response, dict) else None
+        # Fail closed on a reshaped response: a non-list ``ScalingPolicies`` is a
+        # malformed response, not "no policies". A genuinely empty list is the
+        # only valid empty result.
         if not isinstance(policies, list):
-            return []
+            raise ValueError("malformed scaling policies response")
         result: list[dict[str, str]] = []
         for entry in policies[: _MAX_SCALING_POLICIES + 1]:
             if not isinstance(entry, dict):
@@ -110,8 +127,7 @@ class GameLiftObservationAdapter:
             if not isinstance(name, str) or not name:
                 raise ValueError("scaling policy has no name")
             if status not in _VALID_STATUSES:
-                # Default an unknown provider status to ACTIVE only when the
-                # policy is otherwise well-formed would hide data; fail closed.
+                # Fail closed on an unknown provider status rather than hiding it.
                 raise ValueError("scaling policy has an unknown status")
             if not isinstance(metric, str) or not metric:
                 raise ValueError("scaling policy has no metric name")

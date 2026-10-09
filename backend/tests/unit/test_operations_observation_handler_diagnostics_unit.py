@@ -1,18 +1,12 @@
 """Safe, production-visible diagnostics at the observation handler's unexpected
 catch-all (GitHub issue #413).
 
-Live diagnosis (demo / us-west-2, 2026-09-21) of the E1 observe path found that
-after the store-boundary diagnostics landed, a *valid* ``POST`` that succeeds
-locally under Admin returned a bounded ``INTERNAL_ERROR`` 500 in the deployed
-Lambda — and the running Lambda emitted **nothing** naming even the failing
-stage or the exception class. :class:`ObservationRequestHandler.handle` wraps
-dispatch in a bare ``except Exception`` that maps any unexpected error to a
-sanitized generic 500 and returns, swallowing every internal signal. That is the
-same diagnostic blind spot #413 root-caused at the store, now one layer up at
-the protocol adapter.
-
-These tests pin a fix that, at the handler's unexpected catch-all ONLY, emits a
-single bounded, sanitized ``logging`` record carrying only:
+:class:`ObservationRequestHandler.handle` wraps dispatch in a bare
+``except Exception`` that maps any unexpected error to a sanitized generic 500.
+On its own that path emits no signal naming the failing stage or the exception
+class, which leaves a deployed Lambda failure undiagnosable. These tests pin the
+behavior that, at the handler's unexpected catch-all ONLY, emits a single
+bounded, sanitized ``logging`` record carrying only:
 
 * a fixed event name (a static literal),
 * the request ``stage`` drawn from a strict allowlist (never request-derived
@@ -236,20 +230,29 @@ def _handler(cls: type[ObservationService]) -> ObservationRequestHandler:
             capability_maximum="observe",
             risk_policy="observe",
         ),
+        observer_groups=frozenset({"admin", "users"}),
     )
 
 
 def _claims() -> dict[str, Any]:
-    return {"sub": "subject.operator-1", "client_id": "client.web-console", "token_use": "access", "exp": EXP}
+    return {
+        "sub": "subject.operator-1",
+        "client_id": "client.web-console",
+        "token_use": "access",
+        "exp": EXP,
+        "cognito:groups": "[users]",
+    }
 
 
 def _event(*, method: str = "POST") -> dict[str, Any]:
+    route_key = "POST /operations/observe" if method == "POST" else "GET /operations/{operationId}"
     return {
         "requestContext": {
             "requestId": "abc123def456",
             "http": {"method": method},
             "authorizer": {"jwt": {"claims": _claims()}},
         },
+        "routeKey": route_key,
         "body": json.dumps({"fleet_id": FLEET_ID, "idempotency_token": TOKEN}),
     }
 

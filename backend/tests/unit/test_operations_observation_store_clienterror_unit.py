@@ -64,7 +64,9 @@ class StatefulDynamoClient:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
         self.transactions: list[list[dict[str, Any]]] = []
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def transact_write_items(
+        self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         self.transactions.append(TransactItems)
         # First pass: evaluate conditions, raising a real conditional-only cancel.
         for entry in TransactItems:
@@ -101,7 +103,6 @@ def _begin(store: DynamoDbObservationStore, *, operation_id: str = OPERATION_ID)
         lease_holder=HOLDER,
         commit_not_after=NOW + timedelta(minutes=30),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent=INTENT,
     )
 

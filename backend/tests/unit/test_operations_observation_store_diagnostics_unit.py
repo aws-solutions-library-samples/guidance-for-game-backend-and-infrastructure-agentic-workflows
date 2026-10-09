@@ -1,17 +1,11 @@
 """Safe structured diagnostic logging at the store's exception boundaries (#413).
 
-Live diagnosis (demo / us-west-2, 2026-09-21) of an E1 valid POST that returned
-``503 PROVIDER_UNAVAILABLE`` ("observation state store is temporarily
-unavailable") with no table item written found a *diagnostic blind spot*: the
-``DynamoDbObservationStore`` maps every non-conditional ``TransactWriteItems``
-failure to ``PROVIDER_UNAVAILABLE`` and swallows the exception with no log line.
-The only signal was at the AWS layer (DynamoDB ``UserErrors`` HTTP 400, while the
-sole successful ``TransactWriteItems`` was an out-of-band admin control write) —
-the running Lambda emitted nothing that named the failing operation or the AWS
-error/cancellation codes.
-
-These tests pin a fix that logs, at *every* store exception boundary, a bounded
-structured record carrying only:
+The ``DynamoDbObservationStore`` maps every non-conditional ``TransactWriteItems``
+failure to ``PROVIDER_UNAVAILABLE``. Without a log line at that boundary the only
+signal is at the AWS layer (DynamoDB ``UserErrors``), which does not name the
+failing operation or the AWS error/cancellation codes. These tests pin the
+behavior that logs, at *every* store exception boundary, a bounded structured
+record carrying only:
 
 * the store operation name (a static literal we pass, never request-derived),
 * the exception TYPE name (``type(exc).__name__``),
@@ -19,20 +13,17 @@ structured record carrying only:
 * the bounded transaction cancellation-reason codes
   (``exc.response["CancellationReasons"][].Code``).
 
-Reconciling #409's traceback policy: #409 switched general call sites to
-``logger.exception`` so the class+message+frames reach CloudWatch (with
-``diagnose=False`` stripping local VALUES). This boundary is stricter — the
-store handles idempotency tokens, operation ids, canonical intent, and request
-items, any of which can appear in a botocore exception MESSAGE or in stack
-locals. So this boundary MUST NOT emit the exception message, ``str(exc)``, a
-traceback, or ``exc_info``; it emits sanitized metadata only. These tests prove
-that with secret-bearing fake exceptions (no leak) and real botocore errors
-(useful codes present).
+The boundary is deliberately strict: the store handles idempotency tokens,
+operation ids, canonical intent, and request items, any of which can appear in a
+botocore exception MESSAGE or in stack locals. So this boundary MUST NOT emit the
+exception message, ``str(exc)``, a traceback, or ``exc_info``; it emits sanitized
+metadata only. These tests prove that with secret-bearing fake exceptions (no
+leak) and real botocore errors (useful codes present).
 
 Lambda-safe emit: the boundary logs through the Python standard-library
 ``logging`` module, NOT loguru. This store ships in the minimal E1 observe
 Lambda whose dependency closure deliberately excludes loguru; importing loguru
-here broke the real package import before deployment. These tests capture the
+here would break the real package import at deployment. These tests capture the
 emitted ``LogRecord`` through a production-SHAPED stdlib handler (``%(message)s``
 with framework-metadata prefix, no structured ``extra``), so a passing assertion
 means the datum survives the deployed handler to CloudWatch.
@@ -167,7 +158,9 @@ class _StatefulDynamoClient:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def transact_write_items(
+        self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         for entry in TransactItems:
             if "Put" in entry:
                 put = entry["Put"]
@@ -202,7 +195,6 @@ def _begin(store: DynamoDbObservationStore, *, operation_id: str = OPERATION_ID)
         lease_holder=HOLDER,
         commit_not_after=NOW + timedelta(minutes=30),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent=INTENT,
     )
 
@@ -312,7 +304,6 @@ def test_complete_unavailable_logs_useful_codes() -> None:
             workspace_id=WORKSPACE,
             lease_holder=HOLDER,
             commit_not_after=NOW + timedelta(minutes=30),
-            ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
             observation=_observation(),
         )
         output = buffer.getvalue()
@@ -346,7 +337,6 @@ def test_fail_observation_swallows_but_logs_type() -> None:
             workspace_id=WORKSPACE,
             lease_holder=HOLDER,
             reason_code="provider_error",
-            ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
             generation=1,
         )
         output = buffer.getvalue()
@@ -361,10 +351,13 @@ def test_fail_observation_swallows_but_logs_type() -> None:
 # --- _get boundary (load_status / complete replay) --------------------------
 
 
-def test_get_boundary_logs_and_reraises_useful_codes() -> None:
+def test_get_boundary_logs_and_raises_typed_retryable_error() -> None:
     """A read failure (get_item) at the load_status boundary must not vanish:
-    it logs a bounded record and the exception still propagates (reads are not
-    silently swallowed into a false 'not found')."""
+    it logs a bounded record and raises a typed retryable read error, so a read
+    fault is never silently swallowed into a false 'not found'."""
+
+    # Local modules
+    from operations.observation import ObservationStoreReadError
 
     class _ReadFailingClient(_StatefulDynamoClient):
         def get_item(self, **_kwargs: Any) -> dict[str, Any]:
@@ -372,7 +365,7 @@ def test_get_boundary_logs_and_reraises_useful_codes() -> None:
 
     store = _store(_ReadFailingClient())
     with _ProductionSink() as buffer:
-        with pytest.raises(ClientError):
+        with pytest.raises(ObservationStoreReadError):
             store.load_status(operation_id=OPERATION_ID, workspace_id=WORKSPACE)
         output = buffer.getvalue()
 
@@ -448,7 +441,9 @@ class _ReclaimFailingClient(_StatefulDynamoClient):
     """A stateful fake that seeds normally but fails the fenced RECLAIM
     transaction with a real, non-conditional botocore error."""
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def transact_write_items(
+        self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         # The reclaim transaction is the only one carrying a snapshot ``Update``
         # leg (advancing the fencing generation). Fail exactly that one with a
         # provider fault so the reclaim boundary — not begin/complete — is hit.
@@ -481,7 +476,6 @@ def test_reclaim_unavailable_logs_useful_codes() -> None:
             lease_holder="request.observe-2",
             commit_not_after=later + timedelta(minutes=30),
             lease_not_after=later + timedelta(seconds=15),
-            ttl_epoch_s=int((later + timedelta(minutes=30)).timestamp()),
             intent=INTENT,
         )
         output = buffer.getvalue()
@@ -502,7 +496,9 @@ def test_reclaim_lost_race_does_not_log_unavailable() -> None:
     race is not a provider fault."""
 
     class _ReclaimRaceClient(_StatefulDynamoClient):
-        def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+        def transact_write_items(
+            self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+        ) -> dict[str, Any]:
             if any("Update" in entry for entry in TransactItems):
                 # Another writer already advanced the generation: conditional.
                 raise _transaction_canceled("ConditionalCheckFailed")
@@ -523,7 +519,6 @@ def test_reclaim_lost_race_does_not_log_unavailable() -> None:
             lease_holder="request.observe-3",
             commit_not_after=later + timedelta(minutes=30),
             lease_not_after=later + timedelta(seconds=15),
-            ttl_epoch_s=int((later + timedelta(minutes=30)).timestamp()),
             intent=INTENT,
         )
         output = buffer.getvalue()

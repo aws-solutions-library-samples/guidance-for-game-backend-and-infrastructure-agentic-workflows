@@ -48,7 +48,9 @@ class FakeDynamoClient:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def transact_write_items(
+        self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         # All-or-nothing: evaluate every condition, then apply.
         for entry in TransactItems:
             if "Put" in entry:
@@ -181,6 +183,7 @@ def _handler(client: FakeDynamoClient, reader: _Reader | None = None) -> Observa
             capability_maximum="observe",
             risk_policy="observe",
         ),
+        observer_groups=frozenset({"admin", "users"}),
     )
 
 
@@ -196,10 +199,12 @@ def _post_event(body: dict[str, Any] | None = None) -> dict[str, Any]:
                         "client_id": "client.web-console",
                         "token_use": "access",
                         "exp": EXP,
+                        "cognito:groups": "[users]",
                     }
                 }
             },
         },
+        "routeKey": "POST /operations/observe",
         "body": json.dumps(body or {"fleet_id": FLEET_ID, "idempotency_token": TOKEN}),
     }
 
@@ -207,6 +212,7 @@ def _post_event(body: dict[str, Any] | None = None) -> dict[str, Any]:
 def _get_event(operation_id: str) -> dict[str, Any]:
     event = _post_event()
     event["requestContext"]["http"]["method"] = "GET"
+    event["routeKey"] = "GET /operations/{operationId}"
     event.pop("body")
     event["pathParameters"] = {"operationId": operation_id}
     return event
@@ -300,6 +306,7 @@ def test_status_get_cross_workspace_is_404() -> None:
             capability_maximum="observe",
             risk_policy="observe",
         ),
+        observer_groups=frozenset({"admin", "users"}),
     )
     status = other_ws_handler.handle(_get_event(OPERATION_ID))
     assert status["statusCode"] == 404
@@ -384,6 +391,7 @@ def test_deployable_lambda_handler_end_to_end(monkeypatch: pytest.MonkeyPatch) -
         "client_id": "operations-api",
         "token_use": "access",
         "exp": future_exp,
+        "cognito:groups": "[users]",
     }
     event = _post_event()
     event["requestContext"]["authorizer"]["jwt"]["claims"] = claims
@@ -402,12 +410,12 @@ def test_deployable_lambda_handler_end_to_end(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_record_then_replay_returns_byte_identical_body_and_same_operation() -> None:
-    # Live E1 diagnosis (#413): a first success serializes the freshly built
-    # observation in Python insertion order, while the replay loads the stored
-    # ``observation_json`` (written sort-key canonical) and serializes THAT
-    # order. Both bodies are semantically equal and equal in size, yet differ
-    # byte-for-byte, so a client asserting raw-body idempotency fails on retry.
-    # The handler MUST serialize every response deterministically so a real
+    # A first success serializes the freshly built observation in Python
+    # insertion order, while the replay loads the stored ``observation_json``
+    # (written sort-key canonical) and serializes THAT order. Both bodies are
+    # semantically equal and equal in size, yet a naive serializer would differ
+    # byte-for-byte, so a client asserting raw-body idempotency would fail on
+    # retry. The handler serializes every response deterministically so a real
     # record and its replay are byte-identical, carry the same operation id, and
     # trigger zero additional provider reads.
     client = FakeDynamoClient()

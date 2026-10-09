@@ -4,11 +4,17 @@ This handler is the protocol adapter for the observe phase. It trusts **only**
 the API Gateway JWT authorizer context that API Gateway itself populates after
 cryptographically verifying the Cognito access token
 (``event.requestContext.authorizer.jwt.claims``). It never reads identity from
-the request body, query string, or a custom header, so a direct or unattributed
-invocation — one without a verified authorizer context — is rejected before any
-provider read.
+the request body, query string, or a custom header, so a call that arrives
+without a verified authorizer context is rejected before any provider read.
+This rejection depends on the deployed function's invoke permissions: a
+principal granted ``lambda:InvokeFunction`` could craft an event that includes a
+forged authorizer block, so the guarantee is only as strong as the function's
+resource policy, which admits invocation solely through the JWT-authorized API
+Gateway route.
 
-The handler dispatches two routes on the verified caller:
+The handler dispatches two routes on the verified caller, keyed on the API
+Gateway ``routeKey`` so an unexpected path is not found rather than mistaken for
+observe or status:
 
 * ``POST /operations/observe`` parses the untrusted body into an
   :class:`~operations.observation.ObservationRequest` (fleet id and idempotency
@@ -28,8 +34,8 @@ provider payload, or internal detail never crosses the boundary.
 from __future__ import annotations
 
 # Standard library
-import json
 import logging
+import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -37,7 +43,7 @@ from typing import Any
 # Local modules
 from operations.claims import parse_group_claim, parse_scope_claim
 from operations.contracts import CONTRACT_VERSION
-from operations.contracts.canonical import CanonicalizationError, canonicalize
+from operations.contracts.canonical import CanonicalizationError, canonicalize, load_json
 from operations.identity import VerifiedPrincipal
 from operations.observation import (
     AuthorityInputs,
@@ -63,7 +69,8 @@ _STATUS_BY_ERROR = {
     ObservationErrorCode.INTERNAL_ERROR: 500,
 }
 
-_OBSERVE_ROUTE = "/operations/observe"
+# The observe request body is a few short fields; bound it before parsing.
+_MAX_BODY_BYTES = 4096
 
 
 class HandlerConfigError(RuntimeError):
@@ -83,9 +90,12 @@ class ObservationRequestHandler:
         capability_id: str,
         capability_version: str,
         authority_inputs: AuthorityInputs,
+        observer_groups: frozenset[str],
     ) -> None:
         if not tenant_id or not workspace_id or not trusted_audience:
             raise HandlerConfigError("tenant_id, workspace_id, and trusted_audience are required")
+        if not observer_groups:
+            raise HandlerConfigError("observer_groups must list at least one group")
         self._service = service
         self._tenant_id = tenant_id
         self._workspace_id = workspace_id
@@ -93,6 +103,28 @@ class ObservationRequestHandler:
         self._capability_id = capability_id
         self._capability_version = capability_version
         self._authority_inputs = authority_inputs
+        self._observer_groups = observer_groups
+
+    def _principal_authority(self, principal: VerifiedPrincipal) -> str:
+        """Derive principal authority from the verified access-token groups.
+
+        A caller whose verified ``cognito:groups`` intersect the server-owned
+        observer allowlist derives ``observe`` authority; a caller with no
+        intersecting group derives ``disabled``, which the service's authority
+        minimum turns into a 403 on both POST observe and GET status. The groups
+        come only from the authorizer-verified claims, never from request data.
+        """
+        return "observe" if (principal.groups & self._observer_groups) else "disabled"
+
+    def _authority_inputs_for(self, principal: VerifiedPrincipal) -> AuthorityInputs:
+        base = self._authority_inputs
+        return AuthorityInputs(
+            tenant_policy=base.tenant_policy,
+            workspace_policy=base.workspace_policy,
+            principal_authority=self._principal_authority(principal),
+            capability_maximum=base.capability_maximum,
+            risk_policy=base.risk_policy,
+        )
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one API Gateway HTTP API (payload v2) invocation."""
@@ -115,30 +147,39 @@ class ObservationRequestHandler:
             )
 
     def _dispatch(self, event: Mapping[str, Any], stage: list[str]) -> dict[str, Any]:
-        method = _method(event)
+        route_key = _route_key(event)
         stage[0] = "identity"
         principal = self._verified_principal(event)
-        if method == "POST":
+        # Derive principal authority from verified groups and apply it to BOTH
+        # routes: a caller with no observer group is denied on observe and on
+        # status alike, before any store read.
+        if self._principal_authority(principal) != "observe":
+            raise ObservationBoundaryError(
+                ObservationErrorCode.AUTHORIZATION_DENIED, "caller is not permitted to observe"
+            )
+        if route_key == "POST /operations/observe":
             stage[0] = "parse_observe"
             request = self._parse_observe_request(event)
             context = ObservationRequestContext(
                 requester=principal,
                 request_id=_request_id(event),
-                authority_inputs=self._authority_inputs,
+                authority_inputs=self._authority_inputs_for(principal),
                 capability_id=self._capability_id,
                 capability_version=self._capability_version,
             )
             stage[0] = "service_observe"
             observation = self._service.observe(request, context)
             return _json_response(200, observation)
-        if method == "GET":
+        if route_key == "GET /operations/{operationId}":
             stage[0] = "parse_status"
             status_request = self._parse_status_request(event)
             status_context = StatusRequestContext(requester=principal, request_id=_request_id(event))
             stage[0] = "service_status"
             status = self._service.get_status(status_request, status_context)
             return _json_response(200, _status_body(status))
-        raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "unsupported method")
+        # Any other route (including a method/path the API Gateway did not route
+        # to one of the two known routes) is not found here.
+        raise ObservationBoundaryError(ObservationErrorCode.NOT_FOUND, "no such operations route")
 
     def _parse_observe_request(self, event: Mapping[str, Any]) -> ObservationRequest:
         raw_body = event.get("body")
@@ -148,9 +189,15 @@ class ObservationRequestHandler:
             raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "observation request is invalid")
         if not isinstance(raw_body, str) or not raw_body.strip():
             raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "observation request is invalid")
+        if len(raw_body.encode("utf-8")) > _MAX_BODY_BYTES:
+            # Bound the raw body before parsing so a hostile payload cannot force
+            # unbounded work; the observe request is a few short fields.
+            raise ObservationBoundaryError(ObservationErrorCode.CONTRACT_INVALID, "observation request is invalid")
         try:
-            payload = json.loads(raw_body)
-        except (ValueError, TypeError) as exc:
+            # Strict I-JSON parse: reject duplicate names (last-wins ambiguity),
+            # non-finite numbers, and other non-canonical values.
+            payload = load_json(raw_body)
+        except (CanonicalizationError, ValueError, TypeError) as exc:
             raise ObservationBoundaryError(
                 ObservationErrorCode.CONTRACT_INVALID, "observation request is invalid"
             ) from exc
@@ -224,6 +271,18 @@ def _method(event: Mapping[str, Any]) -> str:
     return ""
 
 
+def _route_key(event: Mapping[str, Any]) -> str:
+    """Return the API Gateway HTTP API ``routeKey`` for this invocation.
+
+    Dispatch is by the gateway's own ``routeKey`` (for example
+    ``"POST /operations/observe"``) rather than by HTTP method alone, so a
+    request that reached the integration on an unexpected path is routed to the
+    not-found path instead of being treated as observe or status.
+    """
+    route_key = event.get("routeKey")
+    return route_key if isinstance(route_key, str) else ""
+
+
 def _authorizer_claims(event: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return the JWT claims API Gateway placed in the authorizer context.
 
@@ -253,7 +312,9 @@ def _request_id(event: Mapping[str, Any]) -> str:
         safe = "".join(ch for ch in candidate if ch.isalnum() or ch in "._:-")
         if len(safe) >= 3:
             return f"apigw.{safe}"[:128]
-    return "apigw.observation-request"
+    # No usable gateway request id: use a random per-invocation id so two such
+    # requests never share a lease holder.
+    return f"apigw.{secrets.token_hex(16)}"
 
 
 def _expiry(value: object) -> datetime | None:
@@ -315,18 +376,16 @@ def _error_response(error: ObservationBoundaryError) -> dict[str, Any]:
 
 # -- Safe diagnostic logging at the handler's unexpected catch-all (#413) ------
 #
-# Live diagnosis of the deployed E1 observe path found the protocol adapter's
-# bare ``except Exception`` maps any unexpected error to a sanitized generic 500
-# and returns, emitting NO signal — the same blind spot #413 root-caused at the
-# store, one layer up. This boundary emits a single BOUNDED, sanitized record
-# naming only: a fixed event name, the request STAGE (an allowlisted literal),
-# the HTTP METHOD (an allowlisted literal), the exception TYPE, and the bounded
-# AWS ``Error.Code`` / transaction cancellation-reason codes when a
-# botocore-shaped exception carries them.
+# The protocol adapter's ``except Exception`` maps any unexpected error to a
+# sanitized generic 500. To keep that path observable, this boundary emits a
+# single BOUNDED, sanitized record naming only: a fixed event name, the request
+# STAGE (an allowlisted literal), the HTTP METHOD (an allowlisted literal), the
+# exception TYPE, and the bounded AWS ``Error.Code`` / transaction
+# cancellation-reason codes when a botocore-shaped exception carries them.
 #
-# It is deliberately stricter than #409's general ``logger.exception`` policy:
-# the handler processes an untrusted event, body, idempotency token, operation
-# id, and path parameter, any of which can appear in an exception MESSAGE or in
+# It is deliberately stricter than a general ``logger.exception`` policy: the
+# handler processes an untrusted event, body, idempotency token, operation id,
+# and path parameter, any of which can appear in an exception MESSAGE or in
 # stack locals. So it emits sanitized METADATA ONLY: never the exception
 # message, ``str(exc)``, the event/body, an id/token/ARN/account, a traceback,
 # or ``exc_info``. Bounded lengths cap any adversarial code a provider returns.
@@ -336,9 +395,8 @@ _MAX_REASON_CODES = 16
 # The emit uses the Python standard-library ``logging`` module, NOT loguru. This
 # handler ships in the minimal E1 observe Lambda whose dependency closure
 # deliberately excludes loguru; importing it here would break the real package
-# import before deployment (the #409/#413 regression). ``logging`` is always
-# present in the Lambda runtime, so the diagnostic stays Lambda-safe without
-# expanding that closure.
+# import at deployment. ``logging`` is always present in the Lambda runtime, so
+# the diagnostic stays Lambda-safe without expanding that closure.
 #
 # The whole record lives in the ``LogRecord`` message string: a CloudWatch/Lambda
 # handler renders ``%(message)s`` and carries no structured ``extra`` mapping, so

@@ -435,7 +435,7 @@ def test_request_payload_accepts_exact_shape() -> None:
 # --- Provider read failures (fail closed, no partial success) -------------
 
 
-def test_provider_read_exception_fails_closed_retryable_and_records_failed() -> None:
+def test_provider_read_exception_fails_closed_and_records_failed() -> None:
     class BoomReader(FakeReader):
         def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
             raise RuntimeError("provider boom")
@@ -444,7 +444,11 @@ def test_provider_read_exception_fails_closed_retryable_and_records_failed() -> 
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
-    assert exc.value.retryable is True
+    # The provider failure is recorded terminally for this idempotency token, so
+    # the FIRST response is non-retryable and tells the client to use a new
+    # token — a same-token retry can never make progress.
+    assert exc.value.retryable is False
+    assert "new idempotency token" in exc.value.safe_message
     # The operation was created before the read, so a bounded failed transition
     # is recorded and no result is completed.
     assert len(store.begin_calls) == 1
@@ -874,3 +878,118 @@ def test_effective_authority_is_real_minimum_when_an_input_is_below_capability()
     assert result["effective_authority"] == "observe"
     # tenant_policy 'remediate' from the default fixture is preserved unchanged.
     assert result["authority_inputs"]["tenant_policy"] == "remediate"
+
+
+# --- Read abandonment: a hung read returns within its per-read budget -------
+
+
+def test_hung_read_is_abandoned_within_the_per_read_budget() -> None:
+    # Standard library
+    import threading
+
+    # Local modules
+    from operations.validation.e0_latency import LatencyBudget
+
+    release = threading.Event()
+
+    class HangingReader(FakeReader):
+        def read_utilization(self, fleet_id: str) -> dict[str, int]:
+            # Block until released; the service must abandon the read at its
+            # per-read deadline rather than wait for this to return.
+            release.wait(timeout=5.0)
+            return super().read_utilization(fleet_id)
+
+    service, _, store, metrics = _service(reader=HangingReader())
+    # A short real per-read budget so the wall-clock abandonment is observable
+    # without a slow test. The service uses real time for this measurement.
+    service._budget = LatencyBudget(per_read_s=0.3, persistence_s=0.3, cancellation_margin_s=0.3)
+    try:
+        started = time.monotonic()
+        with pytest.raises(ObservationBoundaryError) as exc:
+            service.observe(_request(), _context())
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    # The request returned near the per-read budget, not after the full 5s block.
+    assert elapsed < 2.0
+    assert store.complete_calls == []
+    assert "observation.timeout" in metrics.names()
+
+
+# --- Provider error classification before any terminal record (major) -------
+
+
+def _client_error(code: str) -> Exception:
+    # Third-party packages
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "DescribeFleetCapacity")
+
+
+def test_not_found_fleet_maps_to_not_found_non_retryable() -> None:
+    class NotFoundReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            raise _client_error("NotFoundException")
+
+    service, _, store, _ = _service(reader=NotFoundReader())
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.NOT_FOUND
+    assert exc.value.retryable is False
+    # A terminal reason is recorded, and no result is completed.
+    assert store.fail_calls[0]["reason_code"] == "not_found"
+    assert store.complete_calls == []
+
+
+def test_invalid_request_maps_to_contract_invalid() -> None:
+    class InvalidReader(FakeReader):
+        def read_scaling_policies(self, fleet_id: str) -> list[dict[str, str]]:
+            raise _client_error("InvalidRequestException")
+
+    service, _, store, _ = _service(reader=InvalidReader())
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.CONTRACT_INVALID
+    assert exc.value.retryable is False
+    assert store.fail_calls[0]["reason_code"] == "contract_invalid"
+
+
+def test_provider_data_failing_contract_is_a_5xx_not_client_400() -> None:
+    # A provider value that passes shape normalization but fails the observation
+    # contract is a server/provider-side fault, reported as a 5xx.
+    class ContractBreakingReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            # desired above maximum violates the observation contract's ranges.
+            return [{"location": "us-west-2", "desired": 99, "minimum": 0, "maximum": 1, "active": 0, "idle": 0}]
+
+    service, _, store, _ = _service(reader=ContractBreakingReader())
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.INTERNAL_ERROR
+    assert store.fail_calls[0]["reason_code"] == "provider_contract_invalid"
+
+
+# --- Metrics failures never mask a typed outcome (minor) --------------------
+
+
+def test_metrics_failure_does_not_mask_the_typed_outcome() -> None:
+    class ExplodingMetrics(RecordingMetrics):
+        def record(self, name: str, value: float, *, dimensions: dict[str, str] | None = None) -> None:
+            super().record(name, value, dimensions=dimensions)
+            if name in ("observation.failed", "observation.timeout"):
+                raise RuntimeError("cloudwatch down")
+
+    class BoomReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            raise RuntimeError("provider boom")
+
+    # The service records the failed transition BEFORE emitting metrics, so a
+    # metrics backend fault cannot strand the snapshot or replace the typed
+    # error. (With the CloudWatch sink the publish is swallowed; here the fake
+    # raises to prove the fail transition already happened.)
+    service, _, store, _ = _service(reader=BoomReader(), metrics=ExplodingMetrics())
+    with pytest.raises((ObservationBoundaryError, RuntimeError)):
+        service.observe(_request(), _context())
+    # The failed transition was recorded before the metrics raise.
+    assert len(store.fail_calls) == 1

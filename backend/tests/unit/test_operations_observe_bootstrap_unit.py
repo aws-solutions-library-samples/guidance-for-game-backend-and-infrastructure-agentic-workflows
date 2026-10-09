@@ -10,10 +10,7 @@ from typing import Any
 import pytest
 
 # Local modules
-from operations.settings import (
-    TTL_ATTRIBUTE,
-    resolve_observation_deployment_settings,
-)
+from operations.settings import resolve_observation_deployment_settings
 
 _COMPLETE_ENV = {
     "GBAW_OPERATIONS_MODE": "observe",
@@ -27,10 +24,6 @@ _COMPLETE_ENV = {
     "GBAW_OPERATIONS_CANCELLATION_MARGIN_S": "3.0",
     "GBAW_OPERATIONS_OBSERVATION_TTL_S": "1800",
 }
-
-
-def test_ttl_attribute_is_frozen_as_ttl() -> None:
-    assert TTL_ATTRIBUTE == "ttl"
 
 
 def test_deployment_settings_resolve_the_full_frozen_contract() -> None:
@@ -112,18 +105,25 @@ def test_bootstrap_builds_handler_over_injected_clients(monkeypatch: pytest.Monk
     monkeypatch.setattr("boto3.Session", FakeSession, raising=False)
     monkeypatch.setattr(entry, "_region", lambda: "us-west-2")
     entry._handler.cache_clear()
-    handler = entry._handler()
+    handler, metrics = entry._handler()
     assert hasattr(handler, "handle")
-    # The metrics sink is retained for per-request latency publication.
-    assert getattr(handler, "_metrics_sink", None) is not None
+    # The metrics sink is returned alongside the handler for per-request latency.
+    assert metrics is not None
     entry._handler.cache_clear()
 
 
-def test_bounded_config_uses_read_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bounded_config_uses_persistence_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     # Local modules
     import operations.observe.lambda_entry as entry
 
     settings = resolve_observation_deployment_settings(env=_COMPLETE_ENV)
+    # Store/metrics clients derive their timeouts from the persistence budget
+    # and make a single attempt so no transparent SDK retry outlasts the budget.
     config = entry._bounded_config(settings)
-    assert config.read_timeout == settings.operations.per_read_budget_s
+    assert config.read_timeout == settings.operations.persistence_budget_s
     assert config.connect_timeout <= 2.0
+    assert config.retries["max_attempts"] == 1
+    # The GameLift read client derives its timeout from the per-read budget.
+    read_config = entry._read_config(settings)
+    assert read_config.read_timeout == settings.operations.per_read_budget_s
+    assert read_config.retries["max_attempts"] == 1

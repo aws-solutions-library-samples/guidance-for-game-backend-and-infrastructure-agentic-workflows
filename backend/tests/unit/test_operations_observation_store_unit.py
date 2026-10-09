@@ -69,11 +69,15 @@ class StatefulDynamoClient:
     def __init__(self) -> None:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
         self.transactions: list[list[dict[str, Any]]] = []
+        self.request_tokens: list[str | None] = []
         self.gets: list[tuple[str, str]] = []
         self.raise_non_conditional = False
 
-    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def transact_write_items(
+        self, *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         self.transactions.append(TransactItems)
+        self.request_tokens.append(ClientRequestToken)
         if self.raise_non_conditional:
             raise RuntimeError("throttled")
         # First pass: evaluate every condition against current state.
@@ -168,9 +172,8 @@ def _begin(
         workspace_id=WORKSPACE,
         idempotency_token=TOKEN,
         lease_holder=HOLDER,
-        commit_not_after=deadline or (NOW + timedelta(minutes=30)),
+        commit_not_after=deadline or (NOW + timedelta(seconds=15)),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent=INTENT,
     )
 
@@ -180,8 +183,7 @@ def _complete(store: DynamoDbObservationStore, observation: dict[str, Any] | Non
         operation_id=OPERATION_ID,
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
-        commit_not_after=NOW + timedelta(minutes=30),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
+        commit_not_after=NOW + timedelta(seconds=15),
         observation=observation or _observation(),
     )
 
@@ -208,7 +210,9 @@ def test_begin_snapshot_is_observing_with_lease() -> None:
     assert snapshot["generation"]["N"] == "1"
     assert snapshot["lease_holder"]["S"] == HOLDER
     assert snapshot["workspace_id"]["S"] == WORKSPACE
-    assert "ttl" in snapshot
+    # ADR 0005: the snapshot is retained for the audit/replay window and carries
+    # no DynamoDB ``ttl`` attribute.
+    assert "ttl" not in snapshot
 
 
 def test_begin_expired_deadline_fails_closed_without_writing() -> None:
@@ -247,6 +251,7 @@ def test_begin_changed_intent_is_idempotency_conflict() -> None:
     client = StatefulDynamoClient()
     store = _store(client)
     _begin(store)
+    before = {key: dict(value) for key, value in client.items.items()}
     # Same token, different fingerprint => conflict, never mutates the op.
     conflict = store.begin_observation(
         operation_id="obs_bbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -256,10 +261,11 @@ def test_begin_changed_intent_is_idempotency_conflict() -> None:
         lease_holder="request.observe-2",
         commit_not_after=NOW + timedelta(minutes=30),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent={"phase": "observe", "provider": "gamelift", "target": {"provider": "gamelift", "fleet_id": "fleet-z"}},
     )
     assert conflict.outcome is ObservationBeginOutcome.IDEMPOTENCY_CONFLICT
+    # The conflict mutated nothing: no second operation, no changed item.
+    assert client.items == before
 
 
 def test_begin_in_progress_when_not_yet_completed() -> None:
@@ -329,7 +335,6 @@ def test_complete_expired_deadline_fails_closed() -> None:
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
         commit_not_after=NOW - timedelta(seconds=1),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         observation=_observation(),
     )
     assert complete.outcome is ObservationCompleteOutcome.DEADLINE_EXPIRED
@@ -344,7 +349,6 @@ def test_complete_under_wrong_holder_is_state_conflict() -> None:
         workspace_id=WORKSPACE,
         lease_holder="request.someone-else",
         commit_not_after=NOW + timedelta(minutes=30),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         observation=_observation(),
     )
     assert complete.outcome is ObservationCompleteOutcome.STATE_CONFLICT
@@ -362,7 +366,6 @@ def test_fail_records_bounded_failed_transition() -> None:
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
         reason_code="provider_unavailable",
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
     )
     snapshot = client.items[(f"OP#{OPERATION_ID}", "STATE#current")]
     assert snapshot["state"]["S"] == "failed"
@@ -381,7 +384,6 @@ def test_fail_is_best_effort_and_swallows_errors() -> None:
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
         reason_code="provider_unavailable",
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
     )
 
 
@@ -449,7 +451,6 @@ def _seed_observing(
         lease_holder=holder,
         commit_not_after=NOW + timedelta(minutes=30),
         lease_not_after=NOW + timedelta(seconds=15),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         intent=INTENT,
     )
     snap = dict(client.items[(f"OP#{OPERATION_ID}", "STATE#current")])
@@ -470,10 +471,19 @@ def test_begin_reclaims_stale_lease_and_advances_generation() -> None:
     snapshot = client.items[(f"OP#{OPERATION_ID}", "STATE#current")]
     assert snapshot["generation"]["N"] == "2"
     assert snapshot["lease_holder"]["S"] == HOLDER  # the reclaiming caller's holder
-    # A recovery ledger transition was appended, keyed by the new generation.
-    assert (f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#2") in client.items
-    reclaim = client.items[(f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#2")]
+    # A recovery ledger transition was appended, keyed to sort between the
+    # create and terminal events and carrying a strictly increasing sequence.
+    assert (f"OP#{OPERATION_ID}", "LEDGER#0#RECLAIM#0002") in client.items
+    reclaim = client.items[(f"OP#{OPERATION_ID}", "LEDGER#0#RECLAIM#0002")]
     assert reclaim["event_type"]["S"] == "observation.lease_reclaimed"
+    assert reclaim["sub_sequence"]["N"] == "2"
+    # The reclaim event sorts after the create event and before the terminal one.
+    assert "LEDGER#0#RECLAIM#0002" > "LEDGER#0"
+    assert "LEDGER#0#RECLAIM#0002" < "LEDGER#1"
+    # The reclaimed lease is the caller's own request lease, not the far commit
+    # deadline, so a dead reclaimer frees the operation within one request lease.
+    reclaimed_lease = int(client.items[(f"OP#{OPERATION_ID}", "STATE#current")]["lease_not_after"]["N"])
+    assert reclaimed_lease <= int((NOW + timedelta(seconds=15)).timestamp())
 
 
 def test_begin_live_lease_is_in_progress_not_reclaimed() -> None:
@@ -483,7 +493,7 @@ def test_begin_live_lease_is_in_progress_not_reclaimed() -> None:
     retry = _begin(store, operation_id="obs_" + "b" * 26)
     assert retry.outcome is ObservationBeginOutcome.IN_PROGRESS
     # The live lease is untouched: no reclaim ledger event, generation unchanged.
-    assert (f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#2") not in client.items
+    assert (f"OP#{OPERATION_ID}", "LEDGER#0#RECLAIM#0002") not in client.items
     assert client.items[(f"OP#{OPERATION_ID}", "STATE#current")]["generation"]["N"] == "1"
 
 
@@ -503,13 +513,15 @@ def test_reclaim_race_loser_conditional_failure_is_in_progress_not_duplicate() -
     # its reclaim update would receive after the winner advanced the generation.
     original = client.transact_write_items
 
-    def _reject_stale_reclaim(*, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+    def _reject_stale_reclaim(
+        *, TransactItems: list[dict[str, Any]], ClientRequestToken: str | None = None
+    ) -> dict[str, Any]:
         for entry in TransactItems:
             if "Update" in entry:
                 vals = entry["Update"].get("ExpressionAttributeValues", {})
                 if ":cur_gen" in vals and int(vals[":cur_gen"]["N"]) == 1:
                     raise _TransactionCanceled("ConditionalCheckFailed")
-        return original(TransactItems=TransactItems)
+        return original(TransactItems=TransactItems, ClientRequestToken=ClientRequestToken)
 
     client.transact_write_items = _reject_stale_reclaim  # type: ignore[method-assign]
     # Force the loser to observe the pre-winner generation-1 lease as expired.
@@ -520,7 +532,7 @@ def test_reclaim_race_loser_conditional_failure_is_in_progress_not_duplicate() -
     loser = _begin(_store(client, clock=NOW), operation_id="obs_" + "c" * 26)
     assert loser.outcome is ObservationBeginOutcome.IN_PROGRESS
     # No duplicate reclaim ledger for a generation-3 was written.
-    assert (f"OP#{OPERATION_ID}", "LEDGER#RECLAIM#3") not in client.items
+    assert (f"OP#{OPERATION_ID}", "LEDGER#0#RECLAIM#0003") not in client.items
 
 
 def test_complete_under_reclaimed_generation_fences_out_superseded_writer() -> None:
@@ -535,7 +547,6 @@ def test_complete_under_reclaimed_generation_fences_out_superseded_writer() -> N
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
         commit_not_after=NOW + timedelta(minutes=30),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         observation=_observation(),
         generation=1,
     )
@@ -546,7 +557,6 @@ def test_complete_under_reclaimed_generation_fences_out_superseded_writer() -> N
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
         commit_not_after=NOW + timedelta(minutes=30),
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
         observation=_observation(),
         generation=2,
     )
@@ -566,7 +576,6 @@ def test_begin_replays_terminal_failure_distinctly_from_in_progress() -> None:
         workspace_id=WORKSPACE,
         lease_holder=HOLDER,
         reason_code="provider_unavailable",
-        ttl_epoch_s=int((NOW + timedelta(minutes=30)).timestamp()),
     )
     replay = _begin(store, operation_id="obs_" + "f" * 26)
     assert replay.outcome is ObservationBeginOutcome.REPLAY_FAILED
@@ -623,3 +632,114 @@ def test_begin_pure_conditional_reason_resolves_idempotency() -> None:
     # A pure ConditionalCheckFailed routes to idempotency resolution.
     retry = _begin(store, operation_id="obs_" + "b" * 26)
     assert retry.outcome is ObservationBeginOutcome.IN_PROGRESS
+
+
+# --- Retention: no DynamoDB TTL on any item (ADR 0005) ---------------------
+
+
+def test_begin_items_carry_no_ttl_attribute() -> None:
+    # The idempotency mapping, snapshot, both transitions, and the ledger events
+    # are retained for the full audit/replay window and carry no ``ttl``.
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    for key, item in client.items.items():
+        assert "ttl" not in item, f"{key} unexpectedly carries a ttl attribute"
+
+
+def test_complete_items_carry_no_ttl_attribute() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    _complete(store)
+    for key, item in client.items.items():
+        assert "ttl" not in item, f"{key} unexpectedly carries a ttl attribute"
+    # The complete snapshot update expression never sets a ttl.
+    complete_tx = client.transactions[-1]
+    update = next(e for e in complete_tx if "Update" in e)["Update"]
+    assert "ttl" not in update["UpdateExpression"]
+    assert "#ttl" not in update.get("ExpressionAttributeNames", {})
+
+
+def test_fail_items_carry_no_ttl_attribute() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    store.fail_observation(
+        operation_id=OPERATION_ID, workspace_id=WORKSPACE, lease_holder=HOLDER, reason_code="provider_unavailable"
+    )
+    for key, item in client.items.items():
+        assert "ttl" not in item, f"{key} unexpectedly carries a ttl attribute"
+
+
+# --- Golden fencing expressions: pin the exact conditional expressions ------
+#
+# These golden assertions pin the exact ConditionExpression strings so inverting
+# a comparison in the complete, fail, or reclaim fence fails a test even though
+# the stateful fake decides conditions from the value map.
+
+
+def test_complete_condition_expression_is_pinned() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    _complete(store)
+    update = next(e for e in client.transactions[-1] if "Update" in e)["Update"]
+    assert update["ConditionExpression"] == (
+        "attribute_exists(PK) AND #state = :observing AND #seq = :zero "
+        "AND #gen = :gen AND lease_holder = :holder AND lease_not_after > :now"
+    )
+    assert update["UpdateExpression"] == (
+        "SET #state = :succeeded, #seq = :one, last_transition = :state1, observation_hash = :hash"
+    )
+
+
+def test_fail_condition_expression_is_pinned() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    store.fail_observation(
+        operation_id=OPERATION_ID, workspace_id=WORKSPACE, lease_holder=HOLDER, reason_code="provider_unavailable"
+    )
+    update = next(e for e in client.transactions[-1] if "Update" in e)["Update"]
+    assert update["ConditionExpression"] == (
+        "attribute_exists(PK) AND #state = :observing AND #seq = :zero " "AND #gen = :gen AND lease_holder = :holder"
+    )
+
+
+def test_reclaim_condition_expression_is_pinned() -> None:
+    client = StatefulDynamoClient()
+    _seed_observing(client, lease_not_after=int((NOW - timedelta(seconds=1)).timestamp()))
+    store = _store(client, clock=NOW)
+    _begin(store, operation_id="obs_" + "b" * 26)
+    reclaim_tx = client.transactions[-1]
+    update = next(e for e in reclaim_tx if "Update" in e)["Update"]
+    assert update["ConditionExpression"] == (
+        "attribute_exists(PK) AND #state = :observing AND #seq = :zero "
+        "AND #gen = :cur_gen AND lease_not_after <= :now"
+    )
+
+
+# --- Deterministic ClientRequestToken on every transaction -----------------
+
+
+def test_begin_passes_deterministic_client_request_token() -> None:
+    # A retried begin whose first attempt committed must not resurface as a
+    # spurious conflict: the transaction carries a deterministic idempotency
+    # token so botocore's transparent retry is a server-side no-op.
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    assert client.request_tokens[0] is not None
+    assert len(client.request_tokens[0]) <= 36
+    # The token is stable for the same operation/phase/generation.
+    client2 = StatefulDynamoClient()
+    _begin(_store(client2))
+    assert client.request_tokens[0] == client2.request_tokens[0]
+
+
+def test_complete_and_fail_tokens_differ_by_phase() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    _complete(store)
+    begin_token, complete_token = client.request_tokens[0], client.request_tokens[-1]
+    assert begin_token != complete_token
