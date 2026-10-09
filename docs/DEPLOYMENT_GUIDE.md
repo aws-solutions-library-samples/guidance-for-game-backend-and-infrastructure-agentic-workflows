@@ -280,6 +280,53 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
 **AI usage (variable)**: $20-630+/month depending on query volume and conversation length
 
+### Optional operations control plane (E1)
+
+The optional E1 operations control plane is **default-unprovisioned** and adds
+**$0.00** incremental cost. A default deployment leaves `Provisioned=false` and
+creates no HTTP API route, compute, table, bucket, metric, or alarm. The stack is
+**not** wired into `deploy-all.sh`; it is deployed and torn down only by the
+dedicated shell wrappers (`scripts/infrastructure/deploy-operations.sh` and
+`scripts/infrastructure/teardown-operations.sh`). See
+[OPERATIONS_E1_DEPLOYMENT.md](OPERATIONS_E1_DEPLOYMENT.md) for the full runbook.
+
+When enabled it deploys the accepted synchronous, read-only GameLift observation
+design ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with
+**no queue, worker, dead-letter queue, or Step Functions** in the observation
+path and no provider-write permission. Provisioning and runtime authority are
+separate: an emergency `--disable` keeps every resource and its retained audit
+data under CloudFormation and flips only the runtime kill switch, so a disabled
+but still-provisioned stack continues to incur the fixed standing charges below.
+
+Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**;
+free-tier allowances excluded):
+
+| Scenario | Provisioned | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- | --- |
+| Default (unprovisioned) | no | $0.00 | $0.00 | **$0.00** |
+| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, idle | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations/mo | yes | $1.84 | $3.49 | **$5.33** |
+
+Enabled resources and their charge basis:
+
+| Service | Basis | Notes |
+| --- | --- | --- |
+| API Gateway (HTTP API) | $1.00 / million requests | 1 route; 100K req ≈ $0.10 |
+| Compute (Lambda, x86, 512 MB) | $0.20 / M requests + $0.0000166667 / GB-s | 1.0 s billed/req modelled; scales to zero when idle |
+| DynamoDB (on-demand) | WRU $0.625/M, RRU $0.125/M | 16 WRU + 4 RRU per observation (transactional) |
+| DynamoDB storage + PITR | $0.25 + $0.20 / GB-mo | small standing footprint |
+| S3 (content-addressed) | $0.023 / GB-mo + $0.005/1K PUT + $0.0004/1K GET | 1 PUT + 1 GET per observation, ~8 KB objects |
+| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 metrics + 4 alarms (always-on fixed cost) |
+| CloudWatch logs | $0.50 / GB ingest + $0.03 / GB-mo | ~8 KB per request |
+| X-Ray | $5.00 / million traces | 1 trace per observation |
+
+**Denial-of-wallet controls:** create an AWS Budget on the optional stack's
+cost-allocation tag; set DynamoDB on-demand per-table maximum read/write request
+units; enable HTTP API stage throttling; and alarm on request count and
+error/timeout rate. Disable by setting operations mode to `disabled`; remove all
+cost by tearing the optional stack down.
+
 ### Cost Optimization Tips
 
 - Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch

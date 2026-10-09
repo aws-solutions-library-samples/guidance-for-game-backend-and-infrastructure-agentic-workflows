@@ -1,0 +1,860 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Game Agent - OPTIONAL E1 operations observation control plane (GitHub issue
+  #413). Default-unprovisioned: this stack is not wired into deploy-all.sh, and
+  every resource is gated on the ResourcesProvisioned condition (Provisioned
+  defaults to "false"), so a deploy with defaults creates ZERO E1 resources and
+  costs $0. Provisioning (Provisioned=true) and runtime authority (OperationsMode
+  observe|disabled) are SEPARATE: an emergency disable sets OperationsMode=disabled
+  while keeping Provisioned=true, so resources and their retained audit data stay
+  under CloudFormation with stable physical names and a later re-enable is
+  reversible. Implements the accepted synchronous, read-only GameLift observation
+  design in docs/adr/0005-persist-operations-and-recover-workflows.md. No
+  provider-write permission, no queue/worker/dead-letter queue, and no Step
+  Functions are created.
+
+# W1030 is suppressed below because CodeS3Bucket and CodeS3Key intentionally
+# default to '' in the unprovisioned state; the Rules section asserts both are
+# non-empty whenever Provisioned=true, which cfn-lint cannot see through when it
+# resolves the bare defaults.
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W1030
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming.
+
+  Provisioned:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: >-
+      Initial-provisioning authority, SEPARATE from the runtime OperationsMode
+      kill switch. "false" (the default) creates ZERO E1 resources, so a default
+      new stack costs $0 and holds no data. "true" provisions the full E1
+      resource set (KMS key, DynamoDB table, log groups, role, Lambda, HTTP API,
+      alarms). Provisioning is a deliberate, owner-approved act. Once "true", it
+      MUST stay "true" for the life of the data: an emergency disable flips
+      OperationsMode to "disabled" but keeps Provisioned="true" so every resource
+      stays under CloudFormation with stable physical names and retained audit
+      data, and a later re-enable is reversible. Setting it back to "false"
+      REMOVES the resources (data-bearing ones detach under their retain policy)
+      and is a teardown decision, not a disable.
+
+  OperationsMode:
+    Type: String
+    Default: disabled
+    AllowedValues:
+      - disabled
+      - observe
+    Description: >-
+      Runtime authority (kill switch) for a PROVISIONED control plane, SEPARATE
+      from the Provisioned flag that controls whether resources exist at all.
+      "disabled" (the default) is fail-closed: injected as GBAW_OPERATIONS_MODE
+      so the handler and API reject every operation. "observe" is the only
+      enabled mode for E1: synchronous, read-only GameLift observation. On an
+      already-provisioned stack, an emergency disable sets this to "disabled"
+      while leaving Provisioned="true" (resources and data retained, reversible);
+      it does NOT delete resources. "observe" requires Provisioned="true".
+
+  Environment:
+    Type: String
+    Default: beta
+    AllowedValues:
+      - beta
+      - prod
+    Description: >-
+      Target environment. "prod" enables DynamoDB deletion protection and a
+      longer log-retention posture appropriate to production audit data.
+
+  CognitoIssuer:
+    Type: String
+    Default: ''
+    Description: >-
+      JWT issuer URL (Cognito user pool issuer, e.g.
+      https://cognito-idp.us-west-2.amazonaws.com/us-west-2_example) bound to the
+      HTTP API authorizer. Required when OperationsMode=observe.
+
+  CognitoClientId:
+    Type: String
+    Default: ''
+    Description: >-
+      Cognito application client id used as the JWT audience on every route.
+      Required when OperationsMode=observe.
+
+  TenantId:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted tenant binding injected into the runtime as
+      GBAW_OPERATIONS_TENANT_ID. Required when OperationsMode=observe.
+
+  WorkspaceId:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted workspace binding injected into the runtime as
+      GBAW_OPERATIONS_WORKSPACE_ID. Required when OperationsMode=observe.
+
+  TrustedAudience:
+    Type: String
+    Default: ''
+    Description: >-
+      Server-side trusted audience the runtime enforces (GBAW_OPERATIONS_TRUSTED_AUDIENCE).
+      Defaults to the Cognito client id when left empty at enable time (the
+      wrapper supplies it); an explicit value overrides.
+
+  CodeS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 bucket holding the packaged operations Lambda artifact. Supplied by the
+      deploy wrapper after it builds and uploads a deterministic zip. Required
+      when OperationsMode=observe.
+
+  CodeS3Key:
+    Type: String
+    Default: ''
+    Description: >-
+      Content-hash-addressed S3 key of the packaged operations Lambda artifact.
+      Supplied by the deploy wrapper. Required when OperationsMode=observe.
+
+  RequestDeadlineSeconds:
+    Type: Number
+    Default: 15
+    MinValue: 5
+    MaxValue: 29
+    Description: >-
+      Total observation request budget in seconds (ADR 0005), used ONLY as the
+      Lambda function Timeout. It is NOT injected as a runtime environment
+      variable: the core settings module derives the effective deadline from the
+      per-read + persistence sub-budgets plus the cancellation margin. Bounded
+      below the 30 s API Gateway HTTP API integration ceiling so the request
+      fails closed before the gateway times out.
+
+  PerReadBudgetSeconds:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      Per-provider-read sub-budget in seconds (ADR 0005), injected as
+      GBAW_OPERATIONS_PER_READ_BUDGET_S. A read that blocks past this bound is
+      abandoned and a typed retryable error is raised.
+
+  PersistenceBudgetSeconds:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      Persistence + canonical serialization sub-budget in seconds (ADR 0005),
+      injected as GBAW_OPERATIONS_PERSISTENCE_BUDGET_S.
+
+  CancellationMarginSeconds:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 29
+    Description: >-
+      Cancellation-margin sub-budget in seconds (ADR 0005), injected as
+      GBAW_OPERATIONS_CANCELLATION_MARGIN_S. Reserved headroom so an in-flight
+      request is abandoned before the gateway integration ceiling is reached.
+
+  ObservationTtlSeconds:
+    Type: Number
+    Default: 1800
+    MinValue: 60
+    Description: >-
+      Observation freshness / DynamoDB TTL horizon in seconds for the transient
+      observation records, injected as GBAW_OPERATIONS_OBSERVATION_TTL_S (the
+      value the handler stamps on the `ttl` attribute). Matches the core default
+      (1800 s = 30 min). The audit ledger and idempotency mapping are retained
+      for the full audit window and are not TTL-managed.
+
+  LambdaMemoryMb:
+    Type: Number
+    Default: 512
+    MinValue: 128
+    MaxValue: 3008
+    Description: Lambda memory size (MB); matches the accepted E1 cost model.
+
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+    Description: >-
+      Reserved concurrency cap for the observation function. Bounds blast radius
+      and is a denial-of-wallet control.
+
+  MaxReadRequestUnits:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    Description: DynamoDB on-demand maximum read request units (denial-of-wallet cap).
+
+  MaxWriteRequestUnits:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    Description: DynamoDB on-demand maximum write request units (denial-of-wallet cap).
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: HTTP API stage throttling burst limit (denial-of-wallet control).
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: HTTP API stage throttling steady-state rate limit (denial-of-wallet control).
+
+Conditions:
+  # Resource existence gate. Every resource references THIS, driven by the
+  # Provisioned flag (default "false"), so a default deploy provisions nothing
+  # and costs $0. This is deliberately DECOUPLED from OperationsMode: an
+  # emergency disable sets OperationsMode=disabled but keeps Provisioned="true",
+  # so the resources and their retained data stay under CloudFormation and a
+  # later re-enable is reversible.
+  ResourcesProvisioned: !Equals [!Ref Provisioned, 'true']
+  # Runtime authority (kill switch). Does NOT gate resource existence; it only
+  # feeds the injected GBAW_OPERATIONS_MODE so a provisioned-but-disabled stack
+  # fails closed at the handler/API.
+  OperationsEnabled: !Equals [!Ref OperationsMode, observe]
+  IsProd: !Equals [!Ref Environment, prod]
+  # An explicit trusted audience overrides the Cognito client id fallback.
+  HasExplicitTrustedAudience: !Not [!Equals [!Ref TrustedAudience, '']]
+
+Rules:
+  # Reject the unsafe combination "observe without provisioning": the runtime
+  # authority can only be enabled when the resources it needs actually exist.
+  # This is what makes --enable require Provisioned=true and prevents an
+  # observe-mode deploy against a zero-resource stack.
+  EnabledModeRequiresProvisioning:
+    RuleCondition: !Equals [!Ref OperationsMode, observe]
+    Assertions:
+      - Assert: !Equals [!Ref Provisioned, 'true']
+        AssertDescription: >-
+          OperationsMode=observe requires Provisioned=true; enabling runtime
+          authority against a zero-resource (unprovisioned) stack is rejected.
+
+  # Whenever resources exist (Provisioned=true) the bindings those resources
+  # reference — the JWT issuer/audience on the authorizer, the trusted
+  # tenant/workspace bindings, and the Lambda code artifact — must be non-empty,
+  # in observe AND in disabled-after-provision. This is why an emergency disable
+  # must REUSE the existing parameter values rather than blanking them: a
+  # provisioned stack can never carry an empty issuer, audience, tenant,
+  # workspace, or code artifact.
+  ProvisionedRequiresInputs:
+    RuleCondition: !Equals [!Ref Provisioned, 'true']
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CognitoIssuer, '']]
+        AssertDescription: CognitoIssuer is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref CognitoClientId, '']]
+        AssertDescription: CognitoClientId is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref TenantId, '']]
+        AssertDescription: TenantId is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref WorkspaceId, '']]
+        AssertDescription: WorkspaceId is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref CodeS3Bucket, '']]
+        AssertDescription: CodeS3Bucket is required when Provisioned=true.
+      - Assert: !Not [!Equals [!Ref CodeS3Key, '']]
+        AssertDescription: CodeS3Key is required when Provisioned=true.
+
+Resources:
+  # --------------------------------------------------------------------------- #
+  # KMS customer-managed key for at-rest encryption of E1 audit data.
+  # The key policy also grants the CloudWatch Logs service principal the
+  # encrypt/decrypt actions it needs to write to the CMK-encrypted log groups,
+  # scoped to this account's operations log groups.
+  # --------------------------------------------------------------------------- #
+  OperationsKmsKey:
+    Type: AWS::KMS::Key
+    Condition: ResourcesProvisioned
+    # RetainExceptOnCreate: keep the CMK on teardown/replacement, but delete it
+    # if the stack's initial create rolls back (avoids orphaning an empty key).
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub 'CMK for ${ProjectName} optional operations control plane (E1)'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountManagement
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # CloudWatch Logs needs the full encrypt/decrypt/describe action set to
+          # attach this CMK to a log group; granting only Decrypt+GenerateDataKey
+          # is what caused the beta create to fail with AccessDenied at both log
+          # groups. These are the documented least-privilege service actions,
+          # scoped by encryption context to EXACTLY the two operations log groups
+          # (Lambda + API access) via their full ARNs (no account-wide wildcard).
+          - Sid: AllowCloudWatchLogsEncryptDecrypt
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'kms:EncryptionContext:aws:logs:arn':
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-operations-observe'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  OperationsKmsAlias:
+    Type: AWS::KMS::Alias
+    Condition: ResourcesProvisioned
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-operations'
+      TargetKeyId: !Ref OperationsKmsKey
+
+  # --------------------------------------------------------------------------- #
+  # DynamoDB: operation-state snapshot, immutable transitions, idempotency
+  # mapping, lease, and append-only ledger — single table, PK/SK.
+  # --------------------------------------------------------------------------- #
+  OperationsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ResourcesProvisioned
+    # RetainExceptOnCreate: preserve audit data on teardown/replacement, but
+    # delete the empty table if the initial create rolls back (no orphan).
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-operations'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref OperationsKmsKey
+      # Denial-of-wallet: cap on-demand throughput.
+      OnDemandThroughput:
+        MaxReadRequestUnits: !Ref MaxReadRequestUnits
+        MaxWriteRequestUnits: !Ref MaxWriteRequestUnits
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # Log groups: Lambda logs + HTTP API access logs, with retention.
+  # --------------------------------------------------------------------------- #
+  ObservationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-operations-observe'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !GetAtt OperationsKmsKey.Arn
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ResourcesProvisioned
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-operations-access'
+      RetentionInDays: !If [IsProd, 90, 14]
+      KmsKeyId: !GetAtt OperationsKmsKey.Arn
+
+  # Grant the CloudWatch Logs vended-log delivery principal permission to write
+  # HTTP API access logs into the access log group. Without this resource policy
+  # the API's access-log delivery fails. Scoped to this account and this API.
+  AccessLogDeliveryResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: ResourcesProvisioned
+    DependsOn: AccessLogGroup
+    Properties:
+      PolicyName: !Sub '${ProjectName}-operations-access-log-delivery'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "ApiGatewayAccessLogDelivery",
+              "Effect": "Allow",
+              "Principal": { "Service": "delivery.logs.amazonaws.com" },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access:*",
+              "Condition": {
+                "StringEquals": { "aws:SourceAccount": "${AWS::AccountId}" },
+                "ArnLike": { "aws:SourceArn": "arn:${AWS::Partition}:apigateway:${AWS::Region}::/apis/${HttpApi}" }
+              }
+            }
+          ]
+        }
+
+  # --------------------------------------------------------------------------- #
+  # IAM: dedicated, least-privilege observation execution role.
+  # Exactly three GameLift reads; DynamoDB limited to dynamodb:PutItem, UpdateItem,
+  # and GetItem -- the exact underlying item actions the deployed E1 store
+  # (operations.observation_store.DynamoDbObservationStore) requires: conditional
+  # Put legs and fenced Update legs inside its TransactWriteItems calls, plus
+  # strongly-consistent GetItem reads for idempotency/replay resolution, result
+  # loads, and status. Transactional legs are authorized by the underlying
+  # PutItem/UpdateItem/DeleteItem/GetItem permissions, not by any
+  # "TransactWriteItems" action (which does not exist in IAM). Plus the documented
+  # DynamoDB customer-managed-key data-plane action set pinned to DynamoDB via
+  # kms:ViaService, with CreateGrant isolated and guarded by
+  # kms:GrantIsForAWSResource=true; namespace-scoped PutMetricData. No S3, no
+  # GameLift writes, no iam:PassRole, no Step Functions, no Query/Scan/DeleteItem/
+  # Batch*/ConditionCheckItem, no direct/generic KMS use, no wildcard action.
+  # --------------------------------------------------------------------------- #
+  ObservationRole:
+    Type: AWS::IAM::Role
+    Condition: ResourcesProvisioned
+    Properties:
+      RoleName: !Sub '${ProjectName}-operations-observe-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: GameLiftReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GameLiftThreeReads
+                Effect: Allow
+                Action:
+                  - 'gamelift:DescribeFleetUtilization'
+                  - 'gamelift:DescribeFleetCapacity'
+                  - 'gamelift:DescribeScalingPolicies'
+                Resource: '*'
+        - PolicyName: OperationsTableAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The deployed E1 store is operations.observation_store
+              # .DynamoDbObservationStore (NOT the E0 e0_persistence sink). Across
+              # its lifecycle it issues TransactWriteItems calls whose legs are
+              # conditional *Put* legs AND fenced *Update* legs
+              # (begin/reclaim/complete/fail), plus strongly-consistent *GetItem*
+              # reads (idempotency/replay resolution, result loads, and status).
+              # Per the AWS "Using IAM with DynamoDB transactions" guide, the
+              # Put/Update/Delete/Get legs of a transaction are governed by the
+              # underlying PutItem/UpdateItem/DeleteItem/GetItem permissions --
+              # there is no "dynamodb:TransactWriteItems" IAM action (granting it
+              # is ineffective and cfn-lint flags it W3037). So the exact
+              # underlying action set this role needs is dynamodb:PutItem,
+              # dynamodb:UpdateItem, and dynamodb:GetItem, scoped to the exact
+              # table ARN. Query, Scan, DeleteItem, Batch*, ConditionCheckItem,
+              # and provider writes remain denied by omission (see the negative-
+              # IAM and store-driven drift contract tests).
+              #
+              # Ref:
+              #   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis-iam.html
+              - Sid: TableScopedItemActions
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:GetItem'
+                Resource:
+                  - !GetAtt OperationsTable.Arn
+        - PolicyName: OperationsKmsUse
+          # DynamoDB encrypts this table with the operations customer-managed
+          # key (CMK). Server-side encryption at rest with a CMK requires the
+          # *caller's* role to hold the full documented DynamoDB CMK data-plane
+          # action set -- Encrypt, Decrypt, ReEncrypt*, GenerateDataKey*, and
+          # DescribeKey -- plus a resource-scoped CreateGrant. A role holding only
+          # Decrypt + GenerateDataKey is exactly what raised the live
+          # begin_observation DynamoDB AccessDeniedException (GitHub issue #413),
+          # even though the IAM simulator allowed TransactWriteItems/GetItem.
+          #
+          # Both statements are pinned to DynamoDB via kms:ViaService so this
+          # grant can never be exercised for direct, generic KMS use; the key can
+          # only be touched through DynamoDB on this caller's behalf. CreateGrant
+          # is isolated in its own statement and further guarded by
+          # kms:GrantIsForAWSResource=true so the runtime can only create grants
+          # on behalf of the AWS resource (DynamoDB), never arbitrary grants.
+          #
+          # Refs:
+          #   https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/encryption.usagenotes.html
+          #   https://docs.aws.amazon.com/kms/latest/developerguide/conditions-kms.html
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DynamoDbCmkDataPlane
+                Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !GetAtt OperationsKmsKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+              - Sid: DynamoDbCmkCreateGrant
+                Effect: Allow
+                Action:
+                  - 'kms:CreateGrant'
+                Resource:
+                  - !GetAtt OperationsKmsKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'dynamodb.${AWS::Region}.amazonaws.com'
+                  Bool:
+                    'kms:GrantIsForAWSResource': 'true'
+        - PolicyName: OperationsLogsAndMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource:
+                  - !GetAtt ObservationFunctionLogGroup.Arn
+                  - !Sub '${ObservationFunctionLogGroup.Arn}:*'
+              - Sid: PublishScopedMetrics
+                Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'GameAgent/Operations'
+              - Sid: XRayTraceWrite
+                Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # Lambda: request-scoped observation compute. Code is a real packaged artifact
+  # loaded from S3 (built and uploaded by the deploy wrapper under a content-hash
+  # key); no inline shim is ever the deployed artifact for an enabled route.
+  # --------------------------------------------------------------------------- #
+  ObservationFunction:
+    Type: AWS::Lambda::Function
+    Condition: ResourcesProvisioned
+    DependsOn: ObservationFunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-operations-observe'
+      Runtime: python3.13
+      Architectures:
+        - x86_64
+      Handler: operations.observe.lambda_entry.handler
+      Role: !GetAtt ObservationRole.Arn
+      MemorySize: !Ref LambdaMemoryMb
+      Timeout: !Ref RequestDeadlineSeconds
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          GBAW_OPERATIONS_MODE: !Ref OperationsMode
+          GBAW_OPERATIONS_TABLE_NAME: !Ref OperationsTable
+          GBAW_OPERATIONS_METRIC_NAMESPACE: 'GameAgent/Operations'
+          GBAW_OPERATIONS_TENANT_ID: !Ref TenantId
+          GBAW_OPERATIONS_WORKSPACE_ID: !Ref WorkspaceId
+          GBAW_OPERATIONS_TRUSTED_AUDIENCE: !If
+            - HasExplicitTrustedAudience
+            - !Ref TrustedAudience
+            - !Ref CognitoClientId
+          GBAW_OPERATIONS_PER_READ_BUDGET_S: !Ref PerReadBudgetSeconds
+          GBAW_OPERATIONS_PERSISTENCE_BUDGET_S: !Ref PersistenceBudgetSeconds
+          GBAW_OPERATIONS_CANCELLATION_MARGIN_S: !Ref CancellationMarginSeconds
+          GBAW_OPERATIONS_OBSERVATION_TTL_S: !Ref ObservationTtlSeconds
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Component
+          Value: operations-observation
+        - Key: CostCenter
+          Value: game-operations
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --------------------------------------------------------------------------- #
+  # API Gateway HTTP API with a Cognito/JWT authorizer on every route.
+  # --------------------------------------------------------------------------- #
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations'
+      ProtocolType: HTTP
+      # Restrictive CORS: no wildcard origin, credentials disabled by omission.
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+          - GET
+        AllowHeaders:
+          - authorization
+          - content-type
+        MaxAge: 300
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-observation
+        CostCenter: game-operations
+        ManagedBy: cloudformation
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: ResourcesProvisioned
+    Properties:
+      Name: !Sub '${ProjectName}-operations-jwt'
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Issuer: !Ref CognitoIssuer
+        Audience:
+          - !Ref CognitoClientId
+
+  ObservationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ObservationFunction.Arn
+      PayloadFormatVersion: '2.0'
+      # Bounded below the 30 s ceiling (milliseconds).
+      TimeoutInMillis: 29000
+
+  ObserveRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /operations/observe'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  # GET status route: core (#413) implements the operation status read behind
+  # this frozen path parameter route (GET /operations/{operationId}).
+  StatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ResourcesProvisioned
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /operations/{operationId}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${ObservationIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: ResourcesProvisioned
+    # !GetAtt AccessLogGroup.Arn would provide an implicit dependency on the log
+    # group, but the DestinationArn below is a constructed !Sub ARN (see note),
+    # so declare the dependency explicitly: the log group must exist before the
+    # stage streams access logs to it.
+    DependsOn: AccessLogGroup
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        # API Gateway stores the access-log DestinationArn as the BARE log-group
+        # ARN, without the ":*" log-stream wildcard that !GetAtt <LogGroup>.Arn
+        # returns. Supplying the GetAtt form makes CloudFormation drift detection
+        # report this stage MODIFIED on every run (expected "...:*" vs the API's
+        # stored "..."). Construct the exact ARN API Gateway keeps from the
+        # pseudo-parameters and the AccessLogGroup's own name so the rendered
+        # value is byte-identical to the live value and no drift is reported.
+        DestinationArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/${ProjectName}-operations-access'
+        Format: >-
+          {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
+      DefaultRouteSettings:
+        # API-safe kill switch: when OperationsMode is not "observe" (e.g. after
+        # an emergency --disable on a provisioned stack) the gateway throttles to
+        # zero, so the API itself fails closed and rejects every request BEFORE
+        # the integration — without deleting the stage or any resource. When
+        # enabled, the operator-tuned denial-of-wallet limits apply.
+        ThrottlingBurstLimit: !If [OperationsEnabled, !Ref ThrottlingBurstLimit, 0]
+        ThrottlingRateLimit: !If [OperationsEnabled, !Ref ThrottlingRateLimit, 0]
+        DetailedMetricsEnabled: true
+      Tags:
+        Project: !Ref ProjectName
+        Component: operations-observation
+        ManagedBy: cloudformation
+
+  ObservationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ResourcesProvisioned
+    Properties:
+      FunctionName: !Ref ObservationFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # --------------------------------------------------------------------------- #
+  # CloudWatch alarms on the four frozen metrics.
+  # --------------------------------------------------------------------------- #
+  ObservationFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-failures'
+      AlarmDescription: Observation requests are failing.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ObservationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ObservationTimeoutsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-timeouts'
+      AlarmDescription: Observation requests are exceeding their deadline.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ObservationTimeouts
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  StuckOperationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-stuck'
+      AlarmDescription: Stuck or lease-expired operations detected.
+      Namespace: 'GameAgent/Operations'
+      MetricName: StuckOperations
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ObservationLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: ResourcesProvisioned
+    Properties:
+      AlarmName: !Sub '${ProjectName}-operations-latency'
+      AlarmDescription: Observation request latency approaching the request deadline.
+      Namespace: 'GameAgent/Operations'
+      MetricName: ObservationRequestLatency
+      # p99 is a percentile and must be an ExtendedStatistic, not Statistic.
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 1
+      # 27,000 ms acceptance ceiling from ADR 0005 (ceiling - margin).
+      Threshold: 27000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  Provisioned:
+    Description: >-
+      Whether this stack has provisioned the E1 resource set. "false" means zero
+      resources ($0, no data). "true" means resources exist; a disabled-but-
+      provisioned stack keeps them (and their retained data) under CloudFormation.
+    Value: !Ref Provisioned
+
+  OperationsMode:
+    Description: >-
+      Effective runtime authority (kill switch) for this stack. "disabled" fails
+      closed; "observe" serves read-only observation. Independent of Provisioned.
+    Value: !Ref OperationsMode
+
+  HttpApiEndpoint:
+    Condition: ResourcesProvisioned
+    Description: Base URL of the authenticated operations HTTP API.
+    Value: !GetAtt HttpApi.ApiEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-OperationsHttpApiEndpoint'
+
+  OperationsTableName:
+    Condition: ResourcesProvisioned
+    Description: DynamoDB table for operation state, idempotency, and the ledger.
+    Value: !Ref OperationsTable
+    Export:
+      Name: !Sub '${ProjectName}-OperationsTableName'
+
+  ObservationRoleArn:
+    Condition: ResourcesProvisioned
+    Description: Dedicated least-privilege observation execution role ARN.
+    Value: !GetAtt ObservationRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-OperationsObservationRoleArn'
+
+  OperationsMetricNamespace:
+    Condition: ResourcesProvisioned
+    Description: CloudWatch namespace for E1 metrics.
+    Value: 'GameAgent/Operations'

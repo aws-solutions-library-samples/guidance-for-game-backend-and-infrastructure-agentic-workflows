@@ -114,6 +114,51 @@ The following table provides a sample cost breakdown for deploying this Guidance
 
 > **Note:** The dominant cost driver is model token usage (Sonnet + Haiku = $630, or 84% of total). Infrastructure costs are minimal at this query volume. Token volumes above are estimates based on ~8 model turns per query; actual costs depend on conversation length and specialist complexity. HTTP request volume is estimated at ~100K/month (10K agent queries × ~10 HTTP requests each for auth, polling, streaming, and static assets); ALB and WAF rows use this shared assumption. Prompt caching break-even requires a cache-read share above ~22% of cached tokens — monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch. Minimum cache checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5).
 
+### Optional operations control plane (E1)
+
+The optional E1 operations control plane is **default-unprovisioned and adds no
+incremental cost** to the numbers above. A default deployment leaves
+`Provisioned=false`, so it creates **zero** resources, costs **$0.00**, and holds
+no data. Nothing in the table changes unless an owner explicitly **provisions and
+enables** operations. This stack is not wired into `deploy-all.sh`; it is deployed
+and torn down only by the dedicated shell wrappers documented in
+[docs/OPERATIONS_E1_DEPLOYMENT.md](docs/OPERATIONS_E1_DEPLOYMENT.md).
+
+Note that *disabling* an already-provisioned stack is **not** the $0 state: an
+emergency `--disable` keeps every resource (and its retained audit data) under
+CloudFormation and flips only the runtime kill switch, so the standing (fixed)
+charges below continue until the stack is torn down. When enabled, E1 deploys the
+accepted synchronous, read-only GameLift observation design
+([ADR 0005](docs/adr/0005-persist-operations-and-recover-workflows.md)): an
+API Gateway HTTP API route, request-scoped compute (modelled as AWS Lambda,
+x86, 512 MB), an Amazon DynamoDB on-demand table (with PITR) for operation
+state, idempotency, and the append-only ledger, an Amazon S3 bucket for
+content-addressed observation records, and CloudWatch logs, metrics, and
+alarms with X-Ray tracing. There is **no queue, worker, dead-letter queue, or
+Step Functions** in the observation path, and no provider-write permission is
+deployed.
+
+Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**, AWS
+Price List us-west-2 rates; free-tier allowances intentionally excluded):
+
+| Scenario | Provisioned | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- | --- |
+| Default (unprovisioned) | no | $0.00 | $0.00 | **$0.00** |
+| Disabled after provision (data retained) | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, idle (0 requests) | yes | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations | yes | $1.84 | $3.49 | **$5.33** |
+
+> **Default-unprovisioned vs. disabled-after-provision.** The **$0.00** row is
+> the *default, unprovisioned* stack — no resources, no data. A
+> *disabled-but-provisioned* stack (after an emergency `--disable`) keeps its
+> retained DynamoDB table (storage + PITR), KMS key, log groups, and CloudWatch
+> alarms/metrics, so it continues to cost the **fixed** standing charges and to
+> **retain audit data** — the same fixed cost as "enabled, idle". Disabling stops
+> serving requests; it does not stop the standing cost. Only teardown removes the
+> resources. Variable cost scales linearly at ~$0.0000349 per observation
+> request. This documents an optional design; it does not assert the operations
+> stack is deployed.
+
 ## Prerequisites
 
 ### Required Tools
