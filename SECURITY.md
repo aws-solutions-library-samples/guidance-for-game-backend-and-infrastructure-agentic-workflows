@@ -684,19 +684,39 @@ operation outcomes. They do not contain prompt text, extracted names,
 semantic-memory content, email addresses, display names, raw Cognito subjects,
 or raw session/thread identifiers.
 
-- Correlation uses a per-request ID. A value that must stay tied to a principal
-  or session across lines is emitted as a bounded, non-reversible token:
-  `redact_identifier()` (`backend/src/utils/security.py`, salted SHA-256 prefix
-  keyed by `GBAW_LOG_REDACTION_SALT`) on the backend and `redact()`
-  (`ui/src/utils/logger.ts`) on the frontend.
+- Correlation uses a per-request ID. The backend binds the AgentCore runtime
+  request ID into every log record for the duration of an invocation, so lines
+  from one request can be correlated without any raw identifier. A value that
+  must stay tied to a principal or session across lines is emitted as a
+  bounded, non-reversible token: `redact_identifier()`
+  (`backend/src/utils/security.py`, a keyed HMAC-SHA-256 prefix over a random
+  per-process key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
+  the frontend. The HMAC key is random per process and is never read from the
+  environment, so a token is stable only within a single process and does not
+  correlate across processes, restarts, or tiers. The frontend additionally
+  records the runtime's own request ID from the `x-amzn-RequestId` response
+  header so a request can be traced across tiers.
 - Externally influenced fields are normalized before emission so carriage
-  returns, line feeds, and other control characters cannot inject additional
-  log records (`normalize_log_value()` / `sanitize_log_data()` on the backend;
-  control-character stripping in the frontend logger).
+  returns, line feeds, other C0/C1/DEL control characters, the Unicode line and
+  paragraph separators, and bidirectional-formatting controls cannot inject
+  additional log records or reorder a rendered line. The backend normalizes
+  every record at the logging sink (`normalize_log_value()` applied by the
+  logger patcher in `backend/src/utils/logger.py`); the frontend logger strips
+  the same classes in `logInfo`, `logWarning`, `logError`, `logDebug`, and
+  `redact`.
+- The AgentCore SDK installs its own log handler whose formatter would emit the
+  raw runtime session ID on every invocation. `agentcore_main` wraps that
+  formatter so the serialized `sessionId` is replaced with a bounded token while
+  `requestId` is preserved.
 - Semantic-memory logging records only outcomes and counts.
-- Error logs preserve the exception class and traceback via Loguru's exception
-  API with `diagnose=False`; local variable values and provider error payloads
-  are not disclosed.
+- Error logs record the exception class name and a typed, sanitized error code
+  (and the request ID), never the exception message, which can embed a provider
+  validation payload or caller value. The full traceback is emitted only when
+  debug logging is explicitly enabled (a non-production switch). The
+  Cost Explorer diagnostic path is a deliberate, separately governed exception:
+  it retains the exception message because the message is required to classify
+  Cost Explorer failures, and that path does not carry prompt or identity
+  values.
 
 ### Secrets Management
 
@@ -718,7 +738,12 @@ or raw session/thread identifiers.
 
 - User data isolated per actor_id
 - Memory can be cleared via API (`/api/memory/clear`)
-- No PII stored in logs (prompt text and identifiers excluded; see Application Log Minimization)
+- No PII in application log messages (prompt text and identifiers excluded; see
+  Application Log Minimization). Distributed-trace span content is governed
+  separately: the tracing SDK can attach prompt and response content to GenAI
+  spans, controlled by `OTEL_SEMCONV_STABILITY_OPT_IN`
+  (`gen_ai_unredacted_attributes`). Narrowing trace-span content is tracked as a
+  follow-up.
 
 ### SOC 2 / ISO 27001
 

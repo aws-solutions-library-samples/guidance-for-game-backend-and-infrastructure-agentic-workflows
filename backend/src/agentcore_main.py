@@ -55,7 +55,7 @@ from config.settings import (
     resolve_runtime_host,
 )
 from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
-from utils.logger import logger
+from utils.logger import _REQUEST_ID_VAR, logger
 from utils.response_parser import ResponseParser
 from utils.security import (
     InputValidationError,
@@ -64,6 +64,8 @@ from utils.security import (
     check_rate_limit,
     create_encryption_context,
     get_rate_limit_key,
+    log_sanitized_exception,
+    normalize_log_value,
     redact_identifier,
     validate_conversation_history,
     validate_prompt,
@@ -165,6 +167,81 @@ prewarm_container()
 
 app = BedrockAgentCoreApp()
 
+
+def _current_request_id() -> str:
+    """Return the AgentCore request ID for log correlation, or ``-``.
+
+    The runtime assigns a server-generated request ID per invocation. It is a
+    non-sensitive correlation value (it is not derived from caller identity or
+    content), so it may be logged as-is, after control-character normalization
+    as a defensive measure. Binding it into every record is what lets the lines
+    of a single invocation be correlated without emitting any raw identifier.
+    """
+    try:
+        # Third-party packages
+        from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+
+        request_id = BedrockAgentCoreContext.get_request_id()
+    except Exception:
+        request_id = None
+    return normalize_log_value(request_id) if request_id else "-"
+
+
+def _redact_agentcore_sdk_session_id() -> None:
+    """Stop the AgentCore SDK log handler from emitting the raw session ID.
+
+    ``BedrockAgentCoreApp`` installs its own JSON handler on the
+    ``bedrock_agentcore.app`` logger. Its ``RequestContextFormatter`` reads the
+    runtime session ID from a context variable and writes it verbatim on every
+    invocation record. The frontend sets that session header to the
+    environment-isolated thread ID, so the raw thread/session ID would otherwise
+    reach the runtime log stream on every request.
+
+    Because the formatter reads a context variable (not a record attribute), a
+    ``logging.Filter`` cannot strip the field. The narrowest fix is to wrap the
+    existing formatter so the serialized ``sessionId`` is replaced with a
+    bounded, non-reversible token while ``requestId`` and everything else are
+    preserved. If the SDK's handler shape changes, this degrades to a no-op
+    rather than breaking logging.
+    """
+    try:
+        # Standard library
+        import json
+        import logging
+
+        sdk_logger = logging.getLogger("bedrock_agentcore.app")
+        for handler in list(sdk_logger.handlers):
+            base_formatter = handler.formatter
+            if base_formatter is None:
+                continue
+
+            class _SessionRedactingFormatter(logging.Formatter):
+                def __init__(self, inner: logging.Formatter) -> None:
+                    super().__init__()
+                    self._inner = inner
+
+                def format(self, record: logging.LogRecord) -> str:
+                    rendered = self._inner.format(record)
+                    # The SDK formatter emits JSON; redact sessionId in place and
+                    # fall back to the untouched line if the shape is unexpected.
+                    try:
+                        payload = json.loads(rendered)
+                    except (ValueError, TypeError):
+                        return rendered
+                    if isinstance(payload, dict) and payload.get("sessionId"):
+                        payload["sessionId"] = redact_identifier(payload["sessionId"])
+                        return json.dumps(payload, ensure_ascii=False)
+                    return rendered
+
+            if not isinstance(base_formatter, _SessionRedactingFormatter):
+                handler.setFormatter(_SessionRedactingFormatter(base_formatter))
+    except Exception:
+        # Logging hardening must never prevent the app from starting.
+        pass
+
+
+_redact_agentcore_sdk_session_id()
+
 # Memory ID from environment (set by AgentCore CLI or deployment)
 MEMORY_ID = os.getenv("BEDROCK_AGENTCORE_MEMORY_ID")
 
@@ -210,6 +287,8 @@ def invoke_agent(prompt, context=None):
     Returns:
         Agent response string
     """
+    request_id = _current_request_id()
+    _request_id_token = _REQUEST_ID_VAR.set(request_id)
     try:
         logger.info("=" * 80)
         logger.info("🚀 AGENTCORE INVOCATION START")
@@ -246,7 +325,7 @@ def invoke_agent(prompt, context=None):
             thread_id = prompt.get("thread_id")
             user_context = prompt.get("user_context", {})
             logger.info("📦 Prompt type: dict")
-            logger.info(f"📦 Prompt keys: {list(prompt.keys())}")
+            logger.info(f"📦 Prompt key count: {len(prompt)}")
         else:
             user_prompt = str(prompt)
             thread_id = None
@@ -412,18 +491,26 @@ def invoke_agent(prompt, context=None):
         return response_text
 
     except Exception as e:
-        # Preserve exception class + traceback for diagnosis via loguru's
-        # exception API. Production sinks run with diagnose=False, so local
-        # variable VALUES (prompts, tokens, identifiers) are not annotated into
-        # the traceback. The one-line message carries only the exception class,
-        # never its string payload, so provider error bodies cannot leak.
+        # Record a bounded, non-sensitive failure: the exception class, a typed
+        # sanitized error code, and the request ID for correlation. The raw
+        # exception message is deliberately not emitted — a provider validation
+        # error or SDK error body can quote caller values (prompt text, actor or
+        # session IDs) and may itself carry CR/LF. The full traceback is written
+        # only when debug logging is explicitly enabled (a dev-only switch).
         logger.error("=" * 80)
-        logger.opt(exception=e).error(f"❌ AGENTCORE INVOCATION ERROR ({type(e).__name__})")
+        log_sanitized_exception(
+            logger,
+            "❌ AGENTCORE INVOCATION ERROR",
+            e,
+            request_id=request_id,
+        )
         logger.error("=" * 80)
 
         return (
             "I encountered an error processing your request. Please try again or contact support if the issue persists."
         )
+    finally:
+        _REQUEST_ID_VAR.reset(_request_id_token)
 
 
 def run_server():

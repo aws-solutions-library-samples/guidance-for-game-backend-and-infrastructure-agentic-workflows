@@ -501,7 +501,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] 🔗 Thread/Session:`);
     logInfo(`[${requestId}]   Environment: ${envPrefix}`);
     logInfo(`[${requestId}]   Thread: ${redact(threadId)}`);
-    logInfo(`[${requestId}]   Isolated thread: ${envPrefix}:${redact(isolatedThreadId)}`);
     logInfo(`[${requestId}]   Memory isolation: Dev and prod sessions are separate`);
 
     // Call AgentCore Runtime
@@ -550,7 +549,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 Payload to AgentCore:`);
       logInfo(`[${requestId}]   prompt: ${message.length} chars`);
-      logInfo(`[${requestId}]   thread_id: ${redact(isolatedThreadId)}`);
       logInfo(`[${requestId}]   user_context.user_id: ${redact(payload.user_context.user_id)}`);
       logInfo(`[${requestId}]   user_context.session_id: ${redact(payload.user_context.session_id)}`);
 
@@ -574,7 +572,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       responseContent = await runtimeResponse.text();
-      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed`);
+      // Correlate the proxy requestId with the runtime's own request ID so a
+      // single invocation can be traced across tiers without logging any raw
+      // identifier. The value is a server-generated AWS request ID (not derived
+      // from caller identity), carried in the standard x-amzn-RequestId response
+      // header.
+      const runtimeRequestId = runtimeResponse.headers?.get?.('x-amzn-RequestId') ?? 'unknown';
+      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed (runtime request ${redact(runtimeRequestId)})`);
 
       // AgentCore serializes a string return value as a JSON string.
       try {

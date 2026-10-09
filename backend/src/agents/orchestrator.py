@@ -44,7 +44,7 @@ from config.settings import (
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
-from utils.security import redact_identifier
+from utils.security import log_sanitized_exception, redact_identifier
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 
 # Optional memory integration imports (may not be available in all environments)
@@ -355,7 +355,7 @@ def run_orchestrator(query: str, context: dict = None):
                 logger.debug("✅ Agent created with memory")
 
             except Exception as e:
-                logger.warning(f"⚠️ Memory setup failed, using fallback: {e}")
+                log_sanitized_exception(logger, "⚠️ Memory setup failed, using fallback", e)
                 agent = None
         else:
             logger.debug("ℹ️  Memory not configured, using agent without memory")
@@ -461,11 +461,11 @@ def run_orchestrator(query: str, context: dict = None):
                 try:
                     extract_and_save_user_info(actor_id, query, str(response))
                 except Exception as e:
-                    logger.debug(f"⚠️ Semantic memory extraction skipped: {e}")
+                    log_sanitized_exception(logger, "⚠️ Semantic memory extraction skipped", e)
 
         logger.info(f"✅ Orchestrator complete ({len(str(response))} chars)")
         return response
 
     except Exception as e:
-        logger.error(f"❌ Orchestrator error: {e}")
+        log_sanitized_exception(logger, "❌ Orchestrator error", e)
         raise
