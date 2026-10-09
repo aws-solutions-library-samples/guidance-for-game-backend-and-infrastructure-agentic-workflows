@@ -326,8 +326,8 @@ ignores the bypass whenever hosted mode is on.
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
-- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 4.5)
-- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 4.6)
+- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 5.5)
 - `GBAW_BEDROCK_MODEL_ID` / `GBAW_BEDROCK_MODEL_ID_SECONDARY` - Legacy compatibility aliases
 - `GBAW_TENANT_ID` - Server-side tenant binding (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID` - Server-side workspace binding (default: `default-workspace`)
