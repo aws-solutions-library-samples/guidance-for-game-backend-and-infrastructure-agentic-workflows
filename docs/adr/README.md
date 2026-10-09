@@ -1,8 +1,8 @@
 # Architecture Decision Records
 
 These records define accepted and proposed architecture boundaries for the
-current chat path, the planned optional operations control plane, and optional
-remote access.
+current chat path, the planned optional operations control plane, optional
+remote access, and the web user interface.
 
 An accepted record is a constraint on future implementation. A proposed record
 requires architecture review. Neither status means that the described
@@ -16,7 +16,7 @@ existing Game Agent chat path remains the current product behavior.
 | [ADR 0003](0003-isolate-provider-writes.md) | Accepted | Isolate provider writes behind prepared executors |
 | [ADR 0004](0004-expose-governed-public-mcp-facade.md) | Proposed | Expose a governed public MCP facade |
 | [ADR 0005](0005-persist-operations-and-recover-workflows.md) | Accepted | Persist operations state and recover workflows |
-| [ADR 0007](0007-adopt-cloudscape-with-parallel-shell-cutover.md) | Accepted | Adopt Cloudscape with a parallel-shell cutover |
+| [ADR 0007](0007-adopt-cloudscape-with-parallel-shell-cutover.md) | Proposed | Adopt Cloudscape with a parallel-shell cutover |
 
 Later architecture issues define versioned contracts, trusted principal
 context, and incremental cost. Those details must not weaken the boundaries
