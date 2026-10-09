@@ -6,6 +6,7 @@ Downloads AWS documentation and converts to markdown for Knowledge Base ingestio
 Uses HTTP ETags and Last-Modified headers to avoid unnecessary downloads.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -21,44 +22,56 @@ import html2text
 # Cache duration: 7 days
 CACHE_DAYS = 7
 
-# Reviewed lifecycle status of each source, written into the document header so
-# retrieval cannot present older guidance as the current recommended path.
+# Bump when the generated document format changes; cached entries written by an
+# older format are regenerated instead of kept.
+OUTPUT_FORMAT_VERSION = 2
+
+# Reviewed lifecycle status of each source. The rule:
+#   current    - the recommended approach still applies, even if the service has
+#                since been renamed (for example GameLift to GameLift Servers).
+#   historical - the recommended approach, feature set, or pricing has since been
+#                replaced; kept only as background.
+#   sample     - walks through one specific sample, starter kit, or demo
+#                implementation rather than the service's general guidance.
+# Non-current documents repeat a short qualifier at every heading and at least
+# every QUALIFIER_SPACING characters, so every Knowledge Base chunk carries it.
 LIFECYCLE_NOTES = {
     "current": "Current guidance.",
     "historical": (
         "Historical. Kept for background; details may be out of date. "
         "Current AWS documentation takes precedence."
     ),
+    "sample": (
+        "Sample walkthrough. Shows one example implementation; adapt it rather than treating "
+        "it as the general recommendation."
+    ),
 }
+QUALIFIER_LABELS = {"historical": "Historical source", "sample": "Sample walkthrough"}
+QUALIFIER_SPACING = 600
 
 # AWS Documentation URLs (HTML only - S3 Vectors has size limits).
 # The domain key is the owning specialist; every entry declares a lifecycle.
 DOCS_CONFIG = {
     "gamelift": [
         {
-            "url": "https://docs.aws.amazon.com/gamelift/latest/developerguide/gamelift-intro.html",
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/gamelift-intro.html",
             "output": "developer-guide.md",
             "title": "GameLift Developer Guide",
             "lifecycle": "current"
         },
         {
-            "url": "https://aws.amazon.com/blogs/gametech/reduce-cost-by-up-to-90-with-amazon-gamelift-fleetiq-and-spot-instances/",
-            "output": "blog-fleetiq-spot-cost.md",
-            "title": "Reduce Cost by up to 90% with Amazon GameLift FleetIQ and Spot Instances",
-            # 2018 post; pricing and feature details predate GameLift Servers.
-            "lifecycle": "historical"
-        },
-        {
             "url": "https://aws.amazon.com/blogs/gametech/how-to-host-your-unreal-engine-game-for-under-1-per-player-with-amazon-gamelift/",
             "output": "blog-unreal-under-1-dollar.md",
             "title": "How to Host Your Unreal Engine Game for Under $1 per Player with Amazon GameLift",
-            "lifecycle": "current"
+            # 2023 post; its EC2 fleet setup and per-player cost math predate container fleets.
+            "lifecycle": "historical"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/faster-multiplayer-hosting-with-containers-on-amazon-gamelift-servers/",
             "output": "blog-gamelift-container-fleets.md",
             "title": "Faster Multiplayer Hosting with Containers on Amazon GameLift Servers",
-            "lifecycle": "current"
+            # Walkthrough of the Containers Starter Kit sample.
+            "lifecycle": "sample"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/leverage-fully-managed-containers-to-host-multiplayer-games-at-global-scale-on-amazon-gamelift/",
@@ -99,7 +112,7 @@ DOCS_CONFIG = {
             "lifecycle": "current"
         },
         {
-            "url": "https://aws.github.io/aws-eks-best-practices/",
+            "url": "https://docs.aws.amazon.com/eks/latest/best-practices/introduction.html",
             "output": "best-practices.md",
             "title": "EKS Best Practices",
             "lifecycle": "current"
@@ -114,7 +127,8 @@ DOCS_CONFIG = {
             "url": "https://aws.amazon.com/blogs/gametech/optimize-game-servers-hosting-with-containers/",
             "output": "blog-optimize-containers.md",
             "title": "Optimize Game Servers Hosting with Containers",
-            "lifecycle": "current"
+            # 2022 post; predates GameLift Servers container fleets.
+            "lifecycle": "historical"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/new-solution-guidance-for-building-scalable-cross-platform-game-backends-on-aws/",
@@ -146,13 +160,15 @@ DOCS_CONFIG = {
             "url": "https://aws.amazon.com/blogs/gametech/choose-the-right-compute-strategy-for-your-global-game-servers/",
             "output": "blog-global-compute-strategy.md",
             "title": "Choose the Right Compute Strategy for Your Global Game Servers",
-            "lifecycle": "current"
+            # 2020 post; instance families and pricing guidance have changed.
+            "lifecycle": "historical"
         },
         {
             "url": "https://aws.amazon.com/blogs/gametech/cost-optimize-your-minecraft-java-ec2-server/",
             "output": "blog-cost-optimize-minecraft-ec2.md",
             "title": "Cost Optimize Your Minecraft Java EC2 Server",
-            "lifecycle": "current"
+            # Walkthrough for one specific self-managed EC2 game server.
+            "lifecycle": "sample"
         }
     ]
 }
@@ -190,21 +206,38 @@ class DocScraper:
         with open(self.cache_file, 'w') as f:
             json.dump(self.cache, f, indent=2)
 
-    def _is_cache_valid(self, cache_key: str) -> bool:
+    @staticmethod
+    def _fingerprint(doc_config: Dict) -> str:
+        """Identify what a generated file depends on besides the page itself."""
+        material = {
+            "format": OUTPUT_FORMAT_VERSION,
+            "title": doc_config["title"],
+            "url": doc_config["url"],
+            "lifecycle": doc_config["lifecycle"],
+        }
+        return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _is_cache_valid(self, cache_key: str, fingerprint: str) -> bool:
         if cache_key not in self.cache:
             return False
 
         cached = self.cache[cache_key]
+        if cached.get('fingerprint') != fingerprint:
+            # Written by an older output format, or for a different title,
+            # URL, or lifecycle: regenerate.
+            return False
         cached_date = datetime.fromisoformat(cached.get('cached_at', '2000-01-01'))
         age_days = (datetime.now() - cached_date).days
 
         return age_days < CACHE_DAYS
 
-    def _fetch_with_etag(self, url: str, cache_key: str) -> Optional[str]:
+    def _fetch_with_etag(self, url: str, cache_key: str, fingerprint: str) -> Optional[str]:
         headers = {}
 
-        if cache_key in self.cache:
-            cached = self.cache[cache_key]
+        cached = self.cache.get(cache_key)
+        # Conditional headers only when the existing file was generated for the
+        # same fingerprint; otherwise a 304 would keep an outdated file.
+        if cached and cached.get('fingerprint') == fingerprint:
             if 'etag' in cached:
                 headers['If-None-Match'] = cached['etag']
             if 'last_modified' in cached:
@@ -220,6 +253,7 @@ class DocScraper:
             if response.status_code == 200:
                 self.cache[cache_key] = {
                     'url': url,
+                    'fingerprint': fingerprint,
                     'etag': response.headers.get('ETag'),
                     'last_modified': response.headers.get('Last-Modified'),
                     'cached_at': datetime.now().isoformat()
@@ -300,11 +334,12 @@ class DocScraper:
         print(f"\n📄 {doc_config['title']}")
         print(f"   URL: {url}")
 
-        if self._is_cache_valid(cache_key) and output_file.exists():
+        fingerprint = self._fingerprint(doc_config)
+        if self._is_cache_valid(cache_key, fingerprint) and output_file.exists():
             print(f"  ✅ Cache valid (age < {CACHE_DAYS} days)")
             return True
 
-        html = self._fetch_with_etag(url, cache_key)
+        html = self._fetch_with_etag(url, cache_key, fingerprint)
 
         if html is None and output_file.exists():
             return True
@@ -339,9 +374,10 @@ class DocScraper:
         published = self._published_date(html)
         if published:
             header += f"Published: {published}\n"
-        header += f"Status: {LIFECYCLE_NOTES[doc_config.get('lifecycle', 'current')]}\n"
+        lifecycle = doc_config['lifecycle']
+        header += f"Status: {LIFECYCLE_NOTES[lifecycle]}\n"
         header += "\n"
-        full_content = header + markdown
+        full_content = header + self._qualify(markdown, lifecycle, published)
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -349,6 +385,58 @@ class DocScraper:
 
         print(f"  ✅ Downloaded ({len(full_content)} chars)")
         return True
+
+    @staticmethod
+    def _qualify(markdown: str, lifecycle: str, published: Optional[str]) -> str:
+        """Repeat a short qualifier through a non-current document.
+
+        Knowledge Base chunking splits a document into fixed-size pieces, and only
+        the first piece holds the header. The qualifier is appended to every
+        heading and inserted at a word boundary at least every
+        QUALIFIER_SPACING characters, so each chunk carries it.
+        """
+        label = QUALIFIER_LABELS.get(lifecycle)
+        if not label:
+            return markdown
+        qualifier = f"({label}, published {published}.)" if published else f"({label}.)"
+        out: list = []
+        since = QUALIFIER_SPACING  # qualify the opening text too, not just later chunks
+        for line in markdown.split("\n"):
+            if line.startswith("#"):
+                out.append(f"{line} {qualifier}")
+                since = 0
+                continue
+            pieces = re.split(r"(\s+)", line)
+            rebuilt = []
+            for piece in pieces:
+                rebuilt.append(piece)
+                since += len(piece)
+                if since >= QUALIFIER_SPACING and piece and piece.isspace():
+                    rebuilt.append(f"{qualifier} ")
+                    since = 0
+            out.append("".join(rebuilt))
+            since += 1
+        return "\n".join(out)
+
+    def prune_orphans(self) -> list:
+        """Delete generated files and cache entries for sources no longer configured."""
+        removed = []
+        configured = {domain: {doc["output"] for doc in docs} for domain, docs in DOCS_CONFIG.items()}
+        for domain, outputs in configured.items():
+            domain_dir = self.output_dir / domain
+            if not domain_dir.is_dir():
+                continue
+            for path in sorted(domain_dir.glob("*.md")):
+                if path.name not in outputs:
+                    path.unlink()
+                    removed.append(f"{domain}/{path.name}")
+        for key in list(self.cache):
+            domain, _, name = key.partition("/")
+            if domain in configured and name not in configured[domain]:
+                del self.cache[key]
+        for name in removed:
+            print(f"  🗑️  Removed {name} (no longer a configured source)")
+        return removed
 
     def scrape_all(self) -> bool:
         success_count = 0
@@ -363,6 +451,7 @@ class DocScraper:
                 if self.scrape_doc(domain, doc):
                     success_count += 1
 
+        self.prune_orphans()
         self._save_cache()
 
         print(f"\n{'='*60}")
