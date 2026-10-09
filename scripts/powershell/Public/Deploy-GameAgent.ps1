@@ -14,6 +14,10 @@ function Deploy-GameAgent {
         AWS CLI profile. Default: reads from ui/.env.local or uses "default".
     .PARAMETER SkipFrontend
         Skip frontend steps (6-8) even if Docker is available.
+    .PARAMETER ConfigureAccountObservability
+        Opt in to account-wide X-Ray / CloudWatch Logs changes (trace segment
+        destination, default indexing rule, shared Logs resource policy). Omitted
+        by default so the deployment makes no shared, cross-application changes.
     .EXAMPLE
         Deploy-GameAgent
     .EXAMPLE
@@ -24,7 +28,8 @@ function Deploy-GameAgent {
         [string]$ProjectName = 'game-agent',
         [string]$Region = 'us-west-2',
         [string]$Profile,
-        [switch]$SkipFrontend
+        [switch]$SkipFrontend,
+        [switch]$ConfigureAccountObservability
     )
 
     $ErrorActionPreference = 'Stop'
@@ -192,9 +197,9 @@ function Deploy-GameAgent {
     Write-GameAgentStatus 'Managed Prompts deployed' -Type Success
     Write-Host ''
 
-    # ── Step 1.7: Account-wide observability ──
-    Write-GameAgentStatus 'Step 1.7: Setting up account-wide observability...' -Type Info
-    Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs
+    # ── Step 1.7: Account-wide observability (scoped, opt-in) ──
+    Write-GameAgentStatus 'Step 1.7: Account-wide observability...' -Type Info
+    Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ConfigureAccountObservability:$ConfigureAccountObservability
     Write-Host ''
 
     # ── Step 2: AgentCore Runtime ──
@@ -304,28 +309,16 @@ function Deploy-GameAgent {
 
         # ── Step 2b: CloudWatch delivery for runtime traces ──
         Write-GameAgentStatus 'Step 2b: Ensuring CloudWatch delivery for runtime traces...' -Type Info
-        $deliverySourceName = "$runtimeId-traces-source"
-        $deliveryDestName = "$runtimeId-traces-destination"
-
-        try { Invoke-Aws logs put-delivery-source --name $deliverySourceName --log-type TRACES --resource-arn $runtimeArn --region $Region | Out-Null }
-        catch { <# already exists #> }
-        Write-Host '  Delivery source OK'
-
-        $deliveryDestArn = ''
-        try {
-            $destResult = (Invoke-Aws logs put-delivery-destination --name $deliveryDestName --delivery-destination-type XRAY --region $Region) | ConvertFrom-Json
-            $deliveryDestArn = $destResult.deliveryDestination.arn
-        } catch {
-            $accountId = $identity.Account
-            $deliveryDestArn = "arn:aws:logs:${Region}:${accountId}:delivery-destination:${deliveryDestName}"
-        }
-        Write-Host '  Delivery destination OK'
-
-        if ($deliveryDestArn) {
-            try { Invoke-Aws logs create-delivery --delivery-source-name $deliverySourceName --delivery-destination-arn $deliveryDestArn --region $Region | Out-Null }
-            catch { <# already exists #> }
-            Write-Host '  Delivery OK'
-        }
+        $deliveryInvoker = {
+            param([string[]]$AwsArgs)
+            Invoke-Aws @AwsArgs
+        }.GetNewClosure()
+        Invoke-GameAgentTraceDelivery `
+            -RuntimeId $runtimeId `
+            -RuntimeArn $runtimeArn `
+            -AccountId $identity.Account `
+            -Region $Region `
+            -InvokeAws $deliveryInvoker
         Write-GameAgentStatus 'Runtime traces delivery configured' -Type Success
         Write-Host ''
     } finally { Pop-Location }

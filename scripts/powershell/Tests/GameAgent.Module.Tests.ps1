@@ -44,6 +44,7 @@ Describe 'GameAgent Module' {
             'Invoke-GameAgentPromptDeploy'
             'Invoke-GameAgentPromptTeardown'
             'Invoke-GameAgentWafReconciliation'
+            'Invoke-GameAgentTraceDelivery'
             'New-GameAgentAgentCoreEnvArgs'
         )
         $exported = (Get-Module -Name GameAgent).ExportedCommands.Keys
