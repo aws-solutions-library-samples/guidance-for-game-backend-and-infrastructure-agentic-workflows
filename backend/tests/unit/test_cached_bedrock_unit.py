@@ -38,7 +38,9 @@ class TestCachedBedrockModels:
         assert call_args["region_name"] == AWS_REGION
         assert call_args["cache_prompt"] == "default"
         assert call_args["cache_tools"] == "default"
-        assert call_args["temperature"] == 0.1
+        # The default orchestrator model rejects temperature and turns thinking off.
+        assert "temperature" not in call_args
+        assert call_args["additional_request_fields"] == {"thinking": {"type": "disabled"}}
         assert call_args["max_tokens"] == 4096
         assert result == mock_model
 
@@ -59,6 +61,9 @@ class TestCachedBedrockModels:
         assert call_args["region_name"] == AWS_REGION
         assert call_args["cache_prompt"] == "default"
         assert call_args["cache_tools"] == "default"
+        # The default specialist model rejects temperature and turns thinking off.
+        assert "temperature" not in call_args
+        assert call_args["additional_request_fields"] == {"thinking": {"type": "between_tools"}}
         assert result == mock_model
 
     @patch("models.cached_bedrock.BedrockModel")

@@ -107,12 +107,14 @@ cp ui/.env.local.example ui/.env.local
 
 Edit `ui/.env.local` if you need to customize:
 - `AWS_REGION`: Your deployment region
-- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 5.5)
-- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 5.5)
+- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (commented out; default from `model_settings.py`: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (commented out; default from `model_settings.py`: Claude Sonnet 5.5)
 - `GBAW_TENANT_ID`: Trusted tenant binding for this deployment (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID`: Trusted workspace binding for this deployment (default: `default-workspace`)
 
 Process environment values take precedence over `ui/.env.local`. The canonical role variables above take precedence over the compatibility aliases `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; empty values are treated as unset. The deployment passes the resolved role IDs to AgentCore on both initial launch and updates.
+
+> **Upgrading an existing deployment:** The two model-ID lines ship commented out so the defaults come from `backend/src/config/model_settings.py`. If your existing `ui/.env.local` was created from an earlier example, it may still pin `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID` to the previous model generation. Those pinned values take precedence over the defaults, so a redeploy keeps those models until you update or delete those two lines. After redeploying, confirm the resolved model IDs in the startup log and `scripts/deploy.sh` output name the models you expect.
 
 Tenant and workspace are server-side identity bindings. The deployment passes
 them to the frontend container without a `NEXT_PUBLIC_` prefix; browser request
@@ -264,7 +266,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | Dominant cost | Uses `global.*` cross-region model IDs; per-token rates pending confirmation from the [Bedrock pricing page](https://aws.amazon.com/bedrock/pricing/) |
+| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$369 | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Both run with thinking off |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
 | Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
@@ -278,15 +280,21 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | Cognito | Free | Up to 50,000 MAUs |
 
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
-**AI usage (variable)**: $20-630+/month depending on query volume and conversation length
+**AI usage (variable)**: ~$369/month at ~10,000 queries/month (Claude Sonnet 5.5 + Haiku 5.5, thinking off); scales with query volume and conversation length
 
 ### Cost Optimization Tips
 
-- Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5. Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
+- Prompt caching is enabled by default and uses the default 5-minute TTL. Cache-read share must exceed ~22% of cached tokens for Haiku 5.5 and ~21% for Sonnet 5.5 to break even (writes cost 1.25× input; reads cost 0.1× input for Haiku 5.5 and 0.05× for Sonnet 5.5). Min checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5 (see the Bedrock [prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) guide). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
 - Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage — near-zero cost at small scale
 - ECS Fargate scales between 1-4 tasks based on load (configurable via MinTasks/MaxTasks)
 - AgentCore Runtime only charges for active CPU time; memory is billed for full session duration regardless of I/O wait
 - Monitor CloudWatch dashboards to track AI token consumption
+
+### Optional: application inference profiles for cost attribution
+
+The optional helper scripts `scripts/infrastructure/manage-inference-profile.sh` and `scripts/infrastructure/get-inference-profile-ids.sh` create and resolve Game Agent application inference profiles so Cost Explorer can attribute token spend per role. They are not called by `scripts/deploy.sh`; run them by hand only if you want this attribution.
+
+The profile names track the current model generation (`GameAgent-Orchestrator-Claude-Haiku-5-5` and `GameAgent-Specialist-Claude-Sonnet-5-5`). If you created profiles under earlier names, run `manage-inference-profile.sh create <region>` to create the current ones and delete the previous-generation profiles manually; they are not removed automatically. When no profile exists under the current names, `get-inference-profile-ids.sh` prints a stderr notice and falls back to the resolved model IDs.
 
 ## Environment Variables Reference
 

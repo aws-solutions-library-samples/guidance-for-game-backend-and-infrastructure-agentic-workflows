@@ -267,7 +267,10 @@ EMBEDDING_DIMENSION = int(os.getenv("GBAW_EMBEDDING_DIMENSION", "1024"))
 # =============================================================================
 # BEDROCK QUOTA PLANNING (Well-Architected GenAI Lens: Reliability 1)
 # =============================================================================
-# Default Bedrock on-demand quotas (us-west-2, Claude Haiku 5.5 cross-region):
+# Example Bedrock on-demand quota-planning values (us-west-2, Claude Haiku 5.5
+# cross-region). These are illustrative planning figures, not verified Service
+# Quotas values; confirm the current limits in Service Quotas for your account
+# and model before relying on them:
 #   Requests per minute (RPM): 100   (cross-region inference profile)
 #   Tokens per minute  (TPM): 200,000 input / 200,000 output
 #
