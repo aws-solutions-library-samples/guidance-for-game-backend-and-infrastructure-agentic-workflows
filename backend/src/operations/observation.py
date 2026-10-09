@@ -156,6 +156,18 @@ class ObservationErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
+# A terminally stored failure reason maps back to the exact typed code the first
+# response returned, so a same-token replay of a lost response is identical to
+# it. ``provider_contract_invalid`` is a server fault (500); any unrecognized or
+# missing reason falls back to the non-retryable provider-unavailable response.
+_TERMINAL_REASON_TO_ERROR_CODE: dict[str, ObservationErrorCode] = {
+    "not_found": ObservationErrorCode.NOT_FOUND,
+    "contract_invalid": ObservationErrorCode.CONTRACT_INVALID,
+    "provider_contract_invalid": ObservationErrorCode.INTERNAL_ERROR,
+    "provider_unavailable": ObservationErrorCode.PROVIDER_UNAVAILABLE,
+}
+
+
 class ObservationBoundaryError(RuntimeError):
     """A safe, protocol-neutral fail-closed failure returned by the service."""
 
@@ -583,14 +595,10 @@ class ObservationService:
             # returns its stored bounded failure deterministically and is NOT
             # retryable, because the same idempotency token can never make
             # progress. A caller that wants to try again must start a new
-            # operation with a fresh idempotency token.
-            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "terminal"})
-            raise ObservationBoundaryError(
-                ObservationErrorCode.PROVIDER_UNAVAILABLE,
-                "a prior observation for this idempotency token failed terminally; "
-                "start a new operation with a new idempotency token",
-                retryable=False,
-            )
+            # operation with a fresh idempotency token. The stored reason is
+            # mapped back to the exact typed code the first response returned so
+            # a lost 404 / 400 / 500 replays as the same error, not a 503.
+            return self._replay_terminal_failure(begin)
 
         if begin.outcome is ObservationBeginOutcome.IN_PROGRESS:
             return self._resume_in_progress(begin)
@@ -788,16 +796,23 @@ class ObservationService:
             lambda: self._reader.read_capacity(request.fleet_id),
             lambda: self._reader.read_scaling_policies(request.fleet_id),
         ]
+        # If begin itself consumed the request budget (a slow conflict/reclaim
+        # chain), fail closed with the retryable budget error BEFORE the first
+        # read and BEFORE any terminal record. The operation is left observing so
+        # a retry reclaims it after the lease expires — the token is never burned
+        # on a provider failure for time spent in the store.
+        self._check_budget(request_start, total_deadline_s, phase="read")
         try:
             utilization, capacity, scaling_policies = self._run_reads(
                 reads, request_start=request_start, total_deadline_s=total_deadline_s
             )
         except _ProviderClassifiedError as exc:
             # A recognized provider condition (unknown fleet / unsupported
-            # request) is typed and non-retryable: record the matching terminal
-            # reason, then raise the typed boundary error so the handler returns
-            # NOT_FOUND / CONTRACT_INVALID rather than a retryable 503.
-            self._metrics.record("observation.failed", 1.0, dimensions={"reason": exc.reason_code})
+            # request) is typed and non-retryable. Record the matching terminal
+            # reason BEFORE emitting metrics so a metrics fault can never leave
+            # the snapshot stranded in ``observing``, then raise the typed
+            # boundary error so the handler returns NOT_FOUND / CONTRACT_INVALID
+            # rather than a retryable 503.
             self._store.fail_observation(
                 operation_id=operation_id,
                 workspace_id=requester_identity["workspace_id"],
@@ -805,6 +820,7 @@ class ObservationService:
                 reason_code=exc.reason_code,
                 generation=generation,
             )
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": exc.reason_code})
             raise ObservationBoundaryError(exc.error_code, exc.safe_message, retryable=False) from exc
         except (DeadlineExceededError, PartialObservationError) as exc:
             # Record the terminal failure transition BEFORE emitting metrics so a
@@ -867,8 +883,9 @@ class ObservationService:
         except ObservationContractError as exc:
             # The provider's own data failed our observation contract. This is a
             # server/provider-side fault, not a malformed client request, so it
-            # is reported as a 5xx rather than a 400 CONTRACT_INVALID.
-            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider_contract"})
+            # is reported as a 5xx rather than a 400 CONTRACT_INVALID. Record the
+            # terminal transition BEFORE emitting metrics so a metrics fault can
+            # never strand the snapshot in ``observing``.
             self._store.fail_observation(
                 operation_id=operation_id,
                 workspace_id=requester_identity["workspace_id"],
@@ -876,6 +893,7 @@ class ObservationService:
                 reason_code="provider_contract_invalid",
                 generation=generation,
             )
+            self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider_contract"})
             raise ObservationBoundaryError(
                 ObservationErrorCode.INTERNAL_ERROR, "observation result could not be produced"
             ) from exc
@@ -948,6 +966,33 @@ class ObservationService:
         self._verify_stored_hash(begin.observation, begin.observation_hash)
         self._metrics.record("observation.replay", 1.0)
         return deepcopy(begin.observation)
+
+    def _replay_terminal_failure(self, begin: ObservationBegin) -> dict[str, Any]:
+        """Replay a terminally failed operation as the first response's code.
+
+        The stored bounded ``failure_reason`` is mapped to the typed code the
+        first response returned (``not_found`` -> NOT_FOUND, ``contract_invalid``
+        -> CONTRACT_INVALID, ``provider_contract_invalid`` -> INTERNAL_ERROR,
+        otherwise PROVIDER_UNAVAILABLE), so a same-token retry after a lost
+        response is identical to it. Every terminal replay is non-retryable: the
+        same idempotency token can never make progress, so a client must start a
+        new operation with a fresh token.
+        """
+        reason = begin.failure_reason
+        error_code = _TERMINAL_REASON_TO_ERROR_CODE.get(reason or "", ObservationErrorCode.PROVIDER_UNAVAILABLE)
+        self._metrics.record("observation.failed", 1.0, dimensions={"reason": "terminal"})
+        if error_code is ObservationErrorCode.NOT_FOUND:
+            message = "the requested fleet was not found"
+        elif error_code is ObservationErrorCode.CONTRACT_INVALID:
+            message = "the requested observation is not supported for this fleet"
+        elif error_code is ObservationErrorCode.INTERNAL_ERROR:
+            message = "observation result could not be produced"
+        else:
+            message = (
+                "a prior observation for this idempotency token failed terminally; "
+                "start a new operation with a new idempotency token"
+            )
+        raise ObservationBoundaryError(error_code, message, retryable=False)
 
     def _resume_in_progress(self, begin: ObservationBegin) -> dict[str, Any]:
         # An in-progress retry under an ACTIVE (unexpired) lease held by another

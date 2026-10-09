@@ -8,7 +8,7 @@ with its runtime dependencies:
   :class:`~operations.observe.gamelift_adapter.GameLiftObservationAdapter`
   (three ``describe_*`` reads, no write surface);
 * the :class:`~operations.observation_store.DynamoDbObservationStore` on the
-  frozen ``GBAW_OPERATIONS_TABLE_NAME`` table (TTL attribute ``ttl``);
+  frozen ``GBAW_OPERATIONS_TABLE_NAME`` table;
 * the :class:`~operations.observe.metrics.CloudWatchObservationMetrics` sink
   publishing ``ObservationFailures``/``ObservationTimeouts``/``StuckOperations``/
   ``ObservationRequestLatency`` under ``GBAW_OPERATIONS_METRIC_NAMESPACE``; and
@@ -115,7 +115,12 @@ def _build_handler(
     dynamodb_client = session.client("dynamodb", config=persistence_config)
     cloudwatch_client = session.client("cloudwatch", config=persistence_config)
 
-    metrics = CloudWatchObservationMetrics(client=cloudwatch_client, namespace=settings.metric_namespace)
+    metrics = CloudWatchObservationMetrics(
+        client=cloudwatch_client,
+        namespace=settings.metric_namespace,
+        total_deadline_s=settings.operations.total_deadline_s,
+        min_publish_remaining_s=settings.operations.persistence_budget_s,
+    )
     reader = GameLiftObservationAdapter(gamelift_client)
     store = DynamoDbObservationStore(client=dynamodb_client, table_name=settings.table_name)
 
@@ -164,10 +169,11 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
     try:
         return request_handler.handle(event)
     finally:
-        elapsed_ms = (time.monotonic() - started) * 1000.0
-        # The sink swallows its own CloudWatch errors; the guard here is a final
-        # backstop so publishing latency can never break a request.
+        elapsed_s = time.monotonic() - started
+        # The sink skips the publish when too little of the request budget
+        # remains and swallows its own CloudWatch errors; the guard here is a
+        # final backstop so publishing latency can never break a request.
         try:
-            metrics_sink.put_latency_ms(elapsed_ms)
+            metrics_sink.publish_latency(elapsed_s=elapsed_s)
         except Exception:  # noqa: BLE001 - metrics must never break a request
             pass

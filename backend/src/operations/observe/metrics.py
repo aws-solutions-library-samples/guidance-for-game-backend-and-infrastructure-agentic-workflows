@@ -32,6 +32,11 @@ METRIC_TIMEOUTS = "ObservationTimeouts"
 METRIC_STUCK = "StuckOperations"
 METRIC_LATENCY = "ObservationRequestLatency"
 
+# A caller's own mistyped or unsupported fleet is a client error, not a service
+# fault, so it is not counted in ``ObservationFailures`` and never feeds the
+# failures alarm. The deadline reason is reported as a timeout instead.
+_CLIENT_CAUSED_FAILURE_REASONS = frozenset({"not_found", "contract_invalid"})
+
 
 class CloudWatchClient(Protocol):
     """The narrow slice of the boto3 CloudWatch client this sink uses."""
@@ -42,22 +47,38 @@ class CloudWatchClient(Protocol):
 class CloudWatchObservationMetrics:
     """Translate bounded observe events into the four named CloudWatch metrics."""
 
-    def __init__(self, *, client: CloudWatchClient, namespace: str) -> None:
+    def __init__(
+        self,
+        *,
+        client: CloudWatchClient,
+        namespace: str,
+        total_deadline_s: float | None = None,
+        min_publish_remaining_s: float | None = None,
+    ) -> None:
         if not isinstance(namespace, str) or not namespace.strip():
             raise ValueError("namespace must be a non-empty string")
         self._client = client
         self._namespace = namespace
         self._dropped = 0
+        # The optional latency-publish floor: when fewer than
+        # ``min_publish_remaining_s`` seconds remain of ``total_deadline_s``, the
+        # end-to-end latency publish is skipped so a slow put_metric_data cannot
+        # push the invocation past the Lambda timeout.
+        self._total_deadline_s = total_deadline_s
+        self._min_publish_remaining_s = min_publish_remaining_s
+        self._latency_skipped = 0
 
     def record(self, name: str, value: float, *, dimensions: Mapping[str, str] | None = None) -> None:
         reason = dimensions.get("reason") if isinstance(dimensions, Mapping) else None
         if name == "observation.failed":
-            # A provider deadline overrun surfaces as a timeout; every other
-            # failure reason is a generic failure. A provider *error* (non-
-            # timeout) is reported as a failure; only the deadline reason and an
-            # explicit timeout event count as timeouts.
+            # A provider deadline overrun surfaces as a timeout; a client-caused
+            # reason (an unknown or unsupported fleet) is the caller's error and
+            # is not counted as a service failure; every other reason is a
+            # generic ObservationFailures increment.
             if reason == "deadline":
                 self._safe_put(METRIC_TIMEOUTS, 1.0)
+            elif reason in _CLIENT_CAUSED_FAILURE_REASONS:
+                return
             else:
                 self._safe_put(METRIC_FAILURES, 1.0)
             return
@@ -74,6 +95,27 @@ class CloudWatchObservationMetrics:
     def put_latency_ms(self, latency_ms: float) -> None:
         """Publish end-to-end request latency in milliseconds."""
         self._safe_put(METRIC_LATENCY, float(latency_ms), unit="Milliseconds")
+
+    def publish_latency(self, *, elapsed_s: float) -> None:
+        """Publish latency unless too little of the request budget remains.
+
+        When a budget floor is configured and fewer than
+        ``min_publish_remaining_s`` seconds remain of ``total_deadline_s``, the
+        publish is skipped (and counted) so a slow ``put_metric_data`` can never
+        push the invocation past the Lambda timeout. Without a configured floor
+        the latency is always published.
+        """
+        if self._total_deadline_s is not None and self._min_publish_remaining_s is not None:
+            remaining = self._total_deadline_s - elapsed_s
+            if remaining < self._min_publish_remaining_s:
+                self._latency_skipped += 1
+                return
+        self.put_latency_ms(elapsed_s * 1000.0)
+
+    @property
+    def latency_skipped(self) -> int:
+        """Count of latency publishes skipped because too little time remained."""
+        return self._latency_skipped
 
     def _safe_put(self, metric_name: str, value: float, *, unit: str = "Count") -> None:
         """Publish one metric, swallowing any CloudWatch error.
