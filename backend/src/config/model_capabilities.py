@@ -15,14 +15,20 @@ The table is keyed by substrings of the model ID so it matches foundation
 model IDs and the ``us.``/``global.`` cross-region inference profile prefixes
 alike. Application inference profile IDs are opaque ARNs that cannot be matched
 by pattern; those fall back to the earlier-generation behavior (keep
-``temperature``, no ``thinking`` field) and emit a one-time warning so the
-operator can confirm the model behind the profile accepts that combination.
+``temperature``, no ``thinking`` field) and emit a warning, logged once per
+distinct model ID. Because that fallback sends ``temperature``, an application
+inference profile that wraps Claude Haiku 5.5 or Claude Sonnet 5.5 is rejected
+by the model: use the ``global.`` system inference profile ID for those models
+instead. Application inference profiles over the 5.5 models stay unsupported
+until #421 lands the capability-aware model factory, which can resolve the
+model a profile wraps.
 
 #421 tracks the longer-term capability-aware model factory that would replace
 this table with provider-reported capabilities.
 """
 
 # Standard library
+import threading
 from dataclasses import dataclass
 
 # Third-party packages
@@ -49,6 +55,12 @@ class ModelCapabilities:
 # sent. This also serves as the fallback for IDs the table cannot match.
 _LEGACY_CLAUDE = ModelCapabilities(send_temperature=True, thinking=None)
 
+# Model IDs that have already produced a fallback warning. The lookup runs on
+# every model construction, so this keeps the unmatched-ID warning to one line
+# per distinct ID instead of one per request.
+_warned_model_ids: set[str] = set()
+_warned_lock = threading.Lock()
+
 # Pattern table, evaluated in order. Each key is matched as a substring of the
 # model ID so it covers bare foundation model IDs and the ``us.``/``global.``
 # cross-region inference prefixes. Keep the most specific patterns first.
@@ -68,19 +80,39 @@ def get_model_capabilities(model_id: str) -> ModelCapabilities:
     Matching is a case-insensitive substring test against the pattern table so
     it works for foundation model IDs and ``us.``/``global.`` inference profile
     prefixes. An ID that matches nothing - including an application inference
-    profile ARN - falls back to the earlier-generation behavior and logs a
-    one-time warning so the operator can confirm that model accepts a
-    ``temperature`` parameter with no ``thinking`` field.
+    profile ARN - falls back to the earlier-generation behavior (send
+    ``temperature``, no ``thinking`` field) and logs a warning once per distinct
+    ID. Because that fallback sends ``temperature``, an application inference
+    profile that wraps Claude Haiku 5.5 or Claude Sonnet 5.5 is rejected by the
+    model; use the ``global.`` system inference profile ID for those models.
     """
     normalized = model_id.lower()
     for pattern, capabilities in _CAPABILITY_PATTERNS:
         if pattern in normalized:
             return capabilities
 
+    _warn_unmatched_once(model_id)
+    return _LEGACY_CLAUDE
+
+
+def _warn_unmatched_once(model_id: str) -> None:
+    """Log the unmatched-ID fallback warning once per distinct model ID."""
+    with _warned_lock:
+        if model_id in _warned_model_ids:
+            return
+        _warned_model_ids.add(model_id)
+
     logger.warning(
         f"No inference-capability entry matched model ID '{model_id}'; "
         "sending temperature with no thinking field (earlier-generation behavior). "
-        "If this is an application inference profile or a newer model, confirm it accepts "
-        "that combination."
+        "An application inference profile over Claude Haiku 5.5 or Claude Sonnet 5.5 "
+        "will be rejected because it receives a temperature parameter; use the "
+        "'global.' system inference profile ID for those models instead "
+        "(application inference profiles over the 5.5 models are unsupported until #421)."
     )
-    return _LEGACY_CLAUDE
+
+
+def reset_capability_warnings() -> None:
+    """Clear the set of model IDs that have warned. For tests only."""
+    with _warned_lock:
+        _warned_model_ids.clear()

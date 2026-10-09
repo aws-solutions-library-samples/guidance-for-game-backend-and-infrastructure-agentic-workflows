@@ -78,6 +78,10 @@ delete_custom_profile() {
 
 case "$ACTION" in
   create)
+    echo "Note: these application inference profiles are for Cost Explorer attribution only." >&2
+    echo "Do not use them as GBAW_ORCHESTRATOR_MODEL_ID / GBAW_SPECIALIST_MODEL_ID until #421:" >&2
+    echo "the runtime cannot resolve the model behind a profile and sends temperature, which the" >&2
+    echo "Claude 5.5 models reject. Keep the role variables on the global. system profile IDs." >&2
     if check_profile_exists "$ORCHESTRATOR_PROFILE_NAME"; then
         echo "$ORCHESTRATOR_PROFILE_NAME already exists"
     else
