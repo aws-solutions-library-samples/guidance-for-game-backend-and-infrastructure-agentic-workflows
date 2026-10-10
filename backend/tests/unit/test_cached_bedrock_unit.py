@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 # Local modules
+from config.model_settings import DEFAULT_ORCHESTRATOR_MODEL_ID, DEFAULT_SPECIALIST_MODEL_ID
 from models.cached_bedrock import reset_model_cache
 
 pytestmark = pytest.mark.unit
@@ -20,10 +21,11 @@ class TestCachedBedrockModels:
     def setup_method(self):
         reset_model_cache()
 
+    @patch("models.cached_bedrock.ORCHESTRATOR_MODEL_ID", DEFAULT_ORCHESTRATOR_MODEL_ID)
     @patch("models.cached_bedrock.BedrockModel")
     def test_creates_cached_orchestrator_model(self, mock_bedrock_model):
         # Local modules
-        from config.settings import AWS_REGION, ORCHESTRATOR_MODEL_ID
+        from config.settings import AWS_REGION
         from models.cached_bedrock import BOTO3_CLIENT_CONFIG as MODEL_CLIENT_CONFIG
         from models.cached_bedrock import create_cached_bedrock_model
 
@@ -32,20 +34,23 @@ class TestCachedBedrockModels:
         result = create_cached_bedrock_model()
 
         call_args = mock_bedrock_model.call_args.kwargs
-        assert call_args["model_id"] == ORCHESTRATOR_MODEL_ID
+        assert call_args["model_id"] == DEFAULT_ORCHESTRATOR_MODEL_ID
         assert call_args["boto_client_config"] is MODEL_CLIENT_CONFIG
         assert MODEL_CLIENT_CONFIG.read_timeout == 120
         assert call_args["region_name"] == AWS_REGION
         assert call_args["cache_prompt"] == "default"
         assert call_args["cache_tools"] == "default"
-        assert call_args["temperature"] == 0.1
+        # The default orchestrator model rejects temperature and turns thinking off.
+        assert "temperature" not in call_args
+        assert call_args["additional_request_fields"] == {"thinking": {"type": "disabled"}}
         assert call_args["max_tokens"] == 4096
         assert result == mock_model
 
+    @patch("models.cached_bedrock.SPECIALIST_MODEL_ID", DEFAULT_SPECIALIST_MODEL_ID)
     @patch("models.cached_bedrock.BedrockModel")
     def test_creates_cached_specialist_model(self, mock_bedrock_model):
         # Local modules
-        from config.settings import AWS_REGION, SPECIALIST_MODEL_ID
+        from config.settings import AWS_REGION
         from models.cached_bedrock import BOTO3_CLIENT_CONFIG as MODEL_CLIENT_CONFIG
         from models.cached_bedrock import create_specialist_bedrock_model
 
@@ -54,11 +59,14 @@ class TestCachedBedrockModels:
         result = create_specialist_bedrock_model()
 
         call_args = mock_bedrock_model.call_args.kwargs
-        assert call_args["model_id"] == SPECIALIST_MODEL_ID
+        assert call_args["model_id"] == DEFAULT_SPECIALIST_MODEL_ID
         assert call_args["boto_client_config"] is MODEL_CLIENT_CONFIG
         assert call_args["region_name"] == AWS_REGION
         assert call_args["cache_prompt"] == "default"
         assert call_args["cache_tools"] == "default"
+        # The default specialist model rejects temperature and turns thinking off.
+        assert "temperature" not in call_args
+        assert call_args["additional_request_fields"] == {"thinking": {"type": "between_tools"}}
         assert result == mock_model
 
     @patch("models.cached_bedrock.BedrockModel")

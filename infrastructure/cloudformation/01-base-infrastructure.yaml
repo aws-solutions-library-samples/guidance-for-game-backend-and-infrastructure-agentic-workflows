@@ -201,7 +201,8 @@ Resources:
                   - !Sub 'arn:aws:bedrock:${AWS::Region}::inference-profile/*'
                   # Account-specific inference profiles
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
-                  # Account-specific application profiles created by profile helpers
+                  # Account-specific application inference profiles (runtime use
+                  # waits on the capability-aware model factory, #421)
                   - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*'
               - Sid: BedrockKnowledgeBaseAccess
                 Effect: Allow

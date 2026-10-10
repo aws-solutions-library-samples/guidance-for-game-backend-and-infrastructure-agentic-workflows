@@ -13,6 +13,7 @@ import threading
 from strands.models import BedrockModel
 
 # Local modules
+from config.model_capabilities import get_model_capabilities
 from config.settings import (
     AWS_REGION,
     BEDROCK_GUARDRAIL_ENABLED,
@@ -32,16 +33,29 @@ _model_lock = threading.Lock()
 
 
 def _model_config(model_id: str, temperature: float, max_tokens: int) -> dict:
-    """Build shared Strands configuration without changing the selected role."""
+    """Build shared Strands configuration without changing the selected role.
+
+    Inference parameters are shaped by the model's capabilities: models that
+    reject ``temperature`` have it omitted, and each model receives the
+    ``thinking`` value it accepts (or none). Earlier Claude models keep the
+    supplied ``temperature`` and send no ``thinking`` field.
+    """
+    capabilities = get_model_capabilities(model_id)
+
     config = {
         "model_id": model_id,
         "boto_client_config": BOTO3_CLIENT_CONFIG,
         "region_name": AWS_REGION,
         "cache_prompt": "default",
         "cache_tools": "default",
-        "temperature": temperature,
         "max_tokens": max_tokens,
     }
+
+    if capabilities.send_temperature:
+        config["temperature"] = temperature
+
+    if capabilities.thinking is not None:
+        config["additional_request_fields"] = {"thinking": capabilities.thinking}
 
     if BEDROCK_GUARDRAIL_ENABLED and BEDROCK_GUARDRAIL_ID:
         config["guardrail_id"] = BEDROCK_GUARDRAIL_ID
@@ -112,5 +126,7 @@ def create_bedrock_model_with_overrides(temperature: float = 0.1, max_tokens: in
     """
     selected_model_id = model_id or ORCHESTRATOR_MODEL_ID
     model_config = _model_config(selected_model_id, temperature, max_tokens)
-    logger.info(f"Configured model: {selected_model_id} (temperature={temperature})")
+    shaped_temperature = model_config.get("temperature", "omitted")
+    shaped_thinking = model_config.get("additional_request_fields", {}).get("thinking", "none")
+    logger.info(f"Configured model: {selected_model_id} (temperature={shaped_temperature}, thinking={shaped_thinking})")
     return BedrockModel(**model_config)

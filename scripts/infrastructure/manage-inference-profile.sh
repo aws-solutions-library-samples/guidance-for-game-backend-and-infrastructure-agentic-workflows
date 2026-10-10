@@ -18,8 +18,8 @@ eval "$MODEL_EXPORTS"
 SYSTEM_ORCHESTRATOR_PROFILE="$GBAW_ORCHESTRATOR_MODEL_ID"
 SYSTEM_SPECIALIST_PROFILE="$GBAW_SPECIALIST_MODEL_ID"
 
-ORCHESTRATOR_PROFILE_NAME="GameAgent-Orchestrator-Claude-Haiku-4-5"
-SPECIALIST_PROFILE_NAME="GameAgent-Specialist-Claude-Sonnet-4-6"
+ORCHESTRATOR_PROFILE_NAME="GameAgent-Orchestrator-Claude-Haiku-5-5"
+SPECIALIST_PROFILE_NAME="GameAgent-Specialist-Claude-Sonnet-5-5"
 
 get_system_profile_arn() {
     aws bedrock list-inference-profiles --region "$REGION" \
@@ -78,12 +78,17 @@ delete_custom_profile() {
 
 case "$ACTION" in
   create)
+    echo "Note: an application inference profile records only the requests sent through it." >&2
+    echo "Until #421 the runtime cannot use these profiles: it cannot resolve the model behind a" >&2
+    echo "profile and sends temperature, which the Claude 5.5 models reject. Keep" >&2
+    echo "GBAW_ORCHESTRATOR_MODEL_ID / GBAW_SPECIALIST_MODEL_ID on the global. system profile IDs;" >&2
+    echo "these profiles attribute no runtime spend until the runtime can send requests through them." >&2
     if check_profile_exists "$ORCHESTRATOR_PROFILE_NAME"; then
         echo "$ORCHESTRATOR_PROFILE_NAME already exists"
     else
         create_custom_profile \
             "$ORCHESTRATOR_PROFILE_NAME" \
-            "Game Agent orchestrator profile for Claude Haiku 4.5" \
+            "Game Agent orchestrator profile for Claude Haiku 5.5" \
             "$SYSTEM_ORCHESTRATOR_PROFILE"
     fi
 
@@ -92,7 +97,7 @@ case "$ACTION" in
     else
         create_custom_profile \
             "$SPECIALIST_PROFILE_NAME" \
-            "Game Agent specialist profile for Claude Sonnet 4.6" \
+            "Game Agent specialist profile for Claude Sonnet 5.5" \
             "$SYSTEM_SPECIALIST_PROFILE"
     fi
     ;;

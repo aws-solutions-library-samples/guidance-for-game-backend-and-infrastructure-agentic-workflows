@@ -23,7 +23,7 @@ Before you begin, ensure you have the following installed and configured:
 ### AWS Account Requirements
 
 Your AWS account needs the following:
-- **Bedrock Model Access**: Claude Sonnet 4.6 and Claude Haiku 4.5 enabled in your region
+- **Bedrock Model Access**: Claude Sonnet 5.5 and Claude Haiku 5.5 enabled in your region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
@@ -33,8 +33,8 @@ Your AWS account needs the following:
 2. Navigate to **Model access** in the left sidebar
 3. Click **Manage model access**
 4. Enable:
-   - Anthropic Claude Sonnet 4.6
-   - Anthropic Claude 4.5 Haiku
+   - Anthropic Claude Sonnet 5.5
+   - Anthropic Claude Haiku 5.5
 5. Click **Save changes**
 
 ## Quick Start
@@ -107,12 +107,14 @@ cp ui/.env.local.example ui/.env.local
 
 Edit `ui/.env.local` if you need to customize:
 - `AWS_REGION`: Your deployment region
-- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 4.5)
-- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 4.6)
+- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (commented out; default from `model_settings.py`: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (commented out; default from `model_settings.py`: Claude Sonnet 5.5)
 - `GBAW_TENANT_ID`: Trusted tenant binding for this deployment (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID`: Trusted workspace binding for this deployment (default: `default-workspace`)
 
 Process environment values take precedence over `ui/.env.local`. The canonical role variables above take precedence over the compatibility aliases `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; empty values are treated as unset. The deployment passes the resolved role IDs to AgentCore on both initial launch and updates.
+
+> **Upgrading an existing deployment:** The two model-ID lines ship commented out so the defaults come from `backend/src/config/model_settings.py`. If your existing `ui/.env.local` was created from an earlier example, it may still pin `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID` to the previous model generation. Those pinned values take precedence over the defaults, so a redeploy keeps those models until you update or delete those two lines. After redeploying, confirm the resolved model IDs in the startup log and `scripts/deploy.sh` output name the models you expect.
 
 Tenant and workspace are server-side identity bindings. The deployment passes
 them to the frontend container without a `NEXT_PUBLIC_` prefix; browser request
@@ -167,7 +169,7 @@ Log in with the admin credentials you created.
 | Frontend | ECS Express (Fargate + ALB) | Web UI with chat interface |
 | Backend | Bedrock AgentCore | AI agents and orchestration |
 | Auth | Cognito | User authentication |
-| AI Models | Bedrock | Claude Haiku 4.5 orchestrator and Claude Sonnet 4.6 specialists |
+| AI Models | Bedrock | Claude Haiku 5.5 orchestrator and Claude Sonnet 5.5 specialists |
 | Knowledge Bases | Bedrock | RAG for GameLift, EKS, Cost |
 | Guardrails | Bedrock | AI safety controls |
 | Observability | CloudWatch | Logging and monitoring |
@@ -212,7 +214,7 @@ aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
   --filter-pattern '"Orchestrator model" || "Specialist model"'
 ```
 
-For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 4.5 for the orchestrator and Sonnet 4.6 for specialists. Response text alone is not sufficient evidence of model or tool selection.
+For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 5.5 for the orchestrator and Sonnet 5.5 for specialists. Response text alone is not sufficient evidence of model or tool selection.
 
 ## Teardown
 
@@ -264,7 +266,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet 4.6 + Haiku 4.5) | $20-630+ | Dominant cost; uses `global.*` cross-region model IDs (~$3/M input, ~$15/M output for Sonnet 4.6; ~$1/M input, ~$5/M output for Haiku 4.5) |
+| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$369 at ~10,000 queries/month | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Both run with thinking off. Scales with query volume |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
 | Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
@@ -278,15 +280,23 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | Cognito | Free | Up to 50,000 MAUs |
 
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
-**AI usage (variable)**: $20-630+/month depending on query volume and conversation length
+**AI usage (variable)**: ~$369/month at ~10,000 queries/month (Claude Sonnet 5.5 + Haiku 5.5, thinking off); scales with query volume and conversation length
 
 ### Cost Optimization Tips
 
-- Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
+- Prompt caching is enabled by default and uses the default 5-minute TTL. Cache-read share must exceed ~22% of cached tokens for Haiku 5.5 and ~21% for Sonnet 5.5 to break even (writes cost 1.25× input; reads cost 0.1× input for Haiku 5.5 and 0.05× for Sonnet 5.5). Min checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5 (see the Bedrock [prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) guide). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
 - Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage — near-zero cost at small scale
 - ECS Fargate scales between 1-4 tasks based on load (configurable via MinTasks/MaxTasks)
 - AgentCore Runtime only charges for active CPU time; memory is billed for full session duration regardless of I/O wait
 - Monitor CloudWatch dashboards to track AI token consumption
+
+### Optional: application inference profiles for cost attribution
+
+The optional helper scripts `scripts/infrastructure/manage-inference-profile.sh` and `scripts/infrastructure/get-inference-profile-ids.sh` create and check Game Agent application inference profiles for per-role Cost Explorer attribution. They are not called by `scripts/deploy.sh`. An application inference profile records only the requests sent through it, so the profiles attribute no runtime spend until the runtime can use them (see the note below).
+
+> **Not supported as runtime model IDs yet.** Do not set `GBAW_ORCHESTRATOR_MODEL_ID` or `GBAW_SPECIALIST_MODEL_ID` to an application inference profile that wraps Claude Haiku 5.5 or Claude Sonnet 5.5 until the capability-aware model factory ([#421](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/421)). An application inference profile ID is opaque, so the runtime cannot tell which model it wraps and sends the earlier-generation request shape, which includes `temperature`. The 5.5 models reject `temperature`, so every request through such a profile fails. You can create the profiles ahead of #421, but keep the role variables on the `global.` system inference profile IDs. `get-inference-profile-ids.sh` always exports those resolved IDs and prints a stderr notice when it finds the application profiles.
+
+The profile names track the current model generation (`GameAgent-Orchestrator-Claude-Haiku-5-5` and `GameAgent-Specialist-Claude-Sonnet-5-5`). If you created profiles under earlier names, run `manage-inference-profile.sh create <region>` to create the current ones and delete the previous-generation profiles manually; they are not removed automatically. `get-inference-profile-ids.sh` looks up only the current names.
 
 ## Environment Variables Reference
 
@@ -294,8 +304,8 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 |----------|----------|---------|-------------|
 | `AWS_REGION` | No | us-west-2 | AWS deployment region |
 | `AWS_PROFILE` | No | default | AWS credentials profile |
-| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Orchestrator model/profile |
-| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-4-6` | All specialist models/profiles |
+| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-5-5` | Orchestrator model/profile |
+| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-5-5` | All specialist models/profiles |
 | `GBAW_BEDROCK_MODEL_ID` | No | unset | Legacy orchestrator alias |
 | `GBAW_BEDROCK_MODEL_ID_SECONDARY` | No | unset | Legacy specialist alias |
 | `GBAW_TENANT_ID` | No | `default-tenant` | Server-side trusted tenant binding |
