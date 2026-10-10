@@ -842,6 +842,61 @@ def test_terminal_failed_replay_without_a_stored_reason_is_provider_unavailable(
     assert exc.value.retryable is False
 
 
+def test_replay_of_a_client_caused_failure_does_not_publish_observation_failures() -> None:
+    # A replay of a not_found terminal failure is a client error, not a service
+    # fault: through the real CloudWatch sink it must publish NO
+    # ObservationFailures metric, exactly as the first not_found response does
+    # not. A client hammering a mistyped fleet id cannot feed the failures alarm
+    # through replays.
+    # Local modules
+    from operations.observe.metrics import CloudWatchObservationMetrics
+
+    class FakeCloudWatch:
+        def __init__(self) -> None:
+            self.puts: list[dict[str, Any]] = []
+
+        def put_metric_data(self, **kwargs: Any) -> dict[str, Any]:
+            self.puts.append(kwargs)
+            return {}
+
+    cloudwatch = FakeCloudWatch()
+    sink = CloudWatchObservationMetrics(client=cloudwatch, namespace="GBAW/Operations", emf_emit=lambda _line: None)
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_FAILED)
+    store.failure_reason = "not_found"
+    service, _, _, _ = _service(store=store, metrics=sink)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.NOT_FOUND
+    # No ObservationFailures (nor any other metric) was published for the replay.
+    names = [put["MetricData"][0]["MetricName"] for put in cloudwatch.puts]
+    assert "ObservationFailures" not in names
+
+
+def test_replay_of_a_provider_unavailable_failure_does_publish_observation_failures() -> None:
+    # The other side of the boundary: a provider_unavailable replay IS a service
+    # fault and still publishes ObservationFailures through the sink.
+    # Local modules
+    from operations.observe.metrics import CloudWatchObservationMetrics
+
+    class FakeCloudWatch:
+        def __init__(self) -> None:
+            self.puts: list[dict[str, Any]] = []
+
+        def put_metric_data(self, **kwargs: Any) -> dict[str, Any]:
+            self.puts.append(kwargs)
+            return {}
+
+    cloudwatch = FakeCloudWatch()
+    sink = CloudWatchObservationMetrics(client=cloudwatch, namespace="GBAW/Operations", emf_emit=lambda _line: None)
+    store = FakeStore(begin=ObservationBeginOutcome.REPLAY_FAILED)
+    store.failure_reason = "provider_unavailable"
+    service, _, _, _ = _service(store=store, metrics=sink)
+    with pytest.raises(ObservationBoundaryError):
+        service.observe(_request(), _context())
+    names = [put["MetricData"][0]["MetricName"] for put in cloudwatch.puts]
+    assert "ObservationFailures" in names
+
+
 # --- Budget spent during begin, before the first read (minor) --------------
 
 
@@ -1049,9 +1104,6 @@ def test_provider_data_failing_contract_is_a_5xx_not_client_400() -> None:
     assert store.fail_calls[0]["reason_code"] == "provider_contract_invalid"
 
 
-# --- Metrics failures never mask a typed outcome (minor) --------------------
-
-
 def test_metrics_failure_does_not_mask_the_typed_outcome() -> None:
     # With the production-shaped sink that swallows CloudWatch errors, a metrics
     # fault during a terminal failure never surfaces: the request raises ONLY the
@@ -1074,10 +1126,91 @@ def test_metrics_failure_does_not_mask_the_typed_outcome() -> None:
     with pytest.raises(ObservationBoundaryError) as exc:
         service.observe(_request(), _context())
     assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
-    # The failed transition was recorded before the metrics publish was attempted.
+    # A failed transition was recorded (count only — ordering is pinned by the
+    # dedicated ordering tests below, which capture the fail-call count at the
+    # moment each metric is recorded).
     assert len(store.fail_calls) == 1
     # The sink swallowed the CloudWatch error and counted the drop.
     assert sink.dropped == 1
+
+
+# --- Fail-before-metrics ordering, pinned per branch (minor) ----------------
+
+
+class _OrderingMetrics:
+    """A metrics fake that records the store's fail-call count at each record.
+
+    It is wired to the store under test so each ``record`` call can capture
+    ``len(store.fail_calls)`` at that instant. The first failure metric must see
+    a count of 1, proving ``fail_observation`` ran before the metric was emitted
+    and so a metrics fault can never strand the snapshot in ``observing``.
+    """
+
+    def __init__(self, store: "FakeStore") -> None:
+        self._store = store
+        self.events: list[tuple[str, int, dict[str, str] | None]] = []
+
+    def record(self, name: str, value: float, *, dimensions: dict[str, str] | None = None) -> None:
+        self.events.append((name, len(self._store.fail_calls), dimensions))
+
+    def first_failure_metric(self) -> tuple[str, int, dict[str, str] | None]:
+        return next(e for e in self.events if e[0] in {"observation.failed", "observation.timeout"})
+
+
+def _ordering_service(reader: Any) -> tuple[ObservationService, "FakeStore", _OrderingMetrics]:
+    store = FakeStore(begin=ObservationBeginOutcome.CREATED)
+    metrics = _OrderingMetrics(store)
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe"})
+    service = ObservationService(
+        settings=settings,
+        identity_boundary=_boundary(),
+        reader=reader,
+        store=store,
+        clock=lambda: NOW,
+        operation_id_factory=lambda: OPERATION_ID,
+        metrics=metrics,
+    )
+    return service, store, metrics
+
+
+def test_classified_not_found_records_fail_before_metrics() -> None:
+    class NotFoundReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            raise _client_error("NotFoundException")
+
+    service, store, metrics = _ordering_service(NotFoundReader())
+    with pytest.raises(ObservationBoundaryError):
+        service.observe(_request(), _context())
+    name, fail_count_at_record, _ = metrics.first_failure_metric()
+    # The terminal record (fail_observation) ran BEFORE the failure metric.
+    assert fail_count_at_record == 1
+    assert store.fail_calls[0]["reason_code"] == "not_found"
+
+
+def test_provider_contract_invalid_records_fail_before_metrics() -> None:
+    class ContractBreakingReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            return [{"location": "us-west-2", "desired": 99, "minimum": 0, "maximum": 1, "active": 0, "idle": 0}]
+
+    service, store, metrics = _ordering_service(ContractBreakingReader())
+    with pytest.raises(ObservationBoundaryError):
+        service.observe(_request(), _context())
+    _, fail_count_at_record, _ = metrics.first_failure_metric()
+    assert fail_count_at_record == 1
+    assert store.fail_calls[0]["reason_code"] == "provider_contract_invalid"
+
+
+def test_provider_failure_records_fail_before_metrics() -> None:
+    class BoomReader(FakeReader):
+        def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+            raise RuntimeError("provider boom")
+
+    service, store, metrics = _ordering_service(BoomReader())
+    with pytest.raises(ObservationBoundaryError):
+        service.observe(_request(), _context())
+    _, fail_count_at_record, _ = metrics.first_failure_metric()
+    assert fail_count_at_record == 1
+    assert store.fail_calls[0]["reason_code"] == "provider_unavailable"
 
 
 def test_commit_and_lease_deadlines_are_the_single_request_lease() -> None:
@@ -1130,3 +1263,75 @@ def test_budget_spent_after_the_reads_is_retryable_with_no_complete() -> None:
     assert exc.value.retryable is True
     assert store.complete_calls == []
     assert "observation.timeout" in metrics.names()
+
+
+# --- Read cut short by the request budget vs its own per-read budget --------
+
+
+def test_read_cut_short_by_the_request_budget_is_retryable_without_burning_the_token() -> None:
+    # Standard library
+    import threading
+
+    # Local modules
+    from operations.validation.e0_latency import LatencyBudget
+
+    release = threading.Event()
+
+    class HangingReader(FakeReader):
+        def read_utilization(self, fleet_id: str) -> dict[str, int]:
+            release.wait(timeout=5.0)
+            return super().read_utilization(fleet_id)
+
+    # The first read reaches the provider when only a sliver of the request
+    # budget remains (less than its own per_read_s), so the request budget — not
+    # the provider — cuts it short. That must be a retryable 503 with NO terminal
+    # failure record, so the idempotency token is not burned.
+    # Budget total = 1.0*3 + 1.0 + 0.3 = 4.3; margin = 0.3.
+    # monotonic: request_start(0), begin-check(0), read-check(0),
+    # read0 call_start(3.6) -> request_remaining = 4.3 - 0.3 - 3.6 = 0.4 < per_read(1.0).
+    service_budget_reader = HangingReader()
+    service, _, store, metrics = _service(
+        reader=service_budget_reader,
+        monotonic_times=[0.0, 0.0, 0.0, 3.6, 3.6, 3.6],
+    )
+    service._budget = LatencyBudget(per_read_s=1.0, persistence_s=1.0, cancellation_margin_s=0.3)
+    try:
+        with pytest.raises(ObservationBoundaryError) as exc:
+            service.observe(_request(), _context())
+    finally:
+        release.set()
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is True  # the budget cut is retryable
+    assert store.fail_calls == []  # the token is NOT burned terminally
+    assert store.complete_calls == []
+    assert "observation.timeout" in metrics.names()
+
+
+def test_read_timeout_with_its_full_budget_is_a_terminal_provider_failure() -> None:
+    # Standard library
+    import threading
+
+    # Local modules
+    from operations.validation.e0_latency import LatencyBudget
+
+    release = threading.Event()
+
+    class HangingReader(FakeReader):
+        def read_utilization(self, fleet_id: str) -> dict[str, int]:
+            release.wait(timeout=5.0)
+            return super().read_utilization(fleet_id)
+
+    # The read is given its FULL per-read budget and still times out: this is a
+    # provider timeout, recorded as a terminal, non-retryable failure (the token
+    # cannot make progress), distinct from a request-budget cut.
+    service, _, store, _ = _service(reader=HangingReader())
+    service._budget = LatencyBudget(per_read_s=0.2, persistence_s=0.2, cancellation_margin_s=0.2)
+    try:
+        with pytest.raises(ObservationBoundaryError) as exc:
+            service.observe(_request(), _context())
+    finally:
+        release.set()
+    assert exc.value.error_code is ObservationErrorCode.PROVIDER_UNAVAILABLE
+    assert exc.value.retryable is False  # a provider timeout burns the token
+    assert len(store.fail_calls) == 1
+    assert store.fail_calls[0]["reason_code"] == "provider_unavailable"

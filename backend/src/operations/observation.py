@@ -156,16 +156,41 @@ class ObservationErrorCode(str, Enum):
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
-# A terminally stored failure reason maps back to the exact typed code the first
-# response returned, so a same-token replay of a lost response is identical to
-# it. ``provider_contract_invalid`` is a server fault (500); any unrecognized or
-# missing reason falls back to the non-retryable provider-unavailable response.
-_TERMINAL_REASON_TO_ERROR_CODE: dict[str, ObservationErrorCode] = {
-    "not_found": ObservationErrorCode.NOT_FOUND,
-    "contract_invalid": ObservationErrorCode.CONTRACT_INVALID,
-    "provider_contract_invalid": ObservationErrorCode.INTERNAL_ERROR,
-    "provider_unavailable": ObservationErrorCode.PROVIDER_UNAVAILABLE,
+# A terminally stored failure reason maps back to the exact typed code AND the
+# exact safe message the first response returned, so a same-token replay of a
+# lost response is byte-identical to it (including ``provider_unavailable``, the
+# most common terminal reason). ``provider_contract_invalid`` is a server fault
+# (500); any unrecognized or missing reason falls back to the non-retryable
+# provider-unavailable response. This single table is the one source of truth
+# for both the first terminal response and its replay.
+_TERMINAL_PROVIDER_UNAVAILABLE_MESSAGE = (
+    "provider observation could not be completed; start a new operation with a new idempotency token"
+)
+_TERMINAL_REASON_TO_RESPONSE: dict[str, tuple["ObservationErrorCode", str]] = {
+    "not_found": (ObservationErrorCode.NOT_FOUND, "the requested fleet was not found"),
+    "contract_invalid": (
+        ObservationErrorCode.CONTRACT_INVALID,
+        "the requested observation is not supported for this fleet",
+    ),
+    "provider_contract_invalid": (
+        ObservationErrorCode.INTERNAL_ERROR,
+        "observation result could not be produced",
+    ),
+    "provider_unavailable": (ObservationErrorCode.PROVIDER_UNAVAILABLE, _TERMINAL_PROVIDER_UNAVAILABLE_MESSAGE),
 }
+
+# The fallback response for an unrecognized or missing stored reason: a
+# non-retryable provider-unavailable terminal failure.
+_TERMINAL_FALLBACK_RESPONSE = (ObservationErrorCode.PROVIDER_UNAVAILABLE, _TERMINAL_PROVIDER_UNAVAILABLE_MESSAGE)
+
+
+def _terminal_failure_response(reason: str | None) -> tuple["ObservationErrorCode", str]:
+    """Return the (code, message) a terminal failure reason resolves to.
+
+    The same table drives the first terminal response and a later same-token
+    replay, so the two bodies are byte-identical for every reason.
+    """
+    return _TERMINAL_REASON_TO_RESPONSE.get(reason or "", _TERMINAL_FALLBACK_RESPONSE)
 
 
 class ObservationBoundaryError(RuntimeError):
@@ -478,12 +503,15 @@ class ObservationStore(Protocol):
         lease_holder: str,
         reason_code: str,
         generation: int = 1,
+        commit_not_after: datetime | None = None,
     ) -> None:
         """Record a bounded failed transition where possible (best effort).
 
         The stored bounded failure is terminal and deterministic: a later retry
         under the same idempotency token replays it verbatim rather than being
-        marked retryable. generation fences the write on the caller's lease.
+        marked retryable. generation fences the write on the caller's lease. When
+        ``commit_not_after`` is supplied, the store skips the write rather than
+        start a sub-call that would not fit before the deadline.
         """
         ...
 
@@ -819,6 +847,7 @@ class ObservationService:
                 lease_holder=lease_holder,
                 reason_code=exc.reason_code,
                 generation=generation,
+                commit_not_after=commit_not_after,
             )
             self._metrics.record("observation.failed", 1.0, dimensions={"reason": exc.reason_code})
             raise ObservationBoundaryError(exc.error_code, exc.safe_message, retryable=False) from exc
@@ -833,6 +862,7 @@ class ObservationService:
                 lease_holder=lease_holder,
                 reason_code="provider_unavailable",
                 generation=generation,
+                commit_not_after=commit_not_after,
             )
             # A deadline overrun is a timeout; any other provider condition is a
             # failure. The two are reported through distinct metric events.
@@ -844,12 +874,11 @@ class ObservationService:
             # token, so the same token can never make progress. Report it as
             # non-retryable on the FIRST response too, with the same guidance a
             # same-token replay returns, so a client is never told to retry a
-            # token that is already terminal.
-            raise ObservationBoundaryError(
-                ObservationErrorCode.PROVIDER_UNAVAILABLE,
-                "provider observation could not be completed; " "start a new operation with a new idempotency token",
-                retryable=False,
-            ) from exc
+            # token that is already terminal. The (code, message) comes from the
+            # single terminal-response table so a lost first response and its
+            # same-token replay are byte-identical.
+            first_code, first_message = _terminal_failure_response("provider_unavailable")
+            raise ObservationBoundaryError(first_code, first_message, retryable=False) from exc
 
         observed_at = _utc(self._clock(), "clock")
         observation: dict[str, Any] = {
@@ -892,6 +921,7 @@ class ObservationService:
                 lease_holder=lease_holder,
                 reason_code="provider_contract_invalid",
                 generation=generation,
+                commit_not_after=commit_not_after,
             )
             self._metrics.record("observation.failed", 1.0, dimensions={"reason": "provider_contract"})
             raise ObservationBoundaryError(
@@ -970,28 +1000,24 @@ class ObservationService:
     def _replay_terminal_failure(self, begin: ObservationBegin) -> dict[str, Any]:
         """Replay a terminally failed operation as the first response's code.
 
-        The stored bounded ``failure_reason`` is mapped to the typed code the
-        first response returned (``not_found`` -> NOT_FOUND, ``contract_invalid``
-        -> CONTRACT_INVALID, ``provider_contract_invalid`` -> INTERNAL_ERROR,
-        otherwise PROVIDER_UNAVAILABLE), so a same-token retry after a lost
-        response is identical to it. Every terminal replay is non-retryable: the
-        same idempotency token can never make progress, so a client must start a
-        new operation with a fresh token.
+        The stored bounded ``failure_reason`` resolves through the single
+        terminal-response table to the exact (code, message) the first response
+        returned, so a same-token retry after a lost response is byte-identical
+        to it — including ``provider_unavailable``, the most common reason. Every
+        terminal replay is non-retryable: the same idempotency token can never
+        make progress, so a client must start a new operation with a fresh token.
+
+        The replay is counted under the stored reason, not a blanket
+        ``terminal`` reason, so a replay of a client-caused failure (an unknown
+        or unsupported fleet) is not counted as an ``ObservationFailures``
+        service fault — matching how the first response is classified.
         """
         reason = begin.failure_reason
-        error_code = _TERMINAL_REASON_TO_ERROR_CODE.get(reason or "", ObservationErrorCode.PROVIDER_UNAVAILABLE)
-        self._metrics.record("observation.failed", 1.0, dimensions={"reason": "terminal"})
-        if error_code is ObservationErrorCode.NOT_FOUND:
-            message = "the requested fleet was not found"
-        elif error_code is ObservationErrorCode.CONTRACT_INVALID:
-            message = "the requested observation is not supported for this fleet"
-        elif error_code is ObservationErrorCode.INTERNAL_ERROR:
-            message = "observation result could not be produced"
-        else:
-            message = (
-                "a prior observation for this idempotency token failed terminally; "
-                "start a new operation with a new idempotency token"
-            )
+        error_code, message = _terminal_failure_response(reason)
+        # Count the replay under the STORED reason so a client-caused failure
+        # (not_found / contract_invalid) is not counted as a service failure on
+        # replay, exactly as it is not counted on the first response.
+        self._metrics.record("observation.failed", 1.0, dimensions={"reason": reason or "terminal"})
         raise ObservationBoundaryError(error_code, message, retryable=False)
 
     def _resume_in_progress(self, begin: ObservationBegin) -> dict[str, Any]:
@@ -1016,6 +1042,23 @@ class ObservationService:
             raise ObservationBoundaryError(
                 ObservationErrorCode.STATE_CONFLICT, "stored observation failed hash verification"
             )
+
+    def _budget_cut_error(self) -> "ObservationBoundaryError":
+        """Build the retryable error for a read cut short by the request budget.
+
+        A read whose own per-read budget was not fully available was cut short
+        by the request deadline, not by the provider. It is reported as a
+        retryable ``PROVIDER_UNAVAILABLE`` with no terminal ``fail_observation``,
+        exactly as ``_check_budget`` does, so the idempotency token is not burned
+        on a provider failure for time the request budget spent elsewhere. The
+        operation is left ``observing`` so a later retry reclaims it.
+        """
+        self._metrics.record("observation.timeout", 1.0, dimensions={"reason": "read_budget"})
+        return ObservationBoundaryError(
+            ObservationErrorCode.PROVIDER_UNAVAILABLE,
+            "observation deadline elapsed before the read could complete",
+            retryable=True,
+        )
 
     def _check_budget(self, request_start: float, total_deadline_s: float, *, phase: str) -> None:
         """Fail closed with a typed retryable error if the request budget is spent.
@@ -1054,17 +1097,35 @@ class ObservationService:
         try:
             for index, read in enumerate(reads):
                 call_start = self._monotonic()
-                remaining_total = total_deadline_s - (call_start - request_start)
-                read_budget = min(self._budget.per_read_s, remaining_total)
-                if read_budget <= 0:
+                # The budget available to this read, measured from the single
+                # request-entry clock and reserving the cancellation margin that
+                # the later complete check (``_check_budget(complete)``) also
+                # reserves, so a read never consumes time the finalize step would
+                # refuse anyway.
+                request_remaining = total_deadline_s - self._budget.cancellation_margin_s - (call_start - request_start)
+                if request_remaining <= 0:
+                    # The request budget — not this read's own per-read budget —
+                    # is already spent. This is a retryable budget cut, not a
+                    # provider timeout: raise the retryable boundary error so the
+                    # caller does NOT burn the idempotency token with a terminal
+                    # provider-failure record.
                     abandoned = True
-                    raise DeadlineExceededError(f"read[{index}]", 0.0, self._budget.per_read_s)
+                    raise self._budget_cut_error()
+                read_budget = min(self._budget.per_read_s, request_remaining)
+                # Whether this read's own full per-read budget was available. If
+                # not, the request budget is the binding constraint and a timeout
+                # at ``read_budget`` is a budget cut, not a provider timeout.
+                read_had_full_budget = read_budget >= self._budget.per_read_s
                 future = executor.submit(read)
                 try:
                     value = future.result(timeout=read_budget)
                 except concurrent.futures.TimeoutError as exc:
                     abandoned = True
                     future.cancel()
+                    if not read_had_full_budget:
+                        # The request budget cut the read short, not the provider:
+                        # retryable, and no terminal failure is recorded.
+                        raise self._budget_cut_error() from exc
                     raise DeadlineExceededError(
                         f"read[{index}]", self._monotonic() - call_start, self._budget.per_read_s
                     ) from exc

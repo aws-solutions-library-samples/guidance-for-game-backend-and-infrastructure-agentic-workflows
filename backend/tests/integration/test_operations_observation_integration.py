@@ -436,3 +436,141 @@ def test_record_then_replay_returns_byte_identical_body_and_same_operation() -> 
     assert json.loads(second["body"])["observation_id"] == OPERATION_ID
     # A replay performs no new provider read.
     assert reader.calls == reads_after_first
+
+
+class _SharedClock:
+    """A fake wall clock shared by the store and the service.
+
+    Each store sub-call advances it by one worst-case call cost, so a chain of
+    store calls accumulates realistic wall-clock time. ``now_dt`` drives the
+    store's datetime clock; ``monotonic`` drives the service's budget clock.
+    Both read the same elapsed value.
+    """
+
+    def __init__(self, *, start: datetime, call_cost_s: float) -> None:
+        self._start = start
+        self._elapsed_s = 0.0
+        self._call_cost_s = call_cost_s
+
+    def charge_call(self) -> None:
+        self._elapsed_s += self._call_cost_s
+
+    @property
+    def elapsed_s(self) -> float:
+        return self._elapsed_s
+
+    def now_dt(self) -> datetime:
+        return self._start + timedelta(seconds=self._elapsed_s)
+
+    def monotonic(self) -> float:
+        return self._elapsed_s
+
+
+class _ClockedDynamoClient(FakeDynamoClient):
+    """A FakeDynamoClient that charges one call cost per DynamoDB sub-call."""
+
+    def __init__(self, clock: _SharedClock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    def transact_write_items(self, **kwargs: Any) -> dict[str, Any]:
+        self._clock.charge_call()
+        return super().transact_write_items(**kwargs)
+
+    def get_item(self, **kwargs: Any) -> dict[str, Any]:
+        self._clock.charge_call()
+        return super().get_item(**kwargs)
+
+
+def test_slow_reclaim_chain_fails_closed_before_the_lambda_timeout() -> None:
+    # A fake-clock drive of the real handler, service, and store over a stale,
+    # lease-expired operation: the retry triggers a reclaim chain, and each
+    # store sub-call costs one full call limit (4.5 s). The request must return a
+    # typed, retryable 503 and the accumulated wall-clock time must stay below
+    # the Lambda timeout minus a safety margin, rather than letting a late
+    # sub-call push the invocation past the timeout.
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe"})
+    internal_deadline_s = settings.total_deadline_s  # 15 s with the frozen defaults
+    # The Lambda is configured with a 20 s timeout, above the 15 s internal
+    # deadline; the gap is the headroom the fail-closed design must preserve.
+    lambda_timeout_s = 20.0
+    clock = _SharedClock(start=NOW, call_cost_s=4.5)
+    client = _ClockedDynamoClient(clock)
+
+    # Seed an observing operation whose single-flight lease has already expired,
+    # so a same-token retry sees an in-progress operation eligible for reclaim.
+    op_pk = "OP#" + OPERATION_ID
+    idem_pk = f"WS#workspace.default#IDEM#{TOKEN}"
+    intent_hash = canonical_sha256(
+        {
+            "phase": "observe",
+            "provider": "gamelift",
+            "capability_id": "gamelift.observe-fleet",
+            "capability_version": "1.0",
+            "target": {"provider": "gamelift", "fleet_id": FLEET_ID},
+        }
+    )
+    fingerprint = canonical_sha256(
+        {"workspace_id": "workspace.default", "idempotency_token": TOKEN, "intent_hash": intent_hash}
+    )
+    expired_lease = int((NOW - timedelta(seconds=1)).timestamp())
+    client.items[(idem_pk, "MAP#current")] = {
+        "PK": {"S": idem_pk},
+        "SK": {"S": "MAP#current"},
+        "operation_id": {"S": OPERATION_ID},
+        "idempotency_fingerprint": {"S": fingerprint},
+    }
+    client.items[(op_pk, "STATE#current")] = {
+        "PK": {"S": op_pk},
+        "SK": {"S": "STATE#current"},
+        "operation_id": {"S": OPERATION_ID},
+        "workspace_id": {"S": "workspace.default"},
+        "state": {"S": "observing"},
+        "sequence": {"N": "0"},
+        "generation": {"N": "1"},
+        "lease_holder": {"S": "request.prior"},
+        "lease_not_after": {"N": str(expired_lease)},
+    }
+
+    store = DynamoDbObservationStore(client=client, table_name="obs-table", clock=clock.now_dt, call_limit_s=4.5)
+    service = ObservationService(
+        settings=settings,
+        identity_boundary=ApprovalIdentityBoundary(
+            tenant_id="tenant.default",
+            workspace_id="workspace.default",
+            requester_client_ids=frozenset({"client.web-console"}),
+            approver_client_ids=frozenset({"client.approver"}),
+            trusted_audiences=frozenset({"operations-api"}),
+        ),
+        reader=_Reader(),
+        store=store,
+        clock=clock.now_dt,
+        monotonic=clock.monotonic,
+        operation_id_factory=lambda: OPERATION_ID,
+    )
+    handler = ObservationRequestHandler(
+        service=service,
+        tenant_id="tenant.default",
+        workspace_id="workspace.default",
+        trusted_audience="operations-api",
+        capability_id="gamelift.observe-fleet",
+        capability_version="1.0",
+        authority_inputs=AuthorityInputs(
+            tenant_policy="observe",
+            workspace_policy="observe",
+            principal_authority="observe",
+            capability_maximum="observe",
+            risk_policy="observe",
+        ),
+        observer_groups=frozenset({"admin", "users"}),
+    )
+
+    response = handler.handle(_post_event())
+    # A typed, retryable 503 — never a gateway 5xx from a hard timeout.
+    assert response["statusCode"] == 503
+    assert json.loads(response["body"])["error_code"] == "PROVIDER_UNAVAILABLE"
+    # Work stopped at or before the internal request deadline, so the invocation
+    # stays below the Lambda timeout with at least one full call limit of margin
+    # — a late sub-call never pushed the request past the timeout.
+    assert clock.elapsed_s <= internal_deadline_s
+    assert clock.elapsed_s <= lambda_timeout_s - 4.5
