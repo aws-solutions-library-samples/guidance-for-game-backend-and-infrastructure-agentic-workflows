@@ -26,7 +26,9 @@ A presence/identity check (``x is not None``), a membership test
 (``'prompt' in data``), and a boolean coercion (``bool(...)``) reveal only
 whether a value exists, not the value, so they are not flagged; reading a plain
 attribute off a bare name (``prompt.arn``) discloses that attribute, not the
-base object. ``sanitize_log_data`` and ``normalize_log_value`` are **not**
+base object, while calling a method on a forbidden name (``user_prompt.strip()``)
+returns a value derived from it and is flagged. ``sanitize_log_data`` and
+``normalize_log_value`` are **not**
 treated as safe wrappers here: they keep the value's content (merely redacting
 known patterns or stripping control characters), so logging a prompt or raw
 identifier through them still discloses it.
@@ -177,6 +179,11 @@ def _forbidden_in_expression(expr: ast.AST, forbidden: set[str]) -> set[str]:
                 return
             # Detect dict.get("<forbidden>") -> logs the forbidden value.
             func = call.func
+            # A method call on a forbidden name (``user_prompt.strip()``,
+            # ``query.lower()``) returns a value derived from it, unlike a plain
+            # attribute read such as ``prompt.arn``.
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in forbidden:
+                found.add(func.value.id)
             if isinstance(func, ast.Attribute) and func.attr == "get" and call.args:
                 key = call.args[0]
                 if isinstance(key, ast.Constant) and key.value in forbidden:
@@ -337,6 +344,10 @@ _BYPASS_SNIPPETS = [
     'logger.info(f"...{user_context}")',
     '_get_logger().warning(f"...{actor_id}")',
     'log_sanitized_exception(logger, f"... {actor_id}", e)',
+    # A method call on a forbidden name returns a value derived from it.
+    'logger.info(f"...{user_prompt.strip()}")',
+    'logger.info(f"...{query.lower()[:80]}")',
+    'logger.info("Actor: {}", actor_id.upper())',
 ]
 
 # Snippets that must flag only when scanned as the module that owns the value.
