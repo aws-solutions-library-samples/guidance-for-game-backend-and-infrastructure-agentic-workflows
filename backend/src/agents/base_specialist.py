@@ -117,6 +117,9 @@ def create_specialist_agent(
                             system_prompt=prompt_fn(),
                             tools=tools,
                             model=model,
+                            # Keep streamed model text and tool names out of stdout,
+                            # which the hosted runtime ships to its logs.
+                            callback_handler=None,
                             hooks=[
                                 MaxTurnsHook(AGENT_MAX_TURNS_SPECIALIST),
                                 WallClockTimeoutHook(AGENT_TIMEOUT_SPECIALIST_SECONDS),

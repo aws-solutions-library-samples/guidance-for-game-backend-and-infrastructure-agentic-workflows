@@ -111,15 +111,15 @@ describe('chat.ts - real console sink carries no raw identity', () => {
     (CognitoJwtVerifier.create as jest.Mock).mockReturnValue({ verify });
 
     // getAccountId() calls STS to build the runtime ARN; return a synthetic
-    // account so the invocation path proceeds to the trace-id log line.
+    // account so the invocation path proceeds to the service request-id log line.
     (STSClient as unknown as jest.Mock).mockImplementation(() => ({
       send: jest.fn().mockResolvedValue({ Account: '123456789012' }),
     }));
 
-    // The runtime responds 200 with a trace-id header carrying a CR/LF marker
-    // so the test also proves the trace id is normalized onto a single line.
+    // The runtime responds 200 with a service request-id header carrying a
+    // CR/LF marker so the test also proves the ID is normalized onto one line.
     const runtimeHeaders = new Map<string, string>([
-      ['x-amzn-trace-id', 'Root=1-trace\r\nINJECTED-TRACE-LINE'],
+      ['x-amzn-requestid', 'svc-req-1\r\nINJECTED-REQUEST-LINE'],
     ]);
     (fetchWithTimeout as jest.Mock).mockResolvedValue({
       ok: true,
@@ -148,10 +148,10 @@ describe('chat.ts - real console sink carries no raw identity', () => {
     const output = allConsoleText();
     expect(output).not.toContain(THREAD_MARKER);
     expect(output).not.toContain('ZZMARKER');
-    // The runtime trace id is logged normalized (single line), not redacted,
+    // The service request id is logged normalized (single line), not redacted,
     // and its CR/LF cannot forge a second log line (each control char collapses
     // to one space, so the CRLF becomes two spaces).
-    expect(output).toContain('runtime trace Root=1-trace  INJECTED-TRACE-LINE');
+    expect(output).toContain('AgentCore request svc-req-1  INJECTED-REQUEST-LINE');
     expect(output).not.toContain('\n');
     expect(output).not.toContain('\r');
 
