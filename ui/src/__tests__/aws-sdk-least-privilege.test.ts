@@ -4,7 +4,8 @@
  * WHY THIS EXISTS: the frontend is a Next.js proxy. Its only AWS SDK callers are
  *   - `@aws-sdk/client-sts`  -> GetCallerIdentity (build AgentCore runtime ARN,
  *                               dev identity) in pages/api/copilot/chat.ts
- *   - `@aws-sdk/client-cognito-identity-provider` -> auth/refresh + admin routes
+ *   - `@aws-sdk/client-cognito-identity-provider` -> auth sign-in and token
+ *                               refresh in pages/api/auth/*
  *   - `aws-jwt-verify`       -> Cognito JWT verification (no IAM, HTTPS JWKS)
  * AgentCore is invoked with a Cognito JWT bearer token over `fetch`, NOT the AWS
  * SDK, so the Bedrock Runtime client is not a caller. CloudWatch, Cost Explorer,

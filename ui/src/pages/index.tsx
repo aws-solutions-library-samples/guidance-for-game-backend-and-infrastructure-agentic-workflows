@@ -4,7 +4,6 @@
 
 import React, { useState, useEffect } from 'react';
 import Head from 'next/head';
-import Link from 'next/link';
 import { Chat } from '../components/Chat';
 import ThemeToggle from '../components/ThemeToggle';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
@@ -141,22 +140,6 @@ export default function Home({ user, loggingOut = false, onSignOut }: HomeProps)
                       <div className="ga-user-email">{userInfo?.email || username}</div>
                     </div>
 
-                    {(userInfo?.isAdmin || user?.isAdmin) && (
-                      <Link
-                        href="/admin/users"
-                        style={{
-                          display: 'block',
-                          padding: '12px 16px',
-                          color: 'var(--ga-accent)',
-                          textDecoration: 'none',
-                          fontSize: '14px',
-                          fontWeight: 500,
-                          borderBottom: '1px solid var(--ga-accent-border)'
-                        }}
-                      >
-                        Manage Users
-                      </Link>
-                    )}
                     <button
                       className="ga-signout-button"
                       onClick={handleSignOut}

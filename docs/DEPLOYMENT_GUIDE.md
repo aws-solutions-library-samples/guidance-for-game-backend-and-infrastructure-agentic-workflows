@@ -150,6 +150,26 @@ You'll be prompted for:
 - Email address
 - Password (min 8 characters, uppercase, lowercase, number, symbol)
 
+Self-signup is disabled and the app has no in-app user management. To add
+another administrator, re-run this script. To grant chat-only access, create
+the user the same way but add it to the `users` group instead of `admin`. The
+sign-in page does not handle a temporary-password challenge, so set a permanent
+password:
+
+```bash
+USER_POOL_ID=<user-pool-id>   # the UserPoolId output of the base stack
+CHAT_USER_EMAIL=<email>
+read -rsp "Password: " CHAT_USER_PASSWORD; echo
+aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --user-attributes Name=email,Value="$CHAT_USER_EMAIL" Name=email_verified,Value=true \
+  --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --password "$CHAT_USER_PASSWORD" --permanent
+aws cognito-idp admin-add-user-to-group --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --group-name users
+unset CHAT_USER_PASSWORD
+```
+
 ### Step 6: Access Your Deployment
 
 The deployment script outputs your frontend URL:
@@ -202,7 +222,8 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 ./scripts/infrastructure/test-kb.sh
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
-# short-lived access token from an approved Cognito test user
+# short-lived access token from a provisioned Cognito test user (in the
+# `admin` or `users` group)
 export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
 ./test-ai-evals.sh
 

@@ -118,7 +118,7 @@ function MyApp({ Component, pageProps }: AppProps) {
   }, [performLogout]);
 
   // A logout entry point usable by any caller (protected-request expiration,
-  // refresh-failure broadcast, the header manual sign-out, admin navigation).
+  // refresh-failure broadcast, the header manual sign-out).
   // It is the ONE terminal logout gateway (#310, Blocker 4): it latches the
   // idle controller's terminal generation (so peer tabs converge and the chat
   // locks via `idle.loggingOut`), broadcasts the terminal record, AND routes the
@@ -147,7 +147,7 @@ function MyApp({ Component, pageProps }: AppProps) {
 
   // Bind the terminal logout gateway to the idle hook's sign-out. Every logout
   // entry (protected-request 401 expiration, session-expiration broadcast, main
-  // header sign-out, admin navigation) flows through this one path so it latches
+  // header sign-out) flows through this one path so it latches
   // the idle terminal generation, broadcasts it, locks the chat, and clears
   // cookies last via the coordinator (#310, Blocker 4).
   useEffect(() => {

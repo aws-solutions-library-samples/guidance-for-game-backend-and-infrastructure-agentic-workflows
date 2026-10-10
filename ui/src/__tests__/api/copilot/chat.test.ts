@@ -35,7 +35,7 @@ describe('/api/copilot/chat - JWT decoding', () => {
     // (NEXT_PUBLIC_SKIP_AUTH=true), which is what .env.local ships. NODE_ENV alone
     // no longer skips. ID-token verification still runs regardless of this flag.
     process.env.NEXT_PUBLIC_SKIP_AUTH = 'true';
-    // Default: a valid, approved ID token (tests override as needed).
+    // Default: a valid ID token for a provisioned user (tests override as needed).
     mockVerify.mockResolvedValue({
       sub: 'user123',
       email: 'test@example.com',
@@ -106,14 +106,14 @@ describe('/api/copilot/chat - JWT decoding', () => {
     expect(res._getStatusCode()).not.toBe(400);
   });
 
-  it('returns 403 when user not approved', async () => {
+  it('returns 403 when caller is not in an authorized group', async () => {
     process.env.NODE_ENV = 'production';
     process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';
     process.env.COGNITO_CLIENT_ID = 'web-client';
     process.env.GBAW_TENANT_ID = 'tenant-a';
     process.env.GBAW_WORKSPACE_ID = 'workspace-a';
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
-    // Verified access token, but no approved group.
+    // Verified access token, but not in the admin or users group.
     mockVerify.mockResolvedValue({
       token_use: 'access',
       sub: 'user123',
@@ -142,14 +142,18 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
     expect(res._getStatusCode()).toBe(403);
     const data = JSON.parse(res._getData());
-    expect(data.error).toBe('Account pending approval');
+    expect(data.error).toBe('Access not provisioned');
+    expect(data.message).toBe(
+      'Your account is not provisioned for access. Contact an administrator to be granted access.'
+    );
+    expect(JSON.stringify(data)).not.toMatch(/approv/i);
 
   });
 
   it('fails closed with 401 when auth is real but no trusted principal is built', async () => {
-    // Regression guard for the #320 approval-gate finding: the admin/users gate must not be
-    // silently skipped when the access token verifies "ok" but yields no payload/principal
-    // outside the local-dev bypass. Simulate a non-prod HOSTED env (no SKIP_AUTH) where the
+    // The admin-or-users group gate must not be silently skipped when the access token
+    // verifies "ok" but yields no payload/principal outside the local-dev bypass.
+    // Simulate a non-prod HOSTED env (no SKIP_AUTH) where the
     // verifier resolves to a null-ish payload — the request must be rejected, not proceed.
     process.env.NODE_ENV = 'production';
     process.env.AGENTCORE_RUNTIME_ID = 'runtime-test';

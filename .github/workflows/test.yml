@@ -114,6 +114,16 @@ jobs:
       working-directory: ./ui
       run: npm run build
 
+    # The build-manifest backstop in the no-admin regression suite only has a
+    # `.next` to inspect after the build above. Run it here with the manifest
+    # required so a build that somehow emitted an `/admin/*` route — or no page
+    # manifest at all — fails the job.
+    - name: Verify build exposes no admin route
+      working-directory: ./ui
+      run: npx jest --ci src/__tests__/no-admin-user-management.test.ts
+      env:
+        REQUIRE_NEXT_BUILD_MANIFEST: 'true'
+
     - name: Run E2E smoke tests
       working-directory: ./ui
       run: npx playwright test tests/e2e-smoke.spec.ts
