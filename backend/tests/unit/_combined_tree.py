@@ -99,7 +99,8 @@ def _git_tracked_files(repo_root: pathlib.Path, pathspec: str) -> list[str]:
 
 def _git_show(repo_root: pathlib.Path, rel_path: str) -> str:
     """Contents of a tracked file from the index (``:path``), so the check reads
-    what is *committed/staged*, independent of any dirty worktree edits."""
+    what is *committed/staged*, independent of any uncommitted edits in the
+    working copy."""
     result = subprocess.run(
         ["git", "-C", str(repo_root), "show", f":{rel_path}"],
         capture_output=True,

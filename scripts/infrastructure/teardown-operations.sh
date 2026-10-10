@@ -35,7 +35,9 @@ else
     AWS_PROFILE_ARGS=()
 fi
 
-# When set, the resolved caller account must match before any stack write.
+# REQUIRED for a non-interactive run: the resolved caller account must equal it
+# before any stack write. On a terminal it may be omitted and the masked account
+# is confirmed interactively; a non-interactive run without it is refused.
 GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID="${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID:-}"
 
 CONFIRM=""
@@ -51,6 +53,16 @@ Deletes only the CloudFormation stack. Durable audit data (DynamoDB table, KMS
 key) is RETAINED by policy and is never erased by this script. Removing retained
 audit data is a separate, explicit, manual future step.
 This script is never called by teardown-all.sh; run it by hand.
+
+Environment:
+  GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID  REQUIRED for a non-interactive run: the
+                                       resolved caller account must equal it
+                                       before the stack is deleted. On a
+                                       terminal it may be omitted and the masked
+                                       account is confirmed interactively; a
+                                       non-interactive run without it is refused.
+  AWS_PROFILE, AWS_REGION              Credentials/region, verified before any
+                                       write.
 USAGE
 }
 

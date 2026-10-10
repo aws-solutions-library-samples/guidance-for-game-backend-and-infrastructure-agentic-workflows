@@ -928,7 +928,7 @@ def _underlying_actions_the_store_actually_requires():
     ``PYTHONPATH`` so ``operations.observation_store.DynamoDbObservationStore``
     -- the module the CloudFormation Lambda ``Handler`` actually loads -- and its
     whole dependency subtree import cleanly regardless of suite import order and
-    without depending on any sibling worktree. The script
+    without depending on any directory outside this checkout. The script
     drives begin (fresh create), a conditional-replay begin resolving a stored
     *succeeded* operation, a stale-lease *reclaim* begin, complete, fail, and
     load_status, capturing every ``TransactWriteItems`` leg type and every direct
@@ -944,17 +944,16 @@ def _derive_required_actions_from_store_src(store_src):
 
     ``store_src`` is put FIRST on the subprocess ``PYTHONPATH`` so the clean
     interpreter imports the deployed ``operations`` package tree from exactly
-    that checkout, with no dependence on suite import order or on any sibling
-    worktree. A missing store is a hard failure, so the guard can never pass
-    vacuously by silently importing nothing."""
+    that checkout, with no dependence on suite import order or on any directory
+    outside this checkout. A missing store is a hard failure, so the guard can
+    never pass vacuously by silently importing nothing."""
     # Standard library
     import os
     import subprocess
     import sys
 
     assert store_src is not None, (
-        "deployed E1 store not found: no backend/src carrying "
-        f"{STORE_MODULE_REL} in this checkout or a sibling core worktree"
+        "deployed E1 store not found: no backend/src carrying " f"{STORE_MODULE_REL} in this checkout"
     )
     assert (store_src / STORE_MODULE_REL).is_file(), f"deployed E1 store not found at {store_src}/{STORE_MODULE_REL}"
 
@@ -1017,13 +1016,12 @@ def test_iam_grants_exactly_the_underlying_actions_the_store_transacts(template)
     )
 
 
-def test_store_src_resolves_to_the_current_checkout_without_any_sibling():
+def test_store_src_resolves_to_the_current_checkout():
     """The deployed store must resolve from *this* checkout's own ``backend/src``.
 
-    This branch ships the deployed E1 store under its own ``backend/src``, so
-    :func:`resolve_deployed_store_src` must return that path. The single
-    deployable checkout carries no sibling ``issue-413-core`` directory, and the
-    drift guard must still find the store to drive."""
+    The deployable checkout ships the E1 store under its own ``backend/src``, so
+    :func:`resolve_deployed_store_src` must return that path. Resolution depends
+    only on this checkout, so the drift guard always finds the store to drive."""
     resolved = resolve_deployed_store_src(PROJECT_ROOT)
     assert resolved is not None, "store src did not resolve from the current checkout"
     assert (
@@ -1032,30 +1030,24 @@ def test_store_src_resolves_to_the_current_checkout_without_any_sibling():
     assert (resolved / STORE_MODULE_REL).is_file(), f"resolved store src {resolved} does not carry {STORE_MODULE_REL}"
 
 
-def test_drift_guard_runs_non_vacuously_in_an_isolated_single_checkout(tmp_path):
-    """Prove the drift guard still derives the real action set with NO siblings.
+def test_drift_guard_runs_non_vacuously_in_an_isolated_checkout(tmp_path):
+    """Prove the drift guard still derives the real action set in isolation.
 
-    This copies the current checkout's ``backend/src`` (the repo alone) into an
-    isolated temp root that has *no* sibling ``issue-413-core`` directory next to
-    it -- the shape of a normal single combined checkout / CI -- then drives the
-    real deployed store from there. The derivation must run non-vacuously and
-    return exactly the underlying action set the store's real transaction legs
-    and reads require, proving the guard does not depend on any sibling worktree
-    and does not silently pass by importing nothing."""
+    This copies the current checkout's ``backend/src`` into an isolated temp root
+    that contains the repository alone -- the shape of a normal single checkout
+    or CI run -- then drives the real deployed store from there. The derivation
+    must run non-vacuously and return exactly the underlying action set the
+    store's real transaction legs and reads require, proving the guard depends
+    only on this checkout and does not silently pass by importing nothing."""
     # Standard library
     import shutil
 
-    # Materialize the repo alone under an isolated root: <iso>/repo/backend/src,
-    # so <iso>/repo has no sibling worktree beside it.
+    # Materialize the repository alone under an isolated root:
+    # <iso>/repo/backend/src, so <iso>/repo stands by itself.
     isolated_repo = tmp_path / "repo"
     src_dst = isolated_repo / "backend" / "src"
     src_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(PROJECT_ROOT / "backend" / "src", src_dst)
-
-    # Sanity: the isolated root has no sibling issue-413-core to fall back to.
-    assert not (
-        isolated_repo.parent / "issue-413-core"
-    ).exists(), "isolated root must have no sibling core worktree for a faithful single-checkout probe"
 
     resolved = resolve_deployed_store_src(isolated_repo)
     assert resolved == src_dst, f"isolated resolution must pick the copied src, got {resolved}"
@@ -1073,7 +1065,7 @@ def test_drift_guard_runs_non_vacuously_in_an_isolated_single_checkout(tmp_path)
 def test_drift_guard_fails_loudly_when_no_store_is_present(tmp_path):
     """The guard must never pass vacuously when the deployed store is absent.
 
-    If neither the current checkout nor any sibling carries the store,
+    If the current checkout does not carry the store,
     :func:`resolve_deployed_store_src` returns ``None`` and the derivation must
     raise rather than silently succeed with an empty action set."""
     empty_repo = tmp_path / "empty"
@@ -1323,27 +1315,27 @@ def test_combined_tree_carries_real_core_handler_the_template_points_at(tmp_path
     is absent, so this is never vacuous."""
     src = materialize_combined_operations_tree(tmp_path, PROJECT_ROOT)
     lambda_entry = src / HANDLER_REL
-    assert lambda_entry.is_file(), "combined tree must carry core's real observe handler"
+    assert lambda_entry.is_file(), "the deployable source tree must carry the real observe handler"
     assert module_defines_top_level_handler(
         lambda_entry
-    ), "the combined-tree handler must define a module-level def handler(...)"
+    ), "the packaged handler must define a module-level def handler(...)"
     # The template Handler must name exactly this module + attribute.
     handler_value = _observation_function(load_cfn_template(TEMPLATE.read_text(encoding="utf-8")))["Handler"]
     assert handler_value == HANDLER_DOTTED, (
-        f"template Handler {handler_value!r} must point at the combined-tree " f"module {HANDLER_DOTTED!r}"
+        f"template Handler {handler_value!r} must point at the packaged " f"module {HANDLER_DOTTED!r}"
     )
 
 
-def test_wrapper_packages_and_imports_the_combined_tree_handler():
-    """The deploy wrapper must package the combined tree's handler module and
-    import-probe it, so the artifact it uploads is exactly the module the
-    template invokes. Encodes the wrapper's handler-present gate and probe."""
+def test_wrapper_packages_and_imports_the_handler():
+    """The deploy wrapper must package the handler module from the backend source
+    tree and import-probe it, so the artifact it uploads is exactly the module
+    the template invokes. Encodes the wrapper's handler-present gate and probe."""
     text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
     # The wrapper packages by the frozen module path...
     assert (
         f'HANDLER_MODULE_PATH="{HANDLER_REL}"' in text
-    ), "wrapper must package the frozen handler module path from the combined tree"
-    # ...gates the enable on that module being present in the combined tree...
+    ), "wrapper must package the frozen handler module path from the backend source tree"
+    # ...gates the enable on that module being present in the packaged source...
     assert 'if [ ! -f "$BACKEND_SRC/$HANDLER_MODULE_PATH" ]; then' in text
     assert "exit 5" in text
     # ...and import-probes the dotted module + its module-level handler attr.

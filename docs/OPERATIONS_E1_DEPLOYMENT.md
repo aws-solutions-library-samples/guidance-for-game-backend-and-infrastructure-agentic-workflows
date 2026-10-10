@@ -61,11 +61,10 @@ and tests all bind to them.
 | Lambda handler | `operations.observe.lambda_entry.handler` |
 
 The handler module (`backend/src/operations/observe/lambda_entry.py`) is the
-real, deployable handler owned by the observation core. The infrastructure ships
-no placeholder for this path: the core handler is the sole owner. The handler
-honors the `GBAW_OPERATIONS_MODE` kill switch and **fails closed** rather than
-returning a placeholder success. On a combined tree the infrastructure wrapper
-packages and invokes this core handler directly.
+real, deployable handler in the backend source tree. The infrastructure ships
+no placeholder for this path. The handler honors the `GBAW_OPERATIONS_MODE`
+kill switch and **fails closed** rather than returning a placeholder success.
+The infrastructure wrapper packages and invokes this handler directly.
 
 ### OperationsMode vocabulary
 
@@ -106,6 +105,30 @@ and no S3 content bucket exists. Each budget/freshness variable is backed by a
 validated CloudFormation parameter (`PerReadBudgetSeconds`,
 `PersistenceBudgetSeconds`, `CancellationMarginSeconds`, `ObservationTtlSeconds`)
 so operators tune real, bounded runtime knobs.
+
+### Latency budget variables for the deploy wrapper (`--enable`)
+
+The deploy wrapper (`scripts/infrastructure/deploy-operations.sh`) accepts six
+optional latency-budget variables that map to the same-named CloudFormation
+parameters. The wrapper validates the effective set up front (the sub-budgets
+must fit the request deadline, the Lambda timeout must exceed the request
+deadline, and the p99 alarm threshold must be below the request deadline) before
+any write, because CloudFormation Rules cannot do arithmetic.
+
+| Variable | CloudFormation parameter | Default |
+| --- | --- | --- |
+| `RequestDeadlineSeconds` | `RequestDeadlineSeconds` | `15` |
+| `LambdaTimeoutSeconds` | `LambdaTimeoutSeconds` | `20` |
+| `PerReadBudgetSeconds` | `PerReadBudgetSeconds` | `3` |
+| `PersistenceBudgetSeconds` | `PersistenceBudgetSeconds` | `3` |
+| `CancellationMarginSeconds` | `CancellationMarginSeconds` | `3` |
+| `LatencyAlarmThresholdMs` | `LatencyAlarmThresholdMs` | `13000` |
+
+On an **existing** stack a re-enable sends only the budget keys the operator set
+in the environment; a variable left unset keeps the stack's currently deployed
+value (read from the stack). A plain disable → enable round trip therefore never
+resets a tuned budget back to its default. On a **fresh** stack an unset variable
+takes its template default. Set a variable only when you intend to change it.
 
 ### DynamoDB retention
 

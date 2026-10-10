@@ -22,8 +22,12 @@ import pytest
 pytestmark = pytest.mark.unit
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
-DEPLOY = PROJECT_ROOT / "scripts/infrastructure/deploy-operations.sh"
-TEARDOWN = PROJECT_ROOT / "scripts/infrastructure/teardown-operations.sh"
+# Source wrappers in this checkout; copied into a throwaway probe repo per test
+# so the drive never depends on the developer's working tree or shell state.
+DEPLOY_SRC = PROJECT_ROOT / "scripts/infrastructure/deploy-operations.sh"
+TEARDOWN_SRC = PROJECT_ROOT / "scripts/infrastructure/teardown-operations.sh"
+DEPLOY = "deploy-operations.sh"
+TEARDOWN = "teardown-operations.sh"
 
 # A stub ``aws`` that records every invocation's argv (one line per call, args
 # tab-joined) to $STUB_AWS_LOG and emits canned responses keyed on the
@@ -43,14 +47,20 @@ sub="${args[1]}"
 
 case "$svc $sub" in
   "sts get-caller-identity")
-    # Account query -> a 12-digit id; Arn query -> a role ARN.
+    # Account query -> a 12-digit id; Arn query -> the configured caller ARN.
     case "$*" in
       *Account*) echo "123456789012" ;;
-      *Arn*)     echo "arn:aws:sts::123456789012:assumed-role/ops-role/session" ;;
+      *Arn*)     echo "${STUB_AWS_CALLER_ARN:-arn:aws:sts::123456789012:assumed-role/ops-role/session}" ;;
       *)         echo "123456789012" ;;
     esac
     ;;
   "cloudformation describe-stacks")
+    # A Throttling error on describe-stacks must fail closed (exit 4) with no
+    # upload or deploy, distinct from a "does not exist" (treated as no stack).
+    if [ "${STUB_AWS_THROTTLE_DESCRIBE:-0}" = "1" ]; then
+      echo "An error occurred (Throttling): Rate exceeded" >&2
+      exit 254
+    fi
     # The disable path queries Provisioned, then the full parameter-key list.
     # The enable path queries individual current bindings via _current_param.
     if [ "${STUB_AWS_NO_STACK:-0}" = "1" ]; then
@@ -63,6 +73,12 @@ case "$svc $sub" in
       *"ParameterKey=='TenantId'"*)        echo "${STUB_AWS_CUR_TENANT:-}" ;;
       *"ParameterKey=='WorkspaceId'"*)     echo "${STUB_AWS_CUR_WS:-}" ;;
       *"ParameterKey=='TrustedAudience'"*) echo "${STUB_AWS_CUR_AUD:-}" ;;
+      *"ParameterKey=='RequestDeadlineSeconds'"*)   echo "${STUB_AWS_CUR_REQ:-None}" ;;
+      *"ParameterKey=='LambdaTimeoutSeconds'"*)     echo "${STUB_AWS_CUR_LAMBDA:-None}" ;;
+      *"ParameterKey=='PerReadBudgetSeconds'"*)     echo "${STUB_AWS_CUR_READ:-None}" ;;
+      *"ParameterKey=='PersistenceBudgetSeconds'"*) echo "${STUB_AWS_CUR_PERSIST:-None}" ;;
+      *"ParameterKey=='CancellationMarginSeconds'"*) echo "${STUB_AWS_CUR_MARGIN:-None}" ;;
+      *"ParameterKey=='LatencyAlarmThresholdMs'"*)  echo "${STUB_AWS_CUR_LATENCY:-None}" ;;
       *ParameterKey*)
         # An OLDER deployed stack: a reduced key set that predates the newer
         # template parameters (no LambdaTimeoutSeconds/ObserverGroups/etc.).
@@ -149,22 +165,80 @@ def _make_enable_stub_path(tmp_path: pathlib.Path) -> pathlib.Path:
     return bindir
 
 
-def _run_with_stub(script, *args, tmp_path, env_extra=None):
-    log = tmp_path / "aws-calls.log"
-    log.write_text("", encoding="utf-8")
-    bindir = _make_stub_path(tmp_path)
+def _make_probe_repo(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Build a throwaway git repository holding only what the wrappers need.
+
+    The wrappers derive PROJECT_ROOT as ``<script>/../..`` and the enable path
+    stages ``backend/src/operations`` from ``git archive HEAD``, so the probe
+    runs against a self-contained repository under ``tmp_path`` — never the
+    developer's checkout. This keeps the stub tests independent of the current
+    working tree's dirty/untracked state and of the host shell.
+    """
+    repo = tmp_path / "repo"
+    # Copy the three script/template inputs plus the operations source tree.
+    (repo / "scripts" / "infrastructure").mkdir(parents=True)
+    (repo / "infrastructure" / "cloudformation").mkdir(parents=True)
+    (repo / "backend" / "src").mkdir(parents=True)
+    # Standard library
+    import shutil
+
+    shutil.copy2(DEPLOY_SRC, repo / "scripts" / "infrastructure" / "deploy-operations.sh")
+    shutil.copy2(TEARDOWN_SRC, repo / "scripts" / "infrastructure" / "teardown-operations.sh")
+    shutil.copy2(
+        PROJECT_ROOT / "infrastructure" / "cloudformation" / "06-operations-observation.yaml",
+        repo / "infrastructure" / "cloudformation" / "06-operations-observation.yaml",
+    )
+    shutil.copytree(
+        PROJECT_ROOT / "backend" / "src" / "operations",
+        repo / "backend" / "src" / "operations",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    # Initialize a throwaway repo and commit everything so the enable path's
+    # git archive / clean-tree checks pass against this self-contained tree.
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "probe",
+            "GIT_AUTHOR_EMAIL": "probe@example.com",
+            "GIT_COMMITTER_NAME": "probe",
+            "GIT_COMMITTER_EMAIL": "probe@example.com",
+        }
+    )
+    subprocess.run(["git", "init", "-q"], cwd=repo, env=env, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, env=env, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "probe"], cwd=repo, env=env, check=True)
+    return repo
+
+
+def _base_env(tmp_path: pathlib.Path, bindir: pathlib.Path, log: pathlib.Path) -> dict:
     env = os.environ.copy()
     # Stub first on PATH so the real aws is never used; keep the rest of PATH so
     # bash/coreutils still resolve.
     env["PATH"] = os.pathsep.join([str(bindir), env.get("PATH", "")])
     env["STUB_AWS_LOG"] = str(log)
-    # A profile keeps the --profile drop in the stub exercised and avoids reading
-    # ui/.env.local in the test environment.
     env["AWS_PROFILE"] = "test-profile"
     env["AWS_REGION"] = "us-west-2"
-    # Bind the write to the stub's account so the non-interactive guard allows it
-    # (tests that assert a mismatch override this to a different account).
-    env.setdefault("GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID", "123456789012")
+    # Assign the expected account UNCONDITIONALLY (not setdefault) so an operator
+    # who exported GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID in the host environment
+    # cannot change these tests' behavior; cases that need a different value or
+    # no value override it explicitly via env_extra.
+    env["GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID"] = "123456789012"
+    return env
+
+
+def _run_with_stub(script_rel, *args, tmp_path, env_extra=None):
+    """Run a wrapper from the throwaway probe repo with a stub ``aws`` on PATH.
+
+    ``script_rel`` is the wrapper filename ("deploy-operations.sh" or
+    "teardown-operations.sh"); it is resolved inside the probe repo so
+    PROJECT_ROOT points at that self-contained tree.
+    """
+    repo = _make_probe_repo(tmp_path)
+    script = repo / "scripts" / "infrastructure" / script_rel
+    log = tmp_path / "aws-calls.log"
+    log.write_text("", encoding="utf-8")
+    bindir = _make_stub_path(tmp_path)
+    env = _base_env(tmp_path, bindir, log)
     if env_extra:
         env.update(env_extra)
     result = subprocess.run(
@@ -172,22 +246,20 @@ def _run_with_stub(script, *args, tmp_path, env_extra=None):
         env=env,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     calls = [line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
     return result, calls
 
 
 def _run_enable_with_stub(tmp_path, args=(), *, env_extra=None):
-    """Run the real deploy wrapper's --enable path with stub aws/uv/docker."""
+    """Run the deploy wrapper's --enable path from the probe repo with stubs."""
+    repo = _make_probe_repo(tmp_path)
+    script = repo / "scripts" / "infrastructure" / "deploy-operations.sh"
     log = tmp_path / "aws-calls.log"
     log.write_text("", encoding="utf-8")
     bindir = _make_enable_stub_path(tmp_path)
-    env = os.environ.copy()
-    env["PATH"] = os.pathsep.join([str(bindir), env.get("PATH", "")])
-    env["STUB_AWS_LOG"] = str(log)
-    env["AWS_PROFILE"] = "test-profile"
-    env["AWS_REGION"] = "us-west-2"
-    # The enable opt-in inputs.
+    env = _base_env(tmp_path, bindir, log)
     env.update(
         {
             "GBAW_OPERATIONS_MODE": "observe",
@@ -197,17 +269,16 @@ def _run_enable_with_stub(tmp_path, args=(), *, env_extra=None):
             "WORKSPACE_ID": "workspace-abc",
             "TRUSTED_AUDIENCE": "operations-api",
             "GBAW_OPERATIONS_ARTIFACT_BUCKET": "ops-artifacts-bucket",
-            # Bind the write to the stub account so the non-interactive guard allows it.
-            "GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID": "123456789012",
         }
     )
     if env_extra:
         env.update(env_extra)
     result = subprocess.run(
-        ["bash", str(DEPLOY), "--enable", *args],
+        ["bash", str(script), "--enable", *args],
         env=env,
         capture_output=True,
         text=True,
+        stdin=subprocess.DEVNULL,
     )
     calls = [line for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
     return result, calls
@@ -392,8 +463,9 @@ def test_teardown_deletes_then_waits_and_succeeds(tmp_path):
     assert subs.index("cloudformation delete-stack") < subs.index("cloudformation wait")
 
 
-def test_teardown_surfaces_delete_failure_as_nonzero(tmp_path):
-    # When the delete waiter fails, teardown must NOT report success.
+def test_teardown_surfaces_delete_failure_as_exit_8_after_delete_stack(tmp_path):
+    # When the delete waiter fails, teardown must exit 8 (not report success) and
+    # must have issued the delete-stack call first.
     result, calls = _run_with_stub(
         TEARDOWN,
         "--confirm",
@@ -401,6 +473,171 @@ def test_teardown_surfaces_delete_failure_as_nonzero(tmp_path):
         tmp_path=tmp_path,
         env_extra={"STUB_AWS_FAIL_WAIT": "1"},
     )
-    assert result.returncode != 0, "teardown must exit non-zero on a failed stack deletion"
+    assert result.returncode == 8, f"teardown must exit 8 on a failed stack deletion.\n{result.stdout}\n{result.stderr}"
+    subs = _subcommands(calls)
+    assert "cloudformation delete-stack" in subs, "delete-stack must have been issued before the waiter failed"
     combined = result.stdout + result.stderr
     assert "✅" not in combined or "did not complete" in combined
+
+
+# --------------------------------------------------------------------------- #
+# New guard coverage: these fail when the corresponding guard regresses.
+# --------------------------------------------------------------------------- #
+
+
+def test_enable_throttled_describe_stacks_fails_closed_without_upload_or_deploy(tmp_path):
+    # A Throttling error on describe-stacks must fail closed with exit 4 and must
+    # NOT fall through to "no stack" and upload/deploy. A guard that treated any
+    # describe-stacks error as "no stack" would wrongly proceed here.
+    result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_THROTTLE_DESCRIBE": "1"})
+    assert result.returncode == 4, f"a throttled describe-stacks must exit 4.\n{result.stdout}\n{result.stderr}"
+    subs = _subcommands(calls)
+    assert "s3 cp" not in subs, "no artifact may be uploaded when stack existence is unknown"
+    assert "cloudformation deploy" not in subs
+
+
+def test_enable_without_expected_account_and_no_tty_is_refused(tmp_path):
+    # stdin is DEVNULL (not a TTY) and the expected account is unset: enable must
+    # exit 4 before any write rather than silently trusting the resolved account.
+    result, calls = _run_enable_with_stub(
+        tmp_path, env_extra={"GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID": "", "STUB_AWS_NO_STACK": "1"}
+    )
+    assert result.returncode == 4, f"unset account + no TTY must exit 4.\n{result.stdout}\n{result.stderr}"
+    subs = _subcommands(calls)
+    assert "s3 cp" not in subs
+    assert "cloudformation deploy" not in subs
+
+
+def test_disable_without_expected_account_and_no_tty_is_refused(tmp_path):
+    result, calls = _run_with_stub(
+        DEPLOY, "--disable", tmp_path=tmp_path, env_extra={"GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID": ""}
+    )
+    assert result.returncode == 4
+    assert "cloudformation update-stack" not in _subcommands(calls)
+
+
+def test_teardown_without_expected_account_and_no_tty_is_refused(tmp_path):
+    result, calls = _run_with_stub(
+        TEARDOWN,
+        "--confirm",
+        "delete-operations",
+        tmp_path=tmp_path,
+        env_extra={"GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID": ""},
+    )
+    assert result.returncode == 4
+    assert "cloudformation delete-stack" not in _subcommands(calls)
+
+
+def _caller_line(stdout: str) -> str:
+    return next((ln for ln in stdout.splitlines() if "Caller:" in ln), "")
+
+
+def test_assumed_role_arn_prints_only_the_role_not_the_session(tmp_path):
+    # An assumed-role ARN whose session is an email must print role=<role> and
+    # NOT the session (which could be the user's email).
+    result, _ = _run_with_stub(
+        DEPLOY,
+        "--disable",
+        tmp_path=tmp_path,
+        env_extra={"STUB_AWS_CALLER_ARN": "arn:aws:sts::123456789012:assumed-role/ops-role/user@example.com"},
+    )
+    line = _caller_line(result.stdout)
+    assert "role=ops-role" in line, f"expected role=ops-role in {line!r}"
+    assert "user@example.com" not in line, "the session (an email) must not be printed"
+    assert "123456789012" not in line, "the account must be masked"
+
+
+def test_iam_user_arn_prints_only_the_principal_type_not_a_user_name(tmp_path):
+    # An IAM-user ARN carries a user name; the caller line must print only the
+    # principal type, never the user name or the unmasked account.
+    result, _ = _run_with_stub(
+        DEPLOY,
+        "--disable",
+        tmp_path=tmp_path,
+        env_extra={"STUB_AWS_CALLER_ARN": "arn:aws:iam::123456789012:user/ops/jdoe"},
+    )
+    line = _caller_line(result.stdout)
+    assert "principal=iam-user" in line, f"expected principal=iam-user in {line!r}"
+    assert "jdoe" not in line, "the IAM user name must not be printed"
+    assert "123456789012" not in line, "the account must be masked"
+
+
+def test_enable_sends_the_budget_keys_on_the_deploy_line(tmp_path):
+    # On a fresh stack the enable deploy line must carry the six latency budget
+    # keys so the validated values are the ones actually deployed.
+    result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_NO_STACK": "1"})
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    for key in (
+        "RequestDeadlineSeconds=",
+        "LambdaTimeoutSeconds=",
+        "PerReadBudgetSeconds=",
+        "PersistenceBudgetSeconds=",
+        "CancellationMarginSeconds=",
+        "LatencyAlarmThresholdMs=",
+    ):
+        assert key in deploy_line, f"expected {key} on the deploy line"
+
+
+def test_reenable_without_budget_vars_keeps_deployed_budgets(tmp_path):
+    # An existing stack with tuned budgets, re-enabled with NO budget variables
+    # set, must NOT resend the budget keys, so the deployed (tuned) values are
+    # preserved rather than reset to defaults.
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        # A tuned, non-default budget already deployed.
+        "STUB_AWS_CUR_REQ": "18",
+        "STUB_AWS_CUR_LAMBDA": "25",
+        "STUB_AWS_CUR_READ": "4",
+        "STUB_AWS_CUR_PERSIST": "4",
+        "STUB_AWS_CUR_MARGIN": "2",
+        "STUB_AWS_CUR_LATENCY": "15000",
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    # No budget key is resent, so the deployed tuned values are preserved.
+    for key in (
+        "RequestDeadlineSeconds=",
+        "LambdaTimeoutSeconds=",
+        "PerReadBudgetSeconds=",
+        "PersistenceBudgetSeconds=",
+        "CancellationMarginSeconds=",
+        "LatencyAlarmThresholdMs=",
+    ):
+        assert key not in deploy_line, f"{key} must not be resent on a plain re-enable"
+
+
+def test_reenable_with_one_budget_var_sends_only_that_key(tmp_path):
+    # Setting a single budget variable sends only that key; the rest keep their
+    # deployed values.
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        "STUB_AWS_CUR_REQ": "18",
+        "STUB_AWS_CUR_LAMBDA": "25",
+        "STUB_AWS_CUR_READ": "4",
+        "STUB_AWS_CUR_PERSIST": "4",
+        "STUB_AWS_CUR_MARGIN": "2",
+        "STUB_AWS_CUR_LATENCY": "15000",
+        # Operator tunes only the per-read budget this time (3 keeps the
+        # effective set valid: 3*3 + 4 + 2 = 15 <= RequestDeadlineSeconds 18).
+        "PerReadBudgetSeconds": "3",
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    assert "PerReadBudgetSeconds=3" in deploy_line
+    for key in (
+        "RequestDeadlineSeconds=",
+        "LambdaTimeoutSeconds=",
+        "PersistenceBudgetSeconds=",
+        "CancellationMarginSeconds=",
+        "LatencyAlarmThresholdMs=",
+    ):
+        assert key not in deploy_line, f"{key} must not be resent when only PerReadBudgetSeconds is set"

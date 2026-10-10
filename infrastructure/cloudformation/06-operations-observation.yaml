@@ -570,9 +570,10 @@ Resources:
           # *caller's* role to hold the full documented DynamoDB CMK data-plane
           # action set -- Encrypt, Decrypt, ReEncrypt*, GenerateDataKey*, and
           # DescribeKey -- plus a resource-scoped CreateGrant. A role holding only
-          # Decrypt + GenerateDataKey is exactly what raised the live
-          # begin_observation DynamoDB AccessDeniedException (GitHub issue #413),
-          # even though the IAM simulator allowed TransactWriteItems/GetItem.
+          # Decrypt + GenerateDataKey is insufficient: begin_observation's
+          # DynamoDB write fails closed with AccessDeniedException even when the
+          # IAM simulator allows TransactWriteItems/GetItem, because the CMK
+          # data-plane actions above are evaluated separately.
           #
           # Both statements are pinned to DynamoDB via kms:ViaService so this
           # grant can never be exercised for direct, generic KMS use; the key can

@@ -16,9 +16,9 @@
 # and a later --enable is reversible. It rebuilds no code and runs no Docker.
 #
 # On an enabled deploy the wrapper builds a DETERMINISTIC, Lambda-compatible
-# Python 3.13 / x86_64 zip containing the real `operations` code (from a combined
-# tree that includes issue #413 core's handler) plus every transitive runtime
-# dependency pinned at the version frozen in the repository lock. Dependencies
+# Python 3.13 / x86_64 zip containing the real `operations` code (the backend
+# source tree, which must carry the observe handler) plus every transitive
+# runtime dependency pinned at the version frozen in the repository lock. Dependencies
 # are installed for the Lambda manylinux x86_64 ABI via a deterministic
 # cross-platform pip/uv platform install (or an explicitly versioned Lambda build
 # container) so host-architecture native wheels are NEVER packaged. The artifact
@@ -94,9 +94,12 @@ else
     AWS_PROFILE_ARGS=()
 fi
 
-# The expected AWS account the operation must land in. When set, the resolved
-# caller account must match it before any upload or stack write; this binds the
-# write path to a known account rather than trusting whichever profile resolves.
+# The expected AWS account the operation must land in. It is REQUIRED for a
+# non-interactive run: the resolved caller account must match it before any
+# upload or stack write, binding the write path to a known account rather than
+# trusting whichever profile resolves. On a terminal it may be omitted and the
+# masked account is confirmed interactively; a non-interactive run without it is
+# refused.
 GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID="${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID:-}"
 
 usage() {
@@ -130,12 +133,30 @@ Environment for --enable:
   GBAW_OPERATIONS_ARTIFACT_BUCKET     REQUIRED explicit, pre-existing artifact
                                       bucket. This wrapper verifies it and never
                                       discovers or creates a bucket.
-  GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID Optional; when set, the resolved caller
-                                      account must match it before any write.
+  GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID REQUIRED for a non-interactive run: the
+                                      resolved caller account must equal it
+                                      before any write, binding the write to a
+                                      known account. On a terminal it may be
+                                      omitted and the masked account is confirmed
+                                      interactively instead; a non-interactive
+                                      run without it is refused.
   AWS_PROFILE, AWS_REGION             Credentials/region. AWS_PROFILE is resolved
                                       from the environment or ui/.env.local and
                                       passed only when set; both are verified
                                       before any write.
+
+Latency budget tuning for --enable (all optional; each is validated so the
+sub-budgets fit the request deadline and the alarm can fire before fail-closed).
+On an EXISTING stack an unset variable keeps the stack's deployed value, so a
+plain re-enable never resets a tuned budget; set one only to change it:
+  RequestDeadlineSeconds              Internal request deadline, seconds (15).
+  LambdaTimeoutSeconds                Lambda timeout, seconds; must exceed the
+                                      request deadline (20).
+  PerReadBudgetSeconds                Per provider-read budget, seconds (3).
+  PersistenceBudgetSeconds            Persistence/serialization budget, seconds (3).
+  CancellationMarginSeconds           Reserved cancellation margin, seconds (3).
+  LatencyAlarmThresholdMs             p99 latency alarm threshold, ms, below the
+                                      request deadline in ms (13000).
 USAGE
 }
 
@@ -228,36 +249,6 @@ if [ "$ACTION" = "enable" ]; then
         echo "   never discovers or creates a bucket; set it to a pre-existing bucket." >&2
         exit 6
     fi
-    # Enforce that the latency sub-budgets fit inside the request deadline:
-    # 3*read + persistence + margin <= RequestDeadlineSeconds. These mirror the
-    # template parameter defaults and may be overridden by the same-named env
-    # vars; a budget that does not fit would let the function be killed
-    # mid-transaction, so it is rejected here (CloudFormation Rules cannot do
-    # arithmetic).
-    _req="${RequestDeadlineSeconds:-15}"
-    _read="${PerReadBudgetSeconds:-3}"
-    _persist="${PersistenceBudgetSeconds:-3}"
-    _margin="${CancellationMarginSeconds:-3}"
-    _lambda_timeout="${LambdaTimeoutSeconds:-20}"
-    _sum=$(( 3 * _read + _persist + _margin ))
-    if [ "$_sum" -gt "$_req" ]; then
-        echo "❌ Latency budgets do not fit the request deadline: 3*${_read} + ${_persist} +" >&2
-        echo "   ${_margin} = ${_sum}s > RequestDeadlineSeconds=${_req}s. Raise the deadline or" >&2
-        echo "   lower a sub-budget so the function cannot be killed mid-transaction." >&2
-        exit 3
-    fi
-    if [ "$_lambda_timeout" -le "$_req" ]; then
-        echo "❌ LambdaTimeoutSeconds=${_lambda_timeout}s must be strictly greater than" >&2
-        echo "   RequestDeadlineSeconds=${_req}s so the handler fails closed before the" >&2
-        echo "   function is hard-killed." >&2
-        exit 3
-    fi
-    _latency_ms="${LatencyAlarmThresholdMs:-13000}"
-    if [ "$_latency_ms" -ge $(( _req * 1000 )) ]; then
-        echo "❌ LatencyAlarmThresholdMs=${_latency_ms} must be below the request deadline" >&2
-        echo "   (${_req}s) so the p99 alarm can fire before the handler fails closed." >&2
-        exit 3
-    fi
     OPERATIONS_MODE="observe"
 fi
 
@@ -274,23 +265,35 @@ if ! ACCOUNT_ID="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region
     exit 4
 fi
 CALLER_ARN="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --query Arn --output text 2>/dev/null || true)"
-# Print only a masked account (last 4 digits) and the role/last ARN segment —
-# never the full ARN (which can carry a username/email) or the UserId.
+# Print only a masked account (last 4 digits) and a NON-identifying principal
+# descriptor — never the full ARN (which can carry a user name or email), a user
+# name, or the UserId. For an assumed-role ARN
+# (arn:…:assumed-role/<role>/<session>) print the <role> segment only, because
+# the trailing session is often the user's email. For every other caller shape
+# print only the principal TYPE (iam-user, federated-user, root), never the name.
 MASKED_ACCOUNT="****${ACCOUNT_ID: -4}"
-# Extract the ROLE segment, not the session name. An assumed-role ARN is
-# arn:…:assumed-role/<role>/<session>; the trailing session is often the user's
-# email, so print the <role> segment (the part after "assumed-role/" up to the
-# next "/"). For other ARN shapes fall back to the last segment.
 case "$CALLER_ARN" in
     *:assumed-role/*)
         _after_role="${CALLER_ARN##*:assumed-role/}"
-        ROLE_NAME="${_after_role%%/*}"
+        ROLE_SEGMENT="${_after_role%%/*}"
+        CALLER_DESC="role=${ROLE_SEGMENT:-<unknown>}"
+        ;;
+    *:user/*)
+        # An IAM user ARN carries the user name (and may carry a path); print the
+        # type only so no user name is disclosed.
+        CALLER_DESC="principal=iam-user"
+        ;;
+    *:federated-user/*)
+        CALLER_DESC="principal=federated-user"
+        ;;
+    *:root)
+        CALLER_DESC="principal=root"
         ;;
     *)
-        ROLE_NAME="${CALLER_ARN##*/}"
+        CALLER_DESC="principal=unknown"
         ;;
 esac
-echo "   Caller: account=$MASKED_ACCOUNT role=${ROLE_NAME:-<unknown>}"
+echo "   Caller: account=$MASKED_ACCOUNT $CALLER_DESC"
 
 if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$ACCOUNT_ID" != "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
     echo "❌ Resolved account (****${ACCOUNT_ID: -4}) does not match the expected account" >&2
@@ -380,17 +383,91 @@ if [ "$ACTION" = "enable" ]; then
     fi
 fi
 
+# --------------------------------------------------------------------------- #
+# Latency budget resolution (enable only). A re-enable must NOT silently reset
+# an operator's tuned budgets. For each of the six budget variables the
+# EFFECTIVE value is:
+#   * the same-named environment variable, when the operator set it; else
+#   * the value deployed on an existing stack (read with _current_param); else
+#   * the template default (a fresh stack).
+# Only the keys the operator explicitly set are sent as overrides, so unset keys
+# keep their deployed values on an update instead of being overwritten with a
+# default. The resolved EFFECTIVE set is then validated so a tuned stack can
+# never be left with budgets that do not fit the request deadline.
+# --------------------------------------------------------------------------- #
+BUDGET_OVERRIDES=()
+if [ "$ACTION" = "enable" ]; then
+    # Resolve one budget key into the global ``_RESOLVED`` and, when the value is
+    # operator-set or a fresh-stack default, append an explicit override. Run in
+    # the current shell (never a subshell) so the array append persists.
+    _RESOLVED=""
+    _resolve_budget() {
+        # $1 env var name, $2 CloudFormation parameter key, $3 template default.
+        local _env_name="$1" _param_key="$2" _default="$3" _env_val _deployed
+        _env_val="$(printenv "$_env_name" 2>/dev/null || true)"
+        if [ -n "$_env_val" ]; then
+            # Operator-set: use it and send it as an explicit override.
+            BUDGET_OVERRIDES+=("${_param_key}=${_env_val}")
+            _RESOLVED="$_env_val"
+            return 0
+        fi
+        if [ "$STACK_EXISTS" = "true" ]; then
+            _deployed="$(_current_param "$_param_key")"
+            if [ -n "$_deployed" ] && [ "$_deployed" != "None" ]; then
+                # Keep the deployed value; do NOT add an override, so the update
+                # leaves this tuned key untouched.
+                _RESOLVED="$_deployed"
+                return 0
+            fi
+        fi
+        # Fresh stack with no operator value: the template default applies. Send
+        # it explicitly so the validated value is the one actually deployed.
+        BUDGET_OVERRIDES+=("${_param_key}=${_default}")
+        _RESOLVED="$_default"
+    }
+
+    _resolve_budget RequestDeadlineSeconds RequestDeadlineSeconds 15; _req="$_RESOLVED"
+    _resolve_budget PerReadBudgetSeconds PerReadBudgetSeconds 3; _read="$_RESOLVED"
+    _resolve_budget PersistenceBudgetSeconds PersistenceBudgetSeconds 3; _persist="$_RESOLVED"
+    _resolve_budget CancellationMarginSeconds CancellationMarginSeconds 3; _margin="$_RESOLVED"
+    _resolve_budget LambdaTimeoutSeconds LambdaTimeoutSeconds 20; _lambda_timeout="$_RESOLVED"
+    _resolve_budget LatencyAlarmThresholdMs LatencyAlarmThresholdMs 13000; _latency_ms="$_RESOLVED"
+
+    # Validate the EFFECTIVE set (CloudFormation Rules cannot do arithmetic):
+    # 3*read + persistence + margin <= RequestDeadlineSeconds, the Lambda timeout
+    # is strictly greater than the request deadline, and the p99 alarm threshold
+    # is below the request deadline so it can fire before the handler fails closed.
+    _sum=$(( 3 * _read + _persist + _margin ))
+    if [ "$_sum" -gt "$_req" ]; then
+        echo "❌ Latency budgets do not fit the request deadline: 3*${_read} + ${_persist} +" >&2
+        echo "   ${_margin} = ${_sum}s > RequestDeadlineSeconds=${_req}s. Raise the deadline or" >&2
+        echo "   lower a sub-budget so the function cannot be killed mid-transaction." >&2
+        exit 3
+    fi
+    if [ "$_lambda_timeout" -le "$_req" ]; then
+        echo "❌ LambdaTimeoutSeconds=${_lambda_timeout}s must be strictly greater than" >&2
+        echo "   RequestDeadlineSeconds=${_req}s so the handler fails closed before the" >&2
+        echo "   function is hard-killed." >&2
+        exit 3
+    fi
+    if [ "$_latency_ms" -ge $(( _req * 1000 )) ]; then
+        echo "❌ LatencyAlarmThresholdMs=${_latency_ms} must be below the request deadline" >&2
+        echo "   (${_req}s) so the p99 alarm can fire before the handler fails closed." >&2
+        exit 3
+    fi
+fi
+
 if [ "$ACTION" = "enable" ]; then
     # ----------------------------------------------------------------------- #
     # Build a deterministic, Lambda-compatible zip: the real `operations` code
-    # (from the combined tree) plus the pinned third-party dependency closure.
+    # (the backend source tree) plus the pinned third-party dependency closure.
     # Determinism (fixed mtimes, sorted entries) makes the content hash — and
     # therefore the S3 key — stable for an unchanged source tree.
     # ----------------------------------------------------------------------- #
     if [ ! -f "$BACKEND_SRC/$HANDLER_MODULE_PATH" ]; then
         echo "❌ Refusing to enable: frozen handler module $HANDLER_MODULE_PATH is absent" >&2
-        echo "   from $BACKEND_SRC. Package from a combined tree that includes issue #413" >&2
-        echo "   core's real handler; no enabled route may point at missing/placeholder code." >&2
+        echo "   from $BACKEND_SRC. The backend source tree must carry the real observe" >&2
+        echo "   handler; no enabled route may point at missing/placeholder code." >&2
         exit 5
     fi
 
@@ -782,9 +859,9 @@ fi
 # Build the override list. On an existing stack, send only the keys that change
 # (plus the always-updated Provisioned/OperationsMode/code identifiers), so an
 # unchanged binding is never resent and cannot be accidentally rewritten. The
-# latency budget values validated above are sent too, so the stack actually
-# carries the values the wrapper checked against LambdaTimeoutSeconds rather than
-# silently falling back to template defaults.
+# latency budget keys are sent only when the operator set them (or on a fresh
+# stack); a key the operator did not set keeps its deployed value instead of
+# being reset to a template default, so a re-enable never discards a tuned budget.
 PARAM_OVERRIDES=(
     "ProjectName=${PROJECT_NAME}"
     "Provisioned=true"
@@ -793,13 +870,10 @@ PARAM_OVERRIDES=(
     "CognitoClientId=${COGNITO_CLIENT_ID}"
     "CodeS3Bucket=${CODE_S3_BUCKET:-}"
     "CodeS3Key=${CODE_S3_KEY}"
-    "RequestDeadlineSeconds=${_req}"
-    "LambdaTimeoutSeconds=${_lambda_timeout}"
-    "PerReadBudgetSeconds=${_read}"
-    "PersistenceBudgetSeconds=${_persist}"
-    "CancellationMarginSeconds=${_margin}"
-    "LatencyAlarmThresholdMs=${_latency_ms}"
 )
+if [ "${#BUDGET_OVERRIDES[@]}" -gt 0 ]; then
+    PARAM_OVERRIDES+=("${BUDGET_OVERRIDES[@]}")
+fi
 if [ "$STACK_EXISTS" != "true" ] || [ "$ALLOW_BINDING_CHANGE" = "true" ]; then
     PARAM_OVERRIDES+=(
         "Environment=${ENVIRONMENT}"

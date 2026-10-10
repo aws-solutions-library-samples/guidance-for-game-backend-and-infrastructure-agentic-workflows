@@ -64,11 +64,11 @@ REQUIRED_TOP_LEVEL = ("rfc8785", "jsonschema", "referencing", "rpds")
 
 # Local modules
 # The real versioned contract schema resources the runtime handler loads via
-# importlib.resources at validate time. These live in backend/src (owned by this
-# infra worktree's operations package) and MUST be packaged into the Lambda zip;
-# a .py-only package omits them and every contract load raises FileNotFoundError.
-# The authoritative set is operations.contracts.versions.SCHEMA_NAMES; we import
-# it so the test can never drift from the code under package.
+# importlib.resources at validate time. These live in backend/src with the
+# operations package and MUST be packaged into the Lambda zip; a .py-only
+# package omits them and every contract load raises FileNotFoundError. The
+# authoritative set is operations.contracts.versions.SCHEMA_NAMES; we import it
+# so the test can never drift from the code under package.
 from operations.contracts.versions import SCHEMA_NAMES  # noqa: E402
 
 SCHEMA_SRC_DIR = PROJECT_ROOT / "backend" / "src" / "operations" / "contracts" / "schemas" / "v1"
@@ -140,16 +140,16 @@ def _structural_probe(stage: pathlib.Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Handler-present gate on a combined tree; infra contributes no placeholder
+# Handler-present gate on the deployable source tree; no placeholder is used.
 # --------------------------------------------------------------------------- #
 def test_combined_tree_has_real_module_level_handler(tmp_path):
     """A materialized deployable tree carries ``operations/observe/lambda_entry.py``
     defining a module-level ``handler`` — the exact CloudFormation ``Handler`` —
-    vendored from the real on-disk core handler. The materializer fails closed if
-    the real handler is absent, so this never binds to a synthesized stand-in."""
+    vendored from the real on-disk handler. The materializer fails closed if the
+    real handler is absent, so this never binds to a synthesized stand-in."""
     src = materialize_combined_operations_tree(tmp_path, PROJECT_ROOT)
     lambda_entry = src / HANDLER_REL
-    assert lambda_entry.is_file(), "combined tree must carry core's real handler"
+    assert lambda_entry.is_file(), "the deployable source tree must carry the real handler"
     assert module_defines_top_level_handler(
         lambda_entry
     ), "the combined-tree handler must define a module-level def handler(...)"
@@ -204,7 +204,7 @@ def test_combined_package_zip_is_byte_stable(tmp_path):
 
     hash_a = hashlib.sha256(zip_a.read_bytes()).hexdigest()
     hash_b = hashlib.sha256(zip_b.read_bytes()).hexdigest()
-    assert hash_a == hash_b, "deterministic zip of an unchanged combined tree must be byte-stable"
+    assert hash_a == hash_b, "deterministic zip of an unchanged source tree must be byte-stable"
 
 
 def test_combined_package_contains_handler_and_deps(tmp_path):
@@ -513,7 +513,7 @@ def test_fixed_package_still_contains_handler_and_deps(tmp_path):
 
 def test_fixed_package_is_byte_stable(tmp_path):
     """Adding the schema resources preserves determinism: two builds of an
-    unchanged combined tree (handler + schemas) are byte-identical, so the
+    unchanged source tree (handler + schemas) are byte-identical, so the
     content-hash S3 key stays stable."""
     src = _combined_operations_tree_with_schemas(tmp_path)
     stage_a = tmp_path / "a"
