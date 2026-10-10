@@ -122,7 +122,13 @@ def _build_handler(
         min_publish_remaining_s=settings.operations.persistence_budget_s,
     )
     reader = GameLiftObservationAdapter(gamelift_client)
-    store = DynamoDbObservationStore(client=dynamodb_client, table_name=settings.table_name)
+    # The store's deadline guard uses the worst-case cost of one persistence
+    # sub-call: the single-attempt client's connect timeout plus its read
+    # timeout. Deriving it from the same budget the client config uses keeps the
+    # store's "does one more call fit?" check aligned with the real timeouts.
+    persistence_s = settings.operations.persistence_budget_s
+    call_limit_s = min(2.0, max(0.5, persistence_s / 2.0)) + persistence_s
+    store = DynamoDbObservationStore(client=dynamodb_client, table_name=settings.table_name, call_limit_s=call_limit_s)
 
     # The deployment binds exactly one tenant/workspace/audience and trusts the
     # requester client ids configured for it. The client id is verified by API
@@ -170,9 +176,11 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
         return request_handler.handle(event)
     finally:
         elapsed_s = time.monotonic() - started
-        # The sink skips the publish when too little of the request budget
-        # remains and swallows its own CloudWatch errors; the guard here is a
-        # final backstop so publishing latency can never break a request.
+        # The sink always emits the end-to-end latency as an EMF log line so the
+        # p99 latency alarm sees a datapoint for a request of any duration, and
+        # skips only the redundant synchronous put when too little of the request
+        # budget remains; it swallows its own CloudWatch errors. The guard here
+        # is a final backstop so publishing latency can never break a request.
         try:
             metrics_sink.publish_latency(elapsed_s=elapsed_s)
         except Exception:  # noqa: BLE001 - metrics must never break a request

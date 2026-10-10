@@ -9,6 +9,7 @@ dimension (workspace, fleet, account) leaks to CloudWatch.
 from __future__ import annotations
 
 # Standard library
+import json
 from typing import Any
 
 # Third-party packages
@@ -21,6 +22,7 @@ from operations.observe.metrics import (
     METRIC_STUCK,
     METRIC_TIMEOUTS,
     CloudWatchObservationMetrics,
+    build_latency_emf_line,
 )
 
 NAMESPACE = "GBAW/Operations"
@@ -37,7 +39,8 @@ class FakeCloudWatch:
 
 def _sink() -> tuple[CloudWatchObservationMetrics, FakeCloudWatch]:
     client = FakeCloudWatch()
-    return CloudWatchObservationMetrics(client=client, namespace=NAMESPACE), client
+    emf: list[str] = []
+    return CloudWatchObservationMetrics(client=client, namespace=NAMESPACE, emf_emit=emf.append), client
 
 
 def _names(client: FakeCloudWatch) -> list[str]:
@@ -94,30 +97,87 @@ def test_latency_publishes_milliseconds() -> None:
     assert client.puts[0]["MetricData"][0]["Value"] == pytest.approx(403.194)
 
 
-def test_latency_publish_is_skipped_when_too_little_time_remains() -> None:
+def test_latency_publish_skips_the_synchronous_call_when_too_little_time_remains() -> None:
     # When the request has already consumed the budget down to less than one
-    # persistence call's worth of time, the end-to-end latency publish is
-    # skipped so a slow put_metric_data cannot push the invocation past the
-    # Lambda timeout. The skip is counted so it stays observable.
+    # persistence call's worth of time, the *synchronous* put_metric_data is
+    # skipped so a slow call cannot push the invocation past the Lambda timeout.
+    # The EMF datapoint is still emitted, so no latency datapoint is lost.
     client = FakeCloudWatch()
+    emf: list[str] = []
     sink = CloudWatchObservationMetrics(
-        client=client, namespace=NAMESPACE, total_deadline_s=15.0, min_publish_remaining_s=3.0
+        client=client, namespace=NAMESPACE, total_deadline_s=15.0, min_publish_remaining_s=3.0, emf_emit=emf.append
     )
-    # 13 s elapsed of a 15 s budget leaves 2 s < the 3 s floor: skip.
+    # 13 s elapsed of a 15 s budget leaves 2 s < the 3 s floor: skip the sync call.
     sink.publish_latency(elapsed_s=13.0)
     assert client.puts == []
-    assert sink.latency_skipped == 1
+    assert sink.latency_sync_skipped == 1
+    # The latency datapoint still reaches CloudWatch through the EMF line.
+    assert len(emf) == 1
 
 
-def test_latency_publish_runs_when_enough_time_remains() -> None:
+def test_latency_publish_runs_the_synchronous_call_when_enough_time_remains() -> None:
     client = FakeCloudWatch()
+    emf: list[str] = []
     sink = CloudWatchObservationMetrics(
-        client=client, namespace=NAMESPACE, total_deadline_s=15.0, min_publish_remaining_s=3.0
+        client=client, namespace=NAMESPACE, total_deadline_s=15.0, min_publish_remaining_s=3.0, emf_emit=emf.append
     )
-    # 1 s elapsed leaves 14 s >= the 3 s floor: publish.
+    # 1 s elapsed leaves 14 s >= the 3 s floor: publish synchronously and via EMF.
     sink.publish_latency(elapsed_s=1.0)
     assert _names(client) == ["ObservationRequestLatency"]
-    assert sink.latency_skipped == 0
+    assert sink.latency_sync_skipped == 0
+    assert len(emf) == 1
+
+
+def test_a_slow_request_at_the_alarm_threshold_still_produces_a_latency_datapoint() -> None:
+    # The 13 s request sits exactly at the default p99 latency alarm threshold
+    # (13000 ms). It must still produce a latency datapoint the alarm's metric
+    # would see, otherwise the slow tail the alarm exists to catch is invisible.
+    # The datapoint is the EMF line, carrying the same namespace, metric name,
+    # and unit as the synchronous path.
+    client = FakeCloudWatch()
+    emitted: list[str] = []
+    sink = CloudWatchObservationMetrics(
+        client=client, namespace=NAMESPACE, total_deadline_s=15.0, min_publish_remaining_s=3.0, emf_emit=emitted.append
+    )
+    sink.publish_latency(elapsed_s=13.0)
+    assert len(emitted) == 1
+    document = json.loads(emitted[0])
+    assert document[METRIC_LATENCY] == pytest.approx(13000.0)
+    cloudwatch_metrics = document["_aws"]["CloudWatchMetrics"][0]
+    assert cloudwatch_metrics["Namespace"] == NAMESPACE
+    assert cloudwatch_metrics["Metrics"] == [{"Name": "ObservationRequestLatency", "Unit": "Milliseconds"}]
+    # No dimensions, matching the deployment's p99 alarm.
+    assert cloudwatch_metrics["Dimensions"] == [[]]
+
+
+def test_latency_emf_line_matches_the_alarm_metric_identity() -> None:
+    # A fixed synthetic epoch-millisecond timestamp (built from its parts so it
+    # is never mistaken for an identifier) is echoed into the EMF document.
+    synthetic_timestamp_ms = 1_700 * 1_000_000_000
+    line = build_latency_emf_line(
+        namespace="GameAgent/Operations", latency_ms=403.194, timestamp_ms=synthetic_timestamp_ms
+    )
+    document = json.loads(line)
+    assert document["ObservationRequestLatency"] == pytest.approx(403.194)
+    metric_block = document["_aws"]["CloudWatchMetrics"][0]
+    assert metric_block["Namespace"] == "GameAgent/Operations"
+    assert metric_block["Metrics"][0]["Name"] == "ObservationRequestLatency"
+    assert metric_block["Metrics"][0]["Unit"] == "Milliseconds"
+    assert metric_block["Dimensions"] == [[]]
+    assert document["_aws"]["Timestamp"] == synthetic_timestamp_ms
+
+
+def test_latency_emf_emit_error_is_swallowed_and_counted() -> None:
+    client = FakeCloudWatch()
+
+    def boom(_line: str) -> None:
+        raise RuntimeError("stdout closed")
+
+    sink = CloudWatchObservationMetrics(client=client, namespace=NAMESPACE, emf_emit=boom)
+    sink.publish_latency(elapsed_s=1.0)
+    # The EMF emit failed but was swallowed; the synchronous put still ran.
+    assert sink.dropped == 1
+    assert _names(client) == ["ObservationRequestLatency"]
 
 
 def test_recorded_and_replay_emit_no_named_metric() -> None:

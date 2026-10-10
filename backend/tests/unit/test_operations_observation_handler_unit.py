@@ -12,6 +12,9 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+# Third-party packages
+import pytest
+
 # Local modules
 from operations.contracts import canonical_sha256
 from operations.identity import ApprovalIdentityBoundary
@@ -57,16 +60,26 @@ class FakeStore:
         *,
         begin: ObservationBeginOutcome = ObservationBeginOutcome.CREATED,
         status: ObservationStatus | None = None,
+        failure_reason: str | None = None,
     ) -> None:
         self.begin_outcome = begin
         self.status_result = status
+        self.failure_reason = failure_reason
         self.begin_calls = 0
         self.complete_calls = 0
+        self.fail_calls: list[dict[str, Any]] = []
 
     def begin_observation(self, **kwargs: Any) -> ObservationBegin:
         self.begin_calls += 1
         if self.begin_outcome is ObservationBeginOutcome.CREATED:
             return ObservationBegin(ObservationBeginOutcome.CREATED, operation_id=kwargs["operation_id"])
+        if self.begin_outcome is ObservationBeginOutcome.REPLAY_FAILED:
+            return ObservationBegin(
+                ObservationBeginOutcome.REPLAY_FAILED,
+                operation_id=kwargs["operation_id"],
+                current_state="failed",
+                failure_reason=self.failure_reason,
+            )
         return ObservationBegin(self.begin_outcome)
 
     def complete_observation(self, **kwargs: Any) -> ObservationComplete:
@@ -76,6 +89,7 @@ class FakeStore:
         )
 
     def fail_observation(self, **kwargs: Any) -> None:
+        self.fail_calls.append(dict(kwargs))
         return None
 
     def load_status(self, **kwargs: Any) -> ObservationStatus | None:
@@ -480,3 +494,94 @@ def test_error_body_is_deterministically_serialized() -> None:
     response = handler.handle(_event())
     assert response["statusCode"] == 409
     _assert_deterministically_serialized(response)
+
+
+# --- Terminal failure: first response and its replay are byte-identical ----
+
+
+def _client_error(code: str) -> Exception:
+    # Third-party packages
+    from botocore.exceptions import ClientError
+
+    return ClientError({"Error": {"Code": code, "Message": "x"}}, "DescribeFleetCapacity")
+
+
+class _NotFoundReader(FakeReader):
+    def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+        raise _client_error("NotFoundException")
+
+
+class _InvalidReader(FakeReader):
+    def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+        raise _client_error("InvalidRequestException")
+
+
+class _ContractBreakingReader(FakeReader):
+    def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+        # desired above maximum violates the observation contract's ranges.
+        return [{"location": "us-west-2", "desired": 99, "minimum": 0, "maximum": 1, "active": 0, "idle": 0}]
+
+
+class _BoomReader(FakeReader):
+    def read_capacity(self, fleet_id: str) -> list[dict[str, Any]]:
+        raise RuntimeError("provider boom")
+
+
+def _handler_with_reader(reader: FakeReader, store: FakeStore) -> ObservationRequestHandler:
+    service = ObservationService(
+        settings=resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe"}),
+        identity_boundary=ApprovalIdentityBoundary(
+            tenant_id="tenant.default",
+            workspace_id="workspace.default",
+            requester_client_ids=frozenset({"client.web-console"}),
+            approver_client_ids=frozenset({"client.approver"}),
+            trusted_audiences=frozenset({"operations-api"}),
+        ),
+        reader=reader,
+        store=store,
+        clock=lambda: NOW,
+        operation_id_factory=lambda: OPERATION_ID,
+    )
+    return ObservationRequestHandler(
+        service=service,
+        tenant_id="tenant.default",
+        workspace_id="workspace.default",
+        trusted_audience="operations-api",
+        capability_id="gamelift.observe-fleet",
+        capability_version="1.0",
+        authority_inputs=AuthorityInputs(
+            tenant_policy="observe",
+            workspace_policy="observe",
+            principal_authority="observe",
+            capability_maximum="observe",
+            risk_policy="observe",
+        ),
+        observer_groups=frozenset({"admin", "users"}),
+    )
+
+
+@pytest.mark.parametrize(
+    ("reason", "first_reader"),
+    [
+        ("not_found", _NotFoundReader()),
+        ("contract_invalid", _InvalidReader()),
+        ("provider_contract_invalid", _ContractBreakingReader()),
+        ("provider_unavailable", _BoomReader()),
+    ],
+)
+def test_terminal_failure_first_response_and_replay_are_byte_identical(reason: str, first_reader: FakeReader) -> None:
+    # The first terminal failure response (a freshly created operation whose read
+    # fails) and the same-token replay (a REPLAY_FAILED begin carrying the stored
+    # reason) must be byte-identical, including provider_unavailable — both are
+    # built from the single terminal-response table.
+    first_handler = _handler_with_reader(first_reader, FakeStore(begin=ObservationBeginOutcome.CREATED))
+    first = first_handler.handle(_event())
+
+    replay_handler = _handler_with_reader(
+        FakeReader(), FakeStore(begin=ObservationBeginOutcome.REPLAY_FAILED, failure_reason=reason)
+    )
+    replay = replay_handler.handle(_event())
+
+    assert first["statusCode"] == replay["statusCode"]
+    assert first["body"] == replay["body"]  # byte-for-byte identical
+    assert json.loads(first["body"])["retryable"] is False

@@ -68,7 +68,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Local modules
@@ -104,6 +104,14 @@ _INITIAL_GENERATION = 1
 # below this ceiling; a larger result fails closed rather than being written.
 _DYNAMODB_ITEM_SIZE_LIMIT_BYTES = 400 * 1024
 
+# The default worst-case wall-clock cost of one store sub-call, used to guard
+# every sub-call against the request deadline. The persistence client is
+# configured with a single attempt and connect + read timeouts that sum to
+# about 4.5 s at the default persistence budget (connect min(2.0, p/2) = 1.5 s +
+# read p = 3.0 s). The deployment passes the exact value derived from its
+# configured budgets; this default matches the frozen defaults.
+_DEFAULT_CALL_LIMIT_S = 4.5
+
 
 def _utc(value: datetime, field_name: str) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
@@ -124,12 +132,31 @@ class DynamoDbObservationStore(ObservationStore):
         client: Any,
         table_name: str,
         clock: Callable[[], datetime] | None = None,
+        call_limit_s: float = _DEFAULT_CALL_LIMIT_S,
     ) -> None:
         if not isinstance(table_name, str) or not table_name.strip():
             raise ValueError("table_name must be a non-empty string")
+        if not (isinstance(call_limit_s, (int, float)) and call_limit_s > 0):
+            raise ValueError("call_limit_s must be a positive number of seconds")
         self._client = client
         self._table_name = table_name
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # The worst-case wall-clock cost of one store sub-call (connect + read on
+        # the single-attempt persistence client). A sub-call is only started when
+        # at least this much of the request budget remains, so a transaction or
+        # read never begins so late that it can outlast the Lambda timeout.
+        self._call_limit_s = float(call_limit_s)
+
+    def _deadline_reached(self, deadline: datetime) -> bool:
+        """Whether one full store sub-call would not fit before ``deadline``.
+
+        Returns ``True`` when fewer than one call limit remains, so the caller
+        fails closed with ``DEADLINE_EXPIRED`` *before* starting a sub-call that
+        could return after the request deadline. Guarding on the call limit (not
+        merely on the deadline already being past) keeps the whole invocation
+        inside the Lambda timeout.
+        """
+        return self._clock() + timedelta(seconds=self._call_limit_s) >= deadline
 
     # -- Phase 1: create before reads ------------------------------------
 
@@ -147,7 +174,7 @@ class DynamoDbObservationStore(ObservationStore):
     ) -> ObservationBegin:
         deadline = _utc(commit_not_after, "commit_not_after")
         lease_deadline = _utc(lease_not_after, "lease_not_after")
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
 
         intent_hash = canonical_sha256(dict(intent))
@@ -206,7 +233,7 @@ class DynamoDbObservationStore(ObservationStore):
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
 
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
 
         try:
@@ -272,7 +299,7 @@ class DynamoDbObservationStore(ObservationStore):
         # Re-check the request deadline between the two key lookups: each sub-call
         # has its own wall-clock cost, so a slow conflict/reclaim chain fails
         # closed with DEADLINE_EXPIRED before it can outlast the request budget.
-        if self._clock() >= _utc(deadline, "commit_not_after"):
+        if self._deadline_reached(_utc(deadline, "commit_not_after")):
             return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
         snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
         if not snapshot:
@@ -280,7 +307,7 @@ class DynamoDbObservationStore(ObservationStore):
 
         state = snapshot.get("state")
         if state == STATE_SUCCEEDED:
-            if self._clock() >= _utc(deadline, "commit_not_after"):
+            if self._deadline_reached(_utc(deadline, "commit_not_after")):
                 return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
             observation, observation_hash = self._load_result(op_pk)
             if observation is None:
@@ -351,7 +378,7 @@ class DynamoDbObservationStore(ObservationStore):
         back to in-progress rather than creating a second operation.
         """
         now = self._clock()
-        if now >= _utc(deadline, "commit_not_after"):
+        if self._deadline_reached(_utc(deadline, "commit_not_after")):
             return ObservationBegin(ObservationBeginOutcome.DEADLINE_EXPIRED)
         now_epoch_s = int(now.timestamp())
         new_generation = current_generation + 1
@@ -448,7 +475,7 @@ class DynamoDbObservationStore(ObservationStore):
     ) -> ObservationComplete:
         deadline = _utc(commit_not_after, "commit_not_after")
         now = self._clock()
-        if now >= deadline:
+        if self._deadline_reached(deadline):
             return ObservationComplete(ObservationCompleteOutcome.DEADLINE_EXPIRED)
 
         canonical_json = json.dumps(dict(observation), separators=(",", ":"), sort_keys=True, ensure_ascii=False)
@@ -531,7 +558,7 @@ class DynamoDbObservationStore(ObservationStore):
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
 
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return ObservationComplete(ObservationCompleteOutcome.DEADLINE_EXPIRED)
 
         try:
@@ -544,12 +571,19 @@ class DynamoDbObservationStore(ObservationStore):
                 # Throttle/conflict/validation/provider fault: retryable, not 409.
                 _log_store_exception("complete_observation", exc, classification="unavailable")
                 return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
-            # A racing writer may have already reached succeeded: replay it.
+            # A racing writer may have already reached succeeded: replay it. Each
+            # fallback read is a store sub-call, so it is only started when one
+            # full call limit still fits before the deadline; otherwise fail
+            # closed with DEADLINE_EXPIRED rather than racing the Lambda timeout.
+            if self._deadline_reached(deadline):
+                return ObservationComplete(ObservationCompleteOutcome.DEADLINE_EXPIRED)
             try:
                 snapshot = self._get(op_pk, _STATE_SNAPSHOT_SK)
             except ObservationStoreReadError:
                 return ObservationComplete(ObservationCompleteOutcome.PROVIDER_UNAVAILABLE)
             if snapshot and snapshot.get("state") == STATE_SUCCEEDED:
+                if self._deadline_reached(deadline):
+                    return ObservationComplete(ObservationCompleteOutcome.DEADLINE_EXPIRED)
                 try:
                     stored, stored_hash = self._load_result(op_pk)
                 except ObservationStoreReadError:
@@ -572,8 +606,23 @@ class DynamoDbObservationStore(ObservationStore):
         lease_holder: str,
         reason_code: str,
         generation: int = _INITIAL_GENERATION,
+        commit_not_after: datetime | None = None,
     ) -> None:
-        """Record a bounded failed transition where possible (best effort)."""
+        """Record a bounded failed transition where possible (best effort).
+
+        When ``commit_not_after`` is supplied and one full store sub-call would
+        not fit before it, the write is skipped rather than started: a failed
+        record is best effort, and recording it so late that it races the Lambda
+        timeout would risk the invocation being hard-killed. The operation is
+        left ``observing`` and a later retry reclaims it after the lease expires.
+        """
+        if commit_not_after is not None and self._deadline_reached(_utc(commit_not_after, "commit_not_after")):
+            _log_store_exception(
+                "fail_observation",
+                RuntimeError("skipped: insufficient budget for a terminal record"),
+                classification="best_effort",
+            )
+            return None
         op_pk = f"OP#{operation_id}"
         transition_item = {
             "PK": op_pk,

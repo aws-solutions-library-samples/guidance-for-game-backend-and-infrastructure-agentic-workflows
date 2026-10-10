@@ -222,6 +222,67 @@ def test_begin_expired_deadline_fails_closed_without_writing() -> None:
     assert client.transactions == []
 
 
+def test_begin_refuses_to_start_a_sub_call_that_would_not_fit_before_the_deadline() -> None:
+    # The deadline is still in the future, but less than one full store sub-call
+    # (the default 4.5 s call limit) fits before it. begin must fail closed with
+    # DEADLINE_EXPIRED and write nothing, so a transaction never starts so late
+    # that it could return after the Lambda timeout. A guard that only checked
+    # whether the deadline was already past would wrongly start the write here.
+    client = StatefulDynamoClient()
+    begin = _begin(_store(client), deadline=NOW + timedelta(seconds=2.0))
+    assert begin.outcome is ObservationBeginOutcome.DEADLINE_EXPIRED
+    assert client.transactions == []
+
+
+def test_complete_refuses_to_start_a_sub_call_that_would_not_fit_before_the_deadline() -> None:
+    # Same guard on the finalize transaction: a commit is not started unless one
+    # full call limit still fits before the deadline.
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    complete = _store(client).complete_observation(
+        operation_id=OPERATION_ID,
+        workspace_id=WORKSPACE,
+        lease_holder=HOLDER,
+        commit_not_after=NOW + timedelta(seconds=2.0),
+        observation=_observation(),
+    )
+    assert complete.outcome is ObservationCompleteOutcome.DEADLINE_EXPIRED
+    # Only the begin transaction ran; no finalize transaction started.
+    assert len(client.transactions) == 1
+
+
+def test_fail_observation_skips_the_write_when_the_deadline_would_not_fit() -> None:
+    # fail_observation is best effort: when a commit deadline is supplied and one
+    # full sub-call would not fit before it, the terminal record is skipped
+    # rather than started, leaving the operation observing for a later reclaim.
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    transactions_before = len(client.transactions)
+    _store(client).fail_observation(
+        operation_id=OPERATION_ID,
+        workspace_id=WORKSPACE,
+        lease_holder=HOLDER,
+        reason_code="provider_unavailable",
+        commit_not_after=NOW + timedelta(seconds=2.0),
+    )
+    assert len(client.transactions) == transactions_before  # no fail write started
+
+
+def test_fail_observation_writes_when_the_deadline_fits() -> None:
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    store = _store(client)
+    store.fail_observation(
+        operation_id=OPERATION_ID,
+        workspace_id=WORKSPACE,
+        lease_holder=HOLDER,
+        reason_code="provider_unavailable",
+        commit_not_after=NOW + timedelta(seconds=15),
+    )
+    snapshot = client.items[(f"OP#{OPERATION_ID}", "STATE#current")]
+    assert snapshot["state"]["S"] == "failed"
+
+
 def test_begin_non_conditional_error_is_provider_unavailable() -> None:
     # A non-conditional store fault (throttle/conflict) is a retryable
     # unavailable state, never a false idempotency/state 409.
@@ -245,6 +306,54 @@ def test_begin_replays_completed_operation_without_new_read() -> None:
     assert begin.observation is not None
     assert begin.observation["observation_id"] == OPERATION_ID
     assert begin.observation_hash == canonical_sha256(_observation())
+
+
+def test_begin_succeeded_replay_fails_closed_when_deadline_passes_before_loading_result() -> None:
+    # On a completed replay the store reads the snapshot, then loads the result:
+    # each is a sub-call. If the request budget runs out between the two reads,
+    # the store must fail closed with DEADLINE_EXPIRED before starting the
+    # second read, rather than racing the Lambda timeout to load the result.
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    _complete(_store(client))
+
+    # A clock that stays within budget for the begin-phase deadline checks and
+    # the pre-snapshot check, and only advances past the (deadline - call_limit)
+    # horizon on the check immediately before _load_result. Clock calls in this
+    # replay path: begin top, begin pre-transact, resolve pre-snapshot, then the
+    # succeeded-branch check before _load_result.
+    deadline = NOW + timedelta(seconds=15)
+    times = [NOW, NOW, NOW, NOW + timedelta(seconds=11)]
+
+    def advancing() -> datetime:
+        return times.pop(0) if len(times) > 1 else times[0]
+
+    store = DynamoDbObservationStore(client=client, table_name=TABLE, clock=advancing, call_limit_s=4.5)
+    begin = store.begin_observation(
+        operation_id=OPERATION_ID,
+        idempotency_fingerprint=FINGERPRINT,
+        workspace_id=WORKSPACE,
+        idempotency_token=TOKEN,
+        lease_holder=HOLDER,
+        commit_not_after=deadline,
+        lease_not_after=NOW + timedelta(seconds=15),
+        intent=INTENT,
+    )
+    assert begin.outcome is ObservationBeginOutcome.DEADLINE_EXPIRED
+
+
+def test_complete_transaction_fences_on_the_current_time_not_zero() -> None:
+    # The finalize transaction's unexpired-lease condition compares the stored
+    # lease deadline against ``:now`` (the current epoch second). A mutation that
+    # sent ``:now = 0`` would make every lease look expired (0 is before any
+    # real lease), silently defeating the fence. Pin the real value.
+    client = StatefulDynamoClient()
+    _begin(_store(client))
+    _complete(_store(client))
+    update = next(e for e in client.transactions[-1] if "Update" in e)["Update"]
+    now_value = int(update["ExpressionAttributeValues"][":now"]["N"])
+    assert now_value == int(NOW.timestamp())
+    assert now_value > 0
 
 
 def test_begin_changed_intent_is_idempotency_conflict() -> None:

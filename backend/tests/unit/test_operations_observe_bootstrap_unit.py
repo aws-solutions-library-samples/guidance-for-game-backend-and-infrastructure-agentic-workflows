@@ -109,6 +109,18 @@ def test_bootstrap_builds_handler_over_injected_clients(monkeypatch: pytest.Monk
     assert hasattr(handler, "handle")
     # The metrics sink is returned alongside the handler for per-request latency.
     assert metrics is not None
+    # The latency-publish floor is wired from the frozen budgets: the total
+    # deadline bounds the request and the persistence budget is the floor below
+    # which the synchronous publish is skipped. A mutation dropping these
+    # arguments would leave the sink with no floor and is caught here.
+    settings = resolve_observation_deployment_settings(env=_COMPLETE_ENV)
+    assert metrics._total_deadline_s == settings.operations.total_deadline_s
+    assert metrics._min_publish_remaining_s == settings.operations.persistence_budget_s
+    # The store's deadline guard uses one full persistence sub-call limit
+    # (connect + read on the single-attempt client).
+    persistence_s = settings.operations.persistence_budget_s
+    expected_call_limit = min(2.0, max(0.5, persistence_s / 2.0)) + persistence_s
+    assert handler._service._store._call_limit_s == expected_call_limit
     entry._handler.cache_clear()
 
 
