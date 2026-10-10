@@ -424,7 +424,10 @@ def _account_obs_harness(
             extra_env,
             aws_mock,
             "export -f aws",
-            f'bash "{ACCOUNT_OBS_SCRIPT}"; echo "rc=$?"',
+            # Run the script under the parametrized shell itself, so a
+            # ``/bin/bash`` case really executes it under bash 3.2 rather than
+            # whichever ``bash`` happens to be first on PATH.
+            f'{shell} "{ACCOUNT_OBS_SCRIPT}"; echo "rc=$?"',
             # Surface recorded mutations on stdout so the opt-in helper's output
             # capture (2>&1) does not hide them from the test.
             'echo "MUTATIONS:"; cat "$MUTATION_LOG"; rm -f "$MUTATION_LOG"',
@@ -556,8 +559,8 @@ def test_account_obs_optin_refuses_when_destination_unreadable():
     result = _account_obs_harness("true", aws_mock)
     assert "rc=1" in result.stdout
     assert "Cannot read the current trace destination" in result.stderr
-    # It must NOT change the destination when it cannot read it.
-    assert "MUTATION: xray update-trace-segment-destination" not in result.stdout
+    # It must refuse before any shared write when it cannot read the destination.
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
 
 
 def test_account_obs_optin_preserves_existing_cloudwatchlogs_destination():
@@ -593,6 +596,50 @@ def test_account_obs_optin_fails_when_policy_limit_reached():
     assert "rc=1" in result.stdout
     assert "maximum of 10" in result.stderr
     assert "MUTATION: logs put-resource-policy" not in result.stdout
+
+
+def test_account_obs_optin_refuses_before_any_write_when_percent_is_invalid():
+    """An invalid indexing percentage is validated before any shared write.
+
+    ``GBAW_XRAY_DEFAULT_INDEXING_PERCENT=abc`` is rejected during the read-and-
+    validate phase, so the opt-in refuses with zero mutations rather than
+    leaving the resource policy or trace destination half-changed.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=True, indexing_percent="5"),
+        extra_env='export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="abc"',
+    )
+    assert "rc=1" in result.stdout
+    assert "must be an integer in [0, 100]" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+def test_account_obs_optin_refuses_before_any_write_when_indexing_unreadable_and_change_requested():
+    """An unreadable indexing rule with a change requested refuses before any write.
+
+    When a percentage is requested, the current indexing rule is a hard
+    prerequisite. If ``get-indexing-rules`` fails, the opt-in refuses during the
+    read-and-validate phase with zero mutations.
+    """
+    aws_mock = (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then echo "XRay"; return 0; fi\n'
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{"resourcePolicies":[]}\'; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{"logGroups":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _account_obs_harness(
+        "true",
+        aws_mock,
+        extra_env='export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="10"',
+    )
+    assert "rc=1" in result.stdout
+    assert "Unable to read the current X-Ray default indexing rule" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -670,13 +717,34 @@ def test_account_obs_optin_scopes_the_resource_policy_to_the_caller_account(shel
     assert "arn:aws:logs:us-west-2::" not in result.stdout
 
 
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
 @pytest.mark.parametrize("account_output", ["", "None", "not-an-account"])
-def test_account_obs_optin_refuses_when_the_account_lookup_is_not_an_account_id(account_output):
+def test_account_obs_optin_refuses_when_the_account_lookup_is_not_an_account_id(account_output, shell):
     """A lookup that does not return a 12-digit account fails before any shared write."""
     mock = _obs_mock(destination="XRay", spans=True).replace(
         'echo "123456789012"; return 0', f'echo "{account_output}"; return 0'
     )
-    result = _account_obs_harness("true", mock)
+    result = _account_obs_harness("true", mock, shell=shell)
     assert "rc=1" in result.stdout
     assert "identity lookup returned no account ID" in result.stderr
     assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_proceeds_when_identity_lookup_warns_on_stderr(shell):
+    """A successful identity lookup that also prints a warning to stderr proceeds.
+
+    The CLI may print a deprecation or TLS warning to stderr while still
+    returning the account on stdout. Capturing the streams separately keeps the
+    warning out of the 12-digit check, so the opt-in uses the real account and
+    scopes the shared grant to it.
+    """
+    mock = _obs_mock(destination="XRay", spans=True).replace(
+        'if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi',
+        'if [ "$1" = "sts" ]; then echo "a deprecation notice" >&2; echo "123456789012"; return 0; fi',
+    )
+    result = _account_obs_harness("true", mock, shell=shell)
+    assert "rc=0" in result.stdout
+    assert "identity lookup returned no account ID" not in result.stderr
+    assert "MUTATION: logs put-resource-policy" in result.stdout
+    assert '"aws:SourceAccount": "123456789012"' in result.stdout
