@@ -61,6 +61,18 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+STANDALONE_IDENTITY_POLICY_TYPES = frozenset({"AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"})
+
+
+def _standalone_identity_policy_resources(template: dict[str, Any]) -> list[str]:
+    """Return the logical IDs of standalone identity-policy resources in a template."""
+    return sorted(
+        logical_id
+        for logical_id, resource in template["Resources"].items()
+        if isinstance(resource, dict) and resource.get("Type") in STANDALONE_IDENTITY_POLICY_TYPES
+    )
+
+
 def test_task_role_has_no_inline_or_managed_identity_policies():
     properties = _resource("ECSTaskRole")["Properties"]
     assert _as_list(properties.get("Policies")) == []
@@ -69,12 +81,7 @@ def test_task_role_has_no_inline_or_managed_identity_policies():
 
 def test_base_template_has_no_standalone_identity_policy_resources():
     """Disallow every alternate role-policy attachment form in this template."""
-    forbidden_types = {"AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"}
-    offenders = sorted(
-        logical_id
-        for logical_id, resource in _template()["Resources"].items()
-        if isinstance(resource, dict) and resource.get("Type") in forbidden_types
-    )
+    offenders = _standalone_identity_policy_resources(_template())
     assert offenders == [], f"Standalone identity policies bypass the inline-role invariant: {offenders}"
 
 
@@ -82,10 +89,9 @@ def test_standalone_role_policy_resource_is_rejected():
     """A standalone ``AWS::IAM::RolePolicy`` is an attachment form the guard must reject.
 
     Such a resource grants actions to a role by name without appearing in the
-    role's own ``Policies``/``ManagedPolicyArns``. Mirror the guard's own type
-    set against a synthetic template so the invariant stays explicit.
+    role's own ``Policies``/``ManagedPolicyArns``. The synthetic template runs
+    through the same helper as the base-template guard.
     """
-    forbidden_types = {"AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"}
     synthetic = {
         "Resources": {
             "ECSTaskRole": {"Type": "AWS::IAM::Role", "Properties": {}},
@@ -101,12 +107,7 @@ def test_standalone_role_policy_resource_is_rejected():
             },
         }
     }
-    offenders = sorted(
-        logical_id
-        for logical_id, resource in synthetic["Resources"].items()
-        if isinstance(resource, dict) and resource.get("Type") in forbidden_types
-    )
-    assert offenders == ["SneakyRolePolicy"]
+    assert _standalone_identity_policy_resources(synthetic) == ["SneakyRolePolicy"]
 
 
 def test_get_caller_identity_call_remains_without_an_sts_grant():
