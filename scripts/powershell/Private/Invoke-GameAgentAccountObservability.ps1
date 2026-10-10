@@ -137,9 +137,20 @@ function Invoke-GameAgentAccountObservability {
     }
 
     # ── Opt-in mutation path (state-preserving) ──
-    $accountId = (Invoke-ObsMutation 'identity lookup' @('sts', 'get-caller-identity', '--query', 'Account', '--output', 'text', '--region', $Region) | Out-String).Trim()
+    #
+    # Read and validate everything BEFORE the first write, so a refusal or a bad
+    # input never leaves a shared, account-wide setting half-changed. This
+    # mirrors the ordering in scripts/infrastructure/setup-account-observability.sh.
+
+    # Account ID for the resource-policy scope. Merge stderr with 2>&1 to capture
+    # native CLI diagnostics, then drop the ErrorRecord items before Out-String,
+    # as New-GameAgentAwsInvoker does, so a warning printed to stderr on a
+    # successful call cannot be mistaken for part of the account ID.
+    $identityMerged = (& aws sts get-caller-identity --query Account --output text --region $Region @ProfileArgs 2>&1)
+    $identityStdout = @($identityMerged | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+    $accountId = ($identityStdout | Out-String).Trim()
     # An empty or malformed account would write a resource policy that never matches.
-    if ($accountId -notmatch '^\d{12}$') {
+    if ($LASTEXITCODE -ne 0 -or $accountId -notmatch '^\d{12}$') {
         throw 'identity lookup returned no account ID; not changing shared settings'
     }
 
@@ -149,21 +160,45 @@ function Invoke-GameAgentAccountObservability {
     Write-Host '      These affect every X-Ray / Transaction Search consumer in the account.'
     Write-Host ''
 
+    # Read the trace destination and refuse if it cannot be read.
     $destination = Get-TraceDestination
     Write-Host "  Current X-Ray trace segment destination (preserved unless changed below): $destination"
+    if ($destination -eq 'UNREADABLE') {
+        throw 'Cannot read the current trace destination; not changing it'
+    }
 
-    # ── Resource policy: reconcile against existing policies (never duplicate) ──
-    Write-Host "  Ensuring project-owned CloudWatch Logs resource policy ($ResourcePolicyName)..."
+    # Validate the requested indexing percentage before any write.
+    $requestedPercent = $null
+    if (-not [string]::IsNullOrWhiteSpace($DefaultIndexingPercent)) {
+        $parsedPercent = 0
+        if (-not [int]::TryParse($DefaultIndexingPercent, [ref]$parsedPercent) -or $parsedPercent -lt 0 -or $parsedPercent -gt 100) {
+            throw "GBAW_XRAY_DEFAULT_INDEXING_PERCENT='$DefaultIndexingPercent' must be an integer in [0, 100]"
+        }
+        $requestedPercent = $parsedPercent
+    }
+
+    # Read the indexing rule. It is only a hard requirement when a change is
+    # requested; a read failure with no change requested is non-fatal.
+    $currentPercent = Get-DefaultIndexingPercent
+    if ($null -ne $requestedPercent -and $currentPercent -eq 'UNREADABLE') {
+        throw 'Unable to read the current X-Ray default indexing rule; not changing it'
+    }
+
+    # Read the resource-policy list and decide the action before writing. Only
+    # an Effect: Allow statement counts as an existing grant.
     $policiesRaw = (& aws logs describe-resource-policies --region $Region @ProfileArgs --output json 2>$null)
     if ($LASTEXITCODE -ne 0) { throw 'Unable to read existing CloudWatch Logs resource policies' }
     $existingMatch = $null
     $policyCount = 0
+    $owned = $false
     try {
         $policies = ($policiesRaw | ConvertFrom-Json).resourcePolicies
         foreach ($policy in @($policies)) {
             $policyCount++
+            if ($policy.policyName -eq $ResourcePolicyName) { $owned = $true }
             try { $doc = $policy.policyDocument | ConvertFrom-Json } catch { continue }
             foreach ($statement in @($doc.Statement)) {
+                if ($statement.Effect -ne 'Allow') { continue }
                 $services = @($statement.Principal.Service)
                 $actions = @($statement.Action)
                 $resources = @($statement.Resource)
@@ -180,14 +215,22 @@ function Invoke-GameAgentAccountObservability {
         throw 'Unable to read existing CloudWatch Logs resource policies'
     }
 
+    # The 10-policy limit only matters when a policy would be ADDED. Updating a
+    # policy that already uses the project-owned name is an upsert, not an add.
+    if (-not $existingMatch -and -not $owned -and $policyCount -ge 10) {
+        throw "The account already has the maximum of 10 CloudWatch Logs resource policies in this region; cannot create '$ResourcePolicyName'. Remove an unused policy (for example a legacy '$legacyPolicyName') and re-run."
+    }
+
+    # ── All reads and validation passed; perform the writes in order. ──
+
+    # Resource policy: reconcile against existing policies (never duplicate).
+    Write-Host "  Ensuring project-owned CloudWatch Logs resource policy ($ResourcePolicyName)..."
     if ($existingMatch -and $existingMatch -ne $ResourcePolicyName) {
         Write-Host "  A resource policy ('$existingMatch') already grants xray.amazonaws.com"
         Write-Host "      logs:PutLogEvents on 'aws/spans' - leaving it in place and skipping."
         Write-Host '      See docs/OBSERVABILITY_ADOT_EXPORTER.md for when the legacy policy can be removed.'
-    } elseif (-not $existingMatch -and $policyCount -ge 10) {
-        throw "The account already has the maximum of 10 CloudWatch Logs resource policies in this region; cannot create '$ResourcePolicyName'. Remove an unused policy (for example a legacy '$legacyPolicyName') and re-run."
     } else {
-        $policy = @{
+        $policyDocument = @{
             Version = '2012-10-17'
             Statement = @(@{
                 Sid = 'TransactionSearchXRayAccess'
@@ -204,7 +247,7 @@ function Invoke-GameAgentAccountObservability {
                 }
             })
         } | ConvertTo-Json -Depth 10 -Compress
-        Invoke-ObsMutation 'resource policy' @('logs', 'put-resource-policy', '--policy-name', $ResourcePolicyName, '--policy-document', $policy, '--region', $Region) | Out-Null
+        Invoke-ObsMutation 'resource policy' @('logs', 'put-resource-policy', '--policy-name', $ResourcePolicyName, '--policy-document', $policyDocument, '--region', $Region) | Out-Null
         Write-Host '  CloudWatch Logs resource policy configured'
     }
 
@@ -227,33 +270,27 @@ function Invoke-GameAgentAccountObservability {
         } else {
             Write-GameAgentStatus 'Trace segment destination did not reach ACTIVE within the wait budget; it may still converge shortly.' -Type Warning
         }
-    } elseif ($destination -eq 'UNREADABLE') {
-        throw 'Cannot read the current trace destination; not changing it'
     } else {
         Write-GameAgentStatus "Unexpected trace destination '$destination'; leaving it unchanged." -Type Warning
     }
 
-    # ── Default indexing rule: read and preserve; change only on explicit request ──
-    $currentPercent = Get-DefaultIndexingPercent
-    if ($currentPercent -eq 'UNREADABLE') {
-        throw 'Unable to read the current X-Ray default indexing rule; not changing it'
-    }
-    if ([string]::IsNullOrWhiteSpace($DefaultIndexingPercent)) {
+    # ── Default indexing rule: change only on explicit request. The current
+    #    value was read above; compare numerically so an integer rule reported
+    #    as e.g. '1.0' is not re-sent for a requested '1'. ──
+    if ($null -eq $requestedPercent) {
         Write-Host "  X-Ray default indexing rule left unchanged (current: ${currentPercent}% sampling)."
         Write-Host '      Set GBAW_XRAY_DEFAULT_INDEXING_PERCENT to change this shared setting.'
     } else {
-        $requested = 0
-        if (-not [int]::TryParse($DefaultIndexingPercent, [ref]$requested) -or $requested -lt 0 -or $requested -gt 100) {
-            throw "GBAW_XRAY_DEFAULT_INDEXING_PERCENT='$DefaultIndexingPercent' must be an integer in [0, 100]"
-        }
-        if ("$requested" -eq "$currentPercent") {
+        $currentNumeric = 0.0
+        $currentParsed = [double]::TryParse($currentPercent, [ref]$currentNumeric)
+        if ($currentParsed -and [double]$requestedPercent -eq $currentNumeric) {
             Write-Host "  X-Ray default indexing rule already ${currentPercent}% - left unchanged"
         } else {
-            Write-Host "  Setting X-Ray default indexing rule to ${requested}% sampling..."
+            Write-Host "  Setting X-Ray default indexing rule to ${requestedPercent}% sampling..."
             Write-Host "     Rollback: aws xray update-indexing-rule --name Default --rule '{""Probabilistic"":{""DesiredSamplingPercentage"":${currentPercent}}}' --region $Region"
-            $rule = "{""Probabilistic"": {""DesiredSamplingPercentage"": ${requested}}}"
+            $rule = "{""Probabilistic"": {""DesiredSamplingPercentage"": ${requestedPercent}}}"
             Invoke-ObsMutation 'indexing rule' @('xray', 'update-indexing-rule', '--name', 'Default', '--rule', $rule, '--region', $Region) | Out-Null
-            Write-Host "  X-Ray default indexing rule set to ${requested}%"
+            Write-Host "  X-Ray default indexing rule set to ${requestedPercent}%"
         }
     }
 

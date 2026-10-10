@@ -63,7 +63,7 @@ Describe 'New-GameAgentAwsInvoker' {
         # that warning leak into the returned value (which a caller parses as
         # JSON or an ARN).
         function global:aws {
-            Write-Error 'WARNING: a deprecation notice on stderr'
+            Write-Error 'WARNING: a deprecation notice on stderr' -ErrorAction Continue
             $global:LASTEXITCODE = 0
             return '{"deliveryDestination":{"arn":"arn:aws:logs:us-west-2:123456789012:x"}}'
         }
@@ -75,10 +75,10 @@ Describe 'New-GameAgentAwsInvoker' {
 
     It 'Puts the stderr text in the thrown message on failure' {
         function global:aws {
-            Write-Error 'An error occurred (AccessDeniedException): not authorized'
+            Write-Error 'An error occurred (AccessDeniedException): not authorized' -ErrorAction Continue
             $global:LASTEXITCODE = 254
         }
         $invoker = New-GameAgentAwsInvoker -ProfileArgs @() -Label 'AWS delivery command'
-        { & $invoker @('logs', 'create-delivery') } | Should -Throw '*AccessDeniedException*'
+        { & $invoker @('logs', 'create-delivery') } | Should -Throw '*AWS delivery command failed: *AccessDeniedException*'
     }
 }
