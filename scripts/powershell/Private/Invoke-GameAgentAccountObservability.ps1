@@ -138,6 +138,10 @@ function Invoke-GameAgentAccountObservability {
 
     # ── Opt-in mutation path (state-preserving) ──
     $accountId = (Invoke-ObsMutation 'identity lookup' @('sts', 'get-caller-identity', '--query', 'Account', '--output', 'text', '--region', $Region) | Out-String).Trim()
+    # An empty or malformed account would write a resource policy that never matches.
+    if ($accountId -notmatch '^\d{12}$') {
+        throw 'identity lookup returned no account ID; not changing shared settings'
+    }
 
     Write-GameAgentStatus 'Account-wide observability opt-in is ENABLED.' -Type Warning
     Write-Host '      The following SHARED, account-wide settings may be created or changed:'

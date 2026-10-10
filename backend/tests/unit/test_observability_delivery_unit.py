@@ -476,7 +476,11 @@ def _obs_mock(
         f'  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{spans_json}\'; return 0; fi\n'
         f'  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{policies_json}\'; return 0; fi\n'
         f"{fail_block}"
-        '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"; return 0\n'
+        '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"\n'
+        # Record the full resource-policy arguments so tests can check the
+        # account scoping of the shared grant, not only that a write happened.
+        '  if [ "$1 $2" = "logs put-resource-policy" ]; then echo "POLICY_ARGS: $*" >> "$MUTATION_LOG"; fi\n'
+        "  return 0\n"
         "}"
     )
 
@@ -641,3 +645,38 @@ def test_account_obs_optin_fails_when_destination_mutation_fails(shell):
     assert "rc=1" in result.stdout
     assert "trace destination failed (AccessDeniedException)" in result.stderr
     assert "Account-wide observability configured" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Account-wide observability opt-in: the shared grant is scoped to the caller
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_scopes_the_resource_policy_to_the_caller_account(shell):
+    """The shared resource policy names the caller's account in every ARN and condition.
+
+    An empty account would produce ``arn:aws:logs:<region>::...`` resources and an
+    empty ``aws:SourceAccount`` condition, so the opt-in would write a grant that
+    never matches X-Ray's delivery.
+    """
+    result = _account_obs_harness("true", _obs_mock(destination="XRay", spans=True), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "MUTATION: logs put-resource-policy" in result.stdout
+    assert "arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*" in result.stdout
+    assert "arn:aws:logs:us-west-2:123456789012:log-group:/aws/application-signals/data:*" in result.stdout
+    assert "arn:aws:xray:us-west-2:123456789012:*" in result.stdout
+    assert '"aws:SourceAccount": "123456789012"' in result.stdout
+    assert "arn:aws:logs:us-west-2::" not in result.stdout
+
+
+@pytest.mark.parametrize("account_output", ["", "None", "not-an-account"])
+def test_account_obs_optin_refuses_when_the_account_lookup_is_not_an_account_id(account_output):
+    """A lookup that does not return a 12-digit account fails before any shared write."""
+    mock = _obs_mock(destination="XRay", spans=True).replace(
+        'echo "123456789012"; return 0', f'echo "{account_output}"; return 0'
+    )
+    result = _account_obs_harness("true", mock)
+    assert "rc=1" in result.stdout
+    assert "identity lookup returned no account ID" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
