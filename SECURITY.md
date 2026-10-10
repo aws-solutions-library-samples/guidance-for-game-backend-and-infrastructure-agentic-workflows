@@ -721,8 +721,9 @@ or raw session/thread identifiers.
   switch). Separately governed diagnostic paths that cannot carry prompt or
   identity values do retain the exception message to classify the failure:
   startup credential and container pre-warm checks and the memory-ID config read
-  in `agentcore_main`, the GameLift specialist's AWS SDK describe/list calls, and
-  the Cost Explorer diagnostic path.
+  in `agentcore_main`, the GameLift specialist's AWS SDK describe/list calls, the
+  Cost Explorer diagnostic path, the cost-report snapshot store's DynamoDB failure
+  paths, and the Bedrock Prompt Management load fallback.
 
 ### Secrets Management
 
