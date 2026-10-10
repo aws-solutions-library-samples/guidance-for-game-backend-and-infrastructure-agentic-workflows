@@ -95,7 +95,8 @@ def test_inference_profile_names_follow_role_models(script):
     assert "Claude-Sonnet-4-6" not in content
 
 
-def test_get_profile_ids_prefers_role_application_profiles(tmp_path):
+def test_get_profile_ids_exports_resolved_models_even_when_application_profiles_exist(tmp_path):
+    """Application profiles over the 5.5 models are not runtime IDs until #421."""
     result = subprocess.run(
         ["bash", str(GET_SCRIPT), "us-west-2"],
         env=_stub_environment(tmp_path, aws_mode="profiles"),
@@ -104,11 +105,13 @@ def test_get_profile_ids_prefers_role_application_profiles(tmp_path):
         check=True,
     )
 
-    assert "GBAW_ORCHESTRATOR_MODEL_ID='orchestrator-profile-id'" in result.stdout
-    assert "GBAW_SPECIALIST_MODEL_ID='specialist-profile-id'" in result.stdout
+    assert "GBAW_ORCHESTRATOR_MODEL_ID='global.anthropic.claude-haiku-5-5'" in result.stdout
+    assert "GBAW_SPECIALIST_MODEL_ID='global.anthropic.claude-sonnet-5-5'" in result.stdout
+    assert "profile-id" not in result.stdout
+    assert "not supported as runtime model IDs until #421" in result.stderr
 
 
-def test_agentcore_role_can_invoke_preferred_application_profiles():
+def test_agentcore_role_can_invoke_application_profiles():
     template = BASE_INFRASTRUCTURE_TEMPLATE.read_text(encoding="utf-8")
     execution_role = _cloudformation_resource(template, "AgentCoreExecutionRole")
 
