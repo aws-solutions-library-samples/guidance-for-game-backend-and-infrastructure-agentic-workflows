@@ -357,9 +357,19 @@ configure_account_observability() {
   # ── Read and validate everything BEFORE the first write, so a refusal or a
   #    bad input never leaves a shared setting half-changed. ──
 
-  # Account id via the bounded helper so a failure prints a public-safe label.
-  if ! account_id="$(run_obs_mutation "identity lookup" \
-    sts get-caller-identity --query Account --output text --region "$AWS_REGION")"; then
+  # Account ID for the resource-policy scope. run_obs_mutation discards a
+  # successful call's output, so read it here and require a 12-digit ID; an
+  # empty or malformed value would write a grant that never matches.
+  local identity_output identity_code=0 identity_error="unknown"
+  identity_output="$(aws sts get-caller-identity --query Account --output text --region "$AWS_REGION" 2>&1)" \
+    || identity_code=$?
+  if [ "$identity_code" -eq 0 ] && [[ "$identity_output" =~ ^[0-9]{12}$ ]]; then
+    account_id="$identity_output"
+  else
+    if [[ "$identity_output" =~ \(([A-Za-z0-9]+)\) ]]; then
+      identity_error="${BASH_REMATCH[1]}"
+    fi
+    echo "❌ identity lookup returned no account ID (${identity_error}); not changing shared settings" >&2
     return 1
   fi
 

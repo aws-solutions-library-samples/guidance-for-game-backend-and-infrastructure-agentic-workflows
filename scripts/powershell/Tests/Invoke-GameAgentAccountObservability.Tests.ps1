@@ -19,6 +19,7 @@ BeforeAll {
             [string]$Status = 'ACTIVE',
             [string]$PoliciesJson = '{"resourcePolicies":[]}',
             [string]$FailOperation = '',
+            [string]$AccountId = '123456789012',
             [System.Collections.Generic.List[string]]$Mutations
         )
         $destLocal = $Destination
@@ -28,13 +29,14 @@ BeforeAll {
         $statusLocal = $Status
         $policiesLocal = $PoliciesJson
         $failLocal = $FailOperation
+        $accountLocal = $AccountId
         $mutationsLocal = $Mutations
 
         $mock = {
             $op = "$($args[0]) $($args[1])"
             $allArgs = $args -join ' '
             switch ($op) {
-                'sts get-caller-identity' { $global:LASTEXITCODE = 0; return '123456789012' }
+                'sts get-caller-identity' { $global:LASTEXITCODE = 0; return $accountLocal }
                 'xray get-trace-segment-destination' {
                     if ($unreadableLocal) { $global:LASTEXITCODE = 254; return '' }
                     $global:LASTEXITCODE = 0
@@ -124,6 +126,15 @@ Describe 'Invoke-GameAgentAccountObservability' {
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
         $mutations | Should -Contain 'logs put-resource-policy'
         $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
+    }
+
+    It 'Opt-in refuses before any shared write when the identity lookup returns no account ID' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -AccountId '' -Mutations $mutations
+        {
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
+        } | Should -Throw '*identity lookup returned no account ID*'
+        $mutations.Count | Should -Be 0
     }
 
     It 'Opt-in throws a bounded error when a mutation fails' {
