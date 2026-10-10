@@ -347,6 +347,9 @@ def run_orchestrator(query: str, context: dict = None):
                     tools=agent_tools,
                     model=orch_model,
                     session_manager=session_manager,
+                    # The default Strands handler prints streamed model text and tool
+                    # names to stdout, which the hosted runtime ships to its logs.
+                    callback_handler=None,
                     hooks=[
                         MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),
                         WallClockTimeoutHook(AGENT_TIMEOUT_ORCHESTRATOR_SECONDS),
@@ -367,6 +370,7 @@ def run_orchestrator(query: str, context: dict = None):
                 system_prompt=get_optimized_orchestrator_prompt(),
                 tools=agent_tools,
                 model=orch_model,
+                callback_handler=None,
                 hooks=[
                     MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),
                     WallClockTimeoutHook(AGENT_TIMEOUT_ORCHESTRATOR_SECONDS),

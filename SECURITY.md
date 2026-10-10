@@ -684,6 +684,10 @@ operation outcomes. They do not contain prompt text, extracted names,
 semantic-memory content, email addresses, display names, raw Cognito subjects,
 or raw session/thread identifiers.
 
+- Agents run without the default Strands stdout printer
+  (`callback_handler=None`), so streamed model text and tool names are not
+  written to stdout, which the hosted runtime ships to its log group. A static
+  test checks every `Agent(...)` construction.
 - Correlation uses a per-request ID. The backend binds the AgentCore runtime
   request ID into every log record for the duration of an invocation, so lines
   from one request can be correlated without any raw identifier. A value that
@@ -694,10 +698,11 @@ or raw session/thread identifiers.
   the frontend. The HMAC key is random per process and is never read from the
   environment, so a token is stable only within a single process and does not
   correlate across processes, restarts, or tiers. The frontend additionally
-  records the runtime's own server-generated trace ID from the `X-Amzn-Trace-Id`
-  response header (modeled by the AgentCore InvokeAgentRuntime response) so a
-  request can be traced across tiers. That trace ID is not derived from caller
-  identity or content and is logged normalized rather than redacted.
+  records AgentCore's service request ID from the `x-amzn-RequestId` response
+  header, which identifies the invocation to the service (for example in a
+  support case). It differs from the request ID the runtime container logs, so
+  it does not join frontend and runtime log lines. It is not derived from
+  caller identity or content and is logged normalized rather than redacted.
 - Externally influenced fields are normalized before emission so carriage
   returns, line feeds, other C0/C1/DEL control characters, the Unicode line and
   paragraph separators, and bidirectional-formatting controls cannot inject
