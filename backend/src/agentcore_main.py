@@ -18,7 +18,6 @@ Performance Optimization:
 import os
 import sys
 import time
-import traceback
 
 # Third-party packages
 import boto3
@@ -56,7 +55,7 @@ from config.settings import (
     resolve_runtime_host,
 )
 from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
-from utils.logger import logger
+from utils.logger import _REQUEST_ID_VAR, logger
 from utils.response_parser import ResponseParser
 from utils.security import (
     InputValidationError,
@@ -65,7 +64,9 @@ from utils.security import (
     check_rate_limit,
     create_encryption_context,
     get_rate_limit_key,
-    sanitize_log_data,
+    log_sanitized_exception,
+    normalize_log_value,
+    redact_identifier,
     validate_conversation_history,
     validate_prompt,
     validate_user_context,
@@ -166,6 +167,93 @@ prewarm_container()
 
 app = BedrockAgentCoreApp()
 
+
+def _current_request_id() -> str:
+    """Return the AgentCore request ID for log correlation, or ``-``.
+
+    The runtime assigns a server-generated request ID per invocation. It is a
+    non-sensitive correlation value (it is not derived from caller identity or
+    content), so it may be logged as-is, after control-character normalization
+    as a defensive measure. Binding it into every record is what lets the lines
+    of a single invocation be correlated without emitting any raw identifier.
+    """
+    try:
+        # Third-party packages
+        from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+
+        request_id = BedrockAgentCoreContext.get_request_id()
+    except Exception:
+        request_id = None
+    return normalize_log_value(request_id) if request_id else "-"
+
+
+# Standard library
+import json as _json
+import logging as _logging
+
+
+class _SessionRedactingFormatter(_logging.Formatter):
+    """Wrap the AgentCore SDK's JSON formatter to redact the session ID.
+
+    Defined at module level (not inside the installer) so the ``isinstance``
+    idempotence check in :func:`_install_sdk_session_redaction` recognizes a
+    formatter this process already wrapped and never double-wraps it. Wrapping
+    twice would re-tokenize an already-redacted ``sessionId`` and break the
+    match with the application's ``Session:`` line.
+    """
+
+    def __init__(self, inner: _logging.Formatter) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def format(self, record: "_logging.LogRecord") -> str:
+        rendered = self._inner.format(record)
+        # The SDK formatter emits JSON; redact sessionId in place and fall back
+        # to the untouched line if the shape is unexpected.
+        try:
+            payload = _json.loads(rendered)
+        except (ValueError, TypeError):
+            return rendered
+        if isinstance(payload, dict) and payload.get("sessionId"):
+            payload["sessionId"] = redact_identifier(payload["sessionId"])
+            return _json.dumps(payload, ensure_ascii=False)
+        return rendered
+
+
+def _install_sdk_session_redaction() -> None:
+    """Stop the AgentCore SDK log handler from emitting the raw session ID.
+
+    ``BedrockAgentCoreApp`` installs its own JSON handler on the
+    ``bedrock_agentcore.app`` logger. Its ``RequestContextFormatter`` reads the
+    runtime session ID from a context variable and writes it verbatim on every
+    invocation record. The frontend sets that session header to the
+    environment-isolated thread ID, so the raw thread/session ID would otherwise
+    reach the runtime log stream on every request.
+
+    Because the formatter reads a context variable (not a record attribute), a
+    ``logging.Filter`` cannot strip the field. The narrowest fix is to wrap the
+    existing formatter so the serialized ``sessionId`` is replaced with a
+    bounded, non-reversible token while ``requestId`` and everything else are
+    preserved. The wrapper type is module-level, so a repeat call recognizes an
+    already-wrapped formatter and does not stack a second wrapper. If the SDK's
+    handler shape changes, this degrades to a no-op rather than breaking logging.
+    """
+    try:
+        sdk_logger = _logging.getLogger("bedrock_agentcore.app")
+        for handler in list(sdk_logger.handlers):
+            base_formatter = handler.formatter
+            if base_formatter is None:
+                continue
+            if isinstance(base_formatter, _SessionRedactingFormatter):
+                continue
+            handler.setFormatter(_SessionRedactingFormatter(base_formatter))
+    except Exception:
+        # Logging hardening must never prevent the app from starting.
+        pass
+
+
+_install_sdk_session_redaction()
+
 # Memory ID from environment (set by AgentCore CLI or deployment)
 MEMORY_ID = os.getenv("BEDROCK_AGENTCORE_MEMORY_ID")
 
@@ -181,13 +269,13 @@ if not MEMORY_ID:
                 for line in f:
                     if "memory_id:" in line:
                         MEMORY_ID = line.split("memory_id:")[1].strip()
-                        logger.info(f"📋 Memory ID loaded from config file: {MEMORY_ID}")
+                        logger.info("📋 Memory ID loaded from config file")
                         break
     except Exception as e:
         logger.warning(f"⚠️ Could not read memory ID from config: {e}")
 
 if USE_BEDROCK_SESSIONS and MEMORY_ID:
-    logger.info(f"🧠 AgentCore Memory enabled: {MEMORY_ID}")
+    logger.info("🧠 AgentCore Memory enabled")
 elif USE_BEDROCK_SESSIONS:
     logger.warning("⚠️ BEDROCK_AGENTCORE_MEMORY_ID not set - memory disabled")
 else:
@@ -211,6 +299,8 @@ def invoke_agent(prompt, context=None):
     Returns:
         Agent response string
     """
+    request_id = _current_request_id()
+    _request_id_token = _REQUEST_ID_VAR.set(request_id)
     try:
         logger.info("=" * 80)
         logger.info("🚀 AGENTCORE INVOCATION START")
@@ -231,13 +321,13 @@ def invoke_agent(prompt, context=None):
         # application code independently verifies it before admitting claims.
         verified_runtime_identity = None
 
-        # DIAGNOSTIC: Check AgentCore context object. Never log token contents or
-        # raw identity values.
+        # DIAGNOSTIC: Check AgentCore context object. Never log token contents,
+        # raw identity values, or raw session identifiers.
         logger.info("🔍 AgentCore Context Inspection:")
         if context:
             logger.info(f"   Context type: {type(context)}")
             if hasattr(context, "session_id"):
-                logger.info(f"   context.session_id: {context.session_id}")
+                logger.info(f"   context.session_id: {redact_identifier(context.session_id)}")
         else:
             logger.info("   Context is None")
 
@@ -247,7 +337,7 @@ def invoke_agent(prompt, context=None):
             thread_id = prompt.get("thread_id")
             user_context = prompt.get("user_context", {})
             logger.info("📦 Prompt type: dict")
-            logger.info(f"📦 Prompt keys: {list(prompt.keys())}")
+            logger.info(f"📦 Prompt key count: {len(prompt)}")
         else:
             user_prompt = str(prompt)
             thread_id = None
@@ -284,9 +374,10 @@ def invoke_agent(prompt, context=None):
                 logger.warning("⚠️ Rejected request: verified user is not in an approved group")
                 return "I'm sorry, but your request could not be processed due to an identity verification issue."
 
-        # Security: Log sanitized request info (redact sensitive data)
-        logger.info(f"📝 User prompt (sanitized): '{sanitize_log_data(user_prompt, 100)}'")
-        logger.info(f"🔗 Thread ID: {thread_id}")
+        # Security: Log sanitized request metadata only. The prompt itself is
+        # PII-bearing and is never logged; its length is a safe bounded metric.
+        logger.info(f"📝 User prompt accepted (length: {len(user_prompt)})")
+        logger.info(f"🔗 Thread: {redact_identifier(thread_id)}")
 
         # Hosted identity comes only from the cryptographically verified access
         # token. Local development keeps the existing body identity fallback
@@ -306,7 +397,7 @@ def invoke_agent(prompt, context=None):
             rl_key = get_rate_limit_key(persistent_user_id, "invoke_agent")
             check_rate_limit(rl_key, RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
         except RateLimitExceeded as e:
-            logger.warning(f"⚠️ Rate limit hit for user {persistent_user_id}: {e}")
+            logger.warning(f"⚠️ Rate limit hit for user {redact_identifier(persistent_user_id)}: {e}")
             return str(e)
 
         # Use session_id from frontend (environment-isolated: dev-{threadId} or prod-{threadId})
@@ -314,9 +405,8 @@ def invoke_agent(prompt, context=None):
         session_id = user_context.get("session_id") or thread_id or "default"
 
         logger.info(f"👤 Authenticated user context [{auth_type}]")
-        logger.info(f"🆔 Actor ID: {actor_id}")
-        logger.info(f"📍 Session ID: {session_id} (environment-isolated)")
-        logger.info(f"🔑 Persistent User ID: {persistent_user_id}")
+        logger.info(f"🆔 Actor: {redact_identifier(actor_id)}")
+        logger.info(f"📍 Session: {redact_identifier(session_id)} (environment-isolated)")
 
         verified_groups = (
             sorted(verified_runtime_identity.groups)
@@ -358,9 +448,9 @@ def invoke_agent(prompt, context=None):
 
         logger.info(f"🧠 Memory Configuration:")
         logger.info(f"   USE_BEDROCK_SESSIONS: {USE_BEDROCK_SESSIONS}")
-        logger.info(f"   MEMORY_ID: {MEMORY_ID}")
-        logger.info(f"   Actor ID: {actor_id}")
-        logger.info(f"   Session ID: {session_id}")
+        logger.info(f"   Memory configured: {bool(MEMORY_ID)}")
+        logger.info(f"   Actor: {redact_identifier(actor_id)}")
+        logger.info(f"   Session: {redact_identifier(session_id)}")
 
         # Run the orchestrator inline. Timeouts are enforced INSIDE the agent loop
         # by WallClockTimeoutHook (orchestrator 150s, specialists 90s), which
@@ -413,18 +503,26 @@ def invoke_agent(prompt, context=None):
         return response_text
 
     except Exception as e:
-        error_msg = f"❌ AGENTCORE INVOCATION ERROR: {e}"
-        traceback_msg = f"Traceback: {traceback.format_exc()}"
-
-        # Log to logger (captured by CloudWatch via loguru)
+        # Record a bounded, non-sensitive failure: the exception class, a typed
+        # sanitized error code, and the request ID for correlation. The raw
+        # exception message is deliberately not emitted — a provider validation
+        # error or SDK error body can quote caller values (prompt text, actor or
+        # session IDs) and may itself carry CR/LF. The full traceback is written
+        # only when debug logging is explicitly enabled (a dev-only switch).
         logger.error("=" * 80)
-        logger.error(error_msg)
-        logger.error(traceback_msg)
+        log_sanitized_exception(
+            logger,
+            "❌ AGENTCORE INVOCATION ERROR",
+            e,
+            request_id=request_id,
+        )
         logger.error("=" * 80)
 
         return (
             "I encountered an error processing your request. Please try again or contact support if the issue persists."
         )
+    finally:
+        _REQUEST_ID_VAR.reset(_request_id_token)
 
 
 def run_server():

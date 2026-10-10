@@ -143,10 +143,63 @@ owns that implementation.
 
 ## Logging
 
-Do not log raw tokens, cookies, email addresses, or display names.
-Authentication errors are generic to clients and logs; correlation uses a
-request ID and redacted identifiers. Prepared operations and executor payloads
-must not contain tokens, email addresses, or display names.
+Application logs record request/correlation IDs, bounded metrics, and
+operation outcomes only. They do not contain prompt text, extracted names,
+semantic-memory content, email addresses, display names, raw Cognito subjects,
+or raw session/thread identifiers.
+
+- Agents run without the default Strands stdout printer
+  (`callback_handler=None`), so streamed model text and tool names are not
+  written to stdout, which the hosted runtime ships to its log group. A static
+  test checks every `Agent(...)` construction.
+- Correlation uses a per-request ID. The backend binds the AgentCore runtime
+  request ID into every log record for the duration of an invocation. Where a
+  log line must stay tied to a specific principal or session across lines, it
+  carries a bounded, non-reversible token rather than the raw value: the backend
+  uses `redact_identifier()` in `backend/src/utils/security.py` (a keyed
+  HMAC-SHA-256 prefix over a random per-process key) and the frontend uses
+  `redact()` in `ui/src/utils/logger.ts`. The HMAC key is random per process and
+  is never read from the environment, so a token is stable only within a single
+  process and does not correlate across processes, restarts, or tiers. The
+  frontend also logs AgentCore's service request ID from the `x-amzn-RequestId`
+  response header, which identifies the invocation to the service; it differs
+  from the request ID the runtime container logs, so it does not join frontend
+  and runtime log lines. That value is not derived from caller identity or
+  content and is logged normalized rather than redacted.
+- Every externally influenced log field is normalized before emission so
+  carriage returns, line feeds, other C0/C1/DEL control characters, the Unicode
+  line and paragraph separators, and bidirectional-formatting controls cannot
+  create additional log records or reorder a rendered line. The backend
+  normalizes every record once at the logging sink (the logger patcher applies
+  `normalize_log_value()`); the frontend logger strips the same classes in
+  `logInfo`, `logError`, `logWarning`, `logDebug`, and `redact`.
+- The AgentCore SDK's own log handler would otherwise emit the raw runtime
+  session ID on every invocation; `agentcore_main` wraps its formatter so the
+  serialized `sessionId` is replaced with a bounded token while `requestId` is
+  kept.
+- Semantic-memory logging records only outcomes and counts, never extracted
+  names, memory content, or raw actor identifiers.
+- The request-handling error paths that can see prompt or identity values — the
+  AgentCore entrypoint, the orchestrator (including the model-loop failure over
+  the user prompt), the specialists, agent timing, and semantic memory — record
+  the exception class name and a typed, sanitized error code (plus the request
+  ID) through `log_sanitized_exception()`, never the exception message, since a
+  provider or SDK error body can quote caller values. The full traceback is
+  emitted only when debug logging is explicitly enabled (a non-production
+  switch). Authentication errors are generic to clients and logs. Separately
+  governed diagnostic paths that do not carry prompt or identity values retain
+  the exception message to classify the failure: startup credential and
+  container pre-warm checks and the memory-ID config read in `agentcore_main`,
+  the GameLift specialist's AWS SDK describe/list calls, the Cost Explorer
+  diagnostic path, the cost-report snapshot store's DynamoDB failure paths, and
+  the Bedrock Prompt Management load fallback. Prepared operations and executor payloads must not contain
+  tokens, email addresses, or display names.
+
+A static regression test
+(`backend/tests/unit/test_log_static_regression_unit.py`) scans every module in
+`backend/src` so a future prompt/identity/session log is caught in review, and
+includes self-tests over known bypass shapes so the guard cannot quietly stop
+working.
 
 ## References
 

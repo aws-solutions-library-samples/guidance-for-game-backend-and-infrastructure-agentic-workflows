@@ -44,6 +44,7 @@ from config.settings import (
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
+from utils.security import log_sanitized_exception, redact_identifier
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 
 # Optional memory integration imports (may not be available in all environments)
@@ -300,13 +301,15 @@ def run_orchestrator(query: str, context: dict = None):
         if context and isinstance(context, dict):
             actor_id = context.get("user_id") or context.get("actor_id")
             session_id = context.get("session_id")
-            display_name = context.get("display_name", "user")
-            logger.debug(f"👤 User: {display_name}, Actor: {actor_id}, Session: {session_id}")
+            logger.debug(
+                f"👤 Memory context resolved (actor={redact_identifier(actor_id)}, "
+                f"session={redact_identifier(session_id)})"
+            )
 
         # Create agent with or without memory
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id and session_id:
             # Use native AgentCore Memory integration
-            logger.debug(f"🧠 Creating agent with AgentCore Memory: {BEDROCK_AGENTCORE_MEMORY_ID}")
+            logger.debug("🧠 Creating agent with AgentCore Memory")
 
             try:
                 # Create memory config with retrieval config for LTM
@@ -334,7 +337,7 @@ def run_orchestrator(query: str, context: dict = None):
                     filter_restored_tool_context=True,
                 )
                 logger.debug(f"✅ Config created with LTM retrieval enabled")
-                logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {actor_id})")
+                logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {redact_identifier(actor_id)})")
                 logger.debug(f"   Retrieval: top_k=10, relevance_score=0.25, strategy=user_facts")
 
                 # Create session manager and agent with memory
@@ -344,6 +347,9 @@ def run_orchestrator(query: str, context: dict = None):
                     tools=agent_tools,
                     model=orch_model,
                     session_manager=session_manager,
+                    # The default Strands handler prints streamed model text and tool
+                    # names to stdout, which the hosted runtime ships to its logs.
+                    callback_handler=None,
                     hooks=[
                         MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),
                         WallClockTimeoutHook(AGENT_TIMEOUT_ORCHESTRATOR_SECONDS),
@@ -352,7 +358,7 @@ def run_orchestrator(query: str, context: dict = None):
                 logger.debug("✅ Agent created with memory")
 
             except Exception as e:
-                logger.warning(f"⚠️ Memory setup failed, using fallback: {e}")
+                log_sanitized_exception(logger, "⚠️ Memory setup failed, using fallback", e)
                 agent = None
         else:
             logger.debug("ℹ️  Memory not configured, using agent without memory")
@@ -364,6 +370,7 @@ def run_orchestrator(query: str, context: dict = None):
                 system_prompt=get_optimized_orchestrator_prompt(),
                 tools=agent_tools,
                 model=orch_model,
+                callback_handler=None,
                 hooks=[
                     MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),
                     WallClockTimeoutHook(AGENT_TIMEOUT_ORCHESTRATOR_SECONDS),
@@ -376,7 +383,7 @@ def run_orchestrator(query: str, context: dict = None):
         specialist_capture = begin_specialist_capture()
         try:
             response: Any = agent(query)
-        except Exception:
+        except Exception as exc:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
             if authoritative_cost_response is not None:
@@ -389,13 +396,21 @@ def run_orchestrator(query: str, context: dict = None):
                     cost_only=cost_report_followup,
                 )
             elif cost_report_followup:
-                logger.exception("Cost report ID follow-up failed before producing a deterministic rendering")
+                # The failing call is the orchestrator model loop over the user
+                # prompt; its exception message can quote the prompt or a
+                # provider validation payload, so record only the sanitized
+                # class/code/request-id rather than the raw message or traceback.
+                log_sanitized_exception(
+                    logger, "Cost report ID follow-up failed before producing a deterministic rendering", exc
+                )
                 response = _COST_REPORT_FOLLOWUP_FAILURE
             elif _cost_attempted(query, specialist_outputs):
                 # A fresh account-report request raised before producing an
                 # authoritative rendering. Fail closed and preserve only safe
                 # non-cost specialist sections.
-                logger.exception("Cost-bearing request raised before a validated cost report; failing closed")
+                log_sanitized_exception(
+                    logger, "Cost-bearing request raised before a validated cost report; failing closed", exc
+                )
                 response = _compose_final_response(
                     _COST_REPORT_UNAVAILABLE,
                     specialist_outputs,
@@ -458,11 +473,11 @@ def run_orchestrator(query: str, context: dict = None):
                 try:
                     extract_and_save_user_info(actor_id, query, str(response))
                 except Exception as e:
-                    logger.debug(f"⚠️ Semantic memory extraction skipped: {e}")
+                    log_sanitized_exception(logger, "⚠️ Semantic memory extraction skipped", e)
 
         logger.info(f"✅ Orchestrator complete ({len(str(response))} chars)")
         return response
 
     except Exception as e:
-        logger.error(f"❌ Orchestrator error: {e}")
+        log_sanitized_exception(logger, "❌ Orchestrator error", e)
         raise

@@ -23,6 +23,7 @@ from cachetools import TTLCache
 # Local modules
 from config.settings import AWS_REGION, BEDROCK_AGENTCORE_MEMORY_ID, BOTO3_CLIENT_CONFIG
 from utils.logger import logger
+from utils.security import log_sanitized_exception
 
 # Module-level boto3 client cache for performance
 _memory_client = None
@@ -89,14 +90,15 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
 
     # Deduplication check
     if _is_duplicate_memory(actor_id, content):
-        logger.debug(f"♻️ Skipping duplicate memory: actor={actor_id}, content='{content[:30]}...'")
+        logger.debug("♻️ Skipping duplicate memory save")
         return True  # Return True since this is expected behavior, not an error
 
     try:
         client = _get_memory_client()
         request_id = str(uuid.uuid4())
+        short_request_id = request_id[:8]
 
-        logger.info(f"💾 Saving semantic memory: actor={actor_id}, content='{content[:50]}...'")
+        logger.info(f"💾 Saving semantic memory record (req {short_request_id})")
 
         # Create memory record using AWS SDK
         response = client.batch_create_memory_records(
@@ -113,11 +115,15 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
 
         # Mark as saved after successful API call
         _mark_memory_saved(actor_id, content)
-        logger.info(f"✅ Semantic memory saved: id={request_id[:8]}, actor={actor_id}")
+        logger.info(f"✅ Semantic memory saved (req {short_request_id})")
         return True
 
     except Exception as e:
-        logger.error(f"❌ Failed to save semantic memory: {e}")
+        # Record only the exception class and a sanitized error code. The raw
+        # message is withheld: an AgentCore Memory validation error can quote the
+        # record text or actor namespace, which are exactly the values this
+        # function must keep out of logs.
+        log_sanitized_exception(logger, "❌ Failed to save semantic memory", e)
         return False
 
 
@@ -372,9 +378,10 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
         user_message: User's message
         ai_response: AI's response (reserved for future use)
     """
-    logger.debug(f"🔍 Scanning for user info in: '{user_message[:100]}...'")
+    logger.debug("🔍 Scanning message for user info")
 
     extracted_any = False
+    saved_count = 0
 
     # Extract name (keep natural sentence format for consistency)
     for pattern in _NAME_PATTERNS:
@@ -383,15 +390,14 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
             name = match.group(1).title()
             # Validate that extracted text is likely a real name
             if not _is_likely_name(name):
-                logger.debug(f"ℹ️ Skipping false positive name: '{name}'")
+                logger.debug("ℹ️ Skipping false-positive name match")
                 continue
             memory_content = f"User's name is {name}"
-            logger.info(f"📝 Extracted user name: {name} (actor: {actor_id})")
             success = save_semantic_memory(actor_id, memory_content)
             if success:
-                logger.info(f"✅ User name '{name}' saved to LTM for actor {actor_id}")
+                saved_count += 1
             else:
-                logger.warning(f"⚠️ Failed to save user name to LTM")
+                logger.warning("⚠️ Failed to save an extracted user name to LTM")
             extracted_any = True
             break  # Only extract one name
 
@@ -411,13 +417,14 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
             if match:
                 memory_content = formatter(match, label)
                 if memory_content:
-                    logger.info(f"📝 Extracted {label}: {memory_content} (actor: {actor_id})")
                     success = save_semantic_memory(actor_id, memory_content)
                     if success:
-                        logger.info(f"✅ {label} saved to LTM for actor {actor_id}")
+                        saved_count += 1
                     else:
-                        logger.warning(f"⚠️ Failed to save {label} to LTM")
+                        logger.warning("⚠️ Failed to save an extracted fact to LTM")
                     extracted_any = True
 
-    if not extracted_any:
-        logger.debug(f"ℹ️ No patterns matched in message")
+    if extracted_any:
+        logger.info(f"📝 Extracted and saved-or-already-present {saved_count} user info fact(s)")
+    else:
+        logger.debug("ℹ️ No user info patterns matched")
