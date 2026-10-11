@@ -741,10 +741,15 @@ PROBE
     echo "   Bucket verified: owner=$MASKED_ACCOUNT region=$BUCKET_REGION"
 
     echo "☁️  Uploading artifact to s3://$CODE_S3_BUCKET/$CODE_S3_KEY ..."
-    aws s3 cp "$ARTIFACT" "s3://$CODE_S3_BUCKET/$CODE_S3_KEY" \
+    # Use s3api put-object: the high-level s3 copy command does not accept
+    # --expected-bucket-owner, which binds the upload to this account.
+    aws s3api put-object \
         "${AWS_PROFILE_ARGS[@]}" \
+        --bucket "$CODE_S3_BUCKET" \
+        --key "$CODE_S3_KEY" \
+        --body "$ARTIFACT" \
         --expected-bucket-owner "$ACCOUNT_ID" \
-        --region "$AWS_REGION" --only-show-errors
+        --region "$AWS_REGION" --output text --query 'ETag' >/dev/null
 fi
 
 if [ "$ACTION" = "disable" ]; then

@@ -194,7 +194,7 @@ def test_disable_builds_the_parameter_list_from_the_deployed_stack_keys():
 
 def test_disable_does_not_rebuild_code_or_run_docker():
     branch = _disable_branch()
-    for forbidden in ("zip", "pip install", "uv pip", "docker", "shasum", "s3 cp", "head-bucket"):
+    for forbidden in ("zip", "pip install", "uv pip", "docker", "shasum", "s3 cp", "put-object", "head-bucket"):
         assert forbidden not in branch, f"disable path must not '{forbidden}': emergency disable rebuilds no code"
 
 

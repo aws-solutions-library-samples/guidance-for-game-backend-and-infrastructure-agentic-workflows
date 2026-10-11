@@ -97,7 +97,16 @@ case "$svc $sub" in
     # Report the deploy region so the in-region check passes.
     echo "${AWS_REGION:-us-west-2}" ;;
   "s3api head-bucket") echo '{}' ;;
-  "s3 cp") echo '{}' ;;
+  "s3 cp")
+    # Mirror the real CLI: the high-level s3 commands reject the s3api-only
+    # --expected-bucket-owner option before doing anything.
+    case " $* " in
+      *" --expected-bucket-owner "*)
+        echo "aws: [ERROR]: An error occurred (ParamValidation): Unknown options: --expected-bucket-owner" >&2
+        exit 252 ;;
+    esac
+    echo '{}' ;;
+  "s3api put-object") echo 'stub-etag' ;;
   "cloudformation deploy") echo '{}' ;;
   "cloudformation wait")
     if [ "${STUB_AWS_FAIL_WAIT:-0}" = "1" ]; then
@@ -399,9 +408,11 @@ def test_enable_new_stack_stages_the_handler_and_deploys_all_bindings(tmp_path):
     assert "Structural probe passed" in result.stdout
     subs = _subcommands(calls)
     # The artifact was uploaded before the stack deploy.
-    assert "s3 cp" in subs
+    assert "s3api put-object" in subs
     assert "cloudformation deploy" in subs
-    assert subs.index("s3 cp") < subs.index("cloudformation deploy")
+    assert subs.index("s3api put-object") < subs.index("cloudformation deploy")
+    upload_line = next(line for line in calls if "put-object" in line)
+    assert "--expected-bucket-owner" in upload_line.split("\t")
     deploy_line = next(line for line in calls if "parameter-overrides" in line)
     assert "Provisioned=true" in deploy_line
     assert "OperationsMode=observe" in deploy_line
@@ -425,7 +436,7 @@ def test_enable_prod_to_beta_binding_change_is_refused_before_any_upload(tmp_pat
     combined = result.stdout + result.stderr
     assert "Environment (prod -> beta)" in combined
     subs = _subcommands(calls)
-    assert "s3 cp" not in subs, "the binding guard must run before any upload"
+    assert "s3api put-object" not in subs, "the binding guard must run before any upload"
     assert "cloudformation deploy" not in subs
 
 
@@ -492,7 +503,7 @@ def test_enable_throttled_describe_stacks_fails_closed_without_upload_or_deploy(
     result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_THROTTLE_DESCRIBE": "1"})
     assert result.returncode == 4, f"a throttled describe-stacks must exit 4.\n{result.stdout}\n{result.stderr}"
     subs = _subcommands(calls)
-    assert "s3 cp" not in subs, "no artifact may be uploaded when stack existence is unknown"
+    assert "s3api put-object" not in subs, "no artifact may be uploaded when stack existence is unknown"
     assert "cloudformation deploy" not in subs
 
 
@@ -504,7 +515,7 @@ def test_enable_without_expected_account_and_no_tty_is_refused(tmp_path):
     )
     assert result.returncode == 4, f"unset account + no TTY must exit 4.\n{result.stdout}\n{result.stderr}"
     subs = _subcommands(calls)
-    assert "s3 cp" not in subs
+    assert "s3api put-object" not in subs
     assert "cloudformation deploy" not in subs
 
 

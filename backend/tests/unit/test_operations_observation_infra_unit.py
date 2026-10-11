@@ -1423,7 +1423,10 @@ def test_deploy_wrapper_builds_and_uploads_artifact():
     # A real packaging path: build a deterministic zip and upload under a
     # content-hash key, then pass CodeS3Bucket / CodeS3Key.
     assert "CodeS3Bucket" in text and "CodeS3Key" in text
-    assert "s3 cp" in text or "s3api put-object" in text
+    assert "s3api put-object" in text
+    # Only the s3api form accepts --expected-bucket-owner; the high-level
+    # `aws s3 cp` rejects it, so the upload must not use `s3 cp`.
+    assert "aws s3 cp" not in text
     assert "sha256" in text.lower(), "artifact key must be content-hash addressed"
 
 
