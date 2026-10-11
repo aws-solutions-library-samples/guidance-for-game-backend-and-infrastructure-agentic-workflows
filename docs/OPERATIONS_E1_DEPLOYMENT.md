@@ -144,7 +144,7 @@ still returns the stored result rather than racing an asynchronous deletion.
 
 | Metric | Meaning |
 | --- | --- |
-| `ObservationFailures` | Count of failed observation requests |
+| `ObservationFailures` | Count of observation requests that failed for a service-side reason; caller errors (unknown fleet, invalid request, idempotency conflict) are not counted |
 | `ObservationTimeouts` | Count of requests that exceeded a sub-budget or the total deadline |
 | `StuckOperations` | Count of stuck / lease-expired operations detected |
 | `ObservationRequestLatency` | Request-completion latency (milliseconds) |
