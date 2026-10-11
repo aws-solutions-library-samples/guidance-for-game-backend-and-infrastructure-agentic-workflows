@@ -67,10 +67,10 @@ def test_deadline_failure_publishes_timeouts() -> None:
     assert _names(client) == ["ObservationTimeouts"]
 
 
-@pytest.mark.parametrize("reason", ["not_found", "contract_invalid"])
+@pytest.mark.parametrize("reason", ["not_found", "contract_invalid", "idempotency"])
 def test_client_caused_failures_do_not_publish_failures(reason: str) -> None:
-    # A caller's mistyped or unsupported fleet is a client error, not a service
-    # fault. It must not increment ObservationFailures and so must not feed the
+    # A caller's mistyped or unsupported fleet, invalid request, or reused
+    # idempotency token is a client error, not a service fault. It must not increment ObservationFailures and so must not feed the
     # failures alarm; no CloudWatch metric is published for it.
     sink, client = _sink()
     sink.record("observation.failed", 1.0, dimensions={"reason": reason})

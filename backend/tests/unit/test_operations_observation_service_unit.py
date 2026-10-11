@@ -872,6 +872,33 @@ def test_replay_of_a_client_caused_failure_does_not_publish_observation_failures
     assert "ObservationFailures" not in names
 
 
+def test_idempotency_conflict_does_not_publish_observation_failures() -> None:
+    # Reusing an idempotency token with a different target is a caller error
+    # (409). Through the real CloudWatch sink it must publish no
+    # ObservationFailures metric, so a client cannot trip the failures alarm by
+    # replaying a token with changed intent.
+    # Local modules
+    from operations.observe.metrics import CloudWatchObservationMetrics
+
+    class FakeCloudWatch:
+        def __init__(self) -> None:
+            self.puts: list[dict[str, Any]] = []
+
+        def put_metric_data(self, **kwargs: Any) -> dict[str, Any]:
+            self.puts.append(kwargs)
+            return {}
+
+    cloudwatch = FakeCloudWatch()
+    sink = CloudWatchObservationMetrics(client=cloudwatch, namespace="GBAW/Operations", emf_emit=lambda _line: None)
+    store = FakeStore(begin=ObservationBeginOutcome.IDEMPOTENCY_CONFLICT)
+    service, _, _, _ = _service(store=store, metrics=sink)
+    with pytest.raises(ObservationBoundaryError) as exc:
+        service.observe(_request(), _context())
+    assert exc.value.error_code is ObservationErrorCode.IDEMPOTENCY_CONFLICT
+    names = [put["MetricData"][0]["MetricName"] for put in cloudwatch.puts]
+    assert "ObservationFailures" not in names
+
+
 def test_replay_of_a_provider_unavailable_failure_does_publish_observation_failures() -> None:
     # The other side of the boundary: a provider_unavailable replay IS a service
     # fault and still publishes ObservationFailures through the sink.

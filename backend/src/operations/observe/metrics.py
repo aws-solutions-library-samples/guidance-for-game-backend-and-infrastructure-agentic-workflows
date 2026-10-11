@@ -7,8 +7,10 @@ The observe service emits internal, bounded metric events through the
 ``observation.denied``). This sink translates those public-safe events into the
 four CloudWatch metrics the deployment monitors, named **exactly**:
 
-* ``ObservationFailures`` — a request that failed for any non-timeout reason
-  (provider error, contract, idempotency conflict, state conflict, hash).
+* ``ObservationFailures`` — a request that failed for a service-side,
+  non-timeout reason (provider error, provider contract, state conflict, store,
+  hash). Caller errors (an unknown or unsupported fleet, an invalid request, or
+  an idempotency token reused with different intent) are not counted.
 * ``ObservationTimeouts`` — a request that failed because a provider read or the
   persistence step exceeded its wall-clock deadline.
 * ``StuckOperations`` — an operation observed to be already in progress under a
@@ -48,10 +50,11 @@ METRIC_TIMEOUTS = "ObservationTimeouts"
 METRIC_STUCK = "StuckOperations"
 METRIC_LATENCY = "ObservationRequestLatency"
 
-# A caller's own mistyped or unsupported fleet is a client error, not a service
-# fault, so it is not counted in ``ObservationFailures`` and never feeds the
-# failures alarm. The deadline reason is reported as a timeout instead.
-_CLIENT_CAUSED_FAILURE_REASONS = frozenset({"not_found", "contract_invalid"})
+# A caller's own mistyped or unsupported fleet, invalid request, or idempotency
+# token reused with different intent is a client error, not a service fault, so
+# it is not counted in ``ObservationFailures`` and never feeds the failures
+# alarm. The deadline reason is reported as a timeout instead.
+_CLIENT_CAUSED_FAILURE_REASONS = frozenset({"not_found", "contract_invalid", "idempotency"})
 
 
 class CloudWatchClient(Protocol):
@@ -130,7 +133,7 @@ class CloudWatchObservationMetrics:
         reason = dimensions.get("reason") if isinstance(dimensions, Mapping) else None
         if name == "observation.failed":
             # A provider deadline overrun surfaces as a timeout; a client-caused
-            # reason (an unknown or unsupported fleet) is the caller's error and
+            # reason (an unknown fleet, invalid request, or reused token) is the caller's error and
             # is not counted as a service failure; every other reason is a
             # generic ObservationFailures increment.
             if reason == "deadline":
