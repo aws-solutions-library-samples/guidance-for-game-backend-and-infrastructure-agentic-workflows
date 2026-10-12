@@ -170,6 +170,7 @@ def _handler(
     ceiling: int = 1_000_000,
     max_step: int = 1_000_000,
     clock: Any = None,
+    request_deadline_s: float | None = None,
 ) -> ApprovalRequestHandler:
     # The E1 status/advice/prepare pipeline is anchored at the frozen NOW so a
     # fresh, in-bounds proposal always prepares. Only the approval and lifecycle
@@ -258,6 +259,9 @@ def _handler(
         workspace_id="workspace.default",
         trusted_audience=AUDIENCE,
         requester_groups=frozenset({"operations-requester"}),
+        store=store,
+        request_deadline_s=request_deadline_s,
+        clock=decision_clock,
     )
 
 
@@ -835,3 +839,108 @@ def test_not_yet_due_operation_is_not_expired_on_access() -> None:
         )
     )
     assert grant["statusCode"] == 200
+
+
+# -- Per-request deadline under a degraded store (issue #414) ----------------
+#
+# Mirrors the E1 slow-reclaim guard: when the durable store is degraded and each
+# sub-call costs the worst-case ~4.5 s, a single E2 request that fans out into
+# several reads and a transaction must return a typed, retryable error BEFORE
+# the Lambda's wall-clock timeout, rather than being hard-killed with an unknown
+# outcome. The handler derives one monotonic request deadline from the shared
+# operations budget and threads it into the store, which guards every read and
+# caps every write against it.
+
+# The worst-case cost of one degraded store sub-call (connect + read on the
+# single-attempt persistence client), the value the store's call-limit guard
+# uses. Advancing the shared clock by this amount per sub-call models the stall.
+_SLOW_CALL_S = 4.5
+
+# The Lambda wall-clock timeout the request must finish inside, less a safety
+# margin: the request must return a typed error before the function is killed.
+_LAMBDA_TIMEOUT_S = 20.0
+_LAMBDA_SAFETY_MARGIN_S = 2.0
+
+
+class _TickingClock:
+    """A clock that advances a fixed step on each armed store sub-call.
+
+    Prepare runs with the clock held at ``NOW`` so a fresh, in-bounds proposal
+    always persists; the test then arms the clock so each subsequent store
+    sub-call (read or transaction) advances it by one worst-case call cost,
+    modelling a degraded DynamoDB table.
+    """
+
+    def __init__(self, at: datetime, *, step_s: float) -> None:
+        self._at = at
+        self._step = timedelta(seconds=step_s)
+        self._armed = False
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def tick(self) -> None:
+        if self._armed:
+            self._at = self._at + self._step
+
+    def elapsed_since(self, start: datetime) -> float:
+        return (self._at - start).total_seconds()
+
+    def __call__(self) -> datetime:
+        return self._at
+
+
+class _SlowDynamoClient(StatefulDynamoClient):
+    """A stateful fake whose every store sub-call advances a shared clock."""
+
+    def __init__(self, clock: _TickingClock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
+        self._clock.tick()
+        return super().transact_write_items(TransactItems=TransactItems)
+
+    def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
+        self._clock.tick()
+        return super().get_item(TableName=TableName, Key=Key, ConsistentRead=ConsistentRead)
+
+
+def test_degraded_store_returns_retryable_error_before_the_lambda_timeout() -> None:
+    # An approve and an evidence read, each store sub-call costing ~4.5 s under a
+    # degraded table, finish with a typed retryable error before the 20 s Lambda
+    # timeout (less a safety margin) rather than being hard-killed.
+    clock = _TickingClock(NOW, step_s=_SLOW_CALL_S)
+    client = _SlowDynamoClient(clock)
+    handler = _handler(client, clock=clock, request_deadline_s=15.0)
+
+    # Prepare while the clock is held, so the operation materializes normally.
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    # The table degrades: every subsequent sub-call now advances the clock.
+    clock.arm()
+
+    approve_start = clock()
+    approve = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert approve["statusCode"] == 503
+    assert json.loads(approve["body"])["retryable"] is True
+    # The approve returned before the Lambda wall-clock timeout (less a safety
+    # margin): the store refused the sub-call that would cross the request
+    # deadline rather than running until the function was killed.
+    assert clock.elapsed_since(approve_start) <= _LAMBDA_TIMEOUT_S - _LAMBDA_SAFETY_MARGIN_S
+
+    evidence_start = clock()
+    evidence = handler.handle(
+        _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", "client.approver"), op_id=op_id)
+    )
+    assert evidence["statusCode"] == 503
+    assert json.loads(evidence["body"])["retryable"] is True
+    assert clock.elapsed_since(evidence_start) <= _LAMBDA_TIMEOUT_S - _LAMBDA_SAFETY_MARGIN_S

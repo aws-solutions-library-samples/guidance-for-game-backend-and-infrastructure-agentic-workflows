@@ -459,6 +459,41 @@ def test_successful_prepare_emits_no_failure_metric() -> None:
     assert metrics.events == []
 
 
+# -- Per-request budget skips a metric publish that would not fit --------------
+
+
+def test_metric_publish_is_skipped_when_the_request_budget_is_spent() -> None:
+    # A service-side prepare failure would publish PreparationFailures, but when
+    # the monotonic request budget is already spent the publish is skipped so a
+    # synchronous CloudWatch call cannot push the request past the Lambda
+    # timeout. The deadline guard owns failing closed; the metric is best effort.
+    metrics = FakeMetrics()
+    ticks = iter([0.0, 0.0, 100.0, 100.0])
+    handler = _handler(
+        orchestrator=FakeOrchestrator(PrepareOrchestratorError("provider_unavailable", "unavailable", retryable=True)),
+        metrics=metrics,
+        request_deadline_s=15.0,
+        min_publish_remaining_s=3.0,
+        monotonic=lambda: next(ticks),
+    )
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert metrics.events == []
+
+
+def test_metric_publish_happens_when_the_request_budget_remains() -> None:
+    # With ample budget remaining, the same service-side failure publishes.
+    metrics = FakeMetrics()
+    handler = _handler(
+        orchestrator=FakeOrchestrator(PrepareOrchestratorError("provider_unavailable", "unavailable", retryable=True)),
+        metrics=metrics,
+        request_deadline_s=15.0,
+        min_publish_remaining_s=3.0,
+        monotonic=lambda: 0.0,
+    )
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert "preparation.failed" in metrics.events
+
+
 # -- Reserved wire-stable error-code ownership ---------------------------------
 #
 # ``CURRENT_STATE_MISMATCH`` is intentionally not raised anywhere in the advice

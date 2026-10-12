@@ -31,8 +31,10 @@ from __future__ import annotations
 # Standard library
 import logging
 import secrets
-from collections.abc import Mapping
-from datetime import datetime, timezone
+import time
+from collections.abc import Callable, Mapping
+from contextlib import nullcontext
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 # Local modules
@@ -138,6 +140,18 @@ class ApprovalMetricsPort(Protocol):
     def record(self, event: str) -> None: ...
 
 
+class StoreRequestDeadlinePort(Protocol):
+    """Durable store port that binds a per-request deadline for one request.
+
+    The adapter binds a monotonic request deadline for the duration of a single
+    request so every store read is guarded and every write deadline is capped by
+    it. A store with no such binding (a pure in-memory fake) is simply not wired,
+    and the handler enforces no store-side deadline.
+    """
+
+    def request_deadline(self, deadline: datetime) -> Any: ...
+
+
 class _NullApprovalMetrics:
     def record(self, event: str) -> None:  # noqa: D401 - no-op default sink
         return None
@@ -145,6 +159,10 @@ class _NullApprovalMetrics:
 
 class HandlerConfigError(RuntimeError):
     """The handler was constructed without a required trusted binding."""
+
+
+def _system_clock() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class ApprovalRequestHandler:
@@ -162,11 +180,20 @@ class ApprovalRequestHandler:
         trusted_audience: str,
         requester_groups: frozenset[str],
         metrics: ApprovalMetricsPort | None = None,
+        store: StoreRequestDeadlinePort | None = None,
+        request_deadline_s: float | None = None,
+        min_publish_remaining_s: float = 0.0,
+        clock: Callable[[], datetime] = _system_clock,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if not tenant_id or not workspace_id or not trusted_audience:
             raise HandlerConfigError("tenant_id, workspace_id, and trusted_audience are required")
         if not requester_groups:
             raise HandlerConfigError("requester_groups must list at least one group")
+        if request_deadline_s is not None and request_deadline_s <= 0:
+            raise HandlerConfigError("request_deadline_s must be a positive number of seconds")
+        if min_publish_remaining_s < 0:
+            raise HandlerConfigError("min_publish_remaining_s must be non-negative")
         self._metrics = metrics or _NullApprovalMetrics()
         self._orchestrator = orchestrator
         self._approval_service = approval_service
@@ -176,6 +203,17 @@ class ApprovalRequestHandler:
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
         self._requester_groups = requester_groups
+        # One monotonic per-request deadline derived from the operations budget
+        # bounds the whole request. It is threaded into the durable store (reads
+        # guarded, writes capped at ``min(request deadline, commit_not_after)``)
+        # and gates a metric publish that would not fit, so a slow sequence of
+        # store calls returns a typed retryable error before the Lambda timeout.
+        self._store = store
+        self._request_deadline_s = request_deadline_s
+        self._min_publish_remaining_s = min_publish_remaining_s
+        self._clock = clock
+        self._monotonic = monotonic
+        self._request_start = monotonic()
 
     def _principal_authority(self, principal: VerifiedPrincipal) -> str:
         """Derive requester authority from the verified access-token groups.
@@ -192,8 +230,15 @@ class ApprovalRequestHandler:
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one API Gateway HTTP API (payload v2) invocation."""
         stage = ["dispatch"]
+        # Take one monotonic request-entry clock and derive a wall-clock request
+        # deadline from it. The deadline is bound to the durable store for the
+        # whole request (guarding reads and capping writes), and the monotonic
+        # start gates a metric publish that would not fit the remaining budget.
+        self._request_start = self._monotonic()
+        store_scope = self._store_request_deadline()
         try:
-            return self._dispatch(event, stage)
+            with store_scope:
+                return self._dispatch(event, stage)
         except ApprovalBoundaryError as exc:
             self._emit_failure_metric(stage[0], exc.error_code)
             return _approval_error_response(exc)
@@ -202,9 +247,9 @@ class ApprovalRequestHandler:
             return _prepare_error_response(exc)
         except _RETRYABLE_STORE_FAULTS as exc:  # noqa: BLE001 - transient store fault
             # A transient store fault (throttle, transaction conflict, capacity
-            # limit) or a typed E1 read error is retryable, not an internal bug:
-            # surface it as a typed retryable 503 and count it as a service-side
-            # failure.
+            # limit), the per-request deadline elapsing on a read, or a typed E1
+            # read error is retryable, not an internal bug: surface it as a typed
+            # retryable 503 and count it as a service-side failure.
             self._emit_service_fault_metric(stage[0])
             _log_unexpected_exception(stage[0], _method(event), exc)
             return _error_response(503, "PROVIDER_UNAVAILABLE", "operation request is temporarily unavailable", True)
@@ -212,6 +257,42 @@ class ApprovalRequestHandler:
             self._emit_service_fault_metric(stage[0])
             _log_unexpected_exception(stage[0], _method(event), exc)
             return _error_response(500, "INTERNAL_ERROR", "operation request failed", False)
+
+    def _store_request_deadline(self) -> Any:
+        """Bind the per-request store deadline, or a no-op when unavailable.
+
+        The deadline is a wall-clock instant ``now + request_deadline_s`` so the
+        store (which fences on ``commit_not_after`` datetimes) can cap writes and
+        guard reads against it. When no store or budget is configured — a unit
+        test driving fake services — the scope is a no-op.
+        """
+        if self._store is None or self._request_deadline_s is None:
+            return nullcontext()
+        deadline = self._clock().astimezone(timezone.utc) + timedelta(seconds=self._request_deadline_s)
+        return self._store.request_deadline(deadline)
+
+    def _publish_fits(self) -> bool:
+        """Whether enough request budget remains to publish a metric now.
+
+        A metric publish is a synchronous call with its own cost; when fewer than
+        ``min_publish_remaining_s`` of the request budget remain, it is skipped so
+        it cannot push the request past the Lambda timeout. With no budget
+        configured, a publish always fits.
+        """
+        if self._request_deadline_s is None:
+            return True
+        elapsed = self._monotonic() - self._request_start
+        remaining = self._request_deadline_s - elapsed
+        return remaining >= self._min_publish_remaining_s
+
+    def _record_metric(self, event: str) -> None:
+        """Publish one bounded E2 metric, skipping it when the budget is spent."""
+        if not self._publish_fits():
+            return
+        try:
+            self._metrics.record(event)
+        except Exception:  # noqa: BLE001 - metrics must never break a request
+            pass
 
     def _dispatch(self, event: Mapping[str, Any], stage: list[str]) -> dict[str, Any]:
         method = _method(event)
@@ -324,10 +405,7 @@ class ApprovalRequestHandler:
             return
         if outcome is not None:
             # The expiry transition won: record the bounded ApprovalExpired metric.
-            try:
-                self._metrics.record("approval.expired")
-            except Exception:  # noqa: BLE001 - metrics must never break a request
-                pass
+            self._record_metric("approval.expired")
 
     def _decision_request(self, event: Mapping[str, Any]) -> DecisionRequest:
         operation_id = _operation_id(event)
@@ -411,14 +489,14 @@ class ApprovalRequestHandler:
         """
         try:
             if stage == "cancel" and error_code == ApprovalErrorCode.STATE_CONFLICT:
-                self._metrics.record("cancellation.conflict")
+                self._record_metric("cancellation.conflict")
                 return
             if error_code not in _SERVICE_SIDE_APPROVAL_ERRORS:
                 return
             if stage == "prepare":
-                self._metrics.record("preparation.failed")
+                self._record_metric("preparation.failed")
             elif stage in ("approve", "reject", "cancel"):
-                self._metrics.record("approval.failed")
+                self._record_metric("approval.failed")
         except Exception:  # noqa: BLE001 - metrics must never break a request
             pass
 
@@ -426,23 +504,17 @@ class ApprovalRequestHandler:
         """Emit PreparationFailures only for a service-side prepare error."""
         if error_code not in _SERVICE_SIDE_PREPARE_ERRORS:
             return
-        try:
-            if stage == "prepare":
-                self._metrics.record("preparation.failed")
-            elif stage in ("approve", "reject", "cancel"):
-                self._metrics.record("approval.failed")
-        except Exception:  # noqa: BLE001 - metrics must never break a request
-            pass
+        if stage == "prepare":
+            self._record_metric("preparation.failed")
+        elif stage in ("approve", "reject", "cancel"):
+            self._record_metric("approval.failed")
 
     def _emit_service_fault_metric(self, stage: str) -> None:
         """Emit the service-side failure metric for a transient fault or bug."""
-        try:
-            if stage == "prepare":
-                self._metrics.record("preparation.failed")
-            elif stage in ("approve", "reject", "cancel"):
-                self._metrics.record("approval.failed")
-        except Exception:  # noqa: BLE001 - metrics must never break a request
-            pass
+        if stage == "prepare":
+            self._record_metric("preparation.failed")
+        elif stage in ("approve", "reject", "cancel"):
+            self._record_metric("approval.failed")
 
 
 # -- Response bodies ---------------------------------------------------------
