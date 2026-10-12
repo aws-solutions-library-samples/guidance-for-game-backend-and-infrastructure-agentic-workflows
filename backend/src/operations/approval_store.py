@@ -169,11 +169,29 @@ class DynamoDbApprovalStore:
         finally:
             self._request_deadline = previous
 
-    def _effective_deadline(self, commit_not_after: datetime) -> datetime:
-        """Cap a write deadline at the bound request deadline when one is set."""
-        if self._request_deadline is None:
-            return commit_not_after
-        return min(commit_not_after, self._request_deadline)
+    def _guard_write_deadline(self, commit_not_after: datetime) -> datetime | None:
+        """Return the capped write deadline, or ``None`` for genuine expiry.
+
+        Distinguishes which bound is binding when a write cannot fit one more
+        sub-call. When the per-request deadline is the binding cap and it is
+        reached, this is a slow-store condition — the operation itself has not
+        expired — so it fails closed with a retryable :class:`ApprovalStoreError`
+        that the service boundary maps to a counted, retryable 503. When the
+        operation's own ``commit_not_after`` is the binding cap and it is
+        reached, the operation has genuinely expired: the caller returns the
+        non-retryable, uncounted expiry outcome instead. Returns the capped
+        deadline when the write still fits.
+        """
+        operation_deadline = _utc(commit_not_after, "commit_not_after")
+        if self._request_deadline is not None and self._request_deadline < operation_deadline:
+            # The request budget, not the operation's own expiry, is the tighter
+            # cap. Exhausting it under a slow store is a retryable service fault.
+            if self._deadline_reached(self._request_deadline):
+                raise ApprovalStoreError("operation request deadline elapsed before the write could complete")
+            return self._request_deadline
+        if self._deadline_reached(operation_deadline):
+            return None
+        return operation_deadline
 
     def _guard_read(self) -> None:
         """Fail closed before a read that could return after the request deadline.
@@ -211,8 +229,8 @@ class DynamoDbApprovalStore:
         commit_not_after: datetime,
     ) -> PersistResult:
         """Atomically materialize one prepared operation awaiting approval."""
-        deadline = self._effective_deadline(_utc(commit_not_after, "commit_not_after"))
-        if self._deadline_reached(deadline):
+        deadline = self._guard_write_deadline(commit_not_after)
+        if deadline is None:
             return PersistResult(PersistOutcome.DEADLINE_EXPIRED)
 
         operation_id = prepared_operation["operation_id"]
@@ -292,7 +310,7 @@ class DynamoDbApprovalStore:
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
 
-        if self._deadline_reached(deadline):
+        if self._guard_write_deadline(commit_not_after) is None:
             return PersistResult(PersistOutcome.DEADLINE_EXPIRED)
 
         try:
@@ -333,8 +351,8 @@ class DynamoDbApprovalStore:
         commit_not_after: datetime,
         approval: Mapping[str, Any],
     ) -> ApprovalCommitOutcome:
-        deadline = self._effective_deadline(_utc(commit_not_after, "commit_not_after"))
-        if self._deadline_reached(deadline):
+        deadline = self._guard_write_deadline(commit_not_after)
+        if deadline is None:
             return ApprovalCommitOutcome.DEADLINE_EXPIRED
         state_change = _approval_state_change(operation_id, expected_prepared_operation_hash, approval)
         ledger_event = _approval_ledger_event(operation_id, expected_prepared_operation_hash, approval)
@@ -347,7 +365,7 @@ class DynamoDbApprovalStore:
             state_change=state_change,
             ledger_event=ledger_event,
             approval=approval,
-            deadline=deadline,
+            commit_not_after=commit_not_after,
         )
         return _to_approval_outcome(outcome)
 
@@ -369,8 +387,7 @@ class DynamoDbApprovalStore:
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
     ) -> DecisionCommitOutcome:
-        deadline = self._effective_deadline(_utc(commit_not_after, "commit_not_after"))
-        if self._deadline_reached(deadline):
+        if self._guard_write_deadline(commit_not_after) is None:
             return DecisionCommitOutcome.DEADLINE_EXPIRED
         return self._commit_terminal(
             operation_id=operation_id,
@@ -381,7 +398,7 @@ class DynamoDbApprovalStore:
             state_change=state_change,
             ledger_event=ledger_event,
             approval=approval,
-            deadline=deadline,
+            commit_not_after=commit_not_after,
         )
 
     # -- Shared terminal-commit transaction ------------------------------
@@ -397,7 +414,7 @@ class DynamoDbApprovalStore:
         state_change: Mapping[str, Any],
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
-        deadline: datetime,
+        commit_not_after: datetime,
     ) -> DecisionCommitOutcome:
         op_pk = f"OP#{operation_id}"
 
@@ -467,7 +484,7 @@ class DynamoDbApprovalStore:
             )
             transact_items.append(self._conditional_put(approval_item, "attribute_not_exists(SK)"))
 
-        if self._deadline_reached(deadline):
+        if self._guard_write_deadline(commit_not_after) is None:
             return DecisionCommitOutcome.DEADLINE_EXPIRED
 
         try:
@@ -570,8 +587,9 @@ class DynamoDbApprovalStore:
         import json
 
         entries: list[dict[str, Any]] = []
-        # A prepared operation transitions at most once beyond its initial
-        # pending_approval materialization, so the ledger is short and bounded.
+        # The ledger is short and bounded: materialization plus a small number of
+        # lifecycle transitions (for example pending_approval -> approved ->
+        # cancelled). The contiguous LEDGER#<seq> chain is walked from sequence 0.
         for sequence in range(_MAX_LEDGER_SEQUENCE + 1):
             item = self._get(op_pk, f"LEDGER#{sequence}")
             if item is None:
@@ -599,11 +617,20 @@ class DynamoDbApprovalStore:
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
         self._guard_read()
-        response = self._client.get_item(
-            TableName=self._table_name,
-            Key=_marshal({"PK": pk, "SK": sk}),
-            ConsistentRead=True,
-        )
+        try:
+            response = self._client.get_item(
+                TableName=self._table_name,
+                Key=_marshal({"PK": pk, "SK": sk}),
+                ConsistentRead=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - a read fault is transient, not a bug
+            # A throttle, capacity limit, or other client error on a read is a
+            # transient service condition, not an internal bug: log the bounded
+            # breadcrumb and fail closed with a retryable store fault so the
+            # service boundary maps it to a counted, retryable 503 rather than a
+            # non-retryable 500.
+            _log_store_exception("get_item", exc, classification="unavailable")
+            raise ApprovalStoreError("durable read failed and is retryable") from exc
         item = response.get("Item")
         if not item:
             return None

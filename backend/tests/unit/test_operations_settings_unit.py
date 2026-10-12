@@ -179,6 +179,35 @@ def test_e2_expiry_invalid_fails_closed(key: str) -> None:
         resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "advise", key: "0"})
 
 
+@pytest.mark.parametrize("key", ["GBAW_OPERATIONS_PREPARATION_EXPIRY_S", "GBAW_OPERATIONS_APPROVAL_EXPIRY_S"])
+def test_e2_expiry_below_the_floor_fails_closed_in_advise(key: str) -> None:
+    # A window shorter than one store call limit plus a margin would fail every
+    # prepare or approve on a healthy store, so an advise-mode deployment rejects
+    # it rather than configuring an unusable window.
+    with pytest.raises(ValueError):
+        resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "advise", key: "4"})
+
+
+@pytest.mark.parametrize(
+    "key,attr",
+    [
+        ("GBAW_OPERATIONS_PREPARATION_EXPIRY_S", "preparation_expiry_s"),
+        ("GBAW_OPERATIONS_APPROVAL_EXPIRY_S", "approval_expiry_s"),
+    ],
+)
+def test_e2_expiry_at_the_floor_is_accepted_in_advise(key: str, attr: str) -> None:
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "advise", key: "60"})
+    assert getattr(settings, attr) == 60
+
+
+@pytest.mark.parametrize("key", ["GBAW_OPERATIONS_PREPARATION_EXPIRY_S", "GBAW_OPERATIONS_APPROVAL_EXPIRY_S"])
+def test_e2_expiry_floor_is_inert_in_observe(key: str) -> None:
+    # Below the advise ceiling the E2 windows are inert, so observe mode keeps
+    # accepting a short value rather than enforcing the floor.
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe", key: "4"})
+    assert settings.e2_enabled is False
+
+
 def test_approval_expiry_setting_feeds_the_approval_policy_ttl() -> None:
     # The configured approval expiry window is consumed as the approval policy's
     # granted-approval validity, rather than being parsed and ignored.

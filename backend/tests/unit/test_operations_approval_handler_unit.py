@@ -357,7 +357,95 @@ def test_approve_integrity_mismatch_emits_approval_failure_metric() -> None:
     assert "approval.failed" in metrics.events
 
 
-def test_approve_expired_emits_no_failure_metric() -> None:
+def test_caller_precondition_mismatch_emits_no_failure_metric() -> None:
+    # A caller-supplied expected-hash precondition failure is a caller outcome,
+    # mapped to 409 and never counted toward the paging ApprovalFailures metric.
+    metrics = FakeMetrics()
+    handler = _handler(
+        decision_service=FakeDecisionService(
+            reject_result=ApprovalBoundaryError(ApprovalErrorCode.PRECONDITION_FAILED, "operation changed")
+        ),
+        metrics=metrics,
+    )
+    resp = handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/reject",
+            body={},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
+    assert resp["statusCode"] == 409
+    assert "approval.failed" not in metrics.events
+
+
+def test_preparation_expired_emits_no_failure_metric() -> None:
+    # Preparation expiry at persist is a caller/time outcome (the caller's token
+    # or the operation window elapsed), mapped to 409 and never counted. A slow
+    # store that exhausts the request budget raises a retryable store fault
+    # instead, which is counted on a separate path.
+    metrics = FakeMetrics()
+    handler = _handler(
+        orchestrator=FakeOrchestrator(PrepareOrchestratorError("preparation_expired", "expired")),
+        metrics=metrics,
+    )
+    resp = handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert resp["statusCode"] == 409
+    assert "preparation.failed" not in metrics.events
+
+
+def test_approve_rejects_a_non_empty_body() -> None:
+    # Approve carries no decision body: a non-empty or injected body fails closed
+    # with 400 and the grant is never attempted.
+    approval = FakeApprovalService({"approval_id": "approval.x", "decision": "granted"})
+    handler = _handler(approval_service=approval)
+    resp = handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/approve",
+            body={"approver": "x", "decision": "granted"},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
+    assert resp["statusCode"] == 400
+    assert approval.calls == []
+
+
+def test_approve_rejects_a_duplicate_key_body() -> None:
+    # A duplicate decision key is last-wins ambiguous: the strict I-JSON parse
+    # rejects it before the grant is attempted.
+    approval = FakeApprovalService({"approval_id": "approval.x", "decision": "granted"})
+    handler = _handler(approval_service=approval)
+    event = _event(
+        "POST",
+        path=f"/operations/{OPERATION_ID}/approve",
+        claims=_claims(),
+        path_params={"operationId": OPERATION_ID},
+    )
+    event["body"] = '{"x": 1, "x": 2}'
+    resp = handler.handle(event)
+    assert resp["statusCode"] == 400
+    assert approval.calls == []
+
+
+def test_approve_accepts_an_empty_or_absent_body() -> None:
+    # An empty body or a bare ``{}`` is the only accepted shape; the grant runs.
+    for body in (None, {}):
+        approval = FakeApprovalService({"approval_id": "approval.x", "decision": "granted"})
+        handler = _handler(approval_service=approval)
+        resp = handler.handle(
+            _event(
+                "POST",
+                path=f"/operations/{OPERATION_ID}/approve",
+                body=body,
+                claims=_claims(),
+                path_params={"operationId": OPERATION_ID},
+            )
+        )
+        assert resp["statusCode"] == 200
+        assert approval.calls
     # An approve that observes an already-expired operation is a caller/time
     # outcome; lazy expiry already records ApprovalExpired, so the approve path
     # publishes no additional failure metric (no double count).
@@ -494,7 +582,48 @@ def test_metric_publish_happens_when_the_request_budget_remains() -> None:
     assert "preparation.failed" in metrics.events
 
 
-# -- Reserved wire-stable error-code ownership ---------------------------------
+# -- Per-request deadline binds both the store and the E1 read scope -----------
+
+
+class _RecordingScope:
+    """A deadline-bearing port that records each bound/cleared request scope."""
+
+    def __init__(self) -> None:
+        self.entered: list[Any] = []
+        self.active = 0
+
+    def request_deadline(self, deadline):
+        # Standard library
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _scope():
+            self.entered.append(deadline)
+            self.active += 1
+            try:
+                yield
+            finally:
+                self.active -= 1
+
+        return _scope()
+
+
+def test_request_deadline_binds_both_store_and_read_scope() -> None:
+    # The handler binds the same per-request deadline to the durable approval
+    # store AND the E1 current-state read scope prepare uses, so prepare's status
+    # reads are guarded by the same budget as its approval writes. Both scopes
+    # are entered during the request and cleared on exit.
+    store = _RecordingScope()
+    read_scope = _RecordingScope()
+    handler = _handler(store=store, read_scope=read_scope, request_deadline_s=15.0, clock=lambda: NOW)
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert len(store.entered) == 1
+    assert len(read_scope.entered) == 1
+    # Both scopes bound the identical deadline instant and were cleared on exit.
+    assert store.entered == read_scope.entered
+    assert store.active == 0 and read_scope.active == 0
+
+
 #
 # ``CURRENT_STATE_MISMATCH`` is intentionally not raised anywhere in the advice
 # or prepare boundaries today, but both enums declare it as a stable wire value

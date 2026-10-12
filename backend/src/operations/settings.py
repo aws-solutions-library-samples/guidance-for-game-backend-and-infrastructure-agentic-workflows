@@ -63,6 +63,13 @@ DEFAULT_OBSERVER_GROUPS = ("admin", "users")
 DEFAULT_PREPARATION_EXPIRY_S = 900
 DEFAULT_APPROVAL_EXPIRY_S = 1800
 
+# The smallest usable prepare/approval window. The durable store refuses any
+# write within one worst-case call limit (~4.5 s) of its deadline, so a window
+# shorter than the call limit plus a margin would fail every prepare or approve
+# on a healthy store. The floor keeps a configured window long enough for at
+# least one write to land. Mirrored by the deploy wrapper.
+MINIMUM_EXPIRY_S = 60
+
 # Self-approval (the requester approving their own operation) is denied by
 # default; an owner opts in explicitly and it still only ever admits an
 # explicit low-risk capability. Fails closed.
@@ -221,6 +228,21 @@ class OperationsSettings:
         if not isinstance(self.approver_group, str) or not _GROUP_NAME_PATTERN.fullmatch(self.approver_group):
             raise ValueError("approver_group must be a valid group token")
         self._validate_capacity_bounds()
+        self._validate_expiry_windows()
+
+    def _validate_expiry_windows(self) -> None:
+        # The prepare/approval windows only govern the E2 lifecycle, so they are
+        # validated against the floor only when the deployment admits E2. Below
+        # the advise ceiling the fields are inert and a bare observe deployment
+        # keeps accepting any value.
+        if not self.e2_enabled:
+            return
+        for value, name in (
+            (self.preparation_expiry_s, "preparation_expiry_s"),
+            (self.approval_expiry_s, "approval_expiry_s"),
+        ):
+            if value < MINIMUM_EXPIRY_S:
+                raise ValueError(f"{name} must be at least {MINIMUM_EXPIRY_S} seconds")
 
     def _validate_capacity_bounds(self) -> None:
         floor, ceiling, max_step = self.capacity_floor, self.capacity_ceiling, self.capacity_max_step

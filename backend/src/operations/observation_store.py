@@ -67,7 +67,8 @@ from __future__ import annotations
 # Standard library
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -146,6 +147,34 @@ class DynamoDbObservationStore(ObservationStore):
         # at least this much of the request budget remains, so a transaction or
         # read never begins so late that it can outlast the Lambda timeout.
         self._call_limit_s = float(call_limit_s)
+        # The optional per-request deadline (a wall-clock instant) a caller binds
+        # for the duration of one request via :meth:`request_deadline`. When set,
+        # every status read on the E2 prepare path fails closed before starting a
+        # sub-call that could return after the deadline, so prepare's current-state
+        # reads stay inside the same request budget as its approval-store writes.
+        # Unbound (the E1 observation path) it imposes no deadline.
+        self._request_deadline: datetime | None = None
+
+    @contextmanager
+    def request_deadline(self, deadline: datetime) -> Iterator[None]:
+        """Bind a per-request read deadline for the duration of one request.
+
+        While bound, every ``get_item`` fails closed before starting a sub-call
+        that could return after ``deadline``. The binding is cleared on exit so a
+        reused per-container store never leaks one request's deadline into the
+        next.
+        """
+        previous = self._request_deadline
+        self._request_deadline = _utc(deadline, "request_deadline")
+        try:
+            yield
+        finally:
+            self._request_deadline = previous
+
+    def _guard_read(self) -> None:
+        """Fail closed before a read that could return after the request deadline."""
+        if self._request_deadline is not None and self._deadline_reached(self._request_deadline):
+            raise ObservationStoreReadError("operation request deadline elapsed before the read could complete")
 
     def _deadline_reached(self, deadline: datetime) -> bool:
         """Whether one full store sub-call would not fit before ``deadline``.
@@ -739,6 +768,7 @@ class DynamoDbObservationStore(ObservationStore):
         return observation, recorded_hash if isinstance(recorded_hash, str) else None
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
+        self._guard_read()
         try:
             response = self._client.get_item(
                 TableName=self._table_name,

@@ -187,6 +187,8 @@
               "MINIMUM_EXCEEDS_MAXIMUM",
               "DESIRED_OUTSIDE_RANGE",
               "DELTA_EXCEEDS_MAX_STEP",
+              "MINIMUM_DELTA_EXCEEDS_MAX_STEP",
+              "MAXIMUM_DELTA_EXCEEDS_MAX_STEP",
               "TARGET_NOT_ENROLLED"
             ]
           }

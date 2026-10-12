@@ -127,6 +127,7 @@ class StatefulDynamoClient:
         self.items: dict[tuple[str, str], dict[str, Any]] = {}
         self.transactions: list[list[dict[str, Any]]] = []
         self.raise_on_transact: BaseException | None = None
+        self.raise_on_get: BaseException | None = None
 
     def transact_write_items(self, *, TransactItems: list[dict[str, Any]]) -> dict[str, Any]:
         self.transactions.append(TransactItems)
@@ -170,6 +171,8 @@ class StatefulDynamoClient:
         return {}
 
     def get_item(self, *, TableName: str, Key: dict[str, Any], ConsistentRead: bool = False) -> dict[str, Any]:
+        if self.raise_on_get is not None:
+            raise self.raise_on_get
         item = self.items.get((Key["PK"]["S"], Key["SK"]["S"]))
         return {"Item": item} if item else {}
 
@@ -562,25 +565,53 @@ def test_bound_request_deadline_guards_reads_and_caps_writes() -> None:
         with pytest.raises(ApprovalStoreError):
             store.load_operation_evidence(OPERATION_ID)
 
-    # A far commit_not_after is capped by a nearer request deadline: the write
-    # fails closed as deadline-expired without issuing a transaction.
+    # A far commit_not_after capped by a nearer request deadline: the request
+    # budget — not the operation's own expiry — is the binding cap, so the write
+    # fails closed with a retryable store fault (mapped to a counted, retryable
+    # 503) rather than reporting the operation as expired, and issues no
+    # transaction.
     transactions_before = len(client.transactions)
     with store.request_deadline(NOW + timedelta(seconds=2)):
-        outcome = store.record_terminal_decision(
-            operation_id=OPERATION_ID,
-            expected_prepared_operation_hash=_hash(),
-            expected_state="pending_approval",
-            new_state="cancelled",
-            commit_not_after=NOW + timedelta(hours=1),
-            state_change=_state_change("cancelled", "CANCELLED"),
-            ledger_event=_ledger_event("operation.state-changed"),
-            approval=None,
-        )
-    assert outcome is DecisionCommitOutcome.DEADLINE_EXPIRED
+        with pytest.raises(ApprovalStoreError):
+            store.record_terminal_decision(
+                operation_id=OPERATION_ID,
+                expected_prepared_operation_hash=_hash(),
+                expected_state="pending_approval",
+                new_state="cancelled",
+                commit_not_after=NOW + timedelta(hours=1),
+                state_change=_state_change("cancelled", "CANCELLED"),
+                ledger_event=_ledger_event("operation.state-changed"),
+                approval=None,
+            )
     assert len(client.transactions) == transactions_before
 
     # The binding is cleared on exit: the same read now succeeds.
     assert store.load_operation_evidence(OPERATION_ID) is not None
+
+
+def test_write_at_its_own_expiry_reports_deadline_expired() -> None:
+    # When the operation's OWN commit_not_after is the binding cap and it is
+    # reached, the operation has genuinely expired: the store reports the
+    # non-retryable deadline-expired outcome (a caller-facing 409), not a
+    # retryable store fault.
+    client = StatefulDynamoClient()
+    _persist(_store(client))
+    store = DynamoDbApprovalStore(client=client, table_name=TABLE, clock=lambda: NOW, call_limit_s=4.5)
+
+    transactions_before = len(client.transactions)
+    # No request deadline bound; the operation's own near commit_not_after binds.
+    outcome = store.record_terminal_decision(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        new_state="cancelled",
+        commit_not_after=NOW + timedelta(seconds=2),
+        state_change=_state_change("cancelled", "CANCELLED"),
+        ledger_event=_ledger_event("operation.state-changed"),
+        approval=None,
+    )
+    assert outcome is DecisionCommitOutcome.DEADLINE_EXPIRED
+    assert len(client.transactions) == transactions_before
 
 
 def test_ledger_contract_sequence_is_strictly_increasing_per_operation() -> None:
@@ -693,6 +724,27 @@ def test_record_terminal_decision_deadline_expired() -> None:
     )
 
     assert outcome is DecisionCommitOutcome.DEADLINE_EXPIRED
+
+
+def test_get_item_client_fault_raises_retryable_store_error() -> None:
+    # A read fault (throttle, capacity limit) must surface as a retryable
+    # ApprovalStoreError, not propagate as a raw ClientError that the handler
+    # maps to a non-retryable 500. Both an evidence load and an approval load
+    # fail closed the same way.
+    client = StatefulDynamoClient()
+    _persist(_store(client))
+    store = _store(client)
+    client.raise_on_get = ClientError(
+        {
+            "Error": {"Code": "ProvisionedThroughputExceededException", "Message": "throttled"},
+            "ResponseMetadata": {"HTTPStatusCode": 400},
+        },
+        "GetItem",
+    )
+    with pytest.raises(ApprovalStoreError):
+        store.load_operation_evidence(OPERATION_ID)
+    with pytest.raises(ApprovalStoreError):
+        store.load_for_approval(OPERATION_ID)
 
 
 # -- Evidence load -----------------------------------------------------------
