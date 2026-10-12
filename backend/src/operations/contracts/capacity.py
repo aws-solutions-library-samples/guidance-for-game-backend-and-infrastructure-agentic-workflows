@@ -186,14 +186,22 @@ def calculate_capacity_risk(
     factors: list[str] = []
     score = 0
 
-    desired_delta = abs(change["desired"])
-    baseline = max(current["desired"], 1)
-    # Relative magnitude of the desired change, capped so a single factor can
-    # never dominate the bounded [0, 100] score.
-    magnitude = min((desired_delta * 50) // baseline, 50)
+    # Relative magnitude of the change across all three dimensions, so pinning a
+    # fleet (collapsing minimum/maximum onto desired) or widening/narrowing the
+    # autoscaling band scores as risk even when the desired value is unchanged.
+    # Each dimension is scaled against its own current value; the largest swing
+    # drives the factor, capped so it can never dominate the bounded [0, 100]
+    # score.
+    magnitude = 0
+    for dimension in ("desired", "minimum", "maximum"):
+        delta = abs(change[dimension])
+        if not delta:
+            continue
+        baseline = max(current[dimension], 1)
+        magnitude = max(magnitude, min((delta * 50) // baseline, 50))
     if magnitude:
         score += magnitude
-        factors.append("desired-magnitude")
+        factors.append("capacity-magnitude")
 
     if change["desired"] > 0 or change["maximum"] > 0:
         score += 10
@@ -258,6 +266,29 @@ def effective_authority(authority_inputs: dict[str, str]) -> str:
         (authority_inputs[field] for field in _AUTHORITY_INPUT_FIELDS),
         key=_AUTHORITY_ORDER.__getitem__,
     )
+
+
+# -- Policy version binding -------------------------------------------------
+
+
+def capacity_policy_version(base_version: str, limits: dict[str, int]) -> str:
+    """Return a policy version that binds the server-owned capacity limits.
+
+    The version is ``<base_version>.<digest>`` where ``digest`` is a short
+    canonical SHA-256 over the sorted floor/ceiling/max-step limits. Because the
+    prepared operation carries this value in its hashed ``policy`` binding, any
+    change to the server-owned band yields a different version, so an operation
+    prepared under one band fails the approval policy's version match
+    (``POLICY_STALE``) rather than being approved under a band it was never
+    evaluated against.
+    """
+    material = {
+        "floor": int(limits["floor"]),
+        "ceiling": int(limits["ceiling"]),
+        "max_step": int(limits["max_step"]),
+    }
+    digest = canonical_sha256(material).split(":", 1)[1]
+    return f"{base_version}.{digest[:16]}"
 
 
 # -- Prepared hash ----------------------------------------------------------

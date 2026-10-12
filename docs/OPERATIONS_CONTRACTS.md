@@ -231,7 +231,13 @@ Ledger storage MUST be append-only. Each operation has a strictly increasing
 `sequence`; an event identifier is unique and an accepted event is never
 updated or deleted. Event type and payload type must match. Payload schemas
 permit only bounded domain results and stable provider identifiers, never raw
-provider responses.
+provider responses. The durable store owns the contract `sequence`: it is the
+physical ledger index plus one, so the creation event carries `sequence` 1 and
+each later transition increments it. The capacity prepare transaction
+materializes the operation directly at `pending_approval` and records its first
+ledger event there; it does not write a separate `prepared` creation transition
+ahead of it, which is a deliberate deviation from the two-step creation that
+ADR 0005 sketches.
 
 Application errors have a closed error-code set, a bounded safe message,
 retryability, and correlation. They expose only bounded field paths and state.

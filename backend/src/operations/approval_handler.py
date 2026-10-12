@@ -29,8 +29,8 @@ This module holds no executor credential and performs no provider write.
 from __future__ import annotations
 
 # Standard library
-import json
 import logging
+import secrets
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -42,13 +42,31 @@ from operations.approval import (
     ApprovalRequest,
     ApprovalRequestContext,
 )
+from operations.approval_store import ApprovalStoreError
 from operations.claims import parse_group_claim, parse_scope_claim
 from operations.contracts import CONTRACT_VERSION
-from operations.contracts.canonical import CanonicalizationError, canonicalize
+from operations.contracts.canonical import CanonicalizationError, canonicalize, load_json
 from operations.decisions import DecisionRequest, DecisionRequestContext
 from operations.identity import VerifiedPrincipal
+from operations.observation import ObservationStoreReadError
 from operations.prepare import PreparedDecision
 from operations.prepare_orchestrator import PrepareOrchestratorError, PrepareResult
+
+# Transient store faults and the typed E1 read error are retryable service-side
+# conditions, mapped to a typed retryable 503 rather than a non-retryable 500.
+_RETRYABLE_STORE_FAULTS = (ApprovalStoreError, ObservationStoreReadError)
+
+# Prepare-orchestrator error codes that are service-side failures (not caller
+# errors). Only these publish the PreparationFailures metric.
+_SERVICE_SIDE_PREPARE_ERRORS = frozenset(
+    {"contract_output_invalid", "provider_unavailable", "preparation_expired", "internal_error"}
+)
+
+# Approval error codes that are service-side failures (not caller errors). Only
+# these publish the ApprovalFailures metric. An integrity/hash mismatch counts;
+# authorization denial, invalid input, not-found, policy-stale, state conflict,
+# and expiry do not.
+_SERVICE_SIDE_APPROVAL_ERRORS = frozenset({ApprovalErrorCode.OPERATION_HASH_MISMATCH})
 
 # HTTP status for each typed approval boundary error. Everything else is 500.
 _STATUS_BY_APPROVAL_ERROR = {
@@ -78,12 +96,25 @@ _STATUS_BY_PREPARE_ERROR = {
     "provider_unavailable": 503,
 }
 
-_PREPARE_ROUTE = "/operations/prepare"
+_PREPARE_ROUTE_KEY = "POST /operations/prepare"
+_APPROVE_ROUTE_KEY = "POST /operations/{operationId}/approve"
+_REJECT_ROUTE_KEY = "POST /operations/{operationId}/reject"
+_CANCEL_ROUTE_KEY = "POST /operations/{operationId}/cancel"
+_EVIDENCE_ROUTE_KEY = "GET /operations/{operationId}"
+
+# Every E2 request body is a few short fields; bound it before parsing.
+_MAX_BODY_BYTES = 4096
 
 
 class PrepareOrchestratorPort(Protocol):
     def prepare(
-        self, body: object, requester: VerifiedPrincipal, *, request_id: str, correlation_id: str
+        self,
+        body: object,
+        requester: VerifiedPrincipal,
+        *,
+        request_id: str,
+        correlation_id: str,
+        principal_authority: str,
     ) -> PrepareResult: ...
 
 
@@ -129,10 +160,13 @@ class ApprovalRequestHandler:
         tenant_id: str,
         workspace_id: str,
         trusted_audience: str,
+        requester_groups: frozenset[str],
         metrics: ApprovalMetricsPort | None = None,
     ) -> None:
         if not tenant_id or not workspace_id or not trusted_audience:
             raise HandlerConfigError("tenant_id, workspace_id, and trusted_audience are required")
+        if not requester_groups:
+            raise HandlerConfigError("requester_groups must list at least one group")
         self._metrics = metrics or _NullApprovalMetrics()
         self._orchestrator = orchestrator
         self._approval_service = approval_service
@@ -141,6 +175,19 @@ class ApprovalRequestHandler:
         self._tenant_id = tenant_id
         self._workspace_id = workspace_id
         self._trusted_audience = trusted_audience
+        self._requester_groups = requester_groups
+
+    def _principal_authority(self, principal: VerifiedPrincipal) -> str:
+        """Derive requester authority from the verified access-token groups.
+
+        A caller whose verified ``cognito:groups`` intersect the server-owned
+        requester allowlist derives ``advise`` authority; a caller with no
+        intersecting group derives ``disabled``. The groups come only from the
+        authorizer-verified claims, never from request data. Prepare, cancel,
+        and evidence require ``advise``; approve and reject keep the separate
+        approver-group gate in the approval policy.
+        """
+        return "advise" if (principal.groups & self._requester_groups) else "disabled"
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
         """Handle one API Gateway HTTP API (payload v2) invocation."""
@@ -151,46 +198,74 @@ class ApprovalRequestHandler:
             self._emit_failure_metric(stage[0], exc.error_code)
             return _approval_error_response(exc)
         except PrepareOrchestratorError as exc:
-            self._emit_prepare_failure_metric(stage[0])
+            self._emit_prepare_failure_metric(stage[0], exc.error_code)
             return _prepare_error_response(exc)
+        except _RETRYABLE_STORE_FAULTS as exc:  # noqa: BLE001 - transient store fault
+            # A transient store fault (throttle, transaction conflict, capacity
+            # limit) or a typed E1 read error is retryable, not an internal bug:
+            # surface it as a typed retryable 503 and count it as a service-side
+            # failure.
+            self._emit_service_fault_metric(stage[0])
+            _log_unexpected_exception(stage[0], _method(event), exc)
+            return _error_response(503, "PROVIDER_UNAVAILABLE", "operation request is temporarily unavailable", True)
         except Exception as exc:  # noqa: BLE001 - never leak an internal detail
-            self._emit_prepare_failure_metric(stage[0])
+            self._emit_service_fault_metric(stage[0])
             _log_unexpected_exception(stage[0], _method(event), exc)
             return _error_response(500, "INTERNAL_ERROR", "operation request failed", False)
 
     def _dispatch(self, event: Mapping[str, Any], stage: list[str]) -> dict[str, Any]:
         method = _method(event)
         route = _route(event)
+        route_key = _route_key(event)
         stage[0] = "identity"
         principal = self._verified_principal(event)
+        requester_authority = self._principal_authority(principal)
 
-        if method == "POST" and route == _PREPARE_ROUTE:
+        if method == "POST" and route_key == _PREPARE_ROUTE_KEY:
             stage[0] = "prepare"
-            return self._handle_prepare(event, principal)
-        if method == "POST" and route.endswith("/approve"):
+            self._require_requester_authority(requester_authority)
+            return self._handle_prepare(event, principal, requester_authority)
+        if method == "POST" and route_key == _APPROVE_ROUTE_KEY:
             stage[0] = "approve"
             self._expire_if_due(event)
             return self._handle_approve(event, principal)
-        if method == "POST" and route.endswith("/reject"):
+        if method == "POST" and route_key == _REJECT_ROUTE_KEY:
             stage[0] = "reject"
             self._expire_if_due(event)
             return self._handle_reject(event, principal)
-        if method == "POST" and route.endswith("/cancel"):
+        if method == "POST" and route_key == _CANCEL_ROUTE_KEY:
             stage[0] = "cancel"
+            self._require_requester_authority(requester_authority)
             self._expire_if_due(event)
             return self._handle_cancel(event, principal)
-        if method == "GET":
+        if method == "GET" and route_key == _EVIDENCE_ROUTE_KEY:
             stage[0] = "evidence"
+            self._require_requester_authority(requester_authority)
             self._expire_if_due(event)
             return self._handle_evidence(event, principal)
         raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "unsupported route")
 
+    def _require_requester_authority(self, requester_authority: str) -> None:
+        """Deny a caller with no allowed requester group before any store read."""
+        if requester_authority != "advise":
+            raise ApprovalBoundaryError(
+                ApprovalErrorCode.AUTHORIZATION_DENIED, "caller is not permitted to operate on prepared operations"
+            )
+
     # -- Route handlers ---------------------------------------------------
 
-    def _handle_prepare(self, event: Mapping[str, Any], principal: VerifiedPrincipal) -> dict[str, Any]:
+    def _handle_prepare(
+        self, event: Mapping[str, Any], principal: VerifiedPrincipal, requester_authority: str
+    ) -> dict[str, Any]:
         body = self._parse_json_body(event)
         request_id = _request_id(event)
-        result = self._orchestrator.prepare(body, principal, request_id=request_id, correlation_id=request_id)
+        result = self._orchestrator.prepare(
+            body,
+            principal,
+            request_id=request_id,
+            correlation_id=request_id,
+            principal_authority=requester_authority,
+        )
         status = 201 if result.decision is PreparedDecision.APPROVAL_REQUIRED and result.persisted else 200
         return _json_response(status, _prepare_body(result))
 
@@ -257,8 +332,15 @@ class ApprovalRequestHandler:
     def _decision_request(self, event: Mapping[str, Any]) -> DecisionRequest:
         operation_id = _operation_id(event)
         body = self._parse_json_body(event, allow_empty=True)
+        # Build the decision request from the trusted path id plus only the one
+        # optional body field the decision contract allows; any other key is an
+        # injection attempt and fails closed.
+        if not isinstance(body, dict):
+            raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid")
+        if not set(body).issubset({"expected_prepared_hash"}):
+            raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid")
         payload: dict[str, Any] = {"operation_id": operation_id}
-        if isinstance(body, dict) and "expected_prepared_hash" in body:
+        if "expected_prepared_hash" in body:
             payload["expected_prepared_hash"] = body["expected_prepared_hash"]
         return DecisionRequest.from_payload(payload)
 
@@ -272,9 +354,15 @@ class ApprovalRequestHandler:
             raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid")
         if not isinstance(raw_body, str):
             raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid")
+        if len(raw_body.encode("utf-8")) > _MAX_BODY_BYTES:
+            # Bound the raw body before parsing so a hostile payload cannot force
+            # unbounded work; every E2 request body is a few short fields.
+            raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid")
         try:
-            return json.loads(raw_body)
-        except (ValueError, TypeError) as exc:
+            # Strict I-JSON parse: reject duplicate names (last-wins ambiguity),
+            # non-finite numbers, and other non-canonical values.
+            return load_json(raw_body)
+        except (CanonicalizationError, ValueError, TypeError) as exc:
             raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid") from exc
 
     def _verified_principal(self, event: Mapping[str, Any]) -> VerifiedPrincipal:
@@ -313,21 +401,41 @@ class ApprovalRequestHandler:
             ) from exc
 
     def _emit_failure_metric(self, stage: str, error_code: ApprovalErrorCode) -> None:
-        """Emit the bounded E2 failure metric for one typed approval error."""
+        """Emit a bounded E2 failure metric only for a service-side approval error.
+
+        Caller errors (authorization denial, self-approval denial, invalid input,
+        not-found, policy-stale, a decision against an already-terminal state) and
+        expiry publish no failure metric, so a shakedown's expected 4xx outcomes
+        never page. A cancel that loses a fenced conditional race still records the
+        informational CancellationConflicts metric.
+        """
         try:
+            if stage == "cancel" and error_code == ApprovalErrorCode.STATE_CONFLICT:
+                self._metrics.record("cancellation.conflict")
+                return
+            if error_code not in _SERVICE_SIDE_APPROVAL_ERRORS:
+                return
             if stage == "prepare":
                 self._metrics.record("preparation.failed")
-            elif stage == "cancel" and error_code == ApprovalErrorCode.STATE_CONFLICT:
-                self._metrics.record("cancellation.conflict")
             elif stage in ("approve", "reject", "cancel"):
-                if error_code == ApprovalErrorCode.APPROVAL_EXPIRED:
-                    self._metrics.record("approval.expired")
-                else:
-                    self._metrics.record("approval.failed")
+                self._metrics.record("approval.failed")
         except Exception:  # noqa: BLE001 - metrics must never break a request
             pass
 
-    def _emit_prepare_failure_metric(self, stage: str) -> None:
+    def _emit_prepare_failure_metric(self, stage: str, error_code: str) -> None:
+        """Emit PreparationFailures only for a service-side prepare error."""
+        if error_code not in _SERVICE_SIDE_PREPARE_ERRORS:
+            return
+        try:
+            if stage == "prepare":
+                self._metrics.record("preparation.failed")
+            elif stage in ("approve", "reject", "cancel"):
+                self._metrics.record("approval.failed")
+        except Exception:  # noqa: BLE001 - metrics must never break a request
+            pass
+
+    def _emit_service_fault_metric(self, stage: str) -> None:
+        """Emit the service-side failure metric for a transient fault or bug."""
         try:
             if stage == "prepare":
                 self._metrics.record("preparation.failed")
@@ -370,6 +478,32 @@ def _route(event: Mapping[str, Any]) -> str:
     return raw if isinstance(raw, str) else ""
 
 
+def _route_key(event: Mapping[str, Any]) -> str:
+    """Return the API Gateway HTTP API ``routeKey`` for this invocation.
+
+    Dispatch is by the gateway's own ``routeKey`` (for example
+    ``"POST /operations/prepare"``) so a request that reached the integration on
+    an unexpected path is routed to the not-found path rather than mistaken for
+    a known route. When the gateway did not supply ``routeKey`` (an invocation
+    shaped only with ``http.path``), synthesize the equivalent key from the
+    method and path by collapsing the operation-id segment to the templated
+    ``{operationId}`` the routes declare, so the two forms dispatch identically.
+    """
+    route_key = event.get("routeKey")
+    if isinstance(route_key, str) and route_key:
+        return route_key
+    method = _method(event)
+    path = _route(event)
+    if not method or not path:
+        return ""
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) == 3 and segments[0] == "operations" and segments[2] in ("approve", "reject", "cancel"):
+        return f"{method} /operations/{{operationId}}/{segments[2]}"
+    if len(segments) == 2 and segments[0] == "operations" and segments[1] != "prepare":
+        return f"{method} /operations/{{operationId}}"
+    return f"{method} /{'/'.join(segments)}"
+
+
 def _operation_id(event: Mapping[str, Any]) -> str:
     params = event.get("pathParameters")
     operation_id = params.get("operationId") if isinstance(params, Mapping) else None
@@ -401,7 +535,9 @@ def _request_id(event: Mapping[str, Any]) -> str:
         safe = "".join(ch for ch in candidate if ch.isalnum() or ch in "._:-")
         if len(safe) >= 3:
             return f"apigw.{safe}"[:128]
-    return "apigw.operations-request"
+    # No usable gateway request id: use a random per-invocation id so two such
+    # requests never share a correlation/request identifier.
+    return f"apigw.{secrets.token_hex(16)}"
 
 
 def _expiry(value: object) -> datetime | None:

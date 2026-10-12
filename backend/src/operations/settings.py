@@ -218,8 +218,8 @@ class OperationsSettings:
             raise ValueError(f"GBAW_OPERATIONS_MODE must be one of {OPERATIONS_MODES}")
         if not self.observer_groups:
             raise ValueError("observer_groups must list at least one group")
-        if not isinstance(self.approver_group, str) or not self.approver_group.strip():
-            raise ValueError("approver_group must be a non-empty string")
+        if not isinstance(self.approver_group, str) or not _GROUP_NAME_PATTERN.fullmatch(self.approver_group):
+            raise ValueError("approver_group must be a valid group token")
         self._validate_capacity_bounds()
 
     def _validate_capacity_bounds(self) -> None:

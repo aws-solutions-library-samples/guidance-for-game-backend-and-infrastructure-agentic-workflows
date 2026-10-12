@@ -51,6 +51,7 @@ class FakeApprovalStore:
         operation_id: str,
         expected_prepared_operation_hash: str,
         expected_state: str,
+        expected_sequence: int = 0,
         commit_not_after: datetime,
         approval,
     ) -> object:
@@ -59,6 +60,7 @@ class FakeApprovalStore:
                 "operation_id": operation_id,
                 "expected_prepared_operation_hash": expected_prepared_operation_hash,
                 "expected_state": expected_state,
+                "expected_sequence": expected_sequence,
                 "commit_not_after": commit_not_after,
                 "approval": deepcopy(dict(approval)),
             }
@@ -190,6 +192,7 @@ def test_runtime_records_authenticated_approver_against_exact_stored_hash() -> N
             "operation_id": OPERATION_ID,
             "expected_prepared_operation_hash": expected_hash,
             "expected_state": "pending_approval",
+            "expected_sequence": 0,
             "commit_not_after": datetime(2026, 8, 13, 20, 35, tzinfo=timezone.utc),
             "approval": approval,
         }

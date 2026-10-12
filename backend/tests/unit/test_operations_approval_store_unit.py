@@ -442,6 +442,166 @@ def test_record_granted_approval_precondition_failed_on_state_race() -> None:
 # -- Terminal decision commit -------------------------------------------
 
 
+def test_load_returns_the_snapshot_sequence() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+
+    stored = store.load_for_approval(OPERATION_ID)
+
+    assert stored is not None
+    assert stored.sequence == 0
+
+
+def test_approved_operation_can_still_be_cancelled() -> None:
+    # A grant advances the snapshot to sequence 1; a later cancel must fence on
+    # that sequence and commit sequence 2, so an approved operation can still be
+    # withdrawn before dispatch.
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+    store.record_granted_approval(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        expected_sequence=0,
+        commit_not_after=NOW + timedelta(minutes=5),
+        approval=_approval(),
+    )
+    approved = store.load_for_decision(OPERATION_ID)
+    assert approved.state == "approved"
+
+    outcome = store.record_terminal_decision(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="approved",
+        expected_sequence=approved.sequence,
+        new_state="cancelled",
+        commit_not_after=NOW + timedelta(minutes=5),
+        state_change=_state_change("cancelled", "CANCELLED"),
+        ledger_event=_ledger_event("operation.state-changed"),
+        approval=None,
+    )
+
+    assert outcome is DecisionCommitOutcome.RECORDED
+    assert store.load_for_decision(OPERATION_ID).state == "cancelled"
+
+
+def test_approved_operation_can_still_be_expired() -> None:
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+    store.record_granted_approval(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        expected_sequence=0,
+        commit_not_after=NOW + timedelta(minutes=5),
+        approval=_approval(),
+    )
+    approved = store.load_for_decision(OPERATION_ID)
+
+    outcome = store.record_terminal_decision(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="approved",
+        expected_sequence=approved.sequence,
+        new_state="expired",
+        commit_not_after=NOW + timedelta(minutes=5),
+        state_change=_state_change("expired", "EXPIRED"),
+        ledger_event=_ledger_event("operation.state-changed"),
+        approval=None,
+    )
+
+    assert outcome is DecisionCommitOutcome.RECORDED
+    assert store.load_for_decision(OPERATION_ID).state == "expired"
+    # The terminal transition appends at the next physical ledger index.
+    evidence = store.load_operation_evidence(OPERATION_ID)
+    assert [e["sequence"] for e in evidence.ledger] == [0, 1, 2]
+
+
+def test_commit_fails_closed_when_one_call_limit_would_not_fit() -> None:
+    # The deadline guard uses the per-call limit, not just "deadline already
+    # past": a commit does not start when fewer than one call limit remains, so
+    # a transaction can never land after the request deadline.
+    client = StatefulDynamoClient()
+    # Deadline is 2s away but one store sub-call costs the default 4.5s, so the
+    # guard refuses to start the transaction.
+    store = DynamoDbApprovalStore(client=client, table_name=TABLE, clock=lambda: NOW, call_limit_s=4.5)
+    _persist(DynamoDbApprovalStore(client=client, table_name=TABLE, clock=lambda: NOW - timedelta(hours=1)))
+    transactions_before = len(client.transactions)
+
+    outcome = store.record_terminal_decision(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        new_state="cancelled",
+        commit_not_after=NOW + timedelta(seconds=2),
+        state_change=_state_change("cancelled", "CANCELLED"),
+        ledger_event=_ledger_event("operation.state-changed"),
+        approval=None,
+    )
+
+    assert outcome is DecisionCommitOutcome.DEADLINE_EXPIRED
+    # No new transaction was issued: the guard fired before starting the commit.
+    assert len(client.transactions) == transactions_before
+
+
+def test_ledger_contract_sequence_is_strictly_increasing_per_operation() -> None:
+    # The stored ledger-event contract ``sequence`` is physical index + 1 and
+    # strictly increasing: creation carries 1, the terminal transition carries 2.
+    # Standard library
+    import json as _json
+
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+    store.record_terminal_decision(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        new_state="cancelled",
+        commit_not_after=NOW + timedelta(minutes=5),
+        state_change=_state_change("cancelled", "CANCELLED"),
+        ledger_event=_ledger_event("operation.state-changed"),
+        approval=None,
+    )
+
+    sequences = []
+    for physical in (0, 1):
+        item = client.items[(f"OP#{OPERATION_ID}", f"LEDGER#{physical}")]
+        event = _json.loads(item["ledger_json"]["S"])
+        sequences.append(event["sequence"])
+    assert sequences == [1, 2]
+    assert sequences == sorted(set(sequences))
+
+
+def test_commit_condition_fences_on_prepared_hash_and_sequence() -> None:
+    # The terminal commit's ConditionExpression must fence on BOTH the stored
+    # prepared_hash and the expected sequence, so a mutation that drops either
+    # clause is caught by this assertion rather than passing silently.
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _persist(store)
+    store.record_terminal_decision(
+        operation_id=OPERATION_ID,
+        expected_prepared_operation_hash=_hash(),
+        expected_state="pending_approval",
+        new_state="cancelled",
+        commit_not_after=NOW + timedelta(minutes=5),
+        state_change=_state_change("cancelled", "CANCELLED"),
+        ledger_event=_ledger_event("operation.state-changed"),
+        approval=None,
+    )
+    # The second transaction is the terminal commit (the first is the persist).
+    terminal = client.transactions[-1]
+    update = next(entry["Update"] for entry in terminal if "Update" in entry)
+    condition = update["ConditionExpression"]
+    assert "prepared_hash = :hash" in condition
+    assert "#seq = :prev_seq" in condition
+    assert "#s = :expected" in condition
+
+
 def test_record_terminal_decision_cancels_and_appends_ledger() -> None:
     client = StatefulDynamoClient()
     store = _store(client)

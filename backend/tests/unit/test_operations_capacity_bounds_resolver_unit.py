@@ -123,6 +123,36 @@ def test_not_enrolled_when_no_fresh_observation() -> None:
     assert bounds.target_enrolled is False
 
 
+def test_resolved_policy_version_binds_the_server_owned_limits() -> None:
+    # The resolved policy_version must change when any limit changes, so that a
+    # pending operation prepared under one band fails the approval policy's
+    # version match (POLICY_STALE) after an owner narrows the band.
+    def _with_limits(floor: int, ceiling: int, max_step: int) -> str:
+        resolver = DeploymentCapacityBoundsResolver(
+            state_port=_state_port(_succeeded()),
+            floor=floor,
+            ceiling=ceiling,
+            max_step=max_step,
+            enrollment_id="enrollment.gamelift.capacity",
+            enrollment_version="1",
+            policy_id="policy.gamelift.capacity",
+            policy_version="1",
+        )
+        bounds = resolver.resolve_bounds(requester=_principal(), fleet_id=FLEET, location=LOCATION)
+        return bounds.policy_version
+
+    baseline = _with_limits(0, 100, 25)
+    narrowed_ceiling = _with_limits(0, 50, 25)
+    smaller_step = _with_limits(0, 100, 10)
+    raised_floor = _with_limits(5, 100, 25)
+
+    assert baseline.startswith("1")
+    assert len({baseline, narrowed_ceiling, smaller_step, raised_floor}) == 4
+    # Deterministic: identical limits yield an identical version.
+    assert baseline == _with_limits(0, 100, 25)
+    assert len(baseline) <= 128
+
+
 def test_invalid_deployment_config_fails_closed() -> None:
     with pytest.raises(ValueError):
         DeploymentCapacityBoundsResolver(

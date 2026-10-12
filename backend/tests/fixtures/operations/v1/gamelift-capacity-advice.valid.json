@@ -49,7 +49,7 @@
     "level": "moderate",
     "score": 30,
     "factors": [
-      "desired-magnitude",
+      "capacity-magnitude",
       "scale-up"
     ]
   },

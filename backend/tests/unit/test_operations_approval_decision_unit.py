@@ -24,11 +24,13 @@ from operations.approval import (
     ApprovalBoundaryError,
     ApprovalErrorCode,
     ApprovalPolicy,
+    StoredPreparedOperation,
+)
+from operations.decisions import (
     DecisionCommitOutcome,
     DecisionRequest,
     DecisionRequestContext,
     LifecycleDecisionService,
-    StoredPreparedOperation,
 )
 from operations.contracts import load_json
 from operations.contracts.capacity import capacity_prepared_hash
@@ -57,6 +59,7 @@ class FakeDecisionStore:
         operation_id: str,
         expected_prepared_operation_hash: str,
         expected_state: str,
+        expected_sequence: int = 0,
         new_state: str,
         commit_not_after: datetime,
         state_change: Any,
@@ -68,6 +71,7 @@ class FakeDecisionStore:
                 "operation_id": operation_id,
                 "expected_prepared_operation_hash": expected_prepared_operation_hash,
                 "expected_state": expected_state,
+                "expected_sequence": expected_sequence,
                 "new_state": new_state,
                 "commit_not_after": commit_not_after,
                 "state_change": deepcopy(dict(state_change)),
