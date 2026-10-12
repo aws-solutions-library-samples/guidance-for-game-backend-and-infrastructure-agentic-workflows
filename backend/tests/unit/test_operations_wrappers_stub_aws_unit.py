@@ -19,6 +19,9 @@ import subprocess
 # Third-party packages
 import pytest
 
+# Local modules
+from _cfn_yaml import load_cfn_template
+
 pytestmark = pytest.mark.unit
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[3]
@@ -86,6 +89,11 @@ case "$svc $sub" in
       *"ParameterKey=='CapacityCeiling'"*)          echo "${STUB_AWS_CUR_CAP_CEILING:-None}" ;;
       *"ParameterKey=='CapacityMaxStep'"*)          echo "${STUB_AWS_CUR_CAP_STEP:-None}" ;;
       *ParameterKey*)
+        if [ -n "${STUB_AWS_DEPLOYED_KEYS:-}" ]; then
+          # An explicit deployed key set (tab-separated, as the real CLI prints).
+          printf '%s\n' "$STUB_AWS_DEPLOYED_KEYS"
+          exit 0
+        fi
         # An OLDER deployed stack: a reduced key set that predates the newer
         # template parameters (no LambdaTimeoutSeconds/ObserverGroups/etc.).
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -503,9 +511,11 @@ def test_enable_existing_stack_omits_bindings_when_unchanged(tmp_path):
     assert "ParameterKey=OperationsMode,ParameterValue=observe" in create_line
     # An existing stack creates the change set with type UPDATE.
     assert "UPDATE" in create_line.split("\t")
-    # Unchanged bindings are not resent.
-    assert "ParameterKey=TenantId" not in create_line
-    assert "ParameterKey=Environment" not in create_line
+    # Unchanged bindings are never resent with a value; a deployed binding is
+    # reused as-is.
+    assert "ParameterKey=TenantId,ParameterValue=" not in create_line
+    assert "ParameterKey=Environment,ParameterValue=" not in create_line
+    assert "ParameterKey=Environment,UsePreviousValue=true" in create_line.split("\t")
 
 
 # --------------------------------------------------------------------------- #
@@ -812,4 +822,70 @@ def test_enable_refuses_an_over_limit_template_without_any_upload(tmp_path):
     assert result.returncode == 3, f"an over-limit template must exit 3.\n{result.stdout}\n{result.stderr}"
     subs = _subcommands(calls)
     assert "s3api put-object" not in subs, "no object may be uploaded for an over-limit template"
+    assert "cloudformation create-change-set" not in subs
+
+
+def _template_parameter_keys():
+    template = PROJECT_ROOT / "infrastructure" / "cloudformation" / "06-operations-observation.yaml"
+    return list(load_cfn_template(template.read_text(encoding="utf-8"))["Parameters"])
+
+
+def _change_set_parameters(create_line):
+    """Return the ``ParameterKey=...`` entries sent to create-change-set."""
+    return [part for part in create_line.split("\t") if part.startswith("ParameterKey=")]
+
+
+def test_reenable_reuses_every_deployed_parameter_it_does_not_override(tmp_path):
+    # create-change-set does not carry an existing stack's values forward: an
+    # omitted key falls back to the template default, and a required binding
+    # with no default (TenantId/WorkspaceId) fails the template Rules, so the
+    # update rolls back. A re-enable must therefore send every deployed key the
+    # template still declares and this run does not override as
+    # UsePreviousValue, and must not send a deployed key the template retired.
+    template_keys = _template_parameter_keys()
+    deployed_keys = [*template_keys, "RetiredParameter"]
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        "STUB_AWS_DEPLOYED_KEYS": "\t".join(deployed_keys),
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    create_line = next(line for line in calls if "create-change-set" in line)
+    sent = _change_set_parameters(create_line)
+    sent_keys = [entry.split(",", 1)[0].removeprefix("ParameterKey=") for entry in sent]
+
+    assert len(sent_keys) == len(set(sent_keys)), f"a key was sent twice: {sent_keys}"
+    assert set(sent_keys) == set(template_keys), "every template key must be either overridden or reused"
+    assert "RetiredParameter" not in sent_keys
+    for binding in ("Environment", "TenantId", "WorkspaceId", "TrustedAudience"):
+        assert f"ParameterKey={binding},UsePreviousValue=true" in sent
+    for always_sent in ("Provisioned", "OperationsMode", "CodeS3Key"):
+        assert any(entry.startswith(f"ParameterKey={always_sent},ParameterValue=") for entry in sent)
+
+
+def test_create_sends_no_use_previous_value(tmp_path):
+    # A fresh stack has no previous values to reuse.
+    result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_NO_STACK": "1"})
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    create_line = next(line for line in calls if "create-change-set" in line)
+    assert "UsePreviousValue" not in create_line
+
+
+def test_reenable_refuses_before_any_upload_when_deployed_keys_are_unreadable(tmp_path):
+    # Without the deployed key list the update cannot reuse the bindings, so the
+    # wrapper refuses before building or uploading anything.
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        "STUB_AWS_DEPLOYED_KEYS": "None",
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 4, f"{result.stdout}\n{result.stderr}"
+    subs = _subcommands(calls)
+    assert "s3api put-object" not in subs
     assert "cloudformation create-change-set" not in subs

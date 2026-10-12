@@ -557,6 +557,21 @@ if [ "$ACTION" = "enable" ]; then
             echo "   Pass --allow-binding-change to proceed intentionally." >&2
             exit 9
         fi
+        # The update change set must reuse every deployed value this run does not
+        # override (see the change-set parameter list below), so read the deployed
+        # keys now and fail closed before anything is built or uploaded.
+        DEPLOYED_PARAM_KEYS="$(aws cloudformation describe-stacks \
+            "${AWS_PROFILE_ARGS[@]}" \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query "Stacks[0].Parameters[].ParameterKey" \
+            --output text 2>/dev/null || true)"
+        if [ -z "$DEPLOYED_PARAM_KEYS" ] || [ "$DEPLOYED_PARAM_KEYS" = "None" ]; then
+            echo "❌ Could not read the deployed stack's parameter keys; refusing to update" >&2
+            echo "   without them, because an omitted key would fall back to its template" >&2
+            echo "   default instead of keeping the deployed value." >&2
+            exit 4
+        fi
     fi
 fi
 
@@ -1180,11 +1195,32 @@ DEPLOY_TEMPLATE_URL="https://${CODE_S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${
 # create-change-set takes --parameters ParameterKey=K,ParameterValue=V, not the
 # deploy convenience --parameter-overrides K=V, so translate the override list.
 CHANGE_SET_PARAMETERS=()
+CHANGE_SET_OVERRIDDEN_KEYS=" "
 for _override in "${PARAM_OVERRIDES[@]}"; do
     _k="${_override%%=*}"
     _v="${_override#*=}"
     CHANGE_SET_PARAMETERS+=("ParameterKey=${_k},ParameterValue=${_v}")
+    CHANGE_SET_OVERRIDDEN_KEYS="${CHANGE_SET_OVERRIDDEN_KEYS}${_k} "
 done
+
+# Unlike `cloudformation deploy`, an UPDATE change set does not carry the stack's
+# current values forward: an omitted key falls back to its template default, and
+# a required binding with no default (TenantId, WorkspaceId) fails the template
+# Rules, so the update rolls back. Reuse every deployed key that this run does
+# not override and that the template still declares (a key the template no
+# longer declares cannot be sent).
+if [ "$STACK_EXISTS" = "true" ]; then
+    TEMPLATE_PARAM_KEYS=" $(awk '
+        /^Parameters:[[:space:]]*$/ { in_params = 1; next }
+        in_params && /^[^[:space:]#]/ { exit }
+        in_params && /^  [A-Za-z0-9]+:[[:space:]]*$/ { key = $1; sub(/:$/, "", key); printf "%s ", key }
+    ' "$TEMPLATE")"
+    for _key in $DEPLOYED_PARAM_KEYS; do
+        case "$CHANGE_SET_OVERRIDDEN_KEYS" in *" ${_key} "*) continue ;; esac
+        case "$TEMPLATE_PARAM_KEYS" in *" ${_key} "*) ;; *) continue ;; esac
+        CHANGE_SET_PARAMETERS+=("ParameterKey=${_key},UsePreviousValue=true")
+    done
+fi
 
 if [ "$STACK_EXISTS" = "true" ]; then
     CHANGE_SET_TYPE="UPDATE"
