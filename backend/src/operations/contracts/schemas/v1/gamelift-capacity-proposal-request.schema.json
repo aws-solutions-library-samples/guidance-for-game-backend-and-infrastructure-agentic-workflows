@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:operations:contracts:v1:gamelift-capacity-proposal-request",
+  "title": "GameLift Capacity Adjustment Proposal Request 1.0",
+  "$comment": "Additive untrusted E2 input for the gamelift.capacity-adjustment/1.0 capability. It reuses the immutable common $defs but is not part of the published source-control write-contract schema set bound by the source-control playbook, so it never alters an existing v1 write contract or its playbook hash. It carries only bounded capacity intent and an idempotency token: no identity, correlation, policy, enrollment, risk, executor, credential, approval, deployment mode, playbook, or trusted current-state field. additionalProperties is false everywhere, so injecting any such field fails validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "request_contract_version",
+    "capability_id",
+    "idempotency_token",
+    "proposal"
+  ],
+  "properties": {
+    "request_contract_version": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/contract_version"
+    },
+    "capability_id": {
+      "const": "gamelift.capacity-adjustment"
+    },
+    "idempotency_token": {
+      "$ref": "urn:game-agent:operations:contracts:v1:common#/$defs/idempotency_token"
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fleet_id",
+        "location",
+        "requested"
+      ],
+      "properties": {
+        "fleet_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^fleet-[a-f0-9-]{1,120}$"
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "requested": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "desired",
+            "minimum",
+            "maximum"
+          ],
+          "properties": {
+            "desired": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "minimum": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            },
+            "maximum": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000
+            }
+          }
+        }
+      }
+    }
+  }
+}
