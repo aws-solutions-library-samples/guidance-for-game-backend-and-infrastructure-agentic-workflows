@@ -270,7 +270,7 @@ def _prepare(router: Any, *, anchor: datetime) -> dict[str, Any]:
         _event(
             "POST",
             "/operations/prepare",
-            claims=_claims("user.requester", anchor=anchor),
+            claims=_claims("user.requester", anchor=anchor, groups="users"),
             body=_prepare_body(),
         )
     )
@@ -371,7 +371,7 @@ def test_bootstrap_cancel_transitions_terminally_then_conflicts(monkeypatch: pyt
         _event(
             "POST",
             f"/operations/{op_id}/cancel",
-            claims=_claims("user.requester", anchor=anchor),
+            claims=_claims("user.requester", anchor=anchor, groups="users"),
             body={},
             op_id=op_id,
         )
@@ -381,7 +381,7 @@ def test_bootstrap_cancel_transitions_terminally_then_conflicts(monkeypatch: pyt
         _event(
             "POST",
             f"/operations/{op_id}/cancel",
-            claims=_claims("user.requester", anchor=anchor),
+            claims=_claims("user.requester", anchor=anchor, groups="users"),
             body={},
             op_id=op_id,
         )

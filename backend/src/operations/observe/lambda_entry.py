@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -216,6 +216,7 @@ def _build_approval_handler(
     from operations.contracts.capacity import (
         ACTION,
         PROFILE,
+        capacity_policy_version,
         capacity_prepared_hash,
         validate_capacity_approval_binding,
         validate_capacity_prepared_operation,
@@ -236,6 +237,15 @@ def _build_approval_handler(
     ops = settings.operations
     approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=settings.table_name)
     approval_metrics = CloudWatchApprovalMetrics(client=cloudwatch_client, namespace=settings.metric_namespace)
+
+    # The policy version binds the server-owned capacity limits, so narrowing or
+    # widening the band after an operation is prepared surfaces as POLICY_STALE
+    # at approval. The bounds resolver and the approval policy MUST derive the
+    # same value from the same limits.
+    bound_policy_version = capacity_policy_version(
+        _POLICY_VERSION,
+        {"floor": ops.capacity_floor, "ceiling": ops.capacity_ceiling, "max_step": ops.capacity_max_step},
+    )
 
     def _advice_service_factory(observation_id: str) -> AdviceService:
         state_port = E1ObservationCapacityStatePort(status_loader=observation_store, observation_id=observation_id)
@@ -291,9 +301,10 @@ def _build_approval_handler(
     low_risk_actions = frozenset({ACTION}) if ops.low_risk_self_approval_enabled else frozenset()
     policy = ApprovalPolicy(
         policy_id=_POLICY_ID,
-        policy_version=_POLICY_VERSION,
+        policy_version=bound_policy_version,
         approver_groups=frozenset({ops.approver_group}),
         low_risk_self_approval_actions=low_risk_actions,
+        approval_ttl=timedelta(seconds=ops.approval_expiry_s),
     )
     # Inject the capacity-specific validator, hasher, and binding so the
     # deployable ApprovalService validates and hashes the stored capacity
@@ -323,6 +334,7 @@ def _build_approval_handler(
         tenant_id=settings.tenant_id,
         workspace_id=settings.workspace_id,
         trusted_audience=settings.trusted_audience,
+        requester_groups=ops.observer_groups,
         metrics=approval_metrics,
     )
 
