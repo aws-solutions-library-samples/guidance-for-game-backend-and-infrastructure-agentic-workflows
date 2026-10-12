@@ -3,7 +3,9 @@ import { defineConfig, devices } from '@playwright/test';
 export default defineConfig({
   testDir: './tests',
   // Authenticated live tests have their own config and explicit credentials.
-  testIgnore: ['live-shakedown.spec.ts'],
+  // Cloudscape-shell specs run under playwright.cloudscape.config.ts against a
+  // production build with the shell selector set, so they are excluded here.
+  testIgnore: ['live-shakedown.spec.ts', '**/*.cloudscape.spec.ts'],
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,

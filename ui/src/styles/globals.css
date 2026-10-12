@@ -134,9 +134,18 @@
   --ga-chart-8: #8a6d00;
 }
 
-/* Reset and base styles */
-html,
-body {
+/* Reset and base styles.
+
+   Every element-level and universal rule below is scoped to the current shell
+   with :where([data-ga-shell="current"]) so it never reaches a page rendered in
+   another shell. :where() keeps specificity at (0,0,0), so each rule retains the
+   specificity it would have unscoped and nothing changes about which rule wins
+   on the current UI. The Cloudscape shell sets data-ga-shell="cloudscape", so
+   these resets never match it and it keeps its own normalize.css reset. The
+   prefers-reduced-motion safeguard below is deliberately left unscoped because
+   it is an accessibility protection that must apply to both shells. */
+:where([data-ga-shell='current']) html,
+:where([data-ga-shell='current']) body {
   padding: 0;
   margin: 0;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -147,23 +156,23 @@ body {
   color: var(--ga-text);
 }
 
-a {
+:where([data-ga-shell='current']) a {
   color: inherit;
   text-decoration: none;
 }
 
-* {
+:where([data-ga-shell='current']) * {
   box-sizing: border-box;
 }
 
 /* Ensure full height layout */
-#__next {
+:where([data-ga-shell='current']) #__next {
   height: 100vh;
   overflow: hidden;
 }
 
 /* Remove default button styles */
-button {
+:where([data-ga-shell='current']) button {
   border: none;
   background: none;
   cursor: pointer;
@@ -171,14 +180,14 @@ button {
 }
 
 /* Improve text rendering */
-body {
+:where([data-ga-shell='current']) body {
   text-rendering: optimizeLegibility;
   -webkit-text-size-adjust: 100%;
   -ms-text-size-adjust: 100%;
 }
 
 /* Hide scrollbars on body to prevent double scrollbars */
-body {
+:where([data-ga-shell='current']) body {
   overflow: hidden;
 }
 
@@ -189,17 +198,17 @@ body {
 }
 
 /* Selection styling */
-::selection {
+:where([data-ga-shell='current']) ::selection {
   background: rgba(139, 69, 255, 0.3);
   color: var(--ga-text);
 }
 
 /* Focus states */
-*:focus {
+:where([data-ga-shell='current']) *:focus {
   outline: none;
 }
 
-*:focus-visible {
+:where([data-ga-shell='current']) *:focus-visible {
   outline: 2px solid var(--ga-accent);
   outline-offset: 2px;
 }

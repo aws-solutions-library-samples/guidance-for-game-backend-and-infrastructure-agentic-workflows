@@ -1,0 +1,11 @@
+{
+  "description": "Recorded gzip-6 first-load baselines for current-UI pages, measured from a clean current-UI build (pages[route] UNION pages['/_app'], .js files, divided by 1024). Used by measure-bundles.mjs to enforce the +2 KiB per-page ceiling. CSS first-load for current-UI pages is 10.6 KiB.",
+  "unit": "KiB (1024 bytes), gzip level 6",
+  "pages": {
+    "/": { "jsFirstLoadKiB": 822.6, "cssFirstLoadKiB": 10.6 },
+    "/admin/users": { "jsFirstLoadKiB": 159.0, "cssFirstLoadKiB": 10.6 }
+  },
+  "shared": {
+    "/_app": { "jsFirstLoadKiB": 140.0 }
+  }
+}

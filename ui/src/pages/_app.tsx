@@ -52,6 +52,12 @@ function isProtectedApiRequest(input: RequestInfo | URL): boolean {
 }
 
 function MyApp({ Component, pageProps }: AppProps) {
+  // `_app` hosts both shells. It renders the active page (`Component`) as the
+  // per-shell presentation and never imports Cloudscape chrome or global styles,
+  // so the current UI's shared bundle stays free of Cloudscape code; the
+  // Cloudscape shell brings its own layout and global styles through its page
+  // entry (see `pages/shell-cloudscape.tsx`). The session, token refresh, and
+  // idle timer below are reused unchanged across both shells.
   const [authMode, setAuthMode] = useState<'loading' | 'skip' | 'cognito'>('loading');
   const [config, setConfig] = useState<Config | null>(null);
   const [user, setUser] = useState<CognitoUser | null>(null);

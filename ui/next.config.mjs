@@ -9,11 +9,19 @@ const nextConfig = {
   // Note: instrumentation.ts (OpenTelemetry/ADOT) auto-loads in Next 16;
   // the former experimental.instrumentationHook flag was removed upstream.
 
-  // Transpile CopilotKit packages (required for proper bundling)
+  // Transpile CopilotKit packages (required for proper bundling).
+  // Cloudscape publishes ESM with per-component entry points that Next must
+  // transpile; its Next.js guidance lists components, chat-components, and
+  // component-toolkit. These packages are imported only from the Cloudscape
+  // shell entry module, so listing them here does not pull Cloudscape code into
+  // the current UI's chunks.
   transpilePackages: [
     '@copilotkit/react-core',
     '@copilotkit/react-ui',
-    '@copilotkit/react-textarea'
+    '@copilotkit/react-textarea',
+    '@cloudscape-design/components',
+    '@cloudscape-design/chat-components',
+    '@cloudscape-design/component-toolkit'
   ],
 
   // Strict type checking (DO NOT disable in production)
