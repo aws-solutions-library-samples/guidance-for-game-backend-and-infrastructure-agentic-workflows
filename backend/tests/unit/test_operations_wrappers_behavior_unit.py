@@ -9,6 +9,7 @@ that the scripts parse under ``bash -n``.
 # Standard library
 import os
 import pathlib
+import re
 import subprocess
 
 # Third-party packages
@@ -236,3 +237,213 @@ def test_disable_help_describes_data_preserving_no_rebuild():
     combined = result.stdout + result.stderr
     assert "data-preserving" in combined.lower()
     assert "does not rebuild" in combined.lower() or "rebuild" in combined.lower()
+
+
+# --------------------------------------------------------------------------- #
+# E2 (issue #414) advise-mode wrapper behavior: explicit --mode with a MATCHING
+# GBAW_OPERATIONS_MODE double opt-in. These run only the refusal paths, which
+# exit before any aws call, so they never touch AWS.
+# --------------------------------------------------------------------------- #
+def test_deploy_enable_advise_without_matching_mode_env_refuses():
+    """--mode advise requires GBAW_OPERATIONS_MODE=advise to match; a mismatched
+    (or observe) env value is refused so an enable never silently escalates."""
+    result = _run(DEPLOY, "--enable", "--mode", "advise", env_extra={"GBAW_OPERATIONS_MODE": "observe"})
+    assert result.returncode == 3
+    assert "Refusing to enable" in result.stdout + result.stderr
+
+
+def test_deploy_enable_observe_with_advise_env_refuses():
+    """The reverse mismatch (--mode observe, env advise) is equally refused."""
+    result = _run(DEPLOY, "--enable", "--mode", "observe", env_extra={"GBAW_OPERATIONS_MODE": "advise"})
+    assert result.returncode == 3
+
+
+def test_deploy_enable_invalid_mode_refuses():
+    """--mode must be observe or advise; any other value fails closed."""
+    result = _run(DEPLOY, "--enable", "--mode", "operate", env_extra={"GBAW_OPERATIONS_MODE": "operate"})
+    assert result.returncode == 3
+    assert "observe or advise" in (result.stdout + result.stderr)
+
+
+def test_deploy_enable_advise_matching_mode_reaches_input_validation():
+    """With --mode advise and a MATCHING GBAW_OPERATIONS_MODE=advise, the mode
+    double opt-in passes and the wrapper proceeds to the enabling-input checks
+    (Cognito/tenant), still refusing (no creds/inputs) before any aws call."""
+    result = _run(DEPLOY, "--enable", "--mode", "advise", env_extra={"GBAW_OPERATIONS_MODE": "advise"})
+    assert result.returncode == 3
+    combined = (result.stdout + result.stderr).upper()
+    # It got past the mode gate: the failure is now the missing Cognito input.
+    assert "COGNITO" in combined
+
+
+def test_deploy_enable_passes_e2_settings_in_overrides():
+    """The enable PARAM_OVERRIDES must pass the three E2 settings so the
+    advise-mode runtime posture is applied."""
+    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
+    enable = _DEPLOY_TEXT[idx:]
+    assert '"LowRiskSelfApproval=${LOW_RISK_SELF_APPROVAL}"' in enable
+    assert '"PreparationExpirySeconds=${PREPARATION_EXPIRY_SECONDS}"' in enable
+    assert '"ApprovalExpirySeconds=${APPROVAL_EXPIRY_SECONDS}"' in enable
+
+
+def test_disable_reuses_e2_settings_unchanged():
+    """An emergency disable reuses the three E2 settings so a disabled-but-
+    provisioned advise stack keeps its posture on re-enable. The disable path
+    reuses every deployed parameter key (except the two safety levers) via a
+    UsePreviousValue loop over the deployed stack's own keys, so the E2 settings
+    are carried unchanged without a hard-coded reuse list."""
+    branch = _disable_branch()
+    # The two safety levers are overridden; everything else is reused.
+    assert '"ParameterKey=OperationsMode,ParameterValue=disabled"' in branch
+    assert "UsePreviousValue=true" in branch
+    assert "describe-stacks" in branch
+    # The loop reuses every non-override key, so the E2 keys are not special-cased
+    # out of the reuse set.
+    for key in ("LowRiskSelfApproval", "PreparationExpirySeconds", "ApprovalExpirySeconds"):
+        assert f"{key}) :" not in branch, f"{key} must not be excluded from the reuse loop"
+
+
+def test_disable_help_describes_data_preserving_no_rebuild_e2():
+    result = _run(DEPLOY, "--help")
+    assert result.returncode == 0
+    combined = result.stdout + result.stderr
+    assert "advise" in combined.lower()
+
+
+# --------------------------------------------------------------------------- #
+# E2 (issue #414) server-owned CAPACITY POLICY wrapper behavior.
+#
+# The three capacity-policy settings are server-owned and injected as frozen
+# core env names. The wrapper accepts EXPLICIT bounded overrides ONLY from
+# dedicated environment variables (never from a request body), passes them on
+# enable, and reuses the stack's existing values via UsePreviousValue on an
+# emergency disable. Safe defaults (0/1/1) cap a fresh enable at one instance.
+# --------------------------------------------------------------------------- #
+def test_deploy_capacity_defaults_are_safe_zero_one_one():
+    """The wrapper's capacity defaults match the template safe defaults (0/1/1)
+    so a fresh enable with no override never scales past one instance."""
+    assert re.search(r'CAPACITY_FLOOR="\$\{GBAW_OPERATIONS_CAPACITY_FLOOR:-0\}"', _DEPLOY_TEXT)
+    assert re.search(r'CAPACITY_CEILING="\$\{GBAW_OPERATIONS_CAPACITY_CEILING:-1\}"', _DEPLOY_TEXT)
+    assert re.search(r'CAPACITY_MAX_STEP="\$\{GBAW_OPERATIONS_CAPACITY_MAX_STEP:-1\}"', _DEPLOY_TEXT)
+
+
+def test_deploy_capacity_overrides_come_from_env_not_request_body():
+    """The bounded overrides are read from explicit environment variables. The
+    wrapper never parses a request body / JSON payload for capacity values."""
+    for env_name in (
+        "GBAW_OPERATIONS_CAPACITY_FLOOR",
+        "GBAW_OPERATIONS_CAPACITY_CEILING",
+        "GBAW_OPERATIONS_CAPACITY_MAX_STEP",
+    ):
+        assert env_name in _DEPLOY_TEXT, f"{env_name} must be an accepted explicit override"
+    for forbidden in ("request_body", "REQUEST_BODY", "jq ", "--data", "request.json"):
+        assert forbidden not in _DEPLOY_TEXT, f"capacity overrides must not come from {forbidden}"
+
+
+def test_deploy_enable_passes_capacity_settings_in_overrides():
+    """The enable PARAM_OVERRIDES must pass all three capacity settings so the
+    server-owned bound is applied."""
+    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
+    enable = _DEPLOY_TEXT[idx:]
+    assert '"CapacityFloor=${CAPACITY_FLOOR}"' in enable
+    assert '"CapacityCeiling=${CAPACITY_CEILING}"' in enable
+    assert '"CapacityMaxStep=${CAPACITY_MAX_STEP}"' in enable
+
+
+def test_disable_reuses_capacity_settings_unchanged():
+    """An emergency disable reuses all three capacity settings so a disabled-but-
+    provisioned advise stack keeps its bound on re-enable. The disable path
+    reuses every deployed key via a UsePreviousValue loop, so the capacity keys
+    are carried unchanged without a hard-coded reuse list."""
+    branch = _disable_branch()
+    assert "UsePreviousValue=true" in branch
+    assert "describe-stacks" in branch
+    for key in ("CapacityFloor", "CapacityCeiling", "CapacityMaxStep"):
+        assert f"{key}) :" not in branch, f"{key} must not be excluded from the reuse loop"
+
+
+def test_deploy_enable_incoherent_capacity_floor_above_ceiling_refuses():
+    """An explicit override with floor > ceiling is refused before any AWS call.
+    The wrapper enforces the FULL numeric coherent bound the template Rules
+    cannot express with equality-only functions."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_FLOOR": "5",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "3",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined
+
+
+def test_deploy_enable_incoherent_capacity_max_step_too_large_refuses():
+    """max_step larger than (ceiling - floor) is refused before any AWS call."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_FLOOR": "0",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "2",
+            "GBAW_OPERATIONS_CAPACITY_MAX_STEP": "5",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined
+
+
+def test_deploy_enable_zero_max_step_refuses():
+    """A non-positive max_step is refused: the step must be strictly positive."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_FLOOR": "0",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "3",
+            "GBAW_OPERATIONS_CAPACITY_MAX_STEP": "0",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined
+
+
+def test_deploy_enable_non_integer_capacity_refuses():
+    """A non-integer capacity override is refused before any AWS call."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "3.5",
+        },
+    )
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).upper()
+    assert "CAPACITY" in combined

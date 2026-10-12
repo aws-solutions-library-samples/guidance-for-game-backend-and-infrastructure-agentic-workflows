@@ -124,6 +124,8 @@ stack is not wired into `deploy-all.sh`; it is deployed and torn down only by
 the dedicated shell wrappers documented in
 [docs/OPERATIONS_E1_DEPLOYMENT.md](docs/OPERATIONS_E1_DEPLOYMENT.md).
 
+> **E2 (advise) — planned, not yet live-validated.** An optional E2 *advise* mode (GitHub issue #414) extends E1 **additively**: it keeps the read-only observation routes and adds a read-only **prepare** step and a **human-approval gate** (approve / reject / cancel), with **no** provider write for bounded GameLift. Its infrastructure, deploy wrapper, and runbook are implemented and test-covered, but E2 has **not** been deployed or validated against a live account, so it is **planned** until a live shakedown confirms it. E2 changes nothing about the default-unprovisioned **$0.00** state and adds **no** new IAM beyond the E1 read-only boundary. See [`docs/OPERATIONS_E1_DEPLOYMENT.md`](docs/OPERATIONS_E1_DEPLOYMENT.md) (E2 addendum).
+
 Note that *disabling* an already-provisioned stack is **not** a zero-cost state:
 an emergency `--disable` keeps every resource (and its retained audit data)
 under CloudFormation and flips only the runtime kill switch, so the standing

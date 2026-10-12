@@ -739,3 +739,170 @@ PowerShell path: `deploy-operations.sh` and `teardown-operations.sh` are
 POSIX-shell only, and the PowerShell module (`Deploy-GameAgent`,
 `Remove-GameAgent`, `Get-GameAgentStatus`) neither invokes nor lists them. On
 Windows, run these wrappers under WSL or a POSIX shell.
+
+
+
+---
+
+# E2 Operations Advise Control Plane — Addendum (issue #414)
+
+> **Status: PLANNED — not yet live-validated.** The E2 *infrastructure,
+> deployment wrapper, and documentation* in this addendum are implemented and
+> covered by parser-verifiable tests, but the advise control plane has **not**
+> been deployed or validated against a live account. Treat E2 as **planned**
+> until a live shakedown confirms it, exactly as E1 was treated before its own
+> validation. The default deployment (`./deploy-all.sh`) still creates **zero**
+> operations resources and costs **$0**; E2 changes nothing about that.
+
+E2 extends the E1 observation control plane **additively** through GitHub issue
+[#414](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/414).
+It edits **no** backend application code: it widens the same CloudFormation
+stack, deploy wrapper, and this runbook. It adds a read-only **prepare** step and
+a **human-approval gate** (approve / reject / cancel) with **no** provider write
+for bounded GameLift. Provisioning stays separate and default-`false`; an
+emergency disable stays reversible.
+
+## OperationsMode vocabulary (widened)
+
+| Value | Meaning |
+| --- | --- |
+| `disabled` | Default. Fail-closed. Creates zero resources. |
+| `observe` | E1: synchronous, read-only GameLift observation. |
+| `advise` | E2: strictly **higher** authority than `observe`. KEEPS the observe routes active AND enables the read-only prepare + human-approval gate. Requires `Provisioned=true`. No provider write. |
+
+`advise` is distinguished from `observe` only by the injected
+`GBAW_OPERATIONS_MODE` value the runtime reads; resource existence stays gated on
+`Provisioned` and the API-stage kill switch on the enabled-mode condition, so an
+emergency `--disable` still keeps every resource and its retained data and a
+later `--enable` is reversible.
+
+## Routes (all JWT, one shared real handler)
+
+Every route below is JWT-authorized and targets the **same** shared integration
+— the one real handler Lambda. There is no second handler and no per-route
+divergent integration.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /operations/observe` | E1 observation (retained). |
+| `GET /operations/{operationId}` | Status read (retained). |
+| `POST /operations/prepare` | E2: read-only preparation of a proposed operation. |
+| `POST /operations/{operationId}/approve` | E2: authorized approver grants approval. |
+| `POST /operations/{operationId}/reject` | E2: authorized approver rejects. |
+| `POST /operations/{operationId}/cancel` | E2: cancel a prepared/pending operation. |
+
+**No approval route is exposed through chat or MCP.** The prepare/approve/reject/
+cancel surface is HTTP + JWT only; the chat and MCP tool surfaces reference none
+of these routes.
+
+## E2 environment / deployment bindings (frozen core names)
+
+These are the **frozen core env names** E2 defines. The stack injects them from
+validated CloudFormation parameters; the core runtime consumes them in a later
+slice.
+
+| Name | CFN parameter | Default | Meaning |
+| --- | --- | --- | --- |
+| `GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL` | `LowRiskSelfApproval` | `false` | Server-owned low-risk self-approval posture. `false` means the preparer can **never** approve their own operation; `true` permits self-approval **only** for the server-defined low-risk action set the core policy recognises. Defaults to disabled. |
+| `GBAW_OPERATIONS_PREPARATION_EXPIRY_S` | `PreparationExpirySeconds` | `900` | Preparation validity window (seconds). A prepared operation not approved within it expires and cannot be approved afterward. Bounded to at most one day. |
+| `GBAW_OPERATIONS_APPROVAL_EXPIRY_S` | `ApprovalExpirySeconds` | `1800` | Approval validity window (seconds). Matches the core `ApprovalPolicy` default (30 min) and the contract that an approval TTL is > 0 and ≤ one day. |
+| `GBAW_OPERATIONS_CAPACITY_FLOOR` | `CapacityFloor` | `0` | Server-owned minimum desired-instance floor for a bounded proposal. Integer ≥ 0. |
+| `GBAW_OPERATIONS_CAPACITY_CEILING` | `CapacityCeiling` | `1` | Server-owned maximum desired-instance ceiling (denial-of-wallet cap). Integer ≥ 1. The default `1` caps a demo/fresh deploy at **one** instance. |
+| `GBAW_OPERATIONS_CAPACITY_MAX_STEP` | `CapacityMaxStep` | `1` | Server-owned maximum single-step change in desired instances. Integer, `0 < max_step ≤ (ceiling − floor)`. |
+
+## E2 CloudWatch metric names (namespace `GameAgent/Operations`)
+
+The four E1 metrics/alarms are **retained**. E2 adds four more alarms in the same
+namespace:
+
+| Metric | Meaning |
+| --- | --- |
+| `PreparationFailures` | Count of failed prepare-operation requests. |
+| `ApprovalFailures` | Count of failed approval-gate requests (approve/reject). |
+| `ApprovalExpired` | Count of approvals or prepared operations that expired before dispatch. |
+| `CancellationConflicts` | Count of cancellation attempts that conflicted with a concurrent state change. |
+
+## IAM boundary (unchanged for bounded GameLift E2)
+
+E2 adds **no** IAM. The role keeps exactly the three GameLift reads
+(`DescribeFleetUtilization`, `DescribeFleetCapacity`, `DescribeScalingPolicies`),
+the three underlying DynamoDB item actions (`PutItem`/`UpdateItem`/`GetItem`), and
+the scoped KMS / log / metric grants. For bounded GameLift E2 there is **no**
+provider write, **no** source-control credential, **no** `iam:PassRole`, **no**
+`states:` action, **no** generic `execute`, and **no** S3 content bucket.
+
+## Deploy (explicit, opt-in) — selecting the mode
+
+```bash
+# Preview only (default): READ-ONLY validate + lint. Creates nothing.
+./scripts/infrastructure/deploy-operations.sh
+
+# Enable E1 observe (unchanged; --mode defaults to observe).
+GBAW_OPERATIONS_MODE=observe   COGNITO_ISSUER=<issuer> COGNITO_CLIENT_ID=<client-id>   TENANT_ID=<tenant> WORKSPACE_ID=<workspace>   GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket>   AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-operations.sh --enable --mode observe
+
+# Enable E2 advise. GBAW_OPERATIONS_MODE MUST match --mode (double opt-in).
+GBAW_OPERATIONS_MODE=advise   COGNITO_ISSUER=<issuer> COGNITO_CLIENT_ID=<client-id>   TENANT_ID=<tenant> WORKSPACE_ID=<workspace>   GBAW_OPERATIONS_ARTIFACT_BUCKET=<pre-existing-artifact-bucket>   AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-operations.sh --enable --mode advise
+```
+
+The enable is refused unless the `GBAW_OPERATIONS_MODE` environment value
+**matches** the selected `--mode` (belt-and-braces), so an enable can never
+silently escalate or downgrade the runtime authority. The template's `Rules`
+independently reject an enabled mode (observe **or** advise) against an
+unprovisioned (`Provisioned=false`) stack.
+
+The advise-mode settings are server-owned and default safely:
+`GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL=false` (never self-approve),
+`GBAW_OPERATIONS_PREPARATION_EXPIRY_S=900`, `GBAW_OPERATIONS_APPROVAL_EXPIRY_S=1800`.
+Override any of them in the environment before `--enable`.
+
+## E2 server-owned capacity policy (safe by default, one instance)
+
+The bounded-capacity band is **server-owned** and injected as three frozen
+core env names from validated integer CloudFormation parameters:
+`GBAW_OPERATIONS_CAPACITY_FLOOR` / `_CEILING` / `_MAX_STEP`
+(`CapacityFloor` / `CapacityCeiling` / `CapacityMaxStep`). They are **never**
+taken from a request body.
+
+The defaults are **`0` / `1` / `1`**, which **cap every demo or fresh
+deployment at exactly one instance**: floor `0`, ceiling `1`, single-step
+change `1`. A fresh deploy therefore can never silently scale to a large
+fleet.
+
+**Increasing any capacity bound is a deliberate, cost-relevant act.** It
+requires an **explicit stack update** with new parameter values *and a cost
+review* — a larger ceiling directly raises the maximum fleet size (and spend)
+the advise plane can propose. The wrapper accepts explicit, bounded overrides
+only from the `GBAW_OPERATIONS_CAPACITY_*` environment variables before
+`--enable`; it never reads them from a request body.
+
+Coherence — `floor ≤ ceiling` and `0 < max_step ≤ (ceiling − floor)` — is a
+numeric bound. CloudFormation `Rules` have equality/set-membership functions
+only (no numeric less-than), so it is enforced in two layers that together
+are at least as strict as the stated bound: the `CapacityBandIsCoherent`
+template Rule rejects the equality-expressible degenerate band (`floor ==
+ceiling`) at deploy time before any resource is created, and the deploy
+wrapper enforces the full arithmetic (`floor` strictly below `ceiling`, and
+`0 < max_step ≤ ceiling − floor`) on any explicit override before any AWS
+call. Every parameter is additionally integer-bounded (`MinValue`/`MaxValue`)
+so no dimension can be edited to a runaway ("million-instance") fleet within
+the template's own bounds.
+
+## Packaging carries the E2 contract schemas
+
+On `--enable` the wrapper's runtime probe additionally loads the E2 contract
+schemas (`prepare-operation-request`, `approval-record`, `prepared-operation`)
+from the staged package, so a package that ships the handler but omits an E2
+schema **fails closed before upload** rather than at the first prepare/approve/
+reject/cancel request.
+
+## Emergency disable (unchanged, rebuild-free)
+
+```bash
+AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-operations.sh --disable
+```
+
+`--disable` still keeps `Provisioned=true` and every resource under
+CloudFormation with stable physical names and retained audit data, reusing every
+current parameter value (including the three E2 settings) via `UsePreviousValue`
+and setting only `OperationsMode=disabled`. It rebuilds no code and runs no
+Docker. A later `--enable --mode observe|advise` is fully reversible.

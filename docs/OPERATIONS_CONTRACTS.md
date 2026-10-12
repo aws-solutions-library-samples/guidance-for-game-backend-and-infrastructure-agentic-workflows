@@ -237,6 +237,106 @@ Application errors have a closed error-code set, a bounded safe message,
 retryability, and correlation. They expose only bounded field paths and state.
 Adapters map these errors to their protocol without changing product meaning.
 
+## Additive Capacity-Adjustment Profile (E2)
+
+The `gamelift.capacity-adjustment/1.0` capability adds an **E2 prepare** layer on
+top of the read-only E1 observation. It is delivered as four additive schemas
+that reuse the immutable `common` `$defs` but are deliberately **not** part of
+the published source-control write-contract set (`SCHEMA_NAMES`) or its playbook
+binding, exactly like the additive `gamelift-observation` contract. Adding them
+therefore cannot change a published v1 write contract or its playbook hash.
+
+| Contract | Version field | Schema |
+|---|---|---|
+| Capacity proposal request (untrusted) | `request_contract_version` | `gamelift-capacity-proposal-request.schema.json` |
+| Capacity advice (deterministic) | `advice_contract_version` | `gamelift-capacity-advice.schema.json` |
+| Capacity authorization decision (trusted) | `authorization_contract_version` | `gamelift-capacity-authorization.schema.json` |
+| Capacity prepared operation (immutable) | `operation_contract_version` | `gamelift-capacity-prepared-operation.schema.json` |
+
+The **untrusted** proposal request carries only bounded target/requested capacity
+intent (`fleet_id`, `location`, desired/min/max) and an idempotency token. It has
+no identity, correlation, policy, enrollment, risk, executor, credential,
+approval, deployment-mode, playbook, or trusted current-state field, and
+`additionalProperties` is false everywhere, so injecting any such field fails
+validation.
+
+A trusted `AdviceService` resolves the requester only from the verified
+principal, loads the current fleet capacity from a trusted E1 observation/status
+port at advice time, applies server-owned enrollment/policy bounds, and computes
+a deterministic change and risk. A trusted `PrepareService` then selects the
+exact playbook/capability in code — never from model text — evaluates the six
+ADR 0001 authority inputs and their deterministic minimum, and produces exactly
+one of `approval_required` or `denied`. Preparing and approving are **advise**-
+authority acts — they bind an intent and record a human approval but never touch
+a provider — so a non-denied outcome only requires the six authority inputs to
+clear `advise`; `observe` and `disabled` still deny (`INSUFFICIENT_AUTHORITY` /
+`DEPLOYMENT_DISABLED`). A GameLift capacity change is never `authorized` outright;
+a non-denied outcome always requires a direct human approval.
+
+Every prepared operation and its authorization carry an immutable, hash-bound
+`required_execution_authority` (always `remediate`). This is the execution
+authority a **future E3 executor MUST independently re-verify** (deployment mode
+and policy at or above `remediate`) before any provider write. The advise-
+authority E2 phase never satisfies or elevates it, and approving an operation
+does not raise it. Because it is inside the hashed material, tampering with it
+changes `prepared_hash` and fails validation (it is also `const: "remediate"` in
+schema).
+
+The prepared operation is immutable and idempotent: its `prepared_hash` binds
+every other field — the target, the current-state observation id/hash, the exact
+desired/min/max change, the playbook/profile/capability/contract versions, the
+authority inputs/decision, the `required_execution_authority`, the calculated
+risk, the requester scope, the expiry, and the future executor binding
+identifier — and excludes only itself. Its
+timestamps are a deterministic function of the bound current-state revision, not
+the wall clock: `created_at` is the trusted E1 observation revision anchor
+(`current_state.observed_at`) and `expires_at` is derived as the earlier of the
+trusted observation expiry (`current_state.expires_at`) and `created_at` plus the
+configured preparation TTL. The live clock is used only to decide whether that
+anchor/current-state revision is still fresh, so the same token, intent, and
+current-state revision retried later yield byte-for-byte identical timestamps,
+`operation_id`, document bytes, and `prepared_hash`; a changed current-state
+revision yields a distinct hash. Provider writes and executor credentials are
+structurally absent: there is no provider-write parameter and the future executor
+binding is an identifier only.
+
+### Expiry (lazy-on-access)
+
+A prepared operation carries an immutable, hash-bound `expires_at`. Expiry is
+enforced **lazily on access**: before the E2 request handler treats an operation
+as active — on `GET /operations/{id}` evidence and on
+`approve` / `reject` / `cancel` — it first calls
+`LifecycleDecisionService.expire_if_due`. If the operation is past `expires_at`
+and still in a non-terminal, pre-dispatch state (`prepared` / `pending_approval`
+/ `approved`), that call atomically transitions it to `expired` with a **system**
+actor (`operations.expiry-sweeper`) and an appended `operation.state-changed`
+ledger entry, through the same fenced, conditional store transaction the other
+terminal decisions use. Expiry is driven by the trusted system clock and needs
+no caller credential.
+
+Consequences the handler guarantees:
+
+- **Terminal is a safe no-op.** An already-terminal operation (or a lost race)
+  makes `expire_if_due` a no-op; the opportunistic call is swallowed and the
+  underlying route returns its own bounded response (e.g. a `409` conflict, or a
+  `404` if the record is gone).
+- **One terminal state, one transition.** A race between expiry and
+  `approve` / `reject` / `cancel` resolves through the single fenced writer, so
+  exactly one terminal state and one state transition win; the loser observes a
+  bounded `STATE_CONFLICT` / `APPROVAL_EXPIRED`.
+- **Approval after due never grants.** `ApprovalService.grant` independently
+  rechecks `expires_at` against a fresh clock before and immediately before
+  commit, returning `APPROVAL_EXPIRED` (`409`) — a due operation is never
+  granted, whether or not the lazy transition has already run.
+- **Metric on transition win.** When the lazy transition wins, the handler emits
+  the bounded `ApprovalExpired` CloudWatch metric (no identifiers/dimensions).
+
+There is **no scheduler or Step Functions sweep** in this phase. Expiry is
+observed only when an operation is next accessed; an untouched due operation
+stays at its stored non-terminal state until the first access transitions it.
+A periodic background sweep that expires idle operations without an access is
+deliberately deferred to **E4**.
+
 ## Compatibility and Publication
 
 Version `1.0` is exact, not a minimum. Consumers MUST use an explicit allowlist

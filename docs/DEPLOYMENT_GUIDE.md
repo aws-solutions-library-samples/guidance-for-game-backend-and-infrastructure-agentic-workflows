@@ -291,6 +291,10 @@ only by the dedicated shell wrappers (`scripts/infrastructure/deploy-operations.
 and `scripts/infrastructure/teardown-operations.sh`). See
 [OPERATIONS_E1_DEPLOYMENT.md](OPERATIONS_E1_DEPLOYMENT.md) for the full runbook.
 
+#### E2 advise mode (planned, issue #414)
+
+The optional **E2 advise** mode extends E1 **additively** and is **planned** until live validation. It keeps the read-only observation routes and adds read-only prepare and a human-approval gate on the **same** authenticated HTTP API and the **same** real handler: `POST /operations/prepare` and `POST /operations/{operationId}/approve|reject|cancel`, plus the retained `GET /operations/{operationId}` status. Every route is JWT-authorized and **no** approval route is exposed through chat or MCP. E2 adds four CloudWatch alarms (`PreparationFailures`, `ApprovalFailures`, `ApprovalExpired`, `CancellationConflicts`) alongside the retained E1 alarms, and three validated, server-owned settings (`GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL` default `false`, `GBAW_OPERATIONS_PREPARATION_EXPIRY_S`, `GBAW_OPERATIONS_APPROVAL_EXPIRY_S`) plus the server-owned capacity bounds (`GBAW_OPERATIONS_CAPACITY_FLOOR`/`CEILING`/`MAX_STEP`, safe defaults `0`/`1`/`1`). It adds **no** IAM beyond the E1 read-only boundary — no provider write, source-control credential, `iam:PassRole`, `states:` action, generic execute, or S3 content bucket for bounded GameLift. Enable it with `--enable --mode advise` and a matching `GBAW_OPERATIONS_MODE=advise` (double opt-in); provisioning stays separate and `--disable` stays reversible. See the E2 addendum in [OPERATIONS_E1_DEPLOYMENT.md](OPERATIONS_E1_DEPLOYMENT.md).
+
 When enabled it deploys the accepted synchronous, read-only GameLift observation
 design ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with
 **no queue, worker, dead-letter queue, or Step Functions** in the observation

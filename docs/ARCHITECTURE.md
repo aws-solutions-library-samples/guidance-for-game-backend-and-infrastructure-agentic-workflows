@@ -34,6 +34,8 @@ operations services.
 See [Identity and Authorization](IDENTITY_AND_AUTHORIZATION.md) for the trusted
 principal, read-path, approval, remote-client, and executor identity contracts.
 
+An optional **E2 advise** mode (issue #414) is **planned** on top of the E1 observation plane: it keeps the read-only observation routes and adds a read-only prepare step and a human-approval gate (approve / reject / cancel), with **no** provider write for bounded GameLift and **no** new IAM beyond the E1 read-only boundary. It is implemented and test-covered at the infrastructure/deployment/docs layer but is **not** live-validated, so it remains planned until a live shakedown confirms it. No approval route is exposed through chat or MCP.
+
 ---
 
 ## Architecture Diagram

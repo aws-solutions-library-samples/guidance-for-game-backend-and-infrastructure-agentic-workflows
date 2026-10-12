@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -101,7 +102,7 @@ def _read_config(settings: ObservationDeploymentSettings) -> Any:
 
 def _build_handler(
     settings: ObservationDeploymentSettings,
-) -> tuple[ObservationRequestHandler, CloudWatchObservationMetrics]:
+) -> tuple[Any, CloudWatchObservationMetrics]:
     # Third-party packages
     import boto3
 
@@ -148,7 +149,7 @@ def _build_handler(
         store=store,
         metrics=metrics,
     )
-    handler = ObservationRequestHandler(
+    observation_handler = ObservationRequestHandler(
         service=service,
         tenant_id=settings.tenant_id,
         workspace_id=settings.workspace_id,
@@ -158,11 +159,176 @@ def _build_handler(
         authority_inputs=_DEFAULT_AUTHORITY_INPUTS,
         observer_groups=settings.operations.observer_groups,
     )
-    return handler, metrics
+
+    # The E2 prepare/approval surface is additive and gated on the advise
+    # ceiling. When it is disabled the deployable handler is exactly the E1
+    # observation handler (byte-for-byte preserved). When it is enabled both
+    # surfaces are served through one router behind the single entry point.
+    if not settings.e2_enabled:
+        return observation_handler, metrics
+
+    # Local modules
+    from operations.router import OperationsRequestRouter
+
+    approval_handler = _build_approval_handler(
+        settings=settings,
+        boundary=boundary,
+        dynamodb_client=dynamodb_client,
+        cloudwatch_client=cloudwatch_client,
+        observation_store=store,
+    )
+    router = OperationsRequestRouter(
+        observation_handler=observation_handler,
+        approval_handler=approval_handler,
+    )
+    return router, metrics
+
+
+# The E2 approval policy identity and playbook binding are code-owned, not
+# request-derived. The playbook hash is the real RFC 8785 / SHA-256 digest of
+# the complete immutable capacity playbook definition (id/version/profile/
+# capability, retry policy, parameter/precondition bounds, executor binding);
+# any drift in that definition changes the hash. E2 performs no provider write.
+_POLICY_ID = "policy.gamelift.capacity"
+_POLICY_VERSION = "1"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _build_approval_handler(
+    *,
+    settings: ObservationDeploymentSettings,
+    boundary: Any,
+    dynamodb_client: Any,
+    cloudwatch_client: Any,
+    observation_store: Any,
+) -> Any:
+    """Construct the E2 approval handler and its service dependencies."""
+    # Local modules
+    from operations.advice import AdviceService
+    from operations.approval import ApprovalPolicy, ApprovalService
+    from operations.approval_handler import ApprovalRequestHandler
+    from operations.approval_store import DynamoDbApprovalStore
+    from operations.capacity_bounds import DeploymentCapacityBoundsResolver
+    from operations.capacity_state import E1ObservationCapacityStatePort
+    from operations.contracts.capacity import (
+        ACTION,
+        PROFILE,
+        capacity_prepared_hash,
+        validate_capacity_approval_binding,
+        validate_capacity_prepared_operation,
+    )
+    from operations.decisions import LifecycleDecisionService
+    from operations.evidence import E2EvidenceService
+    from operations.observe.e2_metrics import CloudWatchApprovalMetrics
+    from operations.playbook_definition import (
+        FUTURE_EXECUTOR_BINDING,
+        PLAYBOOK_ID,
+        PLAYBOOK_VERSION,
+        RETRY_POLICY,
+        capacity_playbook_hash,
+    )
+    from operations.prepare import CapacityPlaybook, PrepareService
+    from operations.prepare_orchestrator import PrepareOrchestrator
+
+    ops = settings.operations
+    approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=settings.table_name)
+    approval_metrics = CloudWatchApprovalMetrics(client=cloudwatch_client, namespace=settings.metric_namespace)
+
+    def _advice_service_factory(observation_id: str) -> AdviceService:
+        state_port = E1ObservationCapacityStatePort(status_loader=observation_store, observation_id=observation_id)
+        bounds_port = DeploymentCapacityBoundsResolver(
+            state_port=state_port,
+            floor=ops.capacity_floor,
+            ceiling=ops.capacity_ceiling,
+            max_step=ops.capacity_max_step,
+            enrollment_id="enrollment.gamelift.capacity",
+            enrollment_version="1",
+            policy_id=_POLICY_ID,
+            policy_version=_POLICY_VERSION,
+        )
+        return AdviceService(
+            settings=ops,
+            identity_boundary=boundary,
+            state_port=state_port,
+            bounds_port=bounds_port,
+            clock=_utcnow,
+        )
+
+    playbook = CapacityPlaybook(
+        playbook_id=PLAYBOOK_ID,
+        playbook_version=PLAYBOOK_VERSION,
+        playbook_hash=capacity_playbook_hash(),
+        profile=PROFILE,
+        retry_policy=dict(RETRY_POLICY),
+        future_executor_binding=dict(FUTURE_EXECUTOR_BINDING),
+    )
+    prepare_service = PrepareService(
+        settings=ops,
+        identity_boundary=boundary,
+        playbook=playbook,
+        clock=_utcnow,
+        operation_ttl_seconds=ops.preparation_expiry_s,
+    )
+    orchestrator = PrepareOrchestrator(
+        prepare_service=prepare_service,
+        store=approval_store,
+        clock=_utcnow,
+        deployment_mode=ops.mode,
+        advice_service_factory=_advice_service_factory,
+        preparation_expiry_s=ops.preparation_expiry_s,
+    )
+
+    # A direct approver must belong to the server-owned Cognito approver group
+    # (default ``admin``); approver authority is bound to a provider-controlled
+    # group, never to the trusted app client id. The ApprovalIdentityBoundary
+    # still binds the trusted app client. A default ``users`` requester cannot
+    # approve. Self-approval is denied by default; only an explicit low-risk
+    # opt-in admits the requester approving their own low-risk operation, and it
+    # still requires the approver group.
+    low_risk_actions = frozenset({ACTION}) if ops.low_risk_self_approval_enabled else frozenset()
+    policy = ApprovalPolicy(
+        policy_id=_POLICY_ID,
+        policy_version=_POLICY_VERSION,
+        approver_groups=frozenset({ops.approver_group}),
+        low_risk_self_approval_actions=low_risk_actions,
+    )
+    # Inject the capacity-specific validator, hasher, and binding so the
+    # deployable ApprovalService validates and hashes the stored capacity
+    # prepared operation exactly as it was prepared. Without these it would
+    # fall back to the generic source-control contract and reject every
+    # stored capacity operation as APPROVAL_INVALID ('stored operation is
+    # invalid'). The generic defaults remain in place for other callers (#419).
+    approval_service = ApprovalService(
+        identity_boundary=boundary,
+        policy=policy,
+        store=approval_store,
+        clock=_utcnow,
+        operation_validator=validate_capacity_prepared_operation,
+        operation_hasher=capacity_prepared_hash,
+        binding_validator=validate_capacity_approval_binding,
+    )
+    decision_service = LifecycleDecisionService(
+        identity_boundary=boundary, policy=policy, store=approval_store, clock=_utcnow
+    )
+    evidence_service = E2EvidenceService(store=approval_store, identity_boundary=boundary)
+
+    return ApprovalRequestHandler(
+        orchestrator=orchestrator,
+        approval_service=approval_service,
+        decision_service=decision_service,
+        evidence_service=evidence_service,
+        tenant_id=settings.tenant_id,
+        workspace_id=settings.workspace_id,
+        trusted_audience=settings.trusted_audience,
+        metrics=approval_metrics,
+    )
 
 
 @lru_cache(maxsize=1)
-def _handler() -> tuple[ObservationRequestHandler, CloudWatchObservationMetrics]:
+def _handler() -> tuple[Any, CloudWatchObservationMetrics]:
     """Resolve settings and build the handler once per container (fail closed)."""
     settings = resolve_observation_deployment_settings()
     return _build_handler(settings)
@@ -173,7 +339,8 @@ def handler(event: Mapping[str, Any], context: Any = None) -> dict[str, Any]:
     request_handler, metrics_sink = _handler()
     started = time.monotonic()
     try:
-        return request_handler.handle(event)
+        response: dict[str, Any] = request_handler.handle(event)
+        return response
     finally:
         elapsed_s = time.monotonic() - started
         # The sink always emits the end-to-end latency as an EMF log line so the
