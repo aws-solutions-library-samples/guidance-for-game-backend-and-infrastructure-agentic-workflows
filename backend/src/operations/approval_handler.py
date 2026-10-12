@@ -33,7 +33,7 @@ import logging
 import secrets
 import time
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
@@ -59,15 +59,18 @@ from operations.prepare_orchestrator import PrepareOrchestratorError, PrepareRes
 _RETRYABLE_STORE_FAULTS = (ApprovalStoreError, ObservationStoreReadError)
 
 # Prepare-orchestrator error codes that are service-side failures (not caller
-# errors). Only these publish the PreparationFailures metric.
-_SERVICE_SIDE_PREPARE_ERRORS = frozenset(
-    {"contract_output_invalid", "provider_unavailable", "preparation_expired", "internal_error"}
-)
+# errors). Only these publish the PreparationFailures metric. Preparation expiry
+# at persist is a caller-side condition — the caller's token or the operation's
+# own window elapsed — so it is a 409 that publishes no failure metric; a slow
+# store that exhausts the per-request deadline surfaces as a retryable store
+# fault (provider_unavailable), which is counted separately.
+_SERVICE_SIDE_PREPARE_ERRORS = frozenset({"contract_output_invalid", "provider_unavailable", "internal_error"})
 
 # Approval error codes that are service-side failures (not caller errors). Only
-# these publish the ApprovalFailures metric. An integrity/hash mismatch counts;
-# authorization denial, invalid input, not-found, policy-stale, state conflict,
-# and expiry do not.
+# these publish the ApprovalFailures metric. A stored-document integrity/hash
+# mismatch counts; authorization denial, invalid input, not-found, policy-stale,
+# state conflict, expiry, and a caller-supplied expected-hash precondition
+# failure do not.
 _SERVICE_SIDE_APPROVAL_ERRORS = frozenset({ApprovalErrorCode.OPERATION_HASH_MISMATCH})
 
 # HTTP status for each typed approval boundary error. Everything else is 500.
@@ -78,6 +81,7 @@ _STATUS_BY_APPROVAL_ERROR = {
     ApprovalErrorCode.APPROVAL_EXPIRED: 409,
     ApprovalErrorCode.OPERATION_NOT_FOUND: 404,
     ApprovalErrorCode.OPERATION_HASH_MISMATCH: 409,
+    ApprovalErrorCode.PRECONDITION_FAILED: 409,
     ApprovalErrorCode.POLICY_STALE: 409,
     ApprovalErrorCode.STATE_CONFLICT: 409,
 }
@@ -181,6 +185,7 @@ class ApprovalRequestHandler:
         requester_groups: frozenset[str],
         metrics: ApprovalMetricsPort | None = None,
         store: StoreRequestDeadlinePort | None = None,
+        read_scope: StoreRequestDeadlinePort | None = None,
         request_deadline_s: float | None = None,
         min_publish_remaining_s: float = 0.0,
         clock: Callable[[], datetime] = _system_clock,
@@ -209,6 +214,7 @@ class ApprovalRequestHandler:
         # and gates a metric publish that would not fit, so a slow sequence of
         # store calls returns a typed retryable error before the Lambda timeout.
         self._store = store
+        self._read_scope = read_scope
         self._request_deadline_s = request_deadline_s
         self._min_publish_remaining_s = min_publish_remaining_s
         self._clock = clock
@@ -261,15 +267,24 @@ class ApprovalRequestHandler:
     def _store_request_deadline(self) -> Any:
         """Bind the per-request store deadline, or a no-op when unavailable.
 
-        The deadline is a wall-clock instant ``now + request_deadline_s`` so the
-        store (which fences on ``commit_not_after`` datetimes) can cap writes and
-        guard reads against it. When no store or budget is configured — a unit
-        test driving fake services — the scope is a no-op.
+        The deadline is a wall-clock instant ``now + request_deadline_s`` so each
+        bound store (which fences on ``commit_not_after`` datetimes) can cap
+        writes and guard reads against it. Both the durable approval store and the
+        E1 current-state read scope prepare uses are bound to the same deadline,
+        so prepare's status reads stay inside the request budget alongside its
+        approval writes. When no store or budget is configured — a unit test
+        driving fake services — the scope is a no-op.
         """
-        if self._store is None or self._request_deadline_s is None:
+        if self._request_deadline_s is None:
+            return nullcontext()
+        scopes = [scope for scope in (self._store, self._read_scope) if scope is not None]
+        if not scopes:
             return nullcontext()
         deadline = self._clock().astimezone(timezone.utc) + timedelta(seconds=self._request_deadline_s)
-        return self._store.request_deadline(deadline)
+        stack = ExitStack()
+        for scope in scopes:
+            stack.enter_context(scope.request_deadline(deadline))
+        return stack
 
     def _publish_fits(self) -> bool:
         """Whether enough request budget remains to publish a metric now.
@@ -352,6 +367,13 @@ class ApprovalRequestHandler:
 
     def _handle_approve(self, event: Mapping[str, Any], principal: VerifiedPrincipal) -> dict[str, Any]:
         operation_id = _operation_id(event)
+        # Approve carries no decision body: parse and allow only an empty or
+        # ``{}`` body, so a hostile or oversize payload, a duplicate key, a
+        # non-finite number, or any injected field fails closed exactly as the
+        # reject and cancel routes do. Identity is still taken only from the token.
+        body = self._parse_json_body(event, allow_empty=True)
+        if body != {}:
+            raise ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_INVALID, "request body is invalid")
         request = ApprovalRequest.from_payload({"operation_id": operation_id})
         context = ApprovalRequestContext(approver=principal, request_id=_request_id(event))
         approval = self._approval_service.grant(request, context)

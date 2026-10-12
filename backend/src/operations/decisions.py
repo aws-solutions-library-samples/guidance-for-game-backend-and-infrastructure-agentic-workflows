@@ -416,8 +416,12 @@ class LifecycleDecisionService:
                 ApprovalErrorCode.OPERATION_HASH_MISMATCH, "stored operation integrity check failed"
             )
         if request.expected_prepared_hash is not None and request.expected_prepared_hash != prepared_hash:
+            # A caller-supplied expected hash that does not match the stored
+            # operation is a caller-side precondition failure (the operation
+            # changed since it was presented), not a stored-document integrity
+            # fault: it is a 409 that publishes no failure metric.
             raise ApprovalBoundaryError(
-                ApprovalErrorCode.OPERATION_HASH_MISMATCH, "operation changed since it was presented"
+                ApprovalErrorCode.PRECONDITION_FAILED, "operation changed since it was presented"
             )
         return prepared_operation, prepared_hash, stored.state, stored.sequence
 

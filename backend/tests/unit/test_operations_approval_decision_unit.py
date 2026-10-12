@@ -26,14 +26,14 @@ from operations.approval import (
     ApprovalPolicy,
     StoredPreparedOperation,
 )
+from operations.contracts import load_json
+from operations.contracts.capacity import capacity_prepared_hash
 from operations.decisions import (
     DecisionCommitOutcome,
     DecisionRequest,
     DecisionRequestContext,
     LifecycleDecisionService,
 )
-from operations.contracts import load_json
-from operations.contracts.capacity import capacity_prepared_hash
 from operations.identity import ApprovalIdentityBoundary, VerifiedPrincipal
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "operations" / "v1"
@@ -371,11 +371,14 @@ def test_decision_binds_expected_prepared_hash_and_conflicts_on_mismatch() -> No
     store = FakeDecisionStore(_stored())
     service = _service(store)
 
+    # A caller-supplied expected hash that does not match the stored operation
+    # is a caller-side precondition failure (the operation changed since it was
+    # presented), distinct from a stored-document integrity fault.
     _assert_error(
         lambda: service.reject(
             DecisionRequest(OPERATION_ID, expected_prepared_hash="sha256:" + "0" * 64),
             _reject_context(),
         ),
-        ApprovalErrorCode.OPERATION_HASH_MISMATCH,
+        ApprovalErrorCode.PRECONDITION_FAILED,
     )
     assert store.commits == []

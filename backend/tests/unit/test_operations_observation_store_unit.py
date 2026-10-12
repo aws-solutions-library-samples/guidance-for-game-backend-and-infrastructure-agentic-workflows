@@ -521,6 +521,32 @@ def test_load_status_observing_has_no_observation() -> None:
     assert status.observation is None
 
 
+def test_bound_request_deadline_guards_status_reads() -> None:
+    # On the E2 prepare path the handler binds a per-request deadline to the
+    # observation store so prepare's current-state reads cannot outlast the
+    # request budget. A read that would start within one call limit of the
+    # deadline fails closed with a retryable read error rather than running on.
+    # Local modules
+    from operations.observation import ObservationStoreReadError
+
+    client = StatefulDynamoClient()
+    store = _store(client)
+    _begin(store)
+    _complete(store)
+
+    # A far deadline leaves the read unaffected.
+    with store.request_deadline(NOW + timedelta(seconds=60)):
+        assert store.load_status(operation_id=OPERATION_ID, workspace_id=WORKSPACE) is not None
+
+    # A deadline only 2 s away cannot fit one 4.5 s sub-call: the read is refused.
+    with store.request_deadline(NOW + timedelta(seconds=2)):
+        with pytest.raises(ObservationStoreReadError):
+            store.load_status(operation_id=OPERATION_ID, workspace_id=WORKSPACE)
+
+    # The binding is cleared on exit: the same read succeeds again.
+    assert store.load_status(operation_id=OPERATION_ID, workspace_id=WORKSPACE) is not None
+
+
 def test_load_status_cross_workspace_is_invisible() -> None:
     client = StatefulDynamoClient()
     store = _store(client)

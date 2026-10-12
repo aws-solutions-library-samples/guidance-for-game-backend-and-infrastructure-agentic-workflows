@@ -944,3 +944,53 @@ def test_degraded_store_returns_retryable_error_before_the_lambda_timeout() -> N
     assert evidence["statusCode"] == 503
     assert json.loads(evidence["body"])["retryable"] is True
     assert clock.elapsed_since(evidence_start) <= _LAMBDA_TIMEOUT_S - _LAMBDA_SAFETY_MARGIN_S
+
+
+# The worst-case cost of one degraded sub-call, well under the store's 4.5 s
+# call limit so the per-read guard never trips first: here the binding cap is
+# the request deadline reached across the write, not any single read.
+_SUB_CALL_S = 2.7
+
+
+def test_slow_store_write_deadline_returns_retryable_not_expired() -> None:
+    # With each store sub-call costing 2.7 s (under the 4.5 s per-call read
+    # guard), a sequence of reads and a transaction eventually makes the
+    # per-request deadline the binding write cap. The operation itself has not
+    # expired, so the approve must return a typed, retryable 503 rather than a
+    # non-retryable 409 that misstates the operation as expired. A healthy retry
+    # then still grants, proving the operation was never actually expired.
+    clock = _TickingClock(NOW, step_s=_SUB_CALL_S)
+    client = _SlowDynamoClient(clock)
+    handler = _handler(client, clock=clock, request_deadline_s=15.0)
+
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+
+    clock.arm()
+    approve = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert approve["statusCode"] == 503
+    assert json.loads(approve["body"])["retryable"] is True
+
+    # A healthy retry (clock held steady) still grants: the operation was
+    # never expired, only the slow request's budget was exhausted.
+    healthy = _TickingClock(NOW, step_s=_SUB_CALL_S)
+    healthy_client = _SlowDynamoClient(healthy)
+    healthy_handler = _handler(healthy_client, clock=healthy, request_deadline_s=15.0)
+    healthy_op = json.loads(_prepare(healthy_handler)["body"])["operation_id"]
+    granted = healthy_handler.handle(
+        _event(
+            "POST",
+            f"/operations/{healthy_op}/approve",
+            claims=_claims("user.approver", "client.approver"),
+            body={},
+            op_id=healthy_op,
+        )
+    )
+    assert granted["statusCode"] == 200
