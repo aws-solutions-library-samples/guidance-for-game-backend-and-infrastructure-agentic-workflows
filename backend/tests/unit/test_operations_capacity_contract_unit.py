@@ -240,6 +240,56 @@ def test_bounds_violations_flags_unenrolled_target() -> None:
 
 
 @pytest.mark.unit
+def test_bounds_violations_bind_max_step_to_minimum_and_maximum() -> None:
+    # The step cap governs every dimension, not only desired: widening the
+    # autoscaling band by more than one step, or collapsing it, is a step
+    # violation even when desired is unchanged.
+    limits = {"floor": 0, "ceiling": 1000, "max_step": 10}
+    requested = {"desired": 500, "minimum": 500, "maximum": 520}
+    change = {"desired": 0, "minimum": 100, "maximum": -480}
+    violations = capacity_bounds_violations(requested=requested, change=change, limits=limits, target_enrolled=True)
+    assert "MINIMUM_DELTA_EXCEEDS_MAX_STEP" in violations
+    assert "MAXIMUM_DELTA_EXCEEDS_MAX_STEP" in violations
+    assert violations == sorted(violations)
+
+
+@pytest.mark.unit
+def test_risk_counts_a_maximum_decrease_as_scale_down() -> None:
+    # Cutting the ceiling removes burst headroom; it is a scale-down even when
+    # desired and minimum are unchanged.
+    current = {"desired": 500, "minimum": 400, "maximum": 1000}
+    requested = {"desired": 500, "minimum": 400, "maximum": 520}
+    risk = calculate_capacity_risk(current=current, requested=requested, within_bounds=True)
+    assert "scale-down" in risk["factors"]
+
+
+@pytest.mark.unit
+def test_minimum_increase_above_step_is_not_low_risk() -> None:
+    # A minimum raised by more than one step is out of bounds, so the operation
+    # is never eligible for low-risk self-approval.
+    limits = {"floor": 0, "ceiling": 1000, "max_step": 10}
+    current = {"desired": 500, "minimum": 400, "maximum": 1000}
+    requested = {"desired": 500, "minimum": 500, "maximum": 1000}
+    change = capacity_change(current, requested)
+    violations = capacity_bounds_violations(requested=requested, change=change, limits=limits, target_enrolled=True)
+    assert "MINIMUM_DELTA_EXCEEDS_MAX_STEP" in violations
+    risk = calculate_capacity_risk(current=current, requested=requested, within_bounds=not violations)
+    assert risk["level"] != "low"
+
+
+@pytest.mark.unit
+def test_maximum_decrease_above_step_is_not_low_risk() -> None:
+    limits = {"floor": 0, "ceiling": 1000, "max_step": 10}
+    current = {"desired": 500, "minimum": 400, "maximum": 1000}
+    requested = {"desired": 500, "minimum": 400, "maximum": 520}
+    change = capacity_change(current, requested)
+    violations = capacity_bounds_violations(requested=requested, change=change, limits=limits, target_enrolled=True)
+    assert "MAXIMUM_DELTA_EXCEEDS_MAX_STEP" in violations
+    risk = calculate_capacity_risk(current=current, requested=requested, within_bounds=not violations)
+    assert risk["level"] != "low"
+
+
+@pytest.mark.unit
 def test_effective_authority_is_the_minimum() -> None:
     inputs = {
         "deployment_mode": "operate",

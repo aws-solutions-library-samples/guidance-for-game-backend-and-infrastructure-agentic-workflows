@@ -206,7 +206,7 @@ def calculate_capacity_risk(
     if change["desired"] > 0 or change["maximum"] > 0:
         score += 10
         factors.append("scale-up")
-    if change["desired"] < 0 or change["minimum"] < 0:
+    if change["desired"] < 0 or change["minimum"] < 0 or change["maximum"] < 0:
         score += 15
         factors.append("scale-down")
     if not within_bounds:
@@ -234,6 +234,10 @@ def capacity_bounds_violations(
     """Return the sorted, deduplicated server-owned bounds violations.
 
     ``limits`` are server-owned enrollment/policy bounds — never client input.
+    The ``max_step`` cap governs every dimension: a desired, minimum, or maximum
+    delta larger than ``max_step`` is a step violation, so widening or collapsing
+    the autoscaling band by more than one step is out of bounds even when the
+    desired value is unchanged.
     """
     violations: set[str] = set()
 
@@ -253,6 +257,10 @@ def capacity_bounds_violations(
         violations.add("MAXIMUM_ABOVE_CEILING")
     if abs(change["desired"]) > limits["max_step"]:
         violations.add("DELTA_EXCEEDS_MAX_STEP")
+    if abs(change["minimum"]) > limits["max_step"]:
+        violations.add("MINIMUM_DELTA_EXCEEDS_MAX_STEP")
+    if abs(change["maximum"]) > limits["max_step"]:
+        violations.add("MAXIMUM_DELTA_EXCEEDS_MAX_STEP")
 
     return sorted(violations)
 
