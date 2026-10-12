@@ -21,6 +21,7 @@ from __future__ import annotations
 
 # Local modules
 from operations.advice import CapacityBounds, CapacityStatePort
+from operations.contracts.capacity import capacity_policy_version
 from operations.identity import VerifiedPrincipal
 
 
@@ -58,7 +59,12 @@ class DeploymentCapacityBoundsResolver:
         self._enrollment_id = enrollment_id
         self._enrollment_version = enrollment_version
         self._policy_id = policy_id
-        self._policy_version = policy_version
+        # Bind the server-owned limits into the policy version so a later band
+        # change makes a pending operation fail the approval policy version
+        # match rather than approving under a band it was never evaluated under.
+        self._policy_version = capacity_policy_version(
+            policy_version, {"floor": floor, "ceiling": ceiling, "max_step": max_step}
+        )
 
     def resolve_bounds(self, *, requester: VerifiedPrincipal, fleet_id: str, location: str) -> CapacityBounds:
         """Return server-owned bounds; ``target_enrolled`` reflects a fresh read."""
