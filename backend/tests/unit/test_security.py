@@ -30,6 +30,52 @@ class TestInputValidation:
         with pytest.raises(InputValidationError, match="cannot be empty"):
             validate_prompt("")
 
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "   ",
+            "\t\n",
+            "\u00a0",  # non-breaking space
+            "\u2003",  # em space
+            " \u00a0 \u2003\t",  # mixed ASCII and Unicode whitespace
+            "\u200b",  # zero-width space (not removed by str.strip)
+            "\ufeff",  # zero-width no-break space / BOM
+            "\u200b\u200c\ufeff",  # only zero-width characters
+            " \u200b \u00a0 ",  # whitespace plus zero-width characters
+        ],
+        ids=[
+            "ascii-spaces",
+            "tab-newline",
+            "nbsp",
+            "em-space",
+            "mixed-unicode-whitespace",
+            "zero-width-space",
+            "bom",
+            "only-zero-width",
+            "whitespace-and-zero-width",
+        ],
+    )
+    def test_validate_prompt_whitespace_only_raises_error(self, prompt):
+        """Whitespace-only prompts (including Unicode and zero-width) are rejected.
+
+        A prompt that reduces to nothing meaningful would produce an empty
+        Memory search query, so it is rejected with the same bounded response
+        as an empty prompt before any agent construction or Memory retrieval.
+        """
+        # Local modules
+        from utils.security import InputValidationError, validate_prompt
+
+        with pytest.raises(InputValidationError, match="cannot be empty"):
+            validate_prompt(prompt)
+
+    def test_validate_prompt_preserves_internal_whitespace(self):
+        """Prompts with meaningful content keep their internal spacing."""
+        # Local modules
+        from utils.security import validate_prompt
+
+        result = validate_prompt("  How is my fleet doing?  ")
+        assert result == "How is my fleet doing?"
+
     def test_validate_prompt_non_string_raises_error(self):
         """Non-string prompts should raise InputValidationError."""
         # Local modules

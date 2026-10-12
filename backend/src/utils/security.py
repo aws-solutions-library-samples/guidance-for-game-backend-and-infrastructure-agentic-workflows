@@ -37,6 +37,11 @@ def _get_logger() -> Logger:
 # Maximum prompt length (characters)
 MAX_PROMPT_LENGTH = 32000
 
+# Zero-width and byte-order-mark characters that str.strip() does not remove but
+# carry no meaning for a Memory search query. A prompt consisting only of these
+# (optionally with ordinary whitespace) is treated as empty.
+_ZERO_WIDTH_CHARS = "\u200b\u200c\u200d\u2060\ufeff"
+
 # Maximum conversation history messages
 MAX_HISTORY_MESSAGES = 100
 
@@ -123,7 +128,17 @@ def validate_prompt(prompt: str, strict_mode: bool = False) -> str:
     prompt = prompt.replace("\x00", "")
     prompt = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f]", "", prompt)
 
-    return prompt.strip()
+    prompt = prompt.strip()
+
+    # Reject prompts that reduce to nothing meaningful. Unicode whitespace is
+    # removed by strip(), but zero-width characters are not, yet an all
+    # zero-width prompt still yields an empty Memory search query. Rejecting
+    # here keeps the empty and whitespace-only paths identical and prevents an
+    # invalid downstream retrieval call.
+    if not prompt.strip(_ZERO_WIDTH_CHARS):
+        raise InputValidationError("Prompt cannot be empty")
+
+    return prompt
 
 
 def validate_user_context(context: dict | None) -> dict:
