@@ -261,6 +261,8 @@ describe('/api/copilot/chat - CSRF same-origin check', () => {
     delete process.env.NEXT_PUBLIC_SKIP_AUTH;
     delete process.env.AGENTCORE_RUNTIME_ID;
     delete process.env.COGNITO_CLIENT_ID;
+    delete process.env.GBAW_TENANT_ID;
+    delete process.env.GBAW_WORKSPACE_ID;
   });
 
   it('rejects a cross-origin POST with 403 before any token or runtime call', async () => {
@@ -307,7 +309,17 @@ describe('/api/copilot/chat - CSRF same-origin check', () => {
     expect(mockFetchWithTimeout).not.toHaveBeenCalled();
   });
 
-  it('allows a same-origin POST through the CSRF check', async () => {
+  it('allows a same-origin POST through the CSRF check to a successful response', async () => {
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      'cognito:groups': ['users'],
+      scope: 'openid profile',
+    });
     const { req, res } = createMocks({
       method: 'POST',
       headers: {
@@ -323,9 +335,37 @@ describe('/api/copilot/chat - CSRF same-origin check', () => {
 
     await handler(req, res);
 
-    // The request passed the CSRF gate and reached operation handling, so it is
-    // not a 403 CSRF rejection.
-    expect(res._getStatusCode()).not.toBe(403);
+    expect(res._getStatusCode()).toBe(200);
+    expect(JSON.parse(res._getData()).data.availableAgents).toBeDefined();
     expect(mockVerify).toHaveBeenCalled();
+  });
+
+  it('does not gate a cross-origin GET connectivity probe', async () => {
+    // Hosted-style (no local bypass), so isSameOrigin would reject this request
+    // if the gate applied to GET.
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      'cognito:groups': ['users'],
+      scope: 'openid profile',
+    });
+    mockFetchWithTimeout.mockResolvedValue({ ok: true, status: 200, text: async () => 'ok' });
+    const { req, res } = createMocks({
+      method: 'GET',
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://evil.example.com',
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
+      },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(JSON.parse(res._getData()).status).toBe('connected');
   });
 });
