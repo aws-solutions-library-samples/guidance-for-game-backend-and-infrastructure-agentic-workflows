@@ -167,8 +167,8 @@ class TestInvokeAgent:
 
     @pytest.mark.parametrize(
         "prompt",
-        ["   ", "\t\n", "\u00a0\u2003", "\u200b\ufeff"],
-        ids=["ascii-spaces", "tab-newline", "unicode-whitespace", "zero-width"],
+        ["   ", "\t\n", "\u00a0\u2003", "\u200b\ufeff", "\u200b \u200b", "\u200e\u00ad"],
+        ids=["ascii-spaces", "tab-newline", "unicode-whitespace", "zero-width", "interleaved", "format-chars"],
     )
     def test_invoke_agent_whitespace_only_skips_memory_retrieval(self, mock_orchestrator, prompt):
         """Whitespace-only prompts are rejected before Memory retrieval (#525).

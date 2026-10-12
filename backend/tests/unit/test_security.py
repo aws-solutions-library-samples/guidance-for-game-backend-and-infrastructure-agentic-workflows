@@ -42,6 +42,14 @@ class TestInputValidation:
             "\ufeff",  # zero-width no-break space / BOM
             "\u200b\u200c\ufeff",  # only zero-width characters
             " \u200b \u00a0 ",  # whitespace plus zero-width characters
+            "\u200b \u200b",  # zero-width interleaved with a space
+            "\u200b\u00a0\u200b",  # zero-width interleaved with a non-breaking space
+            "\ufeff\n\ufeff",  # byte-order marks around a newline
+            "\u200e\u200f",  # directional marks
+            "\u00ad",  # soft hyphen
+            "\u2062",  # invisible times
+            "\u180e",  # Mongolian vowel separator
+            "\x7f",  # DEL
         ],
         ids=[
             "ascii-spaces",
@@ -53,6 +61,14 @@ class TestInputValidation:
             "bom",
             "only-zero-width",
             "whitespace-and-zero-width",
+            "interleaved-zero-width-space",
+            "interleaved-zero-width-nbsp",
+            "interleaved-bom-newline",
+            "directional-marks",
+            "soft-hyphen",
+            "invisible-times",
+            "mongolian-vowel-separator",
+            "del",
         ],
     )
     def test_validate_prompt_whitespace_only_raises_error(self, prompt):
@@ -68,13 +84,23 @@ class TestInputValidation:
         with pytest.raises(InputValidationError, match="cannot be empty"):
             validate_prompt(prompt)
 
-    def test_validate_prompt_preserves_internal_whitespace(self):
-        """Prompts with meaningful content keep their internal spacing."""
+    @pytest.mark.parametrize(
+        ("prompt", "expected"),
+        [
+            ("  How is my fleet doing?  ", "How is my fleet doing?"),
+            ("  List   fleets\n\n  in us-west-2  ", "List   fleets\n\n  in us-west-2"),
+            ("Game\u200bLift fleets", "Game\u200bLift fleets"),
+            ("\u200bshow costs", "\u200bshow costs"),
+            ("\U0001f468\u200d\U0001f4bb status", "\U0001f468\u200d\U0001f4bb status"),
+        ],
+        ids=["edge-spaces", "internal-whitespace-runs", "embedded-zero-width", "leading-zero-width", "emoji-zwj"],
+    )
+    def test_validate_prompt_keeps_real_content_unchanged(self, prompt, expected):
+        """Prompts with real content are returned trimmed but otherwise unchanged."""
         # Local modules
         from utils.security import validate_prompt
 
-        result = validate_prompt("  How is my fleet doing?  ")
-        assert result == "How is my fleet doing?"
+        assert validate_prompt(prompt) == expected
 
     def test_validate_prompt_non_string_raises_error(self):
         """Non-string prompts should raise InputValidationError."""
