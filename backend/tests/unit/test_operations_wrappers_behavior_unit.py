@@ -246,16 +246,50 @@ def test_disable_help_describes_data_preserving_no_rebuild():
 # --------------------------------------------------------------------------- #
 def test_deploy_enable_advise_without_matching_mode_env_refuses():
     """--mode advise requires GBAW_OPERATIONS_MODE=advise to match; a mismatched
-    (or observe) env value is refused so an enable never silently escalates."""
-    result = _run(DEPLOY, "--enable", "--mode", "advise", env_extra={"GBAW_OPERATIONS_MODE": "observe"})
+    (observe) env value is refused via the MODE-MISMATCH guard specifically, so
+    an enable never silently escalates. Complete enabling inputs are supplied so
+    the only thing that can fail is the mode mismatch, not a missing input."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        "--mode",
+        "advise",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "observe",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+        },
+    )
     assert result.returncode == 3
-    assert "Refusing to enable" in result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+    assert "set GBAW_OPERATIONS_MODE=advise to confirm" in combined
+    assert "match the selected --mode advise" in combined
 
 
 def test_deploy_enable_observe_with_advise_env_refuses():
-    """The reverse mismatch (--mode observe, env advise) is equally refused."""
-    result = _run(DEPLOY, "--enable", "--mode", "observe", env_extra={"GBAW_OPERATIONS_MODE": "advise"})
+    """The reverse mismatch (--mode observe, env advise) is equally refused via
+    the mode-mismatch guard, with complete inputs so only the mismatch can fail."""
+    result = _run(
+        DEPLOY,
+        "--enable",
+        "--mode",
+        "observe",
+        env_extra={
+            "GBAW_OPERATIONS_MODE": "advise",
+            "COGNITO_ISSUER": "https://issuer.example",
+            "COGNITO_CLIENT_ID": "client-123",
+            "TENANT_ID": "tenant-abc",
+            "WORKSPACE_ID": "workspace-abc",
+            "GBAW_OPERATIONS_ARTIFACT_BUCKET": "some-bucket",
+        },
+    )
     assert result.returncode == 3
+    combined = result.stdout + result.stderr
+    assert "set GBAW_OPERATIONS_MODE=observe to confirm" in combined
+    assert "match the selected --mode observe" in combined
 
 
 def test_deploy_enable_invalid_mode_refuses():
@@ -277,13 +311,12 @@ def test_deploy_enable_advise_matching_mode_reaches_input_validation():
 
 
 def test_deploy_enable_passes_e2_settings_in_overrides():
-    """The enable PARAM_OVERRIDES must pass the three E2 settings so the
-    advise-mode runtime posture is applied."""
-    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
-    enable = _DEPLOY_TEXT[idx:]
-    assert '"LowRiskSelfApproval=${LOW_RISK_SELF_APPROVAL}"' in enable
-    assert '"PreparationExpirySeconds=${PREPARATION_EXPIRY_SECONDS}"' in enable
-    assert '"ApprovalExpirySeconds=${APPROVAL_EXPIRY_SECONDS}"' in enable
+    """The enable path must resolve and pass the three E2 settings (self-approval
+    and the two expiry windows) so the advise-mode runtime posture is applied,
+    using the env > deployed > default resolver so a re-enable preserves them."""
+    assert "_resolve_e2 GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL LowRiskSelfApproval" in _DEPLOY_TEXT
+    assert "_resolve_e2 GBAW_OPERATIONS_PREPARATION_EXPIRY_S PreparationExpirySeconds" in _DEPLOY_TEXT
+    assert "_resolve_e2 GBAW_OPERATIONS_APPROVAL_EXPIRY_S ApprovalExpirySeconds" in _DEPLOY_TEXT
 
 
 def test_disable_reuses_e2_settings_unchanged():
@@ -320,11 +353,12 @@ def test_disable_help_describes_data_preserving_no_rebuild_e2():
 # emergency disable. Safe defaults (0/1/1) cap a fresh enable at one instance.
 # --------------------------------------------------------------------------- #
 def test_deploy_capacity_defaults_are_safe_zero_one_one():
-    """The wrapper's capacity defaults match the template safe defaults (0/1/1)
-    so a fresh enable with no override never scales past one instance."""
-    assert re.search(r'CAPACITY_FLOOR="\$\{GBAW_OPERATIONS_CAPACITY_FLOOR:-0\}"', _DEPLOY_TEXT)
-    assert re.search(r'CAPACITY_CEILING="\$\{GBAW_OPERATIONS_CAPACITY_CEILING:-1\}"', _DEPLOY_TEXT)
-    assert re.search(r'CAPACITY_MAX_STEP="\$\{GBAW_OPERATIONS_CAPACITY_MAX_STEP:-1\}"', _DEPLOY_TEXT)
+    """The wrapper's capacity resolver defaults match the template safe defaults
+    (0/1/1) so a fresh enable with no override never scales past one instance.
+    The defaults are the final argument to the env > deployed > default resolver."""
+    assert re.search(r"_resolve_e2 GBAW_OPERATIONS_CAPACITY_FLOOR CapacityFloor 0\b", _DEPLOY_TEXT)
+    assert re.search(r"_resolve_e2 GBAW_OPERATIONS_CAPACITY_CEILING CapacityCeiling 1\b", _DEPLOY_TEXT)
+    assert re.search(r"_resolve_e2 GBAW_OPERATIONS_CAPACITY_MAX_STEP CapacityMaxStep 1\b", _DEPLOY_TEXT)
 
 
 def test_deploy_capacity_overrides_come_from_env_not_request_body():
@@ -341,13 +375,12 @@ def test_deploy_capacity_overrides_come_from_env_not_request_body():
 
 
 def test_deploy_enable_passes_capacity_settings_in_overrides():
-    """The enable PARAM_OVERRIDES must pass all three capacity settings so the
-    server-owned bound is applied."""
-    idx = _DEPLOY_TEXT.index("# ENABLE path deploy")
-    enable = _DEPLOY_TEXT[idx:]
-    assert '"CapacityFloor=${CAPACITY_FLOOR}"' in enable
-    assert '"CapacityCeiling=${CAPACITY_CEILING}"' in enable
-    assert '"CapacityMaxStep=${CAPACITY_MAX_STEP}"' in enable
+    """The enable path must resolve and pass all three capacity settings so the
+    server-owned bound is applied, through the env > deployed > default resolver
+    so a re-enable preserves a cost-reviewed band."""
+    assert "_resolve_e2 GBAW_OPERATIONS_CAPACITY_FLOOR CapacityFloor" in _DEPLOY_TEXT
+    assert "_resolve_e2 GBAW_OPERATIONS_CAPACITY_CEILING CapacityCeiling" in _DEPLOY_TEXT
+    assert "_resolve_e2 GBAW_OPERATIONS_CAPACITY_MAX_STEP CapacityMaxStep" in _DEPLOY_TEXT
 
 
 def test_disable_reuses_capacity_settings_unchanged():

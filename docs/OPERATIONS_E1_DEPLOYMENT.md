@@ -756,11 +756,13 @@ Windows, run these wrappers under WSL or a POSIX shell.
 
 E2 extends the E1 observation control plane **additively** through GitHub issue
 [#414](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/414).
-It edits **no** backend application code: it widens the same CloudFormation
-stack, deploy wrapper, and this runbook. It adds a read-only **prepare** step and
-a **human-approval gate** (approve / reject / cancel) with **no** provider write
-for bounded GameLift. Provisioning stays separate and default-`false`; an
-emergency disable stays reversible.
+It widens the same CloudFormation stack, deploy wrapper, and this runbook, and
+adds the backend prepare/approval application code the advise routes need (the
+deployable handler wiring plus the capacity playbook and the deployed shakedown
+harness). It adds a read-only **prepare** step and a **human-approval gate**
+(approve / reject / cancel) with **no** provider write for bounded GameLift.
+Provisioning stays separate and default-`false`; an emergency disable stays
+reversible.
 
 ## OperationsMode vocabulary (widened)
 
@@ -798,8 +800,9 @@ of these routes.
 ## E2 environment / deployment bindings (frozen core names)
 
 These are the **frozen core env names** E2 defines. The stack injects them from
-validated CloudFormation parameters; the core runtime consumes them in a later
-slice.
+validated CloudFormation parameters, and the runtime consumes them now: the
+deployable handler resolves them through `OperationsSettings` to build the
+prepare/approval surface.
 
 | Name | CFN parameter | Default | Meaning |
 | --- | --- | --- | --- |
@@ -812,15 +815,22 @@ slice.
 
 ## E2 CloudWatch metric names (namespace `GameAgent/Operations`)
 
-The four E1 metrics/alarms are **retained**. E2 adds four more alarms in the same
-namespace:
+The E1 metrics and alarms are **retained**. E2 adds four more metrics in the
+same namespace, each with its own alarm. The two service-side failure alarms
+page (they carry the alarm action); the two expected-caller-outcome alarms are
+**informational** (no alarm action), so a routine expiry or a fenced cancellation
+race never pages:
 
-| Metric | Meaning |
-| --- | --- |
-| `PreparationFailures` | Count of failed prepare-operation requests. |
-| `ApprovalFailures` | Count of failed approval-gate requests (approve/reject). |
-| `ApprovalExpired` | Count of approvals or prepared operations that expired before dispatch. |
-| `CancellationConflicts` | Count of cancellation attempts that conflicted with a concurrent state change. |
+| Metric | Alarm posture | Meaning |
+| --- | --- | --- |
+| `PreparationFailures` | Paging | Count of service-side prepare-operation failures (not caller 4xx). |
+| `ApprovalFailures` | Paging | Count of service-side approval-gate failures (approve/reject). |
+| `ApprovalExpired` | Informational | Count of approvals or prepared operations that expired before dispatch. |
+| `CancellationConflicts` | Informational | Count of cancellations that lost a fenced race with a concurrent state change. |
+
+Expected caller outcomes — authorization denial, a self-approval denial, invalid
+input, not-found, a policy-stale or state conflict, and expiry — publish **no**
+failure metric, so a clean shakedown run never trips the paging alarms.
 
 ## IAM boundary (unchanged for bounded GameLift E2)
 
@@ -889,11 +899,14 @@ the template's own bounds.
 
 ## Packaging carries the E2 contract schemas
 
-On `--enable` the wrapper's runtime probe additionally loads the E2 contract
-schemas (`prepare-operation-request`, `approval-record`, `prepared-operation`)
-from the staged package, so a package that ships the handler but omits an E2
-schema **fails closed before upload** rather than at the first prepare/approve/
-reject/cancel request.
+On `--enable` the wrapper's runtime probe additionally loads the E2 **capacity**
+contract schemas the advise routes validate against — every name in
+`operations.contracts.capacity.CAPACITY_SCHEMA_NAMES` (`gamelift-capacity-proposal-request`,
+`gamelift-capacity-advice`, `gamelift-capacity-authorization`,
+`gamelift-capacity-prepared-operation`) via `load_capacity_schema` — from the
+staged package, so a package that ships the handler but omits a capacity schema
+**fails closed before upload** rather than at the first prepare/approve/reject/
+cancel request.
 
 ## Emergency disable (unchanged, rebuild-free)
 
@@ -903,6 +916,45 @@ AWS_PROFILE=<profile> AWS_REGION=<region>   ./scripts/infrastructure/deploy-oper
 
 `--disable` still keeps `Provisioned=true` and every resource under
 CloudFormation with stable physical names and retained audit data, reusing every
-current parameter value (including the three E2 settings) via `UsePreviousValue`
-and setting only `OperationsMode=disabled`. It rebuilds no code and runs no
-Docker. A later `--enable --mode observe|advise` is fully reversible.
+current parameter value (including the six E2 settings — self-approval, the two
+expiry windows, and the three capacity dimensions) via `UsePreviousValue` and
+setting only `OperationsMode=disabled`. It rebuilds no code and runs no Docker.
+A later `--enable --mode observe|advise` is fully reversible: a re-enable that
+omits an E2 variable keeps the stack's deployed value rather than resetting it to
+a default, so a cost-reviewed capacity band or a narrowed approval window
+survives the disable/enable cycle.
+
+## Run the E2 shakedown
+
+After enabling `advise`, verify the deployed prepare/approval lifecycle against
+the live stage with the public-safe shakedown harness. It issues only HTTP calls
+against the stack's own operations API and never echoes the endpoint, a token, or
+an operation id. All inputs come from `--flags` or the matching `GBAW_E2_*`
+environment variables (placeholders shown):
+
+```bash
+python -m operations.validation.e2_shakedown \
+  --endpoint        "https://<api-id>.execute-api.<region>.amazonaws.com" \
+  --access-token    "<requester access token>" \
+  --approver-token  "<distinct approver access token>" \
+  --fleet-id        "fleet-00000000-0000-0000-0000-000000000000" \
+  --location        "<location>" \
+  --observation-id  "obs_00000000000000000000000000"
+# Optional: --current-desired <int>  --expiry-wait-seconds <int>  --out report.json
+```
+
+| Input | Flag | Environment variable |
+| --- | --- | --- |
+| Operations API base URL | `--endpoint` | `GBAW_E2_ENDPOINT` |
+| Requester access token | `--access-token` | `GBAW_E2_ACCESS_TOKEN` |
+| Distinct approver access token | `--approver-token` | `GBAW_E2_APPROVER_TOKEN` |
+| Target fleet id | `--fleet-id` | `GBAW_E2_FLEET_ID` |
+| Target location | `--location` | `GBAW_E2_LOCATION` |
+| Bound observation id | `--observation-id` | `GBAW_E2_OBSERVATION_ID` |
+| Current desired (optional) | `--current-desired` | `GBAW_E2_CURRENT_DESIRED` |
+| Real-time expiry wait, seconds (optional) | `--expiry-wait-seconds` | `GBAW_E2_EXPIRY_WAIT_SECONDS` |
+
+The run exercises only expected caller outcomes (self-approval denial, replay and
+reject/cancel conflicts, bounded evidence), so a clean run prints a JSON summary
+and publishes no failure metric — it never trips the paging alarms. A transport
+failure prints a fixed, input-free error and exits non-zero without a traceback.

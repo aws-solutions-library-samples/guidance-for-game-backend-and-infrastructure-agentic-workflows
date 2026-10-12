@@ -42,6 +42,16 @@ PROJECT_NAME="game-agent"
 STACK_NAME="${PROJECT_NAME}-operations"
 TEMPLATE="$PROJECT_ROOT/infrastructure/cloudformation/06-operations-observation.yaml"
 BACKEND_SRC="$PROJECT_ROOT/backend/src"
+# CloudFormation caps an inline template body (validate-template --template-body,
+# deploy without --s3-bucket) at 51,200 bytes; an S3-backed template
+# (--template-url / deploy --s3-bucket) is capped at 460,800 bytes. The E2
+# template exceeds the inline cap, so both preview validation and enable upload
+# the template to the verified artifact bucket and reference it by URL. A size
+# check runs before any upload so an over-limit template is refused cleanly and
+# leaves no stray object.
+TEMPLATE_S3_LIMIT_BYTES=460800
+# The S3 key prefix for the uploaded template (content-hash key under it).
+TEMPLATE_S3_PREFIX="operations/templates"
 HANDLER_MODULE_PATH="operations/observe/lambda_entry.py"
 # Documentary constant mirrored by the packaging-contract test; the import probe
 # below references the dotted module directly inside its Python heredoc.
@@ -82,20 +92,12 @@ COGNITO_CLIENT_ID="${COGNITO_CLIENT_ID:-}"
 TENANT_ID="${TENANT_ID:-}"
 WORKSPACE_ID="${WORKSPACE_ID:-}"
 TRUSTED_AUDIENCE="${TRUSTED_AUDIENCE:-}"
-# E2 (issue #414) server-owned advise settings. Self-approval defaults OFF so
-# a fresh enable never self-approves; expiry windows match the core defaults.
-LOW_RISK_SELF_APPROVAL="${GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL:-false}"
-PREPARATION_EXPIRY_SECONDS="${GBAW_OPERATIONS_PREPARATION_EXPIRY_S:-900}"
-APPROVAL_EXPIRY_SECONDS="${GBAW_OPERATIONS_APPROVAL_EXPIRY_S:-1800}"
-# E2 (issue #414) server-owned CAPACITY POLICY defaults. Accepted ONLY as
-# explicit, bounded environment overrides — never parsed from a request body.
-# The SAFE defaults 0/1/1 cap a fresh enable at exactly one instance; raising
-# them is a deliberate, cost-relevant act (explicit stack update + cost
-# review). The full coherent bound (floor <= ceiling, 0 < max_step <=
-# ceiling - floor) is validated below before any AWS call.
-CAPACITY_FLOOR="${GBAW_OPERATIONS_CAPACITY_FLOOR:-0}"
-CAPACITY_CEILING="${GBAW_OPERATIONS_CAPACITY_CEILING:-1}"
-CAPACITY_MAX_STEP="${GBAW_OPERATIONS_CAPACITY_MAX_STEP:-1}"
+# E2 (issue #414) server-owned advise settings (self-approval, expiry windows)
+# and the capacity band are resolved later with env > deployed-stack > default
+# precedence and validated on the EFFECTIVE set, so a plain re-enable keeps a
+# cost-reviewed band and a narrowed window rather than resetting them. They are
+# accepted ONLY as explicit, bounded environment overrides, never from a request
+# body. The safe capacity default 0/1/1 caps a fresh enable at one instance.
 # The EXPLICIT, pre-existing artifact bucket for the Lambda zip. There is no
 # discovery and no creation: an enabled deploy requires this to name a bucket
 # that already exists in the target account/region.
@@ -191,7 +193,14 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --enable)  ACTION="enable" ;;
         --disable) ACTION="disable" ;;
-        --mode) shift; REQUESTED_MODE="${1:-observe}" ;;
+        --mode)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "❌ --mode requires a value (observe|advise)." >&2
+                exit 2
+            fi
+            REQUESTED_MODE="$1"
+            ;;
         --allow-binding-change) ALLOW_BINDING_CHANGE="true" ;;
         --environment)
             shift
@@ -215,7 +224,7 @@ if [ "$ENVIRONMENT" != "beta" ] && [ "$ENVIRONMENT" != "prod" ]; then
 fi
 
 echo "=================================================="
-echo " ⚙️  OPTIONAL E1 operations control plane"
+echo " ⚙️  OPTIONAL E1/E2 operations control plane"
 echo "=================================================="
 echo "Region:      $AWS_REGION"
 echo "Profile:     ${AWS_PROFILE:-<ambient credentials>}"
@@ -223,6 +232,23 @@ echo "Stack:       $STACK_NAME"
 echo "Environment: $ENVIRONMENT"
 echo "Action:      $ACTION"
 echo ""
+
+# The template must fit the S3-backed CloudFormation limit; it is referenced by
+# URL (never sent inline) because it exceeds the inline cap. Checked before any
+# artifact or template upload so an over-limit template is refused cleanly and
+# leaves no stray S3 object.
+_template_bytes() {
+    wc -c < "$TEMPLATE" | tr -d '[:space:]'
+}
+_require_template_within_s3_limit() {
+    local _bytes
+    _bytes="$(_template_bytes)"
+    if [ "$_bytes" -gt "$TEMPLATE_S3_LIMIT_BYTES" ]; then
+        echo "❌ Template is ${_bytes} bytes, over the ${TEMPLATE_S3_LIMIT_BYTES}-byte S3-backed" >&2
+        echo "   CloudFormation limit. Trim the template before deploying." >&2
+        exit 3
+    fi
+}
 
 if ! command -v aws >/dev/null 2>&1; then
     echo "❌ AWS CLI not found." >&2
@@ -235,19 +261,47 @@ fi
 # --------------------------------------------------------------------------- #
 if [ "$ACTION" = "preview" ]; then
     echo "🔎 Preview only (READ-ONLY). Validating and linting the template."
-    echo "   To deploy: GBAW_OPERATIONS_MODE=observe $0 --enable"
+    echo "   To deploy observe (E1): GBAW_OPERATIONS_MODE=observe $0 --enable"
+    echo "   To deploy advise (E2):  GBAW_OPERATIONS_MODE=advise  $0 --enable --mode advise"
+    _require_template_within_s3_limit
     if command -v cfn-lint >/dev/null 2>&1; then
         echo "   Running cfn-lint ..."
         cfn-lint "$TEMPLATE"
     else
         echo "   cfn-lint not found; skipping lint."
     fi
-    echo "   Running template service validation (read-only) ..."
-    aws cloudformation validate-template \
-        "${AWS_PROFILE_ARGS[@]}" \
-        --template-body "file://$TEMPLATE" \
-        --region "$AWS_REGION" >/dev/null
-    echo "✅ Preview complete. Template validated; no resources were created."
+    # The template exceeds the inline validate-template limit, so it cannot be
+    # sent with --template-body. Service validation needs the template in S3 and
+    # referenced by URL. When the artifact bucket is configured, upload the
+    # template under a content-hash key (owner-bound) and validate by URL;
+    # otherwise run lint only and say so, rather than send an over-limit body.
+    if [ -n "$GBAW_OPERATIONS_ARTIFACT_BUCKET" ]; then
+        if PREVIEW_ACCOUNT_ID="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --query Account --output text 2>/dev/null)"; then
+            PREVIEW_TEMPLATE_HASH="$(shasum -a 256 "$TEMPLATE" | awk '{print $1}')"
+            PREVIEW_TEMPLATE_KEY="${TEMPLATE_S3_PREFIX}/${PREVIEW_TEMPLATE_HASH}.yaml"
+            echo "   Uploading template to s3://$GBAW_OPERATIONS_ARTIFACT_BUCKET/$PREVIEW_TEMPLATE_KEY ..."
+            aws s3api put-object \
+                "${AWS_PROFILE_ARGS[@]}" \
+                --bucket "$GBAW_OPERATIONS_ARTIFACT_BUCKET" \
+                --key "$PREVIEW_TEMPLATE_KEY" \
+                --body "$TEMPLATE" \
+                --expected-bucket-owner "$PREVIEW_ACCOUNT_ID" \
+                --region "$AWS_REGION" --output text --query 'ETag' >/dev/null
+            echo "   Running template service validation (read-only) by URL ..."
+            aws cloudformation validate-template \
+                "${AWS_PROFILE_ARGS[@]}" \
+                --template-url "https://${GBAW_OPERATIONS_ARTIFACT_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${PREVIEW_TEMPLATE_KEY}" \
+                --region "$AWS_REGION" >/dev/null
+            echo "✅ Preview complete. Template linted and service-validated; nothing was deployed."
+        else
+            echo "⚠️  Could not verify credentials; ran lint only (service validation skipped)." >&2
+            echo "✅ Preview complete (lint only); no resources were created."
+        fi
+    else
+        echo "ℹ️  GBAW_OPERATIONS_ARTIFACT_BUCKET is unset; ran lint only. Set it to also"
+        echo "   run read-only template service validation by URL."
+        echo "✅ Preview complete (lint only); no resources were created."
+    fi
     exit 0
 fi
 
@@ -286,26 +340,45 @@ if [ "$ACTION" = "enable" ]; then
         echo "   never discovers or creates a bucket; set it to a pre-existing bucket." >&2
         exit 6
     fi
-    # Validate the server-owned capacity band: each value must be a
-    # non-negative integer, and the band must be coherent — floor below
-    # ceiling and 0 < max_step <= (ceiling - floor). CloudFormation Rules
-    # cannot compare numbers, so this is the authoritative arithmetic guard
-    # for any explicit override, and it runs BEFORE any AWS call.
+    # Fast-fail validation of any EXPLICITLY SET capacity/expiry override BEFORE
+    # any AWS call, so a malformed or incoherent operator input is refused with
+    # no credential dependency or network call. The EFFECTIVE resolved set (env >
+    # deployed > default) is validated again after stack existence is known, so a
+    # value inherited from the deployed stack is also checked. CloudFormation
+    # Rules cannot do arithmetic, so this shell guard is authoritative.
     _int_re='^[0-9]+$'
-    if ! [[ "$CAPACITY_FLOOR" =~ $_int_re ]] || ! [[ "$CAPACITY_CEILING" =~ $_int_re ]] || ! [[ "$CAPACITY_MAX_STEP" =~ $_int_re ]]; then
-        echo "❌ Refusing to enable: capacity floor/ceiling/max_step must be non-negative integers" >&2
-        echo "   (got floor=$CAPACITY_FLOOR ceiling=$CAPACITY_CEILING max_step=$CAPACITY_MAX_STEP)." >&2
-        exit 3
+    _env_floor="$(printenv GBAW_OPERATIONS_CAPACITY_FLOOR 2>/dev/null || true)"
+    _env_ceiling="$(printenv GBAW_OPERATIONS_CAPACITY_CEILING 2>/dev/null || true)"
+    _env_max_step="$(printenv GBAW_OPERATIONS_CAPACITY_MAX_STEP 2>/dev/null || true)"
+    if [ -n "$_env_floor$_env_ceiling$_env_max_step" ]; then
+        # When any capacity dimension is overridden, require the full coherent
+        # triple so a partial override cannot pair with an incoherent default.
+        _chk_floor="${_env_floor:-0}"
+        _chk_ceiling="${_env_ceiling:-1}"
+        _chk_max_step="${_env_max_step:-1}"
+        if ! [[ "$_chk_floor" =~ $_int_re ]] || ! [[ "$_chk_ceiling" =~ $_int_re ]] || ! [[ "$_chk_max_step" =~ $_int_re ]]; then
+            echo "❌ Refusing to enable: capacity floor/ceiling/max_step must be non-negative integers" >&2
+            echo "   (got floor=$_chk_floor ceiling=$_chk_ceiling max_step=$_chk_max_step)." >&2
+            exit 3
+        fi
+        if [ "$_chk_floor" -ge "$_chk_ceiling" ]; then
+            echo "❌ Refusing to enable: capacity floor ($_chk_floor) must be strictly below ceiling ($_chk_ceiling)." >&2
+            exit 3
+        fi
+        _chk_span=$(( _chk_ceiling - _chk_floor ))
+        if [ "$_chk_max_step" -lt 1 ] || [ "$_chk_max_step" -gt "$_chk_span" ]; then
+            echo "❌ Refusing to enable: capacity max_step ($_chk_max_step) must be > 0 and <= ceiling-floor ($_chk_span)." >&2
+            exit 3
+        fi
     fi
-    if [ "$CAPACITY_FLOOR" -ge "$CAPACITY_CEILING" ]; then
-        echo "❌ Refusing to enable: capacity floor ($CAPACITY_FLOOR) must be strictly below ceiling ($CAPACITY_CEILING)." >&2
-        exit 3
-    fi
-    _capacity_span=$(( CAPACITY_CEILING - CAPACITY_FLOOR ))
-    if [ "$CAPACITY_MAX_STEP" -lt 1 ] || [ "$CAPACITY_MAX_STEP" -gt "$_capacity_span" ]; then
-        echo "❌ Refusing to enable: capacity max_step ($CAPACITY_MAX_STEP) must be > 0 and <= ceiling-floor ($_capacity_span)." >&2
-        exit 3
-    fi
+    for _pair in "GBAW_OPERATIONS_PREPARATION_EXPIRY_S" "GBAW_OPERATIONS_APPROVAL_EXPIRY_S"; do
+        _value="$(printenv "$_pair" 2>/dev/null || true)"
+        [ -z "$_value" ] && continue
+        if ! [[ "$_value" =~ $_int_re ]] || [ "$_value" -lt 1 ] || [ "$_value" -gt 86400 ]; then
+            echo "❌ Refusing to enable: $_pair must be an integer in [1, 86400] seconds (got '$_value')." >&2
+            exit 3
+        fi
+    done
     OPERATIONS_MODE="$REQUESTED_MODE"
 fi
 
@@ -453,6 +526,7 @@ fi
 # never be left with budgets that do not fit the request deadline.
 # --------------------------------------------------------------------------- #
 BUDGET_OVERRIDES=()
+PARAM_OVERRIDES_E2=()
 if [ "$ACTION" = "enable" ]; then
     # Resolve one budget key into the global ``_RESOLVED`` and, when the value is
     # operator-set or a fresh-stack default, append an explicit override. Run in
@@ -489,6 +563,68 @@ if [ "$ACTION" = "enable" ]; then
     _resolve_budget CancellationMarginSeconds CancellationMarginSeconds 3; _margin="$_RESOLVED"
     _resolve_budget LambdaTimeoutSeconds LambdaTimeoutSeconds 20; _lambda_timeout="$_RESOLVED"
     _resolve_budget LatencyAlarmThresholdMs LatencyAlarmThresholdMs 13000; _latency_ms="$_RESOLVED"
+
+    # Resolve the six server-owned E2 settings with the SAME env > deployed >
+    # default precedence, so a plain re-enable that omits them keeps the stack's
+    # deployed values instead of resetting a cost-reviewed band or a narrowed
+    # approval window back to the defaults. Only an operator-set key (or a fresh
+    # stack) is sent as an explicit override; the coherence/range checks below
+    # then run on the EFFECTIVE resolved set, not the raw env.
+    _resolve_e2() {
+        # $1 env var name, $2 CloudFormation parameter key, $3 default.
+        local _env_name="$1" _param_key="$2" _default="$3" _env_val _deployed
+        _env_val="$(printenv "$_env_name" 2>/dev/null || true)"
+        if [ -n "$_env_val" ]; then
+            PARAM_OVERRIDES_E2+=("${_param_key}=${_env_val}")
+            _RESOLVED="$_env_val"
+            return 0
+        fi
+        if [ "$STACK_EXISTS" = "true" ]; then
+            _deployed="$(_current_param "$_param_key")"
+            if [ -n "$_deployed" ] && [ "$_deployed" != "None" ]; then
+                _RESOLVED="$_deployed"
+                return 0
+            fi
+        fi
+        PARAM_OVERRIDES_E2+=("${_param_key}=${_default}")
+        _RESOLVED="$_default"
+    }
+
+    _resolve_e2 GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL LowRiskSelfApproval false
+    _resolve_e2 GBAW_OPERATIONS_PREPARATION_EXPIRY_S PreparationExpirySeconds 900; PREPARATION_EXPIRY_SECONDS="$_RESOLVED"
+    _resolve_e2 GBAW_OPERATIONS_APPROVAL_EXPIRY_S ApprovalExpirySeconds 1800; APPROVAL_EXPIRY_SECONDS="$_RESOLVED"
+    _resolve_e2 GBAW_OPERATIONS_CAPACITY_FLOOR CapacityFloor 0; CAPACITY_FLOOR="$_RESOLVED"
+    _resolve_e2 GBAW_OPERATIONS_CAPACITY_CEILING CapacityCeiling 1; CAPACITY_CEILING="$_RESOLVED"
+    _resolve_e2 GBAW_OPERATIONS_CAPACITY_MAX_STEP CapacityMaxStep 1; CAPACITY_MAX_STEP="$_RESOLVED"
+
+    # Validate the EFFECTIVE capacity band and expiry windows (CloudFormation
+    # Rules cannot do arithmetic). The band must be coherent — floor below
+    # ceiling and 0 < max_step <= ceiling-floor — and each expiry an integer in
+    # [1, 86400] seconds, whether the value came from the operator, the deployed
+    # stack, or the default.
+    _int_re='^[0-9]+$'
+    if ! [[ "$CAPACITY_FLOOR" =~ $_int_re ]] || ! [[ "$CAPACITY_CEILING" =~ $_int_re ]] || ! [[ "$CAPACITY_MAX_STEP" =~ $_int_re ]]; then
+        echo "❌ Refusing to enable: effective capacity floor/ceiling/max_step must be non-negative integers" >&2
+        echo "   (got floor=$CAPACITY_FLOOR ceiling=$CAPACITY_CEILING max_step=$CAPACITY_MAX_STEP)." >&2
+        exit 3
+    fi
+    if [ "$CAPACITY_FLOOR" -ge "$CAPACITY_CEILING" ]; then
+        echo "❌ Refusing to enable: effective capacity floor ($CAPACITY_FLOOR) must be strictly below ceiling ($CAPACITY_CEILING)." >&2
+        exit 3
+    fi
+    _capacity_span=$(( CAPACITY_CEILING - CAPACITY_FLOOR ))
+    if [ "$CAPACITY_MAX_STEP" -lt 1 ] || [ "$CAPACITY_MAX_STEP" -gt "$_capacity_span" ]; then
+        echo "❌ Refusing to enable: effective capacity max_step ($CAPACITY_MAX_STEP) must be > 0 and <= ceiling-floor ($_capacity_span)." >&2
+        exit 3
+    fi
+    for _pair in "PreparationExpirySeconds=$PREPARATION_EXPIRY_SECONDS" "ApprovalExpirySeconds=$APPROVAL_EXPIRY_SECONDS"; do
+        _name="${_pair%%=*}"
+        _value="${_pair#*=}"
+        if ! [[ "$_value" =~ $_int_re ]] || [ "$_value" -lt 1 ] || [ "$_value" -gt 86400 ]; then
+            echo "❌ Refusing to enable: effective $_name must be an integer in [1, 86400] seconds (got '$_value')." >&2
+            exit 3
+        fi
+    done
 
     # Validate the EFFECTIVE set (CloudFormation Rules cannot do arithmetic):
     # 3*read + persistence + margin <= RequestDeadlineSeconds, the Lambda timeout
@@ -527,6 +663,11 @@ if [ "$ACTION" = "enable" ]; then
         echo "   handler; no enabled route may point at missing/placeholder code." >&2
         exit 5
     fi
+
+    # Size-check the template BEFORE building or uploading the artifact, so an
+    # over-limit template is refused without leaving a stray artifact in the
+    # bucket. The template is referenced by URL (never inline) at deploy.
+    _require_template_within_s3_limit
 
     BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gbaw-ops-pkg.XXXXXXXX")"
     trap 'rm -rf "$BUILD_DIR"' EXIT
@@ -713,14 +854,16 @@ try:
 except v.ContractValidationError:
     pass
 # E2 (issue #414): the advise-mode routes (POST /operations/prepare and
-# POST /operations/{operationId}/approve|reject|cancel) validate against these
-# contract schemas at runtime. Load each explicitly so a package that ships
-# the handler but OMITS an E2 schema fails the probe here, before upload,
+# POST /operations/{operationId}/approve|reject|cancel) validate the capacity
+# proposal, advice, authorization, and prepared-operation documents against the
+# gamelift-capacity-* contract schemas at runtime. Load every name in the
+# capacity schema set via load_capacity_schema so a package that ships the
+# handler but OMITS a capacity schema fails the probe here, before upload,
 # instead of at the first prepare/approve/reject/cancel request.
-for e2_schema in ("prepare-operation-request", "approval-record", "prepared-operation"):
-    assert e2_schema in SCHEMA_NAMES, "E2 schema %s absent from package" % e2_schema
-    v.load_schema(e2_schema)
-print("runtime probe ok: handler import + %d schemas loaded (incl. E2 prepare/approve)" % len(SCHEMA_NAMES))
+from operations.contracts.capacity import CAPACITY_SCHEMA_NAMES, load_capacity_schema
+for e2_schema in sorted(CAPACITY_SCHEMA_NAMES):
+    load_capacity_schema(e2_schema)
+print("runtime probe ok: handler import + %d schemas + %d capacity schemas (incl. E2 prepare/approve)" % (len(SCHEMA_NAMES), len(CAPACITY_SCHEMA_NAMES)))
 PROBE
 )"
 
@@ -940,13 +1083,13 @@ PARAM_OVERRIDES=(
     "CognitoClientId=${COGNITO_CLIENT_ID}"
     "CodeS3Bucket=${CODE_S3_BUCKET:-}"
     "CodeS3Key=${CODE_S3_KEY}"
-    "LowRiskSelfApproval=${LOW_RISK_SELF_APPROVAL}"
-    "PreparationExpirySeconds=${PREPARATION_EXPIRY_SECONDS}"
-    "ApprovalExpirySeconds=${APPROVAL_EXPIRY_SECONDS}"
-    "CapacityFloor=${CAPACITY_FLOOR}"
-    "CapacityCeiling=${CAPACITY_CEILING}"
-    "CapacityMaxStep=${CAPACITY_MAX_STEP}"
 )
+# The six server-owned E2 settings are sent only when the operator set them (or
+# on a fresh stack); a key the operator did not set keeps its deployed value on
+# a re-enable instead of being reset to a default (see _resolve_e2 above).
+if [ "${#PARAM_OVERRIDES_E2[@]}" -gt 0 ]; then
+    PARAM_OVERRIDES+=("${PARAM_OVERRIDES_E2[@]}")
+fi
 if [ "${#BUDGET_OVERRIDES[@]}" -gt 0 ]; then
     PARAM_OVERRIDES+=("${BUDGET_OVERRIDES[@]}")
 fi
@@ -960,9 +1103,15 @@ if [ "$STACK_EXISTS" != "true" ] || [ "$ALLOW_BINDING_CHANGE" = "true" ]; then
 fi
 
 echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."
+# The template exceeds the inline limit, so it is NOT sent with --template-file
+# alone (which would send it inline and be rejected). Passing --s3-bucket (with
+# the same verified, owner-bound artifact bucket) and --s3-prefix makes the CLI
+# upload the template under operations/templates/ and reference it by URL.
 aws cloudformation deploy \
     "${AWS_PROFILE_ARGS[@]}" \
     --template-file "$TEMPLATE" \
+    --s3-bucket "$CODE_S3_BUCKET" \
+    --s3-prefix "$TEMPLATE_S3_PREFIX" \
     --stack-name "$STACK_NAME" \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "$AWS_REGION" \

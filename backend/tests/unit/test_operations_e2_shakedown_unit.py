@@ -387,3 +387,59 @@ def test_config_rejects_unbounded_expiry_wait() -> None:
             observation_id=OBS_ID,
             expiry_wait_seconds=10_000.0,
         )
+
+
+def test_main_catches_transport_failure_without_leaking_endpoint_or_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A transport failure (e.g. a refused connection) must not print a raw
+    # traceback that names the endpoint host or an operation path. main() wraps
+    # the run in a catch-all that prints a fixed, input-free message and returns
+    # the dedicated error exit code.
+    for name in (
+        "GBAW_E2_ENDPOINT",
+        "GBAW_E2_ACCESS_TOKEN",
+        "GBAW_E2_APPROVER_TOKEN",
+        "GBAW_E2_FLEET_ID",
+        "GBAW_E2_LOCATION",
+        "GBAW_E2_OBSERVATION_ID",
+        "GBAW_E2_CURRENT_DESIRED",
+        "GBAW_E2_EXPIRY_WAIT_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    def _raising_transport():
+        def _transport(method, url, headers, body):
+            # A real ConnectionError names the host and the path in its message.
+            raise RuntimeError(f"connection refused to {url}")
+
+        return _transport
+
+    monkeypatch.setattr(sd, "_requests_transport", _raising_transport)
+    exit_code = sd.main(
+        [
+            "--endpoint",
+            ENDPOINT,
+            "--access-token",
+            ACCESS,
+            "--approver-token",
+            APPROVER,
+            "--fleet-id",
+            FLEET,
+            "--location",
+            LOCATION,
+            "--observation-id",
+            OBS_ID,
+        ]
+    )
+    assert exit_code == sd.EXIT_ERROR
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "shakedown error" in combined
+    # Neither the endpoint host nor an operation path leaks.
+    assert ENDPOINT not in combined
+    assert "execute-api" not in combined
+    assert "/operations/" not in combined
+    # Nor do the sentinel tokens.
+    assert ACCESS not in combined
+    assert APPROVER not in combined

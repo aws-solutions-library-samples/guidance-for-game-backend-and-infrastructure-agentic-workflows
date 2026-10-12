@@ -318,9 +318,43 @@ class ObservationDeploymentSettings:
 
 
 def resolve_operations_settings(env: Mapping[str, str] | None = None) -> OperationsSettings:
-    """Resolve operations settings from the environment, failing closed."""
+    """Resolve operations settings from the environment, failing closed.
+
+    The E2 (advise) fields are parsed from the environment only when the mode
+    admits the E2 prepare/approval surface (``advise`` and higher). In a
+    ``disabled`` or bare ``observe`` deployment they take their safe defaults and
+    the E2 environment is NOT parsed, so a malformed E2 value (for example a
+    fractional expiry) can never raise at load time and break observe mode. The
+    deploy wrapper validates the E2 values before any AWS call for an advise
+    enable.
+    """
     source: Mapping[str, str] = os.environ if env is None else env
     mode = (source.get("GBAW_OPERATIONS_MODE") or _DEFAULT_MODE).strip() or _DEFAULT_MODE
+    e2_enabled = _AUTHORITY_ORDER.get(mode, 0) >= _AUTHORITY_ORDER[_ADVISE_MODE]
+    if e2_enabled:
+        preparation_expiry_s = _positive_int(
+            source, "GBAW_OPERATIONS_PREPARATION_EXPIRY_S", DEFAULT_PREPARATION_EXPIRY_S
+        )
+        approval_expiry_s = _positive_int(source, "GBAW_OPERATIONS_APPROVAL_EXPIRY_S", DEFAULT_APPROVAL_EXPIRY_S)
+        low_risk_self_approval_enabled = _bool(
+            source, "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL", DEFAULT_LOW_RISK_SELF_APPROVAL
+        )
+        approver_group = _optional_str(source, "GBAW_OPERATIONS_APPROVER_GROUP", DEFAULT_APPROVER_GROUP)
+        capacity_floor = _int_field(source, "GBAW_OPERATIONS_CAPACITY_FLOOR", DEFAULT_CAPACITY_FLOOR, minimum=0)
+        capacity_ceiling = _int_field(source, "GBAW_OPERATIONS_CAPACITY_CEILING", DEFAULT_CAPACITY_CEILING, minimum=0)
+        capacity_max_step = _int_field(
+            source, "GBAW_OPERATIONS_CAPACITY_MAX_STEP", DEFAULT_CAPACITY_MAX_STEP, minimum=1
+        )
+    else:
+        # Not an E2 deployment: hold the safe E2 defaults and do not parse the E2
+        # environment, so a bad E2 value cannot break observe mode at init.
+        preparation_expiry_s = DEFAULT_PREPARATION_EXPIRY_S
+        approval_expiry_s = DEFAULT_APPROVAL_EXPIRY_S
+        low_risk_self_approval_enabled = DEFAULT_LOW_RISK_SELF_APPROVAL
+        approver_group = DEFAULT_APPROVER_GROUP
+        capacity_floor = DEFAULT_CAPACITY_FLOOR
+        capacity_ceiling = DEFAULT_CAPACITY_CEILING
+        capacity_max_step = DEFAULT_CAPACITY_MAX_STEP
     return OperationsSettings(
         mode=mode,
         per_read_budget_s=_positive_float(source, "GBAW_OPERATIONS_PER_READ_BUDGET_S", DEFAULT_PER_READ_BUDGET_S),
@@ -332,17 +366,13 @@ def resolve_operations_settings(env: Mapping[str, str] | None = None) -> Operati
         ),
         observation_ttl_s=_positive_int(source, "GBAW_OPERATIONS_OBSERVATION_TTL_S", DEFAULT_OBSERVATION_TTL_S),
         observer_groups=_observer_groups(source, "GBAW_OPERATIONS_OBSERVER_GROUPS", DEFAULT_OBSERVER_GROUPS),
-        preparation_expiry_s=_positive_int(
-            source, "GBAW_OPERATIONS_PREPARATION_EXPIRY_S", DEFAULT_PREPARATION_EXPIRY_S
-        ),
-        approval_expiry_s=_positive_int(source, "GBAW_OPERATIONS_APPROVAL_EXPIRY_S", DEFAULT_APPROVAL_EXPIRY_S),
-        low_risk_self_approval_enabled=_bool(
-            source, "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL", DEFAULT_LOW_RISK_SELF_APPROVAL
-        ),
-        approver_group=_optional_str(source, "GBAW_OPERATIONS_APPROVER_GROUP", DEFAULT_APPROVER_GROUP),
-        capacity_floor=_int_field(source, "GBAW_OPERATIONS_CAPACITY_FLOOR", DEFAULT_CAPACITY_FLOOR, minimum=0),
-        capacity_ceiling=_int_field(source, "GBAW_OPERATIONS_CAPACITY_CEILING", DEFAULT_CAPACITY_CEILING, minimum=0),
-        capacity_max_step=_int_field(source, "GBAW_OPERATIONS_CAPACITY_MAX_STEP", DEFAULT_CAPACITY_MAX_STEP, minimum=1),
+        preparation_expiry_s=preparation_expiry_s,
+        approval_expiry_s=approval_expiry_s,
+        low_risk_self_approval_enabled=low_risk_self_approval_enabled,
+        approver_group=approver_group,
+        capacity_floor=capacity_floor,
+        capacity_ceiling=capacity_ceiling,
+        capacity_max_step=capacity_max_step,
     )
 
 

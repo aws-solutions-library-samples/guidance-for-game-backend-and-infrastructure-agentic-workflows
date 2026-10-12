@@ -1,10 +1,10 @@
 """Parser- and scanner-verifiable contract tests for the OPTIONAL E2 operations
 advise control plane's server-owned CAPACITY POLICY settings (GitHub issue #414).
 
-These extend the E2 advise slice ADDITIVELY. The core (a later slice) resolves
-per-fleet/location capacity bounds through a trusted enrollment/policy port, but
-it requires the three frozen server-owned capacity-policy env names to be
-present and validated by the deployment. This slice DEFINES and injects them:
+These extend the E2 advise slice ADDITIVELY. The runtime resolves per-fleet/
+location capacity bounds through a trusted enrollment/policy port, and it
+requires the three frozen server-owned capacity-policy env names to be present
+and validated by the deployment. This slice DEFINES and injects them:
 
 * ``GBAW_OPERATIONS_CAPACITY_FLOOR``   — minimum desired instances a bounded
   proposal may request (server floor).
@@ -160,14 +160,45 @@ def _rules_text(raw):
     return raw[rules_start:resources_start]
 
 
-def test_capacity_rule_references_all_three_dimensions(raw):
-    """The coherent-bound Rule must reference the three capacity parameters so a
-    floor above the ceiling or a non-positive/oversized step is rejected at
-    deploy time (equality-expressible cases) before any resource is created."""
-    rules_text = _rules_text(raw)
-    for token in ("CapacityFloor", "CapacityCeiling", "CapacityMaxStep"):
-        assert token in rules_text, f"coherent capacity bound must reference {token}"
-    assert "Assert" in rules_text, "capacity Rule must carry an Assertion"
+def test_capacity_rule_references_all_three_dimensions(template):
+    """The coherent-bound Rule's ASSERTION (not its prose description) must
+    compare CapacityFloor against CapacityCeiling, so a floor equal to the
+    ceiling is rejected at deploy time. Parse the Rule and assert the actual
+    Fn::Equals operands, so a mutation that drops the floor/ceiling comparison
+    (e.g. replacing it with an unrelated non-empty check) fails here. The
+    max_step upper bound is arithmetic and enforced by the wrapper, which the
+    AssertDescription states; the equality-expressible half is the Rule's job."""
+    rules = template.get("Rules", {})
+    rule = rules.get("CapacityBandIsCoherent")
+    assert rule is not None, f"expected a CapacityBandIsCoherent Rule; have {sorted(rules)}"
+    assertions = rule.get("Assertions", [])
+    # The cfn loader drops the ! tags, so !Not[!Equals[!Ref Floor, !Ref Ceiling]]
+    # parses to the nested plain structure [[ "CapacityFloor", "CapacityCeiling" ]]
+    # (outer list = Not's single operand, inner list = the Equals operands with
+    # Refs flattened to their target names). Assert that exact comparison, so a
+    # mutation that compares other operands (e.g. ceiling against an empty
+    # string) does not match and this test fails.
+    floor_ceiling = {"CapacityFloor", "CapacityCeiling"}
+    found = any(_not_equals_operands(a.get("Assert")) == floor_ceiling for a in assertions)
+    assert found, (
+        "the CapacityBandIsCoherent Rule must assert Not(Equals(CapacityFloor, CapacityCeiling)) "
+        "so a degenerate floor==ceiling band is rejected; the actual assertion operands were not that comparison"
+    )
+
+
+def _not_equals_operands(assert_node):
+    """Return the operand set of a Not[Equals[...]] assertion, else empty.
+
+    The cfn test loader renders !Not[!Equals[a, b]] as the nested plain list
+    [[a, b]]. Any other shape returns an empty set so a mutated assertion does
+    not match the expected floor/ceiling pair.
+    """
+    if not isinstance(assert_node, list) or len(assert_node) != 1:
+        return set()
+    equals = assert_node[0]
+    if not isinstance(equals, list):
+        return set()
+    return {operand for operand in equals if isinstance(operand, str)}
 
 
 def test_capacity_ceiling_and_step_are_positive_members(raw):

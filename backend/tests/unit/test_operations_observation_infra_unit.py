@@ -569,10 +569,16 @@ def test_alarms_metrics_and_log_retention_present(template):
     custom_alarms = [a["Properties"] for a in alarms.values() if a["Properties"]["Namespace"] == METRIC_NAMESPACE]
     assert custom_alarms, "expected custom-metric alarms"
 
-    # Every alarm wires its action to the optional alarm topic (an Fn::If on
-    # the HasAlarmTopic condition), so a configured topic is notified. The
+    # Every PAGING alarm wires its action to the optional alarm topic (an Fn::If
+    # on the HasAlarmTopic condition), so a configured topic is notified. The
     # template loader renders !If as a 3-element list [condition, true, false].
-    for a in alarms.values():
+    # The two E2 expected-caller-outcome alarms (ApprovalExpired,
+    # CancellationConflicts) are deliberately informational and carry no action.
+    _informational_alarms = {"ApprovalExpiredAlarm", "CancellationConflictsAlarm"}
+    for name, a in alarms.items():
+        if name in _informational_alarms:
+            assert "AlarmActions" not in a["Properties"], f"{name} is informational and must carry no AlarmActions"
+            continue
         actions = a["Properties"].get("AlarmActions")
         assert (
             isinstance(actions, list) and actions and actions[0] == "HasAlarmTopic"

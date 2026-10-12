@@ -235,7 +235,16 @@ def _build_approval_handler(
     from operations.prepare_orchestrator import PrepareOrchestrator
 
     ops = settings.operations
-    approval_store = DynamoDbApprovalStore(client=dynamodb_client, table_name=settings.table_name)
+    # The store's deadline guard uses the worst-case cost of one persistence
+    # sub-call: the single-attempt client's connect timeout plus its read
+    # timeout. Deriving it from the same budget the client config uses keeps the
+    # store's "does one more call fit?" check aligned with the real timeouts,
+    # exactly as the E1 observation store does.
+    persistence_s = ops.persistence_budget_s
+    approval_call_limit_s = min(2.0, max(0.5, persistence_s / 2.0)) + persistence_s
+    approval_store = DynamoDbApprovalStore(
+        client=dynamodb_client, table_name=settings.table_name, call_limit_s=approval_call_limit_s
+    )
     approval_metrics = CloudWatchApprovalMetrics(client=cloudwatch_client, namespace=settings.metric_namespace)
 
     # The policy version binds the server-owned capacity limits, so narrowing or
@@ -336,6 +345,15 @@ def _build_approval_handler(
         trusted_audience=settings.trusted_audience,
         requester_groups=ops.observer_groups,
         metrics=approval_metrics,
+        # Bound the whole E2 request by the same operations budget E1 uses: the
+        # store guards every read and caps every write against one monotonic
+        # per-request deadline, and a metric publish that would not fit the
+        # remaining budget is skipped so a slow store can never push a request
+        # past the Lambda wall-clock timeout.
+        store=approval_store,
+        request_deadline_s=ops.total_deadline_s,
+        min_publish_remaining_s=ops.persistence_budget_s,
+        clock=_utcnow,
     )
 
 

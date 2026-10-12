@@ -505,7 +505,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_MISSING_INPUT
 
     runner = E2ShakedownRunner(config=config, transport=_requests_transport())
-    report = runner.run()
+    try:
+        report = runner.run()
+    except Exception:  # noqa: BLE001 - never leak the endpoint, path, or a traceback
+        # A transport or unexpected failure must not print a raw traceback that
+        # names the endpoint host, the region, or an operation path. Print a
+        # fixed, input-free message and return the dedicated error code; the
+        # harness never echoes the endpoint by contract.
+        print("shakedown error: the E2 shakedown could not complete against the configured endpoint", file=sys.stderr)
+        return EXIT_ERROR
     summary = report.to_summary()
     rendered = json.dumps(summary, indent=2, sort_keys=True)
     print(rendered)

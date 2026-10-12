@@ -947,11 +947,12 @@ Resources:
         Format: >-
           {"requestId":"$context.requestId","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage"}
       DefaultRouteSettings:
-        # API-safe kill switch: when OperationsMode is not "observe" (e.g. after
-        # an emergency --disable on a provisioned stack) the gateway throttles to
-        # zero, so the API itself fails closed and rejects every request BEFORE
-        # the integration — without deleting the stage or any resource. When
-        # enabled, the operator-tuned denial-of-wallet limits apply.
+        # API-safe kill switch: when OperationsMode is not an enabled mode
+        # (observe or advise) — e.g. after an emergency --disable on a
+        # provisioned stack — the gateway throttles to zero, so the API itself
+        # fails closed and rejects every request BEFORE the integration, without
+        # deleting the stage or any resource. When enabled, the operator-tuned
+        # denial-of-wallet limits apply.
         ThrottlingBurstLimit: !If [OperationsEnabled, !Ref ThrottlingBurstLimit, 0]
         ThrottlingRateLimit: !If [OperationsEnabled, !Ref ThrottlingRateLimit, 0]
         DetailedMetricsEnabled: true
@@ -1124,7 +1125,10 @@ Resources:
     Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-approval-expired'
-      AlarmDescription: Approvals or prepared operations expired before dispatch.
+      AlarmDescription: >-
+        Informational: approvals or prepared operations expired before dispatch.
+        Expiry is an expected caller outcome, so this alarm raises no action; it
+        exists for dashboards and trend visibility only.
       Namespace: 'GameAgent/Operations'
       MetricName: ApprovalExpired
       Statistic: Sum
@@ -1133,14 +1137,16 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
   CancellationConflictsAlarm:
     Type: AWS::CloudWatch::Alarm
     Condition: ResourcesProvisioned
     Properties:
       AlarmName: !Sub '${ProjectName}-operations-cancellation-conflicts'
-      AlarmDescription: Cancellation attempts conflicted with a concurrent state change.
+      AlarmDescription: >-
+        Informational: a cancellation lost a fenced race with a concurrent state
+        change. A fenced conflict is an expected outcome, so this alarm raises no
+        action; it exists for dashboards and trend visibility only.
       Namespace: 'GameAgent/Operations'
       MetricName: CancellationConflicts
       Statistic: Sum
@@ -1149,7 +1155,6 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
-      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref 'AWS::NoValue']
 
 Outputs:
   Provisioned:
@@ -1163,7 +1168,9 @@ Outputs:
   OperationsMode:
     Description: >-
       Effective runtime authority (kill switch) for this stack. "disabled" fails
-      closed; "observe" serves read-only observation. Independent of Provisioned.
+      closed; "observe" serves read-only observation; "advise" additionally
+      serves the read-only prepare and human-approval gate. Independent of
+      Provisioned.
     Value: !Ref OperationsMode
 
   HttpApiEndpoint:
@@ -1189,5 +1196,5 @@ Outputs:
 
   OperationsMetricNamespace:
     Condition: ResourcesProvisioned
-    Description: CloudWatch namespace for E1 metrics.
+    Description: CloudWatch namespace for E1 and E2 metrics.
     Value: 'GameAgent/Operations'

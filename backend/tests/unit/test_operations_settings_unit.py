@@ -216,3 +216,57 @@ def test_valid_approver_group_is_accepted() -> None:
         env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_APPROVER_GROUP": "capacity.approvers"}
     )
     assert settings.approver_group == "capacity.approvers"
+
+
+# --------------------------------------------------------------------------- #
+# E2 fields are parsed and validated ONLY when the mode admits the E2 surface,
+# so a malformed E2 value can never raise at load time and break observe mode
+# (issue #414).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "env_name",
+    [
+        "GBAW_OPERATIONS_PREPARATION_EXPIRY_S",
+        "GBAW_OPERATIONS_APPROVAL_EXPIRY_S",
+        "GBAW_OPERATIONS_CAPACITY_FLOOR",
+        "GBAW_OPERATIONS_CAPACITY_CEILING",
+        "GBAW_OPERATIONS_CAPACITY_MAX_STEP",
+    ],
+)
+def test_observe_mode_ignores_a_malformed_e2_value(env_name: str) -> None:
+    # In observe mode the E2 environment is not parsed, so a malformed E2 value
+    # (a fraction, a non-integer) is ignored and the safe default is held — it
+    # must NOT raise and take observe mode down.
+    settings = resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "observe", env_name: "900.5"})
+    assert settings.observe_enabled is True
+    assert settings.e2_enabled is False
+    # The E2 fields hold their safe defaults.
+    assert settings.preparation_expiry_s == 900
+    assert settings.approval_expiry_s == 1800
+    assert (settings.capacity_floor, settings.capacity_ceiling, settings.capacity_max_step) == (0, 1, 1)
+
+
+def test_advise_mode_still_validates_a_malformed_e2_value() -> None:
+    # In advise mode the E2 fields ARE parsed and validated, so a malformed value
+    # fails closed at load time.
+    with pytest.raises(ValueError):
+        resolve_operations_settings(
+            env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_PREPARATION_EXPIRY_S": "900.5"}
+        )
+
+
+def test_advise_mode_reads_e2_overrides() -> None:
+    settings = resolve_operations_settings(
+        env={
+            "GBAW_OPERATIONS_MODE": "advise",
+            "GBAW_OPERATIONS_PREPARATION_EXPIRY_S": "600",
+            "GBAW_OPERATIONS_CAPACITY_CEILING": "8",
+            "GBAW_OPERATIONS_CAPACITY_MAX_STEP": "2",
+        }
+    )
+    assert settings.e2_enabled is True
+    assert settings.preparation_expiry_s == 600
+    assert settings.capacity_ceiling == 8
+    assert settings.capacity_max_step == 2

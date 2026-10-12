@@ -1,9 +1,10 @@
 """Parser- and scanner-verifiable contract tests for the OPTIONAL E2 operations
 advise control plane (GitHub issue #414).
 
-E2 extends the accepted E1 observation control plane ADDITIVELY. It never edits
-backend application code; it widens the same CloudFormation stack, deploy
-wrapper, and runbook that E1 froze. These tests never call AWS. They parse the
+E2 extends the accepted E1 observation control plane ADDITIVELY. It widens the
+same CloudFormation stack, deploy wrapper, and runbook that E1 froze, and adds
+the backend prepare/approval application code the advise routes need. These
+tests never call AWS. They parse the
 repository-owned CloudFormation template and shell wrappers as data and assert
 the **frozen E2 runtime contract** on top of the retained E1 contract:
 
@@ -21,7 +22,7 @@ the **frozen E2 runtime contract** on top of the retained E1 contract:
   ``POST /operations/observe``. Every route requires JWT. No approval route is
   exposed through chat/MCP (asserted against the MCP wiring).
 * New validated, server-owned settings injected as the frozen core env names
-  this slice DEFINES (the core consumes them in a later slice):
+  this slice DEFINES and the runtime consumes:
   ``GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL`` (default ``false``),
   ``GBAW_OPERATIONS_PREPARATION_EXPIRY_S``, and
   ``GBAW_OPERATIONS_APPROVAL_EXPIRY_S``. Self-approval defaults to disabled.
@@ -82,8 +83,8 @@ E2_NEW_ROUTE_KEYS = frozenset(
     }
 )
 
-# Frozen core env names this slice DEFINES for the E2 settings the core consumes
-# in a later slice. Server-owned, validated, and injected by the stack.
+# Frozen core env names this slice DEFINES for the E2 settings the runtime
+# consumes. Server-owned, validated, and injected by the stack.
 E2_REQUIRED_ENV_KEYS = frozenset(
     {
         "GBAW_OPERATIONS_LOW_RISK_SELF_APPROVAL",
@@ -406,6 +407,29 @@ def test_all_e2_alarms_use_the_retained_namespace(template):
         assert alarms[name]["Properties"]["Namespace"] == METRIC_NAMESPACE
 
 
+def test_only_failure_alarms_page_expected_caller_outcomes_are_informational(template):
+    # PreparationFailures and ApprovalFailures are the service-side failure
+    # alarms and keep their alarm actions. ApprovalExpired and
+    # CancellationConflicts are expected caller outcomes and must be
+    # informational: no AlarmActions, so a routine expiry or fenced-cancel race
+    # never pages.
+    alarms = _resources_of_type(template, "AWS::CloudWatch::Alarm")
+    for paging in ("PreparationFailuresAlarm", "ApprovalFailuresAlarm"):
+        assert "AlarmActions" in alarms[paging]["Properties"], f"{paging} must keep its alarm action"
+    for informational in ("ApprovalExpiredAlarm", "CancellationConflictsAlarm"):
+        assert (
+            "AlarmActions" not in alarms[informational]["Properties"]
+        ), f"{informational} must be informational (no AlarmActions): it fires on an expected caller outcome"
+
+
+def test_template_is_within_the_s3_backed_cloudformation_limit():
+    # The template exceeds the 51,200-byte inline limit and is deployed by URL
+    # (S3-backed), so the relevant ceiling is the 460,800-byte S3-backed limit.
+    # A template above it cannot be deployed at all.
+    size = TEMPLATE.stat().st_size
+    assert size <= 460_800, f"template is {size} bytes, over the 460,800-byte S3-backed limit"
+
+
 # --------------------------------------------------------------------------- #
 # IAM boundary unchanged (bounded GameLift E2 adds no write surface)
 # --------------------------------------------------------------------------- #
@@ -438,22 +462,38 @@ def test_no_s3_content_bucket_for_bounded_gamelift_e2(template):
 # --------------------------------------------------------------------------- #
 # Packaging carries E2 schemas and probes the E2 routes
 # --------------------------------------------------------------------------- #
-def test_packaging_probe_covers_e2_contract_schemas():
-    """The wrapper's runtime probe must load the E2 contract schemas (approval /
-    prepare) before upload, so a package missing them fails closed pre-upload."""
+def _runtime_probe_script() -> str:
+    """Extract the RUNTIME_PROBE_PY heredoc body from the deploy wrapper.
+
+    The assertions below check the probe SCRIPT content (what actually runs
+    against the built artifact), not merely that a token appears somewhere in
+    the wrapper (which a comment would satisfy).
+    """
     text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
-    # The probe already iterates SCHEMA_NAMES; assert it references the E2
-    # schema names so a regression that drops them is caught.
-    for schema in ("approval-record", "prepare-operation-request", "prepared-operation"):
-        assert schema in text, f"packaging probe must reference the E2 schema {schema}"
+    start = text.index("RUNTIME_PROBE_PY=\"$(cat <<'PROBE'")
+    body_start = text.index("\n", start) + 1
+    end = text.index("\nPROBE", body_start)
+    return text[body_start:end]
+
+
+def test_packaging_probe_covers_e2_capacity_contract_schemas():
+    """The wrapper's runtime probe must load the E2 CAPACITY contract schemas the
+    advise routes validate against (gamelift-capacity-*), via load_capacity_schema,
+    so a package missing them fails closed pre-upload. The generic source-control
+    schema names are not what the capacity routes use."""
+    probe = _runtime_probe_script()
+    assert "CAPACITY_SCHEMA_NAMES" in probe, "probe must iterate the capacity schema set"
+    assert "load_capacity_schema" in probe, "probe must load each capacity schema via load_capacity_schema"
 
 
 def test_packaging_probe_exercises_e2_handler_routes():
-    """The probe must import the real handler and assert the E2 route verbs it
-    serves are recognised (prepare/approve/reject/cancel) before upload."""
-    text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
-    for token in ("prepare", "approve", "reject", "cancel"):
-        assert token in text, f"packaging probe must cover the E2 route '{token}'"
+    """The probe must import the real handler and force the versioned schema
+    resources to load, so a package that ships the handler but omits a runtime
+    schema resource fails the probe before upload."""
+    probe = _runtime_probe_script()
+    assert "operations.observe.lambda_entry" in probe, "probe must import the real handler module"
+    assert "callable(m.handler)" in probe, "probe must assert the handler is callable"
+    assert "load_capacity_schema" in probe, "probe must exercise the E2 capacity schema load path"
 
 
 # --------------------------------------------------------------------------- #
@@ -471,12 +511,15 @@ def test_wrapper_double_opt_in_requires_matching_mode_env():
     --mode advise flag (belt-and-braces), exactly as observe requires
     GBAW_OPERATIONS_MODE=observe."""
     text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
-    # The wrapper compares the requested mode against the env value.
-    assert "GBAW_OPERATIONS_MODE" in text
-    # A matching-mode guard: the env value must equal the selected mode.
-    assert re.search(r"GBAW_OPERATIONS_MODE.*\$\{?REQUESTED_MODE|REQUESTED_MODE.*GBAW_OPERATIONS_MODE", text) or (
-        '"$GBAW_OPERATIONS_MODE" != "$OPERATIONS_MODE"' in text or '"${GBAW_OPERATIONS_MODE' in text
-    ), "wrapper must require the env mode to match the requested mode"
+    # The wrapper compares the requested mode against the env value with an
+    # EQUALITY guard: GBAW_OPERATIONS_MODE must equal the selected --mode. Assert
+    # the exact mismatch comparison so a mutation to "any enabled mode" (which
+    # drops the equality to REQUESTED_MODE) fails this test.
+    assert (
+        '"${GBAW_OPERATIONS_MODE:-disabled}" != "$REQUESTED_MODE"' in text
+    ), "wrapper must require the env mode to EQUAL the requested --mode"
+    # And the refusal names the specific mode to set, not a generic message.
+    assert "set GBAW_OPERATIONS_MODE=$REQUESTED_MODE to confirm" in text
 
 
 def test_wrapper_emergency_disable_rebuilds_nothing():

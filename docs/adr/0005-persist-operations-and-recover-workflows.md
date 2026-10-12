@@ -278,6 +278,17 @@ together, a partially created operation cannot exist. If the transaction fails
 the condition on the mapping, a mapping already exists and the request is a
 replay.
 
+> **E2 capacity implementation note.** The capacity prepare/approval surface
+> (issue #414) materializes a prepared operation **directly at
+> `pending_approval`** in this single creation transaction, rather than writing
+> a separate `STATE#0` transition into `prepared` and then a second transition
+> into `pending_approval`. The `STATE#0`/`LEDGER#0` records are the creation
+> event, and the current-state snapshot's initial state is `pending_approval`.
+> The ledger-event contract `sequence` is the physical `LEDGER#<n>` index plus
+> one, so the creation event carries contract `sequence` 1 and remains strictly
+> increasing. This is a deliberate deviation from the two-step creation
+> described above; `docs/OPERATIONS_CONTRACTS.md` documents the same deviation.
+
 A retry recomputes the fingerprint and compares it to the stored mapping.
 An identical fingerprint with the same token and trusted workspace resolves to
 that same operation and returns its stored result. Reusing the token with

@@ -79,6 +79,12 @@ case "$svc $sub" in
       *"ParameterKey=='PersistenceBudgetSeconds'"*) echo "${STUB_AWS_CUR_PERSIST:-None}" ;;
       *"ParameterKey=='CancellationMarginSeconds'"*) echo "${STUB_AWS_CUR_MARGIN:-None}" ;;
       *"ParameterKey=='LatencyAlarmThresholdMs'"*)  echo "${STUB_AWS_CUR_LATENCY:-None}" ;;
+      *"ParameterKey=='LowRiskSelfApproval'"*)      echo "${STUB_AWS_CUR_SELF_APPROVAL:-None}" ;;
+      *"ParameterKey=='PreparationExpirySeconds'"*) echo "${STUB_AWS_CUR_PREP_EXPIRY:-None}" ;;
+      *"ParameterKey=='ApprovalExpirySeconds'"*)    echo "${STUB_AWS_CUR_APPR_EXPIRY:-None}" ;;
+      *"ParameterKey=='CapacityFloor'"*)            echo "${STUB_AWS_CUR_CAP_FLOOR:-None}" ;;
+      *"ParameterKey=='CapacityCeiling'"*)          echo "${STUB_AWS_CUR_CAP_CEILING:-None}" ;;
+      *"ParameterKey=='CapacityMaxStep'"*)          echo "${STUB_AWS_CUR_CAP_STEP:-None}" ;;
       *ParameterKey*)
         # An OLDER deployed stack: a reduced key set that predates the newer
         # template parameters (no LambdaTimeoutSeconds/ObserverGroups/etc.).
@@ -652,3 +658,72 @@ def test_reenable_with_one_budget_var_sends_only_that_key(tmp_path):
         "LatencyAlarmThresholdMs=",
     ):
         assert key not in deploy_line, f"{key} must not be resent when only PerReadBudgetSeconds is set"
+
+
+def test_reenable_without_e2_vars_keeps_deployed_capacity_and_expiry(tmp_path):
+    # An existing stack with a tuned, cost-reviewed capacity band and a narrowed
+    # approval window, re-enabled with NO E2 variables set, must NOT resend those
+    # keys, so the deployed values are preserved rather than reset to the safe
+    # defaults (which would widen a narrowed window and shrink a reviewed band).
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        # A tuned, non-default band and windows already deployed.
+        "STUB_AWS_CUR_CAP_FLOOR": "2",
+        "STUB_AWS_CUR_CAP_CEILING": "8",
+        "STUB_AWS_CUR_CAP_STEP": "3",
+        "STUB_AWS_CUR_PREP_EXPIRY": "600",
+        "STUB_AWS_CUR_APPR_EXPIRY": "900",
+        "STUB_AWS_CUR_SELF_APPROVAL": "true",
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    for key in (
+        "CapacityFloor=",
+        "CapacityCeiling=",
+        "CapacityMaxStep=",
+        "PreparationExpirySeconds=",
+        "ApprovalExpirySeconds=",
+        "LowRiskSelfApproval=",
+    ):
+        assert key not in deploy_line, f"{key} must not be resent on a plain re-enable"
+
+
+def test_reenable_with_one_e2_var_sends_only_that_key(tmp_path):
+    # Setting a single E2 variable sends only that key as an override; the rest
+    # keep their deployed values.
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        "STUB_AWS_CUR_CAP_FLOOR": "2",
+        "STUB_AWS_CUR_CAP_CEILING": "8",
+        "STUB_AWS_CUR_CAP_STEP": "3",
+        "STUB_AWS_CUR_PREP_EXPIRY": "600",
+        "STUB_AWS_CUR_APPR_EXPIRY": "900",
+        "STUB_AWS_CUR_SELF_APPROVAL": "true",
+        # Operator narrows only the approval window this time.
+        "GBAW_OPERATIONS_APPROVAL_EXPIRY_S": "300",
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    assert "ApprovalExpirySeconds=300" in deploy_line
+    for key in ("CapacityFloor=", "CapacityCeiling=", "CapacityMaxStep=", "PreparationExpirySeconds="):
+        assert key not in deploy_line, f"{key} must not be resent when only the approval window is set"
+
+
+def test_enable_deploys_the_template_by_url_not_inline(tmp_path):
+    # The template exceeds the inline CloudFormation limit, so enable must pass
+    # the template through S3 (--s3-bucket/--s3-prefix) rather than sending it
+    # inline, which the service would reject.
+    result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_NO_STACK": "1"})
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    deploy_line = next(line for line in calls if "cloudformation" in line and "deploy" in line)
+    assert "--s3-bucket" in deploy_line, "enable must upload the template to S3"
+    assert "--s3-prefix" in deploy_line
+    assert "operations/templates" in deploy_line
