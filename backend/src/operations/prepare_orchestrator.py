@@ -129,13 +129,28 @@ class PrepareOrchestrator:
         *,
         request_id: str,
         correlation_id: str,
+        principal_authority: str = _PRINCIPAL_AUTHORITY,
     ) -> PrepareResult:
         """Parse, advise, prepare, and (when approval-required) persist once."""
         observation_id, proposal = self._parse_body(body)
         advice_service = self._resolve_advice_service(observation_id)
 
-        advice = self._advise(advice_service, proposal, requester, request_id=request_id, correlation_id=correlation_id)
-        prepared = self._prepare(advice, proposal, requester, request_id=request_id, correlation_id=correlation_id)
+        advice = self._advise(
+            advice_service,
+            proposal,
+            requester,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            principal_authority=principal_authority,
+        )
+        prepared = self._prepare(
+            advice,
+            proposal,
+            requester,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            principal_authority=principal_authority,
+        )
 
         if prepared.decision is PreparedDecision.DENIED:
             # A deterministically denied operation is never persisted.
@@ -192,6 +207,7 @@ class PrepareOrchestrator:
         *,
         request_id: str,
         correlation_id: str,
+        principal_authority: str = _PRINCIPAL_AUTHORITY,
     ) -> dict[str, Any]:
         context = AdviceRequestContext(
             requester=requester,
@@ -200,7 +216,7 @@ class PrepareOrchestrator:
             authority_ceilings=AuthorityCeilings(
                 tenant_policy=_TENANT_POLICY,
                 workspace_policy=_WORKSPACE_POLICY,
-                principal_authority=_PRINCIPAL_AUTHORITY,
+                principal_authority=principal_authority,
                 capability_maximum=_CAPABILITY_MAXIMUM,
                 operation_risk_policy=_OPERATION_RISK_POLICY,
             ),
@@ -218,6 +234,7 @@ class PrepareOrchestrator:
         *,
         request_id: str,
         correlation_id: str,
+        principal_authority: str = _PRINCIPAL_AUTHORITY,
     ) -> PreparedOperation:
         context = PrepareRequestContext(
             requester=requester,
@@ -226,7 +243,7 @@ class PrepareOrchestrator:
             deployment_mode=self._deployment_mode,
             tenant_policy=_TENANT_POLICY,
             workspace_policy=_WORKSPACE_POLICY,
-            principal_authority=_PRINCIPAL_AUTHORITY,
+            principal_authority=principal_authority,
             capability_maximum=_CAPABILITY_MAXIMUM,
             operation_risk_policy=_OPERATION_RISK_POLICY,
         )

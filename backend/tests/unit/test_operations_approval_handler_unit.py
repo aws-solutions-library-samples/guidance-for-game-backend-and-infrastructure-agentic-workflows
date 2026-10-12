@@ -30,6 +30,7 @@ from operations import approval_handler as _approval_handler_module
 from operations.advice import AdviceErrorCode
 from operations.approval import ApprovalBoundaryError, ApprovalErrorCode
 from operations.approval_handler import ApprovalRequestHandler
+from operations.approval_store import ApprovalStoreError
 from operations.prepare import PreparedDecision, PrepareErrorCode
 from operations.prepare_orchestrator import PrepareOrchestratorError, PrepareResult
 
@@ -40,13 +41,16 @@ OPERATION_ID = "op_aaaaaaaaaaaaaaaaaaaaaaaaaa"
 PREPARED_HASH = "sha256:" + "c" * 64
 
 
-def _claims() -> dict[str, Any]:
-    return {
+def _claims(groups: object = "operations-requester") -> dict[str, Any]:
+    claims: dict[str, Any] = {
         "sub": "user.requester",
         "client_id": "client.requester",
         "token_use": "access",
         "exp": str(int((NOW + timedelta(hours=1)).timestamp())),
     }
+    if groups is not None:
+        claims["cognito:groups"] = groups
+    return claims
 
 
 def _event(
@@ -68,8 +72,8 @@ class FakeOrchestrator:
         self._result = result
         self.calls: list[Any] = []
 
-    def prepare(self, body, requester, *, request_id, correlation_id) -> PrepareResult:
-        self.calls.append((body, requester.subject_id, request_id))
+    def prepare(self, body, requester, *, request_id, correlation_id, principal_authority="advise") -> PrepareResult:
+        self.calls.append((body, requester.subject_id, request_id, principal_authority))
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -149,6 +153,7 @@ def _handler(**overrides) -> ApprovalRequestHandler:
         tenant_id="tenant.default",
         workspace_id="workspace.default",
         trusted_audience="operations-api",
+        requester_groups=frozenset({"operations-requester"}),
     )
     defaults.update(overrides)
     return ApprovalRequestHandler(**defaults)
@@ -289,17 +294,31 @@ class FakeMetrics:
         self.events.append(event)
 
 
-def test_prepare_conflict_emits_preparation_failure_metric() -> None:
+def test_prepare_caller_conflict_emits_no_failure_metric() -> None:
+    # An idempotency conflict is a caller outcome, not a service failure, so it
+    # must publish no PreparationFailures metric (which pages at threshold 1).
     metrics = FakeMetrics()
     handler = _handler(
         orchestrator=FakeOrchestrator(PrepareOrchestratorError("idempotency_conflict", "conflict")),
         metrics=metrics,
     )
     handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    assert "preparation.failed" not in metrics.events
+
+
+def test_prepare_service_fault_emits_preparation_failure_metric() -> None:
+    # A provider-unavailable (service-side) prepare failure does publish.
+    metrics = FakeMetrics()
+    handler = _handler(
+        orchestrator=FakeOrchestrator(PrepareOrchestratorError("provider_unavailable", "unavailable", retryable=True)),
+        metrics=metrics,
+    )
+    handler.handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
     assert "preparation.failed" in metrics.events
 
 
-def test_approve_denied_emits_approval_failure_metric() -> None:
+def test_approve_denied_emits_no_failure_metric() -> None:
+    # Authorization denial (including self-approval denial) is a caller outcome.
     metrics = FakeMetrics()
     handler = _handler(
         approval_service=FakeApprovalService(ApprovalBoundaryError(ApprovalErrorCode.AUTHORIZATION_DENIED, "denied")),
@@ -314,11 +333,34 @@ def test_approve_denied_emits_approval_failure_metric() -> None:
             path_params={"operationId": OPERATION_ID},
         )
     )
+    assert metrics.events == []
+
+
+def test_approve_integrity_mismatch_emits_approval_failure_metric() -> None:
+    # An operation integrity/hash mismatch is service-side and does publish.
+    metrics = FakeMetrics()
+    handler = _handler(
+        approval_service=FakeApprovalService(
+            ApprovalBoundaryError(ApprovalErrorCode.OPERATION_HASH_MISMATCH, "integrity")
+        ),
+        metrics=metrics,
+    )
+    handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/approve",
+            body={},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
     assert "approval.failed" in metrics.events
-    assert "approval.expired" not in metrics.events
 
 
-def test_approve_expired_emits_expired_metric() -> None:
+def test_approve_expired_emits_no_failure_metric() -> None:
+    # An approve that observes an already-expired operation is a caller/time
+    # outcome; lazy expiry already records ApprovalExpired, so the approve path
+    # publishes no additional failure metric (no double count).
     metrics = FakeMetrics()
     handler = _handler(
         approval_service=FakeApprovalService(ApprovalBoundaryError(ApprovalErrorCode.APPROVAL_EXPIRED, "expired")),
@@ -333,7 +375,7 @@ def test_approve_expired_emits_expired_metric() -> None:
             path_params={"operationId": OPERATION_ID},
         )
     )
-    assert "approval.expired" in metrics.events
+    assert "approval.failed" not in metrics.events
 
 
 def test_cancel_state_conflict_emits_cancellation_conflict_metric() -> None:
@@ -355,6 +397,59 @@ def test_cancel_state_conflict_emits_cancellation_conflict_metric() -> None:
         )
     )
     assert "cancellation.conflict" in metrics.events
+
+
+def test_shakedown_like_4xx_sequence_emits_no_failure_metric() -> None:
+    # A shakedown exercises expected 4xx outcomes (invalid prepare body, auth
+    # denial, replay conflict, unknown-op not-found). None is a service failure,
+    # so a clean shakedown pages none of the threshold-1 alarms.
+    metrics = FakeMetrics()
+    _handler(
+        orchestrator=FakeOrchestrator(PrepareOrchestratorError("contract_invalid", "bad body")),
+        metrics=metrics,
+    ).handle(_event("POST", path="/operations/prepare", body={"x": 1}, claims=_claims()))
+    for error_code in (
+        ApprovalErrorCode.AUTHORIZATION_DENIED,
+        ApprovalErrorCode.STATE_CONFLICT,
+        ApprovalErrorCode.OPERATION_NOT_FOUND,
+    ):
+        _handler(
+            approval_service=FakeApprovalService(ApprovalBoundaryError(error_code, "expected")),
+            metrics=metrics,
+        ).handle(
+            _event(
+                "POST",
+                path=f"/operations/{OPERATION_ID}/approve",
+                body={},
+                claims=_claims(),
+                path_params={"operationId": OPERATION_ID},
+            )
+        )
+    assert "preparation.failed" not in metrics.events
+    assert "approval.failed" not in metrics.events
+
+
+def test_store_fault_returns_retryable_503_and_counts_as_service_failure() -> None:
+    # A transient store fault surfaces as a typed retryable 503 (not a 500) and
+    # counts as a service-side failure metric.
+    metrics = FakeMetrics()
+    handler = _handler(
+        approval_service=FakeApprovalService(ApprovalStoreError("terminal commit failed and is retryable")),
+        metrics=metrics,
+    )
+    resp = handler.handle(
+        _event(
+            "POST",
+            path=f"/operations/{OPERATION_ID}/approve",
+            body={},
+            claims=_claims(),
+            path_params={"operationId": OPERATION_ID},
+        )
+    )
+    assert resp["statusCode"] == 503
+    body = json.loads(resp["body"])
+    assert body["retryable"] is True
+    assert "approval.failed" in metrics.events
 
 
 def test_successful_prepare_emits_no_failure_metric() -> None:

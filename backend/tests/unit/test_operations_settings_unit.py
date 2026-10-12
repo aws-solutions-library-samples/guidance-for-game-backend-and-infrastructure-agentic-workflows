@@ -177,3 +177,42 @@ def test_e2_expiries_are_overridable_and_positive() -> None:
 def test_e2_expiry_invalid_fails_closed(key: str) -> None:
     with pytest.raises(ValueError):
         resolve_operations_settings(env={"GBAW_OPERATIONS_MODE": "advise", key: "0"})
+
+
+def test_approval_expiry_setting_feeds_the_approval_policy_ttl() -> None:
+    # The configured approval expiry window is consumed as the approval policy's
+    # granted-approval validity, rather than being parsed and ignored.
+    # Standard library
+    from datetime import timedelta
+
+    # Local modules
+    from operations.approval import ApprovalPolicy
+
+    settings = resolve_operations_settings(
+        env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_APPROVAL_EXPIRY_S": "600"}
+    )
+    assert settings.approval_expiry_s == 600
+
+    policy = ApprovalPolicy(
+        policy_id="policy.gamelift.capacity",
+        policy_version="1",
+        approver_scopes=frozenset({"operations-api"}),
+        approval_ttl=timedelta(seconds=settings.approval_expiry_s),
+    )
+    assert policy.approval_ttl == timedelta(seconds=600)
+
+
+def test_approver_group_is_validated_against_the_group_token_alphabet() -> None:
+    # A malformed approver group (space, control, or injection characters) fails
+    # closed, the same way an observer group would.
+    with pytest.raises(ValueError):
+        resolve_operations_settings(
+            env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_APPROVER_GROUP": "bad group!"}
+        )
+
+
+def test_valid_approver_group_is_accepted() -> None:
+    settings = resolve_operations_settings(
+        env={"GBAW_OPERATIONS_MODE": "advise", "GBAW_OPERATIONS_APPROVER_GROUP": "capacity.approvers"}
+    )
+    assert settings.approver_group == "capacity.approvers"

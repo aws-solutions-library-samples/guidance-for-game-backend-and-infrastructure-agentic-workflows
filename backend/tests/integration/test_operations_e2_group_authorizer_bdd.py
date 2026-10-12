@@ -64,6 +64,7 @@ from operations.capacity_bounds import DeploymentCapacityBoundsResolver
 from operations.capacity_state import E1ObservationCapacityStatePort
 from operations.contracts.capacity import (
     PROFILE,
+    capacity_policy_version,
     capacity_prepared_hash,
     validate_capacity_approval_binding,
     validate_capacity_prepared_operation,
@@ -140,7 +141,9 @@ def _handler(client: StatefulDynamoClient) -> ApprovalRequestHandler:
     # self-approval is never allowed (no low-risk self-approval actions).
     policy = ApprovalPolicy(
         policy_id=POLICY_ID,
-        policy_version=POLICY_VERSION,
+        policy_version=capacity_policy_version(
+            POLICY_VERSION, {"floor": 0, "ceiling": 1_000_000, "max_step": 1_000_000}
+        ),
         approver_groups=frozenset({APPROVER_GROUP}),
         low_risk_self_approval_actions=frozenset(),
     )
@@ -162,6 +165,7 @@ def _handler(client: StatefulDynamoClient) -> ApprovalRequestHandler:
         tenant_id="tenant.default",
         workspace_id="workspace.default",
         trusted_audience=AUDIENCE,
+        requester_groups=frozenset({APPROVER_GROUP, "operations-requester"}),
     )
 
 
@@ -225,7 +229,7 @@ def _prepare(handler: ApprovalRequestHandler) -> str:
         _event(
             "POST",
             "/operations/prepare",
-            claims=_claims("user.requester", "client.requester"),
+            claims=_claims("user.requester", "client.requester", groups="[operations-requester]"),
             body=_prepare_body(),
         )
     )

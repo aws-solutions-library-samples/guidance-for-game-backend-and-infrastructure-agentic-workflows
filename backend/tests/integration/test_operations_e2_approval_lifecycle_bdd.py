@@ -37,6 +37,7 @@ from operations.capacity_state import E1ObservationCapacityStatePort
 from operations.contracts.capacity import (
     ACTION,
     PROFILE,
+    capacity_policy_version,
     capacity_prepared_hash,
     validate_capacity_approval_binding,
     validate_capacity_prepared_operation,
@@ -231,9 +232,12 @@ def _handler(
     )
     policy = ApprovalPolicy(
         policy_id=POLICY_ID,
-        policy_version=POLICY_VERSION,
+        policy_version=capacity_policy_version(
+            POLICY_VERSION, {"floor": floor, "ceiling": ceiling, "max_step": max_step}
+        ),
         approver_scopes=frozenset({AUDIENCE}),
         low_risk_self_approval_actions=frozenset(),
+        approval_ttl=timedelta(seconds=ops.approval_expiry_s),
     )
     return ApprovalRequestHandler(
         orchestrator=orchestrator,
@@ -253,17 +257,23 @@ def _handler(
         tenant_id="tenant.default",
         workspace_id="workspace.default",
         trusted_audience=AUDIENCE,
+        requester_groups=frozenset({"operations-requester"}),
     )
 
 
-def _claims(subject: str, client_id: str, *, exp_delta_min: int = 60) -> dict[str, Any]:
-    return {
+def _claims(
+    subject: str, client_id: str, *, exp_delta_min: int = 60, groups: object = "operations-requester"
+) -> dict[str, Any]:
+    claims: dict[str, Any] = {
         "sub": subject,
         "client_id": client_id,
         "token_use": "access",
         "scope": AUDIENCE,
         "exp": str(int((NOW + timedelta(minutes=exp_delta_min)).timestamp())),
     }
+    if groups is not None:
+        claims["cognito:groups"] = groups
+    return claims
 
 
 def _event(
@@ -369,6 +379,74 @@ def test_requester_self_approval_is_denied_but_distinct_approver_grants() -> Non
     assert replay["statusCode"] == 409
 
 
+def test_approved_operation_can_be_cancelled_by_requester() -> None:
+    # An operation a distinct approver has already approved can still be
+    # cancelled by its requester before dispatch: the terminal transition fences
+    # on the post-grant snapshot sequence rather than a hard-coded first step.
+    handler = _handler(StatefulDynamoClient())
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+    grant = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert grant["statusCode"] == 200
+
+    cancel = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/cancel",
+            claims=_claims("user.requester", "client.requester"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert cancel["statusCode"] == 200
+
+    evidence = json.loads(
+        handler.handle(
+            _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", "client.approver"), op_id=op_id)
+        )["body"]
+    )
+    assert evidence["state"] == "cancelled"
+
+
+def test_approved_operation_expires_once_due() -> None:
+    # An approved operation whose window elapses transitions to expired on the
+    # next access, fencing on its post-grant sequence.
+    client = StatefulDynamoClient()
+    clock = _AdvanceableClock(NOW)
+    handler = _handler(client, clock=clock)
+    op_id = json.loads(_prepare(handler)["body"])["operation_id"]
+    grant = handler.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/approve",
+            claims=_claims("user.approver", "client.approver", exp_delta_min=60 + 20),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert grant["statusCode"] == 200
+
+    clock.set(_PAST_EXPIRY)
+    evidence = json.loads(
+        handler.handle(
+            _event(
+                "GET",
+                f"/operations/{op_id}",
+                claims=_claims("user.viewer", "client.approver", exp_delta_min=60 + 20),
+                op_id=op_id,
+            )
+        )["body"]
+    )
+    assert evidence["state"] == "expired"
+
+
 def test_get_returns_bounded_workspace_scoped_evidence() -> None:
     handler = _handler(StatefulDynamoClient())
     op_id = json.loads(_prepare(handler)["body"])["operation_id"]
@@ -440,6 +518,47 @@ def test_expired_credential_cannot_approve() -> None:
     assert resp["statusCode"] in (401, 409)
 
 
+def test_caller_with_no_group_is_denied_on_prepare_cancel_and_evidence() -> None:
+    # A verified caller whose token carries no group has no requester authority:
+    # prepare, cancel, and evidence are denied with 403 before any store read.
+    handler = _handler(StatefulDynamoClient())
+    no_group = _claims("user.outsider", "client.requester", groups=None)
+
+    prepare_resp = handler.handle(_event("POST", "/operations/prepare", claims=no_group, body=_prepare_body()))
+    assert prepare_resp["statusCode"] == 403
+
+    cancel_resp = handler.handle(
+        _event(
+            "POST",
+            "/operations/op_aaaaaaaaaaaaaaaaaaaaaaaaaa/cancel",
+            claims=no_group,
+            body={},
+            op_id="op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+    )
+    assert cancel_resp["statusCode"] == 403
+
+    evidence_resp = handler.handle(
+        _event(
+            "GET",
+            "/operations/op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            claims=no_group,
+            op_id="op_aaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+    )
+    assert evidence_resp["statusCode"] == 403
+
+
+def test_caller_outside_the_requester_allowlist_is_denied_on_prepare() -> None:
+    # A caller whose only group is outside the server-owned requester allowlist
+    # derives no authority and is denied, so a group unrelated to operations
+    # cannot prepare.
+    handler = _handler(StatefulDynamoClient())
+    wrong_group = _claims("user.outsider", "client.requester", groups=["unrelated-group"])
+    resp = handler.handle(_event("POST", "/operations/prepare", claims=wrong_group, body=_prepare_body()))
+    assert resp["statusCode"] == 403
+
+
 # -- Adapter parity + direct-Lambda identity denial (issue #414) ------------
 
 
@@ -466,7 +585,11 @@ def test_handler_prepare_matches_direct_orchestrator_outcome() -> None:
         expires_at=NOW + timedelta(hours=1),
     )
     direct = direct_handler._orchestrator.prepare(
-        _prepare_body(), principal, request_id="apigw.req-1", correlation_id="apigw.req-1"
+        _prepare_body(),
+        principal,
+        request_id="apigw.req-1",
+        correlation_id="apigw.req-1",
+        principal_authority="advise",
     )
     assert via_handler["operation_id"] == direct.operation["operation_id"]
     assert via_handler["prepared_hash"] == direct.prepared_hash

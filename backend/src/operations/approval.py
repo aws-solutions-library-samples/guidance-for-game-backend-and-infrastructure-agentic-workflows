@@ -211,18 +211,26 @@ class ApprovalRequestContext:
 class StoredPreparedOperation:
     """Defensive snapshot returned by the durable operation store."""
 
-    __slots__ = ("_prepared_operation", "prepared_operation_hash", "state")
+    __slots__ = ("_prepared_operation", "prepared_operation_hash", "state", "sequence")
 
     _prepared_operation: dict[str, Any]
     prepared_operation_hash: str
     state: str
+    sequence: int
 
-    def __init__(self, prepared_operation: dict[str, Any], prepared_operation_hash: str, state: str) -> None:
+    def __init__(
+        self,
+        prepared_operation: dict[str, Any],
+        prepared_operation_hash: str,
+        state: str,
+        sequence: int = 0,
+    ) -> None:
         if not isinstance(prepared_operation, dict):
             raise ValueError("prepared_operation must be a JSON object")
         self._prepared_operation = deepcopy(prepared_operation)
         self.prepared_operation_hash = prepared_operation_hash
         self.state = state
+        self.sequence = sequence
 
     def copy_prepared_operation(self) -> dict[str, Any]:
         """Return a copy so policy evaluation cannot mutate the stored snapshot."""
@@ -250,6 +258,7 @@ class ApprovalStore(Protocol):
         operation_id: str,
         expected_prepared_operation_hash: str,
         expected_state: str,
+        expected_sequence: int,
         commit_not_after: datetime,
         approval: Mapping[str, Any],
     ) -> ApprovalCommitOutcome:
@@ -407,6 +416,7 @@ class ApprovalService:
             operation_id=request.operation_id,
             expected_prepared_operation_hash=prepared_operation_hash,
             expected_state="pending_approval",
+            expected_sequence=stored.sequence,
             commit_not_after=commit_not_after,
             approval=deepcopy(approval),
         )
@@ -424,23 +434,6 @@ class ApprovalService:
         return deepcopy(approval)
 
 
-# Local modules
-# -- Lifecycle decisions (reject / cancel / expire) -------------------------
-#
-# The reject/cancel/expiry lifecycle decisions live in
-# :mod:`operations.decisions` to keep this module focused on the grant path,
-# but they are part of the same public approval surface. They are re-exported
-# here so callers import the whole approval domain from one place. The import
-# is at the end of the module so ``operations.decisions`` (which imports the
-# grant-path symbols defined above) resolves without a circular import.
-from operations.decisions import (  # noqa: E402  (deferred to avoid a cycle)
-    DecisionCommitOutcome,
-    DecisionRequest,
-    DecisionRequestContext,
-    DecisionStore,
-    LifecycleDecisionService,
-)
-
 __all__ = [
     "ApprovalBoundaryError",
     "ApprovalCommitOutcome",
@@ -452,10 +445,5 @@ __all__ = [
     "ApprovalRequestContext",
     "ApprovalService",
     "ApprovalStore",
-    "DecisionCommitOutcome",
-    "DecisionRequest",
-    "DecisionRequestContext",
-    "DecisionStore",
-    "LifecycleDecisionService",
     "StoredPreparedOperation",
 ]

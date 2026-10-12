@@ -174,6 +174,7 @@ class DecisionStore(Protocol):
         operation_id: str,
         expected_prepared_operation_hash: str,
         expected_state: str,
+        expected_sequence: int,
         new_state: str,
         commit_not_after: datetime,
         state_change: Mapping[str, Any],
@@ -210,9 +211,14 @@ class LifecycleDecisionService:
 
     def reject(self, request: DecisionRequest, context: DecisionRequestContext) -> dict[str, Any]:
         """An authorized approver denies one pending operation."""
-        principal_identity, prepared_operation, prepared_hash, stored_state, evaluated_at = self._load_authenticated(
-            request, context
-        )
+        (
+            principal_identity,
+            prepared_operation,
+            prepared_hash,
+            stored_state,
+            stored_sequence,
+            evaluated_at,
+        ) = self._load_authenticated(request, context)
         if prepared_operation["operation_id"] != request.operation_id:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.OPERATION_HASH_MISMATCH, "stored operation integrity check failed"
@@ -254,15 +260,21 @@ class LifecycleDecisionService:
             state_change,
             ledger_event,
             approval,
+            expected_sequence=stored_sequence,
             commit_not_after=min(context.principal.expires_at, self._operation_expiry(prepared_operation)),
         )
         return dict(approval)
 
     def cancel(self, request: DecisionRequest, context: DecisionRequestContext) -> dict[str, Any]:
         """The requester or an authorized approver cancels a pre-dispatch op."""
-        principal_identity, prepared_operation, prepared_hash, stored_state, evaluated_at = self._load_authenticated(
-            request, context
-        )
+        (
+            principal_identity,
+            prepared_operation,
+            prepared_hash,
+            stored_state,
+            stored_sequence,
+            evaluated_at,
+        ) = self._load_authenticated(request, context)
         if prepared_operation["operation_id"] != request.operation_id:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.OPERATION_HASH_MISMATCH, "stored operation integrity check failed"
@@ -302,6 +314,7 @@ class LifecycleDecisionService:
             state_change,
             ledger_event,
             None,
+            expected_sequence=stored_sequence,
             commit_not_after=min(context.principal.expires_at, self._operation_expiry(prepared_operation)),
         )
         return dict(state_change)
@@ -309,7 +322,7 @@ class LifecycleDecisionService:
     def expire_if_due(self, request: DecisionRequest) -> dict[str, Any] | None:
         """Transition a due operation to ``expired``; a no-op if not yet due."""
         now = _utc(self._clock(), "clock")
-        prepared_operation, prepared_hash, stored_state = self._load_and_validate(request)
+        prepared_operation, prepared_hash, stored_state, stored_sequence = self._load_and_validate(request)
         if prepared_operation["operation_id"] != request.operation_id:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.OPERATION_HASH_MISMATCH, "stored operation integrity check failed"
@@ -354,6 +367,7 @@ class LifecycleDecisionService:
             state_change,
             ledger_event,
             None,
+            expected_sequence=stored_sequence,
             commit_not_after=_FAR_FUTURE,
         )
         return dict(state_change)
@@ -362,7 +376,7 @@ class LifecycleDecisionService:
 
     def _load_authenticated(
         self, request: DecisionRequest, context: DecisionRequestContext
-    ) -> tuple[dict[str, str], dict[str, Any], str, str, datetime]:
+    ) -> tuple[dict[str, str], dict[str, Any], str, str, int, datetime]:
         try:
             evaluated_at = _utc(self._clock(), "clock")
             principal_identity = self._identity_boundary.bind_approver(context.principal, now=evaluated_at)
@@ -370,16 +384,16 @@ class LifecycleDecisionService:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.IDENTITY_CONTEXT_INVALID, "authenticated decision identity is invalid"
             ) from exc
-        prepared_operation, prepared_hash, stored_state = self._load_and_validate(request)
+        prepared_operation, prepared_hash, stored_state, stored_sequence = self._load_and_validate(request)
         try:
             self._identity_boundary.validate_stored_requester(prepared_operation["requester"])
         except IdentityBoundaryError as exc:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.AUTHORIZATION_DENIED, "decision is not authorized for this operation"
             ) from exc
-        return principal_identity, prepared_operation, prepared_hash, stored_state, evaluated_at
+        return principal_identity, prepared_operation, prepared_hash, stored_state, stored_sequence, evaluated_at
 
-    def _load_and_validate(self, request: DecisionRequest) -> tuple[dict[str, Any], str, str]:
+    def _load_and_validate(self, request: DecisionRequest) -> tuple[dict[str, Any], str, str, int]:
         stored = self._store.load_for_decision(request.operation_id)
         if stored is None:
             raise ApprovalBoundaryError(ApprovalErrorCode.OPERATION_NOT_FOUND, "operation is unavailable for decision")
@@ -405,7 +419,7 @@ class LifecycleDecisionService:
             raise ApprovalBoundaryError(
                 ApprovalErrorCode.OPERATION_HASH_MISMATCH, "operation changed since it was presented"
             )
-        return prepared_operation, prepared_hash, stored.state
+        return prepared_operation, prepared_hash, stored.state, stored.sequence
 
     @staticmethod
     def _require_state(state: str, allowed: frozenset[str]) -> str:
@@ -553,12 +567,14 @@ class LifecycleDecisionService:
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
         *,
+        expected_sequence: int,
         commit_not_after: datetime,
     ) -> None:
         outcome = self._store.record_terminal_decision(
             operation_id=request.operation_id,
             expected_prepared_operation_hash=prepared_hash,
             expected_state=expected_state,
+            expected_sequence=expected_sequence,
             new_state=new_state,
             commit_not_after=_utc(commit_not_after, "commit_not_after"),
             state_change=dict(state_change),

@@ -36,11 +36,9 @@ approval record. A lost conditional check is reported as a precondition failure
 
 **E2 records carry no TTL.** The prepared operation, its state snapshot and
 transitions, the append-only ledger, the idempotency mapping, and the approval
-record are the durable audit trail and MUST NOT expire. Only the transient E1
-observation records carry a numeric ``ttl`` (see
-:mod:`operations.observation_store`); this store never writes a ``ttl``
-attribute. Expiry of an operation is a *state transition* to ``expired`` in the
-ledger, not the physical deletion of a record.
+record are the durable audit trail and MUST NOT expire. This store never writes
+a ``ttl`` attribute on any record. Expiry of an operation is a *state
+transition* to ``expired`` in the ledger, not the physical deletion of a record.
 
 Error classification reads the real botocore wire shape
 (``exc.response["CancellationReasons"]``): only a pure ``ConditionalCheckFailed``
@@ -57,7 +55,7 @@ from __future__ import annotations
 # Standard library
 import logging
 from collections.abc import Callable, Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -75,6 +73,12 @@ _IDEM_SK = "MAP#current"
 _CONTRACT_VERSION = "1.0"
 _INITIAL_GENERATION = 1
 _PENDING_APPROVAL = "pending_approval"
+
+# The worst-case wall-clock cost of one store sub-call (connect + read on the
+# single-attempt persistence client), matching the E1 observation store. A read
+# or transaction only begins when at least this much of the request budget
+# remains.
+_DEFAULT_CALL_LIMIT_S = 4.5
 
 # The prepared-operation lifecycle appends at most a small, bounded number of
 # ledger entries (materialization + one terminal transition), so an evidence
@@ -125,12 +129,30 @@ class DynamoDbApprovalStore:
         client: Any,
         table_name: str,
         clock: Callable[[], datetime] | None = None,
+        call_limit_s: float = _DEFAULT_CALL_LIMIT_S,
     ) -> None:
         if not isinstance(table_name, str) or not table_name.strip():
             raise ValueError("table_name must be a non-empty string")
+        if not (isinstance(call_limit_s, (int, float)) and call_limit_s > 0):
+            raise ValueError("call_limit_s must be a positive number of seconds")
         self._client = client
         self._table_name = table_name
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # The worst-case wall-clock cost of one store sub-call (connect + read on
+        # the single-attempt persistence client). A read or transaction is only
+        # started when at least this much of the request budget remains, so a
+        # store call never begins so late that it can outlast the Lambda timeout.
+        self._call_limit_s = float(call_limit_s)
+
+    def _deadline_reached(self, deadline: datetime) -> bool:
+        """Whether one full store sub-call would not fit before ``deadline``.
+
+        Returns ``True`` when fewer than one call limit remains, so the caller
+        fails closed before starting a sub-call that could return after the
+        request deadline. Guarding on the call limit (not merely on the deadline
+        already being past) keeps the whole invocation inside the Lambda timeout.
+        """
+        return self._clock() + timedelta(seconds=self._call_limit_s) >= deadline
 
     # -- Persist a prepared operation awaiting approval -------------------
 
@@ -148,7 +170,7 @@ class DynamoDbApprovalStore:
     ) -> PersistResult:
         """Atomically materialize one prepared operation awaiting approval."""
         deadline = _utc(commit_not_after, "commit_not_after")
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return PersistResult(PersistOutcome.DEADLINE_EXPIRED)
 
         operation_id = prepared_operation["operation_id"]
@@ -228,7 +250,7 @@ class DynamoDbApprovalStore:
             self._conditional_put(ledger_item, "attribute_not_exists(SK)"),
         ]
 
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return PersistResult(PersistOutcome.DEADLINE_EXPIRED)
 
         try:
@@ -265,11 +287,12 @@ class DynamoDbApprovalStore:
         operation_id: str,
         expected_prepared_operation_hash: str,
         expected_state: str,
+        expected_sequence: int = 0,
         commit_not_after: datetime,
         approval: Mapping[str, Any],
     ) -> ApprovalCommitOutcome:
         deadline = _utc(commit_not_after, "commit_not_after")
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return ApprovalCommitOutcome.DEADLINE_EXPIRED
         state_change = _approval_state_change(operation_id, expected_prepared_operation_hash, approval)
         ledger_event = _approval_ledger_event(operation_id, expected_prepared_operation_hash, approval)
@@ -278,7 +301,7 @@ class DynamoDbApprovalStore:
             expected_prepared_operation_hash=expected_prepared_operation_hash,
             expected_state=expected_state,
             new_state="approved",
-            sequence=1,
+            sequence=expected_sequence + 1,
             state_change=state_change,
             ledger_event=ledger_event,
             approval=approval,
@@ -297,6 +320,7 @@ class DynamoDbApprovalStore:
         operation_id: str,
         expected_prepared_operation_hash: str,
         expected_state: str,
+        expected_sequence: int = 0,
         new_state: str,
         commit_not_after: datetime,
         state_change: Mapping[str, Any],
@@ -304,14 +328,14 @@ class DynamoDbApprovalStore:
         approval: Mapping[str, Any] | None,
     ) -> DecisionCommitOutcome:
         deadline = _utc(commit_not_after, "commit_not_after")
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return DecisionCommitOutcome.DEADLINE_EXPIRED
         return self._commit_terminal(
             operation_id=operation_id,
             expected_prepared_operation_hash=expected_prepared_operation_hash,
             expected_state=expected_state,
             new_state=new_state,
-            sequence=1,
+            sequence=expected_sequence + 1,
             state_change=state_change,
             ledger_event=ledger_event,
             approval=approval,
@@ -374,7 +398,12 @@ class DynamoDbApprovalStore:
                 "contract_version": _CONTRACT_VERSION,
                 "operation_id": operation_id,
                 "sequence": sequence,
-                "ledger_json": _canonical_json(ledger_event),
+                # The ledger-event contract ``sequence`` is strictly increasing
+                # per operation: it is the physical ``LEDGER#<n>`` index plus one
+                # (creation at index 0 carries contract sequence 1, this terminal
+                # transition at index n carries n + 1), so the ledger history
+                # never repeats a contract sequence.
+                "ledger_json": _canonical_json(_with_contract_sequence(ledger_event, sequence + 1)),
             }
         )
         transact_items: list[dict[str, Any]] = [
@@ -396,7 +425,7 @@ class DynamoDbApprovalStore:
             )
             transact_items.append(self._conditional_put(approval_item, "attribute_not_exists(SK)"))
 
-        if self._clock() >= deadline:
+        if self._deadline_reached(deadline):
             return DecisionCommitOutcome.DEADLINE_EXPIRED
 
         try:
@@ -437,7 +466,9 @@ class DynamoDbApprovalStore:
         state = snapshot.get("state")
         if not isinstance(prepared_hash, str) or not isinstance(state, str) or not isinstance(document, dict):
             return None
-        return StoredPreparedOperation(document, prepared_hash, state)
+        sequence_raw = snapshot.get("sequence")
+        sequence = sequence_raw if isinstance(sequence_raw, int) and not isinstance(sequence_raw, bool) else 0
+        return StoredPreparedOperation(document, prepared_hash, state, sequence)
 
     # -- Evidence load ----------------------------------------------------
 
@@ -554,6 +585,18 @@ def _canonical_json(document: Mapping[str, Any]) -> str:
 
     canonical: str = rfc8785.dumps(dict(document)).decode("utf-8")
     return canonical
+
+
+def _with_contract_sequence(ledger_event: Mapping[str, Any], contract_sequence: int) -> dict[str, Any]:
+    """Return the ledger event with its contract ``sequence`` set, server-owned.
+
+    The contract ``sequence`` is strictly increasing per operation (physical
+    ``LEDGER#<n>`` index + 1). It is owned by the durable store, not the caller,
+    so the stored history can never repeat a sequence.
+    """
+    event = dict(ledger_event)
+    event["sequence"] = contract_sequence
+    return event
 
 
 def _approval_state_change(operation_id: str, prepared_hash: str, approval: Mapping[str, Any]) -> dict[str, Any]:

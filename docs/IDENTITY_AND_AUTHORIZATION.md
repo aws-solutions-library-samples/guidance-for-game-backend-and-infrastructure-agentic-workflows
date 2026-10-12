@@ -90,9 +90,11 @@ The approval store receives expected state and hash plus an exclusive
 `commit_not_after` deadline equal to the earliest credential, operation, or
 approval-record expiry, and returns a typed recorded, precondition-failed, or
 deadline-expired outcome. Only exact outcome enum members are accepted; raw
-string values fail closed. Its durable implementation must enforce all three
-conditions in the same atomic transaction that records the approval and state
-transition.
+string values fail closed. Its durable implementation fences the expected state
+and hash in the same atomic transaction that records the approval and state
+transition, and enforces the request deadline client-side: it refuses to start
+the transaction unless at least one full store sub-call fits before
+`commit_not_after`, so a commit never lands after the deadline.
 
 The default policy denies self-approval. A tenant/workspace policy may
 explicitly allow the same principal to approve an eligible low-risk operation.
