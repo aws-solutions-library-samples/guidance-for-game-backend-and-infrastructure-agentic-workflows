@@ -3,8 +3,9 @@
 The deployable operations Lambda exposes exactly one ``handler`` entry point but
 serves two surfaces: the read-only E1 observation surface (issue #413) and the
 E2 prepare/approval surface (issue #414). ``OperationsRequestRouter`` picks the
-correct sub-handler by HTTP method and route so E1 routes stay byte-for-byte
-preserved while the E2 routes are added additively:
+correct sub-handler by the API Gateway HTTP API ``routeKey`` (falling back to
+the method and path when a raw invocation carries no ``routeKey``) so E1 routes
+stay byte-for-byte preserved while the E2 routes are added additively:
 
 * ``POST /operations/observe`` -> the E1 observation handler.
 * ``POST /operations/prepare`` and ``POST /operations/{operationId}/<action>``
@@ -13,6 +14,11 @@ preserved while the E2 routes are added additively:
   observation id, E2 evidence when the id is an ``op_`` prepared-operation id.
   Any other id preserves E1 status behavior (its bounded NOT_FOUND /
   CONTRACT_INVALID), so an unknown id never silently reaches the E2 surface.
+
+Dispatching on the gateway's own ``routeKey`` rather than the raw request path
+keeps routing correct under a custom-domain base path mapping, where the path
+carries a stage/base-path prefix the templated routes do not; the two E2 POST
+and GET route keys still reach the E2 handler there.
 
 The router only *chooses* a handler; each sub-handler independently enforces the
 JWT-only identity boundary and returns its own bounded, sanitized response.
@@ -28,6 +34,16 @@ _OBSERVE_ROUTE = "/operations/observe"
 _PREPARE_ROUTE = "/operations/prepare"
 _E2_ID_PREFIX = "op_"
 _E2_POST_SUFFIXES = ("/approve", "/reject", "/cancel")
+_OBSERVE_ROUTE_KEY = "POST /operations/observe"
+_PREPARE_ROUTE_KEY = "POST /operations/prepare"
+_E2_POST_ROUTE_KEYS = frozenset(
+    {
+        "POST /operations/{operationId}/approve",
+        "POST /operations/{operationId}/reject",
+        "POST /operations/{operationId}/cancel",
+    }
+)
+_EVIDENCE_ROUTE_KEY = "GET /operations/{operationId}"
 
 
 class RequestHandlerPort(Protocol):
@@ -42,6 +58,26 @@ class OperationsRequestRouter:
         self._approval_handler = approval_handler
 
     def handle(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        route_key = _route_key(event)
+        if route_key:
+            return self._route_by_key(event, route_key)
+        return self._route_by_method_and_path(event)
+
+    def _route_by_key(self, event: Mapping[str, Any], route_key: str) -> dict[str, Any]:
+        if route_key == _OBSERVE_ROUTE_KEY:
+            return self._observation_handler.handle(event)
+        if route_key == _PREPARE_ROUTE_KEY or route_key in _E2_POST_ROUTE_KEYS:
+            return self._approval_handler.handle(event)
+        if route_key == _EVIDENCE_ROUTE_KEY:
+            operation_id = _operation_id(event)
+            if isinstance(operation_id, str) and operation_id.startswith(_E2_ID_PREFIX):
+                return self._approval_handler.handle(event)
+            # An obs_ id or any other/unknown id preserves E1 status behavior.
+            return self._observation_handler.handle(event)
+        # An unknown route key preserves the E1 handler's bounded rejection.
+        return self._observation_handler.handle(event)
+
+    def _route_by_method_and_path(self, event: Mapping[str, Any]) -> dict[str, Any]:
         method = _method(event)
         route = _route(event)
 
@@ -63,6 +99,11 @@ class OperationsRequestRouter:
         # Any other method is handled (and rejected) by the E1 handler, keeping
         # the observe surface's method contract unchanged.
         return self._observation_handler.handle(event)
+
+
+def _route_key(event: Mapping[str, Any]) -> str:
+    route_key = event.get("routeKey")
+    return route_key if isinstance(route_key, str) and route_key else ""
 
 
 def _method(event: Mapping[str, Any]) -> str:

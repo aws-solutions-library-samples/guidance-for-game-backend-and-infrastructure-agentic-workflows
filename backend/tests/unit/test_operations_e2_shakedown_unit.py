@@ -115,7 +115,7 @@ def test_shakedown_runs_full_flow_and_all_checks_pass() -> None:
         "replay_grant_conflicts",
         "evidence",
         "reject_conflict",
-        "cancel_conflict",
+        "cancel_approved_and_replay_conflict",
     } <= names
 
 
@@ -217,9 +217,10 @@ class FakeMultiOpDeployedE2:
             return _resp(200, op["approval"])
 
         if method == "POST" and path.endswith("/cancel"):
-            if op["state"] != "pending_approval":
+            # A pre-dispatch operation (prepared / pending_approval / approved)
+            # is cancellable; a terminal operation conflicts.
+            if op["state"] not in ("prepared", "pending_approval", "approved"):
                 return _resp(409, {"error_code": "STATE_CONFLICT", "safe_message": "conflict"})
-            # The requester (access token) may cancel their own pending op.
             op["state"] = "cancelled"
             return _resp(200, {"new_state": "cancelled"})
 

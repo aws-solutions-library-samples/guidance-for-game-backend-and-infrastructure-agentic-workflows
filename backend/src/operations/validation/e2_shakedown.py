@@ -21,8 +21,10 @@ What it asserts (each is one discriminating check):
 5. **A distinct human approver grants** (200), and **a replayed grant conflicts**
    (409) — the fenced, atomic single-grant invariant.
 6. **GET returns bounded evidence** for the operation (200), leak-free.
-7. **Reject and cancel on the now-approved operation conflict** (409) — the
-   terminal-state fence.
+7. **Reject on the now-approved operation conflicts** (409) — reject requires a
+   pending operation — while **cancelling the approved operation succeeds**
+   (200) and a **replayed cancel conflicts** (409): an approved, pre-dispatch
+   operation is still cancellable, and the terminal state then fences a replay.
 
 Secret hygiene
 --------------
@@ -325,13 +327,24 @@ class E2ShakedownRunner:
         passed = ok and response.status == 409
         return CheckResult("reject_conflict", passed, "" if passed else f"status={response.status} {reason}")
 
-    def check_cancel_conflict(self, operation_id: str) -> CheckResult:
-        response = self._request(
+    def check_cancel_approved_and_replay_conflict(self, operation_id: str) -> CheckResult:
+        """Cancelling the approved operation succeeds (200); a replay conflicts (409).
+
+        An approved, pre-dispatch operation is still cancellable by an authorized
+        approver, so the first cancel transitions it to ``cancelled`` and returns
+        200. The now-terminal operation then fences a replayed cancel at 409.
+        """
+        cancel = self._request(
             "POST", f"/operations/{operation_id}/cancel", bearer=self._config.approver_token, body={}
         )
-        ok, reason = response_is_bounded_and_clean(response)
-        passed = ok and response.status == 409
-        return CheckResult("cancel_conflict", passed, "" if passed else f"status={response.status} {reason}")
+        ok1, reason1 = response_is_bounded_and_clean(cancel)
+        replay = self._request(
+            "POST", f"/operations/{operation_id}/cancel", bearer=self._config.approver_token, body={}
+        )
+        ok2, reason2 = response_is_bounded_and_clean(replay)
+        passed = ok1 and cancel.status == 200 and ok2 and replay.status == 409
+        detail = "" if passed else f"cancel={cancel.status} {reason1}; replay={replay.status} {reason2}"
+        return CheckResult("cancel_approved_and_replay_conflict", passed, detail)
 
     def check_requester_cancel_and_replay_conflict(self) -> CheckResult:
         """On its OWN fresh operation, the requester cancels (200), replay 409."""
@@ -406,7 +419,7 @@ class E2ShakedownRunner:
             report.checks.append(self.check_replay_grant_conflicts(operation_id))
             report.checks.append(self.check_evidence(operation_id))
             report.checks.append(self.check_reject_conflict(operation_id))
-            report.checks.append(self.check_cancel_conflict(operation_id))
+            report.checks.append(self.check_cancel_approved_and_replay_conflict(operation_id))
             # Independent operations: a requester cancellation and a distinct-
             # admin rejection, each on its OWN fresh operation, both proving the
             # replayed terminal decision conflicts.

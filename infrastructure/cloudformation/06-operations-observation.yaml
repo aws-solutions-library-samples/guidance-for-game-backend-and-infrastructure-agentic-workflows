@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  Game Agent - OPTIONAL E1 operations observation control plane (GitHub issue
-  #413). Default-unprovisioned: this stack is not wired into deploy-all.sh and is
-  only ever created with Provisioned=true, so the default deployment creates no
-  stack at all (zero resources, zero cost, no data). Every resource is gated on
-  the ResourcesProvisioned condition. Provisioning (Provisioned=true) and runtime
+  Game Agent - OPTIONAL E1/E2 operations control plane (GitHub issues #413 E1
+  observe, #414 E2 advise). Default-unprovisioned: this stack is not wired into
+  deploy-all.sh and is only ever created with Provisioned=true, so the default
+  deployment creates no stack at all (zero resources, zero cost, no data). Every
+  resource is gated on the ResourcesProvisioned condition. Provisioning
+  (Provisioned=true) and runtime
   authority (OperationsMode observe|disabled) are SEPARATE: an emergency disable
   sets OperationsMode=disabled while keeping Provisioned=true, so resources and
   their retained audit data stay under CloudFormation with stable physical names
@@ -219,10 +220,12 @@ Parameters:
       pattern [A-Za-z0-9][A-Za-z0-9._:-]{0,127} with no spaces or empty entries.
     Description: >-
       Comma-separated, server-owned allowlist of Cognito groups permitted to
-      observe, injected as GBAW_OPERATIONS_OBSERVER_GROUPS. A verified caller
-      whose access-token groups intersect this set derives `observe` authority;
-      a caller with no intersecting group is denied on both the observe and the
-      status route. Matches the core default (admin,users).
+      operate the control plane, injected as GBAW_OPERATIONS_OBSERVER_GROUPS. A
+      verified caller whose access-token groups intersect this set derives the
+      requester authority; a caller with no intersecting group is denied on the
+      E1 observe and status routes and on the E2 prepare, cancel, and evidence
+      routes. E2 approve and reject are additionally gated by the separate
+      approver group. Matches the core default (admin,users).
 
   # ------------------------------------------------------------------------- #
   # E2 (issue #414) advise-mode settings. Server-owned and validated; the env

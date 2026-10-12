@@ -954,7 +954,9 @@ python -m operations.validation.e2_shakedown \
 | Current desired (optional) | `--current-desired` | `GBAW_E2_CURRENT_DESIRED` |
 | Real-time expiry wait, seconds (optional) | `--expiry-wait-seconds` | `GBAW_E2_EXPIRY_WAIT_SECONDS` |
 
-The run exercises only expected caller outcomes (self-approval denial, replay and
-reject/cancel conflicts, bounded evidence), so a clean run prints a JSON summary
-and publishes no failure metric — it never trips the paging alarms. A transport
-failure prints a fixed, input-free error and exits non-zero without a traceback.
+The run exercises only expected caller outcomes (self-approval denial, a replayed
+grant conflict, a reject-on-approved conflict, a cancel of the approved operation
+followed by a replayed-cancel conflict, and bounded evidence), so a clean run
+prints a JSON summary and publishes no failure metric — it never trips the paging
+alarms. A transport failure prints a fixed, input-free error and exits non-zero
+without a traceback.

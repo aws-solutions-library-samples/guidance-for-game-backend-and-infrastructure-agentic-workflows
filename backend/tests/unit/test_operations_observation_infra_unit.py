@@ -1455,9 +1455,19 @@ def test_deploy_wrapper_verifies_bucket_region_and_account_context():
 
 def test_preview_is_read_only_no_change_set():
     text = DEPLOY_WRAPPER.read_text(encoding="utf-8")
-    # Preview validates/lints only; it must not create a change set.
-    assert "create-change-set" not in text, "preview must not create a change set"
-    assert "validate-template" in text or "cfn-lint" in text
+    # Scope the assertion to the preview block (from its guard to its exit 0),
+    # since the enable path legitimately deploys through a change set elsewhere.
+    start = text.index('if [ "$ACTION" = "preview" ]')
+    preview_block = text[start : text.index("exit 0\nfi", start)]
+    # Preview validates/lints and may upload the template for URL validation, but
+    # it must not create a change set or deploy a stack.
+    assert "create-change-set" not in preview_block, "preview must not create a change set"
+    assert "cloudformation deploy" not in preview_block, "preview must not deploy a stack"
+    assert "validate-template" in preview_block or "cfn-lint" in preview_block
+    # The enable path (not preview) is what deploys through an owner-bound change
+    # set referenced by URL.
+    assert "create-change-set" in text, "enable must deploy through a change set"
+    assert "--template-url" in text
 
 
 def test_teardown_wrapper_requires_explicit_confirmation():

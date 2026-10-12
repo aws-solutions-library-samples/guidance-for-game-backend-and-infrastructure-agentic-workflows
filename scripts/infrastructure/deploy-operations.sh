@@ -13,9 +13,10 @@
 #   * GBAW_OPERATIONS_MODE=observe  (environment), and
 #   * --enable                      (flag)
 # An enabled deploy provisions resources (Provisioned=true) AND sets the runtime
-# authority to observe. Without both opt-ins, it runs a READ-ONLY preview
-# (template service validation + lint only; it creates no change set and mutates
-# nothing). Provisioning and runtime authority are SEPARATE: --disable is an
+# authority to observe. Without both opt-ins, it runs a preview that lints the
+# template and, when an artifact bucket is configured, uploads the template to
+# that bucket (owner-bound, in the expected account) to run read-only service
+# validation by URL; it creates no change set, stack, or runtime resource. Provisioning and runtime authority are SEPARATE: --disable is an
 # emergency, data-preserving path that keeps Provisioned=true and every resource
 # in place, flipping only OperationsMode to disabled so the stack fails closed
 # and a later --enable is reversible. It rebuilds no code and runs no Docker.
@@ -131,8 +132,10 @@ usage() {
     cat <<'USAGE'
 Usage: deploy-operations.sh [--enable [--mode observe|advise] | --disable] [--environment beta|prod] [--allow-binding-change]
 
-  (no flag)     Preview only (READ-ONLY): validates and lints the template and
-                creates nothing. No change set is created.
+  (no flag)     Preview: lints the template and, when an artifact bucket is set,
+                uploads it to that bucket (owner-bound, expected account) to run
+                read-only service validation by URL. Creates no stack or change
+                set.
   --enable      Build/upload the operations Lambda artifact and deploy the stack
                 with the selected enabled OperationsMode (default observe).
                 Requires GBAW_OPERATIONS_MODE to MATCH the selected --mode
@@ -256,11 +259,16 @@ if ! command -v aws >/dev/null 2>&1; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Read-only preview: validate + lint only. Never creates a change set, never
-# mutates AWS, and does not require credentials for linting.
+# Preview: lint, and (when an artifact bucket is set) upload the template to that
+# bucket in the expected account to run read-only service validation by URL. It
+# creates no change set and no stack. Linting needs no credentials; the optional
+# upload + service validation do, and are bound to the expected account first.
 # --------------------------------------------------------------------------- #
 if [ "$ACTION" = "preview" ]; then
-    echo "🔎 Preview only (READ-ONLY). Validating and linting the template."
+    echo "🔎 Preview: lints the template and, when an artifact bucket is set,"
+    echo "   uploads the template to that bucket (owner-bound, in the expected"
+    echo "   account) to run read-only service validation by URL. It creates no"
+    echo "   stack, change set, or runtime resource."
     echo "   To deploy observe (E1): GBAW_OPERATIONS_MODE=observe $0 --enable"
     echo "   To deploy advise (E2):  GBAW_OPERATIONS_MODE=advise  $0 --enable --mode advise"
     _require_template_within_s3_limit
@@ -277,6 +285,17 @@ if [ "$ACTION" = "preview" ]; then
     # otherwise run lint only and say so, rather than send an over-limit body.
     if [ -n "$GBAW_OPERATIONS_ARTIFACT_BUCKET" ]; then
         if PREVIEW_ACCOUNT_ID="$(aws sts get-caller-identity "${AWS_PROFILE_ARGS[@]}" --region "$AWS_REGION" --query Account --output text 2>/dev/null)"; then
+            # Bind the upload to the expected account BEFORE writing, so the
+            # preview never puts an object into a bucket in a different account
+            # from the main deployment. When the expected account is set and does
+            # not match, fall back to lint only rather than write cross-account.
+            if [ -n "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ] && [ "$PREVIEW_ACCOUNT_ID" != "$GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID" ]; then
+                echo "⚠️  Resolved account (****${PREVIEW_ACCOUNT_ID: -4}) does not match the expected" >&2
+                echo "   account (****${GBAW_OPERATIONS_EXPECTED_ACCOUNT_ID: -4}); ran lint only and" >&2
+                echo "   uploaded nothing. Service validation skipped." >&2
+                echo "✅ Preview complete (lint only); no object was uploaded and nothing was deployed."
+                exit 0
+            fi
             PREVIEW_TEMPLATE_HASH="$(shasum -a 256 "$TEMPLATE" | awk '{print $1}')"
             PREVIEW_TEMPLATE_KEY="${TEMPLATE_S3_PREFIX}/${PREVIEW_TEMPLATE_HASH}.yaml"
             echo "   Uploading template to s3://$GBAW_OPERATIONS_ARTIFACT_BUCKET/$PREVIEW_TEMPLATE_KEY ..."
@@ -292,15 +311,15 @@ if [ "$ACTION" = "preview" ]; then
                 "${AWS_PROFILE_ARGS[@]}" \
                 --template-url "https://${GBAW_OPERATIONS_ARTIFACT_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${PREVIEW_TEMPLATE_KEY}" \
                 --region "$AWS_REGION" >/dev/null
-            echo "✅ Preview complete. Template linted and service-validated; nothing was deployed."
+            echo "✅ Preview complete. Template linted and service-validated by URL; no stack was deployed."
         else
             echo "⚠️  Could not verify credentials; ran lint only (service validation skipped)." >&2
-            echo "✅ Preview complete (lint only); no resources were created."
+            echo "✅ Preview complete (lint only); no object was uploaded and nothing was deployed."
         fi
     else
         echo "ℹ️  GBAW_OPERATIONS_ARTIFACT_BUCKET is unset; ran lint only. Set it to also"
         echo "   run read-only template service validation by URL."
-        echo "✅ Preview complete (lint only); no resources were created."
+        echo "✅ Preview complete (lint only); no object was uploaded and nothing was deployed."
     fi
     exit 0
 fi
@@ -351,31 +370,59 @@ if [ "$ACTION" = "enable" ]; then
     _env_ceiling="$(printenv GBAW_OPERATIONS_CAPACITY_CEILING 2>/dev/null || true)"
     _env_max_step="$(printenv GBAW_OPERATIONS_CAPACITY_MAX_STEP 2>/dev/null || true)"
     if [ -n "$_env_floor$_env_ceiling$_env_max_step" ]; then
-        # When any capacity dimension is overridden, require the full coherent
-        # triple so a partial override cannot pair with an incoherent default.
-        _chk_floor="${_env_floor:-0}"
-        _chk_ceiling="${_env_ceiling:-1}"
-        _chk_max_step="${_env_max_step:-1}"
-        if ! [[ "$_chk_floor" =~ $_int_re ]] || ! [[ "$_chk_ceiling" =~ $_int_re ]] || ! [[ "$_chk_max_step" =~ $_int_re ]]; then
-            echo "❌ Refusing to enable: capacity floor/ceiling/max_step must be non-negative integers" >&2
-            echo "   (got floor=$_chk_floor ceiling=$_chk_ceiling max_step=$_chk_max_step)." >&2
-            exit 3
+        # Validate only the dimensions the operator explicitly set here: each
+        # must be a non-negative integer. The cross-dimension coherence check
+        # (floor below ceiling, max_step within the span) is deferred to the
+        # EFFECTIVE validation after stack existence is known, which fills an
+        # unset dimension from the deployed value rather than a hard-coded
+        # default. That way setting only one dimension (for example a new floor)
+        # against a deployed band is validated against the real other two, not
+        # against 0/1/1, and a coherent partial override is not falsely refused.
+        for _pair in "floor=$_env_floor" "ceiling=$_env_ceiling" "max_step=$_env_max_step"; do
+            _dim_name="${_pair%%=*}"
+            _dim_value="${_pair#*=}"
+            [ -z "$_dim_value" ] && continue
+            if ! [[ "$_dim_value" =~ $_int_re ]]; then
+                echo "❌ Refusing to enable: capacity $_dim_name must be a non-negative integer (got '$_dim_value')." >&2
+                exit 3
+            fi
+        done
+        # Cross-dimension coherence that does not depend on an unset dimension
+        # can be checked now; a check that needs a dimension the operator did
+        # not set is deferred to the EFFECTIVE validation (which fills it from
+        # the deployed value). floor < ceiling needs only floor and ceiling, so
+        # it is enforced early whenever BOTH are set. The max_step span needs all
+        # three, so it is only enforced early when all three are set; a lone
+        # floor/ceiling override against a deployed band is validated against the
+        # real deployed max_step rather than a hard-coded default.
+        if [ -n "$_env_floor" ] && [ -n "$_env_ceiling" ]; then
+            if [ "$_env_floor" -ge "$_env_ceiling" ]; then
+                echo "❌ Refusing to enable: capacity floor ($_env_floor) must be strictly below ceiling ($_env_ceiling)." >&2
+                exit 3
+            fi
         fi
-        if [ "$_chk_floor" -ge "$_chk_ceiling" ]; then
-            echo "❌ Refusing to enable: capacity floor ($_chk_floor) must be strictly below ceiling ($_chk_ceiling)." >&2
-            exit 3
+        if [ -n "$_env_floor" ] && [ -n "$_env_ceiling" ] && [ -n "$_env_max_step" ]; then
+            _chk_span=$(( _env_ceiling - _env_floor ))
+            if [ "$_env_max_step" -lt 1 ] || [ "$_env_max_step" -gt "$_chk_span" ]; then
+                echo "❌ Refusing to enable: capacity max_step ($_env_max_step) must be > 0 and <= ceiling-floor ($_chk_span)." >&2
+                exit 3
+            fi
         fi
-        _chk_span=$(( _chk_ceiling - _chk_floor ))
-        if [ "$_chk_max_step" -lt 1 ] || [ "$_chk_max_step" -gt "$_chk_span" ]; then
-            echo "❌ Refusing to enable: capacity max_step ($_chk_max_step) must be > 0 and <= ceiling-floor ($_chk_span)." >&2
-            exit 3
-        fi
+    fi
+    # The prepare/approval expiry windows only govern the E2 advise lifecycle.
+    # In advise mode a window must be at least the store call limit plus a margin
+    # (60 s), mirroring the operations settings floor, so a window too short to
+    # ever land one store write cannot be configured. In observe mode the windows
+    # are inert, so any in-range value is accepted (upper bound only).
+    _expiry_floor=1
+    if [ "$REQUESTED_MODE" = "advise" ]; then
+        _expiry_floor=60
     fi
     for _pair in "GBAW_OPERATIONS_PREPARATION_EXPIRY_S" "GBAW_OPERATIONS_APPROVAL_EXPIRY_S"; do
         _value="$(printenv "$_pair" 2>/dev/null || true)"
         [ -z "$_value" ] && continue
-        if ! [[ "$_value" =~ $_int_re ]] || [ "$_value" -lt 1 ] || [ "$_value" -gt 86400 ]; then
-            echo "❌ Refusing to enable: $_pair must be an integer in [1, 86400] seconds (got '$_value')." >&2
+        if ! [[ "$_value" =~ $_int_re ]] || [ "$_value" -lt "$_expiry_floor" ] || [ "$_value" -gt 86400 ]; then
+            echo "❌ Refusing to enable: $_pair must be an integer in [$_expiry_floor, 86400] seconds (got '$_value')." >&2
             exit 3
         fi
     done
@@ -617,11 +664,18 @@ if [ "$ACTION" = "enable" ]; then
         echo "❌ Refusing to enable: effective capacity max_step ($CAPACITY_MAX_STEP) must be > 0 and <= ceiling-floor ($_capacity_span)." >&2
         exit 3
     fi
+    # The expiry floor matches the operations settings: 60 s in advise mode (at
+    # least one store call limit plus a margin), relaxed to 1 s in observe mode
+    # where the windows are inert.
+    _eff_expiry_floor=1
+    if [ "$OPERATIONS_MODE" = "advise" ]; then
+        _eff_expiry_floor=60
+    fi
     for _pair in "PreparationExpirySeconds=$PREPARATION_EXPIRY_SECONDS" "ApprovalExpirySeconds=$APPROVAL_EXPIRY_SECONDS"; do
         _name="${_pair%%=*}"
         _value="${_pair#*=}"
-        if ! [[ "$_value" =~ $_int_re ]] || [ "$_value" -lt 1 ] || [ "$_value" -gt 86400 ]; then
-            echo "❌ Refusing to enable: effective $_name must be an integer in [1, 86400] seconds (got '$_value')." >&2
+        if ! [[ "$_value" =~ $_int_re ]] || [ "$_value" -lt "$_eff_expiry_floor" ] || [ "$_value" -gt 86400 ]; then
+            echo "❌ Refusing to enable: effective $_name must be an integer in [$_eff_expiry_floor, 86400] seconds (got '$_value')." >&2
             exit 3
         fi
     done
@@ -1103,19 +1157,97 @@ if [ "$STACK_EXISTS" != "true" ] || [ "$ALLOW_BINDING_CHANGE" = "true" ]; then
 fi
 
 echo "🚀 Deploying $STACK_NAME with Provisioned=true OperationsMode=$OPERATIONS_MODE ..."
-# The template exceeds the inline limit, so it is NOT sent with --template-file
-# alone (which would send it inline and be rejected). Passing --s3-bucket (with
-# the same verified, owner-bound artifact bucket) and --s3-prefix makes the CLI
-# upload the template under operations/templates/ and reference it by URL.
-aws cloudformation deploy \
+# The template exceeds the inline limit, so it is referenced by URL rather than
+# sent inline. Upload it with an owner-bound put-object (so a bucket that was
+# re-created or re-owned under a different account is refused), then deploy
+# through a change set referencing it by --template-url. This closes the
+# time-of-check/time-of-use window the CLI's own --s3-bucket upload left open,
+# where that upload carried no expected-owner guard. The change set preserves
+# the existing create-or-update semantics and treats an empty change set as a
+# no-op success.
+DEPLOY_TEMPLATE_HASH="$(shasum -a 256 "$TEMPLATE" | awk '{print $1}')"
+DEPLOY_TEMPLATE_KEY="${TEMPLATE_S3_PREFIX}/${DEPLOY_TEMPLATE_HASH}.yaml"
+echo "   Uploading template to s3://$CODE_S3_BUCKET/$DEPLOY_TEMPLATE_KEY (owner-bound) ..."
+aws s3api put-object \
     "${AWS_PROFILE_ARGS[@]}" \
-    --template-file "$TEMPLATE" \
-    --s3-bucket "$CODE_S3_BUCKET" \
-    --s3-prefix "$TEMPLATE_S3_PREFIX" \
+    --bucket "$CODE_S3_BUCKET" \
+    --key "$DEPLOY_TEMPLATE_KEY" \
+    --body "$TEMPLATE" \
+    --expected-bucket-owner "$ACCOUNT_ID" \
+    --region "$AWS_REGION" --output text --query 'ETag' >/dev/null
+DEPLOY_TEMPLATE_URL="https://${CODE_S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${DEPLOY_TEMPLATE_KEY}"
+
+# create-change-set takes --parameters ParameterKey=K,ParameterValue=V, not the
+# deploy convenience --parameter-overrides K=V, so translate the override list.
+CHANGE_SET_PARAMETERS=()
+for _override in "${PARAM_OVERRIDES[@]}"; do
+    _k="${_override%%=*}"
+    _v="${_override#*=}"
+    CHANGE_SET_PARAMETERS+=("ParameterKey=${_k},ParameterValue=${_v}")
+done
+
+if [ "$STACK_EXISTS" = "true" ]; then
+    CHANGE_SET_TYPE="UPDATE"
+else
+    CHANGE_SET_TYPE="CREATE"
+fi
+CHANGE_SET_NAME="operations-$(date -u +%Y%m%d%H%M%S)-${DEPLOY_TEMPLATE_HASH:0:12}"
+echo "   Creating change set $CHANGE_SET_NAME ($CHANGE_SET_TYPE) ..."
+aws cloudformation create-change-set \
+    "${AWS_PROFILE_ARGS[@]}" \
     --stack-name "$STACK_NAME" \
+    --change-set-name "$CHANGE_SET_NAME" \
+    --change-set-type "$CHANGE_SET_TYPE" \
+    --template-url "$DEPLOY_TEMPLATE_URL" \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "$AWS_REGION" \
-    --no-fail-on-empty-changeset \
-    --parameter-overrides "${PARAM_OVERRIDES[@]}"
+    --parameters "${CHANGE_SET_PARAMETERS[@]}" >/dev/null
+
+# Wait for the change set to be created. A change set that reaches FAILED with no
+# changes is a successful no-op (empty change set), handled below; any other
+# failure is fatal.
+if ! aws cloudformation wait change-set-create-complete \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --stack-name "$STACK_NAME" \
+    --change-set-name "$CHANGE_SET_NAME" \
+    --region "$AWS_REGION" 2>/dev/null; then
+    CHANGE_SET_STATUS="$(aws cloudformation describe-change-set \
+        "${AWS_PROFILE_ARGS[@]}" \
+        --stack-name "$STACK_NAME" \
+        --change-set-name "$CHANGE_SET_NAME" \
+        --region "$AWS_REGION" \
+        --query 'StatusReason' --output text 2>/dev/null || true)"
+    case "$CHANGE_SET_STATUS" in
+        *"didn't contain changes"* | *"No updates"* | *"no updates"*)
+            echo "ℹ️  Change set is empty (no updates); deleting it and treating as a no-op success."
+            aws cloudformation delete-change-set \
+                "${AWS_PROFILE_ARGS[@]}" \
+                --stack-name "$STACK_NAME" \
+                --change-set-name "$CHANGE_SET_NAME" \
+                --region "$AWS_REGION" >/dev/null 2>&1 || true
+            echo "✅ Deploy complete (Provisioned=true, OperationsMode=$OPERATIONS_MODE; no changes)."
+            exit 0
+            ;;
+        *)
+            echo "❌ Change set $CHANGE_SET_NAME did not reach CREATE_COMPLETE: ${CHANGE_SET_STATUS:-unknown}." >&2
+            exit 5
+            ;;
+    esac
+fi
+
+echo "   Executing change set $CHANGE_SET_NAME ..."
+aws cloudformation execute-change-set \
+    "${AWS_PROFILE_ARGS[@]}" \
+    --stack-name "$STACK_NAME" \
+    --change-set-name "$CHANGE_SET_NAME" \
+    --region "$AWS_REGION" >/dev/null
+
+if [ "$CHANGE_SET_TYPE" = "CREATE" ]; then
+    aws cloudformation wait stack-create-complete \
+        "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION"
+else
+    aws cloudformation wait stack-update-complete \
+        "${AWS_PROFILE_ARGS[@]}" --stack-name "$STACK_NAME" --region "$AWS_REGION"
+fi
 
 echo "✅ Deploy complete (Provisioned=true, OperationsMode=$OPERATIONS_MODE)."

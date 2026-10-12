@@ -349,8 +349,11 @@ def _build_approval_handler(
         # store guards every read and caps every write against one monotonic
         # per-request deadline, and a metric publish that would not fit the
         # remaining budget is skipped so a slow store can never push a request
-        # past the Lambda wall-clock timeout.
+        # past the Lambda wall-clock timeout. The E1 observation store prepare
+        # reads current state through is bound to the same deadline, so prepare's
+        # status reads cannot outlast the request budget either.
         store=approval_store,
+        read_scope=observation_store,
         request_deadline_s=ops.total_deadline_s,
         min_publish_remaining_s=ops.persistence_budget_s,
         clock=_utcnow,

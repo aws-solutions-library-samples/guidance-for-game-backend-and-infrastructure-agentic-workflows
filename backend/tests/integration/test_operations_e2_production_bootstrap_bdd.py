@@ -469,3 +469,231 @@ def test_bootstrap_get_after_due_transitions_to_expired_and_approval_conflicts(
     )
     assert approve_resp["statusCode"] == 409, approve_resp["body"]
     assert '"decision": "granted"' not in approve_resp["body"]
+
+
+# -- Deployed shakedown runner over the real bootstrap (issue #414) ----------
+#
+# The scripted shakedown unit test cannot see a lifecycle change that breaks a
+# real check (for example, an approved operation becoming cancellable). These
+# scenarios drive the real `E2ShakedownRunner` against the bootstrap-built
+# handler over the stateful fake through a small transport adapter, and require
+# every check to pass, so the shakedown and the deployed boundary stay aligned.
+
+# The shakedown proposes a single bounded step inside the fail-closed [0, 1]
+# envelope, so the bootstrap must be built with the same band.
+_SHAKEDOWN_ENV = {
+    "GBAW_OPERATIONS_MODE": "advise",
+    "GBAW_OPERATIONS_TABLE_NAME": TABLE,
+    "GBAW_OPERATIONS_METRIC_NAMESPACE": "GBAW/Operations",
+    "GBAW_OPERATIONS_TENANT_ID": "tenant.default",
+    "GBAW_OPERATIONS_WORKSPACE_ID": WORKSPACE,
+    "GBAW_OPERATIONS_TRUSTED_AUDIENCE": AUDIENCE,
+    "GBAW_OPERATIONS_CAPACITY_FLOOR": "0",
+    "GBAW_OPERATIONS_CAPACITY_CEILING": "1",
+    "GBAW_OPERATIONS_CAPACITY_MAX_STEP": "1",
+}
+
+_ACCESS_TOKEN = "access-token-opaque"
+_APPROVER_TOKEN = "approver-token-opaque"
+
+
+def _build_router_with_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str], *, anchor: datetime) -> Any:
+    client = StatefulDynamoClient()
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("boto3.Session", _FakeSession(client), raising=False)
+    monkeypatch.setattr(entry, "_region", lambda: "us-west-2")
+    entry._handler.cache_clear()
+    router, _ = entry._handler()
+    entry._handler.cache_clear()
+    _seed_capacity_zero_one_observation(client, anchor=anchor)
+    return router
+
+
+def _seed_capacity_zero_one_observation(client: StatefulDynamoClient, *, anchor: datetime) -> None:
+    """Seed a SUCCEEDED observation whose capacity sits inside the [0, 1] band."""
+    # Local modules
+    from operations.contracts import canonical_sha256
+
+    observation = {
+        "observation_id": OBS_ID,
+        "target": {"provider": "gamelift", "fleet_id": FLEET},
+        "observed_at": (anchor - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+        "expires_at": (anchor + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
+        "results": {
+            "utilization": {
+                "active_server_processes": 1,
+                "active_game_sessions": 0,
+                "current_player_sessions": 0,
+                "maximum_player_sessions": 10,
+            },
+            "capacity": [{"location": LOCATION, "desired": 1, "minimum": 0, "maximum": 1, "active": 1, "idle": 0}],
+            "scaling_policies": [],
+        },
+    }
+    observation_hash = canonical_sha256(dict(observation))
+    op_pk = f"OP#{OBS_ID}"
+    ttl = int((anchor + timedelta(hours=1)).timestamp())
+    snapshot = {
+        "PK": op_pk,
+        "SK": _STATE_SNAPSHOT_SK,
+        "record_type": "observation_state",
+        "operation_id": OBS_ID,
+        "workspace_id": WORKSPACE,
+        "state": STATE_SUCCEEDED,
+        "sequence": 1,
+        "observation_hash": observation_hash,
+        "ttl": ttl,
+    }
+    result = {
+        "PK": op_pk,
+        "SK": _RESULT_SK,
+        "record_type": "observation_result",
+        "operation_id": OBS_ID,
+        "observation_hash": observation_hash,
+        "observation_json": json.dumps(observation, separators=(",", ":"), sort_keys=True, ensure_ascii=False),
+        "ttl": ttl,
+    }
+    client.put_item(TableName=TABLE, Item=_marshal(snapshot))
+    client.put_item(TableName=TABLE, Item=_marshal(result))
+
+
+class _RouterTransport:
+    """Adapt the shakedown's HTTP transport to the in-process bootstrap router.
+
+    The deployed API Gateway JWT authorizer verifies the bearer token and injects
+    the caller's claims; here the adapter maps the opaque access token to a
+    ``users`` requester and the approver token to a distinct ``admin`` approver,
+    mirroring the deployed authorizer so the runner exercises the real handler.
+    A request with no bearer carries no authorizer context, so the handler denies
+    it exactly as the gateway's unauthenticated path would.
+    """
+
+    def __init__(self, router: Any, *, anchor: datetime) -> None:
+        # Local modules
+        from operations.validation.e1_shakedown import HttpResponse
+
+        self._router = router
+        self._anchor = anchor
+        self._HttpResponse = HttpResponse
+
+    def __call__(self, method: str, url: str, headers: dict, body: bytes | None):
+        path = url.split("example.com", 1)[1] if "example.com" in url else url
+        auth = (headers or {}).get("Authorization", "")
+        claims: dict[str, Any] | None = None
+        if _ACCESS_TOKEN in auth:
+            claims = _claims("user.requester", anchor=self._anchor, groups="users")
+        elif _APPROVER_TOKEN in auth:
+            claims = _claims("user.approver", anchor=self._anchor, groups="admin")
+        rc: dict[str, Any] = {"http": {"method": method, "path": path}, "requestId": "req-shakedown"}
+        if claims is not None:
+            rc["authorizer"] = {"jwt": {"claims": claims}}
+        event: dict[str, Any] = {"requestContext": rc, "rawPath": path}
+        segments = [s for s in path.split("/") if s]
+        if len(segments) == 2 and segments[0] == "operations" and segments[1] != "prepare":
+            event["pathParameters"] = {"operationId": segments[1]}
+        elif len(segments) == 3 and segments[0] == "operations":
+            event["pathParameters"] = {"operationId": segments[1]}
+        if body is not None:
+            event["body"] = body.decode("utf-8")
+        resp = self._router.handle(event)
+        return self._HttpResponse(
+            status=resp["statusCode"],
+            content_type="application/json",
+            body_bytes=resp["body"].encode("utf-8"),
+        )
+
+
+def test_deployed_shakedown_passes_every_check_against_the_real_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Local modules
+    from operations.validation.e2_shakedown import E2ShakedownConfig, E2ShakedownRunner
+
+    anchor = _now()
+    router = _build_router_with_env(monkeypatch, _SHAKEDOWN_ENV, anchor=anchor)
+    config = E2ShakedownConfig(
+        endpoint="https://example.com",
+        access_token=_ACCESS_TOKEN,
+        approver_token=_APPROVER_TOKEN,
+        fleet_id=FLEET,
+        location=LOCATION,
+        observation_id=OBS_ID,
+        current_desired=1,
+    )
+    runner = E2ShakedownRunner(config=config, transport=_RouterTransport(router, anchor=anchor))
+    report = runner.run()
+    # Every check — including the corrected cancel-the-approved-operation step —
+    # passes against a correct deployment.
+    failing = [c.name for c in report.checks if not c.passed]
+    assert report.ok, f"failing checks: {failing}"
+
+
+def test_bootstrap_denies_a_users_caller_when_observer_groups_is_admin(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With the requester allowlist narrowed to ``admin`` (the deployment's
+    # ObserverGroups), a ``users`` caller derives no requester authority and is
+    # denied (403) on prepare, evidence, and cancel before any store read. This
+    # pins requester_groups=ops.observer_groups: a bootstrap that hard-codes the
+    # groups would admit the users caller and fail this test.
+    anchor = _now()
+    env = dict(_BOOTSTRAP_ENV)
+    env["GBAW_OPERATIONS_OBSERVER_GROUPS"] = "admin"
+    router = _build_router_with_env_bootstrap(monkeypatch, env, anchor=anchor)
+
+    prepare = router.handle(
+        _event(
+            "POST",
+            "/operations/prepare",
+            claims=_claims("user.requester", anchor=anchor, groups="users"),
+            body=_prepare_body(),
+        )
+    )
+    assert prepare["statusCode"] == 403, prepare["body"]
+
+    # Evidence and cancel on an arbitrary op id are denied before any lookup.
+    op_id = "op_aaaaaaaaaaaaaaaaaaaaaaaaaa"
+    evidence = router.handle(
+        _event("GET", f"/operations/{op_id}", claims=_claims("user.viewer", anchor=anchor, groups="users"), op_id=op_id)
+    )
+    assert evidence["statusCode"] == 403, evidence["body"]
+    cancel = router.handle(
+        _event(
+            "POST",
+            f"/operations/{op_id}/cancel",
+            claims=_claims("user.requester", anchor=anchor, groups="users"),
+            body={},
+            op_id=op_id,
+        )
+    )
+    assert cancel["statusCode"] == 403, cancel["body"]
+
+
+def _build_router_with_env_bootstrap(monkeypatch: pytest.MonkeyPatch, env: dict[str, str], *, anchor: datetime) -> Any:
+    client = StatefulDynamoClient()
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr("boto3.Session", _FakeSession(client), raising=False)
+    monkeypatch.setattr(entry, "_region", lambda: "us-west-2")
+    entry._handler.cache_clear()
+    router, _ = entry._handler()
+    entry._handler.cache_clear()
+    _seed_succeeded_observation(client, anchor=anchor)
+    return router
+
+
+def test_bootstrap_wires_the_request_deadline_and_call_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pin the production request-deadline and call-limit wiring: a bootstrap that
+    # set request_deadline_s=None would leave the slow-store guard off, and one
+    # that dropped the store/read-scope binding would leave prepare's reads
+    # unguarded. Assert the handler carries the operations budget as its deadline
+    # and binds both the approval store and the E1 read scope.
+    anchor = _now()
+    router = _build_router_with_env_bootstrap(monkeypatch, dict(_BOOTSTRAP_ENV), anchor=anchor)
+    approval_handler = router._approval_handler
+    ops = entry.resolve_operations_settings(env=_BOOTSTRAP_ENV)
+    assert approval_handler._request_deadline_s == ops.total_deadline_s
+    assert approval_handler._requester_groups == ops.observer_groups
+    assert approval_handler._store is not None
+    # The E1 current-state read scope is bound so prepare's reads are guarded.
+    assert approval_handler._read_scope is not None
+    # The approval store's call limit is derived from the persistence budget, so
+    # it refuses a sub-call that would not fit the remaining request budget.
+    assert approval_handler._store._call_limit_s > 0

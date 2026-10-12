@@ -114,9 +114,36 @@ case "$svc $sub" in
     echo '{}' ;;
   "s3api put-object") echo 'stub-etag' ;;
   "cloudformation deploy") echo '{}' ;;
+  "cloudformation create-change-set")
+    # An empty change set is modelled by STUB_AWS_EMPTY_CHANGESET: the waiter
+    # then fails and describe-change-set reports the "no changes" reason.
+    echo '{"Id":"arn:aws:cloudformation:us-west-2:123456789012:changeSet/stub/abc"}' ;;
+  "cloudformation describe-change-set")
+    if [ "${STUB_AWS_EMPTY_CHANGESET:-0}" = "1" ]; then
+      case "$*" in
+        *StatusReason*) echo "The submitted information didn't contain changes." ;;
+        *) echo '{"Status":"FAILED","StatusReason":"The submitted information did not contain changes."}' ;;
+      esac
+    else
+      case "$*" in
+        *StatusReason*) echo "None" ;;
+        *) echo '{"Status":"CREATE_COMPLETE"}' ;;
+      esac
+    fi
+    ;;
+  "cloudformation execute-change-set") echo '{}' ;;
+  "cloudformation delete-change-set") echo '{}' ;;
   "cloudformation wait")
+    waiter="${args[2]}"
+    # The teardown stack-delete waiter fails under STUB_AWS_FAIL_WAIT; the
+    # change-set waiter fails under STUB_AWS_EMPTY_CHANGESET so the wrapper takes
+    # its empty-change-set no-op branch.
+    if [ "$waiter" = "change-set-create-complete" ] && [ "${STUB_AWS_EMPTY_CHANGESET:-0}" = "1" ]; then
+      echo "Waiter ChangeSetCreateComplete failed" >&2
+      exit 255
+    fi
     if [ "${STUB_AWS_FAIL_WAIT:-0}" = "1" ]; then
-      echo "Waiter StackDeleteComplete failed" >&2
+      echo "Waiter failed" >&2
       exit 255
     fi
     ;;
@@ -180,7 +207,7 @@ def _make_enable_stub_path(tmp_path: pathlib.Path) -> pathlib.Path:
     return bindir
 
 
-def _make_probe_repo(tmp_path: pathlib.Path) -> pathlib.Path:
+def _make_probe_repo(tmp_path: pathlib.Path, *, template_pad_bytes: int = 0) -> pathlib.Path:
     """Build a throwaway git repository holding only what the wrappers need.
 
     The wrappers derive PROJECT_ROOT as ``<script>/../..`` and the enable path
@@ -188,6 +215,10 @@ def _make_probe_repo(tmp_path: pathlib.Path) -> pathlib.Path:
     runs against a self-contained repository under ``tmp_path`` — never the
     developer's checkout. This keeps the stub tests independent of the current
     working tree's dirty/untracked state and of the host shell.
+
+    ``template_pad_bytes`` appends that many bytes of a trailing YAML comment to
+    the copied template before the commit, so a test can drive the over-limit
+    template guard without a real giant file in the tree.
     """
     repo = tmp_path / "repo"
     # Copy the three script/template inputs plus the operations source tree.
@@ -203,6 +234,10 @@ def _make_probe_repo(tmp_path: pathlib.Path) -> pathlib.Path:
         PROJECT_ROOT / "infrastructure" / "cloudformation" / "06-operations-observation.yaml",
         repo / "infrastructure" / "cloudformation" / "06-operations-observation.yaml",
     )
+    if template_pad_bytes > 0:
+        template_path = repo / "infrastructure" / "cloudformation" / "06-operations-observation.yaml"
+        with template_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n# " + ("x" * template_pad_bytes) + "\n")
     shutil.copytree(
         PROJECT_ROOT / "backend" / "src" / "operations",
         repo / "backend" / "src" / "operations",
@@ -267,9 +302,9 @@ def _run_with_stub(script_rel, *args, tmp_path, env_extra=None):
     return result, calls
 
 
-def _run_enable_with_stub(tmp_path, args=(), *, env_extra=None):
+def _run_enable_with_stub(tmp_path, args=(), *, env_extra=None, template_pad_bytes=0):
     """Run the deploy wrapper's --enable path from the probe repo with stubs."""
-    repo = _make_probe_repo(tmp_path)
+    repo = _make_probe_repo(tmp_path, template_pad_bytes=template_pad_bytes)
     script = repo / "scripts" / "infrastructure" / "deploy-operations.sh"
     log = tmp_path / "aws-calls.log"
     log.write_text("", encoding="utf-8")
@@ -413,20 +448,25 @@ def test_enable_new_stack_stages_the_handler_and_deploys_all_bindings(tmp_path):
     # The handler and schemas were staged (the structural probe reported success).
     assert "Structural probe passed" in result.stdout
     subs = _subcommands(calls)
-    # The artifact was uploaded before the stack deploy.
+    # The artifact AND the template were uploaded before the stack change set,
+    # and the stack is deployed through an owner-bound change set.
     assert "s3api put-object" in subs
-    assert "cloudformation deploy" in subs
-    assert subs.index("s3api put-object") < subs.index("cloudformation deploy")
-    upload_line = next(line for line in calls if "put-object" in line)
-    assert "--expected-bucket-owner" in upload_line.split("\t")
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
-    assert "Provisioned=true" in deploy_line
-    assert "OperationsMode=observe" in deploy_line
-    # A new stack receives all four trusted bindings.
-    assert "Environment=beta" in deploy_line
-    assert "TenantId=tenant-abc" in deploy_line
-    assert "WorkspaceId=workspace-abc" in deploy_line
-    assert "TrustedAudience=operations-api" in deploy_line
+    assert "cloudformation create-change-set" in subs
+    assert subs.index("s3api put-object") < subs.index("cloudformation create-change-set")
+    assert "cloudformation execute-change-set" in subs
+    # Every put-object (artifact and template) is owner-bound.
+    for upload_line in (line for line in calls if "put-object" in line):
+        assert "--expected-bucket-owner" in upload_line.split("\t")
+    # A new stack creates the change set with type CREATE.
+    create_line = next(line for line in calls if "create-change-set" in line)
+    assert "CREATE" in create_line.split("\t")
+    assert "ParameterKey=Provisioned,ParameterValue=true" in create_line
+    assert "ParameterKey=OperationsMode,ParameterValue=observe" in create_line
+    # A new stack receives all four trusted bindings as ParameterKey/Value pairs.
+    assert "ParameterKey=Environment,ParameterValue=beta" in create_line
+    assert "ParameterKey=TenantId,ParameterValue=tenant-abc" in create_line
+    assert "ParameterKey=WorkspaceId,ParameterValue=workspace-abc" in create_line
+    assert "ParameterKey=TrustedAudience,ParameterValue=operations-api" in create_line
 
 
 def test_enable_prod_to_beta_binding_change_is_refused_before_any_upload(tmp_path):
@@ -443,7 +483,7 @@ def test_enable_prod_to_beta_binding_change_is_refused_before_any_upload(tmp_pat
     assert "Environment (prod -> beta)" in combined
     subs = _subcommands(calls)
     assert "s3api put-object" not in subs, "the binding guard must run before any upload"
-    assert "cloudformation deploy" not in subs
+    assert "cloudformation create-change-set" not in subs
 
 
 def test_enable_existing_stack_omits_bindings_when_unchanged(tmp_path):
@@ -458,17 +498,44 @@ def test_enable_existing_stack_omits_bindings_when_unchanged(tmp_path):
     }
     result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
-    assert "Provisioned=true" in deploy_line
-    assert "OperationsMode=observe" in deploy_line
+    create_line = next(line for line in calls if "create-change-set" in line)
+    assert "ParameterKey=Provisioned,ParameterValue=true" in create_line
+    assert "ParameterKey=OperationsMode,ParameterValue=observe" in create_line
+    # An existing stack creates the change set with type UPDATE.
+    assert "UPDATE" in create_line.split("\t")
     # Unchanged bindings are not resent.
-    assert "TenantId=tenant-abc" not in deploy_line
-    assert "Environment=beta" not in deploy_line
+    assert "ParameterKey=TenantId" not in create_line
+    assert "ParameterKey=Environment" not in create_line
 
 
 # --------------------------------------------------------------------------- #
 # Teardown path: real wrapper, stub aws.
 # --------------------------------------------------------------------------- #
+
+
+def test_enable_lone_floor_override_is_validated_against_deployed_band(tmp_path):
+    # A single capacity dimension override (only the floor) is validated against
+    # the DEPLOYED ceiling/max_step, not against the hard-coded 0/1/1 default, so
+    # a coherent partial override is accepted rather than refused with "ceiling
+    # (1)". Here the deployed band is 0/100/50 and the operator raises the floor
+    # to 5 (coherent: 5 < 100 and max_step 50 <= 95).
+    env_extra = {
+        "STUB_AWS_CUR_ENV": "beta",
+        "STUB_AWS_CUR_TENANT": "tenant-abc",
+        "STUB_AWS_CUR_WS": "workspace-abc",
+        "STUB_AWS_CUR_AUD": "operations-api",
+        "STUB_AWS_CUR_CAP_FLOOR": "0",
+        "STUB_AWS_CUR_CAP_CEILING": "100",
+        "STUB_AWS_CUR_CAP_STEP": "50",
+        "GBAW_OPERATIONS_CAPACITY_FLOOR": "5",
+    }
+    result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
+    assert result.returncode == 0, f"a coherent lone-floor override must be accepted.\n{result.stdout}\n{result.stderr}"
+    create_line = next(line for line in calls if "create-change-set" in line)
+    # Only the floor is resent; ceiling and max_step keep their deployed values.
+    assert "ParameterKey=CapacityFloor,ParameterValue=5" in create_line
+    assert "ParameterKey=CapacityCeiling," not in create_line
+    assert "ParameterKey=CapacityMaxStep," not in create_line
 
 
 def test_teardown_deletes_then_waits_and_succeeds(tmp_path):
@@ -510,7 +577,7 @@ def test_enable_throttled_describe_stacks_fails_closed_without_upload_or_deploy(
     assert result.returncode == 4, f"a throttled describe-stacks must exit 4.\n{result.stdout}\n{result.stderr}"
     subs = _subcommands(calls)
     assert "s3api put-object" not in subs, "no artifact may be uploaded when stack existence is unknown"
-    assert "cloudformation deploy" not in subs
+    assert "cloudformation create-change-set" not in subs
 
 
 def test_enable_without_expected_account_and_no_tty_is_refused(tmp_path):
@@ -522,7 +589,7 @@ def test_enable_without_expected_account_and_no_tty_is_refused(tmp_path):
     assert result.returncode == 4, f"unset account + no TTY must exit 4.\n{result.stdout}\n{result.stderr}"
     subs = _subcommands(calls)
     assert "s3api put-object" not in subs
-    assert "cloudformation deploy" not in subs
+    assert "cloudformation create-change-set" not in subs
 
 
 def test_disable_without_expected_account_and_no_tty_is_refused(tmp_path):
@@ -580,20 +647,20 @@ def test_iam_user_arn_prints_only_the_principal_type_not_a_user_name(tmp_path):
 
 
 def test_enable_sends_the_budget_keys_on_the_deploy_line(tmp_path):
-    # On a fresh stack the enable deploy line must carry the six latency budget
+    # On a fresh stack the enable change set must carry the six latency budget
     # keys so the validated values are the ones actually deployed.
     result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_NO_STACK": "1"})
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    create_line = next(line for line in calls if "create-change-set" in line)
     for key in (
-        "RequestDeadlineSeconds=",
-        "LambdaTimeoutSeconds=",
-        "PerReadBudgetSeconds=",
-        "PersistenceBudgetSeconds=",
-        "CancellationMarginSeconds=",
-        "LatencyAlarmThresholdMs=",
+        "RequestDeadlineSeconds",
+        "LambdaTimeoutSeconds",
+        "PerReadBudgetSeconds",
+        "PersistenceBudgetSeconds",
+        "CancellationMarginSeconds",
+        "LatencyAlarmThresholdMs",
     ):
-        assert key in deploy_line, f"expected {key} on the deploy line"
+        assert f"ParameterKey={key}," in create_line, f"expected {key} on the change set"
 
 
 def test_reenable_without_budget_vars_keeps_deployed_budgets(tmp_path):
@@ -615,17 +682,17 @@ def test_reenable_without_budget_vars_keeps_deployed_budgets(tmp_path):
     }
     result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    create_line = next(line for line in calls if "create-change-set" in line)
     # No budget key is resent, so the deployed tuned values are preserved.
     for key in (
-        "RequestDeadlineSeconds=",
-        "LambdaTimeoutSeconds=",
-        "PerReadBudgetSeconds=",
-        "PersistenceBudgetSeconds=",
-        "CancellationMarginSeconds=",
-        "LatencyAlarmThresholdMs=",
+        "RequestDeadlineSeconds",
+        "LambdaTimeoutSeconds",
+        "PerReadBudgetSeconds",
+        "PersistenceBudgetSeconds",
+        "CancellationMarginSeconds",
+        "LatencyAlarmThresholdMs",
     ):
-        assert key not in deploy_line, f"{key} must not be resent on a plain re-enable"
+        assert f"ParameterKey={key}," not in create_line, f"{key} must not be resent on a plain re-enable"
 
 
 def test_reenable_with_one_budget_var_sends_only_that_key(tmp_path):
@@ -648,16 +715,18 @@ def test_reenable_with_one_budget_var_sends_only_that_key(tmp_path):
     }
     result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
-    assert "PerReadBudgetSeconds=3" in deploy_line
+    create_line = next(line for line in calls if "create-change-set" in line)
+    assert "ParameterKey=PerReadBudgetSeconds,ParameterValue=3" in create_line
     for key in (
-        "RequestDeadlineSeconds=",
-        "LambdaTimeoutSeconds=",
-        "PersistenceBudgetSeconds=",
-        "CancellationMarginSeconds=",
-        "LatencyAlarmThresholdMs=",
+        "RequestDeadlineSeconds",
+        "LambdaTimeoutSeconds",
+        "PersistenceBudgetSeconds",
+        "CancellationMarginSeconds",
+        "LatencyAlarmThresholdMs",
     ):
-        assert key not in deploy_line, f"{key} must not be resent when only PerReadBudgetSeconds is set"
+        assert (
+            f"ParameterKey={key}," not in create_line
+        ), f"{key} must not be resent when only PerReadBudgetSeconds is set"
 
 
 def test_reenable_without_e2_vars_keeps_deployed_capacity_and_expiry(tmp_path):
@@ -680,16 +749,16 @@ def test_reenable_without_e2_vars_keeps_deployed_capacity_and_expiry(tmp_path):
     }
     result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
+    create_line = next(line for line in calls if "create-change-set" in line)
     for key in (
-        "CapacityFloor=",
-        "CapacityCeiling=",
-        "CapacityMaxStep=",
-        "PreparationExpirySeconds=",
-        "ApprovalExpirySeconds=",
-        "LowRiskSelfApproval=",
+        "CapacityFloor",
+        "CapacityCeiling",
+        "CapacityMaxStep",
+        "PreparationExpirySeconds",
+        "ApprovalExpirySeconds",
+        "LowRiskSelfApproval",
     ):
-        assert key not in deploy_line, f"{key} must not be resent on a plain re-enable"
+        assert f"ParameterKey={key}," not in create_line, f"{key} must not be resent on a plain re-enable"
 
 
 def test_reenable_with_one_e2_var_sends_only_that_key(tmp_path):
@@ -711,19 +780,36 @@ def test_reenable_with_one_e2_var_sends_only_that_key(tmp_path):
     }
     result, calls = _run_enable_with_stub(tmp_path, env_extra=env_extra)
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "parameter-overrides" in line)
-    assert "ApprovalExpirySeconds=300" in deploy_line
-    for key in ("CapacityFloor=", "CapacityCeiling=", "CapacityMaxStep=", "PreparationExpirySeconds="):
-        assert key not in deploy_line, f"{key} must not be resent when only the approval window is set"
+    create_line = next(line for line in calls if "create-change-set" in line)
+    assert "ParameterKey=ApprovalExpirySeconds,ParameterValue=300" in create_line
+    for key in ("CapacityFloor", "CapacityCeiling", "CapacityMaxStep", "PreparationExpirySeconds"):
+        assert (
+            f"ParameterKey={key}," not in create_line
+        ), f"{key} must not be resent when only the approval window is set"
 
 
 def test_enable_deploys_the_template_by_url_not_inline(tmp_path):
-    # The template exceeds the inline CloudFormation limit, so enable must pass
-    # the template through S3 (--s3-bucket/--s3-prefix) rather than sending it
-    # inline, which the service would reject.
+    # The template exceeds the inline CloudFormation limit, so enable must upload
+    # it (owner-bound) and reference it by URL on the change set rather than
+    # sending it inline, which the service would reject.
     result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_NO_STACK": "1"})
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
-    deploy_line = next(line for line in calls if "cloudformation" in line and "deploy" in line)
-    assert "--s3-bucket" in deploy_line, "enable must upload the template to S3"
-    assert "--s3-prefix" in deploy_line
-    assert "operations/templates" in deploy_line
+    create_line = next(line for line in calls if "create-change-set" in line)
+    assert "--template-url" in create_line.split("\t"), "enable must reference the template by URL"
+    assert "operations/templates" in create_line
+    # The template put-object that precedes it is owner-bound.
+    template_upload = [line for line in calls if "put-object" in line and "operations/templates" in line]
+    assert template_upload, "the template must be uploaded to S3 before the change set"
+    for line in template_upload:
+        assert "--expected-bucket-owner" in line.split("\t")
+
+
+def test_enable_refuses_an_over_limit_template_without_any_upload(tmp_path):
+    # A template padded past the 460,800-byte S3-backed CloudFormation limit must
+    # be refused (exit 3) before any artifact or template is uploaded, so an
+    # over-limit template never leaves a stray object in the bucket.
+    result, calls = _run_enable_with_stub(tmp_path, env_extra={"STUB_AWS_NO_STACK": "1"}, template_pad_bytes=420_000)
+    assert result.returncode == 3, f"an over-limit template must exit 3.\n{result.stdout}\n{result.stderr}"
+    subs = _subcommands(calls)
+    assert "s3api put-object" not in subs, "no object may be uploaded for an over-limit template"
+    assert "cloudformation create-change-set" not in subs
