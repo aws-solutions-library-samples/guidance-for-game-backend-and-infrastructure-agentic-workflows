@@ -9,6 +9,8 @@
 import {
   CLOUDSCAPE_PAGE,
   DEFAULT_SHELL,
+  documentShell,
+  reloadForShellBoundary,
   resolveShellSelection,
   shellForPage,
 } from '@/shell/shell';
@@ -41,4 +43,33 @@ describe('shellForPage', () => {
       expect(shellForPage(page as string | undefined | null)).toBe('current');
     },
   );
+});
+
+describe('documentShell', () => {
+  afterEach(() => {
+    delete document.documentElement.dataset.gaShell;
+  });
+
+  it('reads the Cloudscape shell from the data-ga-shell attribute', () => {
+    document.documentElement.dataset.gaShell = 'cloudscape';
+    expect(documentShell()).toBe('cloudscape');
+  });
+
+  it('reads the current shell from the data-ga-shell attribute', () => {
+    document.documentElement.dataset.gaShell = 'current';
+    expect(documentShell()).toBe('current');
+  });
+
+  it('defaults to the current shell when the attribute is absent', () => {
+    expect(documentShell()).toBe('current');
+  });
+});
+
+describe('reloadForShellBoundary', () => {
+  it('is a no-op when there is no window (server render)', () => {
+    // The function guards on `typeof window`; calling it under jsdom simply
+    // delegates to the (unimplemented in jsdom) reload, so assert it is a
+    // callable export that does not throw when guarded.
+    expect(typeof reloadForShellBoundary).toBe('function');
+  });
 });

@@ -37,20 +37,31 @@ export default function CloudscapeShell() {
 
   useIsomorphicLayoutEffect(() => {
     applyCloudscapeMode(resolvedTheme);
-    applyGaTokenBridge(document.documentElement);
+    // Write the --ga-* bridge onto document.body (where Cloudscape's base theme
+    // tokens live) so first-party component CSS resolves to Cloudscape colors
+    // everywhere, including chrome such as IdleWarningDialog that renders
+    // outside this shell's root element. Also bridge the shell root so a nested
+    // element resolves the same values without walking up to <body>.
+    applyGaTokenBridge(document.body);
     applyGaTokenBridge(rootRef.current);
   }, [resolvedTheme]);
 
   return (
     <div ref={rootRef}>
-      <TopNavigation
-        identity={{ href: '/', title: 'Game Agent' }}
-        utilities={[]}
-        i18nStrings={{ overflowMenuTriggerText: 'More', overflowMenuTitleText: 'All' }}
-      />
+      <div id="ga-top-navigation">
+        <TopNavigation
+          identity={{ href: '/', title: 'Game Agent' }}
+          utilities={[]}
+          i18nStrings={{ overflowMenuTriggerText: 'More', overflowMenuTitleText: 'All' }}
+        />
+      </div>
       <AppLayout
         navigationHide
         toolsHide
+        // Point AppLayout at the TopNavigation wrapper so it subtracts the
+        // navigation height from its own; without this the empty layout is
+        // sized to the full viewport beneath the navigation and overflows.
+        headerSelector="#ga-top-navigation"
         ariaLabels={{ navigation: 'Navigation', tools: 'Tools' }}
         content={<ContentLayout header={<Header variant="h1">Game Agent</Header>} />}
       />

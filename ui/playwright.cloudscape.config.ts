@@ -10,9 +10,11 @@ import { defineConfig, devices } from '@playwright/test';
  * the current-shell local e2e config uses. The default `playwright.config.ts`
  * ignores `*.cloudscape.spec.ts`, so the current-shell suite is unaffected.
  *
- * The authenticated-journey checks (real sign-in, token refresh, idle warning)
- * against a deployed Cognito backend are validated separately; see the ADR's
- * "Harness auth" open risk.
+ * These specs run against `next dev`, which the dev-only skip-auth bypass
+ * (`NODE_ENV=development`) requires. `next dev` does not emit the production
+ * security headers, so these specs do not exercise the production Content
+ * Security Policy; CSP and the authenticated journey against a deployed Cognito
+ * backend are validated separately (see the ADR's "Harness auth" open risk).
  */
 export default defineConfig({
   testDir: './tests',
@@ -26,7 +28,7 @@ export default defineConfig({
   expect: { timeout: 10000 },
 
   use: {
-    baseURL: 'http://localhost:3100',
+    baseURL: 'http://127.0.0.1:3100',
     trace: 'on-first-retry',
     actionTimeout: 10000,
     navigationTimeout: 15000,
@@ -42,9 +44,10 @@ export default defineConfig({
   webServer: {
     // Dev server with the shell selector on and skip-auth enabled, matching the
     // current-shell local e2e harness. The proxy rewrite runs in development as
-    // it does in production.
-    command: 'npx next dev --port 3100',
-    url: 'http://localhost:3100',
+    // it does in production. Bound to 127.0.0.1 so the test server is never
+    // reachable beyond the local host.
+    command: 'npx next dev --port 3100 -H 127.0.0.1',
+    url: 'http://127.0.0.1:3100',
     reuseExistingServer: !process.env.CI,
     timeout: 120000,
     env: {

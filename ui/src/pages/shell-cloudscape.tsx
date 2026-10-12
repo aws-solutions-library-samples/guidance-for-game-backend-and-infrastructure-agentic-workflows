@@ -2,9 +2,11 @@
  * Internal entry page for the Cloudscape shell.
  *
  * The server proxy rewrites `/` to this route when `GBAW_UI_SHELL=cloudscape`;
- * nothing links to it and no deployment default selects it, so the Cloudscape
- * shell is unreachable unless explicitly selected. The heavy Cloudscape layout
- * and `@cloudscape-design/global-styles` load only through this entry (via
+ * no deployment default selects it and nothing links to it. The route is
+ * directly addressable, but it is authentication-gated and presentation-only:
+ * it reuses the same session and sign-in flow as the current shell and adds no
+ * API route or data of its own. The heavy Cloudscape layout and
+ * `@cloudscape-design/global-styles` load only through this entry (via
  * `next/dynamic`), so no Cloudscape code enters `_app` or any current-UI page.
  *
  * Authentication is reused unchanged: `_app` wraps this page in the same session
@@ -35,8 +37,8 @@ const ShellCloudscape: ShellCloudscapePage = () => (
   </>
 );
 
-// Read by `_app` to select per-shell presentation and by `_document` through the
-// page route; marks this page as the Cloudscape shell.
+// Read by `_app` to select the per-shell boundary reload and by `_document`
+// through the page route; marks this page as the Cloudscape shell.
 ShellCloudscape.shell = 'cloudscape';
 
 export default ShellCloudscape;

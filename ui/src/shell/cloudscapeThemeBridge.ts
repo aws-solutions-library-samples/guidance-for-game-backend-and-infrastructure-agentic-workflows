@@ -46,7 +46,11 @@ export function applyCloudscapeMode(resolvedTheme: ResolvedTheme): void {
     return;
   }
 
-  applyMode(resolvedTheme === 'light' ? Mode.Light : Mode.Dark, document.documentElement);
+  // Use applyMode's default target (`document.body`). Cloudscape declares its
+  // base theme tokens on `<body>` inside `@layer awsui-base-theme`, so the
+  // visual mode must be set there; setting it on `<html>` leaves `<body>` and
+  // every descendant resolving the light token values.
+  applyMode(resolvedTheme === 'light' ? Mode.Light : Mode.Dark, document.body);
 }
 
 /**

@@ -6,7 +6,8 @@
  * files listed under `pages[route] ∪ pages['/_app']` in
  * `.next/build-manifest.json`, split into JavaScript first-load and CSS
  * first-load. It then enforces two rules for every current-UI page (any
- * prerendered page other than the Cloudscape shell entry):
+ * prerendered page other than the Cloudscape shell entry, including `/_error`,
+ * which serves the current UI's 404 and 500 pages):
  *
  *   1. No Cloudscape module (`awsui` / `cloudscape-design`) and no Cloudscape
  *      global CSS appears in the page's first-load set.
@@ -17,8 +18,10 @@
  * tracked alongside the JavaScript budget.
  *
  * Run `node scripts/measure-bundles.mjs` from `ui/` after `next build`. Pass
- * `--json` for machine-readable output. The process exits non-zero if any rule
- * fails, so it can gate CI.
+ * `--json` for machine-readable output. `BUNDLE_NEXT_DIR` and
+ * `BUNDLE_BASELINE_PATH` override the `.next` and baseline locations so the
+ * budget logic can be tested against a synthetic build. The process exits
+ * non-zero if any rule fails, so it can gate CI.
  */
 
 import { readFileSync } from 'node:fs';
@@ -28,16 +31,21 @@ import { gzipSync } from 'node:zlib';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const UI_DIR = dirname(SCRIPT_DIR);
-const NEXT_DIR = join(UI_DIR, '.next');
-const BASELINE_PATH = join(SCRIPT_DIR, 'bundle-baseline.json');
+// `.next` and the baseline default to the real build locations but can be
+// pointed elsewhere so the budget logic is testable against a synthetic build
+// without running a full `next build`.
+const NEXT_DIR = process.env.BUNDLE_NEXT_DIR ?? join(UI_DIR, '.next');
+const BASELINE_PATH = process.env.BUNDLE_BASELINE_PATH ?? join(SCRIPT_DIR, 'bundle-baseline.json');
 
 const KIB = 1024;
 const GROWTH_CEILING_KIB = 2;
 const CLOUDSCAPE_PATTERN = /awsui|cloudscape-design/;
 /** Pages that are expected to carry Cloudscape and are not current-UI pages. */
 const CLOUDSCAPE_PAGES = new Set(['/shell-cloudscape']);
-/** Manifest keys that are not real pages. */
-const NON_PAGE_KEYS = new Set(['/_app', '/_error']);
+/** Manifest keys that are not real pages. `/_error` IS scanned: it serves the
+ *  current UI's 404 and 500 pages, so a Cloudscape import into it must fail the
+ *  budget like any other current-UI page. */
+const NON_PAGE_KEYS = new Set(['/_app']);
 
 function gzipSizeOf(relPath) {
   return gzipSync(readFileSync(join(NEXT_DIR, relPath)), { level: 6 }).length;

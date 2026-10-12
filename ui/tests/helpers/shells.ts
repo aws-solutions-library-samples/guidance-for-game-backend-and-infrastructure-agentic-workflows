@@ -33,6 +33,24 @@ async function readTheme(page: Page): Promise<string | null> {
   return page.evaluate(() => document.documentElement.getAttribute('data-theme'));
 }
 
+/**
+ * Read the computed background color of the Cloudscape AppLayout content
+ * region. Cloudscape resolves this from its base-theme tokens on `<body>`, so a
+ * dark page produces a dark value and a light page a light one — unlike reading
+ * the theme attribute, which `ThemeProvider` sets regardless of Cloudscape.
+ */
+export async function cloudscapeContentBackground(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const main = document.querySelector('main') ?? document.body;
+    return getComputedStyle(main).backgroundColor;
+  });
+}
+
+/** Read a resolved `--ga-*` bridged token from `document.body`. */
+export async function gaTokenOnBody(page: Page, name: string): Promise<string> {
+  return page.evaluate((n) => getComputedStyle(document.body).getPropertyValue(n).trim(), name);
+}
+
 /** Page object for the current (default) shell. */
 export const currentShell: ShellPage = {
   name: 'current',

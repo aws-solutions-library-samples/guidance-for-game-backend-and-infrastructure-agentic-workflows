@@ -20,14 +20,17 @@ describe('applyCloudscapeMode', () => {
     (applyMode as jest.Mock).mockClear();
   });
 
-  it('applies the light visual mode for the light theme', () => {
+  it('applies the light visual mode for the light theme on document.body', () => {
     applyCloudscapeMode('light');
-    expect(applyMode).toHaveBeenCalledWith(Mode.Light, document.documentElement);
+    // Cloudscape declares its base theme tokens on <body>, so the visual mode
+    // and the --ga-* bridge must land on <body> (applyMode's own default target)
+    // for the page to actually render dark.
+    expect(applyMode).toHaveBeenCalledWith(Mode.Light, document.body);
   });
 
-  it('applies the dark visual mode for the dark theme', () => {
+  it('applies the dark visual mode for the dark theme on document.body', () => {
     applyCloudscapeMode('dark');
-    expect(applyMode).toHaveBeenCalledWith(Mode.Dark, document.documentElement);
+    expect(applyMode).toHaveBeenCalledWith(Mode.Dark, document.body);
   });
 });
 

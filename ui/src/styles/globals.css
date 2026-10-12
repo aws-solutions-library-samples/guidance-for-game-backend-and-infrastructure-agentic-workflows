@@ -137,14 +137,16 @@
 /* Reset and base styles.
 
    Every element-level and universal rule below is scoped to the current shell
-   with :where([data-ga-shell="current"]) so it never reaches a page rendered in
-   another shell. :where() keeps specificity at (0,0,0), so each rule retains the
+   with :where(...) so it never reaches a page rendered in another shell. The
+   root rules target `html[data-ga-shell="current"]` directly because the
+   attribute sits on <html> itself; the rest match descendants of the scoped
+   root. :where() keeps specificity at (0,0,0), so each rule retains the
    specificity it would have unscoped and nothing changes about which rule wins
    on the current UI. The Cloudscape shell sets data-ga-shell="cloudscape", so
    these resets never match it and it keeps its own normalize.css reset. The
    prefers-reduced-motion safeguard below is deliberately left unscoped because
    it is an accessibility protection that must apply to both shells. */
-:where([data-ga-shell='current']) html,
+:where(html[data-ga-shell='current']),
 :where([data-ga-shell='current']) body {
   padding: 0;
   margin: 0;
@@ -161,6 +163,7 @@
   text-decoration: none;
 }
 
+:where(html[data-ga-shell='current']),
 :where([data-ga-shell='current']) * {
   box-sizing: border-box;
 }

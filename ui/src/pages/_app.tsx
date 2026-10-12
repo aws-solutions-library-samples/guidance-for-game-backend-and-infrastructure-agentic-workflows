@@ -2,7 +2,7 @@ import '../styles/globals.css';
 import '@copilotkit/react-ui/styles.css';
 import type { AppProps } from 'next/app';
 import Head from 'next/head';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import CognitoAuth from '../components/CognitoAuth';
 import { IdleWarningDialog } from '../components/IdleWarningDialog';
 import { useIdleSession } from '@/utils/useIdleSession';
@@ -16,6 +16,30 @@ import {
 } from '@/utils/sessionRefresh';
 import { allocateSessionEpoch } from '@/utils/idleTimer';
 import { ThemeProvider } from '../components/ThemeProvider';
+import { DEFAULT_SHELL, documentShell, reloadForShellBoundary } from '@/shell/shell';
+import type { Shell } from '@/shell/shell';
+
+/**
+ * `_app` runs on the client across soft navigations, but `data-ga-shell` is
+ * written once into the server HTML by `_document` and never updated by the
+ * client router. The server proxy also answers the router's data request for
+ * `/`, so a client-side `router.push('/')` from a current-UI page would render
+ * the Cloudscape page inside a `data-ga-shell="current"` document (and the
+ * reverse), mixing the two design systems in one document. Forcing a full
+ * document load whenever the active page's shell differs from the document's
+ * shell keeps each shell isolated: the URL is already updated for both push and
+ * Back, so a reload fetches the correct document without adding a history entry.
+ */
+function useShellBoundaryReload(componentShell: Shell): void {
+  // `useLayoutEffect` runs before paint so the mismatched shell is never shown;
+  // on the server it would warn, so fall back to `useEffect` there.
+  const useIsomorphicLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
+  useIsomorphicLayoutEffect(() => {
+    if (componentShell !== documentShell()) {
+      reloadForShellBoundary();
+    }
+  }, [componentShell]);
+}
 
 const SESSION_EXPIRED_MESSAGE = 'Your session expired. Sign in again.';
 const PUBLIC_API_PATHS = new Set([
@@ -58,6 +82,14 @@ function MyApp({ Component, pageProps }: AppProps) {
   // Cloudscape shell brings its own layout and global styles through its page
   // entry (see `pages/shell-cloudscape.tsx`). The session, token refresh, and
   // idle timer below are reused unchanged across both shells.
+  //
+  // The active page declares its shell through a static `shell` property
+  // (defaulting to the current shell). When that differs from the document's
+  // shell after a client-side navigation, force a full document load so the two
+  // design systems are never mixed in one document.
+  const componentShell: Shell = (Component as { shell?: Shell }).shell ?? DEFAULT_SHELL;
+  useShellBoundaryReload(componentShell);
+
   const [authMode, setAuthMode] = useState<'loading' | 'skip' | 'cognito'>('loading');
   const [config, setConfig] = useState<Config | null>(null);
   const [user, setUser] = useState<CognitoUser | null>(null);
