@@ -116,31 +116,43 @@ test.describe('Cloudscape shell', { tag: ['@e2e', '@cloudscape', '@a11y'] }, () 
     await cloudscapeShell.goto(page);
     await cloudscapeShell.expectShellAttribute(page);
 
-    // Navigate to a current-shell page client-side.
+    // Navigate to a current-shell page and wait for its chrome (the logo link)
+    // to actually render, so the client-side click below exercises the real
+    // in-app navigation rather than a full document load fallback.
     await page.goto('/admin/users');
-    await page.waitForLoadState('domcontentloaded');
+    const logoLink = page.locator('a[href="/"]').first();
+    await expect(logoLink).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.getAttribute('data-ga-shell'))).toBe('current');
 
-    // Client-side navigate back to `/`. The shell-boundary reload forces a full
-    // document load, so the document ends up as the Cloudscape shell again —
-    // never the Cloudscape page inside a current-shell document. The reload
-    // destroys the client execution context, so wait for the Cloudscape shell's
-    // own heading (its presence proves the Cloudscape document loaded) before
-    // reading the attribute.
-    await page.evaluate(() => {
-      const link = document.querySelector('a[href="/"]') as HTMLAnchorElement | null;
-      if (link) {
-        link.click();
-      } else {
-        window.location.assign('/');
+    // Count document-level requests triggered by the logo click. The click is a
+    // client-side navigation to `/`; the shell-boundary reload must turn it into
+    // exactly one full document load so the Cloudscape document is served (never
+    // the Cloudscape page inside the current-shell document). Removing the hook
+    // leaves the current-shell document in place and makes zero document
+    // requests, so this count is what fails without the fix.
+    let documentRequests = 0;
+    const countDocuments = (request: import('@playwright/test').Request) => {
+      if (request.resourceType() === 'document') {
+        documentRequests += 1;
       }
-    });
-    await expect(page.getByRole('heading', { name: 'Game Agent', level: 1 })).toBeVisible({
-      timeout: 15000,
-    });
-    expect(await page.evaluate(() => document.documentElement.getAttribute('data-ga-shell'))).toBe(
-      'cloudscape',
-    );
+    };
+    page.on('request', countDocuments);
+
+    // Click the real logo link with an auto-waiting locator (no manual fallback).
+    await logoLink.click();
+
+    // Wait until the Cloudscape document is in place. The shell attribute only
+    // flips to `cloudscape` after the full reload loads the Cloudscape
+    // document, so polling it (rather than the shared "Game Agent" heading,
+    // which the current shell's own navigation also renders) guarantees the
+    // reload has completed before the count is read.
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute('data-ga-shell')), {
+        timeout: 15000,
+      })
+      .toBe('cloudscape');
+    page.off('request', countDocuments);
+    expect(documentRequests).toBe(1);
     // The current shell's CopilotKit markup must not be present in the
     // Cloudscape document.
     await expect(page.locator('.copilotKitMessages')).toHaveCount(0);

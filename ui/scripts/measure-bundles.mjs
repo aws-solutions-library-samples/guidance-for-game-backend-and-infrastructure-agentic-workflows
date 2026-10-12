@@ -17,6 +17,11 @@
  * It also reports the gzipped CSS first-load per shell so the CSS budget is
  * tracked alongside the JavaScript budget.
  *
+ * The gate also fails when the manifest lists no current-UI page to measure
+ * (for example a skipped or broken build whose manifest holds only `/_app`), or
+ * when a baselined current-UI page is absent from the manifest, so a build that
+ * produced nothing to protect can never pass the budget vacuously.
+ *
  * Run `node scripts/measure-bundles.mjs` from `ui/` after `next build`. Pass
  * `--json` for machine-readable output. `BUNDLE_NEXT_DIR` and
  * `BUNDLE_BASELINE_PATH` override the `.next` and baseline locations so the
@@ -83,6 +88,24 @@ function main() {
 
   const failures = [];
   const report = {};
+
+  // A build that produced no current-UI page (for example a skipped or broken
+  // `next build` whose manifest holds only `/_app`) must fail rather than
+  // silently report the budget OK: there is nothing to protect and the gate
+  // would pass vacuously.
+  if (routes.length === 0) {
+    failures.push('manifest lists no current-UI page to measure (is `.next` from a complete build?)');
+  }
+
+  // Every baselined current-UI page must appear in the manifest. A baselined
+  // page absent from the manifest means the build did not emit it, so its
+  // growth ceiling would go unenforced; fail instead of skipping it silently.
+  const baselinePages = baseline.pages ?? {};
+  for (const baselinedRoute of Object.keys(baselinePages)) {
+    if (!routes.includes(baselinedRoute)) {
+      failures.push(`${baselinedRoute}: baselined current-UI page is missing from the build manifest`);
+    }
+  }
 
   for (const result of results) {
     const { route, jsBytes, cssBytes, cloudscapeFiles } = result;

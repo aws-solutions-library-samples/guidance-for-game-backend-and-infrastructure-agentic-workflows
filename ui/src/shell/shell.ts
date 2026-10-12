@@ -58,12 +58,77 @@ export function documentShell(): Shell {
 }
 
 /**
- * Force a full document load. Used to cross the shell boundary on a client-side
- * navigation so the correct document is fetched and the two design systems are
- * never mixed. A reload adds no history entry, so browser Back still works.
+ * `sessionStorage` key holding the URL a shell-boundary reload was last issued
+ * for. The reload is one-shot per URL: a URL that has already triggered a reload
+ * is not reloaded again, so a render that keeps producing a shell mismatch for
+ * the same URL (for example the client error page, which carries no shell inside
+ * a Cloudscape document) cannot loop. The marker is scoped to the tab and
+ * cleared the moment a render's shell matches the document, so a later genuine
+ * boundary crossing to the same URL still reloads.
  */
-export function reloadForShellBoundary(): void {
-  if (typeof window !== 'undefined') {
-    window.location.reload();
+const SHELL_BOUNDARY_RELOAD_MARKER = 'ga-shell-boundary-reload';
+
+function sessionStorageOrNull(): Storage | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    return window.sessionStorage;
+  } catch {
+    // Access to sessionStorage can throw (for example in a sandboxed document);
+    // treat that as "no marker store" rather than failing the render.
+    return null;
+  }
+}
+
+/**
+ * Force a full document load, at most once per URL. Used to cross the shell
+ * boundary on a client-side navigation so the correct document is fetched and
+ * the two design systems are never mixed. A reload adds no history entry, so
+ * browser Back still works.
+ *
+ * Before reloading, the current URL is written to a `sessionStorage` marker; if
+ * the marker already holds the current URL the reload is skipped. This bounds
+ * the reload to one per URL so a persistently mismatched render (such as the
+ * client error page) cannot reload forever. Returns `true` when a reload was
+ * issued and `false` when it was skipped by the one-shot guard or no window is
+ * available.
+ */
+export function reloadForShellBoundary(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  const store = sessionStorageOrNull();
+  const currentUrl = window.location.href;
+  if (store) {
+    if (store.getItem(SHELL_BOUNDARY_RELOAD_MARKER) === currentUrl) {
+      return false;
+    }
+    try {
+      store.setItem(SHELL_BOUNDARY_RELOAD_MARKER, currentUrl);
+    } catch {
+      // If the marker cannot be persisted the reload still runs; the guard only
+      // adds protection when it can, and never blocks a needed reload.
+    }
+  }
+  window.location.reload();
+  return true;
+}
+
+/**
+ * Clear the one-shot shell-boundary reload marker. Called on any render whose
+ * shell already matches the document, so the correct-document render always
+ * re-arms the guard for a future boundary crossing to the same URL.
+ */
+export function clearShellBoundaryReloadMarker(): void {
+  const store = sessionStorageOrNull();
+  if (!store) {
+    return;
+  }
+  try {
+    store.removeItem(SHELL_BOUNDARY_RELOAD_MARKER);
+  } catch {
+    // A failure to clear the marker is harmless: at worst a future reload for
+    // the same URL is skipped, which only reduces reloads, never causes a loop.
   }
 }

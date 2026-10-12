@@ -171,6 +171,47 @@ class BundleBudgetChecks(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, f"bundle budget failed:\n{result.stdout}\n{result.stderr}")
 
+    def test_manifest_with_no_current_ui_page_exits_one(self):
+        """A manifest holding only /_app (a skipped or broken build) must fail
+        instead of silently reporting the budget OK."""
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            manifest = {"pages": {"/_app": ["static/app.js"]}}
+            files = {"static/app.js": "export const app = 1;\n"}
+            next_dir = _build_synthetic_next(tmp, manifest, files)
+            baseline = {"pages": {}}
+            result = _run_against_fixture(next_dir, baseline)
+            self.assertEqual(
+                result.returncode, 1, f"a manifest with no current-UI page must fail:\n{result.stdout}\n{result.stderr}"
+            )
+            self.assertIn("no current-UI page", result.stderr)
+
+    def test_baselined_page_missing_from_manifest_exits_one(self):
+        """A baselined current-UI page absent from the manifest means the build
+        did not produce it; the budget must fail rather than skip it silently."""
+        with tempfile.TemporaryDirectory() as tmp_name:
+            tmp = Path(tmp_name)
+            # The manifest produced `/` but not the baselined `/admin/users`.
+            manifest = {"pages": {"/": ["static/clean.js"], "/_app": ["static/app.js"]}}
+            files = {
+                "static/clean.js": "export const page = 1;\n",
+                "static/app.js": "export const app = 1;\n",
+            }
+            next_dir = _build_synthetic_next(tmp, manifest, files)
+            baseline = {
+                "pages": {
+                    "/": {"jsFirstLoadKiB": 100.0},
+                    "/admin/users": {"jsFirstLoadKiB": 100.0},
+                }
+            }
+            result = _run_against_fixture(next_dir, baseline)
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"a baselined page missing from the manifest must fail:\n{result.stdout}\n{result.stderr}",
+            )
+            self.assertIn("/admin/users", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

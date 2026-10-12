@@ -1,18 +1,22 @@
 /**
  * The server proxy selects the shell for `/` and guards the internal Cloudscape
  * route. It MUST rewrite `/` to the Cloudscape page only when `GBAW_UI_SHELL` is
- * exactly `cloudscape`, serve the current UI otherwise, and return 404 for a
- * direct request to `/shell-cloudscape` UNLESS the Cloudscape shell is selected
- * (in which case `/` is rewritten there internally and the proxy re-runs on it,
- * so that re-entry must be allowed through).
+ * exactly `cloudscape`, serve the current UI otherwise, and serve the app's own
+ * 404 page with a 404 status for a direct request to `/shell-cloudscape` UNLESS
+ * the Cloudscape shell is selected (in which case `/` is rewritten there
+ * internally and the proxy re-runs on it, so that re-entry must be allowed
+ * through).
  *
  * `next/server` is mocked so the decision is observable without the Next
  * runtime; the end-to-end rewrite/404 behavior is verified against a real build
  * separately.
  */
-
 jest.mock('next/server', () => {
-  const mockRewrite = jest.fn((url: unknown) => ({ kind: 'rewrite', url }));
+  const mockRewrite = jest.fn((url: unknown, init: { status?: number } = {}) => ({
+    kind: 'rewrite',
+    url,
+    status: init.status,
+  }));
   const mockNext = jest.fn(() => ({ kind: 'next' }));
   return {
     NextResponse: Object.assign(
@@ -66,17 +70,21 @@ describe('proxy shell selection', () => {
     expect(result.url?.pathname).toBe(CLOUDSCAPE_PAGE);
   });
 
-  it('404s a direct /shell-cloudscape request when the selector is unset', () => {
+  it('serves the app 404 page for a direct /shell-cloudscape request when the selector is unset', () => {
     delete process.env.GBAW_UI_SHELL;
     const result = proxy(requestFor(CLOUDSCAPE_PAGE)) as unknown as Decision;
-    expect(result.kind).toBe('response');
+    // The hidden route is rewritten to the app's own 404 page, keeping a 404
+    // status rather than returning a bare empty-body response.
+    expect(result.kind).toBe('rewrite');
+    expect(result.url?.pathname).toBe('/404');
     expect(result.status).toBe(404);
   });
 
-  it('404s a direct /shell-cloudscape request for a non-cloudscape value', () => {
+  it('serves the app 404 page for a direct /shell-cloudscape request for a non-cloudscape value', () => {
     process.env.GBAW_UI_SHELL = 'Cloudscape'; // wrong case → current shell
     const result = proxy(requestFor(CLOUDSCAPE_PAGE)) as unknown as Decision;
-    expect(result.kind).toBe('response');
+    expect(result.kind).toBe('rewrite');
+    expect(result.url?.pathname).toBe('/404');
     expect(result.status).toBe(404);
   });
 

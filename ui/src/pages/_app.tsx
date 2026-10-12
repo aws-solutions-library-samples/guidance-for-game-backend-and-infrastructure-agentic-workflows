@@ -16,7 +16,7 @@ import {
 } from '@/utils/sessionRefresh';
 import { allocateSessionEpoch } from '@/utils/idleTimer';
 import { ThemeProvider } from '../components/ThemeProvider';
-import { DEFAULT_SHELL, documentShell, reloadForShellBoundary } from '@/shell/shell';
+import { DEFAULT_SHELL, documentShell, reloadForShellBoundary, clearShellBoundaryReloadMarker } from '@/shell/shell';
 import type { Shell } from '@/shell/shell';
 
 /**
@@ -29,16 +29,35 @@ import type { Shell } from '@/shell/shell';
  * document load whenever the active page's shell differs from the document's
  * shell keeps each shell isolated: the URL is already updated for both push and
  * Back, so a reload fetches the correct document without adding a history entry.
+ *
+ * The reload is bounded so it can never loop. Next's production `renderError`
+ * re-renders `_app` with the built-in error page, which declares no shell, so
+ * inside a Cloudscape document a client-side exception would otherwise look like
+ * a permanent shell mismatch and reload forever. Two guards prevent that: an
+ * error render (signalled by the `err` prop) never reloads, and
+ * `reloadForShellBoundary` is one-shot per URL. A render whose shell matches the
+ * document clears the one-shot marker so a later genuine boundary crossing to
+ * the same URL still reloads.
  */
-function useShellBoundaryReload(componentShell: Shell): void {
+function useShellBoundaryReload(componentShell: Shell, isErrorRender: boolean): void {
   // `useLayoutEffect` runs before paint so the mismatched shell is never shown;
   // on the server it would warn, so fall back to `useEffect` there.
   const useIsomorphicLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
   useIsomorphicLayoutEffect(() => {
+    // An error render replaces the active page with the shell-less error page.
+    // Never treat that as a shell crossing: reloading would re-run the same
+    // failing render and loop.
+    if (isErrorRender) {
+      return;
+    }
     if (componentShell !== documentShell()) {
       reloadForShellBoundary();
+    } else {
+      // The document already matches the active page's shell, so re-arm the
+      // one-shot guard for a future boundary crossing to this URL.
+      clearShellBoundaryReloadMarker();
     }
-  }, [componentShell]);
+  }, [componentShell, isErrorRender]);
 }
 
 const SESSION_EXPIRED_MESSAGE = 'Your session expired. Sign in again.';
@@ -75,7 +94,12 @@ function isProtectedApiRequest(input: RequestInfo | URL): boolean {
     && !PUBLIC_API_PATHS.has(url.pathname);
 }
 
-function MyApp({ Component, pageProps }: AppProps) {
+// `_app`'s props at runtime include an optional `err` that Next's production
+// `renderError` passes alongside the built-in error page; `next/app`'s exported
+// `AppProps` type does not declare it, so widen the type here to read it.
+type AppPropsWithError = AppProps & { err?: Error };
+
+function MyApp({ Component, pageProps, err }: AppPropsWithError) {
   // `_app` hosts both shells. It renders the active page (`Component`) as the
   // per-shell presentation and never imports Cloudscape chrome or global styles,
   // so the current UI's shared bundle stays free of Cloudscape code; the
@@ -86,9 +110,11 @@ function MyApp({ Component, pageProps }: AppProps) {
   // The active page declares its shell through a static `shell` property
   // (defaulting to the current shell). When that differs from the document's
   // shell after a client-side navigation, force a full document load so the two
-  // design systems are never mixed in one document.
+  // design systems are never mixed in one document. An error render (Next's
+  // production `renderError` passes `err` and the shell-less error page) is
+  // never treated as a shell crossing, so a client-side exception cannot loop.
   const componentShell: Shell = (Component as { shell?: Shell }).shell ?? DEFAULT_SHELL;
-  useShellBoundaryReload(componentShell);
+  useShellBoundaryReload(componentShell, Boolean(err));
 
   const [authMode, setAuthMode] = useState<'loading' | 'skip' | 'cognito'>('loading');
   const [config, setConfig] = useState<Config | null>(null);

@@ -9,6 +9,7 @@
 import {
   CLOUDSCAPE_PAGE,
   DEFAULT_SHELL,
+  clearShellBoundaryReloadMarker,
   documentShell,
   reloadForShellBoundary,
   resolveShellSelection,
@@ -65,11 +66,29 @@ describe('documentShell', () => {
   });
 });
 
-describe('reloadForShellBoundary', () => {
-  it('is a no-op when there is no window (server render)', () => {
-    // The function guards on `typeof window`; calling it under jsdom simply
-    // delegates to the (unimplemented in jsdom) reload, so assert it is a
-    // callable export that does not throw when guarded.
-    expect(typeof reloadForShellBoundary).toBe('function');
+describe('reloadForShellBoundary one-shot guard', () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it('issues a reload the first time it is called for a URL', () => {
+    expect(reloadForShellBoundary()).toBe(true);
+  });
+
+  it('skips a second reload for the same URL (so a mismatch cannot loop)', () => {
+    expect(reloadForShellBoundary()).toBe(true);
+    expect(reloadForShellBoundary()).toBe(false);
+    expect(reloadForShellBoundary()).toBe(false);
+  });
+
+  it('re-arms after the marker is cleared, so a later crossing reloads again', () => {
+    expect(reloadForShellBoundary()).toBe(true);
+    expect(reloadForShellBoundary()).toBe(false);
+    clearShellBoundaryReloadMarker();
+    expect(reloadForShellBoundary()).toBe(true);
   });
 });

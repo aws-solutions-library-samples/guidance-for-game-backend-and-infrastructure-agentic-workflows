@@ -14,7 +14,7 @@
     "asyncCloudscapeChunks": { "jsKiB": 143.9, "cssKiB": 206.3 }
   },
   "cssBudget": {
-    "note": "No hard CSS ceiling is enforced yet. The Cloudscape shell's async CSS (~206 KiB gzip) is expected to change as the chat, chart, and operator surfaces are added in later changes, so a CSS ceiling is deferred to the shell-cutover readiness work tracked by #549. The current-UI CSS first-load (10.7 KiB) is unaffected by the Cloudscape shell."
+    "note": "No hard CSS ceiling is enforced yet. The Cloudscape shell's async CSS (~206 KiB gzip) is expected to change as the chat, chart, and operator surfaces are added in later changes, so a CSS ceiling is deferred to the shell-cutover readiness work tracked by #552. The current-UI CSS first-load (10.7 KiB) is unaffected by the Cloudscape shell."
   },
   "growthNote": "The current-UI pages' first-load JS grew ~1 KiB over the pre-Cloudscape build. The cause is a Turbopack chunk regrouping that duplicated a shared react-dom module into the pages' shared chunk (that chunk grew ~11.6 to ~12.5 KiB gzip; prefetchDNS now appears twice in the first-load instead of once). No Cloudscape code is in any current-UI first-load; the growth is unrelated to the Cloudscape packages and stays within the +2 KiB per-page ceiling."
 }

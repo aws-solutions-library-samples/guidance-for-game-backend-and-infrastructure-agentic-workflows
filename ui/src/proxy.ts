@@ -28,6 +28,9 @@ import type { NextRequest } from 'next/server';
 // Local modules
 import { CLOUDSCAPE_PAGE, resolveShellSelection, SHELL_ENV_VAR } from '@/shell/shell';
 
+/** The app's own not-found page, served for a direct hit on the hidden route. */
+const NOT_FOUND_PAGE = '/404';
+
 export function proxy(request: NextRequest) {
   const shell = resolveShellSelection(process.env[SHELL_ENV_VAR]);
 
@@ -35,8 +38,15 @@ export function proxy(request: NextRequest) {
     // When the Cloudscape shell is selected, `/` is rewritten here internally
     // and the proxy re-runs on the rewritten path; let that through. When it is
     // not selected, a request reaching this route came from an external caller
-    // addressing it directly, so return 404 to keep the internal route hidden.
-    return shell === 'cloudscape' ? NextResponse.next() : new NextResponse(null, { status: 404 });
+    // addressing it directly, so rewrite to the app's own 404 page with a 404
+    // status to keep the internal route hidden while serving the same
+    // not-found experience (and security headers) as any other unknown path.
+    if (shell === 'cloudscape') {
+      return NextResponse.next();
+    }
+    const notFoundUrl = request.nextUrl.clone();
+    notFoundUrl.pathname = NOT_FOUND_PAGE;
+    return NextResponse.rewrite(notFoundUrl, { status: 404 });
   }
 
   if (shell === 'cloudscape') {
