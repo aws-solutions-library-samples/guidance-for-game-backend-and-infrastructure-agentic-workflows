@@ -131,7 +131,11 @@ describe('chat.ts - real console sink carries no raw identity', () => {
 
     const { req, res } = createMocks({
       method: 'POST',
-      headers: { cookie: 'cognito_access_token=atoken; cognito_id_token=itoken' },
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://app.example.com',
+        cookie: 'cognito_access_token=atoken; cognito_id_token=itoken',
+      },
       body: {
         operationName: 'generateCopilotResponse',
         variables: {
