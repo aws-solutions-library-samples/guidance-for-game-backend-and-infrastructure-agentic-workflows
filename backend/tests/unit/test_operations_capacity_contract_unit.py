@@ -193,6 +193,31 @@ def test_bounds_violation_raises_risk_level() -> None:
 
 
 @pytest.mark.unit
+def test_risk_scores_minimum_and_maximum_swings() -> None:
+    # Pinning the band (min/max collapse onto desired) is a large structural
+    # change even when the desired value is unchanged: it removes the fleet's
+    # autoscaling range. It must not score as zero-risk/low.
+    current = {"desired": 50, "minimum": 0, "maximum": 100}
+    requested = {"desired": 50, "minimum": 50, "maximum": 50}
+    risk = calculate_capacity_risk(current=current, requested=requested, within_bounds=True)
+    assert risk["score"] > 0
+    assert risk["level"] != "low"
+
+
+@pytest.mark.unit
+def test_risk_magnitude_counts_the_largest_capacity_swing() -> None:
+    # A large maximum reduction with no desired change still carries magnitude.
+    current = {"desired": 10, "minimum": 2, "maximum": 100}
+    desired_only = calculate_capacity_risk(
+        current=current, requested={"desired": 10, "minimum": 2, "maximum": 100}, within_bounds=True
+    )
+    maximum_swing = calculate_capacity_risk(
+        current=current, requested={"desired": 10, "minimum": 2, "maximum": 10}, within_bounds=True
+    )
+    assert maximum_swing["score"] > desired_only["score"]
+
+
+@pytest.mark.unit
 def test_bounds_violations_flags_server_owned_limits() -> None:
     limits = {"floor": 1, "ceiling": 30, "max_step": 5}
     requested = {"desired": 40, "minimum": 0, "maximum": 40}
