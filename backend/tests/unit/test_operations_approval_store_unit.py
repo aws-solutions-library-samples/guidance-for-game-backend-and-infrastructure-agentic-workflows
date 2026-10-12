@@ -547,6 +547,42 @@ def test_commit_fails_closed_when_one_call_limit_would_not_fit() -> None:
     assert len(client.transactions) == transactions_before
 
 
+def test_bound_request_deadline_guards_reads_and_caps_writes() -> None:
+    # While a per-request deadline is bound, a read that would start after the
+    # deadline fails closed with a retryable store fault (so the multi-get
+    # evidence walk cannot outlast the request budget), and a write deadline is
+    # capped at min(request deadline, commit_not_after).
+    client = StatefulDynamoClient()
+    _persist(_store(client))
+    store = DynamoDbApprovalStore(client=client, table_name=TABLE, clock=lambda: NOW, call_limit_s=4.5)
+
+    # A request deadline only 2s away: one 4.5s sub-call cannot fit, so a read is
+    # refused rather than started.
+    with store.request_deadline(NOW + timedelta(seconds=2)):
+        with pytest.raises(ApprovalStoreError):
+            store.load_operation_evidence(OPERATION_ID)
+
+    # A far commit_not_after is capped by a nearer request deadline: the write
+    # fails closed as deadline-expired without issuing a transaction.
+    transactions_before = len(client.transactions)
+    with store.request_deadline(NOW + timedelta(seconds=2)):
+        outcome = store.record_terminal_decision(
+            operation_id=OPERATION_ID,
+            expected_prepared_operation_hash=_hash(),
+            expected_state="pending_approval",
+            new_state="cancelled",
+            commit_not_after=NOW + timedelta(hours=1),
+            state_change=_state_change("cancelled", "CANCELLED"),
+            ledger_event=_ledger_event("operation.state-changed"),
+            approval=None,
+        )
+    assert outcome is DecisionCommitOutcome.DEADLINE_EXPIRED
+    assert len(client.transactions) == transactions_before
+
+    # The binding is cleared on exit: the same read now succeeds.
+    assert store.load_operation_evidence(OPERATION_ID) is not None
+
+
 def test_ledger_contract_sequence_is_strictly_increasing_per_operation() -> None:
     # The stored ledger-event contract ``sequence`` is physical index + 1 and
     # strictly increasing: creation carries 1, the terminal transition carries 2.

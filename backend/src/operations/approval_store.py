@@ -54,7 +54,8 @@ from __future__ import annotations
 
 # Standard library
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
@@ -143,6 +144,47 @@ class DynamoDbApprovalStore:
         # started when at least this much of the request budget remains, so a
         # store call never begins so late that it can outlast the Lambda timeout.
         self._call_limit_s = float(call_limit_s)
+        # The optional per-request monotonic deadline (a wall-clock instant) the
+        # adapter binds for the duration of one request via :meth:`request_deadline`.
+        # When set, every read is guarded and every write deadline is capped by it,
+        # so the whole request — including the multi-get evidence ledger walk —
+        # stays inside the Lambda timeout, not only the individual commits.
+        self._request_deadline: datetime | None = None
+
+    @contextmanager
+    def request_deadline(self, deadline: datetime) -> Iterator[None]:
+        """Bind a per-request deadline for the duration of one request.
+
+        While bound, every store read fails closed before starting a sub-call
+        that could return after ``deadline`` (so the bounded multi-get evidence
+        read cannot outlast the request budget), and every write's
+        ``commit_not_after`` is capped at ``min(deadline, commit_not_after)``.
+        The binding is cleared on exit so a reused per-container store never
+        leaks one request's deadline into the next.
+        """
+        previous = self._request_deadline
+        self._request_deadline = _utc(deadline, "request_deadline")
+        try:
+            yield
+        finally:
+            self._request_deadline = previous
+
+    def _effective_deadline(self, commit_not_after: datetime) -> datetime:
+        """Cap a write deadline at the bound request deadline when one is set."""
+        if self._request_deadline is None:
+            return commit_not_after
+        return min(commit_not_after, self._request_deadline)
+
+    def _guard_read(self) -> None:
+        """Fail closed before a read that could return after the request deadline.
+
+        A bound request deadline guards every ``get_item`` the same way the
+        commit guard protects a transaction: when fewer than one call limit
+        remains, the read is refused with a retryable store fault rather than
+        started so late that the ledger walk outlasts the Lambda timeout.
+        """
+        if self._request_deadline is not None and self._deadline_reached(self._request_deadline):
+            raise ApprovalStoreError("operation request deadline elapsed before the read could complete")
 
     def _deadline_reached(self, deadline: datetime) -> bool:
         """Whether one full store sub-call would not fit before ``deadline``.
@@ -169,7 +211,7 @@ class DynamoDbApprovalStore:
         commit_not_after: datetime,
     ) -> PersistResult:
         """Atomically materialize one prepared operation awaiting approval."""
-        deadline = _utc(commit_not_after, "commit_not_after")
+        deadline = self._effective_deadline(_utc(commit_not_after, "commit_not_after"))
         if self._deadline_reached(deadline):
             return PersistResult(PersistOutcome.DEADLINE_EXPIRED)
 
@@ -291,7 +333,7 @@ class DynamoDbApprovalStore:
         commit_not_after: datetime,
         approval: Mapping[str, Any],
     ) -> ApprovalCommitOutcome:
-        deadline = _utc(commit_not_after, "commit_not_after")
+        deadline = self._effective_deadline(_utc(commit_not_after, "commit_not_after"))
         if self._deadline_reached(deadline):
             return ApprovalCommitOutcome.DEADLINE_EXPIRED
         state_change = _approval_state_change(operation_id, expected_prepared_operation_hash, approval)
@@ -327,7 +369,7 @@ class DynamoDbApprovalStore:
         ledger_event: Mapping[str, Any],
         approval: Mapping[str, Any] | None,
     ) -> DecisionCommitOutcome:
-        deadline = _utc(commit_not_after, "commit_not_after")
+        deadline = self._effective_deadline(_utc(commit_not_after, "commit_not_after"))
         if self._deadline_reached(deadline):
             return DecisionCommitOutcome.DEADLINE_EXPIRED
         return self._commit_terminal(
@@ -556,6 +598,7 @@ class DynamoDbApprovalStore:
     # -- Low-level helpers ------------------------------------------------
 
     def _get(self, pk: str, sk: str) -> dict[str, Any] | None:
+        self._guard_read()
         response = self._client.get_item(
             TableName=self._table_name,
             Key=_marshal({"PK": pk, "SK": sk}),
