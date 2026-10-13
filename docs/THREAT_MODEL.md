@@ -173,6 +173,7 @@ detail in [`SECURITY.md`](../SECURITY.md#trust-boundaries--data-flow).
 | I4 | Conversation history exposure | Memory System | User-scoped sessions (`actor_id`), encryption at rest | Deployed |
 | I5 | Internal infrastructure details | AI Responses | Guardrails regex filters | Deployed |
 | I6 | Customer data cross-contamination | Multi-tenant | User-scoped sessions, separate contexts | Deployed |
+| I7 | Prompt/response content in exported traces | Observability | Startup redaction guard; GenAI content capture off and span attributes redacted by default; opt-in fails closed | Deployed |
 
 ### Denial of Service
 

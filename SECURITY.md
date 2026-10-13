@@ -211,7 +211,35 @@ Health check path `/api/health` is configured in the template; interval, timeout
 **AWS Documentation**:
 - [CloudWatch Logs Retention](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Working-with-log-groups-and-streams.html)
 
-### S3 Lifecycle Policies
+### Exported Telemetry Content
+
+The runtime is traced with OpenTelemetry under the AWS OpenTelemetry distro and AgentCore observability. Trace spans and the OpenTelemetry log records derived from GenAI events are governed separately from application logs, so they have their own content boundary.
+
+**Exported by default** (needed for latency, cost, and error analysis):
+
+- Span and request structure, timing, and latency
+- Token-count attributes (input, output, total, and cache read/write counts)
+- Model id, operation name, and finish/stop reason
+- Error type and status
+
+**Redacted by default** (never exported unless an operator opts in):
+
+- Prompt text and conversation messages (`gen_ai.input.messages`)
+- Model and tool responses (`gen_ai.output.messages`)
+- System prompts (`gen_ai.system_instructions`)
+- Tool inputs and results
+- Knowledge Base passages and memory query or content
+
+**How it is enforced**: A startup guard (`backend/src/config/telemetry_guard.py`) runs at process start, before any tracer is constructed, and sets two switches regardless of the deploy environment:
+
+- `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false` — the Bedrock instrumentation attaches no message content to GenAI events, so the OpenTelemetry log records derived from them carry none either. An explicit `false` wins over the distro's observability default.
+- `OTEL_SEMCONV_STABILITY_OPT_IN` carries `gen_ai_unredacted_attributes=` (an empty allowlist) — the tracer redacts every sensitive span attribute and legacy per-message event. Any unrelated semantic-convention tokens already present are preserved. The deployment environment builders (`scripts/deploy.sh` and the PowerShell equivalent) pass the same two settings so the distro also sees them at process start.
+
+**Operator opt-in (non-production only)**: Set `GBAW_CAPTURE_TRACE_CONTENT` to the exact value `capture-content-nonprod` to export message content for debugging. The switch fails closed: any other value, including `true` or an empty string, keeps content redacted. Enabling it in a hosted runtime exports prompt and response content to CloudWatch and should be used only in a disposable, non-production environment.
+
+**Residual risk**: Redaction removes message content, but a span still records that an operation happened, its timing, and its token counts. Correlation and session identifiers created by the platform remain for trace stitching; the runtime does not add actor id, Cognito subject, email, or raw session content as span attributes, and user content is redacted as above. If content capture is opted in, exported telemetry is only as protected as the CloudWatch log group and X-Ray data holding it.
+
+
 
 **CloudTrail Logs**: 90-day expiration policy  
 **Knowledge Base Documents**: No expiration (persistent)
@@ -479,6 +507,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | Backend (AgentCore) | Sanitized prompt, user context | **Validated** | Input validation, rate limiting, guardrails |
 | AWS service responses | Fleet/cluster info, costs | **Internal** | IAM-scoped read-only access |
 | Logs (CloudWatch) | Sanitized excerpts | **Redacted** | PII/credentials stripped by `sanitize_log_data()`, encrypted at rest |
+| Traces and OpenTelemetry log records | Latency, token counts, model id, finish reason, error type, span structure | **Redacted** | Prompt, response, tool, system-prompt, and memory content redacted by default; see Exported Telemetry Content |
 | Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation (`actor_id`), encrypted at rest, TTL-enforced |
 
 ### Service-to-Service Credentials

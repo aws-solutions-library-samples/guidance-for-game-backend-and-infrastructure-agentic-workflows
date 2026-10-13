@@ -26,6 +26,17 @@ import boto3
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Local modules
+from config.telemetry_guard import apply_trace_content_guard
+
+# Keep model and tool content out of exported telemetry before any tracer is
+# built. This runs at import, ahead of prewarm_container() and the first Strands
+# Tracer, so the hosted default redacts prompt/response/system-prompt content in
+# spans and OpenTelemetry log records regardless of the deploy environment. An
+# operator can opt into capture for non-production debugging via
+# GBAW_CAPTURE_TRACE_CONTENT; see config/telemetry_guard.py and SECURITY.md.
+_TRACE_CONTENT_DECISION = apply_trace_content_guard()
+
 # Third-party packages
 from bedrock_agentcore.runtime import BedrockAgentCoreApp  # type: ignore[import-untyped]
 
@@ -165,6 +176,16 @@ _CREDENTIALS_OK = validate_aws_credentials()
 prewarm_container()
 
 app = BedrockAgentCoreApp()
+
+# Record the exported-telemetry content posture (no content values are logged).
+if _TRACE_CONTENT_DECISION.capture_enabled:
+    logger.warning(
+        "⚠️ Trace content capture is ENABLED (GBAW_CAPTURE_TRACE_CONTENT opt-in). "
+        "For non-production use only: exported spans and OpenTelemetry log records "
+        "may carry prompt and response content."
+    )
+else:
+    logger.info("🔒 Trace content redaction active: exported telemetry carries no prompt or response content")
 
 # Memory ID from environment (set by AgentCore CLI or deployment)
 MEMORY_ID = os.getenv("BEDROCK_AGENTCORE_MEMORY_ID")
