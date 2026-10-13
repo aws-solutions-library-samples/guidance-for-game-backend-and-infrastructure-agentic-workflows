@@ -197,8 +197,8 @@ run_toolkit_preflight() {
 # When the operator has set the fail-closed stop switch, run the preflight ONCE
 # up front so a predicted (or unknown) account-wide change halts the deploy
 # before the Knowledge Base and observability steps — not partway through. The
-# per-launch preflights below still run; they are no-ops here because the stop
-# switch would already have exited.
+# per-launch preflights below still run; they re-check immediately before each
+# launch and can still halt if a later read fails or the account state changes.
 if [ "${GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE:-false}" = "true" ]; then
   echo "🔎 Stop switch set: running the toolkit Transaction Search preflight before Step 2..."
   if ! run_toolkit_preflight; then

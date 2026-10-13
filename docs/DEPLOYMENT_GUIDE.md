@@ -338,8 +338,9 @@ GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
   GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh
 ```
 
-or enable Transaction Search once in the AWS X-Ray / CloudWatch console. Then
-re-run without the stop switch.
+or enable Transaction Search once in the AWS X-Ray / CloudWatch console. Once all
+three conditions hold, the deploy proceeds without changing any shared setting,
+with the stop switch still in place — leave it set so later deploys stay guarded.
 
 **Cleanup.** The warning prints only the rollback commands for the changes it
 predicted. If the toolkit added its own policy, remove it after launch (only once

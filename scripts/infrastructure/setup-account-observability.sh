@@ -122,8 +122,10 @@ print_account_scope() {
 #      toolkit still adds its own 'TransactionSearchXRayAccess' policy.
 #   2. trace destination — set to CloudWatchLogs iff the current destination is
 #      not already CloudWatchLogs.
-#   3. indexing rule    — a Default rule is created iff NO X-Ray indexing rule
-#      named 'Default' exists; an existing Default rule is left unchanged.
+#   3. indexing rule    — the toolkit sets the shared X-Ray 'Default' indexing
+#      rule to 1% via UpdateIndexingRule when NO rule named 'Default' exists. An
+#      account that already has a 'Default' rule satisfies the condition, so the
+#      preflight predicts no indexing change there.
 #
 # The exact name the toolkit uses for its own resource policy (name-only check).
 TOOLKIT_RESOURCE_POLICY_NAME="TransactionSearchXRayAccess"
@@ -298,6 +300,10 @@ preflight_transaction_search_toolkit() {
     echo "      effect is UNKNOWN. The toolkit writes on doubt: for each unknown item it"
     echo "      WILL perform the write during 'agentcore launch'. Treating this as a"
     echo "      possible shared change (not 'no change')."
+    local unknown_item
+    for unknown_item in "${unknown_items[@]}"; do
+      echo "        - UNKNOWN: ${unknown_item}"
+    done
     return 0
   fi
 
@@ -448,7 +454,8 @@ run_transaction_search_preflight() {
     echo "     GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \\" >&2
     echo "       GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh" >&2
     echo "   (on an account with no other 'aws/spans' grant), or enable Transaction Search once" >&2
-    echo "   in the AWS console. Then re-run without the stop switch." >&2
+    echo "   in the AWS console. Once all three conditions hold, this deploy proceeds without" >&2
+    echo "   changing any shared setting, with the stop switch still in place." >&2
     return 1
   fi
   return 0

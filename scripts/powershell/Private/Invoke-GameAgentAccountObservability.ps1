@@ -58,12 +58,10 @@ function Invoke-GameAgentAccountObservability {
     Write-GameAgentStatus "Account-wide observability (region $Region)..." -Type Info
 
     # Returns XRay | CloudWatchLogs, or UNREADABLE if the read did not succeed.
+    # Delegates to the shared Get-GameAgentTraceDestination so the opt-in path
+    # and the Transaction Search preflight use one implementation.
     function Get-TraceDestination {
-        $raw = (& aws xray get-trace-segment-destination --region $Region @ProfileArgs --query 'Destination' --output text 2>$null)
-        if ($LASTEXITCODE -ne 0) { return 'UNREADABLE' }
-        $dest = ("$raw").Trim()
-        if ($dest -eq 'XRay' -or $dest -eq 'CloudWatchLogs') { return $dest }
-        return 'UNREADABLE'
+        return Get-GameAgentTraceDestination -Region $Region -ProfileArgs $ProfileArgs
     }
 
     function Get-TraceStatus {

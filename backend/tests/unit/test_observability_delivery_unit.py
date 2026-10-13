@@ -32,6 +32,44 @@ DELIVERY_FUNCTION_NAMES = (
 )
 
 
+def _discover_bash_shells() -> "tuple[str, ...]":
+    """Return absolute paths to the distinct bash binaries available on this
+    host, one per major version, so the shell harnesses can run under both the
+    macOS system bash (3.2) and a newer bash (5.x) when it is installed.
+
+    Only binaries that actually exist are returned; a version that is not
+    installed is skipped rather than silently falling back to another one. The
+    directory containing each returned path is placed ahead of the system paths
+    in the harness ``PATH`` so a nested ``bash`` call resolves to the same
+    version the test parametrized over.
+    """
+    candidates = ("/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash")
+    by_major: "dict[str, str]" = {}
+    for candidate in candidates:
+        if not pathlib.Path(candidate).exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [candidate, "-c", 'printf "%s" "${BASH_VERSINFO[0]}"'],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            continue
+        major = proc.stdout.strip() or candidate
+        # Keep the first binary seen for each major version (prefer /bin/bash).
+        by_major.setdefault(major, candidate)
+    # Deterministic order by major version.
+    return tuple(by_major[major] for major in sorted(by_major))
+
+
+# Absolute bash paths this suite runs the shell harnesses under: the macOS
+# system bash 3.2 and a newer bash when installed. Parametrizing over absolute
+# paths (rather than the bare name ``bash``) guarantees each case runs under the
+# intended version instead of whichever ``bash`` happens to be first on PATH.
+_BASH_SHELLS = _discover_bash_shells()
+
+
 def _function_source(script: str, name: str) -> str:
     match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}\n", script)
     assert match, f"{name} not found"
@@ -436,9 +474,10 @@ def _account_obs_harness(
     return subprocess.run([shell, "-c", command], capture_output=True, text=True)
 
 
-# Shells the opt-in path is validated against: the login shell `bash` and the
-# macOS system `/bin/bash` (3.2), so a bash-4+ construct cannot regress 3.2.
-_OBS_SHELLS = ("bash", "/bin/bash")
+# Shells the opt-in path is validated against: every distinct bash major
+# version installed (the macOS system bash 3.2 and a newer bash when present),
+# so a bash-4+ construct cannot regress 3.2.
+_OBS_SHELLS = _BASH_SHELLS
 
 
 def _obs_mock(
@@ -831,7 +870,7 @@ def _preflight_mock(
     )
 
 
-_PREFLIGHT_SHELLS = ("bash", "/bin/bash")
+_PREFLIGHT_SHELLS = _BASH_SHELLS
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
@@ -1003,6 +1042,15 @@ def test_deploy_guards_both_agentcore_launch_sites_with_the_preflight():
     for idx in launch_lines:
         window = "\n".join(lines[max(0, idx - 6) : idx])
         assert "run_toolkit_preflight" in window, f"agentcore launch at line {idx + 1} is not guarded by the preflight"
+        # The guard must be fail-closed: `if ! run_toolkit_preflight; then exit 1`.
+        # A neutralized guard (e.g. `run_toolkit_preflight || true`) still contains
+        # the call but does not stop the launch, so reject it explicitly.
+        assert (
+            "if ! run_toolkit_preflight" in window
+        ), f"agentcore launch at line {idx + 1} must use the fail-closed `if ! run_toolkit_preflight` guard"
+        assert (
+            "run_toolkit_preflight || true" not in window
+        ), f"agentcore launch at line {idx + 1} has a neutralized (|| true) preflight guard"
 
 
 def _launch_wiring_harness(
@@ -1107,9 +1155,9 @@ case "$svc $op" in
       *) echo "None";;
     esac
     ;;
-  "logs describe-resource-policies") echo "${STUB_POLICIES_JSON:-{\"resourcePolicies\":[]}}";;
-  "xray get-trace-segment-destination") echo "${STUB_TRACE_DESTINATION:-CloudWatchLogs}";;
-  "xray get-indexing-rules") echo "${STUB_INDEXING_JSON:-{\"IndexingRules\":[{\"Name\":\"Default\"}]}}";;
+  "logs describe-resource-policies") echo "$STUB_POLICIES_JSON";;
+  "xray get-trace-segment-destination") echo "$STUB_TRACE_DESTINATION";;
+  "xray get-indexing-rules") echo "$STUB_INDEXING_JSON";;
   "logs put-delivery-source") :;;
   "logs put-delivery-destination") :;;
   "logs create-delivery") :;;
@@ -1196,7 +1244,10 @@ exit 0
 """
 
 _DOCKER_STUB = r"""#!/usr/bin/env bash
-# `docker info` must succeed for deploy.sh to treat Docker as available.
+# `docker info` must succeed for deploy.sh to treat Docker as available. Drain
+# stdin so a piped `docker login --password-stdin` never races the writer into
+# SIGPIPE under `pipefail` (which would make deploy.sh exit 141).
+cat >/dev/null 2>&1
 exit 0
 """
 
@@ -1222,12 +1273,14 @@ def _build_deploy_tree(tmp_path: "pathlib.Path") -> "pathlib.Path":
         ACCOUNT_OBS_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
     )
 
-    # No-op sub-scripts deploy.sh invokes by path.
+    # No-op sub-scripts deploy.sh invokes by path. deploy-kb.sh additionally
+    # drops a marker file so a test can assert whether the Knowledge Base step
+    # was reached (it must NOT be, when the stop switch halts before Step 2).
     noop = "#!/usr/bin/env bash\nexit 0\n"
+    kb_marker = repo / "kb_ran.marker"
     for rel in (
         "scripts/infrastructure/download-kb-docs.sh",
         "scripts/infrastructure/deploy-prompts.sh",
-        "scripts/infrastructure/deploy-kb.sh",
         "scripts/infrastructure/seed-kb-gamelift.sh",
         "scripts/infrastructure/seed-kb-eks.sh",
         "scripts/infrastructure/seed-kb-cost.sh",
@@ -1237,6 +1290,9 @@ def _build_deploy_tree(tmp_path: "pathlib.Path") -> "pathlib.Path":
         p = repo / rel
         p.write_text(noop, encoding="utf-8")
         p.chmod(0o755)
+    kb = repo / "scripts/infrastructure/deploy-kb.sh"
+    kb.write_text(f'#!/usr/bin/env bash\ntouch "{kb_marker}"\nexit 0\n', encoding="utf-8")
+    kb.chmod(0o755)
 
     # Template files referenced via --template-file (the aws stub ignores them).
     for name in (
@@ -1272,9 +1328,10 @@ def _build_deploy_tree(tmp_path: "pathlib.Path") -> "pathlib.Path":
 def _run_deploy_e2e(
     tmp_path: "pathlib.Path",
     *,
-    shell: str = "bash",
+    shell: str = "/bin/bash",
     docker: bool = False,
     stop_switch: bool = False,
+    runtime_exists: bool = False,
     trace_destination: str = "CloudWatchLogs",
     policies_json: str = '{"resourcePolicies":[{"policyName":"TransactionSearchXRayAccess","policyDocument":"{}"}]}',
     indexing_json: str = '{"IndexingRules":[{"Name":"Default"}]}',
@@ -1291,6 +1348,15 @@ def _run_deploy_e2e(
     if docker:
         _write_stub(bindir / "docker", _DOCKER_STUB)
 
+    # deploy.sh runs nested `bash "$SCRIPT_DIR/.../setup-account-observability.sh"`
+    # calls. Put a directory containing the parametrized shell (named `bash`)
+    # ahead of /usr/bin so those nested calls use the SAME bash version this
+    # case runs under, rather than the system bash. The stub bin dir still comes
+    # first so the mocked `aws`/`uv`/`yq` win.
+    shelldir = tmp_path / "shell"
+    shelldir.mkdir()
+    (shelldir / "bash").symlink_to(shell)
+
     launch_log = tmp_path / "launches.log"
     launch_log.write_text("", encoding="utf-8")
 
@@ -1298,14 +1364,16 @@ def _run_deploy_e2e(
     runtime_id = resolved_arn.rsplit("/", 1)[-1]
 
     env = {
-        "PATH": f"{bindir}:/usr/bin:/bin",
+        "PATH": f"{bindir}:{shelldir}:/usr/bin:/bin",
         "HOME": str(tmp_path),
         "AWS_REGION": "us-west-2",
         "STUB_LAUNCH_LOG": str(launch_log),
         "STUB_TRACE_DESTINATION": trace_destination,
         "STUB_POLICIES_JSON": policies_json,
         "STUB_INDEXING_JSON": indexing_json,
-        "STUB_RUNTIME_ARN": "",
+        # When runtime_exists, yq reports a non-empty ARN on the FIRST read, so
+        # deploy.sh skips the first (new-runtime) launch and only Step 5b runs.
+        "STUB_RUNTIME_ARN": resolved_arn if runtime_exists else "",
         "STUB_RUNTIME_ARN_RESOLVED": resolved_arn,
         "STUB_DELIVERY_SOURCE_NAME": f"{runtime_id}-traces-source",
         "STUB_DELIVERY_DEST_ARN": "arn:aws:logs:us-west-2:123456789012:delivery-destination:example",
@@ -1328,19 +1396,22 @@ def _run_deploy_e2e(
     return result
 
 
-_E2E_SHELLS = ("bash", "/bin/bash")
+_E2E_SHELLS = _BASH_SHELLS
 
 
 @pytest.mark.parametrize("shell", _E2E_SHELLS)
 @pytest.mark.parametrize("docker", [False, True])
-def test_deploy_e2e_default_completes_and_launches(tmp_path, shell, docker):
-    """A default deploy completes (exit 0) and reaches both launches, with and
-    without Docker. The Docker-absent (backend-only) path is documented as
-    supported; it must not abort at the final summary."""
-    result = _run_deploy_e2e(tmp_path, shell=shell, docker=docker)
+@pytest.mark.parametrize("runtime_exists", [False, True])
+def test_deploy_e2e_default_completes_and_launches(tmp_path, shell, docker, runtime_exists):
+    """A default deploy completes (exit 0), with and without Docker, on both the
+    new-runtime and existing-runtime paths. The Docker-absent (backend-only)
+    path is documented as supported; it must not abort at the final summary."""
+    result = _run_deploy_e2e(tmp_path, shell=shell, docker=docker, runtime_exists=runtime_exists)
     assert result.returncode == 0, f"stdout tail:\n{result.stdout[-800:]}\nstderr:\n{result.stderr[-800:]}"
-    # Both the new-runtime launch and the Step 5b update launch ran.
-    assert result.launches.count("agentcore launch") == 2  # type: ignore[attr-defined]
+    # New-runtime path launches twice (initial launch + Step 5b update); the
+    # existing-runtime path skips the first launch and only Step 5b runs.
+    expected_launches = 1 if runtime_exists else 2
+    assert result.launches.count("agentcore launch") == expected_launches  # type: ignore[attr-defined]
     if docker:
         assert "Deployment Complete!" in result.stdout
     else:
@@ -1348,12 +1419,35 @@ def test_deploy_e2e_default_completes_and_launches(tmp_path, shell, docker):
 
 
 @pytest.mark.parametrize("shell", _E2E_SHELLS)
-def test_deploy_e2e_stop_switch_halts_before_any_launch(tmp_path, shell):
+@pytest.mark.parametrize("docker", [False, True])
+def test_deploy_e2e_default_prints_exactly_one_no_change_line_per_launch(tmp_path, shell, docker):
+    """On a compliant account (nothing predicted to change), each `agentcore
+    launch` is preceded by exactly one no-change preflight line and no WARNING
+    or per-item WOULD detail is printed."""
+    result = _run_deploy_e2e(tmp_path, shell=shell, docker=docker)
+    assert result.returncode == 0
+    launches = result.launches.count("agentcore launch")  # type: ignore[attr-defined]
+    no_change_lines = result.stdout.count("would make NO account-wide")
+    assert no_change_lines == launches == 2
+    # No toolkit-preflight change was predicted, so none of its per-item change
+    # markers appear. (The Step 1.7 default-mode report may mention the opt-in
+    # separately; scope this to the toolkit preflight's own WOULD markers.)
+    assert "WARNING: 'agentcore launch'" not in result.stdout
+    assert "WOULD ADD" not in result.stdout
+    assert "WOULD CHANGE" not in result.stdout
+    assert "WOULD SET" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+@pytest.mark.parametrize("runtime_exists", [False, True])
+def test_deploy_e2e_stop_switch_halts_before_any_launch(tmp_path, shell, runtime_exists):
     """With the stop switch set and a predicted change, the deploy exits non-zero
-    and records zero `agentcore launch` calls."""
+    before the Step 2 banner, records zero `agentcore launch` calls, and never
+    reaches the Knowledge Base step — on both runtime paths."""
     result = _run_deploy_e2e(
         tmp_path,
         shell=shell,
+        runtime_exists=runtime_exists,
         stop_switch=True,
         trace_destination="XRay",
         policies_json='{"resourcePolicies":[]}',
@@ -1362,6 +1456,20 @@ def test_deploy_e2e_stop_switch_halts_before_any_launch(tmp_path, shell):
     assert result.returncode != 0
     assert result.launches.count("agentcore launch") == 0  # type: ignore[attr-defined]
     assert "Stopping before 'agentcore launch'" in result.stderr
+    # The early stop-switch preflight halts BEFORE Step 2 and the KB steps.
+    assert "Step 2: Launching AgentCore Runtime" not in result.stdout
+    assert not (tmp_path / "repo" / "kb_ran.marker").exists()
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+@pytest.mark.parametrize("runtime_exists", [False, True])
+def test_deploy_e2e_stop_switch_with_nothing_predicted_completes(tmp_path, shell, runtime_exists):
+    """With the stop switch set but a compliant account (nothing predicted to
+    change), the deploy is a full refresh: it exits 0 and reaches its launches."""
+    result = _run_deploy_e2e(tmp_path, shell=shell, runtime_exists=runtime_exists, stop_switch=True)
+    assert result.returncode == 0, f"stderr:\n{result.stderr[-800:]}"
+    expected_launches = 1 if runtime_exists else 2
+    assert result.launches.count("agentcore launch") == expected_launches  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize("shell", _E2E_SHELLS)

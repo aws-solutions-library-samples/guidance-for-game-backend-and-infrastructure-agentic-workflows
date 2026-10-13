@@ -33,6 +33,9 @@ Describe 'GameAgent Module' {
     It 'Does not export private functions' {
         $privateFunctions = @(
             'Resolve-GameAgentProfile'
+            'Resolve-GameAgentStopSwitch'
+            'Assert-GameAgentTransactionSearchPreflight'
+            'Get-GameAgentTraceDestination'
             'Test-GameAgentPort'
             'Write-GameAgentStatus'
             'Invoke-GameAgentAppObservability'

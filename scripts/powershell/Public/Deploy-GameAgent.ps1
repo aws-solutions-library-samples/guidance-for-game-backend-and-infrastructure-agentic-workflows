@@ -53,9 +53,10 @@ function Deploy-GameAgent {
 
     # Likewise honor the shell-equivalent fail-closed stop switch. Only the exact
     # value 'true' (case-sensitive) enables it, matching the shell path, which
-    # treats 'TRUE', '1', and '' as off.
+    # treats 'TRUE', '1', and '' as off. The mapping lives in a shared helper so
+    # it is testable in isolation.
     if (-not $PSBoundParameters.ContainsKey('StopOnAccountObservabilityChange') -and
-        $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -ceq 'true') {
+        (Resolve-GameAgentStopSwitch -Value $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE)) {
         $StopOnAccountObservabilityChange = $true
     }
 
@@ -244,6 +245,18 @@ function Deploy-GameAgent {
     Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ConfigureAccountObservability:$ConfigureAccountObservability
     Write-Host ''
 
+    # When the fail-closed stop switch is set, run the preflight ONCE up front so
+    # a predicted (or unknown) account-wide change halts the deploy before the
+    # AgentCore, Knowledge Base, and observability steps — not partway through.
+    # The per-launch guards below still run; they re-check immediately before
+    # each launch and can still halt if a later read fails. Mirrors the early
+    # stop-switch preflight in scripts/deploy.sh.
+    if ($StopOnAccountObservabilityChange) {
+        Write-GameAgentStatus 'Stop switch set: running the toolkit Transaction Search preflight before Step 2...' -Type Info
+        Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
+        Write-Host ''
+    }
+
     # ── Step 2: AgentCore Runtime ──
     Write-GameAgentStatus 'Step 2: Launching AgentCore Runtime...' -Type Info
     Push-Location $backendPath
@@ -340,9 +353,7 @@ function Deploy-GameAgent {
             # Preflight: predict (read-only) which account-wide X-Ray / CloudWatch
             # Logs settings the AgentCore starter toolkit would change during this
             # launch, and honor the fail-closed stop switch before launching.
-            if (-not (Invoke-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange)) {
-                throw 'Stopped before agentcore launch: the AgentCore starter toolkit would change account-wide observability settings and -StopOnAccountObservabilityChange is set.'
-            }
+            Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
             uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
             if ($LASTEXITCODE -ne 0) { throw "agentcore launch failed (exit code $LASTEXITCODE)" }
             Start-Sleep -Seconds 10
@@ -427,9 +438,7 @@ function Deploy-GameAgent {
         # Preflight again: --auto-update-on-conflict updates the existing runtime,
         # and the toolkit re-runs its account-wide Transaction Search step on
         # every launch.
-        if (-not (Invoke-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange)) {
-            throw 'Stopped before agentcore launch: the AgentCore starter toolkit would change account-wide observability settings and -StopOnAccountObservabilityChange is set.'
-        }
+        Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
