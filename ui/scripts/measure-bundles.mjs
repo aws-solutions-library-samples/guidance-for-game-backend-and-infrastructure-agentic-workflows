@@ -27,6 +27,11 @@
  * `BUNDLE_BASELINE_PATH` override the `.next` and baseline locations so the
  * budget logic can be tested against a synthetic build. The process exits
  * non-zero if any rule fails, so it can gate CI.
+ *
+ * Gzip sizes depend on the zlib build in the Node running this script, so the
+ * baselines are recorded in the CI e2e image and a local run on another Node
+ * can report a different growth. See the `description` in
+ * `bundle-baseline.json` before re-recording.
  */
 
 import { readFileSync } from 'node:fs';
