@@ -1040,7 +1040,12 @@ def test_deploy_guards_both_agentcore_launch_sites_with_the_preflight():
     ]
     assert launch_lines, "expected at least one agentcore launch in deploy.sh"
     for idx in launch_lines:
-        window = "\n".join(lines[max(0, idx - 6) : idx])
+        # Build the preceding window from NON-COMMENT lines only, so a
+        # commented-out guard above a launch cannot satisfy the check. Scan a
+        # wider span and keep the last 6 non-comment lines so interleaved
+        # comments do not push the real guard out of view.
+        window_lines = [l for l in lines[max(0, idx - 12) : idx] if not l.lstrip().startswith("#")][-6:]
+        window = "\n".join(window_lines)
         assert "run_toolkit_preflight" in window, f"agentcore launch at line {idx + 1} is not guarded by the preflight"
         # The guard must be fail-closed: `if ! run_toolkit_preflight; then exit 1`.
         # A neutralized guard (e.g. `run_toolkit_preflight || true`) still contains
@@ -1156,7 +1161,25 @@ case "$svc $op" in
     esac
     ;;
   "logs describe-resource-policies") echo "$STUB_POLICIES_JSON";;
-  "xray get-trace-segment-destination") echo "$STUB_TRACE_DESTINATION";;
+  "xray get-trace-segment-destination")
+    # Normally a fixed value. When STUB_TRACE_DEST_FIRST is set, the first
+    # STUB_TRACE_DEST_FIRST_COUNT reads (default 1) return it and every later
+    # read returns $STUB_TRACE_DESTINATION, using a call counter file. This lets
+    # a test keep the up-front reads compliant (so the deploy proceeds past
+    # Step 2) while a later per-launch re-read sees a change, exercising the
+    # launch-site guard's halting path.
+    if [ -n "${STUB_TRACE_DEST_FIRST:-}" ]; then
+      _tc="${STUB_TRACE_DEST_COUNTER:-/tmp/stub_trace_dest_counter_unset}"
+      _tfirst="${STUB_TRACE_DEST_FIRST_COUNT:-1}"
+      _tn=0
+      [ -f "$_tc" ] && _tn="$(cat "$_tc")"
+      _tn=$((_tn + 1))
+      echo "$_tn" > "$_tc"
+      if [ "$_tn" -le "$_tfirst" ]; then echo "$STUB_TRACE_DEST_FIRST"; else echo "$STUB_TRACE_DESTINATION"; fi
+    else
+      echo "$STUB_TRACE_DESTINATION"
+    fi
+    ;;
   "xray get-indexing-rules") echo "$STUB_INDEXING_JSON";;
   "logs put-delivery-source") :;;
   "logs put-delivery-destination") :;;
@@ -1251,6 +1274,18 @@ cat >/dev/null 2>&1
 exit 0
 """
 
+# "Docker absent" stub. deploy.sh decides Docker is available with
+# `command -v docker && docker info`. A CI runner has a real docker on
+# /usr/bin, so simply omitting a stub lets the Docker-absent cases pick up the
+# real daemon and attempt a real ECR login. This stub, placed first on PATH,
+# shadows any system docker and fails `info` so `DOCKER_AVAILABLE=false` is
+# deterministic. Any non-`info` subcommand also fails, so nothing reaches a
+# real daemon. stdin is drained for symmetry with the available stub.
+_DOCKER_STUB_UNAVAILABLE = r"""#!/usr/bin/env bash
+cat >/dev/null 2>&1
+exit 1
+"""
+
 
 def _write_stub(path: "pathlib.Path", body: str) -> None:
     path.write_text(body, encoding="utf-8")
@@ -1320,6 +1355,12 @@ def _build_deploy_tree(tmp_path: "pathlib.Path") -> "pathlib.Path":
         "agents:\n  gameagentruntime:\n    bedrock_agentcore:\n      agent_arn: ''\n",
         encoding="utf-8",
     )
+    # deploy.sh greps an existing requirements.txt to diff it against the
+    # freshly exported one. Provide an (empty) file so the grep reads a real
+    # file instead of printing "requirements.txt: No such file or directory" to
+    # stderr; the diff against the uv stub's export is non-empty, so deploy.sh
+    # takes its normal "out of sync, updating" path.
+    (repo / "backend" / "requirements.txt").write_text("", encoding="utf-8")
     (repo / "config" / "load_deployment_settings.py").write_text("", encoding="utf-8")
     (repo / "ui" / ".env.local").write_text("AWS_PROFILE=\n", encoding="utf-8")
     return repo
@@ -1333,6 +1374,8 @@ def _run_deploy_e2e(
     stop_switch: bool = False,
     runtime_exists: bool = False,
     trace_destination: str = "CloudWatchLogs",
+    trace_dest_first: str = "",
+    trace_dest_first_count: int = 1,
     policies_json: str = '{"resourcePolicies":[{"policyName":"TransactionSearchXRayAccess","policyDocument":"{}"}]}',
     indexing_json: str = '{"IndexingRules":[{"Name":"Default"}]}',
 ) -> "subprocess.CompletedProcess[str]":
@@ -1345,8 +1388,12 @@ def _run_deploy_e2e(
     _write_stub(bindir / "jq", "#!/usr/bin/env bash\n" + "printf '{\"customJWTAuthorizer\":{}}'\n")
     # Neutralize real waits so the harness runs well under the pytest timeout.
     _write_stub(bindir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
-    if docker:
-        _write_stub(bindir / "docker", _DOCKER_STUB)
+    # Always install a docker stub ahead of the system PATH so a real docker on
+    # a CI runner's /usr/bin can never satisfy deploy.sh's
+    # `command -v docker && docker info` probe. With docker=True the stub
+    # reports available; with docker=False it fails `info`, so the harness is
+    # hermetic on hosts with and without a real Docker daemon.
+    _write_stub(bindir / "docker", _DOCKER_STUB if docker else _DOCKER_STUB_UNAVAILABLE)
 
     # deploy.sh runs nested `bash "$SCRIPT_DIR/.../setup-account-observability.sh"`
     # calls. Put a directory containing the parametrized shell (named `bash`)
@@ -1382,6 +1429,10 @@ def _run_deploy_e2e(
         "GBAW_DELIVERY_MAX_ATTEMPTS": "1",
         "GBAW_DELIVERY_RETRY_SECONDS": "0",
     }
+    if trace_dest_first:
+        env["STUB_TRACE_DEST_FIRST"] = trace_dest_first
+        env["STUB_TRACE_DEST_FIRST_COUNT"] = str(trace_dest_first_count)
+        env["STUB_TRACE_DEST_COUNTER"] = str(tmp_path / "trace_dest_counter")
     if stop_switch:
         env["GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE"] = "true"
 
@@ -1390,6 +1441,7 @@ def _run_deploy_e2e(
         capture_output=True,
         text=True,
         env=env,
+        stdin=subprocess.DEVNULL,
     )
     # Attach the recorded launches for assertions.
     result.launches = launch_log.read_text(encoding="utf-8")  # type: ignore[attr-defined]
@@ -1483,3 +1535,32 @@ def test_deploy_e2e_preflight_output_precedes_each_launch(tmp_path, shell):
     assert first_preflight < first_launch
     # Every launch is preceded by at least one preflight line before it.
     assert out.count("Preflight:") >= out.count("LAUNCH_INVOKED")
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+def test_deploy_e2e_stop_switch_halts_at_launch_guard_when_state_changes_later(tmp_path, shell):
+    """A per-launch guard still halts when a later read differs from the up-front
+    one. The trace destination reads 'CloudWatchLogs' on the FIRST read (so the
+    up-front stop-switch preflight sees a compliant account and the deploy passes
+    Step 2) and 'XRay' on every later read, so the first launch-site guard
+    predicts a change and halts. With the stop switch set this exercises the
+    launch-site guard's halting path (not the up-front block): exit non-zero,
+    zero launches, but the Step 2 banner IS present."""
+    result = _run_deploy_e2e(
+        tmp_path,
+        shell=shell,
+        stop_switch=True,
+        trace_dest_first="CloudWatchLogs",
+        # The two up-front trace-destination reads (the Step 1.7 default-mode
+        # report and the up-front stop-switch preflight) see a compliant
+        # account; the next read, inside the first launch-site guard, sees the
+        # change and halts.
+        trace_dest_first_count=2,
+        trace_destination="XRay",
+    )
+    assert result.returncode != 0
+    assert result.launches.count("agentcore launch") == 0  # type: ignore[attr-defined]
+    # The up-front preflight passed, so the deploy reached Step 2 before the
+    # launch-site guard halted it.
+    assert "Step 2: Launching AgentCore Runtime" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr

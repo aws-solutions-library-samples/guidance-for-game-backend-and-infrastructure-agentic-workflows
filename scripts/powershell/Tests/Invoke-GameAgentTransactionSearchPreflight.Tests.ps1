@@ -233,6 +233,8 @@ Describe 'Deploy-GameAgent wiring (static source checks)' {
     # Every `uv run agentcore launch` must be preceded (within a few lines) by
     # the shared fail-closed guard, so no launch path skips the preflight.
     # Deleting a guard, or replacing it with a non-throwing call, fails this.
+    # Comment lines in the window are ignored so a commented-out guard cannot
+    # satisfy the check.
     It 'Guards every agentcore launch with Assert-GameAgentTransactionSearchPreflight' {
         $launchIdx = @()
         for ($i = 0; $i -lt $script:DeployLines.Count; $i++) {
@@ -243,8 +245,11 @@ Describe 'Deploy-GameAgent wiring (static source checks)' {
         }
         $launchIdx.Count | Should -BeGreaterThan 0
         foreach ($idx in $launchIdx) {
-            $start = [Math]::Max(0, $idx - 6)
-            $window = ($script:DeployLines[$start..($idx - 1)] -join "`n")
+            # Scan a wider span and keep the last 6 non-comment lines so
+            # interleaved comments do not push the real guard out of view.
+            $start = [Math]::Max(0, $idx - 12)
+            $windowLines = $script:DeployLines[$start..($idx - 1)] | Where-Object { $_.TrimStart() -notlike '#*' }
+            $window = (@($windowLines) | Select-Object -Last 6) -join "`n"
             $window | Should -Match 'Assert-GameAgentTransactionSearchPreflight'
         }
     }
@@ -269,5 +274,31 @@ Describe 'Deploy-GameAgent wiring (static source checks)' {
         $step2 | Should -Not -BeNullOrEmpty
         $earlyGuard | Should -BeGreaterThan $step17
         $earlyGuard | Should -BeLessThan $step2
+    }
+
+    # The early block's ORDER is not enough: it must actually call the preflight.
+    # Require an uncommented Assert-GameAgentTransactionSearchPreflight line
+    # between the early-guard `if` and Step 2, and that it is NOT wrapped in a
+    # try/catch (which would swallow the fail-closed throw and let the deploy
+    # continue). Deleting the call, commenting it out, or wrapping it in
+    # try/catch all fail this.
+    It 'Calls Assert-GameAgentTransactionSearchPreflight directly in the early block' {
+        $lines = $script:DeploySource -split "`n"
+        $earlyGuard = ($lines | Select-String -Pattern 'if \(\$StopOnAccountObservabilityChange\)' | Select-Object -First 1).LineNumber
+        $step2 = ($lines | Select-String -SimpleMatch 'Step 2: Launching AgentCore Runtime' | Select-Object -First 1).LineNumber
+        $earlyGuard | Should -Not -BeNullOrEmpty
+        $step2 | Should -Not -BeNullOrEmpty
+        # Select-String LineNumber is 1-based; slice the lines strictly between
+        # the early guard and the Step 2 banner.
+        $blockLines = $lines[$earlyGuard..($step2 - 2)]
+        # Uncommented preflight calls in the early block.
+        $calls = @($blockLines | Where-Object {
+                $_.TrimStart() -notlike '#*' -and $_ -match 'Assert-GameAgentTransactionSearchPreflight'
+            })
+        $calls.Count | Should -BeGreaterThan 0
+        # The early block must not wrap the preflight in a try/catch, which would
+        # swallow its terminating stop and defeat the fail-closed intent.
+        $hasTry = @($blockLines | Where-Object { $_.TrimStart() -notlike '#*' -and $_ -match '\btry\b' }).Count
+        $hasTry | Should -Be 0
     }
 }

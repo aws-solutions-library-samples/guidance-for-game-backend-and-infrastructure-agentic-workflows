@@ -1,4 +1,9 @@
 BeforeAll {
+    # Invoke-GameAgentAccountObservability delegates its trace-destination read
+    # to the shared Get-GameAgentTraceDestination helper, so dot-source that
+    # helper first; otherwise every spec that reaches the read fails with
+    # "The term 'Get-GameAgentTraceDestination' is not recognized".
+    . (Join-Path $PSScriptRoot '..' 'Private' 'Get-GameAgentTraceDestination.ps1' | Resolve-Path)
     . (Join-Path $PSScriptRoot '..' 'Private' 'Invoke-GameAgentAccountObservability.ps1' | Resolve-Path)
 
     $script:StatusMessages = [System.Collections.Generic.List[string]]::new()
