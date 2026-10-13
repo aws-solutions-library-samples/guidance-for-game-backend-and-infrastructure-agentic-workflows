@@ -10,7 +10,22 @@ import pytest
 from bedrock_agentcore.runtime.context import RequestContext
 from botocore.exceptions import ClientError, NoCredentialsError
 
+# Local modules
+from _guard_state import telemetry_guard_isolation
+
 pytestmark = [pytest.mark.unit]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telemetry_guard_state():
+    """Snapshot and restore the content guard's process-wide state per test.
+
+    Tests in this module import ``agentcore_main``, which runs the telemetry
+    content guard against the real environment and installs process-wide Strands
+    tracer wrappers and an MCP logger filter. This fixture restores those after
+    each test so the guard's installs do not leak into the rest of the session.
+    """
+    yield from telemetry_guard_isolation()
 
 
 def _jwt_context(session_id="ctx-session"):
@@ -593,6 +608,13 @@ class TestEntrypointTelemetryGuardWiring:
         # proves the fresh-import harness snapshots and restores all of them, so
         # later tests in the session do not inherit the redaction switches, the
         # tracer wrappers, or the logging filters.
+        #
+        # The test first forces a clean baseline — guard variables removed, the
+        # tracer methods unwrapped through ``__wrapped__``, and the guard's own
+        # logging filters removed — so the assertions compare against a state the
+        # guard definitely did not leave behind. That way the test fails whenever
+        # the harness stops restoring, regardless of collection order (any earlier
+        # test in the session may already have run the guard once).
         # Standard library
         import logging
         import os
@@ -612,9 +634,6 @@ class TestEntrypointTelemetryGuardWiring:
             "GBAW_CAPTURE_TRACE_CONTENT",
             "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS",
         )
-        env_before = {k: os.environ.get(k) for k in otel_vars}
-        start_before = Tracer.start_agent_span
-        end_before = Tracer._end_span
 
         def _guard_filter_count():
             total = 0
@@ -626,11 +645,40 @@ class TestEntrypointTelemetryGuardWiring:
                 )
             return total
 
+        def _unwrap(method):
+            # Resolve past any guard wrapper to the underlying Strands method.
+            while hasattr(method, "__wrapped__"):
+                method = method.__wrapped__
+            return method
+
+        # Force a clean baseline the guard cannot already have produced.
+        for var in otel_vars:
+            os.environ.pop(var, None)
+        Tracer.start_agent_span = _unwrap(Tracer.start_agent_span)
+        Tracer._end_span = _unwrap(Tracer._end_span)
+        for name in MCP_EXCEPTION_LOGGER_NAMES:
+            lg = logging.getLogger(name)
+            for flt in list(lg.filters):
+                if getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker:
+                    lg.removeFilter(flt)
+
+        env_before = {k: os.environ.get(k) for k in otel_vars}
+        start_before = Tracer.start_agent_span
+        end_before = Tracer._end_span
         filters_before = _guard_filter_count()
+        # Baseline really is clean: no guard variables, no guard filters, and the
+        # tracer methods carry no guard wrapper.
+        assert env_before == {k: None for k in otel_vars}
+        assert filters_before == 0
+        assert not hasattr(start_before, "__wrapped__")
+        assert not hasattr(end_before, "__wrapped__")
 
         self._fresh_import_with_recording()
 
+        # The harness must leave the clean baseline exactly as it found it.
         assert {k: os.environ.get(k) for k in otel_vars} == env_before
         assert Tracer.start_agent_span is start_before
         assert Tracer._end_span is end_before
         assert _guard_filter_count() == filters_before
+        assert not hasattr(Tracer.start_agent_span, "__wrapped__")
+        assert not hasattr(Tracer._end_span, "__wrapped__")

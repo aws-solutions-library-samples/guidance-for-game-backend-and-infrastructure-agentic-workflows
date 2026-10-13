@@ -62,8 +62,13 @@ OpenTelemetry log records:
 The hosted default is to carry no content: capture is off, the Strands redaction
 token is present, the agent-span and error-path wrappers are installed, the MCP
 client exception logs are filtered, and the MCP tool-content instrumentation is
-suppressed. Latency, token-count, model id, finish reason, error type, and span
-structure are unaffected because they are separate, non-sensitive attributes.
+suppressed. Latency, token-count, model id, finish reason, and span structure
+remain, as separate non-sensitive attributes. The error *type* also remains, but
+where it is recorded depends on the path: a raised error carries its type as the
+span status description (the ``exception`` event, with its message and stack
+trace, is dropped); an error-status tool result carries a fixed non-content
+status string on the span, with its exception type recorded only on the filtered
+``exception.type`` log-record attribute.
 
 ``apply_trace_content_guard`` is called once at module import of the entrypoint,
 before the first Strands ``Tracer`` is constructed and before the first MCP
@@ -207,13 +212,16 @@ class _McpExceptionInfoFilter(logging.Filter):
     ``record.exc_info`` the filter records the exception *type* name as a plain
     ``exception.type`` record attribute, which the handler copies verbatim (it is
     not a reserved attribute). The static log message (for example "tool execution
-    failed") and the error type are kept, so the fact and class of the failure are
-    still recorded; the message and stack trace are not.
+    failed") is kept, and the error type is preserved as the ``exception.type``
+    OpenTelemetry log-record attribute, so the fact and class of the failure are
+    still recorded on exported log records; the message and stack trace are not.
 
     The filter runs before any handler sees the record, so the exception traceback
     is also removed from the stdout application log, including in local
-    development. The error type still appears in the log message's exception type
-    attribute.
+    development. The ``exception.type`` value is only a log-record attribute that
+    the OpenTelemetry logging handler exports; the plain stdout/console log
+    (loguru's last-resort handler in local development) shows only the static
+    message, not the exception type.
     """
 
     # A sentinel so the guard is idempotent and the filter is identifiable.
