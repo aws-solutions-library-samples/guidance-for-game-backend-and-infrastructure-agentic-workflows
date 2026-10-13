@@ -249,7 +249,13 @@ EVENT_MEMORY_STRATEGY = "BEDROCK_AGENTCORE"
 SEMANTIC_MEMORY_STRATEGY = "BEDROCK_AGENTCORE"
 ```
 
-**Data Isolation**: Memory is isolated per user (actor_id) with no cross-user access.
+**Data Isolation**: Memory is isolated per user (actor ID) with no cross-user access.
+
+**Memory Actor Identifier**: The runtime does not give AgentCore Memory the raw Cognito subject. It derives the actor ID as a SHA-256 digest of the verified subject with a fixed domain-separation prefix (`backend/src/utils/memory_identity.py`), so the same user always maps to the same opaque 64-character hexadecimal ID. This matters because the memory service can emit its own trace spans. When tracing is enabled on the memory resource (the AgentCore CLI enables it for a memory it creates while observability is on), the `CreateEvent`, `GetEvent`, `ListEvents`, and `DeleteEvent` spans carry the actor ID as `actor.id`, and the memory-record retrieval spans carry the namespace, which embeds it ([AgentCore memory observability data](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-memory-metrics.html)). The service produces those spans, so the runtime cannot redact them, and a raw subject would put a stable user identifier into exported traces. The same ID is the long-term-memory namespace and the namespace for semantic memories the runtime saves. A subject that is not a usable string (not a string, empty or whitespace-only, or not encodable as UTF-8) disables memory for the request; there is no fallback to the raw value.
+
+- *Pseudonymous, not anonymous.* Anyone who already knows a subject can compute its actor ID, which lets an operator locate or delete one user's memory: `cd backend/src && python3 -c "from utils.memory_identity import memory_actor_id as m; print(m('<subject>'))"` prints it. Cognito subjects are random UUIDs, so an actor ID does not reveal its user without a list of candidate subjects.
+- *Upgrade effect.* Memory stored under a raw subject (written by a runtime that does not use this scheme) is not read, so each user starts with an empty memory once. Nothing migrates or deletes that data. Events expire on the memory resource's event expiry, which the service applies to each event when it is written (the AgentCore CLI creates the memory with 30 days unless configured otherwise). Long-term records do not expire by default. The records the runtime saves are written with `BatchCreateMemoryRecords`, which takes a time-to-live only from the request (a strategy-level setting does not apply to batch-written records), and the runtime sends none, so they do not expire ([long-term record TTL](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/long-term-record-ttl.html)). The runtime's IAM role cannot delete records, so an operator removes them with `BatchDeleteMemoryRecords` or `DeleteMemoryRecord`, or by deleting the memory resource.
+- *Changing the scheme* (the domain prefix or the hash) has the same effect: every user gets a new actor ID.
 
 **AWS Documentation**:
 - [Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-memory.html)
@@ -479,7 +485,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | Backend (AgentCore) | Sanitized prompt, user context | **Validated** | Input validation, rate limiting, guardrails |
 | AWS service responses | Fleet/cluster info, costs | **Internal** | IAM-scoped read-only access |
 | Logs (CloudWatch) | Sanitized excerpts | **Redacted** | PII/credentials stripped by `sanitize_log_data()`, encrypted at rest |
-| Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation (`actor_id`), encrypted at rest, TTL-enforced |
+| Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation by a pseudonymous actor ID (a digest of the verified subject, not the subject), encrypted at rest, event expiry |
 
 ### Service-to-Service Credentials
 
