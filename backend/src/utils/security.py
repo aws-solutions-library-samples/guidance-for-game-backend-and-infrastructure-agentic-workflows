@@ -338,7 +338,11 @@ def redact_identifier(value: Any, length: int = 12) -> str:
     if not text:
         return "<none>"
     clamped = max(_REDACT_MIN_LENGTH, min(_REDACT_MAX_LENGTH, length))
-    digest = hmac.new(_LOG_REDACTION_KEY, text.encode(), hashlib.sha256).hexdigest()
+    # "backslashreplace" keeps this total: request-supplied text can hold lone
+    # surrogates that strict UTF-8 encoding rejects, and a log helper must not
+    # fail the request. Each such code point becomes a distinct escape, so
+    # different inputs still get different tokens.
+    digest = hmac.new(_LOG_REDACTION_KEY, text.encode("utf-8", "backslashreplace"), hashlib.sha256).hexdigest()
     return f"id:{digest[:clamped]}"
 
 

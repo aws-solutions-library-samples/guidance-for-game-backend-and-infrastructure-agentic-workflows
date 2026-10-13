@@ -102,6 +102,25 @@ def test_redact_identifier_is_bounded_and_non_reversible():
     assert redact_identifier("") == "<none>"
 
 
+def test_redact_identifier_accepts_text_that_cannot_be_encoded_as_utf8():
+    """A log helper must never fail the request it is describing.
+
+    ``json.loads`` accepts a lone surrogate, so a request-supplied identifier can
+    hold text that ``str.encode`` rejects. Redacting it must still return a bounded,
+    stable token, and distinct such values must stay distinct.
+    """
+    # Local modules
+    from utils.security import redact_identifier
+
+    token = redact_identifier("\ud800-synthetic-marker")
+
+    assert token.startswith("id:")
+    assert "synthetic-marker" not in token
+    assert token == redact_identifier("\ud800-synthetic-marker")
+    assert token != redact_identifier("\ud801-synthetic-marker")
+    assert token != redact_identifier("-synthetic-marker")
+
+
 def test_redact_identifier_length_is_clamped():
     """A caller cannot widen the token to the full digest or shrink it away."""
     # Local modules
