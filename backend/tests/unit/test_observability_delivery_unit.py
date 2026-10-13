@@ -748,3 +748,309 @@ def test_account_obs_optin_proceeds_when_identity_lookup_warns_on_stderr(shell):
     assert "identity lookup returned no account ID" not in result.stderr
     assert "MUTATION: logs put-resource-policy" in result.stdout
     assert '"aws:SourceAccount": "123456789012"' in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# AgentCore starter toolkit Transaction Search preflight (read-only prediction)
+# ---------------------------------------------------------------------------
+#
+# `agentcore launch` runs the starter toolkit's enable_transaction_search_if_needed
+# whenever runtime observability is enabled. These tests exercise the read-only
+# preflight that predicts, using the toolkit's own conditions, which account-wide
+# X-Ray / CloudWatch Logs settings the toolkit WOULD change, plus the fail-closed
+# stop switch that halts the deploy before launch. All values are synthetic.
+
+
+def _preflight_harness(
+    aws_mock: str,
+    extra_env: str = "",
+    shell: str = "bash",
+) -> "subprocess.CompletedProcess[str]":
+    """Source setup-account-observability.sh and run the toolkit preflight."""
+    command = "\n".join(
+        (
+            'export AWS_REGION="us-west-2"',
+            extra_env,
+            aws_mock,
+            f'source "{ACCOUNT_OBS_SCRIPT}"',
+            # Mirror the deploy.sh call site, which checks the status in an `if`
+            # so a non-zero return is handled rather than aborting under `set -e`.
+            'if run_transaction_search_preflight; then echo "rc=0"; else echo "rc=$?"; fi',
+        )
+    )
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+def _preflight_mock(
+    *,
+    destination: str = "XRay",
+    toolkit_policy_present: bool = False,
+    default_indexing_present: bool = True,
+    project_grant_present: bool = False,
+    destination_read_fails: bool = False,
+    policies_read_fails: bool = False,
+    indexing_read_fails: bool = False,
+) -> str:
+    # describe-resource-policies feeds both the toolkit name-only check and the
+    # project-owned grant annotation (find_existing_spans_policy).
+    policy_entries = []
+    if toolkit_policy_present:
+        policy_entries.append(
+            '{"policyName":"TransactionSearchXRayAccess",'
+            '"policyDocument":"{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[]}"}'
+        )
+    if project_grant_present:
+        policy_entries.append(
+            '{"policyName":"GameAgentTransactionSearchXRayAccess",'
+            '"policyDocument":"{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":\\"Allow\\",'
+            '\\"Principal\\":{\\"Service\\":\\"xray.amazonaws.com\\"},\\"Action\\":\\"logs:PutLogEvents\\",'
+            '\\"Resource\\":[\\"arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*\\"]}]}"}'
+        )
+    policies_json = '{"resourcePolicies":[' + ",".join(policy_entries) + "]}"
+    indexing_json = (
+        '{"IndexingRules":[{"Name":"Default","Rule":{"Probabilistic":{"DesiredSamplingPercentage":1}}}]}'
+        if default_indexing_present
+        else '{"IndexingRules":[]}'
+    )
+    dest_block = "    return 254" if destination_read_fails else f'    echo "{destination}"; return 0'
+    policies_block = "    return 254" if policies_read_fails else f"    echo '{policies_json}'; return 0"
+    indexing_block = "    return 254" if indexing_read_fails else f"    echo '{indexing_json}'; return 0"
+    return (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        f"{dest_block}\n"
+        "  fi\n"
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then\n'
+        f"{policies_block}\n"
+        "  fi\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then\n'
+        f"{indexing_block}\n"
+        "  fi\n"
+        '  echo "unexpected: $*" >&2; return 1\n'
+        "}"
+    )
+
+
+_PREFLIGHT_SHELLS = ("bash", "/bin/bash")
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_reports_no_change_in_one_line_when_toolkit_would_change_nothing(shell):
+    """When the account already matches every toolkit condition, the preflight
+    prints a single no-change line and no warning."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, default_indexing_present=True),
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "would make NO account-wide" in result.stdout
+    assert "WARNING" not in result.stdout
+    assert "WOULD" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_warns_when_toolkit_would_add_resource_policy(shell):
+    """A missing 'TransactionSearchXRayAccess' policy is predicted as an add."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=False, default_indexing_present=True),
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    assert "WOULD ADD 'TransactionSearchXRayAccess'" in result.stdout
+    assert "AgentCore starter toolkit" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_warns_when_toolkit_would_change_trace_destination(shell):
+    """A non-CloudWatchLogs destination is predicted as a change to CloudWatchLogs."""
+    result = _preflight_harness(
+        _preflight_mock(destination="XRay", toolkit_policy_present=True, default_indexing_present=True),
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    assert "WOULD CHANGE XRay -> CloudWatchLogs" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_warns_when_toolkit_would_create_default_indexing_rule(shell):
+    """No 'Default' indexing rule is predicted as a create."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, default_indexing_present=False),
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    assert "WOULD CREATE a 'Default' rule" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_notes_project_grant_but_toolkit_still_adds_its_policy(shell):
+    """When the project-owned policy already grants access but the toolkit's
+    name-checked policy is absent, the warning says the toolkit still adds its own."""
+    result = _preflight_harness(
+        _preflight_mock(
+            destination="CloudWatchLogs",
+            toolkit_policy_present=False,
+            project_grant_present=True,
+            default_indexing_present=True,
+        ),
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "WOULD ADD 'TransactionSearchXRayAccess'" in result.stdout
+    assert "GameAgentTransactionSearchXRayAccess" in result.stdout
+    assert "adds its own duplicate policy" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_reports_unknown_not_no_change_on_read_failure(shell):
+    """A failed read is reported as UNKNOWN (a possible change), never 'no change'."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, policies_read_fails=True),
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "UNKNOWN" in result.stdout
+    assert "effect is UNKNOWN" in result.stdout
+    assert "would make NO account-wide" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_halts_when_toolkit_would_change(shell):
+    """The exact opt-in GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true stops before launch."""
+    result = _preflight_harness(
+        _preflight_mock(destination="XRay", toolkit_policy_present=False, default_indexing_present=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_halts_on_unknown_read_failure(shell):
+    """Fail-closed: the stop switch also halts when the toolkit's effect is UNKNOWN."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, indexing_read_fails=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_does_not_halt_when_no_change(shell):
+    """The stop switch is a no-op when the toolkit would change nothing."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, default_indexing_present=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "would make NO account-wide" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+@pytest.mark.parametrize("stop_value", ["TRUE", "1", "yes", "True", " true", ""])
+def test_preflight_stop_switch_only_exact_true_enables(stop_value, shell):
+    """Any non-exact value of the stop switch is treated as off (deploy continues)."""
+    result = _preflight_harness(
+        _preflight_mock(destination="XRay", toolkit_policy_present=False, default_indexing_present=True),
+        extra_env=f'export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="{stop_value}"',
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    assert "Stopping before" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# deploy.sh wiring: the preflight runs before `agentcore launch`, and the stop
+# switch prevents the launch from being invoked at all.
+# ---------------------------------------------------------------------------
+#
+# These tests assert the integration contract at the launch call sites in
+# scripts/deploy.sh without running the full deployment: the preflight output
+# must precede any launch, and GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true
+# must stop before `agentcore launch` is ever called.
+
+
+def test_deploy_guards_both_agentcore_launch_sites_with_the_preflight():
+    """Static check: every `agentcore launch` in deploy.sh is immediately
+    preceded by the preflight guard, so no launch path skips it."""
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    launch_lines = [
+        i for i, line in enumerate(lines) if "agentcore launch" in line and not line.lstrip().startswith("#")
+    ]
+    assert launch_lines, "expected at least one agentcore launch in deploy.sh"
+    for idx in launch_lines:
+        window = "\n".join(lines[max(0, idx - 6) : idx])
+        assert (
+            "run_transaction_search_preflight" in window
+        ), f"agentcore launch at line {idx + 1} is not guarded by the preflight"
+
+
+def _launch_wiring_harness(
+    aws_mock: str,
+    extra_env: str = "",
+    shell: str = "bash",
+) -> "subprocess.CompletedProcess[str]":
+    """Reproduce the deploy.sh launch call site: source the helpers, then run
+    the exact guard idiom with a stubbed `agentcore launch`."""
+    command = "\n".join(
+        (
+            "set -e",
+            'export AWS_REGION="us-west-2"',
+            extra_env,
+            aws_mock,
+            # Stub the launch so no AWS call is made; record that it ran.
+            'uv() { echo "LAUNCH_INVOKED: agentcore $*"; }',
+            f'source "{ACCOUNT_OBS_SCRIPT}"',
+            # The exact guard used in scripts/deploy.sh before `agentcore launch`.
+            "if ! run_transaction_search_preflight; then exit 1; fi",
+            "uv run agentcore launch --auto-update-on-conflict",
+        )
+    )
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_launch_wiring_preflight_output_precedes_launch(shell):
+    """The preflight report is printed before `agentcore launch` is invoked."""
+    result = _launch_wiring_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, default_indexing_present=True),
+        shell=shell,
+    )
+    assert "LAUNCH_INVOKED" in result.stdout
+    preflight_pos = result.stdout.index("Preflight:")
+    launch_pos = result.stdout.index("LAUNCH_INVOKED")
+    assert preflight_pos < launch_pos
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_launch_wiring_stop_switch_prevents_launch(shell):
+    """With the stop switch and a predicted change, `agentcore launch` is never invoked."""
+    result = _launch_wiring_harness(
+        _preflight_mock(destination="XRay", toolkit_policy_present=False, default_indexing_present=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert result.returncode == 1
+    assert "LAUNCH_INVOKED" not in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_launch_wiring_proceeds_to_launch_when_no_change(shell):
+    """With no predicted change, the deploy proceeds to `agentcore launch`."""
+    result = _launch_wiring_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, default_indexing_present=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert result.returncode == 0
+    assert "LAUNCH_INVOKED" in result.stdout

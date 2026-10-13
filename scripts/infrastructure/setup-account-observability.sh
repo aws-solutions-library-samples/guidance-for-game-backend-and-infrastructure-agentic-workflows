@@ -102,6 +102,232 @@ print_account_scope() {
   echo "            '/aws/application-signals/data')"
 }
 
+# --- AgentCore starter toolkit Transaction Search preflight (read-only) ---
+#
+# Independently of this repository's opt-in, `agentcore launch` runs the starter
+# toolkit's enable_transaction_search_if_needed() whenever runtime observability
+# is enabled (the same switch that selects the opentelemetry-instrument
+# entrypoint). In toolkit 0.3.11 there is no flag to keep that OTEL entrypoint
+# while skipping only this account-wide step, so the toolkit may change SHARED,
+# account-wide X-Ray / CloudWatch Logs settings during launch. This preflight
+# predicts exactly which of those changes the toolkit WOULD make, using the
+# toolkit's own conditions, so the deployment can warn (and optionally stop)
+# before the launch rather than discover the change afterward.
+#
+# The toolkit's three conditions (services/xray.py), reproduced here read-only:
+#   1. resource policy  — created iff NO CloudWatch Logs resource policy named
+#      literally 'TransactionSearchXRayAccess' exists. The toolkit checks the
+#      NAME only, so this repository's project-owned
+#      'GameAgentTransactionSearchXRayAccess' policy does NOT satisfy it: the
+#      toolkit still adds its own 'TransactionSearchXRayAccess' policy.
+#   2. trace destination — set to CloudWatchLogs iff the current destination is
+#      not already CloudWatchLogs.
+#   3. indexing rule    — a Default rule is created iff NO X-Ray indexing rule
+#      named 'Default' exists; an existing Default rule is left unchanged.
+#
+# The exact name the toolkit uses for its own resource policy (name-only check).
+TOOLKIT_RESOURCE_POLICY_NAME="TransactionSearchXRayAccess"
+
+# Opt-in, fail-closed stop switch. Only the exact value 'true' stops the deploy
+# before `agentcore launch` when the toolkit would change account-wide settings.
+# Any other value (including 'TRUE', '1', 'yes', '') is treated as off.
+GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="${GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE:-false}"
+
+# Return 0 if a CloudWatch Logs resource policy named literally
+# 'TransactionSearchXRayAccess' exists; 1 if it does not; 2 if the list read
+# fails (unknown). Matches the toolkit's name-only _need_resource_policy check.
+toolkit_resource_policy_present() {
+  local policies_json
+  if ! policies_json="$(aws logs describe-resource-policies \
+    --region "$AWS_REGION" --output json 2>/dev/null)"; then
+    return 2
+  fi
+  TOOLKIT_NAME="$TOOLKIT_RESOURCE_POLICY_NAME" POLICIES_JSON="$policies_json" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.loads(os.environ["POLICIES_JSON"])
+except (ValueError, KeyError):
+    sys.exit(2)
+
+name = os.environ["TOOLKIT_NAME"]
+policies = payload.get("resourcePolicies", []) if isinstance(payload, dict) else []
+for policy in policies:
+    if isinstance(policy, dict) and policy.get("policyName") == name:
+        sys.exit(0)
+sys.exit(1)
+'
+}
+
+# Print 'present', 'absent', or 'UNREADABLE' for a Default X-Ray indexing rule.
+# Matches the toolkit's _need_indexing_rule check, which keys off a rule NAMED
+# 'Default' existing (not its sampling percentage).
+get_default_indexing_rule_presence() {
+  local rules_json
+  if ! rules_json="$(aws xray get-indexing-rules \
+    --region "$AWS_REGION" --output json 2>/dev/null)"; then
+    printf 'UNREADABLE\n'
+    return 0
+  fi
+  RULES_JSON="$rules_json" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.loads(os.environ["RULES_JSON"])
+except (ValueError, KeyError):
+    print("UNREADABLE")
+    sys.exit(0)
+
+rules = payload.get("IndexingRules", []) if isinstance(payload, dict) else []
+for rule in rules:
+    if isinstance(rule, dict) and rule.get("Name") == "Default":
+        print("present")
+        sys.exit(0)
+print("absent")
+'
+}
+
+# Predict the toolkit's account-wide changes and print a human-readable report.
+# Sets the global TOOLKIT_WOULD_CHANGE to:
+#   0  the toolkit would change nothing;
+#   1  the toolkit would change at least one shared setting;
+#   2  at least one condition could not be read (unknown) — never reported as
+#      "no change".
+# Output is public-safe (no account IDs or ARNs).
+preflight_transaction_search_toolkit() {
+  local destination policy_rc indexing_presence
+  local -a changes=()
+  local unknown=0
+
+  echo "  🔎 Preflight: predicting AgentCore starter toolkit Transaction Search changes..."
+  echo "      (the toolkit runs these during 'agentcore launch' when runtime"
+  echo "       observability is enabled; they are account-wide and shared)"
+
+  # 1. Resource policy (toolkit checks the literal name 'TransactionSearchXRayAccess').
+  if toolkit_resource_policy_present; then
+    policy_rc=0
+  else
+    policy_rc=$?
+  fi
+  case "$policy_rc" in
+    0)
+      echo "      • CloudWatch Logs resource policy: no change"
+      echo "        (a policy named '${TOOLKIT_RESOURCE_POLICY_NAME}' already exists)"
+      ;;
+    1)
+      changes+=("Adds a CloudWatch Logs resource policy named '${TOOLKIT_RESOURCE_POLICY_NAME}'")
+      echo "      • CloudWatch Logs resource policy: WOULD ADD '${TOOLKIT_RESOURCE_POLICY_NAME}'"
+      echo "        (grants xray.amazonaws.com logs:PutLogEvents on 'aws/spans' and"
+      echo "         '/aws/application-signals/data')"
+      ;;
+    *)
+      unknown=1
+      echo "      • CloudWatch Logs resource policy: UNKNOWN (could not read resource policies)"
+      ;;
+  esac
+
+  # 2. Trace segment destination.
+  destination="$(get_trace_destination)"
+  if [ "$destination" = "CloudWatchLogs" ]; then
+    echo "      • X-Ray trace segment destination: no change (already CloudWatchLogs)"
+  elif [ "$destination" = "UNREADABLE" ]; then
+    unknown=1
+    echo "      • X-Ray trace segment destination: UNKNOWN (could not read destination)"
+  else
+    changes+=("Sets the X-Ray trace segment destination to CloudWatchLogs (region ${AWS_REGION})")
+    echo "      • X-Ray trace segment destination: WOULD CHANGE ${destination} -> CloudWatchLogs"
+    echo "        (region ${AWS_REGION}; shared by every X-Ray caller)"
+  fi
+
+  # 3. Default indexing rule (toolkit creates one only if none named 'Default').
+  indexing_presence="$(get_default_indexing_rule_presence)"
+  if [ "$indexing_presence" = "present" ]; then
+    echo "      • X-Ray default indexing rule: no change (a 'Default' rule already exists)"
+  elif [ "$indexing_presence" = "UNREADABLE" ]; then
+    unknown=1
+    echo "      • X-Ray default indexing rule: UNKNOWN (could not read indexing rules)"
+  else
+    changes+=("Creates the X-Ray 'Default' indexing rule (1% probabilistic sampling)")
+    echo "      • X-Ray default indexing rule: WOULD CREATE a 'Default' rule (1% sampling)"
+  fi
+
+  if [ "$unknown" -eq 1 ]; then
+    TOOLKIT_WOULD_CHANGE=2
+    echo "  ⚠️  Preflight could not read one or more account settings; the toolkit's"
+    echo "      effect is UNKNOWN. Treating it as a possible shared change (not 'no change')."
+    return 0
+  fi
+
+  if [ "${#changes[@]}" -eq 0 ]; then
+    TOOLKIT_WOULD_CHANGE=0
+    echo "  ✅ Preflight: the AgentCore starter toolkit would make NO account-wide X-Ray or CloudWatch Logs change."
+    return 0
+  fi
+
+  TOOLKIT_WOULD_CHANGE=1
+  echo ""
+  echo "  ⚠️  WARNING: 'agentcore launch' WILL change SHARED, account-wide settings via the"
+  echo "      AgentCore starter toolkit (NOT this repository's opt-in). These affect every"
+  echo "      X-Ray / Transaction Search consumer in the account:"
+  local change
+  for change in "${changes[@]}"; do
+    echo "        - ${change}"
+  done
+  # If the project-owned policy already grants the access, the toolkit STILL
+  # adds its own name-checked policy; call that out explicitly.
+  if [ "$policy_rc" -eq 1 ] && resource_policy_grant_present; then
+    echo "      Note: this repository's project-owned policy ('${OBS_RESOURCE_POLICY_NAME}')"
+    echo "      already grants the needed access, but the toolkit checks only for a policy"
+    echo "      named '${TOOLKIT_RESOURCE_POLICY_NAME}', so it adds its own duplicate policy."
+  fi
+  echo "      Cleanup / rollback after launch (run only once no other workload relies on them):"
+  echo "        - Resource policy: aws logs delete-resource-policy --policy-name ${TOOLKIT_RESOURCE_POLICY_NAME} --region ${AWS_REGION}"
+  echo "        - Trace destination: aws xray update-trace-segment-destination --destination ${destination} --region ${AWS_REGION}"
+  echo "          (only if it was changed from '${destination}' above; omit if it was already CloudWatchLogs)"
+  echo "      To stop the deploy before this happens, re-run with"
+  echo "      GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true (deploy halts before 'agentcore launch')."
+  return 0
+}
+
+# Return 0 if ANY CloudWatch Logs resource policy already grants
+# xray.amazonaws.com logs:PutLogEvents on an 'aws/spans' log group (Effect
+# Allow), regardless of policy name. Used only to annotate the warning when the
+# project-owned grant is present but the toolkit will still add its own.
+resource_policy_grant_present() {
+  local scan
+  if scan="$(find_existing_spans_policy)"; then
+    [ -n "$(printf '%s\n' "$scan" | sed -n 's/^MATCH=//p')" ]
+    return $?
+  fi
+  return 1
+}
+
+# Entry point used by scripts/deploy.sh before each `agentcore launch`. Runs the
+# read-only preflight, then enforces the fail-closed stop switch. Returns:
+#   0  safe to launch (no change, or operator accepted the warning);
+#   1  stop requested AND the toolkit would (or might) change shared settings.
+# A read failure (UNKNOWN) is treated as a possible change, so the stop switch
+# halts on it too (fail closed).
+run_transaction_search_preflight() {
+  TOOLKIT_WOULD_CHANGE=0
+  preflight_transaction_search_toolkit
+
+  if [ "$GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE" = "true" ] \
+    && [ "${TOOLKIT_WOULD_CHANGE:-0}" -ne 0 ]; then
+    echo "❌ GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true and the AgentCore starter toolkit" >&2
+    echo "   would change (or might change) account-wide X-Ray / CloudWatch Logs settings." >&2
+    echo "   Stopping before 'agentcore launch' so no shared setting is modified. Enable" >&2
+    echo "   Transaction Search intentionally (for example GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" >&2
+    echo "   or once in the AWS console), then re-run without the stop switch." >&2
+    return 1
+  fi
+  return 0
+}
+
 # --- Read-only default path (no opt-in) ---
 
 report_without_mutation() {

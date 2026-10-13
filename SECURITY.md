@@ -711,6 +711,45 @@ reference to `resolve_runtime_host`.
 
 ---
 
+## Account-Wide Observability Blast Radius
+
+X-Ray Transaction Search depends on account-wide, cross-application settings — the
+X-Ray trace segment destination, the default X-Ray indexing (sampling) rule, and a
+shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log group.
+Changing them affects every X-Ray and Transaction Search consumer in the account,
+so this project treats them as a blast-radius concern:
+
+- **This repository's own setup is opt-in and read-only by default.**
+  `scripts/infrastructure/setup-account-observability.sh` (and the
+  `Invoke-GameAgentAccountObservability` PowerShell function) make no account-wide
+  change unless the operator sets `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true`
+  (PowerShell `-ConfigureAccountObservability`). They read existing state first,
+  enable Transaction Search additively (never a disable/re-enable toggle), and fail
+  closed on an unreadable state rather than guessing.
+- **`agentcore launch` is a separate source of account-wide change.** When runtime
+  observability is enabled (the setting that also selects the
+  `opentelemetry-instrument` entrypoint), the AgentCore starter toolkit (0.3.11)
+  runs its own `enable_transaction_search_if_needed` step on every launch. Version
+  0.3.11 has no flag to keep the OTEL entrypoint while skipping only that account
+  step. The deployment therefore runs a **read-only preflight before every
+  `agentcore launch`** that predicts, using the toolkit's own conditions, which
+  account-wide settings the toolkit would change, and prints either a single
+  no-change line or a prominent warning with cleanup commands. A read failure is
+  reported as **unknown** (a possible change), never as "no change". The default
+  deploy is non-blocking; operators who require no shared account change set the
+  fail-closed `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` (PowerShell
+  `-StopOnAccountObservabilityChange`), which halts the deploy before launch when
+  the toolkit would — or might — change account-wide settings. Only the exact value
+  `true` enables it. Note that the toolkit checks for a policy named literally
+  `TransactionSearchXRayAccess`, so it adds its own policy even when this project's
+  `GameAgentTransactionSearchXRayAccess` policy already grants the access.
+
+See [Deployment Guide — Account-wide Observability](docs/DEPLOYMENT_GUIDE.md#account-wide-observability-scoped-and-opt-in)
+and the launch-time exception section that follows it for the full behavior,
+warning text, and rollback commands.
+
+---
+
 ## Security Contacts
 
 For security issues or questions:

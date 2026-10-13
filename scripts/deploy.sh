@@ -181,6 +181,12 @@ GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY="${GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY:-fa
 echo "✅ Account-wide observability step complete"
 echo ""
 
+# Source the account-observability helpers (the script's main() is guarded by a
+# BASH_SOURCE check, so this only defines functions). This makes the read-only
+# toolkit Transaction Search preflight available before each `agentcore launch`.
+# shellcheck source=scripts/infrastructure/setup-account-observability.sh
+source "$SCRIPT_DIR/infrastructure/setup-account-observability.sh"
+
 # Step 2: Launch AgentCore Runtime (direct code deployment via CodeBuild)
 echo "🤖 Step 2: Launching AgentCore Runtime..."
 cd "$PROJECT_ROOT/backend"
@@ -865,6 +871,12 @@ if [ -n "$EXISTING_RUNTIME" ] && [ "$EXISTING_RUNTIME" != "null" ]; then
   RUNTIME_ARN="$EXISTING_RUNTIME"
 else
   echo "🚀 Launching new AgentCore Runtime (CodeBuild)..."
+  # Preflight: predict (read-only) which account-wide X-Ray / CloudWatch Logs
+  # settings the AgentCore starter toolkit would change during this launch, and
+  # honor the fail-closed stop switch before any launch is attempted.
+  if ! run_transaction_search_preflight; then
+    exit 1
+  fi
   uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 
   # Wait for runtime to be ready
@@ -942,6 +954,11 @@ if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
 # available and avoids dropping prompt or Guardrail settings on replacement.
 build_agentcore_env_args
 echo "🚀 Updating AgentCore Runtime environment..."
+# Preflight again: --auto-update-on-conflict updates the existing runtime, and
+# the toolkit re-runs its account-wide Transaction Search step on every launch.
+if ! run_transaction_search_preflight; then
+  exit 1
+fi
 uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 echo "✅ AgentCore Runtime updated with role models and available service configuration"
 

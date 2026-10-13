@@ -45,6 +45,7 @@ Describe 'GameAgent Module' {
             'Invoke-GameAgentPromptTeardown'
             'Invoke-GameAgentWafReconciliation'
             'Invoke-GameAgentTraceDelivery'
+            'Invoke-GameAgentTransactionSearchPreflight'
             'New-GameAgentAwsInvoker'
             'New-GameAgentAgentCoreEnvArgs'
         )

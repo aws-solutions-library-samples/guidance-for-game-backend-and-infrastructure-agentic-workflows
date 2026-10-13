@@ -255,6 +255,73 @@ aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAcce
 Teardown intentionally preserves account-wide observability resources because
 they may be shared with other applications.
 
+### AgentCore Starter Toolkit Transaction Search (Launch-Time Exception)
+
+The account-wide setup above is this repository's own, opt-in behavior. Separately,
+`agentcore launch` itself can change account-wide X-Ray / CloudWatch Logs settings.
+When runtime observability is enabled — the same setting that selects the
+`opentelemetry-instrument` entrypoint used for tracing — the AgentCore starter
+toolkit (version 0.3.11) runs its `enable_transaction_search_if_needed` step after
+the runtime is created or updated. In 0.3.11 there is no flag to keep that OTEL
+entrypoint while skipping only this account step, so this deployment keeps the
+entrypoint and instead makes the behavior explicit.
+
+**What the toolkit may change (its own conditions):**
+
+- **CloudWatch Logs resource policy** — the toolkit creates a policy named
+  literally `TransactionSearchXRayAccess` whenever no policy with that exact name
+  exists. It checks the *name* only, so this repository's project-owned
+  `GameAgentTransactionSearchXRayAccess` policy does **not** satisfy it: the
+  toolkit adds its own `TransactionSearchXRayAccess` policy even when the opt-in
+  already granted the access.
+- **X-Ray trace segment destination** — set to `CloudWatchLogs` when it is not
+  already `CloudWatchLogs` (account-wide, shared by every X-Ray caller).
+- **X-Ray default indexing rule** — a `Default` rule is created only when no rule
+  named `Default` exists; an existing `Default` rule is left unchanged.
+
+**Read-only preflight and warning.** Before every `agentcore launch`, the
+deployment runs a read-only preflight that predicts exactly which of these the
+toolkit would change, using the toolkit's own conditions. If it would change
+nothing, the deployment prints a single no-change line. If it would change
+something, it prints a prominent warning that names each change and the affected
+shared settings, explains that the change comes from the AgentCore starter toolkit
+(not this repository's opt-in), and prints the cleanup/rollback commands. If a read
+fails, the preflight reports the toolkit's effect as **unknown** (a possible
+change), never as "no change".
+
+**Default is non-blocking.** A fresh-account `./deploy-all.sh` still completes; the
+preflight warns but does not stop.
+
+**Fail-closed stop switch.** Operators who require no shared account change can set
+a stop switch that halts the deploy *before* `agentcore launch` whenever the
+toolkit would (or might) change account-wide settings:
+
+```bash
+GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true ./deploy-all.sh
+```
+
+PowerShell uses the matching switch (or the same environment variable):
+
+```powershell
+Deploy-GameAgent -StopOnAccountObservabilityChange
+```
+
+Only the exact value `true` enables it; any other value is treated as off. Because
+the stop is fail-closed, it also halts when the preflight cannot read the current
+state (unknown). To proceed, enable Transaction Search intentionally — for example
+with `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` or once in the AWS X-Ray /
+CloudWatch console — then re-run without the stop switch.
+
+**Cleanup.** To remove the toolkit's own policy after launch (only once no other
+workload relies on it):
+
+```bash
+aws logs delete-resource-policy --policy-name TransactionSearchXRayAccess --region <region>
+```
+
+If the launch changed the trace destination, restore the prior value with
+`aws xray update-trace-segment-destination --destination <prior> --region <region>`.
+
 
 ## Post-Deployment Configuration
 
@@ -392,6 +459,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | `GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS` | No | 10 | Opt-in only: delay between ACTIVE polls, in seconds |
 | `GBAW_DELIVERY_MAX_ATTEMPTS` | No | 4 (capped at 20) | Runtime trace-delivery retry attempts |
 | `GBAW_DELIVERY_RETRY_SECONDS` | No | 5 (capped at 60) | Delay between trace-delivery retries, in seconds |
+| `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE` | No | false | Fail-closed: stop before `agentcore launch` if the AgentCore starter toolkit would change account-wide X-Ray / CloudWatch Logs settings. Only the exact value `true` enables it. See [AgentCore Starter Toolkit Transaction Search](#agentcore-starter-toolkit-transaction-search-launch-time-exception) |
 
 ## Security Notes
 
