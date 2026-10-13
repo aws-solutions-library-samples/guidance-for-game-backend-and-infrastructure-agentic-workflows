@@ -6,11 +6,12 @@ the Tracer is constructed) no prompt or response text appears in exported span
 attributes or events, while token-count attributes remain.
 
 A second group builds a real Strands ``Agent`` with a fake model that answers and
-calls two failing tools, exports to an in-memory span exporter, and runs the real
-AWS OpenTelemetry distro ``LLOHandler`` into an in-memory log-record exporter. It
-asserts that no system prompt, prompt, response, tool argument, tool result, or
-error text reaches span attributes, status descriptions, events, or log-record
-bodies, while token-count attributes remain.
+calls two failing tools with a marked argument, exports to an in-memory span
+exporter, and runs the real AWS OpenTelemetry distro ``LLOHandler`` into an
+in-memory log-record exporter. It asserts that no system prompt, prompt,
+response, tool argument, tool result, or error text reaches span attributes,
+status descriptions, events, or log-record bodies, while token-count attributes
+remain and the tool spans keep an ERROR status.
 """
 
 # Standard library
@@ -40,6 +41,7 @@ RESPONSE_MARKER = "UNIQUE-RESPONSE-MARKER-9c2b"
 SYSTEM_MARKER = "UNIQUE-SYSTEM-MARKER-1d4e"
 TOOL_RAISE_MARKER = "UNIQUE-TOOL-RAISE-MARKER-3e8f"
 TOOL_ERRSTATUS_MARKER = "UNIQUE-TOOL-ERRSTATUS-MARKER-6a2d"
+TOOL_ARG_MARKER = "UNIQUE-TOOL-ARG-MARKER-2b9c"
 
 _ALL_MARKERS = (
     PROMPT_MARKER,
@@ -47,6 +49,7 @@ _ALL_MARKERS = (
     SYSTEM_MARKER,
     TOOL_RAISE_MARKER,
     TOOL_ERRSTATUS_MARKER,
+    TOOL_ARG_MARKER,
 )
 
 
@@ -168,6 +171,36 @@ def test_strands_start_agent_span_accepts_system_prompt_kwarg():
     assert any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def test_guard_wrappers_chain_to_strands_via_wrapped(monkeypatch):
+    # The guard's wrappers are installed with functools.wraps(original), so the
+    # signature pins above resolve through __wrapped__ to the real Strands method
+    # rather than inspecting the guard's own wrapper. If a future change dropped
+    # functools.wraps, inspect.signature would describe the wrapper and the pins
+    # would be vacuous; this test fails in that case.
+    # Standard library
+    import inspect
+
+    _guard_env(monkeypatch, opt_in=False)
+
+    # Third-party packages
+    from strands.telemetry.tracer import Tracer
+
+    end_span = Tracer._end_span
+    start_agent_span = Tracer.start_agent_span
+
+    # The wrappers are installed (marker set) and expose the original via __wrapped__.
+    assert getattr(end_span, "_gbaw_trace_content_guard", False) is True
+    assert getattr(start_agent_span, "_gbaw_trace_content_guard", False) is True
+    assert hasattr(end_span, "__wrapped__")
+    assert hasattr(start_agent_span, "__wrapped__")
+
+    # inspect.signature follows __wrapped__, so the pinned parameter list is the
+    # real Strands _end_span signature, not the wrapper's own.
+    params = list(inspect.signature(end_span).parameters)
+    assert params == ["self", "span", "attributes", "error", "error_message"]
+    assert list(inspect.signature(end_span.__wrapped__).parameters) == params
+
+
 # --- Direct behavioral wrapper checks against a real Tracer --------------------
 
 
@@ -220,6 +253,14 @@ def test_guard_strips_tool_error_text_from_status_and_exception(monkeypatch):
     # The error type survives as the status description for the raised exception.
     assert "RuntimeError" in blob
 
+    # Both tool spans keep an ERROR status so error reporting is not lost.
+    # Third-party packages
+    from opentelemetry.trace import StatusCode
+
+    statuses = {span.name: span.status.status_code for span in exporter.get_finished_spans()}
+    assert statuses.get("execute_tool lookup") is StatusCode.ERROR
+    assert statuses.get("execute_tool run") is StatusCode.ERROR
+
 
 # --- Real Agent + the AWS distro LLO handler -----------------------------------
 
@@ -251,11 +292,13 @@ def _make_fake_model():
         async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
             self._turn += 1
             if self._turn == 1:
-                # Two tool calls in one assistant turn.
+                # Two tool calls in one assistant turn, each with a marked argument.
                 yield {"messageStart": {"role": "assistant"}}
                 for idx, name in enumerate(("raise_tool", "errstatus_tool")):
                     yield {"contentBlockStart": {"start": {"toolUse": {"toolUseId": f"tu{idx}", "name": name}}}}
-                    yield {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}}
+                    yield {
+                        "contentBlockDelta": {"delta": {"toolUse": {"input": json.dumps({"value": TOOL_ARG_MARKER})}}}
+                    }
                     yield {"contentBlockStop": {}}
                 yield {"messageStop": {"stopReason": "tool_use"}}
                 yield {
@@ -349,6 +392,14 @@ def test_real_agent_and_llo_handler_leak_no_content(monkeypatch):
 
     # Token-count attributes still present on the spans.
     assert "gen_ai.usage.total_tokens" in span_blob
+
+    # Both tool spans keep an ERROR status even though their content is redacted.
+    # Third-party packages
+    from opentelemetry.trace import StatusCode
+
+    tool_statuses = [s.status.status_code for s in spans if s.name.startswith("execute_tool")]
+    assert len(tool_statuses) == 2
+    assert all(code is StatusCode.ERROR for code in tool_statuses)
 
 
 def _rebuild_tracer():

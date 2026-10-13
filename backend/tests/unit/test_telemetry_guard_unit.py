@@ -359,6 +359,24 @@ def test_guard_filters_mcp_exception_text_from_log_records(monkeypatch, _clean_m
     assert _MCP_EXC_MARKER not in blob
     assert "exception.stacktrace" not in blob
     assert "exception.message" not in blob
+    # The non-content exception type survives so error reporting is not lost.
+    assert "exception.type" in blob
+    assert "RuntimeError" in blob
+
+
+def test_mcp_exception_logger_name_is_pinned_to_strands_client():
+    # If Strands renames its MCP client module the filter would silently become a
+    # no-op; pin the real logger name so that drift fails here.
+    # Third-party packages
+    import strands.tools.mcp.mcp_client as mcp_client
+
+    # Local modules
+    from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES
+
+    assert mcp_client.logger.name in MCP_EXCEPTION_LOGGER_NAMES
+    # The MCP SDK root-logger path is deliberately not in the list (documented as
+    # residual risk), so the list contains only the Strands client logger.
+    assert MCP_EXCEPTION_LOGGER_NAMES == ("strands.tools.mcp.mcp_client",)
 
 
 def test_opt_in_leaves_mcp_exception_text_in_log_records(monkeypatch, _clean_mcp_log_filters):

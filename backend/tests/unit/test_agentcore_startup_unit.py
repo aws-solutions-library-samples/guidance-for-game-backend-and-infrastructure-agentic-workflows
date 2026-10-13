@@ -485,6 +485,17 @@ class TestEntrypointTelemetryGuardWiring:
         # Third-party packages
         from amazon.opentelemetry.distro.instrumentation.mcp import McpInstrumentor
         from mcp.shared.session import BaseSession
+        from strands.telemetry.tracer import Tracer
+
+        # Local modules
+        from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES, _McpExceptionInfoFilter
+
+        # Snapshot the Strands Tracer methods and the MCP logger filters so the
+        # guard's process-wide installs during the fresh import are reverted and
+        # do not leak into the rest of the session.
+        saved_start_agent_span = Tracer.start_agent_span
+        saved_end_span = Tracer._end_span
+        saved_filters = {name: list(logging.getLogger(name).filters) for name in MCP_EXCEPTION_LOGGER_NAMES}
 
         # Start from a known single-instrumented MCP state.
         instrumentor = McpInstrumentor()
@@ -545,6 +556,16 @@ class TestEntrypointTelemetryGuardWiring:
                 instrumentor.uninstrument()
             instrumentor._is_instrumented_by_opentelemetry = False
             sys.modules.pop("agentcore_main", None)
+            # Restore the Strands Tracer methods and the MCP logger filters the
+            # guard installed during the import, so they do not leak into the
+            # rest of the session.
+            Tracer.start_agent_span = saved_start_agent_span
+            Tracer._end_span = saved_end_span
+            for name, flts in saved_filters.items():
+                lg = logging.getLogger(name)
+                for flt in list(lg.filters):
+                    if flt not in flts:
+                        lg.removeFilter(flt)
 
         recorded["final_capture"] = final_capture
         recorded["final_mcp_wrapped"] = final_mcp_wrapped
@@ -565,3 +586,51 @@ class TestEntrypointTelemetryGuardWiring:
         # And the module import left the redacting default in place.
         assert recorded["final_capture"] == "false"
         assert recorded["final_mcp_wrapped"] is False
+
+    def test_fresh_import_does_not_leak_guard_state_into_session(self):
+        # Importing the entrypoint runs the guard against the real os.environ and
+        # installs process-wide Strands wrappers and MCP logger filters. This test
+        # proves the fresh-import harness snapshots and restores all of them, so
+        # later tests in the session do not inherit the redaction switches, the
+        # tracer wrappers, or the logging filters.
+        # Standard library
+        import logging
+        import os
+
+        pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
+        pytest.importorskip("mcp")
+
+        # Third-party packages
+        from strands.telemetry.tracer import Tracer
+
+        # Local modules
+        from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES, _McpExceptionInfoFilter
+
+        otel_vars = (
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+            "OTEL_SEMCONV_STABILITY_OPT_IN",
+            "GBAW_CAPTURE_TRACE_CONTENT",
+            "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS",
+        )
+        env_before = {k: os.environ.get(k) for k in otel_vars}
+        start_before = Tracer.start_agent_span
+        end_before = Tracer._end_span
+
+        def _guard_filter_count():
+            total = 0
+            for name in MCP_EXCEPTION_LOGGER_NAMES:
+                total += sum(
+                    1
+                    for flt in logging.getLogger(name).filters
+                    if getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker
+                )
+            return total
+
+        filters_before = _guard_filter_count()
+
+        self._fresh_import_with_recording()
+
+        assert {k: os.environ.get(k) for k in otel_vars} == env_before
+        assert Tracer.start_agent_span is start_before
+        assert Tracer._end_span is end_before
+        assert _guard_filter_count() == filters_before

@@ -28,11 +28,16 @@ OpenTelemetry log records:
   attribute and reduce an error to its type while keeping the error status.
 * Under agent observability the distro installs an OpenTelemetry logging handler
   on the root logger, so a library ``logger.exception(...)`` becomes a log record
-  whose attributes carry the exception message and stack trace. The MCP client
-  logs tool failures this way, and MCP tool exceptions can echo tool arguments or
-  provider output. While redacting, the guard attaches a logging filter to the
-  MCP client loggers that strips exception info from those records so only the
-  static message survives.
+  whose attributes carry the exception type, message, and stack trace. The MCP
+  client logs tool failures this way, and MCP tool exceptions can echo tool
+  arguments or provider output. While redacting, the guard attaches a logging
+  filter to the Strands MCP client logger that keeps the exception type as a
+  plain ``exception.type`` record attribute but removes the message and stack
+  trace, so the fact and class of the failure survive while the content does not.
+  The MCP SDK's own validation and receive-loop errors are logged on the root
+  logger with the exception interpolated into the message string; a named-logger
+  filter cannot reach them, so they are documented as a residual risk rather than
+  filtered here.
 * The AWS OpenTelemetry distro's MCP instrumentor (entry point ``aws_mcp``)
   writes ``gen_ai.tool.call.arguments`` and ``gen_ai.tool.call.result`` -- the
   full MCP tool inputs and outputs -- onto MCP protocol spans unconditionally;
@@ -46,10 +51,13 @@ OpenTelemetry log records:
   botocore spans from the MCP subprocesses start their own traces instead of
   nesting under the tool call, and MCP JSON-RPC error codes are not recorded as
   span attributes; the tool name, call id, status, and timing remain
-  on the Strands tool span. When agent observability is off the distro leaves the
-  exclusion list unset; an auto-instrumented child would then load ``aws_mcp``,
-  but the distro also does not auto-instrument the children in that mode, so no
-  MCP spans are produced regardless.
+  on the Strands tool span. The hosted runtime is safe because agent
+  observability sets this exclusion list, so the guard appends ``aws_mcp`` to it
+  and the MCP server subprocesses inherit the exclusion. When the list is unset
+  (a non-observability ``opentelemetry-instrument`` run) the guard leaves it
+  unset; an auto-instrumented child would then load ``aws_mcp`` and could emit
+  MCP tool-content spans, which is why the exclusion is relied on only under
+  agent observability.
 
 The hosted default is to carry no content: capture is off, the Strands redaction
 token is present, the agent-span and error-path wrappers are installed, the MCP
@@ -68,6 +76,7 @@ disabled-instrumentations list untouched.
 """
 
 # Standard library
+import functools
 import logging
 import os
 from dataclasses import dataclass
@@ -104,12 +113,18 @@ CAPTURE_OPT_IN_VALUE = "capture-content-nonprod"
 STRANDS_SYSTEM_PROMPT_KWARG = "system_prompt"
 REDACTED_TOOL_ERROR_STATUS = "tool returned error status"
 
-# stdlib loggers that emit tool-execution exceptions whose message/stacktrace the
-# OpenTelemetry logging handler would turn into log-record attributes.
-MCP_EXCEPTION_LOGGER_NAMES = (
-    "strands.tools.mcp.mcp_client",
-    "mcp.shared.session",
-)
+# The non-content exception-type attribute key the OpenTelemetry logging handler
+# uses. The guard sets it explicitly before clearing ``exc_info`` so the error
+# type survives on the log record while the message and stack trace do not.
+OTEL_EXCEPTION_TYPE_ATTR = "exception.type"
+
+# stdlib logger whose tool-execution exceptions the OpenTelemetry logging handler
+# would turn into log-record attributes (exception message and stack trace). This
+# is the Strands MCP client logger; the MCP SDK's own validation and receive-loop
+# messages are logged on the root logger with the exception interpolated into the
+# message string, so a named-logger filter cannot reach them (documented as a
+# residual risk in SECURITY.md).
+MCP_EXCEPTION_LOGGER_NAMES = ("strands.tools.mcp.mcp_client",)
 
 
 @dataclass(frozen=True)
@@ -183,27 +198,40 @@ def resolve_trace_content_env(env: Mapping[str, str]) -> TraceContentDecision:
 
 
 class _McpExceptionInfoFilter(logging.Filter):
-    """Strip exception info from a log record so it carries no exception text.
+    """Strip exception message and stack trace from a log record, keep the type.
 
     The OpenTelemetry logging handler copies ``record.exc_info`` into log-record
-    attributes (exception message and stack trace). MCP tool exceptions can echo
-    tool arguments or provider output, so while redacting we drop ``exc_info`` on
-    the MCP client loggers. The static log message (for example "tool execution
-    failed") is kept, so the fact of the failure is still recorded; the error
-    type remains available as the ``error.type`` on the Strands tool span.
+    attributes (exception type, message, and stack trace). MCP tool exceptions can
+    echo tool arguments or provider output, so while redacting we remove the
+    message and stack trace on the MCP client logger. Before clearing
+    ``record.exc_info`` the filter records the exception *type* name as a plain
+    ``exception.type`` record attribute, which the handler copies verbatim (it is
+    not a reserved attribute). The static log message (for example "tool execution
+    failed") and the error type are kept, so the fact and class of the failure are
+    still recorded; the message and stack trace are not.
+
+    The filter runs before any handler sees the record, so the exception traceback
+    is also removed from the stdout application log, including in local
+    development. The error type still appears in the log message's exception type
+    attribute.
     """
 
     # A sentinel so the guard is idempotent and the filter is identifiable.
     marker = "gbaw_trace_content_guard"
 
     def filter(self, record: logging.LogRecord) -> bool:
+        exc_info = record.exc_info
+        if exc_info and exc_info[0] is not None:
+            # Keep the non-content exception type; the handler copies this plain
+            # record attribute into the log record.
+            record.__dict__[OTEL_EXCEPTION_TYPE_ATTR] = exc_info[0].__name__
         record.exc_info = None
         record.exc_text = None
         return True
 
 
 def _install_mcp_logging_filter() -> None:
-    """Attach the exception-stripping filter to the MCP client loggers once."""
+    """Attach the exception-stripping filter to the MCP client logger once."""
     for name in MCP_EXCEPTION_LOGGER_NAMES:
         target = logging.getLogger(name)
         if any(getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker for flt in target.filters):
@@ -224,9 +252,11 @@ def _install_strands_span_wrappers() -> None:
       trace is recorded. The error *status* and the error *type* are kept.
 
     The wrappers are installed on the ``Tracer`` class so every instance is
-    covered, and they are idempotent (marked once applied). They depend on the
-    semi-private ``Tracer._end_span`` signature; the signature is asserted by the
-    unit tests so a Strands change fails loudly rather than silently leaking.
+    covered, and they are idempotent (marked once applied). Each wrapper is
+    decorated with ``functools.wraps(original)`` so ``inspect.signature`` and the
+    ``__wrapped__`` chain resolve to the real Strands method; the signature is
+    asserted by the unit tests so a Strands change fails loudly rather than
+    silently leaking.
     """
     try:
         # Third-party packages
@@ -240,6 +270,7 @@ def _install_strands_span_wrappers() -> None:
     original_start_agent_span = Tracer.start_agent_span
     if not getattr(original_start_agent_span, marker, False):
 
+        @functools.wraps(original_start_agent_span)
         def start_agent_span(self, *args, **kwargs):  # type: ignore[no-untyped-def]
             # Drop the system prompt so it is never set as a raw span attribute.
             kwargs.pop(STRANDS_SYSTEM_PROMPT_KWARG, None)
@@ -251,6 +282,7 @@ def _install_strands_span_wrappers() -> None:
     original_end_span = Tracer._end_span
     if not getattr(original_end_span, marker, False):
 
+        @functools.wraps(original_end_span)
         def _end_span(self, span, attributes=None, error=None, error_message=None):  # type: ignore[no-untyped-def]
             # Keep the error status, but strip any content-bearing text. An
             # exception becomes its type only (no record_exception, no stack
