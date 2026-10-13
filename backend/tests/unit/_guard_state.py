@@ -4,7 +4,8 @@
 Importing ``agentcore_main`` runs ``apply_trace_content_guard`` against the real
 process environment. The guard is process-wide: it writes four OTEL/GBAW
 environment variables, installs wrappers on the Strands ``Tracer`` class methods,
-and attaches a logging filter to the Strands MCP client logger. Tests that import
+attaches a logging filter to the Strands MCP client logger, and (hosted only)
+attaches a filter to the AgentCore Memory SDK client logger. Tests that import
 the entrypoint therefore mutate shared state that would otherwise persist for the
 rest of the pytest session.
 
@@ -52,19 +53,43 @@ def guard_filter_count() -> int:
     return total
 
 
+def memory_client_filter_count() -> int:
+    """Return how many of the guard's own filters are on the memory SDK client logger."""
+    # Local modules
+    from config.telemetry_guard import MEMORY_CLIENT_LOGGER_NAME, _MemoryClientInfoFilter
+
+    return sum(
+        1
+        for flt in logging.getLogger(MEMORY_CLIENT_LOGGER_NAME).filters
+        if getattr(flt, "marker", None) == _MemoryClientInfoFilter.marker
+    )
+
+
+def remove_memory_client_filter() -> None:
+    """Remove the guard's own filter from the memory SDK client logger, if installed."""
+    # Local modules
+    from config.telemetry_guard import MEMORY_CLIENT_LOGGER_NAME, _MemoryClientInfoFilter
+
+    target = logging.getLogger(MEMORY_CLIENT_LOGGER_NAME)
+    for flt in list(target.filters):
+        if getattr(flt, "marker", None) == _MemoryClientInfoFilter.marker:
+            target.removeFilter(flt)
+
+
 def snapshot_guard_state() -> Dict[str, Any]:
     """Capture the process state the content guard mutates on import."""
     # Third-party packages
     from strands.telemetry.tracer import Tracer
 
     # Local modules
-    from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES
+    from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES, MEMORY_CLIENT_LOGGER_NAME
 
+    guarded_loggers = (*MCP_EXCEPTION_LOGGER_NAMES, MEMORY_CLIENT_LOGGER_NAME)
     return {
         "env": {var: os.environ.get(var) for var in _GUARD_ENV_VARS},
         "start_agent_span": Tracer.start_agent_span,
         "end_span": Tracer._end_span,
-        "filters": {name: list(logging.getLogger(name).filters) for name in MCP_EXCEPTION_LOGGER_NAMES},
+        "filters": {name: list(logging.getLogger(name).filters) for name in guarded_loggers},
     }
 
 

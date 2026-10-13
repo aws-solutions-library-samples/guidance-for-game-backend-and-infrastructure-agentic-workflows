@@ -2,18 +2,28 @@
 
 # Standard library
 import importlib
+import logging
 import sys
+from unittest.mock import MagicMock
 
 # Third-party packages
 import pytest
 
 # Local modules
+from _guard_state import (
+    memory_client_filter_count,
+    remove_memory_client_filter,
+    restore_guard_state,
+    snapshot_guard_state,
+)
 from config.telemetry_guard import (
     CAPTURE_OPT_IN_VALUE,
     CAPTURE_TRACE_CONTENT_VAR,
     DISABLED_INSTRUMENTATIONS_VAR,
     GENAI_CAPTURE_CONTENT_VAR,
+    HOSTED_RUNTIME_VAR,
     MCP_INSTRUMENTOR_ENTRY_POINT,
+    MEMORY_CLIENT_LOGGER_NAME,
     SEMCONV_OPT_IN_VAR,
     apply_trace_content_guard,
     resolve_trace_content_env,
@@ -452,3 +462,341 @@ def test_uninstrument_warns_when_adot_layer_remains_under_a_client(monkeypatch, 
         assert "MCP tool-content instrumentation may remain active" in caplog.text
     finally:
         _reset_mcp_instrumentor()
+
+
+# --- AgentCore Memory SDK client logger -----------------------------------------
+#
+# ``MemoryClient.retrieve_memories`` logs the long-term-memory namespace, which
+# embeds the memory actor ID, at INFO on every successful lookup. Under agent
+# observability the distro turns root-logger records into exported OpenTelemetry
+# log records, so the line would leave the process. While redacting in a hosted
+# runtime the guard filters that one logger to WARNING and above. A non-hosted run
+# and the content-capture opt-in do not install the filter.
+
+_MEMORY_NAMESPACE = "/actors/synthetic-actor-0001/"
+
+
+@pytest.fixture
+def _memory_client_logger(_clean_mcp_log_filters):
+    """The SDK client logger with its own level unset and no guard filter.
+
+    The guard changes this logger process-wide, so each test starts clean and
+    leaves it clean. Depending on ``_clean_mcp_log_filters`` also strips the MCP
+    logging filter that every guard call installs.
+    """
+    target = logging.getLogger(MEMORY_CLIENT_LOGGER_NAME)
+    previous_level = target.level
+    target.setLevel(logging.NOTSET)
+    remove_memory_client_filter()
+    yield target
+    remove_memory_client_filter()
+    target.setLevel(previous_level)
+
+
+def _memory_client_info_is_emitted(caplog) -> bool:
+    """Log one INFO record on the SDK client logger and report whether it was handled."""
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        logging.getLogger(MEMORY_CLIENT_LOGGER_NAME).info("synthetic info")
+    return any(r.name == MEMORY_CLIENT_LOGGER_NAME and r.levelno == logging.INFO for r in caplog.records)
+
+
+def _exported_memory_log_text(service_error_code=None) -> str:
+    """Run a real ``MemoryClient.retrieve_memories`` and return what would be exported.
+
+    A root-logger OpenTelemetry handler stands in for the distro's, which is what
+    turns a library log call into an exported log record. The data-plane client is
+    a stub, so nothing touches the network; with ``service_error_code`` it raises a
+    service error with that code.
+    """
+    # Third-party packages
+    from bedrock_agentcore.memory.client import MemoryClient
+    from botocore.exceptions import ClientError
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import InMemoryLogExporter, SimpleLogRecordProcessor
+
+    exporter = InMemoryLogExporter()
+    provider = LoggerProvider()
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    handler = LoggingHandler(level=logging.NOTSET, logger_provider=provider)
+
+    control_plane, data_plane = MagicMock(), MagicMock()
+    if service_error_code is None:
+        data_plane.retrieve_memory_records.return_value = {"memoryRecordSummaries": []}
+    else:
+        data_plane.retrieve_memory_records.side_effect = ClientError(
+            {"Error": {"Code": service_error_code, "Message": "synthetic service message"}}, "RetrieveMemoryRecords"
+        )
+    session = MagicMock()
+    session.client.side_effect = [control_plane, data_plane]
+    client = MemoryClient(region_name="us-west-2", boto3_session=session)
+
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    try:
+        client.retrieve_memories(memory_id="memory-0001", namespace=_MEMORY_NAMESPACE, query="synthetic query")
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+    provider.force_flush()
+    return "\n".join(
+        f"{record.log_record.body} {dict(record.log_record.attributes or {})}"
+        for record in exporter.get_finished_logs()
+    )
+
+
+def test_memory_client_logger_name_is_pinned_to_the_sdk_client():
+    # If the SDK renames or moves its client module, the guard would filter a
+    # logger nothing writes to and the namespace line would leak again; fail here.
+    # Third-party packages
+    import bedrock_agentcore.memory.client as memory_client
+
+    assert memory_client.logger.name == MEMORY_CLIENT_LOGGER_NAME
+
+
+def test_hosted_guard_keeps_the_memory_namespace_out_of_exported_logs(_memory_client_logger):
+    pytest.importorskip("opentelemetry.sdk._logs")
+
+    # Control: with the guard not applied, the SDK's INFO line carries the
+    # namespace into exported records, so the assertion below cannot pass vacuously.
+    assert _MEMORY_NAMESPACE in _exported_memory_log_text()
+
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    assert _MEMORY_NAMESPACE not in _exported_memory_log_text()
+
+
+def test_hosted_guard_passes_memory_client_failure_warnings(_memory_client_logger):
+    # The filter passes WARNING and above so SDK failures stay visible. On a
+    # resource-not-found error the client's WARNING includes the resolved
+    # namespace, which SECURITY.md lists as a residual risk. This pins that
+    # boundary: if it moves, the documented residual risk has to move with it.
+    pytest.importorskip("opentelemetry.sdk._logs")
+
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    exported = _exported_memory_log_text(service_error_code="ResourceNotFoundException")
+    assert "Memory or namespace not found" in exported
+    assert _MEMORY_NAMESPACE in exported
+
+
+def test_hosted_guard_passes_memory_client_event_failure_errors(_memory_client_logger):
+    # When creating or listing events fails, the client logs the service's error
+    # text at ERROR, which the filter passes. SECURITY.md lists this with the
+    # other failure paths; if the boundary moves, the documentation has to move.
+    pytest.importorskip("opentelemetry.sdk._logs")
+    # Third-party packages
+    from bedrock_agentcore.memory.client import MemoryClient
+    from botocore.exceptions import ClientError
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import InMemoryLogExporter, SimpleLogRecordProcessor
+
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    exporter = InMemoryLogExporter()
+    provider = LoggerProvider()
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    handler = LoggingHandler(level=logging.NOTSET, logger_provider=provider)
+    data_plane = MagicMock()
+    error = ClientError({"Error": {"Code": "ValidationException", "Message": "synthetic service message"}}, "x")
+    data_plane.create_event.side_effect = error
+    data_plane.list_events.side_effect = error
+    session = MagicMock()
+    session.client.side_effect = [MagicMock(), data_plane]
+    client = MemoryClient(region_name="us-west-2", boto3_session=session)
+
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    try:
+        with pytest.raises(ClientError):
+            client.create_event(memory_id="memory-0001", actor_id="a", session_id="s", messages=[("hi", "USER")])
+        with pytest.raises(ClientError):
+            client.list_events(memory_id="memory-0001", actor_id="a", session_id="s")
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+    provider.force_flush()
+
+    exported = "\n".join(str(record.log_record.body) for record in exporter.get_finished_logs())
+    assert "Failed to create event" in exported
+    assert "Failed to list events" in exported
+
+
+@pytest.mark.parametrize(
+    ("level", "emitted"),
+    [
+        (logging.DEBUG, False),
+        (logging.INFO, False),
+        (logging.WARNING, True),
+        (logging.ERROR, True),
+        (logging.CRITICAL, True),
+    ],
+)
+def test_hosted_guard_drops_exactly_the_records_below_warning(level, emitted, caplog, _memory_client_logger):
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    with caplog.at_level(logging.DEBUG):
+        _memory_client_logger.log(level, "synthetic record")
+
+    seen = [record for record in caplog.records if record.name == MEMORY_CLIENT_LOGGER_NAME]
+    assert bool(seen) is emitted
+
+
+def test_hosted_guard_holds_when_the_root_level_is_raised_after_it_runs(caplog, _memory_client_logger):
+    # The runtime configures logging on its own schedule. A filter on the logger
+    # must keep dropping INFO whatever the root level is at guard time, which a
+    # level set on the logger from the root's value at that moment would not.
+    root = logging.getLogger()
+    previous_level = root.level
+    root.setLevel(logging.WARNING)
+    try:
+        apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+    finally:
+        root.setLevel(previous_level)
+
+    assert _memory_client_info_is_emitted(caplog) is False
+
+
+def test_hosted_guard_applies_through_the_process_environment(monkeypatch, caplog, _memory_client_logger):
+    # The entrypoint calls the guard with no argument, so it reads os.environ.
+    _set_guard_env(monkeypatch, opt_in=False)
+    monkeypatch.setenv(HOSTED_RUNTIME_VAR, "true")
+
+    apply_trace_content_guard()
+
+    assert _memory_client_info_is_emitted(caplog) is False
+
+
+def test_hosted_guard_leaves_sibling_sdk_loggers_alone(caplog, _memory_client_logger):
+    # The filter belongs to the client logger alone. The Strands session manager's
+    # logger carries the SDK's operational lines ("Created session", "Flushed N
+    # message events"), and it must keep emitting them.
+    # Third-party packages
+    from bedrock_agentcore.memory.integrations.strands import session_manager
+
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    with caplog.at_level(logging.INFO):
+        session_manager.logger.info("synthetic operational line")
+
+    emitted = [record.getMessage() for record in caplog.records if record.name == session_manager.logger.name]
+    assert emitted == ["synthetic operational line"]
+
+
+_HOSTED_FLAG_VALUES = ["true", "TRUE", "True", " true", "true ", "1", "yes", "false", ""]
+
+
+def test_hosted_flag_parsing_matches_the_runtime_settings():
+    # The guard and config.settings must agree on what "hosted" means. Ask
+    # config.settings itself, in a clean process so reloading it cannot disturb
+    # this one, and compare with the guard's parser over the same values.
+    # Standard library
+    import json
+    import os
+    import subprocess
+
+    # Local modules
+    from config.telemetry_guard import _hosted_runtime
+
+    src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src")
+    # config.settings loads ui/.env.local when it exists; stub that out so a
+    # developer's deployment file cannot influence or be read by this test.
+    script = (
+        "import importlib, json, os, sys\n"
+        "import dotenv\n"
+        "dotenv.load_dotenv = lambda *args, **kwargs: False\n"
+        "import config.settings as settings\n"
+        "verdicts = {}\n"
+        "for value in json.loads(sys.argv[1]):\n"
+        "    os.environ['GBAW_HOSTED_RUNTIME'] = value\n"
+        "    importlib.reload(settings)\n"
+        "    verdicts[value] = settings.HOSTED_RUNTIME\n"
+        "print('VERDICTS ' + json.dumps(verdicts))\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != HOSTED_RUNTIME_VAR}
+    env["PYTHONPATH"] = src_dir
+    result = subprocess.run(
+        [sys.executable, "-c", script, json.dumps(_HOSTED_FLAG_VALUES)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    marker_lines = [ln for ln in result.stdout.splitlines() if ln.startswith("VERDICTS ")]
+    assert (
+        result.returncode == 0 and len(marker_lines) == 1
+    ), f"rc={result.returncode} stdout tail={result.stdout[-300:]!r} stderr tail={result.stderr[-300:]!r}"
+    verdicts = json.loads(marker_lines[0][len("VERDICTS ") :])
+
+    for value in _HOSTED_FLAG_VALUES:
+        assert _hosted_runtime({HOSTED_RUNTIME_VAR: value}) is verdicts[value], repr(value)
+    assert _hosted_runtime({}) is False
+
+
+@pytest.mark.parametrize("value", ["true", "TRUE", "True"])
+def test_hosted_flag_spellings_install_the_filter(value, caplog, _memory_client_logger):
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: value})
+
+    assert _memory_client_info_is_emitted(caplog) is False
+
+
+@pytest.mark.parametrize(
+    "env", [{}, {HOSTED_RUNTIME_VAR: "false"}, {HOSTED_RUNTIME_VAR: ""}, {HOSTED_RUNTIME_VAR: "1"}]
+)
+def test_non_hosted_guard_leaves_the_memory_client_logger_alone(env, caplog, _memory_client_logger):
+    apply_trace_content_guard(dict(env))
+
+    assert _memory_client_info_is_emitted(caplog) is True
+
+
+def test_content_capture_opt_in_leaves_the_memory_client_logger_alone(caplog, _memory_client_logger):
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true", CAPTURE_TRACE_CONTENT_VAR: CAPTURE_OPT_IN_VALUE})
+
+    assert _memory_client_info_is_emitted(caplog) is True
+
+
+def test_memory_client_filter_is_installed_once(_memory_client_logger):
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    assert memory_client_filter_count() == 1
+
+
+def test_memory_client_filter_does_not_change_the_logger_level(_memory_client_logger):
+    # A filter only removes records; it must not move the level an operator chose.
+    _memory_client_logger.setLevel(logging.ERROR)
+
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    assert _memory_client_logger.level == logging.ERROR
+    assert _memory_client_logger.isEnabledFor(logging.WARNING) is False
+
+
+def test_guard_state_helpers_restore_the_memory_client_filter(_memory_client_logger):
+    # Importing the entrypoint runs the guard against the real environment. The
+    # shared isolation helpers must undo every process-wide install, including
+    # this filter, or it would leak into the rest of the test session.
+    state = snapshot_guard_state()
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+    assert memory_client_filter_count() == 1
+
+    restore_guard_state(state)
+
+    assert memory_client_filter_count() == 0
+
+
+# These two tests run in file order and prove the repository-wide fixture in
+# tests/conftest.py removes a filter a test leaves behind. The first one
+# deliberately uses no cleanup fixture of its own.
+def test_leftover_memory_client_filter_setup_installs_it_without_cleanup():
+    apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
+
+    assert memory_client_filter_count() == 1
+
+
+def test_leftover_memory_client_filter_is_removed_before_the_next_test():
+    assert memory_client_filter_count() == 0

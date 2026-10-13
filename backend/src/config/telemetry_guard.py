@@ -58,11 +58,21 @@ OpenTelemetry log records:
   unset; an auto-instrumented child would then load ``aws_mcp`` and could emit
   MCP tool-content spans, which is why the exclusion is relied on only under
   agent observability.
+* The AgentCore Memory SDK client logger (``bedrock_agentcore.memory.client``)
+  writes the long-term-memory namespace, which embeds the memory actor ID, at
+  INFO on every successful lookup, and the distro exports root-logger records
+  under agent observability. In a hosted runtime, while redacting, the guard
+  attaches a filter to that one logger that drops its records below WARNING (see
+  ``_MemoryClientInfoFilter`` for what is and is not covered). The gate is
+  deliberate: the line leaves the process only where agent observability installs
+  the root-logger export handler, which is the hosted runtime. The opt-in and a
+  non-hosted run do not install it. SECURITY.md lists the paths this leaves open.
 
 The hosted default is to carry no content: capture is off, the Strands redaction
 token is present, the agent-span and error-path wrappers are installed, the MCP
-client exception logs are filtered, and the MCP tool-content instrumentation is
-suppressed. Latency, token-count, model id, finish reason, and span structure
+client exception logs are filtered, the MCP tool-content instrumentation is
+suppressed, and, in a hosted runtime, the memory SDK client's below-WARNING
+records are dropped. Latency, token-count, model id, finish reason, and span structure
 remain, as separate non-sensitive attributes. The error *type* also remains, but
 where it is recorded depends on the path: a raised error carries its type as the
 span status description (the ``exception`` event, with its message and stack
@@ -76,7 +86,7 @@ client is created, so the default does not depend on the deploy environment
 passing the switches. An operator can opt into content capture only by setting
 ``GBAW_CAPTURE_TRACE_CONTENT`` to the exact opt-in token on the runtime; this is
 for non-production debugging and fails closed on any other value. The opt-in
-leaves the Strands wrappers, the logging filter, MCP instrumentation, and the
+leaves the Strands wrappers, the logging filters, MCP instrumentation, and the
 disabled-instrumentations list untouched.
 """
 
@@ -130,6 +140,16 @@ OTEL_EXCEPTION_TYPE_ATTR = "exception.type"
 # message string, so a named-logger filter cannot reach them (documented as a
 # residual risk in SECURITY.md).
 MCP_EXCEPTION_LOGGER_NAMES = ("strands.tools.mcp.mcp_client",)
+
+# Hosted-runtime switch: the same variable and parsing as
+# ``config.settings.HOSTED_RUNTIME``, read from the mapping handed to the guard
+# (the process environment when the entrypoint calls it) so the guard stays free
+# of application settings and testable with a dict.
+HOSTED_RUNTIME_VAR = "GBAW_HOSTED_RUNTIME"
+
+# stdlib logger of the AgentCore Memory SDK client, whose ``retrieve_memories``
+# logs the long-term-memory namespace at INFO. See ``_MemoryClientInfoFilter``.
+MEMORY_CLIENT_LOGGER_NAME = "bedrock_agentcore.memory.client"
 
 
 @dataclass(frozen=True)
@@ -378,6 +398,58 @@ def _uninstrument_mcp() -> None:
         logger.debug("MCP instrumentor uninstrument skipped: %s", exc)
 
 
+def _hosted_runtime(env: Mapping[str, str]) -> bool:
+    """Return True when the environment marks a hosted runtime.
+
+    Same variable and parsing as ``config.settings.HOSTED_RUNTIME``: only the
+    case-insensitive text ``true`` counts. The guard reads the process environment
+    when it runs, before ``config.settings`` loads any dotenv file, so a flag that
+    exists only in ``ui/.env.local`` is not seen here. Hosted deployments set it in
+    the runtime environment.
+    """
+    return env.get(HOSTED_RUNTIME_VAR, "false").lower() == "true"
+
+
+class _MemoryClientInfoFilter(logging.Filter):
+    """Drop records below WARNING from the AgentCore Memory SDK client logger.
+
+    On every successful lookup the client logs the long-term-memory namespace,
+    which embeds the memory actor ID, at INFO, and the distro exports root-logger
+    records under agent observability. This filter drops that line and the client's
+    other sub-WARNING lines (initialization, event creation). It sits on the logger
+    rather than setting a level, so it holds whatever the root logger is set to and
+    whenever logging is configured, including after this guard runs, and, because
+    a filter can only remove records, it never loosens a stricter level.
+
+    Deliberately not covered:
+
+    * WARNING and above from this logger pass, so SDK failures stay visible. On a
+      service error the client's WARNING can include the resolved namespace
+      (resource not found) or the service's error text, and its ERROR when
+      creating or listing events fails carries the service's error text.
+    * A logger filter applies only to records created on that logger. The SDK's
+      other loggers are untouched, including the Strands session manager's, whose
+      operational INFO lines (session and agent creation, flush counts) remain and
+      whose ERROR on a non-service failure carries the retrieval template key and
+      the exception text. This runtime does not use the SDK's ``MemorySession``,
+      which logs the namespace and the query text at INFO from its own logger.
+    """
+
+    # A sentinel so the guard is idempotent and the filter is identifiable.
+    marker = "gbaw_memory_client_guard"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING
+
+
+def _install_memory_client_filter() -> None:
+    """Attach the below-WARNING filter to the memory SDK client logger once."""
+    target = logging.getLogger(MEMORY_CLIENT_LOGGER_NAME)
+    if any(getattr(flt, "marker", None) == _MemoryClientInfoFilter.marker for flt in target.filters):
+        return
+    target.addFilter(_MemoryClientInfoFilter())
+
+
 def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = None) -> TraceContentDecision:
     """Apply the resolved content switches to the environment in place.
 
@@ -388,8 +460,10 @@ def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = 
     guard also installs the Strands agent-span and error-path wrappers, attaches
     the MCP client logging filter, uninstruments the MCP instrumentor singleton
     in this process, and appends ``aws_mcp`` to an already-set
-    disabled-instrumentations list so subprocesses inherit the exclusion. Returns
-    the decision for logging and tests.
+    disabled-instrumentations list so subprocesses inherit the exclusion. In a
+    hosted runtime it also filters the AgentCore Memory SDK client logger to
+    WARNING and above; a non-hosted run and the opt-in leave it alone. Returns the
+    decision for logging and tests.
     """
     target = os.environ if env is None else env
     decision = resolve_trace_content_env(target)
@@ -401,4 +475,6 @@ def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = 
         _install_strands_span_wrappers()
         _install_mcp_logging_filter()
         _uninstrument_mcp()
+        if _hosted_runtime(target):
+            _install_memory_client_filter()
     return decision
