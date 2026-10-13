@@ -22,6 +22,23 @@ from config.telemetry_guard import (
 pytestmark = pytest.mark.unit
 
 
+def _set_guard_env(monkeypatch, *, opt_in: bool) -> None:
+    """Register the guard's env vars with monkeypatch so changes do not leak.
+
+    ``apply_trace_content_guard`` writes ``os.environ`` in place. monkeypatch
+    only restores a variable it has recorded, and ``delenv(..., raising=False)``
+    on an absent variable records nothing, so set the two switches first; their
+    teardown then deletes whatever the guard wrote.
+    """
+    monkeypatch.setenv(SEMCONV_OPT_IN_VAR, "")
+    monkeypatch.setenv(GENAI_CAPTURE_CONTENT_VAR, "")
+    monkeypatch.delenv(SEMCONV_OPT_IN_VAR, raising=False)
+    monkeypatch.delenv(GENAI_CAPTURE_CONTENT_VAR, raising=False)
+    monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
+    if opt_in:
+        monkeypatch.setenv(CAPTURE_TRACE_CONTENT_VAR, CAPTURE_OPT_IN_VALUE)
+
+
 def test_hosted_default_redacts_and_disables_capture():
     decision = resolve_trace_content_env({"GBAW_HOSTED_RUNTIME": "true"})
 
@@ -80,8 +97,9 @@ def test_hosted_without_opt_in_never_captures():
 def test_apply_overwrites_distro_setdefault_true(monkeypatch):
     # The ADOT distro turns capture on with setdefault before our module imports;
     # the guard must overwrite that to the redacting default.
-    monkeypatch.setenv(GENAI_CAPTURE_CONTENT_VAR, "true")
+    monkeypatch.setenv(SEMCONV_OPT_IN_VAR, "")
     monkeypatch.delenv(SEMCONV_OPT_IN_VAR, raising=False)
+    monkeypatch.setenv(GENAI_CAPTURE_CONTENT_VAR, "true")
     monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
 
     decision = apply_trace_content_guard()
@@ -95,8 +113,11 @@ def test_apply_overwrites_distro_setdefault_true(monkeypatch):
 
 
 def test_apply_respects_opt_in(monkeypatch):
-    monkeypatch.setenv(CAPTURE_TRACE_CONTENT_VAR, CAPTURE_OPT_IN_VALUE)
+    monkeypatch.setenv(SEMCONV_OPT_IN_VAR, "")
     monkeypatch.delenv(SEMCONV_OPT_IN_VAR, raising=False)
+    monkeypatch.setenv(GENAI_CAPTURE_CONTENT_VAR, "")
+    monkeypatch.delenv(GENAI_CAPTURE_CONTENT_VAR, raising=False)
+    monkeypatch.setenv(CAPTURE_TRACE_CONTENT_VAR, CAPTURE_OPT_IN_VALUE)
 
     decision = apply_trace_content_guard()
 
@@ -156,6 +177,10 @@ def test_opt_in_leaves_disabled_list_untouched():
 
 
 def test_apply_appends_once_across_two_calls(monkeypatch):
+    monkeypatch.setenv(SEMCONV_OPT_IN_VAR, "")
+    monkeypatch.delenv(SEMCONV_OPT_IN_VAR, raising=False)
+    monkeypatch.setenv(GENAI_CAPTURE_CONTENT_VAR, "")
+    monkeypatch.delenv(GENAI_CAPTURE_CONTENT_VAR, raising=False)
     monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
     monkeypatch.setenv(DISABLED_INSTRUMENTATIONS_VAR, "urllib3,requests")
 
@@ -170,6 +195,10 @@ def test_apply_appends_once_across_two_calls(monkeypatch):
 
 
 def test_apply_leaves_disabled_list_unset_when_unset(monkeypatch):
+    monkeypatch.setenv(SEMCONV_OPT_IN_VAR, "")
+    monkeypatch.delenv(SEMCONV_OPT_IN_VAR, raising=False)
+    monkeypatch.setenv(GENAI_CAPTURE_CONTENT_VAR, "")
+    monkeypatch.delenv(GENAI_CAPTURE_CONTENT_VAR, raising=False)
     monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
     monkeypatch.delenv(DISABLED_INSTRUMENTATIONS_VAR, raising=False)
 
@@ -218,7 +247,7 @@ def test_apply_uninstruments_mcp_instrumentor_singleton(monkeypatch):
     try:
         assert hasattr(BaseSession.send_request, "__wrapped__")
 
-        monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
+        _set_guard_env(monkeypatch, opt_in=False)
         apply_trace_content_guard()
 
         assert not hasattr(BaseSession.send_request, "__wrapped__")
@@ -237,10 +266,171 @@ def test_apply_opt_in_does_not_uninstrument_mcp(monkeypatch):
     instrumentor = _reset_mcp_instrumentor()
     instrumentor.instrument()
     try:
-        monkeypatch.setenv(CAPTURE_TRACE_CONTENT_VAR, CAPTURE_OPT_IN_VALUE)
+        _set_guard_env(monkeypatch, opt_in=True)
         apply_trace_content_guard()
 
         # The opt-in must leave MCP instrumentation in place.
         assert hasattr(BaseSession.send_request, "__wrapped__")
+    finally:
+        _reset_mcp_instrumentor()
+
+
+# --- MCP exception-logging leg --------------------------------------------------
+#
+# Under agent observability the distro installs an OpenTelemetry logging handler
+# on the root logger. The MCP client calls logger.exception(...) on a tool
+# failure, so the record's exc_info (exception message and stack trace) becomes
+# log-record attributes. MCP tool exceptions can echo tool arguments or provider
+# output. While redacting, the guard attaches a filter to the MCP client loggers
+# that strips exc_info so only the static message survives.
+
+_MCP_EXC_MARKER = "UNIQUE-MCP-EXC-MARKER-5c7e"
+
+
+@pytest.fixture
+def _clean_mcp_log_filters():
+    """Remove the guard's logging filter from the MCP loggers before and after.
+
+    The filter is process-wide by design (installed once at startup), so it must
+    be stripped around tests that assert on its presence or absence.
+    """
+    # Standard library
+    import logging
+
+    # Local modules
+    from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES, _McpExceptionInfoFilter
+
+    def _strip():
+        for name in MCP_EXCEPTION_LOGGER_NAMES:
+            lg = logging.getLogger(name)
+            for flt in list(lg.filters):
+                if getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker:
+                    lg.removeFilter(flt)
+
+    _strip()
+    yield
+    _strip()
+
+
+def _capture_otel_log_attributes(logger_name: str, monkeypatch):
+    """Emit a logger.exception on ``logger_name`` through an OTel LoggingHandler.
+
+    Returns the attributes dict the handler would export for that record.
+    """
+    # Standard library
+    import logging
+
+    # Third-party packages
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import InMemoryLogExporter, SimpleLogRecordProcessor
+
+    exporter = InMemoryLogExporter()
+    provider = LoggerProvider()
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    handler = LoggingHandler(level=logging.NOTSET, logger_provider=provider)
+
+    target = logging.getLogger(logger_name)
+    target.addHandler(handler)
+    monkeypatch.setattr(target, "level", logging.NOTSET, raising=False)
+    try:
+        try:
+            raise RuntimeError(_MCP_EXC_MARKER)
+        except RuntimeError:
+            target.exception("tool execution failed")
+    finally:
+        target.removeHandler(handler)
+    provider.force_flush()
+
+    blobs = []
+    for record in exporter.get_finished_logs():
+        attrs = dict(record.log_record.attributes or {})
+        blobs.append(str(attrs))
+    return "\n".join(blobs)
+
+
+def test_guard_filters_mcp_exception_text_from_log_records(monkeypatch, _clean_mcp_log_filters):
+    pytest.importorskip("opentelemetry.sdk._logs")
+
+    _set_guard_env(monkeypatch, opt_in=False)
+    apply_trace_content_guard()
+
+    blob = _capture_otel_log_attributes("strands.tools.mcp.mcp_client", monkeypatch)
+    # The static message is kept, but no exception message or stack trace.
+    assert _MCP_EXC_MARKER not in blob
+    assert "exception.stacktrace" not in blob
+    assert "exception.message" not in blob
+
+
+def test_opt_in_leaves_mcp_exception_text_in_log_records(monkeypatch, _clean_mcp_log_filters):
+    pytest.importorskip("opentelemetry.sdk._logs")
+
+    _set_guard_env(monkeypatch, opt_in=True)
+    apply_trace_content_guard()
+
+    blob = _capture_otel_log_attributes("strands.tools.mcp.mcp_client", monkeypatch)
+    # Under the opt-in the exception text is retained for debugging.
+    assert _MCP_EXC_MARKER in blob
+
+
+def test_mcp_logging_filter_is_idempotent(monkeypatch, _clean_mcp_log_filters):
+    # Standard library
+    import logging
+
+    _set_guard_env(monkeypatch, opt_in=False)
+    apply_trace_content_guard()
+    apply_trace_content_guard()
+
+    target = logging.getLogger("strands.tools.mcp.mcp_client")
+    markers = [getattr(flt, "marker", None) for flt in target.filters]
+    assert markers.count("gbaw_trace_content_guard") == 1
+
+
+# --- MCP uninstrument robustness (ordering, no spurious warnings) ---------------
+
+
+def test_uninstrument_logs_no_warning_when_not_instrumented(monkeypatch, caplog):
+    # Standard library
+    import logging
+
+    pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
+    pytest.importorskip("mcp")
+
+    _reset_mcp_instrumentor()  # leaves the singleton uninstrumented
+    _set_guard_env(monkeypatch, opt_in=False)
+
+    with caplog.at_level(logging.WARNING):
+        apply_trace_content_guard()
+
+    text = caplog.text.lower()
+    assert "already uninstrumented" not in text
+
+
+def test_uninstrument_warns_when_adot_layer_remains_under_a_client(monkeypatch, caplog):
+    # Standard library
+    import logging
+
+    pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
+    pytest.importorskip("mcp")
+
+    # Third-party packages
+    from mcp.shared.session import BaseSession
+    from wrapt import wrap_function_wrapper
+
+    instrumentor = _reset_mcp_instrumentor()
+    instrumentor.instrument()  # ADOT ClientWrapper is the outermost layer
+    try:
+        # Simulate a Strands MCPClient wrapping the same method AFTER ADOT, so a
+        # single uninstrument() peels only the Strands layer and leaves the ADOT
+        # content-writing layer underneath.
+        def _outer(wrapped, instance, args, kwargs):  # pragma: no cover - not called
+            return wrapped(*args, **kwargs)
+
+        wrap_function_wrapper("mcp.shared.session", "BaseSession.send_request", _outer)
+
+        _set_guard_env(monkeypatch, opt_in=False)
+        with caplog.at_level(logging.WARNING):
+            apply_trace_content_guard()
+
+        assert "MCP tool-content instrumentation may remain active" in caplog.text
     finally:
         _reset_mcp_instrumentor()

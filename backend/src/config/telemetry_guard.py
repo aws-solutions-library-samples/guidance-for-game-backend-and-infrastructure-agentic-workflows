@@ -1,9 +1,10 @@
 """Startup guard that keeps model content out of exported telemetry.
 
 The runtime runs under ``opentelemetry-instrument`` with the AWS OpenTelemetry
-distro and AgentCore observability. Three independent paths decide whether
-prompt text, response text, tool inputs/outputs, system prompts, and retrieved
-passages reach exported spans, span events, and OpenTelemetry log records:
+distro and AgentCore observability. Several independent paths decide whether
+prompt text, response text, tool inputs/outputs, system prompts, retrieved
+passages, and error text reach exported spans, span events, span status, and
+OpenTelemetry log records:
 
 * ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` -- the botocore Bedrock
   instrumentation reads this at call time to decide whether message content is
@@ -13,9 +14,25 @@ passages reach exported spans, span events, and OpenTelemetry log records:
   environment wins.
 * ``OTEL_SEMCONV_STABILITY_OPT_IN`` -- the Strands tracer reads the
   ``gen_ai_unredacted_attributes=<list>`` token when it is constructed. An empty
-  list redacts every sensitive span attribute and legacy per-message event
-  (``gen_ai.input.messages``, ``gen_ai.output.messages``,
-  ``gen_ai.system_instructions``). Omitting the token leaves them unredacted.
+  list redacts the sensitive span attributes and legacy per-message events it
+  routes through its redaction policy (``gen_ai.input.messages``,
+  ``gen_ai.output.messages``, ``gen_ai.system_instructions``). Omitting the token
+  leaves them unredacted.
+* The Strands tracer also carries two content paths the redaction token does not
+  reach. ``start_agent_span`` copies a ``system_prompt`` keyword argument onto the
+  ``invoke_agent`` span as a plain attribute, which the distro's log-record
+  handler emits as a ``system`` message. ``_end_span`` records tool/model error
+  text as the span status description and, for exceptions, as an ``exception``
+  span event (message and stack trace). While redacting, the guard installs
+  narrow wrappers on these two ``Tracer`` methods that drop the ``system_prompt``
+  attribute and reduce an error to its type while keeping the error status.
+* Under agent observability the distro installs an OpenTelemetry logging handler
+  on the root logger, so a library ``logger.exception(...)`` becomes a log record
+  whose attributes carry the exception message and stack trace. The MCP client
+  logs tool failures this way, and MCP tool exceptions can echo tool arguments or
+  provider output. While redacting, the guard attaches a logging filter to the
+  MCP client loggers that strips exception info from those records so only the
+  static message survives.
 * The AWS OpenTelemetry distro's MCP instrumentor (entry point ``aws_mcp``)
   writes ``gen_ai.tool.call.arguments`` and ``gen_ai.tool.call.result`` -- the
   full MCP tool inputs and outputs -- onto MCP protocol spans unconditionally;
@@ -24,26 +41,30 @@ passages reach exported spans, span events, and OpenTelemetry log records:
   process, and, when the distro has set ``OTEL_PYTHON_DISABLED_INSTRUMENTATIONS``
   (its default exclusion list under agent observability), it appends ``aws_mcp``
   to that list so the auto-instrumented MCP server subprocesses -- which inherit
-  a copy of this process's environment -- exclude MCP instrumentation too. The
-  distro leaves that variable unset only when it is not running with agent
-  observability, in which case the children are not auto-instrumented with the
-  default list either, so leaving it unset is safe. Strands' own
-  ``execute_tool`` spans keep tool name, call id, status, and timing while
-  redacting tool inputs/outputs under the redaction token, so dropping the MCP
-  protocol spans loses no non-content signal.
+  a copy of this process's environment -- exclude MCP instrumentation too.
+  Uninstrumenting also removes the instrumentor's trace-context injection, so
+  botocore spans from the MCP subprocesses start their own traces instead of
+  nesting under the tool call, and MCP JSON-RPC error codes are not recorded as
+  span attributes; the tool name, call id, status, and timing remain
+  on the Strands tool span. When agent observability is off the distro leaves the
+  exclusion list unset; an auto-instrumented child would then load ``aws_mcp``,
+  but the distro also does not auto-instrument the children in that mode, so no
+  MCP spans are produced regardless.
 
-The hosted default is to carry no content: capture is off, the Strands
-redaction token is present, and MCP tool content spans are suppressed. Latency,
-token-count, model id, finish reason, error type, and span structure are
-unaffected because they are separate, non-sensitive attributes.
+The hosted default is to carry no content: capture is off, the Strands redaction
+token is present, the agent-span and error-path wrappers are installed, the MCP
+client exception logs are filtered, and the MCP tool-content instrumentation is
+suppressed. Latency, token-count, model id, finish reason, error type, and span
+structure are unaffected because they are separate, non-sensitive attributes.
 
 ``apply_trace_content_guard`` is called once at module import of the entrypoint,
-before any Strands ``Tracer`` is constructed and before any MCP client is
-created, so the default does not depend on the deploy environment passing the
-switches. An operator can opt into content capture only by setting
-``GBAW_CAPTURE_TRACE_CONTENT`` to the exact opt-in token; this is for
-non-production debugging and fails closed on any other value. The opt-in leaves
-MCP instrumentation and the disabled-instrumentations list untouched.
+before the first Strands ``Tracer`` is constructed and before the first MCP
+client is created, so the default does not depend on the deploy environment
+passing the switches. An operator can opt into content capture only by setting
+``GBAW_CAPTURE_TRACE_CONTENT`` to the exact opt-in token on the runtime; this is
+for non-production debugging and fails closed on any other value. The opt-in
+leaves the Strands wrappers, the logging filter, MCP instrumentation, and the
+disabled-instrumentations list untouched.
 """
 
 # Standard library
@@ -76,6 +97,19 @@ MCP_INSTRUMENTOR_ENTRY_POINT = "aws_mcp"
 # fails closed to the redacting default.
 CAPTURE_TRACE_CONTENT_VAR = "GBAW_CAPTURE_TRACE_CONTENT"
 CAPTURE_OPT_IN_VALUE = "capture-content-nonprod"
+
+# The Strands span attribute (set from a plain keyword argument on the agent
+# span) that carries the system prompt, and the non-content replacement used for
+# a redacted error status.
+STRANDS_SYSTEM_PROMPT_KWARG = "system_prompt"
+REDACTED_TOOL_ERROR_STATUS = "tool returned error status"
+
+# stdlib loggers that emit tool-execution exceptions whose message/stacktrace the
+# OpenTelemetry logging handler would turn into log-record attributes.
+MCP_EXCEPTION_LOGGER_NAMES = (
+    "strands.tools.mcp.mcp_client",
+    "mcp.shared.session",
+)
 
 
 @dataclass(frozen=True)
@@ -148,14 +182,140 @@ def resolve_trace_content_env(env: Mapping[str, str]) -> TraceContentDecision:
     )
 
 
+class _McpExceptionInfoFilter(logging.Filter):
+    """Strip exception info from a log record so it carries no exception text.
+
+    The OpenTelemetry logging handler copies ``record.exc_info`` into log-record
+    attributes (exception message and stack trace). MCP tool exceptions can echo
+    tool arguments or provider output, so while redacting we drop ``exc_info`` on
+    the MCP client loggers. The static log message (for example "tool execution
+    failed") is kept, so the fact of the failure is still recorded; the error
+    type remains available as the ``error.type`` on the Strands tool span.
+    """
+
+    # A sentinel so the guard is idempotent and the filter is identifiable.
+    marker = "gbaw_trace_content_guard"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.exc_info = None
+        record.exc_text = None
+        return True
+
+
+def _install_mcp_logging_filter() -> None:
+    """Attach the exception-stripping filter to the MCP client loggers once."""
+    for name in MCP_EXCEPTION_LOGGER_NAMES:
+        target = logging.getLogger(name)
+        if any(getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker for flt in target.filters):
+            continue
+        target.addFilter(_McpExceptionInfoFilter())
+
+
+def _install_strands_span_wrappers() -> None:
+    """Wrap the Strands ``Tracer`` methods that export content the token misses.
+
+    * ``start_agent_span`` -- drop the ``system_prompt`` keyword so it is not set
+      as a plain span attribute (and so the distro's log-record handler cannot
+      turn it into a ``system`` message). The system prompt is still reported,
+      redacted, through ``gen_ai.system_instructions`` on model spans.
+    * ``_end_span`` -- replace an error's status description with its exception
+      type (or a fixed non-content string for an error-status tool result) and
+      drop the exception object so no ``exception`` event with message/stack
+      trace is recorded. The error *status* and the error *type* are kept.
+
+    The wrappers are installed on the ``Tracer`` class so every instance is
+    covered, and they are idempotent (marked once applied). They depend on the
+    semi-private ``Tracer._end_span`` signature; the signature is asserted by the
+    unit tests so a Strands change fails loudly rather than silently leaking.
+    """
+    try:
+        # Third-party packages
+        from strands.telemetry.tracer import Tracer
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        logger.debug("Strands tracer not available; skipping span content wrappers: %s", exc)
+        return
+
+    marker = "_gbaw_trace_content_guard"
+
+    original_start_agent_span = Tracer.start_agent_span
+    if not getattr(original_start_agent_span, marker, False):
+
+        def start_agent_span(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            # Drop the system prompt so it is never set as a raw span attribute.
+            kwargs.pop(STRANDS_SYSTEM_PROMPT_KWARG, None)
+            return original_start_agent_span(self, *args, **kwargs)
+
+        setattr(start_agent_span, marker, True)
+        Tracer.start_agent_span = start_agent_span  # type: ignore[method-assign]
+
+    original_end_span = Tracer._end_span
+    if not getattr(original_end_span, marker, False):
+
+        def _end_span(self, span, attributes=None, error=None, error_message=None):  # type: ignore[no-untyped-def]
+            # Keep the error status, but strip any content-bearing text. An
+            # exception becomes its type only (no record_exception, no stack
+            # trace); an error-status tool result (error is None, error_message
+            # set) becomes a fixed non-content string.
+            if error is not None:
+                return original_end_span(
+                    self,
+                    span,
+                    attributes,
+                    error=None,
+                    error_message=type(error).__name__,
+                )
+            if error_message is not None:
+                return original_end_span(
+                    self,
+                    span,
+                    attributes,
+                    error=None,
+                    error_message=REDACTED_TOOL_ERROR_STATUS,
+                )
+            return original_end_span(self, span, attributes, error=None, error_message=None)
+
+        setattr(_end_span, marker, True)
+        Tracer._end_span = _end_span  # type: ignore[method-assign]
+
+
+def _mcp_client_wrapper_layer_remains() -> bool:
+    """Return True if an ADOT MCP ``ClientWrapper`` layer still wraps the SDK.
+
+    ``uninstrument`` removes only the outermost wrapt layer, so if a Strands
+    ``MCPClient`` wrapped the method after ADOT did, the content-writing ADOT
+    layer can survive underneath. Walk the ``__wrapped__`` chain of the MCP SDK
+    send methods and report whether any wrapper belongs to the ADOT MCP module.
+    """
+    try:
+        # Third-party packages
+        from mcp.shared.session import BaseSession
+    except Exception:  # pragma: no cover - MCP SDK not installed
+        return False
+    adot_mcp_module = "amazon.opentelemetry.distro.instrumentation.mcp"
+    for method_name in ("send_request", "send_notification"):
+        func = getattr(BaseSession, method_name, None)
+        seen = 0
+        while func is not None and hasattr(func, "__wrapped__") and seen < 10:
+            # wrapt proxies __module__ to the wrapped target, so identify the ADOT
+            # layer by the bound wrapper function it holds in ``_self_wrapper``.
+            wrapper_fn = getattr(func, "_self_wrapper", None)
+            wrapper_module = getattr(wrapper_fn, "__module__", "") or ""
+            if wrapper_module.startswith(adot_mcp_module):
+                return True
+            func = getattr(func, "__wrapped__", None)
+            seen += 1
+    return False
+
+
 def _uninstrument_mcp() -> None:
-    """Uninstrument the ADOT MCP instrumentor singleton if it is present.
+    """Uninstrument the ADOT MCP instrumentor singleton if it is instrumented.
 
     The MCP instrumentor is a ``BaseInstrumentor`` singleton whose
     ``uninstrument`` restores the wrapped MCP SDK methods, so no exported span
     carries ``gen_ai.tool.call.arguments`` or ``gen_ai.tool.call.result`` in this
-    process. A missing or changed ADOT package is a debug-logged no-op, never a
-    startup failure.
+    process. ``uninstrument`` is called only when the instrumentor reports it is
+    instrumented, so an uninstrumented startup logs no warning. A missing or
+    changed ADOT package is a debug-logged no-op, never a startup failure.
     """
     try:
         # Third-party packages
@@ -164,7 +324,16 @@ def _uninstrument_mcp() -> None:
         logger.debug("ADOT MCP instrumentor not available; skipping uninstrument: %s", exc)
         return
     try:
-        McpInstrumentor().uninstrument()
+        instrumentor = McpInstrumentor()
+        if instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.uninstrument()
+        if _mcp_client_wrapper_layer_remains():
+            # An MCP client wrapped the SDK before the guard ran, so an ADOT
+            # content-writing layer survives underneath. No content is logged.
+            logger.warning(
+                "MCP tool-content instrumentation may remain active: an MCP client was "
+                "created before telemetry redaction was applied."
+            )
     except Exception as exc:  # pragma: no cover - defensive, never fail startup
         logger.debug("MCP instrumentor uninstrument skipped: %s", exc)
 
@@ -172,13 +341,15 @@ def _uninstrument_mcp() -> None:
 def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = None) -> TraceContentDecision:
     """Apply the resolved content switches to the environment in place.
 
-    Must run before any Strands ``Tracer`` is constructed and before any MCP
-    client is created. The botocore Bedrock instrumentation reads the capture
-    switch at call time, so applying it here also governs GenAI events and the
-    OpenTelemetry log records derived from them. When redacting, the MCP
-    instrumentor singleton is uninstrumented in this process and ``aws_mcp`` is
-    appended to an already-set disabled-instrumentations list so subprocesses
-    inherit the exclusion. Returns the decision for logging and tests.
+    Must run before the first Strands ``Tracer`` is constructed and before the
+    first MCP client is created. The botocore Bedrock instrumentation reads the
+    capture switch at call time, so applying it here also governs GenAI events
+    and the OpenTelemetry log records derived from them. When redacting, the
+    guard also installs the Strands agent-span and error-path wrappers, attaches
+    the MCP client logging filter, uninstruments the MCP instrumentor singleton
+    in this process, and appends ``aws_mcp`` to an already-set
+    disabled-instrumentations list so subprocesses inherit the exclusion. Returns
+    the decision for logging and tests.
     """
     target = os.environ if env is None else env
     decision = resolve_trace_content_env(target)
@@ -187,5 +358,7 @@ def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = 
     if decision.disabled_instrumentations is not None:
         target[DISABLED_INSTRUMENTATIONS_VAR] = decision.disabled_instrumentations
     if not decision.capture_enabled:
+        _install_strands_span_wrappers()
+        _install_mcp_logging_filter()
         _uninstrument_mcp()
     return decision

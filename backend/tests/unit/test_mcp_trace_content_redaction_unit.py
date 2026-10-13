@@ -121,6 +121,11 @@ def test_guard_uninstruments_mcp_so_no_tool_content_span(monkeypatch, _provider)
     instrumentor = _reset_mcp_instrumentor()
     instrumentor.instrument()
     try:
+        # Register the switches so the guard's os.environ writes are restored.
+        monkeypatch.setenv("OTEL_SEMCONV_STABILITY_OPT_IN", "")
+        monkeypatch.delenv("OTEL_SEMCONV_STABILITY_OPT_IN", raising=False)
+        monkeypatch.setenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "")
+        monkeypatch.delenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", raising=False)
         monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
         apply_trace_content_guard()
 

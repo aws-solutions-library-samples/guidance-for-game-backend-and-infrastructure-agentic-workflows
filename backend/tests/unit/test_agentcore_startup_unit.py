@@ -462,3 +462,106 @@ class TestRequestScopeLifecycle:
         assert "error" in result.lower()
         # ...and the scope is still reset via the finally block.
         assert current_scope() is UNSCOPED
+
+
+class TestEntrypointTelemetryGuardWiring:
+    """Pin that the entrypoint applies the content guard before any MCP client.
+
+    The guard overrides the distro's content switches and uninstruments the MCP
+    instrumentor; both must happen before ``prewarm_container`` creates the first
+    MCP client, or MCP tool-content spans would already be wired. Importing the
+    entrypoint fresh exercises that ordering. Removing the guard call from the
+    entrypoint fails these assertions.
+    """
+
+    def _fresh_import_with_recording(self):
+        # Standard library
+        import importlib
+        import logging
+        import os
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        # Third-party packages
+        from amazon.opentelemetry.distro.instrumentation.mcp import McpInstrumentor
+        from mcp.shared.session import BaseSession
+
+        # Start from a known single-instrumented MCP state.
+        instrumentor = McpInstrumentor()
+        for _ in range(5):
+            if not hasattr(BaseSession.send_request, "__wrapped__"):
+                break
+            instrumentor._is_instrumented_by_opentelemetry = True
+            instrumentor.uninstrument()
+        instrumentor._is_instrumented_by_opentelemetry = False
+        instrumentor.instrument()
+
+        recorded = {}
+
+        def _recording_create_mcp_client(server_name, *args, **kwargs):
+            # Capture the MCP wrapping state and the content switch at the moment
+            # the first client would be created during prewarm.
+            if "mcp_wrapped_at_first_client" not in recorded:
+                recorded["mcp_wrapped_at_first_client"] = hasattr(BaseSession.send_request, "__wrapped__")
+                recorded["capture_env_at_first_client"] = os.environ.get(
+                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+                )
+            return MagicMock()
+
+        # Remove any OTEL switches so a missing guard call is detectable.
+        preserved = {
+            k: os.environ.pop(k, None)
+            for k in (
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+                "OTEL_SEMCONV_STABILITY_OPT_IN",
+                "GBAW_CAPTURE_TRACE_CONTENT",
+            )
+        }
+        sys.modules.pop("agentcore_main", None)
+        try:
+            with (
+                patch("boto3.client") as mock_boto3,
+                patch("utils.mcp_client_factory.create_mcp_client", side_effect=_recording_create_mcp_client),
+                patch("models.cached_bedrock.create_cached_bedrock_model", return_value=MagicMock()),
+                patch("utils.kb_tools.create_kb_retrieve_tool", return_value=MagicMock()),
+            ):
+                mock_sts = MagicMock()
+                mock_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+                mock_boto3.return_value = mock_sts
+                importlib.import_module("agentcore_main")
+            final_capture = os.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
+            final_mcp_wrapped = hasattr(BaseSession.send_request, "__wrapped__")
+        finally:
+            # Restore environment and MCP state for the rest of the session.
+            for k, v in preserved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for _ in range(5):
+                if not hasattr(BaseSession.send_request, "__wrapped__"):
+                    break
+                instrumentor._is_instrumented_by_opentelemetry = True
+                instrumentor.uninstrument()
+            instrumentor._is_instrumented_by_opentelemetry = False
+            sys.modules.pop("agentcore_main", None)
+
+        recorded["final_capture"] = final_capture
+        recorded["final_mcp_wrapped"] = final_mcp_wrapped
+        return recorded
+
+    def test_guard_applied_and_mcp_unwrapped_before_first_client(self):
+        pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
+        pytest.importorskip("mcp")
+
+        recorded = self._fresh_import_with_recording()
+
+        # The entrypoint created at least one MCP client during prewarm.
+        assert "mcp_wrapped_at_first_client" in recorded
+        # The content switch was applied before that client was created.
+        assert recorded["capture_env_at_first_client"] == "false"
+        # The MCP instrumentor was uninstrumented before that client was created.
+        assert recorded["mcp_wrapped_at_first_client"] is False
+        # And the module import left the redacting default in place.
+        assert recorded["final_capture"] == "false"
+        assert recorded["final_mcp_wrapped"] is False
