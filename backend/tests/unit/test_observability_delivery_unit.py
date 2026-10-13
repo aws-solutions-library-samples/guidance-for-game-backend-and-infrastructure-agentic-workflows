@@ -875,14 +875,14 @@ def test_preflight_warns_when_toolkit_would_change_trace_destination(shell):
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
 def test_preflight_warns_when_toolkit_would_create_default_indexing_rule(shell):
-    """No 'Default' indexing rule is predicted as a create."""
+    """No 'Default' indexing rule is predicted as an UpdateIndexingRule write."""
     result = _preflight_harness(
         _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, default_indexing_present=False),
         shell=shell,
     )
     assert "rc=0" in result.stdout
     assert "WARNING" in result.stdout
-    assert "WOULD CREATE a 'Default' rule" in result.stdout
+    assert "WOULD SET 'Default' to 1% (UpdateIndexingRule)" in result.stdout
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
@@ -980,8 +980,21 @@ def test_preflight_stop_switch_only_exact_true_enables(stop_value, shell):
 
 def test_deploy_guards_both_agentcore_launch_sites_with_the_preflight():
     """Static check: every `agentcore launch` in deploy.sh is immediately
-    preceded by the preflight guard, so no launch path skips it."""
+    preceded by the subprocess preflight guard, so no launch path skips it, and
+    deploy.sh does not source the account-observability script (which would leak
+    its `set -euo pipefail` into the deploy's shell options)."""
     content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    # deploy.sh must run the preflight as a subprocess, never source it.
+    assert (
+        "source" not in content or "setup-account-observability.sh" not in content.split("source", 1)[1][:80]
+    ), "deploy.sh must not source setup-account-observability.sh"
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert not (
+            stripped.startswith("source ") and "setup-account-observability" in stripped
+        ), "deploy.sh must call the preflight as a subprocess, not source it"
     lines = content.splitlines()
     launch_lines = [
         i for i, line in enumerate(lines) if "agentcore launch" in line and not line.lstrip().startswith("#")
@@ -989,9 +1002,7 @@ def test_deploy_guards_both_agentcore_launch_sites_with_the_preflight():
     assert launch_lines, "expected at least one agentcore launch in deploy.sh"
     for idx in launch_lines:
         window = "\n".join(lines[max(0, idx - 6) : idx])
-        assert (
-            "run_transaction_search_preflight" in window
-        ), f"agentcore launch at line {idx + 1} is not guarded by the preflight"
+        assert "run_toolkit_preflight" in window, f"agentcore launch at line {idx + 1} is not guarded by the preflight"
 
 
 def _launch_wiring_harness(
@@ -1054,3 +1065,313 @@ def test_launch_wiring_proceeds_to_launch_when_no_change(shell):
     )
     assert result.returncode == 0
     assert "LAUNCH_INVOKED" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# End-to-end deploy.sh harness: run the REAL scripts/deploy.sh over PATH stubs,
+# with and without Docker, and under both shells. This is the only test that
+# exercises how deploy.sh integrates the preflight (as a subprocess) and that a
+# backend-only deploy completes. It catches a sourced-script option leak and a
+# missing preflight guard, which the isolated-function tests above cannot.
+# ---------------------------------------------------------------------------
+#
+# The harness builds a throwaway project tree whose scripts/deploy.sh and
+# scripts/infrastructure/setup-account-observability.sh are the real files, while
+# every other sub-script is a no-op. A stubbed `aws`, `uv`, and `yq` on PATH keep
+# the run fully offline; the `uv` stub records every `agentcore launch` so a test
+# can assert whether a launch happened. All identifiers are synthetic.
+
+_AWS_STUB = r"""#!/usr/bin/env bash
+# Offline `aws` stub. Answers the few reads deploy.sh and the preflight make.
+svc="$1"; op="$2"
+_query=""
+for a in "$@"; do
+  case "$prev" in --query) _query="$a";; esac
+  prev="$a"
+done
+case "$svc $op" in
+  "sts get-caller-identity") echo "123456789012";;
+  "cloudformation deploy") :;;
+  "cloudformation describe-stacks")
+    case "$_query" in
+      *UserPoolId*) echo "us-west-2_EXAMPLE";;
+      *UserPoolClientId*) echo "exampleclientid000000000000";;
+      *GuardrailId*) echo "gr-example0000";;
+      *CostReportSnapshotTableName*) echo "game-agent-cost-snapshots";;
+      *AgentCoreExecutionRoleArn*) echo "arn:aws:iam::123456789012:role/example-exec";;
+      *FrontendRepositoryUri*) echo "123456789012.dkr.ecr.us-west-2.amazonaws.com/example";;
+      *ServiceUrl*) echo "example.us-west-2.elb.amazonaws.com";;
+      *LoadBalancerArn*) echo "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/app/example/00";;
+      *WebACLArn*) echo "arn:aws:wafv2:us-west-2:123456789012:regional/webacl/example/00";;
+      *CloudTrailArn*) echo "arn:aws:cloudtrail:us-west-2:123456789012:trail/example";;
+      *) echo "None";;
+    esac
+    ;;
+  "logs describe-resource-policies") echo "${STUB_POLICIES_JSON:-{\"resourcePolicies\":[]}}";;
+  "xray get-trace-segment-destination") echo "${STUB_TRACE_DESTINATION:-CloudWatchLogs}";;
+  "xray get-indexing-rules") echo "${STUB_INDEXING_JSON:-{\"IndexingRules\":[{\"Name\":\"Default\"}]}}";;
+  "logs put-delivery-source") :;;
+  "logs put-delivery-destination") :;;
+  "logs create-delivery") :;;
+  "logs get-delivery-destination") echo "${STUB_DELIVERY_DEST_ARN:-arn:aws:logs:us-west-2:123456789012:delivery-destination:example}";;
+  "logs describe-deliveries")
+    printf '{"deliveries":[{"deliverySourceName":"%s","deliveryDestinationArn":"%s","deliveryDestinationType":"XRAY"}]}' \
+      "${STUB_DELIVERY_SOURCE_NAME}" "${STUB_DELIVERY_DEST_ARN:-arn:aws:logs:us-west-2:123456789012:delivery-destination:example}"
+    ;;
+  "logs get-delivery-source")
+    printf '{"deliverySource":{"resourceArns":["%s"]}}' "${STUB_RUNTIME_ARN_RESOLVED}"
+    ;;
+  "elbv2 modify-load-balancer-attributes") echo "190";;
+  "inspector2 enable") :;;
+  "ecr get-login-password") echo "example-token";;
+  "wafv2 get-web-acl-for-resource") echo "${STUB_WAF_ACL_ARN:-arn:aws:wafv2:us-west-2:123456789012:regional/webacl/example/00}";;
+  "wafv2 associate-web-acl") :;;
+  "wafv2 get-web-acl")
+    # All six rules the reconciler requires, so convergence succeeds first pass.
+    printf 'RateLimitAuthPaths\tRateLimitAdminPaths\tRateLimitPerIP\tAWSManagedRulesCommonRuleSet\tAWSManagedRulesSQLiRuleSet\tAWSManagedRulesKnownBadInputsRuleSet\n'
+    ;;
+  *) echo '{}';;
+esac
+exit 0
+"""
+
+# `uv` stub. Records `agentcore launch` lines to $STUB_LAUNCH_LOG, no-ops the
+# rest, and emits the model/identity exports deploy.sh evals.
+_UV_STUB = r"""#!/usr/bin/env bash
+args="$*"
+case "$args" in
+  *"agentcore launch"*)
+    echo "LAUNCH_INVOKED: uv $args"
+    echo "uv $args" >> "$STUB_LAUNCH_LOG"
+    ;;
+  *"agentcore configure"*) echo "configured";;
+  "sync"*) :;;
+  "export "*)
+    # deploy.sh runs: uv export ... --output-file requirements.txt.tmp
+    out=""
+    prev=""
+    for a in "$@"; do
+      case "$prev" in --output-file) out="$a";; esac
+      prev="$a"
+    done
+    [ -n "$out" ] && printf '# generated\nexample-package==1.0.0\n' > "$out"
+    ;;
+  *"load_deployment_settings.py"*)
+    case "$args" in
+      *--models-only*)
+        echo 'export GBAW_ORCHESTRATOR_MODEL_ID=example-orchestrator'
+        echo 'export GBAW_SPECIALIST_MODEL_ID=example-specialist'
+        ;;
+      *--identity-only*)
+        echo 'export GBAW_TENANT_ID=example-tenant'
+        echo 'export GBAW_WORKSPACE_ID=example-workspace'
+        ;;
+    esac
+    ;;
+  *) :;;
+esac
+exit 0
+"""
+
+# `yq` stub. deploy.sh reads the runtime ARN from .bedrock_agentcore.yaml. An
+# empty value makes deploy.sh take the "new runtime" (launch) path; a non-empty
+# value makes it skip the first launch.
+_YQ_STUB = r"""#!/usr/bin/env bash
+# deploy.sh reads the runtime ARN from .bedrock_agentcore.yaml twice on the
+# new-runtime path: first to check existence (must be empty so it launches),
+# then after launch to resolve the ARN (must be the real value). A call counter
+# distinguishes the two so the harness exercises the full launch path AND the
+# downstream trace-delivery verification with a resolvable runtime ARN.
+_c="${STUB_YQ_COUNTER:-/tmp/stub_yq_counter_unset}"
+n=0
+[ -f "$_c" ] && n="$(cat "$_c")"
+n=$((n + 1))
+echo "$n" > "$_c"
+if [ "$n" -eq 1 ] && [ "${STUB_RUNTIME_ARN:-}" = "" ]; then
+  echo ""
+else
+  echo "${STUB_RUNTIME_ARN:-arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/gameagentruntime-EXAMPLE}"
+fi
+exit 0
+"""
+
+_DOCKER_STUB = r"""#!/usr/bin/env bash
+# `docker info` must succeed for deploy.sh to treat Docker as available.
+exit 0
+"""
+
+
+def _write_stub(path: "pathlib.Path", body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _build_deploy_tree(tmp_path: "pathlib.Path") -> "pathlib.Path":
+    """Create a throwaway project tree whose deploy.sh and the account-observability
+    script are the real files and every other sub-script is a no-op."""
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "infrastructure").mkdir(parents=True)
+    (repo / "infrastructure" / "cloudformation").mkdir(parents=True)
+    (repo / "backend").mkdir(parents=True)
+    (repo / "config").mkdir(parents=True)
+    (repo / "ui").mkdir(parents=True)
+
+    # Real scripts under test.
+    (repo / "scripts" / "deploy.sh").write_text(DEPLOY_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    (repo / "scripts" / "infrastructure" / "setup-account-observability.sh").write_text(
+        ACCOUNT_OBS_SCRIPT.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    # No-op sub-scripts deploy.sh invokes by path.
+    noop = "#!/usr/bin/env bash\nexit 0\n"
+    for rel in (
+        "scripts/infrastructure/download-kb-docs.sh",
+        "scripts/infrastructure/deploy-prompts.sh",
+        "scripts/infrastructure/deploy-kb.sh",
+        "scripts/infrastructure/seed-kb-gamelift.sh",
+        "scripts/infrastructure/seed-kb-eks.sh",
+        "scripts/infrastructure/seed-kb-cost.sh",
+        "scripts/infrastructure/setup-app-observability.sh",
+        "scripts/generate-sbom.sh",
+    ):
+        p = repo / rel
+        p.write_text(noop, encoding="utf-8")
+        p.chmod(0o755)
+
+    # Template files referenced via --template-file (the aws stub ignores them).
+    for name in (
+        "00-solution-tracking.yaml",
+        "01-base-infrastructure.yaml",
+        "02-frontend-ecs-express.yaml",
+        "03-agentcore-observability.yaml",
+        "04-bedrock-guardrails.yaml",
+        "05-security-infrastructure.yaml",
+    ):
+        (repo / "infrastructure" / "cloudformation" / name).write_text("", encoding="utf-8")
+
+    # Minimal generated state deploy.sh reads.
+    (repo / "backend" / ".env.local").write_text(
+        "GBAW_ORCHESTRATOR_PROMPT_ARN=arn:aws:bedrock:us-west-2:123456789012:prompt/example-orch\n"
+        "GBAW_GAMELIFT_PROMPT_ARN=arn:aws:bedrock:us-west-2:123456789012:prompt/example-gl\n"
+        "GBAW_EKS_PROMPT_ARN=arn:aws:bedrock:us-west-2:123456789012:prompt/example-eks\n"
+        "GBAW_COST_PROMPT_ARN=arn:aws:bedrock:us-west-2:123456789012:prompt/example-cost\n"
+        "GBAW_GAMELIFT_KB_ID=EXAMPLEKB01\n"
+        "GBAW_EKS_KB_ID=EXAMPLEKB02\n"
+        "GBAW_COST_KB_ID=EXAMPLEKB03\n",
+        encoding="utf-8",
+    )
+    (repo / "backend" / ".bedrock_agentcore.yaml").write_text(
+        "agents:\n  gameagentruntime:\n    bedrock_agentcore:\n      agent_arn: ''\n",
+        encoding="utf-8",
+    )
+    (repo / "config" / "load_deployment_settings.py").write_text("", encoding="utf-8")
+    (repo / "ui" / ".env.local").write_text("AWS_PROFILE=\n", encoding="utf-8")
+    return repo
+
+
+def _run_deploy_e2e(
+    tmp_path: "pathlib.Path",
+    *,
+    shell: str = "bash",
+    docker: bool = False,
+    stop_switch: bool = False,
+    trace_destination: str = "CloudWatchLogs",
+    policies_json: str = '{"resourcePolicies":[{"policyName":"TransactionSearchXRayAccess","policyDocument":"{}"}]}',
+    indexing_json: str = '{"IndexingRules":[{"Name":"Default"}]}',
+) -> "subprocess.CompletedProcess[str]":
+    repo = _build_deploy_tree(tmp_path)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _write_stub(bindir / "aws", _AWS_STUB)
+    _write_stub(bindir / "uv", _UV_STUB)
+    _write_stub(bindir / "yq", _YQ_STUB)
+    _write_stub(bindir / "jq", "#!/usr/bin/env bash\n" + "printf '{\"customJWTAuthorizer\":{}}'\n")
+    # Neutralize real waits so the harness runs well under the pytest timeout.
+    _write_stub(bindir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
+    if docker:
+        _write_stub(bindir / "docker", _DOCKER_STUB)
+
+    launch_log = tmp_path / "launches.log"
+    launch_log.write_text("", encoding="utf-8")
+
+    resolved_arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/gameagentruntime-EXAMPLE"
+    runtime_id = resolved_arn.rsplit("/", 1)[-1]
+
+    env = {
+        "PATH": f"{bindir}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "AWS_REGION": "us-west-2",
+        "STUB_LAUNCH_LOG": str(launch_log),
+        "STUB_TRACE_DESTINATION": trace_destination,
+        "STUB_POLICIES_JSON": policies_json,
+        "STUB_INDEXING_JSON": indexing_json,
+        "STUB_RUNTIME_ARN": "",
+        "STUB_RUNTIME_ARN_RESOLVED": resolved_arn,
+        "STUB_DELIVERY_SOURCE_NAME": f"{runtime_id}-traces-source",
+        "STUB_DELIVERY_DEST_ARN": "arn:aws:logs:us-west-2:123456789012:delivery-destination:example",
+        "STUB_YQ_COUNTER": str(tmp_path / "yq_counter"),
+        # Keep bounded-retry verification fast and single-pass.
+        "GBAW_DELIVERY_MAX_ATTEMPTS": "1",
+        "GBAW_DELIVERY_RETRY_SECONDS": "0",
+    }
+    if stop_switch:
+        env["GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE"] = "true"
+
+    result = subprocess.run(
+        [shell, str(repo / "scripts" / "deploy.sh")],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    # Attach the recorded launches for assertions.
+    result.launches = launch_log.read_text(encoding="utf-8")  # type: ignore[attr-defined]
+    return result
+
+
+_E2E_SHELLS = ("bash", "/bin/bash")
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+@pytest.mark.parametrize("docker", [False, True])
+def test_deploy_e2e_default_completes_and_launches(tmp_path, shell, docker):
+    """A default deploy completes (exit 0) and reaches both launches, with and
+    without Docker. The Docker-absent (backend-only) path is documented as
+    supported; it must not abort at the final summary."""
+    result = _run_deploy_e2e(tmp_path, shell=shell, docker=docker)
+    assert result.returncode == 0, f"stdout tail:\n{result.stdout[-800:]}\nstderr:\n{result.stderr[-800:]}"
+    # Both the new-runtime launch and the Step 5b update launch ran.
+    assert result.launches.count("agentcore launch") == 2  # type: ignore[attr-defined]
+    if docker:
+        assert "Deployment Complete!" in result.stdout
+    else:
+        assert "Deployment Partially Complete (backend only)" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+def test_deploy_e2e_stop_switch_halts_before_any_launch(tmp_path, shell):
+    """With the stop switch set and a predicted change, the deploy exits non-zero
+    and records zero `agentcore launch` calls."""
+    result = _run_deploy_e2e(
+        tmp_path,
+        shell=shell,
+        stop_switch=True,
+        trace_destination="XRay",
+        policies_json='{"resourcePolicies":[]}',
+        indexing_json='{"IndexingRules":[]}',
+    )
+    assert result.returncode != 0
+    assert result.launches.count("agentcore launch") == 0  # type: ignore[attr-defined]
+    assert "Stopping before 'agentcore launch'" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+def test_deploy_e2e_preflight_output_precedes_each_launch(tmp_path, shell):
+    """The preflight report is printed before each `agentcore launch`."""
+    result = _run_deploy_e2e(tmp_path, shell=shell)
+    assert result.returncode == 0
+    out = result.stdout
+    first_launch = out.index("LAUNCH_INVOKED")
+    first_preflight = out.index("Preflight:")
+    assert first_preflight < first_launch
+    # Every launch is preceded by at least one preflight line before it.
+    assert out.count("Preflight:") >= out.count("LAUNCH_INVOKED")

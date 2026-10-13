@@ -733,14 +733,20 @@ so this project treats them as a blast-radius concern:
   0.3.11 has no flag to keep the OTEL entrypoint while skipping only that account
   step. The deployment therefore runs a **read-only preflight before every
   `agentcore launch`** that predicts, using the toolkit's own conditions, which
-  account-wide settings the toolkit would change, and prints either a single
-  no-change line or a prominent warning with cleanup commands. A read failure is
-  reported as **unknown** (a possible change), never as "no change". The default
-  deploy is non-blocking; operators who require no shared account change set the
-  fail-closed `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` (PowerShell
+  account-wide settings the toolkit would change — a `TransactionSearchXRayAccess`
+  resource policy (name-only check), the trace segment destination, and the shared
+  `Default` X-Ray indexing rule, which the toolkit sets to 1% via
+  `UpdateIndexingRule`. The preflight prints either a single no-change line or the
+  per-item detail with a prominent warning and only the relevant cleanup commands.
+  A read failure is reported as **unknown** (a possible change), never as "no
+  change"; the toolkit writes on doubt, so the warning states that for each unknown
+  item it will perform the write. The default deploy is non-blocking; operators who
+  require no shared account change set the fail-closed
+  `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` (PowerShell
   `-StopOnAccountObservabilityChange`), which halts the deploy before launch when
   the toolkit would — or might — change account-wide settings. Only the exact value
-  `true` enables it. Note that the toolkit checks for a policy named literally
+  `true` enables it (`TRUE`, `1`, and empty are treated as off in both shells).
+  Note that the toolkit checks for a policy named literally
   `TransactionSearchXRayAccess`, so it adds its own policy even when this project's
   `GameAgentTransactionSearchXRayAccess` policy already grants the access.
 

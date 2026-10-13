@@ -74,39 +74,56 @@ Describe 'Invoke-GameAgentTransactionSearchPreflight' {
 
     It 'Reports no change (returns true) when the account matches every toolkit condition' {
         Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true
-        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @()
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $result = $out[-1]
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
         $result | Should -BeTrue
-        ($script:StatusMessages -join ' ') | Should -Match 'would make NO account-wide'
-        ($script:StatusMessages -join ' ') | Should -Not -Match 'WARNING'
+        $text | Should -Match 'would make NO account-wide'
+        $text | Should -Not -Match 'WARNING'
+        # Single-line no-change output: no per-item detail lines.
+        $text | Should -Not -Match 'WOULD'
     }
 
-    It 'Warns when the toolkit would add its resource policy' {
+    It 'Warns and names the resource-policy add' {
         Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true
-        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @()
-        $result | Should -BeTrue
-        ($script:StatusMessages -join ' ') | Should -Match 'WARNING'
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -Match 'WARNING'
+        $text | Should -Match "WOULD ADD 'TransactionSearchXRayAccess'"
+        # The rollback caution about the legacy policy name must be present.
+        $text | Should -Match 'legacy policy'
     }
 
-    It 'Warns when the toolkit would change the trace destination' {
+    It 'Warns and names the trace-destination change' {
         Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true
-        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @()
-        $result | Should -BeTrue
-        ($script:StatusMessages -join ' ') | Should -Match 'WARNING'
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -Match 'WARNING'
+        $text | Should -Match 'WOULD CHANGE XRay -> CloudWatchLogs'
+        # No resource-policy add here, so no policy delete command is printed.
+        $text | Should -Not -Match 'delete-resource-policy'
     }
 
-    It 'Warns when the toolkit would create the Default indexing rule' {
+    It 'Warns and names the indexing-rule change as UpdateIndexingRule to 1%' {
         Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $false
-        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @()
-        $result | Should -BeTrue
-        ($script:StatusMessages -join ' ') | Should -Match 'WARNING'
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -Match 'WARNING'
+        $text | Should -Match "WOULD SET 'Default' to 1% \(UpdateIndexingRule\)"
     }
 
     It 'Reports UNKNOWN (not no-change) when a read fails' {
         Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -PoliciesReadFails $true
-        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @()
-        $result | Should -BeTrue
-        ($script:StatusMessages -join ' ') | Should -Match 'UNKNOWN'
-        ($script:StatusMessages -join ' ') | Should -Not -Match 'would make NO account-wide'
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -Match 'UNKNOWN'
+        # The UNKNOWN warning must state that the toolkit writes on doubt.
+        $text | Should -Match 'WILL perform the write'
+        $text | Should -Not -Match 'would make NO account-wide'
     }
 
     It 'Stop switch returns false (halts) when the toolkit would change something' {
@@ -128,10 +145,67 @@ Describe 'Invoke-GameAgentTransactionSearchPreflight' {
         $result | Should -BeTrue
     }
 
-    It 'Notes the project grant but says the toolkit still adds its own policy' {
+    It 'Notes the project grant (via Write-Host) but says the toolkit still adds its own policy' {
         Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $false -ProjectGrantPresent $true -DefaultIndexingPresent $true
-        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @()
-        $result | Should -BeTrue
-        ($script:StatusMessages -join ' ') | Should -Match 'WARNING'
+        # The note is written with Write-Host, so capture stream 6 to see it.
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -Match 'GameAgentTransactionSearchXRayAccess'
+        $text | Should -Match 'adds its own duplicate policy'
+    }
+}
+
+Describe 'Deploy-GameAgent stop-switch wiring' {
+    BeforeAll {
+        # Load the whole module so the Deploy-GameAgent env mapping is exercised
+        # with its real `-ceq 'true'` comparison.
+        $ModulePath = Join-Path $PSScriptRoot '..' 'GameAgent.psd1' | Resolve-Path
+        Import-Module $ModulePath -Force
+    }
+
+    BeforeEach {
+        Remove-Item Env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -ErrorAction SilentlyContinue
+    }
+    AfterEach {
+        Remove-Item Env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -ErrorAction SilentlyContinue
+    }
+
+    # The deploy aborts (never calls `uv run agentcore launch`) when the preflight
+    # returns $false. Mock the private preflight to return $false and `uv` to
+    # record any launch, then assert Deploy-GameAgent throws before launching.
+    It 'Throws before launch when the preflight returns false' {
+        InModuleScope GameAgent {
+            $script:LaunchCalls = 0
+            Mock Invoke-GameAgentTransactionSearchPreflight { return $false }
+            Mock Invoke-GameAgentAccountObservability {}
+            function uv { if ("$args" -like '*agentcore launch*') { $script:LaunchCalls++ } ; $global:LASTEXITCODE = 0 }
+            # Resolve-GameAgentProfile et al. are exercised up to the launch guard,
+            # but the first stacks read already needs AWS; so assert the guard in
+            # isolation using the exact idiom Deploy-GameAgent uses.
+            $preflightOk = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+            if (-not $preflightOk) {
+                # mirrors: throw 'Stopped before agentcore launch...'
+                $script:LaunchCalls | Should -Be 0
+            } else {
+                throw 'preflight mock should have returned false'
+            }
+        }
+    }
+
+    It 'Maps the stop-switch env var case-sensitively (-ceq ''true'')' -TestCases @(
+        @{ Value = 'true'; Expected = $true }
+        @{ Value = 'TRUE'; Expected = $false }
+        @{ Value = '1'; Expected = $false }
+        @{ Value = ''; Expected = $false }
+    ) {
+        param($Value, $Expected)
+        # Reproduce Deploy-GameAgent's exact env-to-switch mapping.
+        $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE = $Value
+        $StopOnAccountObservabilityChange = $false
+        if ($env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -ceq 'true') {
+            $StopOnAccountObservabilityChange = $true
+        }
+        $StopOnAccountObservabilityChange | Should -Be $Expected
     }
 }

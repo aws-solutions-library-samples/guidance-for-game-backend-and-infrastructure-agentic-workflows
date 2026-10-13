@@ -54,8 +54,14 @@ function Invoke-GameAgentTransactionSearchPreflight {
 
     # Returns 'present', 'absent', or 'unreadable' for a resource policy named
     # literally 'TransactionSearchXRayAccess' (the toolkit's name-only check).
+    # Each AWS read is wrapped so native-stderr handling on PowerShell 7.0/7.1
+    # (where redirected stderr becomes terminating error records under
+    # $ErrorActionPreference='Stop') yields 'unreadable' instead of throwing out
+    # of the preflight and aborting the deploy.
     function Get-ToolkitResourcePolicyPresence {
-        $raw = (& aws logs describe-resource-policies --region $Region @ProfileArgs --output json 2>$null)
+        try {
+            $raw = (& aws logs describe-resource-policies --region $Region @ProfileArgs --output json 2>$null)
+        } catch { return 'unreadable' }
         if ($LASTEXITCODE -ne 0) { return 'unreadable' }
         try { $parsed = $raw | ConvertFrom-Json } catch { return 'unreadable' }
         foreach ($policy in @($parsed.resourcePolicies)) {
@@ -68,7 +74,9 @@ function Invoke-GameAgentTransactionSearchPreflight {
     # logs:PutLogEvents on an 'aws/spans' log group (Effect Allow), regardless of
     # name. Used only to annotate the warning.
     function Test-ProjectSpansGrant {
-        $raw = (& aws logs describe-resource-policies --region $Region @ProfileArgs --output json 2>$null)
+        try {
+            $raw = (& aws logs describe-resource-policies --region $Region @ProfileArgs --output json 2>$null)
+        } catch { return $false }
         if ($LASTEXITCODE -ne 0) { return $false }
         try { $parsed = $raw | ConvertFrom-Json } catch { return $false }
         foreach ($policy in @($parsed.resourcePolicies)) {
@@ -90,7 +98,9 @@ function Invoke-GameAgentTransactionSearchPreflight {
 
     # Returns XRay | CloudWatchLogs, or UNREADABLE.
     function Get-PreflightTraceDestination {
-        $raw = (& aws xray get-trace-segment-destination --region $Region @ProfileArgs --query 'Destination' --output text 2>$null)
+        try {
+            $raw = (& aws xray get-trace-segment-destination --region $Region @ProfileArgs --query 'Destination' --output text 2>$null)
+        } catch { return 'UNREADABLE' }
         if ($LASTEXITCODE -ne 0) { return 'UNREADABLE' }
         $dest = ("$raw").Trim()
         if ($dest -eq 'XRay' -or $dest -eq 'CloudWatchLogs') { return $dest }
@@ -100,7 +110,9 @@ function Invoke-GameAgentTransactionSearchPreflight {
     # Returns 'present', 'absent', or 'unreadable' for a Default indexing rule
     # (the toolkit keys off a rule NAMED 'Default' existing).
     function Get-DefaultIndexingRulePresence {
-        $raw = (& aws xray get-indexing-rules --region $Region @ProfileArgs --output json 2>$null)
+        try {
+            $raw = (& aws xray get-indexing-rules --region $Region @ProfileArgs --output json 2>$null)
+        } catch { return 'unreadable' }
         if ($LASTEXITCODE -ne 0) { return 'unreadable' }
         try { $parsed = $raw | ConvertFrom-Json } catch { return 'unreadable' }
         foreach ($rule in @($parsed.IndexingRules)) {
@@ -109,88 +121,110 @@ function Invoke-GameAgentTransactionSearchPreflight {
         return 'absent'
     }
 
-    Write-Host '  Preflight: predicting AgentCore starter toolkit Transaction Search changes...'
-    Write-Host "      (the toolkit runs these during 'agentcore launch' when runtime"
-    Write-Host '       observability is enabled; they are account-wide and shared)'
-
     $changes = [System.Collections.Generic.List[string]]::new()
+    $detail = [System.Collections.Generic.List[string]]::new()
     $unknown = $false
+    $policyWouldAdd = $false
+    $destinationWouldChange = $false
+    $indexingWouldCreate = $false
+    $priorDestination = ''
 
     # 1. Resource policy (name-only check).
     $policyPresence = Get-ToolkitResourcePolicyPresence
     switch ($policyPresence) {
-        'present' {
-            Write-Host '      - CloudWatch Logs resource policy: no change'
-            Write-Host "        (a policy named '$toolkitPolicyName' already exists)"
-        }
+        'present' { }  # no change — no detail line (single-line no-change output)
         'absent' {
+            $policyWouldAdd = $true
             $changes.Add("Adds a CloudWatch Logs resource policy named '$toolkitPolicyName'")
-            Write-Host "      - CloudWatch Logs resource policy: WOULD ADD '$toolkitPolicyName'"
-            Write-Host "        (grants xray.amazonaws.com logs:PutLogEvents on 'aws/spans' and"
-            Write-Host "         '/aws/application-signals/data')"
+            $detail.Add("      - CloudWatch Logs resource policy: WOULD ADD '$toolkitPolicyName'")
+            $detail.Add("        (grants xray.amazonaws.com logs:PutLogEvents on 'aws/spans' and")
+            $detail.Add("         '/aws/application-signals/data')")
         }
         default {
             $unknown = $true
-            Write-Host '      - CloudWatch Logs resource policy: UNKNOWN (could not read resource policies)'
+            $detail.Add('      - CloudWatch Logs resource policy: UNKNOWN (could not read resource policies)')
         }
     }
 
     # 2. Trace segment destination.
     $destination = Get-PreflightTraceDestination
     if ($destination -eq 'CloudWatchLogs') {
-        Write-Host '      - X-Ray trace segment destination: no change (already CloudWatchLogs)'
+        # no change — no detail line
     } elseif ($destination -eq 'UNREADABLE') {
         $unknown = $true
-        Write-Host '      - X-Ray trace segment destination: UNKNOWN (could not read destination)'
+        $detail.Add('      - X-Ray trace segment destination: UNKNOWN (could not read destination)')
     } else {
+        $destinationWouldChange = $true
+        $priorDestination = $destination
         $changes.Add("Sets the X-Ray trace segment destination to CloudWatchLogs (region $Region)")
-        Write-Host "      - X-Ray trace segment destination: WOULD CHANGE $destination -> CloudWatchLogs"
-        Write-Host "        (region $Region; shared by every X-Ray caller)"
+        $detail.Add("      - X-Ray trace segment destination: WOULD CHANGE $destination -> CloudWatchLogs")
+        $detail.Add("        (region $Region; shared by every X-Ray caller)")
     }
 
-    # 3. Default indexing rule.
+    # 3. Default indexing rule. Any value other than present/absent is UNKNOWN.
     $indexingPresence = Get-DefaultIndexingRulePresence
     switch ($indexingPresence) {
-        'present' {
-            Write-Host "      - X-Ray default indexing rule: no change (a 'Default' rule already exists)"
-        }
-        'unreadable' {
-            $unknown = $true
-            Write-Host '      - X-Ray default indexing rule: UNKNOWN (could not read indexing rules)'
+        'present' { }  # no change — no detail line
+        'absent' {
+            $indexingWouldCreate = $true
+            $changes.Add("Sets the X-Ray 'Default' indexing rule to 1% via UpdateIndexingRule")
+            $detail.Add("      - X-Ray default indexing rule: WOULD SET 'Default' to 1% (UpdateIndexingRule)")
         }
         default {
-            $changes.Add("Creates the X-Ray 'Default' indexing rule (1% probabilistic sampling)")
-            Write-Host "      - X-Ray default indexing rule: WOULD CREATE a 'Default' rule (1% sampling)"
+            $unknown = $true
+            $detail.Add('      - X-Ray default indexing rule: UNKNOWN (could not read indexing rules)')
         }
     }
 
     # Classify: 0 no change, 1 would change, 2 unknown (possible change).
     if ($unknown) {
         $wouldChange = 2
-        Write-GameAgentStatus "Preflight could not read one or more account settings; the toolkit's effect is UNKNOWN. Treating it as a possible shared change (not 'no change')." -Type Warning
+        Write-Host '  Preflight: predicting AgentCore starter toolkit Transaction Search changes...'
+        Write-Host "      (the toolkit runs these during 'agentcore launch' when runtime"
+        Write-Host '       observability is enabled; they are account-wide and shared)'
+        foreach ($line in $detail) { Write-Host $line }
+        Write-GameAgentStatus "Preflight could not read one or more account settings, so the toolkit's effect is UNKNOWN. The toolkit writes on doubt: for each unknown item it WILL perform the write during 'agentcore launch'. Treating this as a possible shared change (not 'no change')." -Type Warning
     } elseif ($changes.Count -eq 0) {
         $wouldChange = 0
         Write-GameAgentStatus 'Preflight: the AgentCore starter toolkit would make NO account-wide X-Ray or CloudWatch Logs change.' -Type Success
     } else {
         $wouldChange = 1
+        Write-Host '  Preflight: predicting AgentCore starter toolkit Transaction Search changes...'
+        Write-Host "      (the toolkit runs these during 'agentcore launch' when runtime"
+        Write-Host '       observability is enabled; they are account-wide and shared)'
+        foreach ($line in $detail) { Write-Host $line }
         Write-Host ''
         Write-GameAgentStatus "WARNING: 'agentcore launch' WILL change SHARED, account-wide settings via the AgentCore starter toolkit (NOT this repository's opt-in). These affect every X-Ray / Transaction Search consumer in the account:" -Type Warning
         foreach ($change in $changes) { Write-Host "        - $change" }
-        if ($policyPresence -eq 'absent' -and (Test-ProjectSpansGrant)) {
+        if ($policyWouldAdd -and (Test-ProjectSpansGrant)) {
             Write-Host "      Note: this repository's project-owned policy ('$ResourcePolicyName')"
             Write-Host '      already grants the needed access, but the toolkit checks only for a policy'
             Write-Host "      named '$toolkitPolicyName', so it adds its own duplicate policy."
         }
         Write-Host '      Cleanup / rollback after launch (run only once no other workload relies on them):'
-        Write-Host "        - Resource policy: aws logs delete-resource-policy --policy-name $toolkitPolicyName --region $Region"
-        Write-Host "        - Trace destination: aws xray update-trace-segment-destination --destination $destination --region $Region"
-        Write-Host "          (only if it was changed from '$destination' above; omit if it was already CloudWatchLogs)"
-        Write-Host '      To stop the deploy before this happens, re-run with'
-        Write-Host '      -StopOnAccountObservabilityChange (deploy halts before agentcore launch).'
+        if ($policyWouldAdd) {
+            Write-Host "        - Resource policy: aws logs delete-resource-policy --policy-name $toolkitPolicyName --region $Region"
+            Write-Host "          Caution: '$toolkitPolicyName' is also this repository's legacy policy"
+            Write-Host '          name. Confirm the launch (not an earlier deploy) created it before deleting,'
+            Write-Host '          so you do not remove a shared grant another workload relies on.'
+        }
+        if ($destinationWouldChange) {
+            Write-Host "        - Trace destination: aws xray update-trace-segment-destination --destination $priorDestination --region $Region"
+            Write-Host "          (restores the prior destination '$priorDestination')"
+        }
+        if ($indexingWouldCreate) {
+            Write-Host "        - Indexing rule: the toolkit sets the shared 'Default' rule to 1%. To restore a"
+            Write-Host '          prior percentage: aws xray update-indexing-rule --name Default `'
+            Write-Host "            --rule '{\"Probabilistic\":{\"DesiredSamplingPercentage\":<prior>}}' --region $Region"
+        }
+        if (-not $StopOnAccountObservabilityChange) {
+            Write-Host '      To stop the deploy before this happens, re-run with'
+            Write-Host '      -StopOnAccountObservabilityChange (deploy halts before agentcore launch).'
+        }
     }
 
     if ($StopOnAccountObservabilityChange -and $wouldChange -ne 0) {
-        Write-GameAgentStatus "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. Enable Transaction Search intentionally (for example -ConfigureAccountObservability or once in the AWS console), then re-run without the stop switch." -Type Error
+        Write-GameAgentStatus "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. To let the deploy continue without any shared change, the account must already satisfy all three toolkit conditions: a CloudWatch Logs resource policy named literally 'TransactionSearchXRayAccess', the X-Ray trace segment destination set to 'CloudWatchLogs', and an X-Ray indexing rule named 'Default'. One way to reach that state is this repository's opt-in with the matching policy name (GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess) on an account with no other 'aws/spans' grant, or enable Transaction Search once in the AWS console. Then re-run without the stop switch." -Type Error
         return $false
     }
     return $true

@@ -276,18 +276,24 @@ entrypoint and instead makes the behavior explicit.
   already granted the access.
 - **X-Ray trace segment destination** — set to `CloudWatchLogs` when it is not
   already `CloudWatchLogs` (account-wide, shared by every X-Ray caller).
-- **X-Ray default indexing rule** — a `Default` rule is created only when no rule
-  named `Default` exists; an existing `Default` rule is left unchanged.
+- **X-Ray default indexing rule** — the toolkit calls `UpdateIndexingRule` to set
+  the shared `Default` rule to 1% when no rule named `Default` exists. There is no
+  separate create operation; this is an upsert of the account-wide `Default` rule.
+- **Write-on-doubt.** When the toolkit cannot read one of these settings, it
+  performs the write anyway. A read that it cannot interpret therefore still
+  results in the account-wide change.
 
 **Read-only preflight and warning.** Before every `agentcore launch`, the
 deployment runs a read-only preflight that predicts exactly which of these the
 toolkit would change, using the toolkit's own conditions. If it would change
-nothing, the deployment prints a single no-change line. If it would change
-something, it prints a prominent warning that names each change and the affected
-shared settings, explains that the change comes from the AgentCore starter toolkit
-(not this repository's opt-in), and prints the cleanup/rollback commands. If a read
-fails, the preflight reports the toolkit's effect as **unknown** (a possible
-change), never as "no change".
+nothing, the deployment prints a single no-change line (no per-item detail). If
+it would change something, it prints the per-item detail followed by a prominent
+warning that names each change and the affected shared settings, explains that
+the change comes from the AgentCore starter toolkit (not this repository's
+opt-in), and prints only the cleanup/rollback commands relevant to the predicted
+changes. If a read fails, the preflight reports the toolkit's effect as
+**unknown** (a possible change), never as "no change", and states that for each
+unknown item the toolkit will perform the write.
 
 **Default is non-blocking.** A fresh-account `./deploy-all.sh` still completes; the
 preflight warns but does not stop.
@@ -306,21 +312,50 @@ PowerShell uses the matching switch (or the same environment variable):
 Deploy-GameAgent -StopOnAccountObservabilityChange
 ```
 
-Only the exact value `true` enables it; any other value is treated as off. Because
-the stop is fail-closed, it also halts when the preflight cannot read the current
-state (unknown). To proceed, enable Transaction Search intentionally — for example
-with `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` or once in the AWS X-Ray /
-CloudWatch console — then re-run without the stop switch.
+Only the exact value `true` enables it; any other value (including `TRUE` and `1`)
+is treated as off. When the stop switch is set, the preflight runs once up front —
+before the Knowledge Base and observability steps — so a predicted or unknown
+change halts the deploy before any of those steps run. Because the stop is
+fail-closed, it also halts when the preflight cannot read the current state
+(unknown).
 
-**Cleanup.** To remove the toolkit's own policy after launch (only once no other
-workload relies on it):
+**Reaching a passing run with the stop switch.** The stop switch keeps halting
+until the account already satisfies all three toolkit conditions, so that the
+toolkit's launch-time step would be a no-op:
+
+- a CloudWatch Logs resource policy named *literally* `TransactionSearchXRayAccess`,
+- the X-Ray trace segment destination set to `CloudWatchLogs`, and
+- an X-Ray indexing rule named `Default`.
+
+This repository's opt-in uses the project-owned name
+`GameAgentTransactionSearchXRayAccess` by default, which does **not** satisfy the
+toolkit's name-only check. To create a policy with the exact name the toolkit
+looks for, run the opt-in with the matching name on an account that has no other
+`aws/spans` grant:
+
+```bash
+GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
+  GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh
+```
+
+or enable Transaction Search once in the AWS X-Ray / CloudWatch console. Then
+re-run without the stop switch.
+
+**Cleanup.** The warning prints only the rollback commands for the changes it
+predicted. If the toolkit added its own policy, remove it after launch (only once
+no other workload relies on it):
 
 ```bash
 aws logs delete-resource-policy --policy-name TransactionSearchXRayAccess --region <region>
 ```
 
+Note that `TransactionSearchXRayAccess` is also this repository's legacy policy
+name, so confirm the launch (not an earlier deploy) created it before deleting.
 If the launch changed the trace destination, restore the prior value with
 `aws xray update-trace-segment-destination --destination <prior> --region <region>`.
+If the launch set the shared `Default` indexing rule to 1%, restore a prior
+percentage with
+`aws xray update-indexing-rule --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":<prior>}}' --region <region>`.
 
 
 ## Post-Deployment Configuration

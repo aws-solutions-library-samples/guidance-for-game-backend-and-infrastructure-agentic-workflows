@@ -52,9 +52,10 @@ function Deploy-GameAgent {
     }
 
     # Likewise honor the shell-equivalent fail-closed stop switch. Only the exact
-    # value 'true' enables it, matching the shell path.
+    # value 'true' (case-sensitive) enables it, matching the shell path, which
+    # treats 'TRUE', '1', and '' as off.
     if (-not $PSBoundParameters.ContainsKey('StopOnAccountObservabilityChange') -and
-        $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -eq 'true') {
+        $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -ceq 'true') {
         $StopOnAccountObservabilityChange = $true
     }
 
