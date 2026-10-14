@@ -32,8 +32,15 @@ vpc:
     - __OPERATOR_CIDR__
 iam:
   withOIDC: false
+  # Every role eksctl creates carries the operator role's workload boundary;
+  # the operator role cannot create a role without it.
+  serviceRolePermissionsBoundary: __BOUNDARY_ARN__
 accessConfig:
   authenticationMode: API
+# Managed node groups, not Auto Mode, which a future eksctl release enables by
+# default.
+autoModeConfig:
+  enabled: false
 managedNodeGroups:
   - name: gameservers
     instanceType: m5.large
@@ -43,6 +50,8 @@ managedNodeGroups:
     volumeSize: 30
     privateNetworking: true
     disableIMDSv1: true
+    iam:
+      instanceRolePermissionsBoundary: __BOUNDARY_ARN__
     labels:
       agones.dev/role: gameserver
     tags:

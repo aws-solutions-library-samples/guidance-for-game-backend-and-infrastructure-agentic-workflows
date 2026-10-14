@@ -24,10 +24,24 @@ spec:
           labels:
             demo: agones-gamelift-migration
         spec:
+          # Pod-level settings stay minimal: Agones injects its SDK sidecar,
+          # which needs the pod's service account token.
+          securityContext:
+            seccompProfile:
+              type: RuntimeDefault
           containers:
             - name: simple-game-server
               # Example image released with Agones 1.61 (tested with chart 1.61.0).
               image: us-docker.pkg.dev/agones-images/examples/simple-game-server:0.43
+              securityContext:
+                # The image's USER is the name "nonroot"; kubelet needs the UID.
+                runAsNonRoot: true
+                runAsUser: 65532
+                runAsGroup: 65532
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
               resources:
                 requests:
                   memory: 64Mi

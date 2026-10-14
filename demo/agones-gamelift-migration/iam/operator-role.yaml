@@ -1,10 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  Least-privilege operator role for the Agones-to-GameLift reference
-  environment. It can create and delete only the demo's own EKS cluster
-  (through eksctl), the demo's GameLift container-fleet stacks, and the demo's
-  ECR repository, in one Region. Deploy it in a non-production account, assume
-  it for the demo, and delete it afterwards. It is never used by the assistant.
+  Operator role for the Agones-to-GameLift reference environment. Use it only in
+  a dedicated sandbox account with no other workloads: its EC2 permissions (the
+  eksctl minimum) apply to every EC2 resource in the Region. Its IAM, EKS,
+  CloudFormation, GameLift, and ECR permissions are scoped to this environment,
+  and every role it creates must carry the workload permissions boundary below.
+  It is never used by the assistant.
 
 Parameters:
   OperatorPrincipalArn:
@@ -14,11 +15,12 @@ Parameters:
   ClusterName:
     Type: String
     Default: agones-demo
+    Description: EKS cluster name; also the demo-env tag value that scopes GameLift resources.
     AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
   StackPrefix:
     Type: String
     Default: gl-demo
-    Description: Name prefix of the GameLift container-fleet stacks.
+    Description: Name prefix of the GameLift container-fleet stacks and their IAM roles.
     AllowedPattern: "^[a-z][a-z0-9-]{2,20}$"
   RepositoryName:
     Type: String
@@ -31,11 +33,98 @@ Parameters:
     AllowedPattern: "^[A-Za-z0-9+=,.@_-]{1,64}$"
 
 Resources:
+  # Ceiling for every role this environment creates (EKS cluster role, node
+  # role, GameLift fleet roles). It covers the services their allowlisted AWS
+  # managed policies use and nothing else: no IAM beyond service-linked roles,
+  # no Systems Manager commands, and no S3 reads. It also denies the EC2
+  # actions that can run code as another role. AmazonEKSClusterPolicy lists
+  # ec2:ModifyInstanceAttribute for load balancer security groups; this
+  # environment creates no load balancers, so the deny costs nothing here.
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ClusterName}-workload-boundary"
+      Description: Permissions boundary for roles created by the Agones-to-GameLift reference environment.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EksClusterAndNodes
+            Effect: Allow
+            Action:
+              - ec2:*
+              - elasticloadbalancing:*
+              - autoscaling:*
+              - eks:*
+              - eks-auth:AssumeRoleForPodIdentity
+              - kms:CreateGrant
+              - kms:DescribeKey
+              - iam:CreateServiceLinkedRole
+            Resource: "*"
+          - Sid: PullImages
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+              - ecr:GetRepositoryPolicy
+              - ecr:GetLifecyclePolicy
+              - ecr:GetLifecyclePolicyPreview
+              - ecr:ListTagsForResource
+              - ecr:DescribeImageScanFindings
+            Resource: "*"
+          - Sid: NodeManagementAgent
+            Effect: Allow
+            Action:
+              - ssm:DescribeAssociation
+              - ssm:GetDeployablePatchSnapshotForInstance
+              - ssm:GetDocument
+              - ssm:DescribeDocument
+              - ssm:GetManifest
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:ListAssociations
+              - ssm:ListInstanceAssociations
+              - ssm:PutInventory
+              - ssm:PutComplianceItems
+              - ssm:PutConfigurePackageResult
+              - ssm:UpdateAssociationStatus
+              - ssm:UpdateInstanceAssociationStatus
+              - ssm:UpdateInstanceInformation
+              - ssmmessages:*
+              - ec2messages:*
+            Resource: "*"
+          - Sid: GameLiftFleetRuntime
+            Effect: Allow
+            Action:
+              - gamelift:GetComputeAuthToken
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:PutRetentionPolicy
+              - s3:PutObject
+              - s3:GetBucketLocation
+              - cloudwatch:PutMetricData
+            Resource: "*"
+          - Sid: DenyCodeExecutionAsOtherRoles
+            Effect: Deny
+            Action:
+              - ec2:ModifyInstanceAttribute
+              - ec2:ModifySnapshotAttribute
+              - ec2:ModifyImageAttribute
+              - ec2:CreateSnapshot
+              - ec2:CreateSnapshots
+              - ec2:GetPasswordData
+            Resource: "*"
+
   OperatorRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub "${ClusterName}-operator"
-      Description: Operator role for the Agones-to-GameLift reference environment (demo only).
+      Description: Operator role for the Agones-to-GameLift reference environment (dedicated sandbox account only).
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -44,6 +133,8 @@ Resources:
             Principal:
               AWS: !Ref OperatorPrincipalArn
             Action: sts:AssumeRole
+      # No demo-env tag: the role outlives `demo.sh down`, which must not find
+      # it, and is deleted last with the operator's own credentials.
       Tags:
         - Key: demo
           Value: agones-gamelift-migration
@@ -52,7 +143,9 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # Everything below is confined to the stack's Region.
+              # ----------------------------------------------------------------
+              # Guard rails
+              # ----------------------------------------------------------------
               - Sid: DenyOtherRegions
                 Effect: Deny
                 NotAction:
@@ -62,11 +155,60 @@ Resources:
                 Condition:
                   StringNotEquals:
                     aws:RequestedRegion: !Ref AWS::Region
+              - Sid: DenyCodeExecutionAsOtherRoles
+                Effect: Deny
+                Action:
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:ModifySnapshotAttribute
+                  - ec2:ModifyImageAttribute
+                  - ec2:CreateSnapshot
+                  - ec2:CreateSnapshots
+                  - ec2:GetPasswordData
+                  - ec2:CreateVpcPeeringConnection
+                  - ec2:AcceptVpcPeeringConnection
+                  - ec2:CreateVpnConnection
+                  - ec2:CreateVpnGateway
+                  - ec2:AttachVpnGateway
+                  - ec2:CreateCustomerGateway
+                  - ec2:CreateTransitGatewayVpcAttachment
+                  - ec2:AcceptTransitGatewayVpcAttachment
+                Resource: "*"
+              - Sid: DenyBoundaryRemovalOrReplacement
+                Effect: Deny
+                Action: iam:DeleteRolePermissionsBoundary
+                Resource: "*"
+              - Sid: DenyOtherBoundaries
+                Effect: Deny
+                Action:
+                  - iam:CreateRole
+                  - iam:PutRolePermissionsBoundary
+                Resource: "*"
+                Condition:
+                  StringNotEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+              - Sid: DenyChangesToProtectedIdentities
+                Effect: Deny
+                Action:
+                  - iam:Attach*
+                  - iam:Put*
+                  - iam:Update*
+                  - iam:Delete*
+                  - iam:Detach*
+                  - iam:CreatePolicyVersion
+                  - iam:SetDefaultPolicyVersion
+                  - iam:Tag*
+                  - iam:Untag*
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AgentRoleName}"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ClusterName}-operator"
+                  - !Ref WorkloadBoundary
 
-              # eksctl manages the VPC, subnets, NAT gateway, security groups,
-              # launch templates, and node instances through CloudFormation.
-              # Mirrors the eksctl minimum policy (AmazonEC2FullAccess), limited
-              # to one Region by the statement above.
+              # ----------------------------------------------------------------
+              # EC2 for eksctl (VPC, subnets, NAT gateway, security groups,
+              # launch templates, node instances). This is the eksctl minimum
+              # and is not resource-scoped; hence the dedicated-account rule.
+              # ----------------------------------------------------------------
               - Sid: Ec2ForEksctl
                 Effect: Allow
                 Action:
@@ -105,7 +247,6 @@ Resources:
               - Sid: EksAccountReads
                 Effect: Allow
                 Action:
-                  - eks:CreateCluster
                   - eks:ListClusters
                   - eks:DescribeAddonVersions
                   - eks:DescribeAddonConfiguration
@@ -123,26 +264,63 @@ Resources:
                 Action: logs:PutRetentionPolicy
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/*"
 
-              # IAM: only eksctl-created roles and instance profiles for this
-              # cluster, and the GameLift fleet roles created by demo stacks.
-              - Sid: IamDemoRoles
+              # ----------------------------------------------------------------
+              # IAM: only the roles this environment creates, always under the
+              # workload boundary, with an allowlist of attachable policies.
+              # ----------------------------------------------------------------
+              - Sid: IamCreateBoundedRoles
                 Effect: Allow
                 Action:
                   - iam:CreateRole
+                  - iam:PutRolePermissionsBoundary
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackPrefix}-*"
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+              - Sid: IamAttachAllowlistedPolicies
+                Effect: Allow
+                Action: iam:AttachRolePolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*"
+                  - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackPrefix}-*"
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+                  ArnLike:
+                    iam:PolicyARN:
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSVPCResourceController"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+                      - !Sub "arn:${AWS::Partition}:iam::aws:policy/GameLiftContainerFleetPolicy"
+                      - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/eksctl-${ClusterName}-*"
+              # eksctl may add inline policies to its own roles; GameLift
+              # stack roles get none.
+              - Sid: IamInlinePoliciesOnEksctlRolesOnly
+                Effect: Allow
+                Action: iam:PutRolePolicy
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*"
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref WorkloadBoundary
+              - Sid: IamManageDemoRoles
+                Effect: Allow
+                Action:
                   - iam:DeleteRole
                   - iam:GetRole
                   - iam:TagRole
                   - iam:UntagRole
-                  - iam:UpdateAssumeRolePolicy
-                  - iam:AttachRolePolicy
                   - iam:DetachRolePolicy
-                  - iam:PutRolePolicy
                   - iam:GetRolePolicy
                   - iam:DeleteRolePolicy
                   - iam:ListAttachedRolePolicies
                   - iam:ListRolePolicies
                   - iam:ListInstanceProfilesForRole
-                  - iam:UpdateRole
                   - iam:UpdateRoleDescription
                   - iam:CreateInstanceProfile
                   - iam:DeleteInstanceProfile
@@ -186,12 +364,14 @@ Resources:
                   - iam:GetPolicy
                   - iam:ListPolicyVersions
                 Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/eksctl-${ClusterName}-*"
-              - Sid: IamReadManagedPolicies
+              - Sid: IamReadPolicies
                 Effect: Allow
                 Action:
                   - iam:GetPolicy
                   - iam:GetPolicyVersion
-                Resource: !Sub "arn:${AWS::Partition}:iam::aws:policy/*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:iam::aws:policy/*"
+                  - !Ref WorkloadBoundary
               - Sid: ServiceLinkedRoles
                 Effect: Allow
                 Action: iam:CreateServiceLinkedRole
@@ -203,46 +383,83 @@ Resources:
                       - eks-nodegroup.amazonaws.com
                       - autoscaling.amazonaws.com
 
-              # GameLift container fleets, container group definitions, and
-              # queues created by the demo stacks, plus test game sessions. The
-              # first block is the union of the CloudFormation registry handler
-              # permissions for AWS::GameLift::ContainerFleet,
+              # ----------------------------------------------------------------
+              # GameLift: every create must carry this environment's demo-env
+              # tag. GameLift authorizes creates against "<type>/*" (verified
+              # live for container group definitions), so a create cannot be
+              # scoped by name; changes and deletes are. Container group
+              # definitions and queues can be changed or deleted only under
+              # <prefix>-* names, and fleets, whose ARNs hold a generated ID,
+              # only while they carry the demo-env tag. The actions are the
+              # CloudFormation registry handler permissions for ContainerFleet,
               # ContainerGroupDefinition, and GameSessionQueue.
-              - Sid: GameLiftContainerHosting
+              # ----------------------------------------------------------------
+              - Sid: GameLiftCreateTagged
                 Effect: Allow
                 Action:
                   - gamelift:CreateContainerGroupDefinition
+                  - gamelift:CreateGameSessionQueue
+                  - gamelift:CreateContainerFleet
+                  - gamelift:TagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/demo-env: !Ref ClusterName
+              # No tag condition: a rollback deletes definitions it never
+              # finished creating, which carry no tags yet.
+              - Sid: GameLiftChangeNamedOnly
+                Effect: Allow
+                Action:
                   - gamelift:UpdateContainerGroupDefinition
                   - gamelift:DeleteContainerGroupDefinition
-                  - gamelift:DescribeContainerGroupDefinition
-                  - gamelift:ListContainerGroupDefinitions
-                  - gamelift:CreateContainerFleet
+                  - gamelift:UpdateGameSessionQueue
+                  - gamelift:DeleteGameSessionQueue
+                  - gamelift:UntagResource
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:containergroupdefinition/${StackPrefix}-*"
+                  - !Sub "arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:gamesessionqueue/${StackPrefix}-*"
+              - Sid: GameLiftChangeTaggedFleetsOnly
+                Effect: Allow
+                Action:
                   - gamelift:UpdateContainerFleet
                   - gamelift:DeleteContainerFleet
-                  - gamelift:DescribeContainerFleet
-                  - gamelift:ListContainerFleets
                   - gamelift:CreateFleetLocations
                   - gamelift:DeleteFleetLocations
-                  - gamelift:DescribeFleetDeployment
-                  - gamelift:DescribeFleetLocationAttributes
-                  - gamelift:DescribeFleetLocationCapacity
                   - gamelift:UpdateFleetCapacity
                   - gamelift:StartFleetActions
                   - gamelift:StopFleetActions
-                  - gamelift:DescribeScalingPolicies
                   - gamelift:PutScalingPolicy
                   - gamelift:DeleteScalingPolicy
-                  - gamelift:CreateGameSessionQueue
-                  - gamelift:UpdateGameSessionQueue
-                  - gamelift:DeleteGameSessionQueue
-                  - gamelift:DescribeGameSessionQueues
-                  - gamelift:TagResource
                   - gamelift:UntagResource
-                  - gamelift:ListTagsForResource
-                  # Operator checks and test sessions (not used by CloudFormation).
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:containerfleet/*"
+                  - !Sub "arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:fleet/*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/demo-env: !Ref ClusterName
+              # CreateGameSession has no resource type or condition keys in the
+              # Service Authorization Reference, so it cannot be scoped. It
+              # starts a session on an existing fleet's server process and
+              # changes no infrastructure; the dedicated-account rule covers it.
+              - Sid: GameLiftStartTestSessions
+                Effect: Allow
+                Action: gamelift:CreateGameSession
+                Resource: "*"
+              - Sid: GameLiftReads
+                Effect: Allow
+                Action:
+                  - gamelift:DescribeContainerGroupDefinition
+                  - gamelift:ListContainerGroupDefinitions
+                  - gamelift:DescribeContainerFleet
+                  - gamelift:ListContainerFleets
+                  - gamelift:DescribeFleetDeployment
+                  - gamelift:DescribeFleetLocationAttributes
+                  - gamelift:DescribeFleetLocationCapacity
                   - gamelift:DescribeFleetCapacity
-                  - gamelift:CreateGameSession
+                  - gamelift:DescribeScalingPolicies
+                  - gamelift:DescribeGameSessionQueues
                   - gamelift:DescribeGameSessions
+                  - gamelift:ListTagsForResource
                 Resource: "*"
 
               - Sid: EcrDemoRepository
@@ -253,6 +470,7 @@ Resources:
                   - ecr:DescribeRepositories
                   - ecr:DescribeImages
                   - ecr:ListImages
+                  - ecr:ListTagsForResource
                   - ecr:BatchGetImage
                   - ecr:BatchDeleteImage
                   - ecr:BatchCheckLayerAvailability
@@ -279,3 +497,6 @@ Resources:
 Outputs:
   OperatorRoleArn:
     Value: !GetAtt OperatorRole.Arn
+  WorkloadBoundaryArn:
+    Description: Permissions boundary that demo.sh, eksctl, and the GameLift stacks attach to every role they create.
+    Value: !Ref WorkloadBoundary

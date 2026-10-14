@@ -19,10 +19,14 @@ Kit's GameLift SDK wrapper (Go Server SDK 5.2.0, checksum-verified). The wrapper
 calls `InitSDK` and `ProcessReady`, activates game sessions, and calls
 `ProcessEnding`.
 
+Run these from this directory, with `CLUSTER_NAME`, `OWNER`, and `EXPIRES_AT`
+set as in the main README:
+
 ```bash
 REPO=agones-gamelift-demo/game-server            # must match the operator role's RepositoryName
 aws ecr create-repository --repository-name "$REPO" --image-scanning-configuration scanOnPush=true \
-  --tags Key=demo,Value=agones-gamelift-migration Key=demo-env,Value=agones-demo Key=owner,Value="$OWNER"
+  --tags Key=demo,Value=agones-gamelift-migration Key=demo-env,Value="$CLUSTER_NAME" \
+    Key=owner,Value="$OWNER" Key=expires-at,Value="$EXPIRES_AT"
 URI=$(aws ecr describe-repositories --repository-names "$REPO" --query 'repositories[0].repositoryUri' --output text)
 aws ecr get-login-password | docker login --username AWS --password-stdin "${URI%%/*}"
 ./server/build.sh "$URI" v1                      # GAME_PORT=7777 ./server/build.sh "$URI" v1-port7777 for another port
@@ -48,26 +52,52 @@ What to look for (the reference template shows each one):
   `GameLiftContainerFleetPolicy`.
 - A `GameSessionQueue` that targets the fleet ARN, and a target-based scaling
   policy on `PercentAvailableGameSessions`.
+- `InstanceConnectionPortRange` and `InstanceInboundPermissions` set
+  explicitly, with matching ports and a narrow source (the cluster's NAT
+  `/32`), never `0.0.0.0/0` or `::/0`. Without them the fleet gets a default
+  rule that is open to every address from the moment its instances launch.
+- Every `AWS::IAM::Role` has `PermissionsBoundary` set to the workload
+  boundary (`../scripts/demo.sh boundary-arn`); the operator role cannot create
+  a role without it. Add the boundary, and the source CIDR above, as
+  parameters if the template lacks them.
+- `demo` and `demo-env` tags on the stack (see step 3), so that the operator
+  role allows the GameLift resources and `down` finds the stack.
 - Only the resources you expect, small capacity, and one location.
 
 ## 3. Deploy
 
+The reference template, as a baseline:
+
+```bash
+aws cloudformation deploy --stack-name gl-demo-reference --template-file container-fleet.reference.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides GameServerImageUri="$URI:v1" DemoEnv="$CLUSTER_NAME" \
+    PlayerSourceCidr="$(../scripts/demo.sh nat-cidr)" BoundaryArn="$(../scripts/demo.sh boundary-arn)" \
+  --tags demo=agones-gamelift-migration demo-env="$CLUSTER_NAME" owner="$OWNER" expires-at="$EXPIRES_AT"
+```
+
+A reviewed generated template, with the same tags and the parameters it
+declares:
+
 ```bash
 aws cloudformation deploy --stack-name gl-demo-migration --template-file <template> \
-  --capabilities CAPABILITY_NAMED_IAM --parameter-overrides <ImageParameter>="$URI:v1" \
-  --tags demo=agones-gamelift-migration demo-env=agones-demo owner="$OWNER"
+  --capabilities CAPABILITY_NAMED_IAM --parameter-overrides <ImageParameter>="$URI:v1" <other parameters> \
+  --tags demo=agones-gamelift-migration demo-env="$CLUSTER_NAME" owner="$OWNER" expires-at="$EXPIRES_AT"
 ```
 
 Stack names must start with `gl-demo-`; the operator role allows no other.
+CloudFormation passes the stack tags on every create call, which is what the
+operator role's `demo-env` condition checks.
 The container group definition first copies the image (`COPYING` → `READY`).
 The fleet then provisions instances and reaches `ACTIVE`, typically in 20–40
 minutes.
 
-## 4. Restrict ingress and send players to GameLift
+## 4. Check ingress and send players to GameLift
 
-A container fleet created without explicit inbound permissions opens its
-connection port range to every address. Replace that rule with the cluster's
-NAT gateway address, then simulate players from inside the cluster:
+`restrict-fleet-ingress` makes the fleet's inbound permissions exactly UDP on
+the connection port range from the cluster's NAT gateway address, re-reads the
+fleet, and fails if anything else remains. For the reference template it only
+confirms what the template set. Then simulate players from inside the cluster:
 
 ```bash
 ../scripts/demo.sh restrict-fleet-ingress gl-demo-migration

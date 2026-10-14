@@ -4,7 +4,8 @@
 GameLift Servers Containers Starter Kit:
 https://github.com/aws/amazon-gamelift-toolkit/tree/main/containers-starter-kit/SdkGoWrapper
 
-Licensed under the Apache License 2.0 (see the upstream repository's LICENSE).
+Licensed under the Apache License 2.0: see `LICENSE` and `NOTICE` in this
+directory, copied from the upstream repository.
 
 The wrapper initializes the GameLift Go Server SDK (5.2.0, downloaded at image
 build time), calls `ProcessReady` for the game port, activates game sessions,

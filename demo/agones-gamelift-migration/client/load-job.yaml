@@ -12,15 +12,37 @@ metadata:
     demo: agones-gamelift-migration
 spec:
   backoffLimit: 0
+  # `demo.sh load` sets the deadline to the run time plus 300 seconds.
+  activeDeadlineSeconds: 420
+  ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels:
         demo: agones-gamelift-migration
     spec:
       restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: load
           image: python:3.12.15-alpine3.24
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
           env:
             - name: TARGET_HOST
               value: "REPLACE_WITH_GAMESERVER_POD_IP"

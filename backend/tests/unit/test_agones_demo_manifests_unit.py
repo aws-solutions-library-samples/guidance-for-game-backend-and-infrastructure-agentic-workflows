@@ -7,6 +7,7 @@ Agones services, and a region-bound, resource-scoped operator role.
 """
 
 # Standard library
+import re
 from pathlib import Path
 from typing import Any
 
@@ -63,17 +64,200 @@ def test_agones_services_stay_cluster_internal():
     assert agones["ping"]["udp"]["serviceType"] == "ClusterIP"
 
 
-def test_load_job_is_bounded():
+def test_cluster_roles_carry_the_workload_boundary():
+    (config,) = _docs("eks/cluster.yaml")
+    assert config["iam"]["serviceRolePermissionsBoundary"] == "__BOUNDARY_ARN__"
+    for group in config["managedNodeGroups"]:
+        assert group["iam"]["instanceRolePermissionsBoundary"] == "__BOUNDARY_ARN__"
+
+
+def test_load_job_is_bounded_and_unprivileged():
     (job,) = _docs("client/load-job.yaml")
-    assert job["spec"]["backoffLimit"] == 0
-    assert job["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+    spec = job["spec"]
+    assert spec["backoffLimit"] == 0
+    assert spec["activeDeadlineSeconds"] > 0
+    assert spec["ttlSecondsAfterFinished"] > 0
+    pod = spec["template"]["spec"]
+    assert pod["restartPolicy"] == "Never"
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["securityContext"]["runAsNonRoot"] is True
+    for container in pod["containers"]:
+        context = container["securityContext"]
+        assert context["allowPrivilegeEscalation"] is False
+        assert context["capabilities"]["drop"] == ["ALL"]
+        assert {"cpu", "memory"} <= set(container["resources"]["limits"])
+
+
+def test_fleet_game_server_is_unprivileged():
+    (fleet,) = _docs("agones/fleet.yaml")
+    for container in fleet["spec"]["template"]["spec"]["template"]["spec"]["containers"]:
+        context = container["securityContext"]
+        assert context["runAsNonRoot"] is True
+        assert context["allowPrivilegeEscalation"] is False
+        assert context["capabilities"]["drop"] == ["ALL"]
+
+
+def _operator_template() -> dict[str, Any]:
+    return load_cfn_template((_DEMO / "iam" / "operator-role.yaml").read_text(encoding="utf-8"))
 
 
 def _statements() -> list[dict[str, Any]]:
-    template = load_cfn_template((_DEMO / "iam" / "operator-role.yaml").read_text(encoding="utf-8"))
-    role = template["Resources"]["OperatorRole"]["Properties"]
+    role = _operator_template()["Resources"]["OperatorRole"]["Properties"]
     assert role["MaxSessionDuration"] == 3600
     return role["Policies"][0]["PolicyDocument"]["Statement"]
+
+
+def _by_sid() -> dict[str, dict[str, Any]]:
+    return {s["Sid"]: s for s in _statements()}
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+_DEMO_ROLE_PATTERNS = {
+    "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*",
+    "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${StackPrefix}-*",
+}
+_CODE_EXECUTION_ACTIONS = {
+    "ec2:ModifyInstanceAttribute",
+    "ec2:ModifySnapshotAttribute",
+    "ec2:ModifyImageAttribute",
+    "ec2:CreateSnapshot",
+    "ec2:CreateSnapshots",
+    "ec2:GetPasswordData",
+}
+
+
+def test_role_creation_and_policy_changes_require_the_workload_boundary():
+    by_sid = _by_sid()
+    role_writes = {"iam:CreateRole", "iam:PutRolePermissionsBoundary", "iam:AttachRolePolicy", "iam:PutRolePolicy"}
+    for statement in _statements():
+        if statement["Effect"] != "Allow":
+            continue
+        granted = role_writes & set(_actions(statement))
+        if not granted:
+            continue
+        assert statement["Condition"]["StringEquals"]["iam:PermissionsBoundary"] == "WorkloadBoundary", statement["Sid"]
+        assert set(_list(statement["Resource"])) <= _DEMO_ROLE_PATTERNS, statement["Sid"]
+    deny = by_sid["DenyOtherBoundaries"]
+    assert deny["Effect"] == "Deny"
+    assert {"iam:CreateRole", "iam:PutRolePermissionsBoundary"} <= set(_actions(deny))
+    assert deny["Condition"]["StringNotEquals"]["iam:PermissionsBoundary"] == "WorkloadBoundary"
+    removal = by_sid["DenyBoundaryRemovalOrReplacement"]
+    assert removal["Effect"] == "Deny" and _actions(removal) == ["iam:DeleteRolePermissionsBoundary"]
+    assert removal["Resource"] == "*"
+
+
+def test_attachable_policies_are_an_allowlist():
+    attach = _by_sid()["IamAttachAllowlistedPolicies"]
+    assert _actions(attach) == ["iam:AttachRolePolicy"]
+    allowed = set(attach["Condition"]["ArnLike"]["iam:PolicyARN"])
+    managed = {a.rsplit("/", 1)[1] for a in allowed if ":iam::aws:policy/" in a}
+    assert managed == {
+        "AmazonEKSClusterPolicy",
+        "AmazonEKSVPCResourceController",
+        "AmazonEKSWorkerNodePolicy",
+        "AmazonEKS_CNI_Policy",
+        "AmazonEC2ContainerRegistryReadOnly",
+        "AmazonEC2ContainerRegistryPullOnly",
+        "AmazonSSMManagedInstanceCore",
+        "GameLiftContainerFleetPolicy",
+    }
+    customer = allowed - {a for a in allowed if ":iam::aws:policy/" in a}
+    assert customer == {"arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/eksctl-${ClusterName}-*"}
+    assert not any("*" in a.rsplit("/", 1)[1] for a in allowed - customer)
+
+
+def test_inline_policies_only_on_eksctl_roles():
+    for statement in _statements():
+        if statement["Effect"] == "Allow" and "iam:PutRolePolicy" in _actions(statement):
+            resources = set(_list(statement["Resource"]))
+            assert resources == {"arn:${AWS::Partition}:iam::${AWS::AccountId}:role/eksctl-${ClusterName}-*"}
+
+
+def test_operator_role_cannot_change_protected_identities():
+    deny = _by_sid()["DenyChangesToProtectedIdentities"]
+    assert deny["Effect"] == "Deny"
+    assert {"iam:Attach*", "iam:Put*", "iam:Delete*", "iam:PassRole"} <= set(_actions(deny))
+    resources = _list(deny["Resource"])
+    assert "WorkloadBoundary" in resources
+    subs = set(resources)
+    assert "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AgentRoleName}" in subs
+    assert "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ClusterName}-operator" in subs
+
+
+def test_code_execution_ec2_actions_are_denied_for_operator_and_workloads():
+    operator = _by_sid()["DenyCodeExecutionAsOtherRoles"]
+    assert operator["Effect"] == "Deny" and operator["Resource"] == "*"
+    assert _CODE_EXECUTION_ACTIONS | {
+        "ec2:CreateVpcPeeringConnection",
+        "ec2:CreateVpnConnection",
+        "ec2:CreateTransitGatewayVpcAttachment",
+    } <= set(_actions(operator))
+    boundary = _operator_template()["Resources"]["WorkloadBoundary"]["Properties"]["PolicyDocument"]["Statement"]
+    deny = next(s for s in boundary if s["Effect"] == "Deny")
+    assert _CODE_EXECUTION_ACTIONS <= set(_actions(deny))
+    allowed = {a for s in boundary if s["Effect"] == "Allow" for a in _actions(s)}
+    assert not any(a.startswith(("iam:", "sts:")) for a in allowed - {"iam:CreateServiceLinkedRole"})
+    assert "*" not in allowed and "ssm:SendCommand" not in allowed and "s3:GetObject" not in allowed
+
+
+def test_gamelift_writes_are_scoped_by_name_or_demo_env_tag():
+    prefixed = {
+        "arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:containergroupdefinition/${StackPrefix}-*",
+        "arn:${AWS::Partition}:gamelift:${AWS::Region}:${AWS::AccountId}:gamesessionqueue/${StackPrefix}-*",
+    }
+    for statement in _statements():
+        actions = [a for a in _actions(statement) if a.startswith("gamelift:")]
+        if statement["Effect"] != "Allow" or not actions or statement["Sid"] == "GameLiftReads":
+            continue
+        if statement["Sid"] == "GameLiftStartTestSessions":
+            # Not scopable (no resource type or condition keys); nothing else may ride along.
+            assert _actions(statement) == ["gamelift:CreateGameSession"]
+            continue
+        condition = statement.get("Condition", {}).get("StringEquals", {})
+        tagged = bool(set(condition) & {"aws:RequestTag/demo-env", "aws:ResourceTag/demo-env"})
+        if tagged:
+            assert all(v == "ClusterName" for v in condition.values()), statement["Sid"]
+        else:
+            assert set(_list(statement["Resource"])) <= prefixed, statement["Sid"]
+        top_level_creates = {
+            "gamelift:CreateContainerFleet",
+            "gamelift:CreateContainerGroupDefinition",
+            "gamelift:CreateGameSessionQueue",
+        }
+        if top_level_creates & set(actions):
+            assert condition.get("aws:RequestTag/demo-env") == "ClusterName", statement["Sid"]
+    fleets = _by_sid()["GameLiftChangeTaggedFleetsOnly"]
+    assert fleets["Condition"]["StringEquals"]["aws:ResourceTag/demo-env"] == "ClusterName"
+    assert {"gamelift:DeleteContainerFleet", "gamelift:UpdateContainerFleet"} <= set(_actions(fleets))
+    reads_actions = _actions(_by_sid()["GameLiftReads"])
+    assert all(a.split(":")[1].startswith(("Describe", "List")) for a in reads_actions)
+
+
+def test_reference_fleet_is_closed_by_default_bounded_and_tagged():
+    template = load_cfn_template((_DEMO / "gamelift" / "container-fleet.reference.yaml").read_text(encoding="utf-8"))
+    parameters = template["Parameters"]
+    source = parameters["PlayerSourceCidr"]
+    assert "Default" not in source
+    pattern = re.compile(source["AllowedPattern"])
+    for accepted in ("198.51.100.7/32", "203.0.113.16/28"):
+        assert pattern.fullmatch(accepted), accepted
+    for rejected in ("0.0.0.0/0", "10.0.0.0/8", "198.51.100.0/24", "198.51.100.7", "::/0", "256.1.1.1/32"):
+        assert not pattern.fullmatch(rejected), rejected
+    resources = template["Resources"]
+    fleet = resources["ContainerFleet"]["Properties"]
+    ports = fleet["InstanceConnectionPortRange"]
+    (permission,) = fleet["InstanceInboundPermissions"]
+    assert permission["IpRange"] == "PlayerSourceCidr"
+    assert (permission["FromPort"], permission["ToPort"]) == (ports["FromPort"], ports["ToPort"])
+    assert permission["Protocol"] == "UDP"
+    assert fleet["Locations"][0]["LocationCapacity"]["MaxSize"] <= 3
+    assert resources["FleetRole"]["Properties"]["PermissionsBoundary"] == "BoundaryArn"
+    for name in ("FleetRole", "GameServerContainerGroup", "ContainerFleet", "GameSessionQueue"):
+        tags = {t["Key"]: t["Value"] for t in resources[name]["Properties"]["Tags"]}
+        assert tags == {"demo": "agones-gamelift-migration", "demo-env": "DemoEnv"}, name
 
 
 def _actions(statement: dict[str, Any]) -> list[str]:

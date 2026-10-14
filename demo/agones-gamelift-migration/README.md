@@ -6,9 +6,11 @@ read-only migration advice. It runs a real Agones fleet on Amazon EKS (the
 proposes (the "to" side), then compare the two under simulated player load.
 
 **Boundaries**
-- You run every step yourself, with a purpose-built operator role, in a
-  non-production account. Nothing here is part of `deploy-all.sh`,
-  `scripts/deploy.sh`, or the product's stacks.
+- Use a dedicated sandbox account with no other workloads. The operator role's
+  EC2 permissions are the eksctl minimum and apply to every EC2 resource in the
+  Region; everything else it can touch is scoped to this environment.
+- You run every step yourself, with that operator role. Nothing here is part
+  of `deploy-all.sh`, `scripts/deploy.sh`, or the product's stacks.
 - The assistant stays read-only. It gets `get`/`list`/`watch` on core and Agones
   resources through the canonical enrollment script, and never these operator
   permissions.
@@ -20,15 +22,15 @@ proposes (the "to" side), then compare the two under simulated player load.
 
 | Path | Purpose |
 |---|---|
-| `iam/operator-role.yaml` | Least-privilege operator role: region-bound, scoped to this cluster, `gl-demo-*` stacks, and one ECR repository |
+| `iam/operator-role.yaml` | Operator role and the permissions boundary for every role it creates. Region-bound; IAM, EKS, CloudFormation, GameLift, and ECR access is scoped to this environment, while EC2 access covers the Region (hence the dedicated account) |
 | `eks/cluster.yaml` | eksctl config: EKS 1.35, private nodes, single NAT gateway, API limited to your `/32` |
 | `agones/helm-values.yaml` | Keeps every Agones service cluster-internal (no load balancers) |
 | `agones/fleet.yaml` | `simple-game-server` fleet (UDP 7654), the workload migrated from |
 | `agones/allocation.yaml` | Allocates a game server ("start a match") |
 | `agones/agent-readonly-rbac.yaml` | Read-only Agones access for the assistant's enrolled group |
 | `client/load-job.yaml` | In-cluster UDP player simulator |
-| `scripts/demo.sh` | Operator commands: `preflight`, `cluster-up`, `agones-up`, `enroll-agent`, `restrict-fleet-ingress`, `load`, `down`, `verify-clean` |
-| `gamelift/` | GameLift-ready game server image, reference template, generated template, deploy steps |
+| `scripts/demo.sh` | Operator commands: `preflight`, `cluster-up`, `agones-up`, `enroll-agent`, `kubeconfig`, `nat-cidr`, `boundary-arn`, `restrict-fleet-ingress`, `load`, `down`, `verify-clean` |
+| `gamelift/` | GameLift-ready game server image, reference template, review checklist, deploy steps |
 
 ## Versions
 
@@ -53,46 +55,79 @@ or 4.x, `jq`, and, to build the image, Go 1.25 and Docker.
 | 2 × m5.large nodes | USD 0.192/hour | Whole demo |
 | NAT gateway, plus USD 0.045/GB processed | USD 0.045/hour | Whole demo |
 | Public IPv4 address (NAT) | USD 0.005/hour | Whole demo |
+| 2 × 30 GiB gp3 node volumes | about USD 0.007/hour | Whole demo |
 | GameLift container fleet, 1 × c6i.large (per stack) | USD 0.109/hour | From stack create to delete |
 
-The EKS environment costs about **USD 0.34/hour**, plus about **USD 0.11/hour
-per GameLift stack**. A typical four-hour session with two stacks costs about
-USD 2.30, before data transfer and ECR storage. Rates are from the AWS Price
-List API at the time of writing; check current pricing before you start.
+The EKS environment costs about **USD 0.35/hour**, plus about **USD 0.11/hour
+per GameLift stack**. The reference fleet can scale to its `MaxSize` of 3
+instances, so a stack can reach about USD 0.33/hour. A typical four-hour
+session with two stacks costs about USD 2.30, before data transfer and ECR
+storage. Rates are from the AWS Price List API at the time of writing; check
+current pricing before you start, and consider an AWS Budgets alert on the
+account (for example, USD 10 per month).
 
-Every taggable resource gets `demo=agones-gamelift-migration`, `demo-env=<cluster name>`, `owner=<you>`,
-and `expires-at=<now + MAX_HOURS>` (default 4 hours, at most 8). The tag records
-your intent; nothing deletes resources automatically, so run `down` when you
-finish. An EKS version that falls out of standard support bills extended
-support at USD 0.60/hour, which is one more reason to delete the cluster
-promptly.
+Tags record intent; nothing deletes resources automatically, so run `down`
+when you finish. The commands below tag resources as follows:
+
+| Resources | Tags |
+|---|---|
+| eksctl stacks, cluster, node group, and their taggable EC2 resources | `demo`, `demo-env`, `owner`, `expires-at` |
+| GameLift stacks and the resources in them | `demo`, `demo-env`, `owner`, `expires-at` (stack tags); the reference template also sets `demo` and `demo-env` on each resource |
+| ECR repository | `demo`, `demo-env`, `owner`, `expires-at` |
+| Operator-role stack and role | `demo`, `owner` only: the role outlives `down`, which must not find it |
+
+`demo=agones-gamelift-migration`, `demo-env` is the cluster name, `owner` is
+`OWNER`, and `expires-at` is now plus `MAX_HOURS` (default 4 hours, at most 8).
+An EKS version that falls out of standard support bills extended support at
+USD 0.60/hour, which is one more reason to delete the cluster promptly.
 
 ## Runbook
 
-### 0. Operator role (once per account)
+Run the commands from this directory. Set these once per shell:
 
 ```bash
-aws cloudformation deploy --stack-name agones-demo-operator-role \
-  --template-file iam/operator-role.yaml --capabilities CAPABILITY_NAMED_IAM \
-  --parameter-overrides OperatorPrincipalArn=arn:aws:iam::123456789012:role/ExampleOperator
+export AWS_REGION=us-east-1 CLUSTER_NAME=agones-demo OWNER=example-owner
+EXPIRES_AT="$(date -u -v+4H +%Y-%m-%dT%H-%M-%SZ 2>/dev/null || date -u -d '+4 hours' +%Y-%m-%dT%H-%M-%SZ)"
 ```
 
-Assume the `agones-demo-operator` role for every following step, for example
-through a named profile with `role_arn` and `source_profile`. The role's
-sessions last at most one hour; re-assume it as needed.
+### 0. Operator role (once per environment)
+
+With your own credentials:
+
+```bash
+aws cloudformation deploy --stack-name "$CLUSTER_NAME-operator-role" \
+  --template-file iam/operator-role.yaml --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides OperatorPrincipalArn=arn:aws:iam::123456789012:role/ExampleOperator \
+    ClusterName="$CLUSTER_NAME" \
+  --tags demo=agones-gamelift-migration owner="$OWNER"
+```
+
+The stack creates the `<cluster>-operator` role and the
+`<cluster>-workload-boundary` policy. Every role the environment creates
+(the EKS cluster and node roles, and each GameLift fleet role) must carry that
+boundary; the operator role cannot create a role without it, attach any policy
+outside a short allowlist, or change the boundary, the assistant's role, or
+itself.
+
+Assume the operator role for every following step, for example through a named
+profile with `role_arn` and `source_profile`. Its sessions last at most one
+hour; re-assume it as needed.
 
 ### 1. Cluster (about 20 minutes)
 
 ```bash
-export AWS_REGION=us-east-1 OWNER=example-owner
 export OPERATOR_CIDR="$(curl -s https://checkip.amazonaws.com)/32"
 scripts/demo.sh preflight
 scripts/demo.sh cluster-up
+export KUBECONFIG="$(scripts/demo.sh kubeconfig)"
 ```
 
-`cluster-up` rejects a missing or wide `OPERATOR_CIDR`. The Kubernetes API is
-reachable publicly only from that address, and privately from inside the VPC.
-Nodes have no public addresses.
+`cluster-up` accepts only a single IPv4 address as `OPERATOR_CIDR`. The
+Kubernetes API is reachable publicly only from that address, and privately from
+inside the VPC. Nodes have no public addresses. Every `demo.sh` command that
+touches Kubernetes uses its own kubeconfig for this cluster and checks the
+server endpoint first, whatever your current context is. Export `KUBECONFIG` as
+above before running `kubectl` yourself.
 
 ### 2. Agones and the fleet
 
@@ -106,7 +141,7 @@ scripts/demo.sh load "$POD_IP" 7654 8 30      # "active players (receiving echoe
 Agones assigns host ports in 7000–8000, but no security group opens them.
 Players are simulated inside the cluster.
 
-### 3. Let the assistant inspect the cluster (read-only)
+### 3. Enroll the assistant (read-only); it cannot reach this cluster
 
 ```bash
 scripts/demo.sh enroll-agent
@@ -115,35 +150,37 @@ kubectl auth can-i delete pods --as=probe --as-group=game-agent-monitoring-group
 kubectl auth can-i get secrets --as=probe --as-group=game-agent-monitoring-group              # no
 ```
 
-`enroll-agent` runs the canonical `infrastructure/kubernetes/enroll-cluster.sh`
-and adds `agent-readonly-rbac.yaml` for the Agones resources.
+`enroll-agent` runs the canonical `infrastructure/kubernetes/enroll-cluster.sh`,
+reads the Kubernetes group it gave the assistant's role (shown above for the
+default role), and binds `agent-readonly-rbac.yaml` to that group for the
+Agones resources.
 
-**Network reachability.** The assistant's runtime reaches the Kubernetes API
-over its public endpoint, which this cluster restricts to `OPERATOR_CIDR`.
-Unless the runtime's egress is inside an allowed range, the EKS specialist
-reports the cluster as unreachable, and the assistant then works from the
-details in your prompt. Giving the runtime a private network path is a separate
-change to the canonical deployment and is not part of this environment. Do not
-widen `publicAccessCIDRs` to work around it.
+In the default runtime network mode, the assistant's Kubernetes and Agones
+reads cannot reach this cluster: its API accepts public traffic only from
+`OPERATOR_CIDR`. The EKS specialist reports the cluster as unreachable, and the
+assistant works from the details in your prompt. A private network path for the
+runtime is a separate change to the canonical deployment, with its own security
+review. Do not widen `publicAccessCIDRs` to work around it.
 
 ### 4. Ask the assistant and deploy its template
 
-See [`../RECORDING.md`](../RECORDING.md) for the prompt and
-[`gamelift/README.md`](gamelift/README.md) to validate and deploy the template.
-Name stacks `gl-demo-<name>` and tag them, for example:
+Build and push the game server image first ([`gamelift/README.md`](gamelift/README.md),
+step 1). Then ask the assistant, for example:
+
+> My Agones fleet `simple-game-server` runs on the EKS cluster `agones-demo` in
+> us-east-1: 3 replicas, one UDP port (container port 7654, Dynamic port
+> policy), 20m CPU and 64 MiB per game server. Plan its migration to an Amazon
+> GameLift Servers container fleet and write the CloudFormation template. The
+> GameLift-ready image is `<image-uri>`.
+
+Review the template against the checklist in
+[`gamelift/README.md`](gamelift/README.md) before you deploy it, and deploy it as
+described there. Stacks must be named `gl-demo-<name>` and carry the tags shown;
+the operator role refuses GameLift resources without `demo-env`. Then send the
+same simulated players to GameLift:
 
 ```bash
-aws cloudformation deploy --stack-name gl-demo-migration --template-file <template> \
-  --capabilities CAPABILITY_NAMED_IAM --parameter-overrides <ImageParameter>=<image-uri> \
-  --tags demo=agones-gamelift-migration demo-env=agones-demo owner="$OWNER"
-```
-
-A container fleet created without explicit inbound permissions opens its
-connection ports to every address. Restrict it to the cluster's NAT address
-before you test:
-
-```bash
-scripts/demo.sh restrict-fleet-ingress gl-demo-migration
+scripts/demo.sh restrict-fleet-ingress gl-demo-migration   # verifies only the NAT /32 is allowed
 FLEET=$(aws cloudformation describe-stacks --stack-name gl-demo-migration \
   --query "Stacks[0].Outputs[?OutputKey=='FleetId'].OutputValue" --output text)
 read -r IP PORT < <(aws gamelift create-game-session --fleet-id "$FLEET" \
@@ -154,18 +191,25 @@ scripts/demo.sh load "$IP" "$PORT" 8 30
 ### 5. Teardown and verification
 
 ```bash
-scripts/demo.sh down          # GameLift stacks → Agones → cluster → ECR repository, then verify-clean
-scripts/demo.sh verify-clean  # exits non-zero if any demo resource remains
-aws cloudformation delete-stack --stack-name agones-demo-operator-role   # with your own credentials
+scripts/demo.sh down          # lists what it will delete and asks for the cluster name
+scripts/demo.sh verify-clean  # exits non-zero if any resource of this environment remains
+aws cloudformation delete-stack --stack-name "$CLUSTER_NAME-operator-role"   # with your own credentials
 ```
 
-`down` deletes only resources this environment created: stacks named
-`gl-demo-*`, the named cluster and its `eksctl-<cluster>-*` stacks, and the
-named ECR repository. It never changes deletion, termination, or retention
-settings. `verify-clean` checks the demo tag across tagged resources, both
-stack name patterns, the cluster, and the repository. Recently deleted
-resources can stay visible to the tagging API for a short time, so re-run
-`verify-clean` after a few minutes if it reports a resource you just deleted.
+`down` resolves its targets first and deletes only resources of this
+environment: `gl-demo-*` stacks tagged `demo=agones-gamelift-migration` and
+`demo-env=<cluster>`, the cluster (after checking the same tags) with its
+`eksctl-<cluster>-*` stacks, and the ECR repository (after checking its tags).
+It waits for in-progress stacks to settle, because a container fleet cannot be
+deleted until it is active. For non-interactive use, set
+`DEMO_CONFIRM=<cluster>`. It never changes deletion, termination, or retention
+settings.
+
+`verify-clean` fails on any AWS error, including an expired session; only a
+service's not-found answer counts as absent. It checks tagged resources, stacks
+in every status except `DELETE_COMPLETE` for both name patterns, the cluster,
+and the repository. Recently deleted resources can stay visible to the tagging
+API for a short time, so it retries before reporting them.
 
 ## Tests
 
