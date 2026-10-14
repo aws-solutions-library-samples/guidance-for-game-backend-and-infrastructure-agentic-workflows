@@ -98,13 +98,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 | Package | Version | Purpose | License | Security Notes |
 |---------|---------|---------|---------|----------------|
-| @aws-sdk/client-bedrock-agentcore | ^3.911.0 | AgentCore client | Apache-2.0 | AWS managed |
-| @aws-sdk/client-bedrock-runtime | ^3.896.0 | Bedrock runtime | Apache-2.0 | AWS managed |
 | @aws-sdk/client-cognito-identity-provider | ^3.911.0 | Cognito client | Apache-2.0 | AWS managed |
-| @aws-sdk/client-cloudwatch | ^3.896.0 | CloudWatch client | Apache-2.0 | AWS managed |
-| @aws-sdk/client-cost-explorer | ^3.898.0 | Cost Explorer client | Apache-2.0 | AWS managed |
-| @aws-sdk/client-eks | ^3.896.0 | EKS client | Apache-2.0 | AWS managed |
-| @aws-sdk/client-gamelift | ^3.896.0 | GameLift client | Apache-2.0 | AWS managed |
 | @aws-sdk/client-sts | ^3.911.0 | STS client | Apache-2.0 | AWS managed |
 
 ### CopilotKit

@@ -11,7 +11,9 @@ import pathlib
 # Third-party packages
 import pytest
 import yaml
-from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+# Local modules
+from _cfn_yaml import load_cfn_template
 
 pytestmark = pytest.mark.unit
 
@@ -20,26 +22,9 @@ BASE_TEMPLATE = PROJECT_ROOT / "infrastructure/cloudformation/01-base-infrastruc
 DEPLOY_SCRIPT = PROJECT_ROOT / "scripts/deploy.sh"
 
 
-class CloudFormationLoader(yaml.SafeLoader):
-    """Safe YAML loader that preserves CloudFormation intrinsic values."""
-
-
-def _construct_intrinsic(loader, _tag_suffix, node):
-    if isinstance(node, ScalarNode):
-        return loader.construct_scalar(node)
-    if isinstance(node, SequenceNode):
-        return loader.construct_sequence(node)
-    if isinstance(node, MappingNode):
-        return loader.construct_mapping(node)
-    raise TypeError(f"Unsupported CloudFormation YAML node: {type(node).__name__}")
-
-
-CloudFormationLoader.add_multi_constructor("!", _construct_intrinsic)
-
-
 @pytest.fixture(scope="module")
 def template() -> dict:
-    return yaml.load(BASE_TEMPLATE.read_text(encoding="utf-8"), Loader=CloudFormationLoader)
+    return load_cfn_template(BASE_TEMPLATE.read_text(encoding="utf-8"))
 
 
 def _table(template: dict) -> dict:

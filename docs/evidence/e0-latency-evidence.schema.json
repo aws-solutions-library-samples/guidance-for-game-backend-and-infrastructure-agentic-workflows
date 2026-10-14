@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:game-agent:validation:e0-latency-evidence:v1",
+  "title": "E0 Synchronous-Observation Latency Evidence v1",
+  "description": "Public-safe schema for the evidence document emitted by the E0 latency harness (issue #412). The document MUST carry latency statistics and declared assumptions only. It MUST NOT carry AWS account identifiers, fleet identifiers, ARNs, credentials, or provider payloads.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "spike",
+    "issue",
+    "measured_at_utc",
+    "target_ref",
+    "assumptions",
+    "budget_ms",
+    "results_ms",
+    "evaluation"
+  ],
+  "properties": {
+    "spike": {
+      "const": "e0-synchronous-observation-latency"
+    },
+    "issue": {
+      "const": 412
+    },
+    "measured_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "target_ref": {
+      "description": "Stable, non-reversible short reference for the measured fleet. Never the real fleet id.",
+      "type": "string",
+      "pattern": "^fleet-[0-9a-f]{12}$"
+    },
+    "assumptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "region",
+        "provider",
+        "provider_reads",
+        "read_count",
+        "sample_size",
+        "concurrency",
+        "arrival_model",
+        "boto3_retry_mode",
+        "boto3_max_attempts",
+        "persistence_mode"
+      ],
+      "properties": {
+        "region": { "type": "string" },
+        "provider": { "const": "gamelift" },
+        "provider_reads": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "string" }
+        },
+        "read_count": { "const": 3 },
+        "sample_size": { "type": "integer", "minimum": 1 },
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "arrival_model": {
+          "description": "Load model under which the percentiles were measured. Declared so the p99 has a defensible meaning.",
+          "type": "string",
+          "enum": ["closed-loop"]
+        },
+        "boto3_retry_mode": { "type": "string" },
+        "boto3_max_attempts": { "type": "integer", "minimum": 1 },
+        "persistence_mode": {
+          "description": "Persistence mode actually exercised on the measured path. 'in-memory-deterministic' is TEST-ONLY and never acceptable as live evidence; 'dynamodb-transactional' is the real transactional write required for acceptance.",
+          "type": "string",
+          "enum": ["in-memory-deterministic", "dynamodb-transactional"]
+        }
+      }
+    },
+    "budget_ms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gateway_integration_timeout",
+        "per_read",
+        "persistence_and_serialization",
+        "cancellation_margin",
+        "total_request_deadline",
+        "acceptance_ceiling"
+      ],
+      "properties": {
+        "gateway_integration_timeout": { "type": "number", "exclusiveMinimum": 0 },
+        "per_read": { "type": "number", "exclusiveMinimum": 0 },
+        "persistence_and_serialization": { "type": "number", "exclusiveMinimum": 0 },
+        "cancellation_margin": { "type": "number", "exclusiveMinimum": 0 },
+        "total_request_deadline": { "type": "number", "exclusiveMinimum": 0 },
+        "acceptance_ceiling": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "results_ms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_size",
+        "successes",
+        "failures",
+        "timeouts",
+        "partial_denials",
+        "percentile_method",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "max_ms"
+      ],
+      "properties": {
+        "sample_size": { "type": "integer", "minimum": 0 },
+        "successes": { "type": "integer", "minimum": 0 },
+        "failures": { "type": "integer", "minimum": 0 },
+        "timeouts": { "type": "integer", "minimum": 0 },
+        "partial_denials": { "type": "integer", "minimum": 0 },
+        "percentile_method": { "const": "nearest_rank" },
+        "p50_ms": { "type": "number", "minimum": 0 },
+        "p95_ms": { "type": "number", "minimum": 0 },
+        "p99_ms": { "type": "number", "minimum": 0 },
+        "max_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule",
+        "acceptance_ceiling_ms",
+        "p99_ms",
+        "persistence_mode",
+        "persistence_acceptable",
+        "clean_run",
+        "synchronous_accepted"
+      ],
+      "properties": {
+        "rule": {
+          "const": "persistence_acceptable AND clean_run AND p99 <= gateway_integration_timeout - cancellation_margin"
+        },
+        "acceptance_ceiling_ms": { "type": "number", "exclusiveMinimum": 0 },
+        "p99_ms": { "type": "number", "minimum": 0 },
+        "persistence_mode": { "type": "string", "enum": ["in-memory-deterministic", "dynamodb-transactional"] },
+        "persistence_acceptable": { "type": "boolean" },
+        "clean_run": { "type": "boolean" },
+        "synchronous_accepted": { "type": "boolean" }
+      }
+    }
+  }
+}

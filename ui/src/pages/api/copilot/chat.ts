@@ -508,7 +508,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     let responseContent: string;
 
     if (isProduction) {
-      // Production: Use AWS SDK to invoke AgentCore Runtime
+      // Production: invoke the AgentCore Runtime over HTTPS with the end user's
+      // verified Cognito access token as an Authorization: Bearer header (plain
+      // fetch, not an AWS SDK invoke client / SigV4). The runtime verifies the
+      // token independently. The only AWS SDK caller on this path is STS
+      // GetCallerIdentity (getAccountId), used to build the runtime ARN.
       logInfo(`[${requestId}] 🚀 Calling AgentCore Runtime with Cognito JWT authorization`);
       logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
 

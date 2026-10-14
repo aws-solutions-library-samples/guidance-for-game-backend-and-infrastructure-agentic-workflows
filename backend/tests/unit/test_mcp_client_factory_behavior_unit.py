@@ -412,3 +412,106 @@ class TestResolveMcpCommand:
 
         # Should fall through to tier 3 (naming convention)
         assert "from awslabs.eks_mcp_server.server import main; main()" in cmd[2]
+
+
+class TestEksProviderErrorLogSuppression:
+    """The EKS specialist's two stdio MCP servers must not emit provider-authored
+    error bodies into our logs (issue #466). We pin their loguru sink above ERROR
+    via FASTMCP_LOG_LEVEL/LOGURU_LEVEL without weakening auth/read-only settings,
+    and Billing must be unaffected."""
+
+    def setup_method(self):
+        clear_mcp_cache()
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_aws_api_server_suppresses_provider_error_logs(self, mock_mcp_client, mock_stdio):
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+        create_mcp_client("aws-api-mcp-server")
+        env = mock_stdio.call_args[0][0].env
+        assert env["FASTMCP_LOG_LEVEL"] == "CRITICAL"
+        assert env["LOGURU_LEVEL"] == "CRITICAL"
+        # Must NOT weaken read-only / auth settings.
+        assert env["READ_OPERATIONS_ONLY"] == "true"
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_eks_server_suppresses_provider_error_logs(self, mock_mcp_client, mock_stdio):
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+        create_mcp_client("eks-mcp-server")
+        env = mock_stdio.call_args[0][0].env
+        assert env["FASTMCP_LOG_LEVEL"] == "CRITICAL"
+        assert env["LOGURU_LEVEL"] == "CRITICAL"
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_billing_server_is_not_affected_by_eks_suppression(self, mock_mcp_client, mock_stdio):
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+        create_mcp_client("billing-cost-management-mcp-server")
+        env = mock_stdio.call_args[0][0].env
+        # Billing keeps its own FASTMCP_LOG_FILE and is not force-silenced by the
+        # EKS boundary (no CRITICAL override, no LOGURU_LEVEL override).
+        assert env.get("FASTMCP_LOG_LEVEL") != "CRITICAL"
+        assert "LOGURU_LEVEL" not in env
+        assert env["FASTMCP_LOG_FILE"].endswith("billing-cost-management-mcp-server.log")
+
+
+class TestEksTransportErrlogSink:
+    """mcp_wrapper forwards the provider child's stderr to its own stderr, so
+    stdio_client's errlog (default sys.stderr) would carry provider-authored
+    bodies into parent logs. For the two EKS stdio servers ONLY we pass a
+    code-owned discarding errlog sink; Billing keeps the default (issue #466).
+
+    These tests invoke the transport factory that create_mcp_client hands to
+    MCPClient, then inspect the errlog argument stdio_client received."""
+
+    def setup_method(self):
+        clear_mcp_cache()
+
+    @staticmethod
+    def _errlog_arg(mock_stdio):
+        """Extract the errlog passed to stdio_client (kwarg or 2nd positional)."""
+        args, kwargs = mock_stdio.call_args
+        if "errlog" in kwargs:
+            return kwargs["errlog"]
+        return args[1] if len(args) > 1 else None
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_aws_api_transport_uses_discarding_errlog(self, mock_mcp_client, mock_stdio):
+        # Local modules
+        from utils.mcp_client_factory import _DiscardingErrLog
+
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+        create_mcp_client("aws-api-mcp-server")
+        errlog = self._errlog_arg(mock_stdio)
+        assert isinstance(errlog, _DiscardingErrLog)
+        # The sink must actually discard: a write returns the char count and
+        # retains nothing recoverable.
+        n = errlog.write("AccessDeniedException: arn:aws:eks:...:cluster/secret\n")
+        assert n > 0
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_eks_transport_uses_discarding_errlog(self, mock_mcp_client, mock_stdio):
+        # Local modules
+        from utils.mcp_client_factory import _DiscardingErrLog
+
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+        create_mcp_client("eks-mcp-server")
+        errlog = self._errlog_arg(mock_stdio)
+        assert isinstance(errlog, _DiscardingErrLog)
+
+    @patch("utils.mcp_client_factory.stdio_client")
+    @patch("utils.mcp_client_factory.MCPClient")
+    def test_billing_transport_keeps_default_errlog(self, mock_mcp_client, mock_stdio):
+        # Local modules
+        from utils.mcp_client_factory import _DiscardingErrLog
+
+        mock_mcp_client.side_effect = lambda factory: factory() or Mock()
+        create_mcp_client("billing-cost-management-mcp-server")
+        errlog = self._errlog_arg(mock_stdio)
+        # Billing must NOT get the EKS discarding sink; stdio_client's default
+        # (sys.stderr) is used, i.e. no errlog is passed by our factory.
+        assert not isinstance(errlog, _DiscardingErrLog)
+        assert errlog is None

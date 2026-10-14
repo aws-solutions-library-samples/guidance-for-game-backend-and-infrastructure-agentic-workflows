@@ -8,9 +8,18 @@ import ThemeToggle from './ThemeToggle';
 interface NavigationProps {
   pageTitle?: string;
   showBackButton?: boolean;
+  /**
+   * Application-level sign-out gateway (#310, Blocker 4). When supplied, the
+   * admin header routes sign-out through the ONE coordinator-backed logout that
+   * latches the idle terminal generation, broadcasts it cross-tab, locks the
+   * chat UI, and clears cookies LAST — instead of posting `/api/auth/logout` and
+   * reloading independently (which skips all of that ordering). Only the
+   * dev/no-coordinator fallback posts logout directly.
+   */
+  onSignOut?: () => void;
 }
 
-export default function Navigation({ pageTitle, showBackButton = false }: NavigationProps) {
+export default function Navigation({ pageTitle, showBackButton = false, onSignOut }: NavigationProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [userInfo, setUserInfo] = useState<{ username: string; email: string; isAdmin: boolean } | null>(null);
   const router = useRouter();
@@ -30,9 +39,19 @@ export default function Navigation({ pageTitle, showBackButton = false }: Naviga
   }, []);
 
   const handleSignOut = async () => {
+    setUserInfo(null);
+    // Route through the shared coordinator gateway (#310, Blocker 4): it
+    // serializes the cookie-clearing logout behind any in-flight refresh,
+    // broadcasts the terminal idle record, and locks the chat — no independent
+    // logout POST or full-page reload from the admin header.
+    if (onSignOut) {
+      onSignOut();
+      return;
+    }
+    // Fallback for contexts without a coordinator (e.g. dev skip-auth): clear
+    // cookies then reload.
     try {
       await fetchWithTimeout('/api/auth/logout', { method: 'POST' });
-      setUserInfo(null);
       window.location.href = '/';
     } catch (error) {
       logError('Logout failed:', error instanceof Error ? error : new Error(String(error)));

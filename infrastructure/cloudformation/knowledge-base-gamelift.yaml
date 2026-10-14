@@ -151,6 +151,11 @@ Resources:
         Type: S3
         S3Configuration:
           BucketArn: !GetAtt DocumentBucket.Arn
+          # Limit this data source to the GameLift documentation uploaded by
+          # the seeding workflow. Other objects in the bucket are unrelated to
+          # this Knowledge Base and must not enter ingestion.
+          InclusionPrefixes:
+            - gamelift/
       VectorIngestionConfiguration:
         ChunkingConfiguration:
           ChunkingStrategy: FIXED_SIZE

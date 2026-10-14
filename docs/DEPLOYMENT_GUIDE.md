@@ -172,6 +172,8 @@ Log in with the admin credentials you created.
 | Guardrails | Bedrock | AI safety controls |
 | Observability | CloudWatch | Logging and monitoring |
 
+ADOT runtime telemetry is auto-configured by AgentCore. For a known cold-start exporter credential limitation (transient `403` on telemetry export) and the read-only detection check, see [`OBSERVABILITY_ADOT_EXPORTER.md`](OBSERVABILITY_ADOT_EXPORTER.md).
+
 ## Post-Deployment Configuration
 
 ### Enroll EKS Clusters (Optional)

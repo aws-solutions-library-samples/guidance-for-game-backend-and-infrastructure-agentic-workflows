@@ -1,0 +1,51 @@
+{
+  "assumptions": {
+    "arrival_model": "closed-loop",
+    "boto3_max_attempts": 3,
+    "boto3_retry_mode": "adaptive",
+    "concurrency": 4,
+    "persistence_mode": "dynamodb-transactional",
+    "provider": "gamelift",
+    "provider_reads": [
+      "describe_fleet_utilization",
+      "describe_fleet_capacity",
+      "describe_scaling_policies"
+    ],
+    "read_count": 3,
+    "region": "us-west-2",
+    "sample_size": 200
+  },
+  "budget_ms": {
+    "acceptance_ceiling": 27000.0,
+    "cancellation_margin": 3000.0,
+    "gateway_integration_timeout": 30000.0,
+    "per_read": 3000.0,
+    "persistence_and_serialization": 3000.0,
+    "total_request_deadline": 15000.0
+  },
+  "evaluation": {
+    "acceptance_ceiling_ms": 27000.0,
+    "clean_run": true,
+    "p99_ms": 403.1936669998686,
+    "persistence_acceptable": true,
+    "persistence_mode": "dynamodb-transactional",
+    "rule": "persistence_acceptable AND clean_run AND p99 <= gateway_integration_timeout - cancellation_margin",
+    "synchronous_accepted": true
+  },
+  "issue": 412,
+  "measured_at_utc": "2026-09-21T19:11:52.042343+00:00",
+  "results_ms": {
+    "failures": 0,
+    "max_ms": 414.698,
+    "p50_ms": 159.753,
+    "p95_ms": 250.094,
+    "p99_ms": 403.194,
+    "partial_denials": 0,
+    "percentile_method": "nearest_rank",
+    "sample_size": 200,
+    "successes": 200,
+    "timeouts": 0
+  },
+  "spike": "e0-synchronous-observation-latency",
+  "target_ref": "fleet-42d3e75fa8d6"
+}

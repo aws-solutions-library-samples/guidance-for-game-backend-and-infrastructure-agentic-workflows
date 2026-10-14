@@ -11,7 +11,7 @@ interface User {
   groups: string[];
 }
 
-export default function AdminUsers() {
+export default function AdminUsers({ onSignOut }: { onSignOut?: () => void }) {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -59,7 +59,7 @@ export default function AdminUsers() {
           <title>User Management - Game Agent</title>
         </Head>
         <div className="ga-layout">
-          <Navigation pageTitle="User Management" showBackButton={true} />
+          <Navigation pageTitle="User Management" showBackButton={true} onSignOut={onSignOut} />
           <div style={{ padding: '40px', color: 'var(--ga-text)', textAlign: 'center' }}>
             <div style={{ fontSize: '18px' }}>Loading users...</div>
           </div>
@@ -74,7 +74,7 @@ export default function AdminUsers() {
         <title>User Management - Game Agent</title>
       </Head>
       <div className="ga-layout">
-        <Navigation pageTitle="User Management" showBackButton={true} />
+        <Navigation pageTitle="User Management" showBackButton={true} onSignOut={onSignOut} />
 
         <main className="ga-admin-main">
           <div className="ga-admin-container">
