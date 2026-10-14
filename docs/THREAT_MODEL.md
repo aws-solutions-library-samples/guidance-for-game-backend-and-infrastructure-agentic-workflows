@@ -29,7 +29,7 @@ separate:
 ## Document Information
 
 - **Version**: 2.1
-- **Last Updated**: 2026-09-21
+- **Last Updated**: 2026-10-14
 - **Status**: Approved for the deployed chat path; planned-control analysis for
   the optional operations control plane
 - **Author**: Security Engineering
@@ -490,7 +490,7 @@ the issue requires:
 |---------------|-------------|------------|--------|
 | Direct Injection | "Ignore previous instructions..." | Pattern detection, guardrails | Deployed |
 | Indirect Injection | Malicious content in AWS resources, diffs, observations | Response sanitization; model output untrusted; deterministic validation and hash-binding gate every write (OP-CD2) | Deployed (chat) / Planned (operations) |
-| Jailbreak Attempts | Trying to bypass restrictions | Topic constraints (user input only), content filters and PII protections on input and output, guardrails | Deployed |
+| Jailbreak Attempts | Trying to bypass restrictions | Topic constraints (user input only), content filters and credential/PII blocking on input and output, PII anonymization on output only, guardrails | Deployed |
 | Role Play Attacks | "You are now a different AI..." | System prompt protection | Deployed |
 | Proposal-as-authority | Treating a model proposal as a write decision | Model cannot approve or execute; approval is a direct authenticated action; executor re-verifies (OP-A1/AU2) | Planned |
 
@@ -691,4 +691,4 @@ Append-only ledger (authoritative audit)
 |---------|------|--------|---------|
 | 1.0 | 2026-01-12 | Security Eng | Initial draft |
 | 2.0 | 2026-09-21 | Security Eng | Split into the deployed read-only chat path (Part I) and the optional, default-disabled operations control plane (Part II). Added trust boundaries O1-O8, per-boundary STRIDE, attack trees, and explicit residual risks for operations APIs, direct approval, immutable prepared operations, replay/stale-approval/cancellation, source-control prepare/executor, remote MCP clients, separate provider-write roles, bounded autonomy, emergency disablement, budget/authority limits, indirect prompt injection, confused deputy, audit integrity, and fail-closed recovery (issue #280). |
-| 2.1 | 2026-10-09 | Security Eng | Scope topics (General Programming Help, Entertainment and Casual Chat) now block on user input only and are detect-only on output (#530). T1, the Jailbreak Attempts row, and the Role override leaf in Appendix A now say topic constraints apply to input only. Residual risk is recorded in SECURITY.md. |
+| 2.1 | 2026-10-14 | Security Eng | Scope topics (General Programming Help, Entertainment and Casual Chat) now block on user input only and are detect-only on output (#530). T1, the Jailbreak Attempts row, and the Role override leaf in Appendix A now say topic constraints apply to input only, and the Jailbreak Attempts row says PII anonymization applies to output only. Residual risk is recorded in SECURITY.md. |
