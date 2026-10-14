@@ -9,9 +9,6 @@ not used as implicit fallbacks for one another.
 import os
 import threading
 
-# Third-party packages
-from strands.models import BedrockModel
-
 # Local modules
 from config.settings import (
     AWS_REGION,
@@ -22,6 +19,10 @@ from config.settings import (
     ORCHESTRATOR_MODEL_ID,
     SPECIALIST_MODEL_ID,
 )
+
+# `BedrockModel` here is the Guardrail-scoped subclass; the alias keeps the
+# `models.cached_bedrock.BedrockModel` patch target used by existing tests.
+from models.guardrail_scope import GuardrailScopedBedrockModel as BedrockModel
 from utils.logger import logger
 
 BEDROCK_MAX_TOKENS = int(os.getenv("BEDROCK_MAX_TOKENS", "4096"))

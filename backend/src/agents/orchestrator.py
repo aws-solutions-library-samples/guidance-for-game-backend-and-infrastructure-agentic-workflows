@@ -50,7 +50,12 @@ from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 try:
     # Third-party packages
     from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
-    from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+
+    # Local modules
+    # `AgentCoreMemorySessionManager` here is the memory-scoped subclass; the
+    # alias keeps the `orch.AgentCoreMemorySessionManager` patch target used by
+    # existing tests.
+    from utils.memory_context import MemoryScopedSessionManager as AgentCoreMemorySessionManager
 
     MEMORY_INTEGRATION_AVAILABLE = True
 except ImportError:
