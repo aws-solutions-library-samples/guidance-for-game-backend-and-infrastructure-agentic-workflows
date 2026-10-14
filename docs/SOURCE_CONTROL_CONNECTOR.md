@@ -495,8 +495,9 @@ infrastructure/cloudformation/01-base-infrastructure.yaml   # scoped secret-read
 scripts/deploy.sh                                           # GBAW_SCM_* env wiring
 ```
 
-> Note: `connector/iac_validation.py` exists in the package but is **not** part of the read path —
+> Note: the read-only package ships **no** infrastructure-as-code parser —
 > `service.py` performs no IaC parse/validation on reads (reads only fetch existing content).
+> A parser with hard input limits belongs to the prepare-only work in #419, not this package.
 
 > Note: there is **no** `connector/executor/` directory in the shipped package on this branch. The
 > isolated write-path executor is **future work tracked by #314 (still open)** and lives only in

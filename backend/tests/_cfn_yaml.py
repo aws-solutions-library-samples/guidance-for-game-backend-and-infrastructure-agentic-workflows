@@ -16,7 +16,13 @@ verify by reading a single function:
 The loader intentionally keeps every safety property of ``yaml.SafeLoader``:
 Python object, module, and callable tags (``!!python/...``) are not resolvable
 and fail closed. CloudFormation ``!`` tags are converted into plain strings,
-lists, and mappings, which is all these contract tests inspect.
+lists, and mappings, which is all most of these contract tests inspect.
+
+Tests that assert on the *shape* of an intrinsic (for example an ``Fn::If``
+gated policy or a ``Ref`` to a parameter) use
+:func:`load_cfn_template_with_intrinsics`, which applies the same scoped,
+directly instantiated and disposed loader but keeps each intrinsic as the
+standard ``{"Ref": ...}`` / ``{"Fn::<Name>": ...}`` mapping.
 """
 
 # Standard library
@@ -67,6 +73,50 @@ def load_cfn_template(text: str) -> Any:
     to static analysis.
     """
     loader = CloudFormationSafeLoader(text)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
+
+
+class CloudFormationIntrinsicLoader(yaml.SafeLoader):
+    """``SafeLoader`` subclass that keeps CloudFormation intrinsic structure.
+
+    Like :class:`CloudFormationSafeLoader`, its constructor is registered on the
+    subclass alone. Each ``!Tag`` becomes the standard JSON form: ``!Ref`` and
+    ``!Condition`` map to their bare keys, every other intrinsic to ``Fn::<Name>``.
+    """
+
+
+def _construct_intrinsic_mapping(loader: yaml.SafeLoader, tag_suffix: str, node: yaml.Node) -> Any:
+    """Convert a CloudFormation short-form ``!`` tag into its mapping form.
+
+    Nested nodes are constructed deeply so a policy inside an ``!If`` is fully
+    built. Unexpected node kinds raise ``TypeError`` and fail closed.
+    """
+    key = tag_suffix if tag_suffix in ("Ref", "Condition") else f"Fn::{tag_suffix}"
+    if isinstance(node, ScalarNode):
+        value: Any = loader.construct_scalar(node)
+    elif isinstance(node, SequenceNode):
+        value = loader.construct_sequence(node, deep=True)
+    elif isinstance(node, MappingNode):
+        value = loader.construct_mapping(node, deep=True)
+    else:
+        raise TypeError(f"Unsupported CloudFormation YAML node: {type(node).__name__}")
+    return {key: value}
+
+
+CloudFormationIntrinsicLoader.add_multi_constructor("!", _construct_intrinsic_mapping)
+
+
+def load_cfn_template_with_intrinsics(text: str) -> Any:
+    """Parse one CloudFormation template, keeping each intrinsic as a mapping.
+
+    Instantiates :class:`CloudFormationIntrinsicLoader` directly, reads the single
+    document via ``get_single_data()``, and disposes the loader in ``finally``.
+    No ``yaml.load`` call is involved.
+    """
+    loader = CloudFormationIntrinsicLoader(text)
     try:
         return loader.get_single_data()
     finally:

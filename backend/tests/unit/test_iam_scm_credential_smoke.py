@@ -18,9 +18,10 @@ This parses ``infrastructure/cloudformation/01-base-infrastructure.yaml`` and as
   read-audit target (the dedicated connector audit log group).
 
 The template uses CloudFormation intrinsic short tags (``!Ref``, ``!Sub``, ``!If``,
-``!GetAtt``, ``!Not``, ``!Equals``). A dedicated ``SafeLoader`` subclass with a multi-tag
-constructor (mirroring ``connector.iac_validation._CfnLoader``) tolerates them by turning
-each intrinsic into an ordinary Python mapping so the document parses into plain structures.
+``!GetAtt``, ``!Not``, ``!Equals``). The shared ``_cfn_yaml.load_cfn_template_with_intrinsics``
+helper (a scoped ``SafeLoader`` subclass that is instantiated directly and always disposed)
+turns each intrinsic into an ordinary Python mapping so the document parses into plain
+structures.
 
 Validates: Requirements 3.1, 3.2, 3.4, 6.2, 6.3, 9.3, 9.5, 11.2, 11.3
 """
@@ -30,7 +31,9 @@ from pathlib import Path
 
 # Third-party packages
 import pytest
-import yaml
+
+# Local modules
+from _cfn_yaml import load_cfn_template_with_intrinsics
 
 pytestmark = pytest.mark.unit
 
@@ -66,47 +69,14 @@ _SCM_AUDIT_CONDITION_NAME = "ScmAuditLogGroupConfigured"
 _SCM_AUDIT_LOG_GROUP_LOGICAL_ID = "ScmAuditLogGroup"
 
 
-# --- CloudFormation-aware YAML loader -----------------------------------------------------
-
-
-class _CfnLoader(yaml.SafeLoader):
-    """A ``SafeLoader`` subclass that understands CloudFormation short-form tags."""
-
-
-def _cfn_multi_constructor(loader: yaml.Loader, tag_suffix: str, node: yaml.Node):
-    """Represent any ``!Tag`` intrinsic as a plain mapping so parsing succeeds.
-
-    ``!Ref`` / ``!Condition`` map to their bare CloudFormation keys; every other intrinsic
-    maps to ``Fn::<suffix>`` (the standard JSON form). ``deep=True`` ensures nested
-    structures (e.g. the policy mapping inside an ``!If``) are fully constructed.
-    """
-    if tag_suffix in ("Ref", "Condition"):
-        key = tag_suffix
-    else:
-        key = f"Fn::{tag_suffix}"
-
-    if isinstance(node, yaml.ScalarNode):
-        value = loader.construct_scalar(node)
-    elif isinstance(node, yaml.SequenceNode):
-        value = loader.construct_sequence(node, deep=True)
-    elif isinstance(node, yaml.MappingNode):
-        value = loader.construct_mapping(node, deep=True)
-    else:
-        value = None
-    return {key: value}
-
-
-_CfnLoader.add_multi_constructor("!", _cfn_multi_constructor)
-
-
 # --- Fixtures -----------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def template() -> dict:
-    """Parse the base-infrastructure template with the CFN-aware loader."""
+    """Parse the base-infrastructure template with the scoped CFN-aware loader."""
     assert _TEMPLATE_PATH.is_file(), f"template not found at {_TEMPLATE_PATH}"
-    parsed = yaml.load(_TEMPLATE_PATH.read_text(), Loader=_CfnLoader)  # noqa: S506 - safe subclass
+    parsed = load_cfn_template_with_intrinsics(_TEMPLATE_PATH.read_text(encoding="utf-8"))
     assert isinstance(parsed, dict), "template root is not a mapping"
     return parsed
 
