@@ -122,8 +122,8 @@ _FINANCIAL_LABEL_WORD = (
 # qualifiers before it ("Amount due:", "Invoice subtotal:", "Cost per
 # instance:"). Without a colon, allow only known financial-label words so
 # ordinary prose such as "cost efficiency" cannot bind to a later count.
-_EXPLICIT_LABEL_LINE_END = r"[^\n:]{0,80}:[ \t*]*\n"
-_IMPLICIT_LABEL_LINE_END = rf"(?:\s+(?:{_FINANCIAL_LABEL_WORD})){{0,2}}[ \t*]*\n"
+_EXPLICIT_LABEL_LINE_END = r"[^\n:]{0,80}:[ \t*_]*\n"
+_IMPLICIT_LABEL_LINE_END = rf"(?:\s+(?:{_FINANCIAL_LABEL_WORD})){{0,2}}[ \t*_]*\n"
 _LABEL_LINE_END = rf"(?:{_EXPLICIT_LABEL_LINE_END}|{_IMPLICIT_LABEL_LINE_END})"
 _VALUE_LANGUAGE_RE = re.compile(
     rf"(?:\b(?:{_FINANCIAL_NOUN})\b[^\n]{{0,200}}{_MONEY_NUMBER})"
@@ -138,19 +138,19 @@ _PERCENT_NOUN = (
     r"cost|costs|spend|spending|sav(?:e|es|ed|ing|ings)|discounts?|share|bills?|billed|billing|drop"
     r"|cheaper|cheapest|expensive|price|prices|pricing"
 )
-_PERCENT_VALUE = r"\d+(?:\.\d+)?\s*%"
+_PERCENT_VALUE = r"\d+(?:\.\d+)?\s*(?:%|percent\b)"
 _FINANCIAL_PERCENT_RE = re.compile(
     rf"(?:\b(?:{_PERCENT_NOUN})\b[^\n]{{0,200}}{_PERCENT_VALUE})"
     rf"|(?:{_PERCENT_VALUE}[^\n]{{0,200}}\b(?:{_PERCENT_NOUN})\b)"
     rf"|(?:\b(?:{_PERCENT_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_PERCENT_VALUE})"
-    rf"|(?:{_PERCENT_VALUE}\s+off\b)",
+    rf"|(?:{_PERCENT_VALUE}\s+off\b(?![-\u2010-\u2015]?\s*peak\b|\s+(?:its|their|the)\s+peak\b))",
     re.IGNORECASE,
 )
 # Markdown underscore emphasis ("_cost_", "__Monthly cost__") would hide a
 # financial word from the word-boundary checks, because "_" is a word
 # character. Underscores that open or close a word are replaced with a space
 # before scanning; interior underscores in identifiers ("cost_report") stay.
-_EMPHASIS_UNDERSCORE_RE = re.compile(r"(?<![A-Za-z0-9])_{1,3}(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])_{1,3}(?![A-Za-z0-9_])")
+_EMPHASIS_UNDERSCORE_RE = re.compile(r"(?<![A-Za-z0-9_])_{1,3}(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])_{1,3}(?![A-Za-z0-9_])")
 
 # Shell positional variables such as `$1` and `${10}` are code, not money.
 # Neutralize them only inside code spans or lines that clearly invoke shell
@@ -162,6 +162,8 @@ _SHELL_LINE_RE = re.compile(r"^.*\b(?:awk|bash|printf|sed|xargs)\b.*$", re.IGNOR
 # financial vocabulary in ordinary prose (for example, an "AWS Costs" capability
 # bullet followed by a Python 3 tutorial URL). URLs are references, not claims.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+# EC2 Spot allocation-strategy names are identifiers, not prices.
+_SPOT_STRATEGY_RE = re.compile(r"\b(?:price-capacity-optimized|lowest-price)\b", re.IGNORECASE)
 
 # A number immediately followed by a count, time, or size unit is a quantity,
 # not money ("2 instances", "3 fleets", "40-minute", "500 players", "10 nodes",
@@ -240,11 +242,12 @@ _ORDERED_LIST_MARKER_RE = re.compile(
     r"^[ \t]*(?:(?P<heading>#{1,6}[ \t]+)|(?P<bold>\*\*|__))?(?P<number>\d{1,3})[.)](?(bold)(?P=bold)?)[ \t]+",
     re.MULTILINE,
 )
-# A currency symbol or word just after a marker means the marker number may be
-# an amount ("1. dollars per hour"); its digits are kept visible.
-_MARKER_CURRENCY_TRAIL_RE = re.compile(
-    rf"[^\n]{{0,20}}(?:[{_CURRENCY_SYMBOLS}]|\b(?:{_CURRENCY_WORD})\b)", re.IGNORECASE
-)
+# A currency word or ISO code just after a marker means the marker number may be
+# an amount ("1. dollars per hour", "2. USD per month"); its digits are kept
+# visible. A currency symbol is not used here: after a marker it is usually a
+# shell variable or prompt ("1. Set `$FLEET_ID`"), and a symbol next to a digit
+# is already caught by the symbol-amount check.
+_MARKER_CURRENCY_TRAIL_RE = re.compile(rf"[^\n]{{0,20}}(?:\b(?i:{_CURRENCY_WORD})\b|\b(?:{_ISO_ALTERNATION})\b)")
 # An AWS Region code ("us-west-2", "eu-central-1", "us-gov-east-1") is an
 # identifier, not money. Its trailing digit must not be read as an amount. The
 # pattern is anchored to real Region prefixes and directions so an arbitrary
@@ -292,9 +295,10 @@ def _neutralize_quantities(text: str) -> str:
 
     def neutralize(match: re.Match[str]) -> str:
         fragment = match.group(0)
-        preceding = text[max(0, match.start() - 40) : match.start()]
-        wide_preceding = text[max(0, match.start() - 400) : match.start()].rstrip()[-8:]
-        following = text[match.end() : match.end() + 40]
+        preceding = _EMPHASIS_UNDERSCORE_RE.sub(" ", text[max(0, match.start() - 40) : match.start()])
+        wide_preceding = _EMPHASIS_UNDERSCORE_RE.sub(" ", text[max(0, match.start() - 400) : match.start()])
+        wide_preceding = wide_preceding.rstrip()[-8:]
+        following = _EMPHASIS_UNDERSCORE_RE.sub(" ", text[match.end() : match.end() + 40])
         if (
             _CURRENCY_LEAD_RE.search(preceding)
             or _CURRENCY_LEAD_RE.search(wide_preceding)
@@ -322,7 +326,8 @@ def _neutralize_quantities(text: str) -> str:
                         break
                 else:
                     return match.group(0)
-            if _MARKER_CURRENCY_TRAIL_RE.match(scannable, match.end(), match.end() + 40):
+            trail = _EMPHASIS_UNDERSCORE_RE.sub(" ", scannable[match.end() : match.end() + 40])
+            if _MARKER_CURRENCY_TRAIL_RE.match(trail):
                 return match.group(0)
             start = match.start("number") - match.start()
             end = match.end("number") - match.start()
@@ -341,7 +346,7 @@ def _neutralize_shell_positionals(text: str) -> str:
 
     def neutralize(match: re.Match[str]) -> str:
         fragment = match.group(0)
-        if _FINANCIAL_WORD_RE.search(fragment):
+        if _FINANCIAL_WORD_RE.search(_EMPHASIS_UNDERSCORE_RE.sub(" ", fragment)):
             return fragment
         return _SHELL_POSITIONAL_RE.sub("", fragment)
 
@@ -370,6 +375,7 @@ def contains_unvalidated_financial_content(text: str) -> bool:
         return False
     scannable = _neutralize_shell_positionals(text)
     scannable = _URL_RE.sub("", scannable)
+    scannable = _SPOT_STRATEGY_RE.sub("allocation-strategy", scannable)
     scannable = _neutralize_quantities(scannable)
     scannable = _EMPHASIS_UNDERSCORE_RE.sub(" ", scannable)
     return bool(

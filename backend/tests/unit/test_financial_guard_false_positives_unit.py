@@ -90,6 +90,18 @@ _OPERATIONAL_CLEAN = [
     "**1. Scale on demand**\n- Use target tracking.\n\n**2. Reduce cost**\n- Right-size fleets.",
     "**1.** Scale on demand.\n**2.** Reduce cost with Spot.",
     "__1.__ Scale on demand.\n__2.__ Reduce cost with Spot.",
+    # Off-peak scaling text is not a discount.
+    "Utilization averages 35% off-peak and 85% at peak.",
+    "CPU sits at 25% off peak.",
+    "Concurrent players are 30% off their peak.",
+    # A shell variable after a numbered step is code, not a currency marker.
+    "1. Set `$FLEET_ID`, then review the scaling rate.",
+    "1. Export `$CLUSTER_NAME` and check the API rate limits.",
+    # Spot allocation-strategy names are identifiers, not prices.
+    "Use the price-capacity-optimized allocation strategy and keep 20% of capacity On-Demand.",
+    "Use `lowest-price` allocation only for stateless pods; keep 10% buffer capacity.",
+    # An interior double underscore in an identifier is not emphasis.
+    "The `report__cost` field holds 5 rows.",
     # Interior underscores in identifiers are not emphasis.
     "Run `describe_fleet_capacity` for 3 fleets; the cost_report module is unchanged.",
 ]
@@ -210,6 +222,21 @@ _FINANCIAL_WITHHELD = [
     "The _monthly cost_ is 1,204.",
     "The __cost__ is 1,204 per month.",
     "__Monthly cost__: 1,204",
+    "__Monthly cost:__\n1,204",
+    "_Savings:_\n30%",
+    "Run the bash script; the _estimated cost_ is $5 per run.",
+    "1. _dollars_ per hour",
+    "1. Compute\n2. USD per month",
+    # Each widened savings and price-comparison word is pinned on its own.
+    "Spot saves 90%.",
+    "Reserved capacity discounts reach 40%.",
+    "Graviton lowers your bills by 20%.",
+    "Spot is the cheapest option at up to 90% below On-Demand.",
+    "On-Demand is 90% more expensive than Spot.",
+    "Spot prices are up to 90% lower.",
+    "Spot pricing is up to 90% lower.",
+    "Spot saves up to 90 percent compared to On-Demand.",
+    "Spot: up to 90% off On-Demand.",
     "### 1. Cost: $1,200 per month",
     "### 1. Overview\n### 2. Monthly cost: 1,204",
     "### 999. That is the estimated monthly cost.",
