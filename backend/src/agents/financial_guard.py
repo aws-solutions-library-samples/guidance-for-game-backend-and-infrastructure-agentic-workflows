@@ -218,8 +218,14 @@ _QUANTITY_RE = re.compile(
 # number that continues an ancestor pops back to it. Only a marker accepted as a
 # list continuation is neutralized; a lone 1-3 digit value that ends a sentence
 # ("999. That is the cost.") keeps its digits so it stays visible to the
-# value-language detector.
-_ORDERED_LIST_MARKER_RE = re.compile(r"^[ \t]*(\d{1,3})([.)])[ \t]+", re.MULTILINE)
+# value-language detector. A numbered Markdown heading ("### 4. Control Costs")
+# or bold numbered pseudo-heading ("**4. Reduce cost**", "**4.** Reduce cost")
+# follows the same rule with its own counter stack, so heading numbers and the
+# list items between headings do not interrupt each other's sequence.
+_ORDERED_LIST_MARKER_RE = re.compile(
+    r"^[ \t]*(?P<prefix>#{1,6}[ \t]+|\*\*|__)?(?P<number>\d{1,3})[.)](?:\*\*|__)?[ \t]+",
+    re.MULTILINE,
+)
 # An AWS Region code ("us-west-2", "eu-central-1", "us-gov-east-1") is an
 # identifier, not money. Its trailing digit must not be read as an amount. The
 # pattern is anchored to real Region prefixes and directions so an arbitrary
@@ -259,9 +265,10 @@ def _neutralize_quantities(text: str) -> str:
     characters before it (or when a symbol or ISO code precedes it after a longer
     run of whitespace), or a currency word sits within twenty characters after
     it, so a monetary amount such as "0.023 GB in dollars" stays visible.
-    Markdown list markers that continue a (possibly nested) list, and AWS Region
-    codes, are also neutralized so their digits cannot bind to a nearby financial
-    word. A lone 1-3 digit value that merely ends a sentence keeps its digits.
+    Markdown list markers and numbered headings that continue a (possibly
+    nested) sequence, and AWS Region codes, are also neutralized so their digits
+    cannot bind to a nearby financial word. A lone 1-3 digit value that merely
+    ends a sentence keeps its digits.
     """
 
     def neutralize(match: re.Match[str]) -> str:
@@ -278,10 +285,12 @@ def _neutralize_quantities(text: str) -> str:
         return re.sub(r"\d[\d,]*(?:\.\d+)?", "N", fragment, count=1)
 
     def neutralize_list_markers(scannable: str) -> str:
-        counters: list[int] = []
+        # Plain list markers and numbered headings keep separate counter stacks.
+        stacks: dict[bool, list[int]] = {False: [], True: []}
 
         def replace(match: re.Match[str]) -> str:
-            number = int(match.group(1))
+            counters = stacks[match.group("prefix") is not None]
+            number = int(match.group("number"))
             if number == 1:
                 counters.append(1)
             elif counters and number in (counters[-1], counters[-1] + 1):
@@ -294,7 +303,10 @@ def _neutralize_quantities(text: str) -> str:
                         break
                 else:
                     return match.group(0)
-            return match.group(0).replace(match.group(1), "N", 1)
+            start = match.start("number") - match.start()
+            end = match.end("number") - match.start()
+            marker = match.group(0)
+            return marker[:start] + "N" + marker[end:]
 
         return _ORDERED_LIST_MARKER_RE.sub(replace, scannable)
 

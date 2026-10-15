@@ -78,6 +78,17 @@ _OPERATIONAL_CLEAN = [
     "1. **Right-size fleets**\n   1. Review CPU\n   2. Review memory\n   3. Review network\n2. **Use Spot** to reduce cost.",
     "1) Right-size\n   1. CPU\n   2. Memory\n   3. Network\n   4. Disk\n2) Use Spot to lower cost.\n3) Review cost.",
     "1. **Right-size fleets** to reduce cost\n   1. Review CPU\n   2. Review memory\n   3. Review network\n2. **Use Spot**",
+    # Numbered Markdown headings and bold numbered pseudo-headings are structure.
+    # A deployed best-practices answer was withheld solely by "### 4. Control
+    # Costs"; the headings keep their own counter, separate from list items.
+    (
+        "## Best Practices\n\n### 1. Architecture\n- Use multiple Regions.\n\n"
+        "### 2. Scaling\n1. Use target tracking.\n2. Keep a buffer.\n3. Review peaks.\n\n"
+        "### 3. Reliability\n- Spread across AZs.\n\n### 4. Control Costs\n- Use Spot for stateless capacity."
+    ),
+    "#### 1. Placement\n- Pick Regions near players.\n#### 2. Optimize Compute Cost (Without Sacrificing Reliability)",
+    "**1. Scale on demand**\n- Use target tracking.\n\n**2. Reduce cost**\n- Right-size fleets.",
+    "**1.** Scale on demand.\n**2.** Reduce cost with Spot.",
 ]
 
 
@@ -169,6 +180,13 @@ _FINANCIAL_WITHHELD = [
     "**Estimated monthly cost:**\n\n120. This assumes On-Demand pricing.",
     "Budget:\n\n500) per month",
     "Total spend\n999) for the fleet",
+    # A numbered heading never hides an amount or savings claim on its line, and
+    # a heading number that does not continue a heading sequence stays visible.
+    "### 1. Architecture\n### 2. Control Costs\n- Spot saves up to 90% of the On-Demand price.",
+    "### 1. Cost: $1,200 per month",
+    "### 1. Overview\n### 2. Monthly cost: 1,204",
+    "### 999. That is the estimated monthly cost.",
+    "**450.** That assumes on-demand rates.",
     # A currency word within twenty characters after the quantity preserves it.
     "0.023 GB in dollars",
     "Storage: 0.023 GB in dollars",
