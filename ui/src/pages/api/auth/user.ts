@@ -7,7 +7,7 @@ import { logError } from '@/utils/logger';
 // it, but a stolen/forged token presented directly to this endpoint must not be
 // trusted — its claims (email, cognito:groups → isAdmin) drive what the UI shows.
 // tokenUse: 'id' because aws-jwt-verify enforces the token_use claim, and the ID
-// token is the one that reliably carries cognito:groups. Matches /api/admin/*.
+// token is the one that reliably carries cognito:groups.
 const verifier = CognitoJwtVerifier.create({
   userPoolId: process.env.COGNITO_USER_POOL_ID!,
   tokenUse: 'id',
