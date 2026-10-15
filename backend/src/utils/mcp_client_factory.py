@@ -15,13 +15,12 @@ Performance Optimization:
 
 # Standard library
 import importlib.metadata
-import io
 import os
 import shutil
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, TextIO, cast
+from typing import Dict, List, Optional, TextIO
 
 # Third-party packages
 from mcp import StdioServerParameters, stdio_client
@@ -47,45 +46,33 @@ MCP_CREATE_RETRY_DELAY = 1.0  # seconds between attempts
 _EKS_LOG_SUPPRESSED_SERVERS = frozenset({"aws-api-mcp-server", "eks-mcp-server"})
 
 
-class _DiscardingErrLog(io.TextIOBase):
-    """A bounded, code-owned sink that discards everything written to it.
-
-    ``mcp.stdio_client(server, errlog=...)`` wires the child transport's stderr
-    to ``errlog`` (default ``sys.stderr``). ``mcp_wrapper.py`` forwards the
-    provider child's stderr to its own stderr, so provider-/Kubernetes-authored
-    error BODIES would otherwise reach the parent logs. For the two EKS stdio
-    servers ONLY we pass this discarding sink so that provider-authored child
-    stderr can never enter parent logs. It is a text sink (the transport writes
-    ``str``); writes are counted and dropped, never buffered or re-emitted. The
-    ``FASTMCP_LOG_LEVEL=CRITICAL`` env pin remains as defense in depth.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._dropped_chars = 0
-
-    def writable(self) -> bool:
-        return True
-
-    def write(self, s: str) -> int:
-        # Discard. Bound memory: only a counter is retained, never the content.
-        n = len(s)
-        self._dropped_chars += n
-        return n
-
-    def flush(self) -> None:  # pragma: no cover - nothing buffered
-        return None
+# ``mcp.stdio_client(server, errlog=...)`` wires the child transport's stderr to
+# ``errlog`` (default ``sys.stderr``). ``mcp_wrapper.py`` forwards the provider
+# child's stderr to its own stderr, so provider-/Kubernetes-authored error BODIES
+# would otherwise reach the parent logs. For the two EKS stdio servers ONLY we
+# pass an ``os.devnull`` handle so the kernel discards that stderr. The sink must
+# be a real file: stdio_client passes errlog to subprocess.Popen, which calls
+# ``fileno()`` (a pure-Python sink fails every spawn, issue #516). One handle is
+# shared for the process lifetime, so transport re-creation never leaks fds. The
+# ``FASTMCP_LOG_LEVEL=CRITICAL`` env pin remains as defense in depth.
+_devnull_errlog: Optional[TextIO] = None
+_devnull_errlog_lock = threading.Lock()
 
 
-def _errlog_for(server_name: str) -> "io.TextIOBase | None":
-    """Return a discarding errlog sink for the two EKS stdio servers, else None
-    (meaning: use stdio_client's default of sys.stderr, e.g. for Billing).
+def _devnull_errlog_sink() -> TextIO:
+    """Return the shared, process-lifetime ``os.devnull`` errlog handle."""
+    global _devnull_errlog
+    with _devnull_errlog_lock:
+        if _devnull_errlog is None or _devnull_errlog.closed:
+            _devnull_errlog = open(os.devnull, "w", encoding="utf-8")
+        return _devnull_errlog
 
-    Typed as TextIOBase; stdio_client is annotated ``errlog: TextIO`` but accepts
-    any text-mode writable file object, and our sink implements ``write``/
-    ``writable``/``flush``. The call site casts to satisfy the stub."""
+
+def _errlog_for(server_name: str) -> Optional[TextIO]:
+    """Return the discarding errlog sink for the two EKS stdio servers, else None
+    (meaning: use stdio_client's default of sys.stderr, e.g. for Billing)."""
     if server_name in _EKS_LOG_SUPPRESSED_SERVERS:
-        return _DiscardingErrLog()
+        return _devnull_errlog_sink()
     return None
 
 
@@ -300,14 +287,14 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
             # so they can't be rebound before the factory is first called.
             def _transport() -> MCPTransport:
                 # For the two EKS stdio servers, route the child transport's
-                # stderr to a code-owned discarding sink so provider-authored
-                # error bodies cannot enter parent logs (issue #466). Other
-                # servers (Billing) keep stdio_client's default (sys.stderr).
+                # stderr to os.devnull so provider-authored error bodies cannot
+                # enter parent logs (issues #466, #516). Other servers (Billing)
+                # keep stdio_client's default (sys.stderr).
                 errlog = _errlog_for(server_name)
                 if errlog is not None:
                     return stdio_client(
                         StdioServerParameters(command=sys.executable, args=[wrapper_path] + mcp_cmd, env=env),
-                        errlog=cast(TextIO, errlog),
+                        errlog=errlog,
                     )
                 return stdio_client(
                     StdioServerParameters(command=sys.executable, args=[wrapper_path] + mcp_cmd, env=env)

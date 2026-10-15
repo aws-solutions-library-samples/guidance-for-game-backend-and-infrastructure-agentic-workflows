@@ -281,7 +281,7 @@ def invoke_agent(prompt, context=None):
                 return "I'm sorry, but your request could not be processed due to an identity verification issue."
 
             if not verified_runtime_identity.groups.intersection({"admin", "users"}):
-                logger.warning("⚠️ Rejected request: verified user is not in an approved group")
+                logger.warning("⚠️ Rejected request: verified user is not provisioned (admin or users group)")
                 return "I'm sorry, but your request could not be processed due to an identity verification issue."
 
         # Security: Log sanitized request info (redact sensitive data)
