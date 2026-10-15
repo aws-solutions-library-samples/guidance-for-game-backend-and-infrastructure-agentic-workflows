@@ -150,6 +150,26 @@ You'll be prompted for:
 - Email address
 - Password (min 8 characters, uppercase, lowercase, number, symbol)
 
+Self-signup is disabled and the app has no in-app user management. To add
+another administrator, re-run this script. To grant chat-only access, create
+the user the same way but add it to the `users` group instead of `admin`. The
+sign-in page does not handle a temporary-password challenge, so set a permanent
+password:
+
+```bash
+USER_POOL_ID=<user-pool-id>   # the UserPoolId output of the base stack
+CHAT_USER_EMAIL=<email>
+read -rsp "Password: " CHAT_USER_PASSWORD; echo
+aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --user-attributes Name=email,Value="$CHAT_USER_EMAIL" Name=email_verified,Value=true \
+  --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --password "$CHAT_USER_PASSWORD" --permanent
+aws cognito-idp admin-add-user-to-group --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --group-name users
+unset CHAT_USER_PASSWORD
+```
+
 ### Step 6: Access Your Deployment
 
 The deployment script outputs your frontend URL:
@@ -202,7 +222,8 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 ./scripts/infrastructure/test-kb.sh
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
-# short-lived access token from an approved Cognito test user
+# short-lived access token from a provisioned Cognito test user (in the
+# `admin` or `users` group)
 export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
 ./test-ai-evals.sh
 
@@ -279,6 +300,48 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
 **AI usage (variable)**: $20-630+/month depending on query volume and conversation length
+
+### Optional operations control plane (E1)
+
+The optional E1 operations control plane is **default-disabled** and adds
+**$0.00** incremental cost. It creates no HTTP API route, compute, table,
+bucket, metric, or alarm unless an owner explicitly enables operations. When
+enabled, it deploys the accepted synchronous, read-only GameLift observation
+design ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with
+**no queue, worker, dead-letter queue, or Step Functions** in the observation
+path and no provider-write permission.
+
+Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**;
+free-tier allowances excluded):
+
+| Scenario | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- |
+| Default-disabled | $0.00 | $0.00 | **$0.00** |
+| Enabled, idle | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations/mo | $1.84 | $3.49 | **$5.33** |
+
+Enabled resources and their charge basis:
+
+| Service | Basis | Notes |
+| --- | --- | --- |
+| API Gateway (HTTP API) | $1.00 / million requests | 1 route; 100K req ≈ $0.10 |
+| Compute (Lambda, x86, 512 MB) | $0.20 / M requests + $0.0000166667 / GB-s | 1.0 s billed/req modelled; scales to zero when idle |
+| DynamoDB (on-demand) | WRU $0.625/M, RRU $0.125/M | 16 WRU + 4 RRU per observation (transactional) |
+| DynamoDB storage + PITR | $0.25 + $0.20 / GB-mo | small standing footprint |
+| S3 (content-addressed) | $0.023 / GB-mo + $0.005/1K PUT + $0.0004/1K GET | 1 PUT + 1 GET per observation, ~8 KB objects |
+| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 metrics + 4 alarms (always-on fixed cost) |
+| CloudWatch logs | $0.50 / GB ingest + $0.03 / GB-mo | ~8 KB per request |
+| X-Ray | $5.00 / million traces | 1 trace per observation |
+
+All rates, source URLs, and assumptions live in
+[`docs/operations-cost-model.json`](operations-cost-model.json) and are
+recomputed by `backend/tests/unit/test_operations_cost_model_unit.py` so these
+tables cannot drift. **Denial-of-wallet controls:** create an AWS Budget on the
+optional stack's cost-allocation tag; set DynamoDB on-demand per-table maximum
+read/write request units; enable HTTP API stage throttling; and alarm on
+request count and error/timeout rate. Disable by setting operations mode to
+`disabled` and removing the optional stack. E1 rollout (#413) is blocked on this
+reviewed cost evidence.
 
 ### Cost Optimization Tips
 
