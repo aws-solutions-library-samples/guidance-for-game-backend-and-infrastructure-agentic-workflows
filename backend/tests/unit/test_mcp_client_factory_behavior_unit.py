@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 # Third-party packages
 import pytest
+from mcp import StdioServerParameters, stdio_client
 
 pytestmark = pytest.mark.unit
 
@@ -459,8 +460,8 @@ class TestEksProviderErrorLogSuppression:
 class TestEksTransportErrlogSink:
     """mcp_wrapper forwards the provider child's stderr to its own stderr, so
     stdio_client's errlog (default sys.stderr) would carry provider-authored
-    bodies into parent logs. For the two EKS stdio servers ONLY we pass a
-    code-owned discarding errlog sink; Billing keeps the default (issue #466).
+    bodies into parent logs. For the two EKS stdio servers ONLY we pass an
+    os.devnull errlog sink; Billing keeps the default (issues #466, #516).
 
     These tests invoke the transport factory that create_mcp_client hands to
     MCPClient, then inspect the errlog argument stdio_client received."""
@@ -476,42 +477,93 @@ class TestEksTransportErrlogSink:
             return kwargs["errlog"]
         return args[1] if len(args) > 1 else None
 
+    @staticmethod
+    def _assert_devnull_sink(errlog):
+        # A real, open os.devnull file: Popen needs fileno(), and the kernel
+        # discards whatever the child writes.
+        assert errlog is not None
+        assert errlog.name == os.devnull
+        assert not errlog.closed
+        assert isinstance(errlog.fileno(), int)
+
     @patch("utils.mcp_client_factory.stdio_client")
     @patch("utils.mcp_client_factory.MCPClient")
-    def test_aws_api_transport_uses_discarding_errlog(self, mock_mcp_client, mock_stdio):
-        # Local modules
-        from utils.mcp_client_factory import _DiscardingErrLog
-
+    def test_aws_api_transport_uses_devnull_errlog(self, mock_mcp_client, mock_stdio):
         mock_mcp_client.side_effect = lambda factory: factory() or Mock()
         create_mcp_client("aws-api-mcp-server")
-        errlog = self._errlog_arg(mock_stdio)
-        assert isinstance(errlog, _DiscardingErrLog)
-        # The sink must actually discard: a write returns the char count and
-        # retains nothing recoverable.
-        n = errlog.write("AccessDeniedException: arn:aws:eks:...:cluster/secret\n")
-        assert n > 0
+        self._assert_devnull_sink(self._errlog_arg(mock_stdio))
 
     @patch("utils.mcp_client_factory.stdio_client")
     @patch("utils.mcp_client_factory.MCPClient")
-    def test_eks_transport_uses_discarding_errlog(self, mock_mcp_client, mock_stdio):
-        # Local modules
-        from utils.mcp_client_factory import _DiscardingErrLog
-
+    def test_eks_transport_uses_devnull_errlog(self, mock_mcp_client, mock_stdio):
         mock_mcp_client.side_effect = lambda factory: factory() or Mock()
         create_mcp_client("eks-mcp-server")
-        errlog = self._errlog_arg(mock_stdio)
-        assert isinstance(errlog, _DiscardingErrLog)
+        self._assert_devnull_sink(self._errlog_arg(mock_stdio))
+
+    def test_eks_errlog_sink_is_shared_across_transports(self):
+        # Local modules
+        from utils.mcp_client_factory import _errlog_for
+
+        # One process-lifetime handle, so transport re-creation never leaks fds.
+        assert _errlog_for("aws-api-mcp-server") is _errlog_for("eks-mcp-server")
 
     @patch("utils.mcp_client_factory.stdio_client")
     @patch("utils.mcp_client_factory.MCPClient")
     def test_billing_transport_keeps_default_errlog(self, mock_mcp_client, mock_stdio):
-        # Local modules
-        from utils.mcp_client_factory import _DiscardingErrLog
-
         mock_mcp_client.side_effect = lambda factory: factory() or Mock()
         create_mcp_client("billing-cost-management-mcp-server")
         errlog = self._errlog_arg(mock_stdio)
         # Billing must NOT get the EKS discarding sink; stdio_client's default
         # (sys.stderr) is used, i.e. no errlog is passed by our factory.
-        assert not isinstance(errlog, _DiscardingErrLog)
         assert errlog is None
+
+
+class TestEksErrlogSinkRealSpawn:
+    """The EKS errlog sink must work with a REAL subprocess spawn (issue #516).
+
+    stdio_client hands errlog to subprocess.Popen as the child's stderr, which
+    requires a real OS file descriptor. The mocked tests above never spawn a
+    child, so a sink without fileno() passed CI while every live EKS MCP spawn
+    failed with io.UnsupportedOperation: fileno. These tests spawn a trivial
+    stdio child through the real transport and assert it starts AND that the
+    child's stderr never reaches the parent's stderr."""
+
+    _SENTINEL = "provider-authored-stderr-body-516"
+
+    # Child writes the sentinel to stderr, then one JSON-RPC notification to
+    # stdout, then blocks on stdin until the transport closes it.
+    _CHILD = (
+        "import sys; "
+        f"sys.stderr.write({_SENTINEL!r}); sys.stderr.flush(); "
+        'sys.stdout.write(\'{"jsonrpc":"2.0","method":"notifications/initialized"}\\n\'); '
+        "sys.stdout.flush(); sys.stdin.read()"
+    )
+
+    def _spawn_through_sink(self, server_name):
+        # Standard library
+        import asyncio
+
+        # Local modules
+        from utils.mcp_client_factory import _errlog_for
+
+        errlog = _errlog_for(server_name)
+        assert errlog is not None
+
+        async def run():
+            params = StdioServerParameters(command=sys.executable, args=["-c", self._CHILD])
+            async with stdio_client(params, errlog=errlog) as (read_stream, _write_stream):
+                # The child flushed stderr before stdout, so once this message
+                # arrives the sentinel has already been written to the sink.
+                return await read_stream.receive()
+
+        return asyncio.run(asyncio.wait_for(run(), timeout=20))
+
+    @pytest.mark.parametrize("server_name", ["aws-api-mcp-server", "eks-mcp-server"])
+    def test_eks_sink_spawns_real_child_and_discards_its_stderr(self, server_name, capfd):
+        message = self._spawn_through_sink(server_name)
+
+        assert not isinstance(message, Exception), message
+        assert message.message.root.method == "notifications/initialized"
+        captured = capfd.readouterr()
+        assert self._SENTINEL not in captured.err
+        assert self._SENTINEL not in captured.out
