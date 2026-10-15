@@ -35,6 +35,8 @@ function request(dataOverrides: Record<string, unknown> = {}) {
   return createMocks({
     method: 'POST',
     headers: {
+      host: 'app.example.com',
+      origin: 'https://app.example.com',
       cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
     },
     body: {
