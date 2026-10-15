@@ -278,9 +278,9 @@ Each sensitive-information entity and regex in
 `infrastructure/cloudformation/04-bedrock-guardrails.yaml` has one action for
 both directions: an `ANONYMIZE` entity such as `USERNAME` in retrieved memory
 reaches the model unmasked, and a `BLOCK` entity such as `PASSWORD` does not
-block the request. The output-side policies still evaluate every reply, so
-content filters, denied topics, word filters, and sensitive-information masking
-and blocking apply to anything the model repeats.
+block the request. The output-side Guardrail policies still evaluate every
+reply, so anything the model repeats from retrieved memory gets the same output
+checks as the rest of the reply.
 
 ---
 
@@ -501,7 +501,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 
 The two scope topics (General Programming Help, Entertainment and Casual Chat) block on user input and are detect-only on model output (#530). Valid infrastructure answers (kubectl commands, GameLift Server SDK steps, CloudFormation templates) were being blocked on output as off-topic. Accepted residual risk:
 
-- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
+- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, retrieved long-term memory, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
 - **Language coverage.** The Guardrail uses the default CLASSIC topic tier, which supports English, French, and Spanish. An off-topic request in another language can pass the input check, and the output check will not catch it.
 - **No user-visible fallback for scope detections on output.** The answer is returned unchanged. Personal Advice, content-filter, PII, and regex blocks still replace the entire response with the blocked-output message.
 - **Detections are not recorded.** A scope-topic match on output appears only in the per-request Guardrail trace. The application does not log or store it.
