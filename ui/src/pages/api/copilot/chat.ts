@@ -4,6 +4,7 @@ import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import { parse } from '@/utils/cookieCompat';
+import { isSameOrigin } from '@/utils/csrf';
 import {
   buildTrustedPrincipal,
   TrustedPrincipalClaimsError,
@@ -210,6 +211,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] 🚀 COPILOT PROXY - NEW REQUEST`);
     logInfo(`[${requestId}] ========================================`);
     logInfo(`[${requestId}] Received ${sanitizedMethod} request to /api/copilot/chat`);
+
+    // CSRF defense-in-depth: reject cross-origin state-changing requests before
+    // any token verification, body handling, or runtime call. GET/HEAD are
+    // read-only connectivity probes and are not gated here. This mirrors the
+    // same-origin gate on the auth and admin state-changing routes.
+    if (req.method === 'POST' && !isSameOrigin(req)) {
+      logError(`[${requestId}] ❌ Cross-origin request blocked`);
+      return res.status(403).json({ error: 'Cross-origin request blocked' });
+    }
 
     // Validate JWT in production
     const { ok: isAuthenticated, payload: accessPayload, token: accessToken } = await verifyAccessToken(req);
