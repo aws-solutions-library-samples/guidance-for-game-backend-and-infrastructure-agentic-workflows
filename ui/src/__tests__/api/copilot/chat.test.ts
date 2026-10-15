@@ -4,6 +4,14 @@
 
 import { createMocks } from 'node-mocks-http';
 import handler from '../../../pages/api/copilot/chat';
+import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
+
+// Mock the server-side proxy fetch so a CSRF-blocked request can assert that no
+// backend/runtime call is ever made.
+jest.mock('@/utils/fetchWithTimeout', () => ({
+  fetchWithTimeout: jest.fn(),
+}));
+const mockFetchWithTimeout = fetchWithTimeout as jest.Mock;
 
 // Mock dependencies
 jest.mock('@/utils/logger', () => ({
@@ -124,6 +132,8 @@ describe('/api/copilot/chat - JWT decoding', () => {
     const { req, res } = createMocks({
       method: 'POST',
       headers: {
+        host: 'app.example.com',
+        origin: 'https://app.example.com',
         cookie: 'cognito_access_token=access-token; cognito_id_token=id-token'
       },
       body: {
@@ -161,7 +171,11 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
     const { req, res } = createMocks({
       method: 'POST',
-      headers: { cookie: 'cognito_access_token=access-token' },
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://app.example.com',
+        cookie: 'cognito_access_token=access-token'
+      },
       body: {
         operationName: 'generateCopilotResponse',
         variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } }
@@ -215,7 +229,7 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
     const { req, res } = createMocks({
       method: 'POST',
-      headers: {}, // no cognito_access_token cookie
+      headers: { host: 'staging.example.com', origin: 'https://staging.example.com' }, // same-origin, no access cookie
       body: {
         operationName: 'generateCopilotResponse',
         variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } }
@@ -226,5 +240,132 @@ describe('/api/copilot/chat - JWT decoding', () => {
 
     expect(res._getStatusCode()).toBe(401);
     expect(JSON.parse(res._getData()).error).toBe('Unauthorized');
+  });
+});
+
+describe('/api/copilot/chat - CSRF same-origin check', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Hosted-style environment: the local-dev bypass is off, so the same-origin
+    // check is enforced.
+    process.env.NODE_ENV = 'production';
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    mockVerify.mockResolvedValue({
+      sub: 'user123',
+      email: 'test@example.com',
+      'cognito:groups': ['users'],
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.NEXT_PUBLIC_SKIP_AUTH;
+    delete process.env.AGENTCORE_RUNTIME_ID;
+    delete process.env.COGNITO_CLIENT_ID;
+    delete process.env.GBAW_TENANT_ID;
+    delete process.env.GBAW_WORKSPACE_ID;
+  });
+
+  it('rejects a cross-origin POST with 403 before any token or runtime call', async () => {
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://evil.example.com',
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
+      },
+      body: {
+        operationName: 'generateCopilotResponse',
+        variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } },
+      },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(403);
+    expect(JSON.parse(res._getData()).error).toBe('Cross-origin request blocked');
+    // No Cognito verification and no backend/runtime invocation happened.
+    expect(mockVerify).not.toHaveBeenCalled();
+    expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+  });
+
+  it('rejects a POST with no Origin or Referer the same way the auth routes do (403)', async () => {
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: {
+        host: 'app.example.com',
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
+      },
+      body: {
+        operationName: 'generateCopilotResponse',
+        variables: { data: { messages: [{ textMessage: { role: 'user', content: 'test' } }] } },
+      },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(403);
+    expect(JSON.parse(res._getData()).error).toBe('Cross-origin request blocked');
+    expect(mockVerify).not.toHaveBeenCalled();
+    expect(mockFetchWithTimeout).not.toHaveBeenCalled();
+  });
+
+  it('allows a same-origin POST through the CSRF check to a successful response', async () => {
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      'cognito:groups': ['users'],
+      scope: 'openid profile',
+    });
+    const { req, res } = createMocks({
+      method: 'POST',
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://app.example.com',
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
+      },
+      body: {
+        operationName: 'availableAgents',
+        variables: { data: {} },
+      },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(JSON.parse(res._getData()).data.availableAgents).toBeDefined();
+    expect(mockVerify).toHaveBeenCalled();
+  });
+
+  it('does not gate a cross-origin GET connectivity probe', async () => {
+    // Hosted-style (no local bypass), so isSameOrigin would reject this request
+    // if the gate applied to GET.
+    process.env.COGNITO_CLIENT_ID = 'web-client';
+    process.env.GBAW_TENANT_ID = 'tenant-a';
+    process.env.GBAW_WORKSPACE_ID = 'workspace-a';
+    mockVerify.mockResolvedValue({
+      token_use: 'access',
+      sub: 'user123',
+      client_id: 'web-client',
+      'cognito:groups': ['users'],
+      scope: 'openid profile',
+    });
+    mockFetchWithTimeout.mockResolvedValue({ ok: true, status: 200, text: async () => 'ok' });
+    const { req, res } = createMocks({
+      method: 'GET',
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://evil.example.com',
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
+      },
+    });
+
+    await handler(req, res);
+
+    expect(res._getStatusCode()).toBe(200);
+    expect(JSON.parse(res._getData()).status).toBe('connected');
   });
 });
