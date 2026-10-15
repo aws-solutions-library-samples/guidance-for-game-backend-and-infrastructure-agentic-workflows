@@ -450,10 +450,12 @@ Resources:
   # The justified STS caller therefore does not imply an STS grant; the correct
   # least-privilege shape is an empty role.
   #
-  # The dormant admin routes still reference IAM-authorized Cognito Admin/List
-  # operations, but the default deployment has never granted those actions and
-  # they are not a supported account-provisioning path. Issue #473 removes that
-  # surface after its #469 dependency; do not grant cognito-idp permissions here.
+  # Access is administrator-provisioned: an operator runs the bootstrap script
+  # to create a confirmed user and place it in the `admin` group (chat-only
+  # users are added to the `users` group out of band). The sample ships no
+  # in-app account-management page or Cognito administrator API, so this role
+  # never needs IAM-authorized Cognito Admin/List operations; do not grant
+  # cognito-idp permissions here.
   #
   # AgentCore is invoked with the end user's Cognito JWT as a bearer token over
   # HTTPS fetch (not the AWS SDK / SigV4), so no bedrock or bedrock-agentcore

@@ -22,9 +22,10 @@ Parameters:
     MinValue: 100
     Description: >-
       Tighter per-IP request limit (per 5-minute window) for the sensitive
-      /api/auth/* and /api/admin/* paths. WAFv2 rate-based rules enforce a
-      minimum of 100. Lower than the global limit to throttle credential
-      stuffing / admin-endpoint abuse.
+      /api/auth/* path and the /api/admin/* namespace. The app serves no
+      /api/admin/* route; this limit is defense in depth for that namespace.
+      WAFv2 rate-based rules enforce a minimum of 100. Lower than the global
+      limit to throttle credential stuffing against auth.
 
   CloudTrailRetentionDays:
     Type: Number
@@ -257,7 +258,8 @@ Resources:
             CloudWatchMetricsEnabled: true
             MetricName: !Sub '${ProjectName}-rate-limit-auth'
 
-        # Tighter rate limit for /api/admin/* (privileged endpoints).
+        # The app serves no /api/admin/* route; this per-IP limit is defense
+        # in depth for that namespace.
         - Name: RateLimitAdminPaths
           Priority: 2
           Statement:
