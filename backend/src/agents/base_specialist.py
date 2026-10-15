@@ -10,9 +10,10 @@ from typing import Any, Callable, List, Optional
 
 # Third-party packages
 from strands import Agent, tool
+from strands.types.exceptions import MaxTokensReachedException
 
 # Local modules
-from agents.specialist_capture import record_specialist_output
+from agents.specialist_capture import begin_specialist_call, record_specialist_output
 from config.settings import AGENT_MAX_TURNS_SPECIALIST, AGENT_TIMEOUT_SPECIALIST_SECONDS, AWS_REGION, INFERENCE_CONFIG
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_specialist_bedrock_model
 from utils.kb_tools import create_kb_retrieve_tool
@@ -21,6 +22,11 @@ from utils.max_turns_hook import MaxTurnsHook
 from utils.mcp_client_factory import create_mcp_client
 from utils.timing import time_operation
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
+
+TRUNCATED_ANSWER_MESSAGE = (
+    "The {service} answer was too long to complete within its response size limit, so nothing partial "
+    "is shown. Ask for one part at a time, for example only the template, or only the cutover plan."
+)
 
 
 def create_specialist_agent(
@@ -63,6 +69,9 @@ def create_specialist_agent(
                 # factory error), the orchestrator can still fail closed instead
                 # of trusting model-authored financial prose.
                 record_specialist_output(service_name, "")
+                # Reserve this call's place in invocation order now, so parallel
+                # calls keep a deterministic order regardless of completion time.
+                call = begin_specialist_call(service_name)
 
                 # Build tools list
                 tools = list(additional_tools) if additional_tools else []
@@ -86,7 +95,7 @@ def create_specialist_agent(
                     if mcp_clients_created == 0 and fallback_fn and not tools:
                         logger.warning(f"⚠️ {service_name} MCP unavailable, using fallback")
                         fallback_message = fallback_fn(AWS_REGION)
-                        record_specialist_output(service_name, fallback_message)
+                        record_specialist_output(service_name, fallback_message, call)
                         return fallback_message
 
                 # Add KB tool if configured
@@ -127,8 +136,16 @@ def create_specialist_agent(
                             result = response_finalizer(result)
                         logger.debug(f"{emoji} {service_name} complete ({len(result)} chars)")
 
-                    record_specialist_output(service_name, result)
+                    record_specialist_output(service_name, result, call)
                     return result
+
+                except MaxTokensReachedException:
+                    # The answer was cut off at the response budget. Say so
+                    # plainly; nothing partial (for example a half-written
+                    # template) is returned or relayed.
+                    logger.warning(f"⚠️ {service_name} answer reached its response size limit")
+                    record_specialist_output(service_name, TRUNCATED_ANSWER_MESSAGE.format(service=service_name), call)
+                    return TRUNCATED_ANSWER_MESSAGE.format(service=service_name)
 
                 except Exception:
                     # Log the full exception (with traceback) server-side, but do
@@ -138,10 +155,10 @@ def create_specialist_agent(
                     logger.exception(f"❌ {service_name} agent failed")
                     if fallback_fn:
                         fallback_message = fallback_fn(AWS_REGION)
-                        record_specialist_output(service_name, fallback_message)
+                        record_specialist_output(service_name, fallback_message, call)
                         return fallback_message
                     failure_message = f"Unable to process the {service_name} request right now. Please try again."
-                    record_specialist_output(service_name, failure_message)
+                    record_specialist_output(service_name, failure_message, call)
                     return failure_message
 
         # Set unique name and docstring

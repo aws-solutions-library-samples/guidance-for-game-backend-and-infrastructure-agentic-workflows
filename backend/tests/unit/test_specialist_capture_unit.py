@@ -8,8 +8,10 @@ import pytest
 
 # Local modules
 from agents.specialist_capture import (
+    begin_specialist_call,
     begin_specialist_capture,
     finish_specialist_capture,
+    finish_specialist_capture_with_history,
     record_specialist_output,
 )
 
@@ -62,6 +64,65 @@ class TestSpecialistCapture:
 
         # One section for the service, holding the most recent output.
         assert recorded == [("eks", "second eks")]
+
+    def test_history_is_in_invocation_order_not_completion_order(self):
+        capture = begin_specialist_capture()
+        try:
+            first = begin_specialist_call("GameLift")
+            eks = begin_specialist_call("EKS")
+            second = begin_specialist_call("GameLift")
+            # Completion order is the reverse of invocation order.
+            record_specialist_output("GameLift", "second gamelift", second)
+            record_specialist_output("EKS", "eks text", eks)
+            record_specialist_output("GameLift", "first gamelift", first)
+        finally:
+            composed, history = finish_specialist_capture_with_history(capture)
+
+        assert history == [("GameLift", "first gamelift"), ("EKS", "eks text"), ("GameLift", "second gamelift")]
+        # Composition is unchanged: last write per service.
+        assert composed == [("GameLift", "first gamelift"), ("EKS", "eks text")]
+
+    def test_history_omits_calls_that_returned_no_text(self):
+        capture = begin_specialist_capture()
+        try:
+            begin_specialist_call("EKS")  # started, never finished
+            call = begin_specialist_call("GameLift")
+            record_specialist_output("GameLift", "answer", call)
+        finally:
+            _, history = finish_specialist_capture_with_history(capture)
+        assert history == [("GameLift", "answer")]
+
+    def test_history_ordering_is_deterministic_under_parallel_completion(self):
+        # Standard library
+        import contextvars
+        import random
+        import threading
+
+        for seed in range(25):
+            capture = begin_specialist_capture()
+            calls = [(f"svc{i % 3}", begin_specialist_call(f"svc{i % 3}"), f"out{i}") for i in range(12)]
+            order = list(range(len(calls)))
+            random.Random(seed).shuffle(order)
+            threads = []
+            for index in order:
+                service, call, output = calls[index]
+                ctx = contextvars.copy_context()
+                threads.append(threading.Thread(target=ctx.run, args=(record_specialist_output, service, output, call)))
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            _, history = finish_specialist_capture_with_history(capture)
+            assert [output for _, output in history] == [f"out{i}" for i in range(12)], seed
+
+    def test_begin_call_without_active_capture_returns_none(self):
+        assert begin_specialist_call("GameLift") is None
+
+    def test_history_finish_is_idempotent(self):
+        capture = begin_specialist_capture()
+        record_specialist_output("EKS", "eks text", begin_specialist_call("EKS"))
+        assert finish_specialist_capture_with_history(capture) == ([("EKS", "eks text")], [("EKS", "eks text")])
+        assert finish_specialist_capture_with_history(capture) == ([], [])
 
     def test_record_without_active_capture_is_noop(self):
         # Must not raise and must not leak into the next capture.

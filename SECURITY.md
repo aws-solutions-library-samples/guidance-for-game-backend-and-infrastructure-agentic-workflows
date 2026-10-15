@@ -489,6 +489,34 @@ No static credentials (access keys, passwords, tokens) exist in the codebase or 
 - **AgentCore → AWS Services**: AgentCore execution role (`bedrock-agentcore.amazonaws.com`) with `aws:SourceAccount` condition
 - **MCP Servers**: Run as subprocesses via stdio transport (no network access), inherit the AgentCore execution role credentials
 
+### CloudFormation Draft Validation
+
+The GameLift specialist can draft CloudFormation and check the draft with the read-only `validate_cloudformation_template` tool (`backend/src/agents/cfn_template_validation.py`). Drafts are model output and are treated as untrusted at every step.
+
+**Permissions.** Two explicit statements on the AgentCore execution role:
+
+| Sid | Action | Resource | Notes |
+|-----|--------|----------|-------|
+| `CloudFormationDraftValidation` | `cloudformation:ValidateTemplate` | `*` | The action has no resource-level permissions, so it is bound to the stack Region with `aws:RequestedRegion`. It parses a template body; it reads no account resources. |
+| `CloudFormationPublicTypeSchemas` | `cloudformation:DescribeType` | `arn:<partition>:cloudformation:<region>::type/resource/AWS-*` | Public `AWS::` resource-type schemas only. No account-scoped private or third-party types. |
+
+Neither action creates, changes, or deletes anything, and the role gains no `CreateStack`, `UpdateStack`, change-set, or execute permission. Unit tests pin both statements and fail if any inline statement allows a CloudFormation write. The role still attaches `AWSCloudFormationReadOnlyAccess`; removing that broader managed policy is tracked in #482. These explicit statements are what the validation feature relies on.
+
+**Threats and mitigations.**
+
+| Threat | Mitigation |
+|--------|------------|
+| A crafted template exhausts CPU or memory while parsing (alias expansion, deep nesting, huge collections) | The bounded loader (`utils/cfn_yaml.py`) checks bytes before parsing and rejects anchors and aliases. It enforces node, depth, collection, and scalar limits while composing. |
+| Object construction through YAML tags | `SafeLoader` subclass. Only core YAML tags and CloudFormation short-form intrinsics are accepted; anything else, including `!!python/...`, is rejected. |
+| Ambiguous documents (duplicate keys, multiple documents, malformed intrinsics) | Rejected with a typed reason rather than resolved silently. |
+| Provider error text leaks ARNs, account IDs, URLs, or addresses into model context or logs | Only the `ValidateTemplate` message for the caller's own template is passed on, reduced to one charset-filtered, length-capped line with those values masked. Every other failure becomes a typed state (`denied`, `throttled`, `unavailable`). |
+| A partial check is presented as a pass | `syntax`, `templateValidation`, `registrySchema`, and `productPolicy` are reported separately. Any check that did not run makes the result `incomplete`, never `valid`. |
+| A validated draft is treated as approved or applied | Every result carries `untrusted: true`, `applied: false`, and a code-owned `notValidated` list. The relay labels drafts as untrusted and states that nothing was created or changed. |
+| Oversized or truncated output | The relay emits only complete fenced blocks and enforces per-block, per-answer, aggregate, and prose byte limits on the final payload. |
+| A later, narrower specialist call replaces a better first draft | Calls are ordered by when they start (assigned at invocation). The relay keeps the earliest relayable draft per service. |
+
+**Residual risk.** Validation proves only what its checks cover. A draft that passes can still fail to deploy in a specific account (quotas, existing names, service availability), can need permissions the deploying person lacks, and is not a security review. The product policy flags literal account IDs (error), unrestricted ingress and literal IP addresses (review), the deprecated container-fleet shape, and oversized templates. It does not evaluate every security property of the resources.
+
 ---
 
 ## Patching Strategy

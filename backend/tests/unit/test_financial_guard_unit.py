@@ -50,6 +50,9 @@ class TestContainsUnvalidatedFinancialContent:
             "```bash\nprintf '%s\\n' '$5'\n```",
             '```json\n{"cost": 999}\n```',
             '```json\n{"cost": "$5"}\n```',
+            "1. Monthly cost: $5",
+            "2. Spend 999 per month on Spot",
+            "3. Monthly cost:\n\n999",
         ],
     )
     def test_flags_financial_content(self, text):
@@ -68,6 +71,12 @@ class TestContainsUnvalidatedFinancialContent:
             "Reduce cost by right-sizing (see recommendations)",
             "A 30.00% utilization improvement is possible",
             "Total latency is 12.00 ms",
+            "Latency policies relax over time (200 ms, then 500 ms) to balance quality and availability",
+            "Load balancing keeps p99 under 120 ms",
+            "Each container group gets 2 vCPU and 3.5 GiB to balance density",
+            "Set the queue timeout to 60 seconds to balance wait time and placement",
+            "6. **Pre-defined rollback thresholds** — Placement success rate and P99 wait time",
+            "  2) Track the rate of abnormal terminations",
             "Time was spent restarting pods",
             "Dollars and yen are currency names",
             "AWS Costs and billing help are available. See https://docs.python.org/3/tutorial/controlflow.html",
@@ -210,4 +219,59 @@ class TestOperationalOutputWithFinancialVocabulary:
         ],
     )
     def test_labelled_or_same_line_financial_values_still_flagged(self, text):
+        assert contains_unvalidated_financial_content(text) is True
+
+
+class TestGameLiftQueuePriorityEnum:
+    _QUEUE = (
+        "      PriorityConfiguration:\n"
+        "        PriorityOrder:\n"
+        "          - LATENCY\n"
+        "          - COST\n"
+        "          - DESTINATION\n"
+        "      PlayerLatencyPolicies:\n"
+        "        - MaximumIndividualPlayerLatencyMilliseconds: 150\n"
+        "          PolicyDurationSeconds: 60\n"
+    )
+
+    def test_cost_priority_enum_is_not_a_financial_label(self):
+        assert contains_unvalidated_financial_content(self._QUEUE) is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "- COST: 5",
+            "- Cost\n999",
+            "- COST\n$5",
+            "- COST\nUSD 5",
+        ],
+    )
+    def test_cost_values_near_list_items_are_still_flagged(self, text):
+        assert contains_unvalidated_financial_content(text) is True
+
+
+class TestOperationalPortsAndRates:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Watch the placement success rate, error rate, and UDP connectivity on port 7654.",
+            "Open ports 7000-8000 for players; the server listens on 7654/UDP.",
+            "- Error rate\n  - P50/P99 connection latency to UDP 7654\n- Increase to 25% then 50%",
+            "Rollback if the crash rate exceeds 2 in 10 minutes.",
+        ],
+    )
+    def test_ports_and_operational_rates_are_clean(self, text):
+        assert contains_unvalidated_financial_content(text) is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "The hourly rate is 0.20 for port 7654.",
+            "Rate: 0.20",
+            "Error rate is low, and it costs $5 per hour.",
+            "aws gamelift create-fleet --anywhere-configuration Cost=0.10",
+            "Port 7654 instances cost 85 per month.",
+        ],
+    )
+    def test_prices_near_ports_or_rates_are_still_flagged(self, text):
         assert contains_unvalidated_financial_content(text) is True
