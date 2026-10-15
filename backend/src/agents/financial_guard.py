@@ -139,11 +139,17 @@ _PERCENT_NOUN = (
     r"|cheaper|cheapest|expensive|price|prices|pricing"
 )
 _PERCENT_VALUE = r"\d+(?:\.\d+)?\s*(?:%|percent\b)"
+# "N% off" is a discount unless it describes an operating period or a distance
+# from a target ("20% off-hours", "15% off its target utilization").
+_OFF_NOT_DISCOUNT = (
+    r"(?![-\u2010-\u2015]?\s*(?:peak|hours?|season|cycle|target|baseline)\b"
+    r"|\s+(?:its|their|the|our|your)\s+(?:\w+\s+)?(?:peak|highs?|lows?|target|baseline|max|maximum)\b)"
+)
 _FINANCIAL_PERCENT_RE = re.compile(
     rf"(?:\b(?:{_PERCENT_NOUN})\b[^\n]{{0,200}}{_PERCENT_VALUE})"
     rf"|(?:{_PERCENT_VALUE}[^\n]{{0,200}}\b(?:{_PERCENT_NOUN})\b)"
     rf"|(?:\b(?:{_PERCENT_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_PERCENT_VALUE})"
-    rf"|(?:{_PERCENT_VALUE}\s+off\b(?![-\u2010-\u2015]?\s*peak\b|\s+(?:its|their|the)\s+peak\b))",
+    rf"|(?:{_PERCENT_VALUE}\s+off\b{_OFF_NOT_DISCOUNT})",
     re.IGNORECASE,
 )
 # Markdown underscore emphasis ("_cost_", "__Monthly cost__") would hide a
@@ -163,7 +169,12 @@ _SHELL_LINE_RE = re.compile(r"^.*\b(?:awk|bash|printf|sed|xargs)\b.*$", re.IGNOR
 # bullet followed by a Python 3 tutorial URL). URLs are references, not claims.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 # EC2 Spot allocation-strategy names are identifiers, not prices.
-_SPOT_STRATEGY_RE = re.compile(r"\b(?:price-capacity-optimized|lowest-price)\b", re.IGNORECASE)
+# "price-capacity-optimized" never appears as ordinary prose, so it is rewritten
+# before every check. "lowest-price" is also an English adjective that can name
+# a bare price ("the lowest-price pool at 0.0385 per hour"), so it is rewritten
+# only for the percentage check, where the strategy name caused false positives.
+_SPOT_STRATEGY_RE = re.compile(r"\bprice-capacity-optimized\b", re.IGNORECASE)
+_LOWEST_PRICE_STRATEGY_RE = re.compile(r"\blowest-price\b", re.IGNORECASE)
 
 # A number immediately followed by a count, time, or size unit is a quantity,
 # not money ("2 instances", "3 fleets", "40-minute", "500 players", "10 nodes",
@@ -242,12 +253,15 @@ _ORDERED_LIST_MARKER_RE = re.compile(
     r"^[ \t]*(?:(?P<heading>#{1,6}[ \t]+)|(?P<bold>\*\*|__))?(?P<number>\d{1,3})[.)](?(bold)(?P=bold)?)[ \t]+",
     re.MULTILINE,
 )
-# A currency word or ISO code just after a marker means the marker number may be
+# A currency word or ISO code directly after a marker (only decoration between)
+# means the marker number may be
 # an amount ("1. dollars per hour", "2. USD per month"); its digits are kept
 # visible. A currency symbol is not used here: after a marker it is usually a
 # shell variable or prompt ("1. Set `$FLEET_ID`"), and a symbol next to a digit
 # is already caught by the symbol-amount check.
-_MARKER_CURRENCY_TRAIL_RE = re.compile(rf"[^\n]{{0,20}}(?:\b(?i:{_CURRENCY_WORD})\b|\b(?:{_ISO_ALTERNATION})\b)")
+_MARKER_CURRENCY_TRAIL_RE = re.compile(
+    rf"[ \t*_`(]{{0,4}}(?:(?:US[ \t]+)?\b(?i:{_CURRENCY_WORD})\b|\b(?:{_ISO_ALTERNATION})\b)"
+)
 # An AWS Region code ("us-west-2", "eu-central-1", "us-gov-east-1") is an
 # identifier, not money. Its trailing digit must not be read as an amount. The
 # pattern is anchored to real Region prefixes and directions so an arbitrary
@@ -373,9 +387,8 @@ def contains_unvalidated_financial_content(text: str) -> bool:
     """
     if not text:
         return False
-    scannable = _neutralize_shell_positionals(text)
+    scannable = _neutralize_shell_positionals(_SPOT_STRATEGY_RE.sub("allocation-strategy", text))
     scannable = _URL_RE.sub("", scannable)
-    scannable = _SPOT_STRATEGY_RE.sub("allocation-strategy", scannable)
     scannable = _neutralize_quantities(scannable)
     scannable = _EMPHASIS_UNDERSCORE_RE.sub(" ", scannable)
     return bool(
@@ -383,7 +396,7 @@ def contains_unvalidated_financial_content(text: str) -> bool:
         or _CODE_AMOUNT_RE.search(scannable)
         or _CURRENCY_WORD_AMOUNT_RE.search(scannable)
         or _VALUE_LANGUAGE_RE.search(scannable)
-        or _FINANCIAL_PERCENT_RE.search(scannable)
+        or _FINANCIAL_PERCENT_RE.search(_LOWEST_PRICE_STRATEGY_RE.sub("allocation-strategy", scannable))
     )
 
 

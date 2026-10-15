@@ -94,6 +94,14 @@ _OPERATIONAL_CLEAN = [
     "Utilization averages 35% off-peak and 85% at peak.",
     "CPU sits at 25% off peak.",
     "Concurrent players are 30% off their peak.",
+    "Keep minimum capacity at 20% off-hours.",
+    "Set desired capacity to 25% off-hours and 100% during peak.",
+    "Run at 40% off-season.",
+    "The fleet is 15% off its target utilization.",
+    "Player counts are 40% off their weekend highs.",
+    # An uppercase code later in a numbered step is not an amount marker.
+    "1. Pre-scale for CNY and watch the error rate.",
+    "1. Set USD as the billing currency.",
     # A shell variable after a numbered step is code, not a currency marker.
     "1. Set `$FLEET_ID`, then review the scaling rate.",
     "1. Export `$CLUSTER_NAME` and check the API rate limits.",
@@ -237,6 +245,17 @@ _FINANCIAL_WITHHELD = [
     "Spot pricing is up to 90% lower.",
     "Spot saves up to 90 percent compared to On-Demand.",
     "Spot: up to 90% off On-Demand.",
+    "Up to 90% off Linux On-Demand instances.",
+    "Spot is 90% off their normal rate.",
+    # "lowest-price" as an adjective still names a bare price.
+    "Karpenter picked the lowest-price pool, m6g.large, at 0.0385 per hour.",
+    "Lowest-price: 0.077 per hour",
+    "The lowest-price Spot pool in us-west-2 currently trades at 0.0312 per hour.",
+    # Underscore emphasis in each window the quantity and label checks read.
+    "_**Monthly cost**_\n1,204",
+    "In _dollars_, that is about 5 instances",
+    "4 GiB in _dollars_",
+    "Total _USD_" + " " * 60 + "5 instances",
     "### 1. Cost: $1,200 per month",
     "### 1. Overview\n### 2. Monthly cost: 1,204",
     "### 999. That is the estimated monthly cost.",
