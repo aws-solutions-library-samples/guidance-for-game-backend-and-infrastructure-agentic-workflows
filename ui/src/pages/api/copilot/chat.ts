@@ -4,6 +4,7 @@ import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import { parse } from '@/utils/cookieCompat';
+import { isSameOrigin } from '@/utils/csrf';
 import {
   buildTrustedPrincipal,
   TrustedPrincipalClaimsError,
@@ -211,6 +212,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] ========================================`);
     logInfo(`[${requestId}] Received ${sanitizedMethod} request to /api/copilot/chat`);
 
+    // CSRF defense-in-depth: reject cross-origin state-changing requests before
+    // any token verification, body handling, or runtime call. GET/HEAD are
+    // read-only connectivity probes and are not gated here. This mirrors the
+    // same-origin gate on the auth and admin state-changing routes.
+    if (req.method === 'POST' && !isSameOrigin(req)) {
+      logError(`[${requestId}] ❌ Cross-origin request blocked`);
+      return res.status(403).json({ error: 'Cross-origin request blocked' });
+    }
+
     // Validate JWT in production
     const { ok: isAuthenticated, payload: accessPayload, token: accessToken } = await verifyAccessToken(req);
     if (!isAuthenticated) {
@@ -246,10 +256,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         !trustedPrincipal.groups.includes('admin') &&
         !trustedPrincipal.groups.includes('users')
       ) {
-        logError(`[${requestId}] ❌ User not approved`);
+        logError(`[${requestId}] ❌ Caller not in an authorized group`);
         return res.status(403).json({
-          error: 'Account pending approval',
-          message: 'Your account is awaiting admin approval. Please contact an administrator.',
+          error: 'Access not provisioned',
+          message: 'Your account is not provisioned for access. Contact an administrator to be granted access.',
           requestId
         });
       }
@@ -257,9 +267,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Fail closed: outside the explicit local-dev bypass, a trusted principal MUST have been
     // built from the verified access token before the request proceeds. Without this, the
-    // approval gate above is only reached when `accessPayload` happens to be truthy — so any
-    // future path that returns ok-but-null (e.g. a misconfigured hosted env) would silently
-    // skip the admin/users check and let an unapproved caller through. The dev bypass
+    // group gate above is only reached when `accessPayload` happens to be truthy — so any
+    // path that returns ok-but-null (e.g. a misconfigured hosted env) would silently
+    // skip the admin-or-users group check and let an unauthorized caller through. The dev bypass
     // (NODE_ENV !== 'production' && NEXT_PUBLIC_SKIP_AUTH === 'true') is the ONLY case allowed
     // to run without a trusted principal; identity there comes from STS, not Cognito.
     const isDevAuthBypass =
