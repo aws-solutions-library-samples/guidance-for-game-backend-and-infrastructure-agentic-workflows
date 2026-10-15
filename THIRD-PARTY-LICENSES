@@ -108,3 +108,12 @@ External Resources
 
 Google Fonts - Inter (wght@400;500;600;700)  SIL Open Font License 1.1
   Source: https://fonts.google.com/specimen/Inter
+
+--------------------------------------------------------------------------------
+Vendored Source (demo/agones-gamelift-migration only)
+--------------------------------------------------------------------------------
+
+aws/amazon-gamelift-toolkit SdkGoWrapper     Apache-2.0
+  Files: demo/agones-gamelift-migration/gamelift/server/wrapper-src/
+         (server.go, go.mod, go.sum; LICENSE and NOTICE alongside)
+  Source: https://github.com/aws/amazon-gamelift-toolkit/tree/main/containers-starter-kit/SdkGoWrapper
