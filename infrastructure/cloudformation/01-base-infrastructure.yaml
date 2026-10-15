@@ -182,14 +182,19 @@ Resources:
       # action below is rebuilt from a concrete reviewed caller (see SECURITY.md,
       # "AgentCore Execution Role (Least Privilege)"). Actions a reviewed path
       # needs but that never worked on the prior role — either no prior policy
-      # granted them (ce:GetUsageForecast, eks:ListInsights/DescribeInsight,
-      # eks-mcpserver:QueryKnowledgeBase, ec2:DescribeRouteTables), or their only
+      # granted them (ce:GetUsageForecast, eks-mcpserver:QueryKnowledgeBase,
+      # ec2:DescribeRouteTables), or their only
       # caller was non-functional (the eks-mcp VPC tool shares DescribeRouteTables'
       # error path, so its ec2:DescribeVpcs/DescribeSubnets reads, granted on the
       # prior role, ran, but the tool always failed at DescribeRouteTables, so
       # their results never reached the model) — are NOT added here: that would
       # expand provider capability (out of scope). Every action that remains had
-      # a caller that worked on the prior role.
+      # a caller that worked on the prior role, except three read actions whose
+      # callers were already on the reviewed surface and failed with access
+      # denied: compute-optimizer:GetEnrollmentStatus (the Billing MCP
+      # compute-optimizer tool's enrollment probe) and eks:ListInsights /
+      # eks:DescribeInsight (the eks-mcp get_eks_insights tool, whose output the
+      # EKS guard projects).
       Policies:
         # Caller: Strands Bedrock model (models/cached_bedrock.py) for model
         # invocation + guardrails; kb_tools.py for direct KB retrieve;
@@ -315,7 +320,8 @@ Resources:
                   - cost-optimization-hub:GetRecommendation
                 Resource: '*'
               # Caller: Billing MCP compute-optimizer tool. Only the EC2 and Auto
-              # Scaling rightsizing operations are on the reviewed surface; EBS and
+              # Scaling rightsizing operations are on the reviewed surface, plus the
+              # GetEnrollmentStatus probe the tool runs before each operation; EBS and
               # Lambda rightsizing never worked on the previous role (their
               # dependent reads were never granted) and are left off to avoid
               # expanding provider capability. Compute Optimizer is a regional
@@ -330,6 +336,7 @@ Resources:
                 Action:
                   - compute-optimizer:GetEC2InstanceRecommendations
                   - compute-optimizer:GetAutoScalingGroupRecommendations
+                  - compute-optimizer:GetEnrollmentStatus
                 Resource: '*'
                 Condition:
                   StringEquals:
@@ -369,7 +376,8 @@ Resources:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
               # Caller: aws-api-mcp call_aws eks verb table (eks_mcp_guard.py) +
-              # eks-mcp DescribeCluster. IdentityProviderConfig reads and
+              # eks-mcp DescribeCluster + eks-mcp get_eks_insights (ListInsights,
+              # DescribeInsight; output projected by the EKS guard). IdentityProviderConfig reads and
               # AccessKubernetesApi were removed (no caller; k8s API access via the
               # MCP uses an STS presigned GetCallerIdentity token, which needs no
               # IAM action). Account-scoped exception: ListClusters has no resource
@@ -386,6 +394,8 @@ Resources:
                   - eks:DescribeFargateProfile
                   - eks:ListAddons
                   - eks:DescribeAddon
+                  - eks:ListInsights
+                  - eks:DescribeInsight
                 Resource: '*'
                 Condition:
                   StringEquals:
