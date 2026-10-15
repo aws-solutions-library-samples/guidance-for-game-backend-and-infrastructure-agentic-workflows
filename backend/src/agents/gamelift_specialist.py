@@ -15,6 +15,7 @@ from strands import tool
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.cfn_template_validation import validate_template_text
 from agents.gamelift_projections import (
     GAMELIFT_MAX_PROJECTED_ITEMS,
     error_result,
@@ -34,6 +35,7 @@ __all__ = [
     "get_fleet_utilization",
     "get_scaling_policies",
     "list_gamelift_fleets",
+    "validate_cloudformation_template",
 ]
 
 # ============================================================================
@@ -350,6 +352,26 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
     return project_scaling_policies(response)
 
 
+@tool
+def validate_cloudformation_template(template: str) -> dict:  # type: ignore
+    """Check a CloudFormation template before you return it. Read-only; creates nothing.
+
+    Pass the complete template text (YAML or JSON). Runs CloudFormation
+    ValidateTemplate and checks every AWS:: resource's properties against the
+    live CloudFormation registry schema: unknown property names (with the
+    allowed names), missing required properties, read-only properties, invalid
+    enum values, and wrong value shapes. ``status`` is valid, invalid, or
+    incomplete (some checks could not run). Fix every reported problem and
+    validate again before answering.
+    """
+    try:
+        client = boto3.client("cloudformation", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+    except Exception as e:
+        log_sanitized_failure("validate_cloudformation_template", uuid.uuid4().hex, e)
+        return {"status": "incomplete", "templateErrors": [], "problems": [], "error": {"codes": ["provider_error"]}}
+    return validate_template_text(template, client)
+
+
 # ============================================================================
 # GameLift Agent (using factory pattern)
 # ============================================================================
@@ -364,6 +386,7 @@ GAMELIFT_AGENT_TOOLS = [
     get_fleet_utilization,
     get_fleet_capacity,
     get_scaling_policies,
+    validate_cloudformation_template,
 ]
 
 

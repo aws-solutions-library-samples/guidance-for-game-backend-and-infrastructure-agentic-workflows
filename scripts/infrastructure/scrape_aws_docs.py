@@ -28,6 +28,58 @@ DOCS_CONFIG = {
             "output": "developer-guide.md",
             "title": "GameLift Developer Guide"
         },
+        # Unreal Engine integration: grounds fresh-setup answers for Unreal
+        # projects (Server SDK plugin, packaging, and container fleet deployment).
+        {
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/unreal-plugin.html",
+            "output": "unreal-plugin.md",
+            "title": "Amazon GameLift Servers plugin for Unreal Engine"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/integration-engines-setup-unreal.html",
+            "output": "unreal-integration.md",
+            "title": "Integrate Amazon GameLift Servers into an Unreal Engine project"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/gameliftservers/latest/developerguide/unreal-plugin-container.html",
+            "output": "unreal-plugin-container.md",
+            "title": "Plugin for Unreal: Deploy your game to a managed container fleet"
+        },
+        # CloudFormation reference for container fleets: grounds IaC generation
+        # in the current resource schema (AWS::GameLift::ContainerFleet, not the
+        # deprecated AWS::GameLift::Fleet ContainerGroupsConfiguration shape).
+        {
+            "url": "https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-gamelift-containerfleet.html",
+            "output": "cfn-containerfleet.md",
+            "title": "CloudFormation Reference: AWS::GameLift::ContainerFleet"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-gamelift-containergroupdefinition.html",
+            "output": "cfn-containergroupdefinition.md",
+            "title": "CloudFormation Reference: AWS::GameLift::ContainerGroupDefinition"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-gamelift-containergroupdefinition-gameservercontainerdefinition.html",
+            "output": "cfn-gameservercontainerdefinition.md",
+            "title": "CloudFormation Reference: ContainerGroupDefinition GameServerContainerDefinition"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-gamelift-containerfleet-scalingpolicy.html",
+            "output": "cfn-containerfleet-scalingpolicy.md",
+            "title": "CloudFormation Reference: ContainerFleet ScalingPolicy"
+        },
+        {
+            "url": "https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-gamelift-gamesessionqueue.html",
+            "output": "cfn-gamesessionqueue.md",
+            "title": "CloudFormation Reference: AWS::GameLift::GameSessionQueue"
+        },
+        {
+            "url": "https://raw.githubusercontent.com/aws/amazon-gamelift-toolkit/main/containers-starter-kit/fleet_deployment_pipeline.yml",
+            "output": "starter-kit-container-fleet-template.md",
+            "title": "GameLift Containers Starter Kit: Container Fleet Deployment Template (CloudFormation)",
+            "format": "code",
+            "language": "yaml"
+        },
         {
             "url": "https://aws.amazon.com/blogs/gametech/reduce-cost-by-up-to-90-with-amazon-gamelift-fleetiq-and-spot-instances/",
             "output": "blog-fleetiq-spot-cost.md",
@@ -215,6 +267,9 @@ class DocScraper:
             print(f"  ✅ Cache valid (age < {CACHE_DAYS} days)")
             return True
 
+        if doc_config.get("format") == "code":
+            return self._scrape_code(url, cache_key, output_file, doc_config)
+
         html = self._fetch_with_etag(url, cache_key)
 
         if html is None and output_file.exists():
@@ -246,6 +301,26 @@ class DocScraper:
 
         header = f"# {doc_config['title']}\n\n"
         full_content = header + markdown
+
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(full_content)
+
+        print(f"  ✅ Downloaded ({len(full_content)} chars)")
+        return True
+
+    def _scrape_code(self, url: str, cache_key: str, output_file: Path, doc_config: Dict) -> bool:
+        """Store a raw source file (e.g. a reference CloudFormation template) as fenced markdown."""
+        raw = self._fetch_with_etag(url, cache_key)
+        if raw is None:
+            if output_file.exists():
+                return True
+            print(f"  ❌ No cached file available")
+            return False
+
+        language = doc_config.get("language", "")
+        header = f"# {doc_config['title']}\n\nSource: {url}\n\n"
+        full_content = f"{header}```{language}\n{raw.rstrip()}\n```\n"
 
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, 'w', encoding='utf-8') as f:

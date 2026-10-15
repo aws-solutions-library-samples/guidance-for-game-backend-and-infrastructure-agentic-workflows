@@ -10,6 +10,7 @@ import pytest
 from agents.specialist_capture import (
     begin_specialist_capture,
     finish_specialist_capture,
+    finish_specialist_capture_with_history,
     record_specialist_output,
 )
 
@@ -62,6 +63,25 @@ class TestSpecialistCapture:
 
         # One section for the service, holding the most recent output.
         assert recorded == [("eks", "second eks")]
+
+    def test_history_keeps_every_nonempty_output_in_record_order(self):
+        capture = begin_specialist_capture()
+        try:
+            record_specialist_output("GameLift", "first gamelift")
+            record_specialist_output("EKS", "eks text")
+            record_specialist_output("GameLift", "")
+            record_specialist_output("GameLift", "second gamelift")
+        finally:
+            composed, history = finish_specialist_capture_with_history(capture)
+
+        assert composed == [("GameLift", "second gamelift"), ("EKS", "eks text")]
+        assert history == [("GameLift", "first gamelift"), ("EKS", "eks text"), ("GameLift", "second gamelift")]
+
+    def test_history_finish_is_idempotent(self):
+        capture = begin_specialist_capture()
+        record_specialist_output("EKS", "eks text")
+        assert finish_specialist_capture_with_history(capture) == ([("EKS", "eks text")], [("EKS", "eks text")])
+        assert finish_specialist_capture_with_history(capture) == ([], [])
 
     def test_record_without_active_capture_is_noop(self):
         # Must not raise and must not leak into the next capture.
