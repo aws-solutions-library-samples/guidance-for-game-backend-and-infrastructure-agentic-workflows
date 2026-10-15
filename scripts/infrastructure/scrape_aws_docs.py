@@ -11,9 +11,10 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -24,7 +25,10 @@ CACHE_DAYS = 7
 
 # Bump when the generated document format changes; cached entries written by an
 # older format are regenerated instead of kept.
-OUTPUT_FORMAT_VERSION = 2
+OUTPUT_FORMAT_VERSION = 3
+
+# Query parameters that only track a click; removed from link targets.
+TRACKING_PARAMETERS = re.compile(r"^(utm_[a-z]+|trk|trkCampaign|sc_channel|sc_campaign|sc_medium|sc_content|sc_detail|sc_country|sc_geo|sc_outcome|sc_publisher|sc_category|sc_segment|sc_icampaign|sc_ichannel|sc_icontent|sc_iplace)$", re.IGNORECASE)
 
 # Reviewed lifecycle status of each source. The rule:
 #   current    - the recommended approach still applies, even if the service has
@@ -33,8 +37,10 @@ OUTPUT_FORMAT_VERSION = 2
 #                replaced; kept only as background.
 #   sample     - walks through one specific sample, starter kit, or demo
 #                implementation rather than the service's general guidance.
-# Non-current documents repeat a short qualifier at every heading and at least
-# every QUALIFIER_SPACING characters, so every Knowledge Base chunk carries it.
+# Non-current documents repeat a short qualifier at every heading, on its own
+# line before every code block (and after long ones), and at least every
+# QUALIFIER_SPACING characters of prose, so every Knowledge Base chunk outside
+# a long code block carries it. Code lines and inline code are never changed.
 LIFECYCLE_NOTES = {
     "current": "Current guidance.",
     "historical": (
@@ -231,41 +237,48 @@ class DocScraper:
 
         return age_days < CACHE_DAYS
 
-    def _fetch_with_etag(self, url: str, cache_key: str, fingerprint: str) -> Optional[str]:
+    def _fetch_with_etag(
+        self, url: str, cache_key: str, fingerprint: str, conditional: bool = True
+    ) -> Tuple[str, Optional[str], Dict]:
+        """Fetch a page. Returns (status, html, cache entry); status is "ok", "not_modified", or "failed".
+
+        The cache entry is returned, not stored: the caller records it only
+        after the generated file has been written.
+        """
         headers = {}
 
         cached = self.cache.get(cache_key)
         # Conditional headers only when the existing file was generated for the
-        # same fingerprint; otherwise a 304 would keep an outdated file.
-        if cached and cached.get('fingerprint') == fingerprint:
-            if 'etag' in cached:
+        # same fingerprint (and still exists); otherwise a 304 would keep an
+        # outdated file or none at all.
+        if conditional and cached and cached.get('fingerprint') == fingerprint:
+            if cached.get('etag'):
                 headers['If-None-Match'] = cached['etag']
-            if 'last_modified' in cached:
+            if cached.get('last_modified'):
                 headers['If-Modified-Since'] = cached['last_modified']
 
         try:
             response = requests.get(url, headers=headers, timeout=30)
-
-            if response.status_code == 304:
-                print(f"  ✅ Not modified (using cache)")
-                return None
-
-            if response.status_code == 200:
-                self.cache[cache_key] = {
-                    'url': url,
-                    'fingerprint': fingerprint,
-                    'etag': response.headers.get('ETag'),
-                    'last_modified': response.headers.get('Last-Modified'),
-                    'cached_at': datetime.now().isoformat()
-                }
-                return response.text
-
-            print(f"  ⚠️  HTTP {response.status_code}")
-            return None
-
         except Exception as e:
             print(f"  ❌ Fetch failed: {e}")
-            return None
+            return "failed", None, {}
+
+        if response.status_code == 304:
+            print(f"  ✅ Not modified (using cache)")
+            return "not_modified", None, {}
+
+        if response.status_code == 200:
+            entry = {
+                'url': url,
+                'fingerprint': fingerprint,
+                'etag': response.headers.get('ETag'),
+                'last_modified': response.headers.get('Last-Modified'),
+                'cached_at': datetime.now().isoformat()
+            }
+            return "ok", response.text, entry
+
+        print(f"  ⚠️  HTTP {response.status_code}")
+        return "failed", None, {}
 
     @staticmethod
     def _published_date(html: str) -> Optional[str]:
@@ -288,7 +301,25 @@ class DocScraper:
             if link is not None and not link.get_text(strip=True) and not link.find('img'):
                 link.decompose()
 
+    @staticmethod
+    def _strip_tracking(content) -> None:
+        """Remove click-tracking query parameters from link targets."""
+        for link in content.find_all('a', href=True):
+            parts = urlsplit(link['href'])
+            if not parts.query:
+                continue
+            kept = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not TRACKING_PARAMETERS.match(k)]
+            link['href'] = urlunsplit(parts._replace(query=urlencode(kept)))
+
     def _extract_content(self, html: str) -> Optional[str]:
+        content = self._select_content(html)
+        if content is None:
+            return None
+        self._drop_images(content)
+        self._strip_tracking(content)
+        return str(content)
+
+    def _select_content(self, html: str):
         soup = BeautifulSoup(html, 'html.parser')
 
         # Blog posts (aws.amazon.com/blogs/...) use a dedicated article body.
@@ -300,8 +331,7 @@ class DocScraper:
         if blog_content:
             for tag in blog_content.find_all(['nav', 'footer', 'script', 'style']):
                 tag.decompose()
-            self._drop_images(blog_content)
-            return str(blog_content)
+            return blog_content
 
         selectors = [
             {'id': 'main-content'},
@@ -316,17 +346,20 @@ class DocScraper:
             if content:
                 for tag in content.find_all(['nav', 'footer', 'script', 'style']):
                     tag.decompose()
-                self._drop_images(content)
-                return str(content)
+                return content
 
-        body = soup.find('body')
-        if body:
-            self._drop_images(body)
-            return str(body)
+        return soup.find('body')
 
-        return None
+    def _discard_stale(self, output_file: Path, cache_key: str, reason: str) -> bool:
+        """Remove a file that no longer matches its fingerprint, so it is never seeded."""
+        if output_file.exists():
+            output_file.unlink()
+        self.cache.pop(cache_key, None)
+        print(f"  ❌ {reason}; removed the outdated file")
+        return False
 
     def scrape_doc(self, domain: str, doc_config: Dict) -> bool:
+        """Generate one document. Returns False when no up-to-date file exists afterwards."""
         url = doc_config['url']
         output_file = self.output_dir / domain / doc_config['output']
         cache_key = f"{domain}/{doc_config['output']}"
@@ -339,41 +372,49 @@ class DocScraper:
             print(f"  ✅ Cache valid (age < {CACHE_DAYS} days)")
             return True
 
-        html = self._fetch_with_etag(url, cache_key, fingerprint)
+        # A file whose cache entry is missing or carries another fingerprint was
+        # generated by an older format or for another title, URL, or lifecycle.
+        # It may be kept only while it is still current.
+        cached = self.cache.get(cache_key) or {}
+        current = output_file.exists() and cached.get('fingerprint') == fingerprint
 
-        if html is None and output_file.exists():
+        status, html, entry = self._fetch_with_etag(url, cache_key, fingerprint, conditional=current)
+
+        if status == "not_modified" and current:
             return True
-
         if html is None:
-            if output_file.exists():
+            if current:
                 print(f"  ⚠️  Using existing file (fetch failed)")
                 return True
-            else:
-                print(f"  ❌ No cached file available")
-                return False
+            if output_file.exists():
+                return self._discard_stale(output_file, cache_key, "Fetch failed and the existing file is outdated")
+            print(f"  ❌ No cached file available")
+            return False
 
         content_html = self._extract_content(html)
         if not content_html:
-            if output_file.exists():
+            if current:
                 print(f"  ⚠️  Using existing file (extraction failed)")
                 return True
-            return False
+            return self._discard_stale(output_file, cache_key, "Extraction failed")
 
         try:
             markdown = self.h2t.handle(content_html)
         except Exception as e:
-            print(f"  ❌ Conversion failed: {e}")
-            if output_file.exists():
-                print(f"  ⚠️  Using existing file")
+            if current:
+                print(f"  ⚠️  Using existing file (conversion failed: {e})")
                 return True
-            return False
+            return self._discard_stale(output_file, cache_key, f"Conversion failed: {e}")
 
-        # Source and publication date give retrieval enough context to tell a
-        # current recommendation from an older post.
+        # Source and date give retrieval enough context to tell a current
+        # recommendation from an older post. Pages that declare no publication
+        # date (the AWS documentation guides) get the retrieval date instead.
         header = f"# {doc_config['title']}\n\nSource: {url}\n"
         published = self._published_date(html)
         if published:
             header += f"Published: {published}\n"
+        else:
+            header += f"Retrieved: {datetime.now(timezone.utc).date().isoformat()}\n"
         lifecycle = doc_config['lifecycle']
         header += f"Status: {LIFECYCLE_NOTES[lifecycle]}\n"
         header += "\n"
@@ -382,9 +423,15 @@ class DocScraper:
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with open(output_file, 'w', encoding='utf-8') as f:
             f.write(full_content)
+        # Recorded only now, so a failure above never marks an old file as valid.
+        self.cache[cache_key] = entry
 
         print(f"  ✅ Downloaded ({len(full_content)} chars)")
         return True
+
+    @staticmethod
+    def _is_indented_code(line: str) -> bool:
+        return line.startswith(("    ", "\t")) and bool(line.strip())
 
     @staticmethod
     def _qualify(markdown: str, lifecycle: str, published: Optional[str]) -> str:
@@ -392,8 +439,10 @@ class DocScraper:
 
         Knowledge Base chunking splits a document into fixed-size pieces, and only
         the first piece holds the header. The qualifier is appended to every
-        heading and inserted at a word boundary at least every
-        QUALIFIER_SPACING characters, so each chunk carries it.
+        heading, put on its own line before every code block and after any code
+        block longer than QUALIFIER_SPACING, and inserted at a word boundary
+        outside inline code at least every QUALIFIER_SPACING characters of
+        prose. Code lines are never changed.
         """
         label = QUALIFIER_LABELS.get(lifecycle)
         if not label:
@@ -401,21 +450,72 @@ class DocScraper:
         qualifier = f"({label}, published {published}.)" if published else f"({label}.)"
         out: list = []
         since = QUALIFIER_SPACING  # qualify the opening text too, not just later chunks
+        fenced = False
+        indented = False
+        block = 0
+
+        def open_block() -> None:
+            nonlocal since, block
+            out.extend([qualifier, ""])
+            since = 0
+            block = 0
+
+        def close_block() -> None:
+            nonlocal since
+            if block >= QUALIFIER_SPACING:
+                out.extend(["", qualifier, ""])
+                since = 0
+
         for line in markdown.split("\n"):
+            fence = line.lstrip().startswith(("```", "~~~"))
+            if fenced:
+                out.append(line)
+                since += len(line) + 1
+                block += len(line) + 1
+                if fence:
+                    fenced = False
+                    close_block()
+                continue
+            if indented:
+                if not line.strip() or DocScraper._is_indented_code(line):
+                    out.append(line)
+                    since += len(line) + 1
+                    block += len(line) + 1
+                    continue
+                indented = False
+                close_block()
+            if fence:
+                open_block()
+                fenced = True
+                out.append(line)
+                block += len(line) + 1
+                since += len(line) + 1
+                continue
+            if DocScraper._is_indented_code(line):
+                open_block()
+                indented = True
+                out.append(line)
+                block += len(line) + 1
+                since += len(line) + 1
+                continue
             if line.startswith("#"):
                 out.append(f"{line} {qualifier}")
                 since = 0
                 continue
-            pieces = re.split(r"(\s+)", line)
             rebuilt = []
-            for piece in pieces:
+            ticks = 0
+            for piece in re.split(r"(\s+)", line):
                 rebuilt.append(piece)
+                ticks += piece.count("`")
                 since += len(piece)
-                if since >= QUALIFIER_SPACING and piece and piece.isspace():
+                # Only between words, and never inside an inline code span.
+                if since >= QUALIFIER_SPACING and piece and piece.isspace() and ticks % 2 == 0:
                     rebuilt.append(f"{qualifier} ")
                     since = 0
             out.append("".join(rebuilt))
             since += 1
+        if fenced or indented:
+            close_block()
         return "\n".join(out)
 
     def prune_orphans(self) -> list:
@@ -454,11 +554,23 @@ class DocScraper:
         self.prune_orphans()
         self._save_cache()
 
+        # Seeding mirrors the generated set (s3 sync --delete), so a missing
+        # source would silently leave the Knowledge Base. Fail instead, so both
+        # deploy paths stop before seeding.
+        missing = [
+            f"{domain}/{doc['output']}"
+            for domain, docs in DOCS_CONFIG.items()
+            for doc in docs
+            if not (self.output_dir / domain / doc['output']).exists()
+        ]
+
         print(f"\n{'='*60}")
-        print(f"✅ Complete: {success_count}/{total_count} documents")
+        print(f"{'✅' if not missing else '❌'} Complete: {success_count}/{total_count} documents")
+        for name in missing:
+            print(f"   missing: {name}")
         print(f"{'='*60}\n")
 
-        return success_count > 0
+        return not missing
 
 
 def main():
