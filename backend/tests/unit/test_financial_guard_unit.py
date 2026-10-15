@@ -8,6 +8,7 @@ from agents.financial_guard import (
     contains_unvalidated_financial_content,
     sanitize_advisory_section,
     sanitize_specialist_section,
+    withheld_financial_reply_notice,
 )
 
 pytestmark = pytest.mark.unit
@@ -211,3 +212,16 @@ class TestOperationalOutputWithFinancialVocabulary:
     )
     def test_labelled_or_same_line_financial_values_still_flagged(self, text):
         assert contains_unvalidated_financial_content(text) is True
+
+
+class TestWithheldFinancialReplyNotice:
+    """The withheld-reply notice must be a safe, number-free, heading-free string."""
+
+    def test_notice_has_no_digits(self):
+        assert not any(char.isdigit() for char in withheld_financial_reply_notice())
+
+    def test_notice_has_no_markdown_heading(self):
+        assert not withheld_financial_reply_notice().lstrip().startswith("#")
+
+    def test_notice_passes_the_guard(self):
+        assert contains_unvalidated_financial_content(withheld_financial_reply_notice()) is False

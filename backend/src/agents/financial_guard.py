@@ -80,10 +80,16 @@ _CURRENCY_WORD_AMOUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Financial-value language: a financial noun on the same line as any monetary-
-# shaped number (integer, one or more decimals, or leading decimal). Percentages
-# are excluded so operational utilization remains valid. Generic "total" is not
-# a financial noun: "total latency is 12.00 ms" must remain operational text.
+# Financial-value language: a financial noun on the same line as any
+# monetary-shaped number (integer, one or more decimals, or leading decimal).
+# Percentages are excluded so operational utilization remains valid. Generic
+# "total" is not a financial noun: "total latency is 12.00 ms" must remain
+# operational text.
+#
+# The noun-to-number window spans up to 200 non-newline characters on the same
+# line in either order. Plain quantities (counts, times, sizes, Markdown list
+# markers, Region codes) are neutralized before scanning, so an operational
+# number near a financial-sounding word is not read as money.
 #
 # Across lines, only a *labelled* value is linked: a financial noun that ends a
 # label ("Monthly cost:") followed within a bounded window by a number, so a
@@ -145,6 +151,157 @@ _SHELL_LINE_RE = re.compile(r"^.*\b(?:awk|bash|printf|sed|xargs)\b.*$", re.IGNOR
 # bullet followed by a Python 3 tutorial URL). URLs are references, not claims.
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
+# A number immediately followed by a count, time, or size unit is a quantity,
+# not money ("2 instances", "3 fleets", "40-minute", "500 players", "10 nodes",
+# "30 seconds", "4 GiB"). The list is explicit and reviewed. ``_neutralize_quantities``
+# preserves a number when the text just before it ends with a currency symbol,
+# ISO code, or currency word. Byte-size units deliberately omit a bare "b"/"B"
+# so an isolated letter cannot swallow an amount.
+#
+# A count unit accepts only an integer ("500 players", "4,096 requests"): a
+# decimal next to a count unit is a price, not a count ("0.0624 vCPU"). A size
+# unit accepts a decimal but refuses a leading "0." so a sub-one size reads as a
+# rate and stays visible ("0.023 GB"). A time unit accepts only a plain integer,
+# because a decimal next to a time unit reads as a rate ("0.12 hr").
+_QUANTITY_COUNT_UNIT = (
+    r"instances?|fleets?|regions?|zones?|azs?|availability zones?|nodes?|pods?|replicas?|containers?|clusters?|"
+    r"servers?|sessions?|players?|users?|requests?|connections?|tasks?|games?|matches?|"
+    r"vcpus?|cpus?|cores?|gpus?"
+)
+_QUANTITY_SIZE_UNIT = r"kib|mib|gib|tib|kb|mb|gb|tb"
+_QUANTITY_TIME_UNIT = (
+    r"ms|milliseconds?|seconds?|secs?|minutes?|mins?|hours?|hrs?|hr|days?|weeks?|months?|years?|"
+    r"minute|hour|day|week|month|year"
+)
+# A number followed by a time word, or by "to date"/"to-date", is a rate or a
+# running total, not a quantity. The following look-ahead, shared by every
+# branch, keeps such a number visible to the value-language detector so a bare
+# amount spelled with spaces ("999 month to date") is not neutralized.
+_QUANTITY_RATE_LOOKAHEAD = (
+    rf"(?![-/\u2010-\u2015]\w|\s+(?:{_QUANTITY_TIME_UNIT})\b|\s+to[\s-]date\b"
+    rf"|\s+(?:over|on|to)\s+(?:{_QUANTITY_TIME_UNIT})\b)"
+)
+# The unit may follow the number directly, after whitespace, or after a single
+# hyphen ("40-minute"). The ``_QUANTITY_RATE_LOOKAHEAD`` keeps a compound pricing
+# unit ("GB-month") and a period-over-period or "to date" running total ("950
+# month over month", "999 month to date") out of the quantity match, so the
+# surviving number stays visible to the currency and value-language detectors.
+# A spaced decimal rate such as "0.04048 vCPU per hour" stays visible because
+# the count branch accepts an integer only, so the decimal never enters the
+# quantity match. The size branch adds a "per <time>" guard so "0.04048 GB per
+# hour" is preserved. A trailing word boundary keeps "4 GiB" from matching a
+# longer token. A currency symbol immediately before the number blocks the match
+# here, and a preceding code or word is handled in ``_neutralize_quantities``.
+#
+# An integer count followed by "per <time>" ("2 instances per minute", "5 vCPU
+# per hour") is treated as operational: the count branch neutralizes the integer
+# and the "per <time>" phrase describes a scaling rate, not a monetary rate.
+#
+# Known ambiguous case: an integer directly followed by a bare time unit with no
+# other currency marker ("The rate is 12 hr.") is treated as an operational
+# quantity and is not withheld. The decimal spelling ("0.12 hr") is withheld as
+# a rate; the integer spelling is kept clean so operational durations such as
+# "a 12 hr maintenance window" are returned.
+_QUANTITY_RE = re.compile(
+    rf"(?<![{_CURRENCY_SYMBOLS}\d.,])\b(?:[1-9]\d{{0,2}}(?:,\d{{3}})+|\d+)[\s-]?(?:{_QUANTITY_COUNT_UNIT})\b"
+    rf"{_QUANTITY_RATE_LOOKAHEAD}"
+    rf"|(?<![{_CURRENCY_SYMBOLS}\d.,])\b(?!0[\d.,])(?:[1-9]\d{{0,2}}(?:,\d{{3}})+|\d+)(?:\.\d+)?"
+    rf"[\s-]?(?:{_QUANTITY_SIZE_UNIT})\b"
+    rf"{_QUANTITY_RATE_LOOKAHEAD}(?!\s+per\s+(?:{_QUANTITY_TIME_UNIT})\b)"
+    rf"|(?<![{_CURRENCY_SYMBOLS}\d.,])\b\d+[\s-]?(?:{_QUANTITY_TIME_UNIT})\b{_QUANTITY_RATE_LOOKAHEAD}",
+    re.IGNORECASE,
+)
+# A Markdown ordered-list marker at the start of a line ("1.", "2)") is
+# structure, not money. ``_neutralize_quantities`` tracks a stack of list
+# counters so nested numbered sub-lists are followed: a "1" opens a new level, a
+# number that repeats or increments the top counter continues that level, and a
+# number that continues an ancestor pops back to it. Only a marker accepted as a
+# list continuation is neutralized; a lone 1-3 digit value that ends a sentence
+# ("999. That is the cost.") keeps its digits so it stays visible to the
+# value-language detector.
+_ORDERED_LIST_MARKER_RE = re.compile(r"^[ \t]*(\d{1,3})([.)])[ \t]+", re.MULTILINE)
+# An AWS Region code ("us-west-2", "eu-central-1", "us-gov-east-1") is an
+# identifier, not money. Its trailing digit must not be read as an amount. The
+# pattern is anchored to real Region prefixes and directions so an arbitrary
+# "xx-word-digit" token (for example "up-to-5", "ab-cd-9") is not treated as a
+# Region and does not hide a nearby amount.
+_REGION_PREFIX = r"us|eu|ap|sa|ca|me|af|il|mx|cn"
+_REGION_DIRECTION = r"east|west|north|south|central|northeast|northwest|southeast|southwest"
+_REGION_CODE_RE = re.compile(
+    rf"\b(?:eusc-de|(?:{_REGION_PREFIX})(?:-gov|-iso|-isob)?)-(?:{_REGION_DIRECTION})-\d\b",
+    re.IGNORECASE,
+)
+
+# A currency marker (symbol, ISO code, or currency word) near a number means the
+# number is monetary and must survive neutralization. ``_CURRENCY_LEAD_RE``
+# matches a marker directly before the number, tested against the forty
+# characters that precede the quantity match and against the last eight
+# non-space characters of a wider four-hundred-character window, so a symbol or
+# ISO code separated from the number by a long run of whitespace (a padded
+# plain-text table) still preserves the amount. ``_CURRENCY_TRAIL_RE`` matches a
+# currency word within twenty characters after the match, so phrasings such as
+# "0.023 GB in dollars" are preserved too.
+_CURRENCY_LEAD_RE = re.compile(
+    rf"(?:[{_CURRENCY_SYMBOLS}]\s*$)"
+    rf"|(?:\b(?:{_ISO_ALTERNATION})[\s:]*$)"
+    rf"|(?:\b(?:{_CURRENCY_WORD})\b[^\n]{{0,20}}$)",
+    re.IGNORECASE,
+)
+_CURRENCY_TRAIL_RE = re.compile(rf"^[^\n]{{0,20}}\b(?:{_CURRENCY_WORD})\b", re.IGNORECASE)
+
+
+def _neutralize_quantities(text: str) -> str:
+    """Blank plain quantities (counts, times, sizes) and non-monetary numeric structure.
+
+    Each quantity's number is replaced with the token ``N`` so no stray ``.`` or
+    ``,`` is left behind to read as a sentence boundary. A number is preserved
+    when a currency symbol, ISO currency code, or currency word sits within forty
+    characters before it (or when a symbol or ISO code precedes it after a longer
+    run of whitespace), or a currency word sits within twenty characters after
+    it, so a monetary amount such as "0.023 GB in dollars" stays visible.
+    Markdown list markers that continue a (possibly nested) list, and AWS Region
+    codes, are also neutralized so their digits cannot bind to a nearby financial
+    word. A lone 1-3 digit value that merely ends a sentence keeps its digits.
+    """
+
+    def neutralize(match: re.Match[str]) -> str:
+        fragment = match.group(0)
+        preceding = text[max(0, match.start() - 40) : match.start()]
+        wide_preceding = text[max(0, match.start() - 400) : match.start()].rstrip()[-8:]
+        following = text[match.end() : match.end() + 40]
+        if (
+            _CURRENCY_LEAD_RE.search(preceding)
+            or _CURRENCY_LEAD_RE.search(wide_preceding)
+            or _CURRENCY_TRAIL_RE.search(following)
+        ):
+            return fragment
+        return re.sub(r"\d[\d,]*(?:\.\d+)?", "N", fragment, count=1)
+
+    def neutralize_list_markers(scannable: str) -> str:
+        counters: list[int] = []
+
+        def replace(match: re.Match[str]) -> str:
+            number = int(match.group(1))
+            if number == 1:
+                counters.append(1)
+            elif counters and number in (counters[-1], counters[-1] + 1):
+                counters[-1] = number
+            else:
+                for level in range(len(counters) - 2, -1, -1):
+                    if number in (counters[level], counters[level] + 1):
+                        del counters[level + 1 :]
+                        counters[-1] = number
+                        break
+                else:
+                    return match.group(0)
+            return match.group(0).replace(match.group(1), "N", 1)
+
+        return _ORDERED_LIST_MARKER_RE.sub(replace, scannable)
+
+    text = neutralize_list_markers(text)
+    text = _REGION_CODE_RE.sub(lambda m: re.sub(r"\d", "N", m.group(0)), text)
+    return _QUANTITY_RE.sub(neutralize, text)
+
 
 def _neutralize_shell_positionals(text: str) -> str:
     """Remove shell positional variables only from code-shaped contexts."""
@@ -167,15 +324,20 @@ def contains_unvalidated_financial_content(text: str) -> bool:
     """Return whether ``text`` appears to contain a monetary/financial value.
 
     Conservative and fail-closed for prose: currency symbols/codes next to a
-    value count as financial content. Financial percentages are blocked when
-    paired with cost/savings language, while operational percentages remain
-    valid. Shell positional variables are neutralized before scanning, while
-    financial values remain detectable even when wrapped in code formatting.
+    value count as financial content. A financial noun links to a number on the
+    same line, and a plain quantity (``2 instances``, ``40-minute``, ``4 GiB``)
+    is neutralized before scanning so counts, times, and sizes near
+    financial-sounding words are not read as money. Financial percentages are
+    blocked when paired with cost/savings language on the same
+    line, while operational percentages remain valid. Shell positional
+    variables are neutralized before scanning, while financial values remain
+    detectable even when wrapped in code formatting.
     """
     if not text:
         return False
     scannable = _neutralize_shell_positionals(text)
     scannable = _URL_RE.sub("", scannable)
+    scannable = _neutralize_quantities(scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)
@@ -229,6 +391,21 @@ def sanitize_advisory_section(service_name: str, output: str) -> str:
         "Unvalidated financial figures were withheld. Review utilization, "
         "right-sizing, idle resources, and commitment options, then use the "
         "validated cost report path for account totals, shares, and historical spending."
+    )
+
+
+def withheld_financial_reply_notice() -> str:
+    """Deterministic, number-free notice for a withheld non-cost reply.
+
+    Used when the orchestrator's own direct reply to a non-cost query contains
+    an unvalidated monetary value. The notice carries no Markdown heading and
+    no cost guidance, so a non-cost question is not answered as if it were a
+    cost question; it only states why the reply was withheld and how to obtain
+    validated figures.
+    """
+    return (
+        "This reply was withheld because it included financial figures that did not "
+        "come from the validated cost report. Ask a cost question to get validated figures."
     )
 
 
