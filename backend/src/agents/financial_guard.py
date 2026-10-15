@@ -131,14 +131,26 @@ _VALUE_LANGUAGE_RE = re.compile(
     rf"|(?:\b(?:{_FINANCIAL_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_MONEY_NUMBER})",
     re.IGNORECASE,
 )
-_PERCENT_NOUN = r"cost|costs|spend|spending|save|saved|savings?|discount|share|bill|billed|billing|drop"
+# Savings, discount, and price-comparison words. A percentage next to any of
+# them is a financial claim ("saves up to 90%", "90% cheaper", "40% better
+# price performance") and is withheld; the product does not repeat savings claims.
+_PERCENT_NOUN = (
+    r"cost|costs|spend|spending|sav(?:e|es|ed|ing|ings)|discounts?|share|bills?|billed|billing|drop"
+    r"|cheaper|cheapest|expensive|price|prices|pricing"
+)
 _PERCENT_VALUE = r"\d+(?:\.\d+)?\s*%"
 _FINANCIAL_PERCENT_RE = re.compile(
     rf"(?:\b(?:{_PERCENT_NOUN})\b[^\n]{{0,200}}{_PERCENT_VALUE})"
     rf"|(?:{_PERCENT_VALUE}[^\n]{{0,200}}\b(?:{_PERCENT_NOUN})\b)"
-    rf"|(?:\b(?:{_PERCENT_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_PERCENT_VALUE})",
+    rf"|(?:\b(?:{_PERCENT_NOUN})\b{_LABEL_LINE_END}[\s\S]{{0,200}}{_PERCENT_VALUE})"
+    rf"|(?:{_PERCENT_VALUE}\s+off\b)",
     re.IGNORECASE,
 )
+# Markdown underscore emphasis ("_cost_", "__Monthly cost__") would hide a
+# financial word from the word-boundary checks, because "_" is a word
+# character. Underscores that open or close a word are replaced with a space
+# before scanning; interior underscores in identifiers ("cost_report") stay.
+_EMPHASIS_UNDERSCORE_RE = re.compile(r"(?<![A-Za-z0-9])_{1,3}(?=[A-Za-z0-9])|(?<=[A-Za-z0-9])_{1,3}(?![A-Za-z0-9_])")
 
 # Shell positional variables such as `$1` and `${10}` are code, not money.
 # Neutralize them only inside code spans or lines that clearly invoke shell
@@ -219,12 +231,19 @@ _QUANTITY_RE = re.compile(
 # list continuation is neutralized; a lone 1-3 digit value that ends a sentence
 # ("999. That is the cost.") keeps its digits so it stays visible to the
 # value-language detector. A numbered Markdown heading ("### 4. Control Costs")
-# or bold numbered pseudo-heading ("**4. Reduce cost**", "**4.** Reduce cost")
+# or bold numbered pseudo-heading ("**4. Reduce cost**", "**4.** Reduce cost",
+# "__4.__ Reduce cost"; the closing delimiter must match the opening one)
 # follows the same rule with its own counter stack, so heading numbers and the
-# list items between headings do not interrupt each other's sequence.
+# list items between headings do not interrupt each other's sequence, and one
+# kind of sequence cannot prime the other into hiding a value.
 _ORDERED_LIST_MARKER_RE = re.compile(
-    r"^[ \t]*(?P<prefix>#{1,6}[ \t]+|\*\*|__)?(?P<number>\d{1,3})[.)](?:\*\*|__)?[ \t]+",
+    r"^[ \t]*(?:(?P<heading>#{1,6}[ \t]+)|(?P<bold>\*\*|__))?(?P<number>\d{1,3})[.)](?(bold)(?P=bold)?)[ \t]+",
     re.MULTILINE,
+)
+# A currency symbol or word just after a marker means the marker number may be
+# an amount ("1. dollars per hour"); its digits are kept visible.
+_MARKER_CURRENCY_TRAIL_RE = re.compile(
+    rf"[^\n]{{0,20}}(?:[{_CURRENCY_SYMBOLS}]|\b(?:{_CURRENCY_WORD})\b)", re.IGNORECASE
 )
 # An AWS Region code ("us-west-2", "eu-central-1", "us-gov-east-1") is an
 # identifier, not money. Its trailing digit must not be read as an amount. The
@@ -289,7 +308,7 @@ def _neutralize_quantities(text: str) -> str:
         stacks: dict[bool, list[int]] = {False: [], True: []}
 
         def replace(match: re.Match[str]) -> str:
-            counters = stacks[match.group("prefix") is not None]
+            counters = stacks[match.group("heading") is not None or match.group("bold") is not None]
             number = int(match.group("number"))
             if number == 1:
                 counters.append(1)
@@ -303,6 +322,8 @@ def _neutralize_quantities(text: str) -> str:
                         break
                 else:
                     return match.group(0)
+            if _MARKER_CURRENCY_TRAIL_RE.match(scannable, match.end(), match.end() + 40):
+                return match.group(0)
             start = match.start("number") - match.start()
             end = match.end("number") - match.start()
             marker = match.group(0)
@@ -350,6 +371,7 @@ def contains_unvalidated_financial_content(text: str) -> bool:
     scannable = _neutralize_shell_positionals(text)
     scannable = _URL_RE.sub("", scannable)
     scannable = _neutralize_quantities(scannable)
+    scannable = _EMPHASIS_UNDERSCORE_RE.sub(" ", scannable)
     return bool(
         _SYMBOL_AMOUNT_RE.search(scannable)
         or _CODE_AMOUNT_RE.search(scannable)

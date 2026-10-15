@@ -89,6 +89,9 @@ _OPERATIONAL_CLEAN = [
     "#### 1. Placement\n- Pick Regions near players.\n#### 2. Optimize Compute Cost (Without Sacrificing Reliability)",
     "**1. Scale on demand**\n- Use target tracking.\n\n**2. Reduce cost**\n- Right-size fleets.",
     "**1.** Scale on demand.\n**2.** Reduce cost with Spot.",
+    "__1.__ Scale on demand.\n__2.__ Reduce cost with Spot.",
+    # Interior underscores in identifiers are not emphasis.
+    "Run `describe_fleet_capacity` for 3 fleets; the cost_report module is unchanged.",
 ]
 
 
@@ -183,6 +186,30 @@ _FINANCIAL_WITHHELD = [
     # A numbered heading never hides an amount or savings claim on its line, and
     # a heading number that does not continue a heading sequence stays visible.
     "### 1. Architecture\n### 2. Control Costs\n- Spot saves up to 90% of the On-Demand price.",
+    "### 1. Overview\n### 2. Save 90% with Spot",
+    "__450.__ That assumes on-demand rates.",
+    # Plain list markers and heading-like markers keep separate counters, so one
+    # kind of sequence cannot prime the other into hiding a value.
+    "1. a\n2. b\n3. c\n**4.** That is the estimated monthly cost.",
+    "### 1. a\n### 2. b\n### 3. c\n4. That is the estimated monthly cost.",
+    # Unpaired or mismatched bold delimiters are not a heading marker.
+    "1.** Monthly cost",
+    "**1.__ Monthly cost",
+    # A currency word right after a marker keeps the marker's digits visible.
+    "**1.** dollars per hour",
+    "### 1. dollars per hour",
+    "1. dollars per hour",
+    # Savings, discount, and price-comparison percentages are financial claims.
+    "Spot saves up to 90% of the On-Demand price.",
+    "Spot is up to 90% cheaper than On-Demand.",
+    "### 3. Use Spot (up to 90% off)",
+    "Graviton offers up to 40% better price performance.",
+    "Savings Plans can lower your compute bills by 72%.",
+    # Underscore emphasis around a financial word does not hide it.
+    "_Savings_: 30%",
+    "The _monthly cost_ is 1,204.",
+    "The __cost__ is 1,204 per month.",
+    "__Monthly cost__: 1,204",
     "### 1. Cost: $1,200 per month",
     "### 1. Overview\n### 2. Monthly cost: 1,204",
     "### 999. That is the estimated monthly cost.",
