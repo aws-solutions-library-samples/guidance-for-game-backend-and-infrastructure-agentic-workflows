@@ -26,12 +26,16 @@ They assert the properties the runbook must have:
 2. A one-character namespace value finds nothing (the real service does not
    match a character prefix of a single-segment namespace), so a reverted
    per-character discovery loop discovers no leftovers.
-3. The delete covers only the exact old namespace, even when a current digest
-   namespace has the old namespace as a prefix, in batches of at most 100.
+3. The delete covers only the exact old namespace, even when the whole-segment
+   listing also returns a namespace nested under it (`<ns>/facts`) or a
+   leading-slash form (`/<ns>`), in batches of at most 100.
 4. The dry-run (list) steps delete nothing.
-5. A failed listing aborts discovery with a non-zero status and no namespace on
-   stdout, so a partial list is never mistaken for the complete set, and a
-   paste keeps the operator's shell open rather than closing it.
+5. A failed source or a failed candidate listing aborts discovery with a
+   non-zero status and no namespace on stdout, so a partial list is never
+   mistaken for the complete set, and a paste keeps the operator's shell open
+   rather than closing it.
+6. The documented cleanup removes the working files and clears their variables,
+   so a Step 1 re-run recreates them with mktemp at mode 0600.
 """
 
 from __future__ import annotations
@@ -354,12 +358,15 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         # user-pool subject but no actor row. Both still hold records, so
         # discovery must list both. A current digest (present as an actor and as
         # a subject-free records namespace) and a digest-prefixed digest must not
-        # be discovered.
+        # be discovered. A record nested under ACTOR_ONLY_NS ("<ns>/facts") is
+        # returned by the whole-segment listing but must not inflate the
+        # candidate's own count: the exact-namespace filter counts it as 1.
         self._write_state(
             records={
                 DIGEST_NS: ["mem-" + "d" * 40],
                 PREFIX_DIGEST_NS: ["mem-" + "p" * 40],
                 ACTOR_ONLY_NS: ["mem-" + "u" * 40],
+                ACTOR_ONLY_NS + "/facts": ["mem-" + "x" * 40],
                 POOL_ONLY_NS: ["mem-" + "g" * 40],
                 UPPER_NS: ["mem-" + "r" * 40],
                 ANON_NS: ["mem-" + "n" * 40],
@@ -373,25 +380,42 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         )
         result = self._run(self.blocks[1])  # Step 1 discovery
         self.assertEqual(result.returncode, 0, result.stderr)
-        # Each leftover row is "<count>\t<namespace>"; collect the namespaces.
-        discovered = {line.split("\t")[-1] for line in result.stdout.splitlines() if line.strip()}
+        # Each leftover row is "<count>\t<namespace>".
+        counts = {}
+        discovered = set()
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            count, ns = line.split("\t")
+            discovered.add(ns)
+            counts[ns] = int(count)
         self.assertIn(ACTOR_ONLY_NS, discovered, "a leftover known only from list-actors must be found")
         self.assertIn(POOL_ONLY_NS, discovered, "a leftover known only from the user pool must be found")
         self.assertIn(UPPER_NS, discovered)
         self.assertIn(ANON_NS, discovered)
         self.assertNotIn(DIGEST_NS, discovered, "a 64-hex digest actor must be skipped")
         self.assertNotIn(PREFIX_DIGEST_NS, discovered)
+        self.assertEqual(
+            counts[ACTOR_ONLY_NS],
+            1,
+            "the exact-namespace filter must count only the candidate's own record, not a nested one",
+        )
 
     def test_discovery_does_not_abort_on_a_candidate_with_no_records(self) -> None:
         # Most candidates (current users whose only records are kept digests, or
         # pool subjects with nothing left behind) hold no old records. Listing a
         # zero-record candidate must be skipped, not treated as an error that
         # ends discovery.
+        # One extra subject sorts last among the candidates (an all-f UUID) and
+        # holds no records, so a discovery that classifies only the last-sorted
+        # candidate -- or prints nothing when the last one has no records -- is
+        # caught here rather than passing silently.
         self._write_state(
             records={ACTOR_ONLY_NS: ["mem-" + "u" * 40]},
             actors=[ACTOR_ONLY_NS],
-            # Two extra subjects with no leftover records at all.
-            subjects=[POOL_ONLY_NS, "e2a1b3c4-0000-4000-8000-000000000000"],
+            # Two extra subjects with no leftover records at all; the second
+            # sorts after every real leftover.
+            subjects=[POOL_ONLY_NS, "ffffffff-0000-4000-8000-000000000000"],
         )
         result = self._run(self.blocks[1])  # Step 1 discovery
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -411,6 +435,47 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "", "a fully upgraded store has no leftovers")
         self.assertNotIn("discovery is incomplete", result.stderr)
+
+    def test_rerun_after_documented_cleanup_recreates_files_at_0600(self) -> None:
+        # The Step 1 block creates its three working files with mktemp (mode
+        # 0600) and reuses them while their variables stay set. The documented
+        # cleanup both removes the files and clears the variables, so a later
+        # Step 1 in the same shell makes fresh mktemp files at 0600 rather than
+        # recreating the paths by redirection at the shell's umask. With the
+        # variables left set, those redirections would land at 0644 under umask
+        # 022, exposing every pool subject's raw ID to other local users on a
+        # shared /tmp. Run discovery, the documented cleanup line, and discovery
+        # again under umask 022, then require the recreated files to be 0600.
+        self._write_state(
+            records={ACTOR_ONLY_NS: ["mem-" + "u" * 40]},
+            actors=[ACTOR_ONLY_NS],
+            subjects=[POOL_ONLY_NS],
+        )
+        cleanup = self._documented_cleanup_line()
+        report = (
+            '\nfor f in "$RAW_CANDIDATES_FILE" "$CANDIDATES_FILE" "$LEFTOVERS_FILE"; do\n'
+            '  printf "mode %s\\n" "$(stat -f "%Lp" "$f" 2>/dev/null || stat -c "%a" "$f")"\n'
+            "done\n"
+        )
+        script = "umask 022\n" + self.blocks[1] + "\n" + cleanup + "\n" + self.blocks[1] + report
+        result = self._run_paste(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        modes = [line.split()[1] for line in result.stdout.splitlines() if line.startswith("mode ")]
+        self.assertEqual(len(modes), 3, f"expected three working files, saw: {result.stdout!r}")
+        self.assertTrue(
+            all(mode == "600" for mode in modes),
+            f"a re-run after the documented cleanup must recreate 0600 files, saw {modes}",
+        )
+
+    def _documented_cleanup_line(self) -> str:
+        # Extract the "rm -f ...; unset ..." command the Step 1 block documents
+        # as a comment, so this test exercises exactly what the guide tells the
+        # operator to run rather than a hand-copied duplicate.
+        for line in self.blocks[1].splitlines():
+            stripped = line.strip().lstrip("#").strip()
+            if stripped.startswith("rm -f") and "unset" in stripped:
+                return stripped
+        raise AssertionError("Step 1 does not document an 'rm -f ...; unset ...' cleanup line")
 
     def test_one_character_namespace_discovers_nothing(self) -> None:
         # The real service does not match a character prefix of a single-segment
@@ -479,15 +544,16 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "")
         self.assertIn("discovery is incomplete", result.stderr)
 
-    def test_discovery_failure_keeps_the_pasting_shell_open(self) -> None:
+    def test_source_failure_keeps_the_pasting_shell_open(self) -> None:
         # A paste runs Step 1 in the operator's own interactive shell, which has
         # no "-e", so the shell does not exit when a command fails. The subshell
-        # around each listing and the "&&" before the classifier are what make a
-        # failed listing stop discovery (non-zero status, nothing on stdout)
-        # without ending the shell. Running the block under "bash -c" (no -e) and
-        # then echoing a marker reproduces that: if a subshell were dropped,
-        # "exit 1" would end the whole run before the marker; if an "&&" were
-        # dropped, the classifier would run after the failure.
+        # around the two source calls, and the "&&" that gates the next stage on
+        # their success, are what make a failed source stop discovery (non-zero
+        # status, nothing on stdout) without ending the shell. Running the block
+        # under "bash -c" (no -e) and then echoing a marker reproduces that: if
+        # the source subshell were replaced by a "{ }" group, its "exit 1" would
+        # end the whole run before the marker; if an "&&" were dropped, the next
+        # stage would run after the failure.
         self._write_state(
             records={
                 ACTOR_ONLY_NS: ["mem-" + "u" * 40],
@@ -503,9 +569,37 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         self.assertEqual(
             result.stdout.strip(),
             "after status=1 file=set",
-            "a failed listing must leave status 1, print no namespace, and keep the shell open",
+            "a failed source must leave status 1, print no namespace, and keep the shell open",
         )
         self.assertIn("discovery is incomplete", result.stderr)
+
+    def test_listing_failure_keeps_the_pasting_shell_open(self) -> None:
+        # The per-candidate listing stage also runs inside a subshell, so a
+        # listing that fails mid-discovery stops with a non-zero status and
+        # prints no leftover row, while the operator's interactive shell stays
+        # open. A "{ }" group here would turn that subshell "exit 1" into an exit
+        # of the operator's own shell, ending the paste before the marker. Fail
+        # one candidate's listing (not a source), paste under "bash -c" (no -e),
+        # and require the marker to still print at status 1.
+        self._write_state(
+            records={
+                ACTOR_ONLY_NS: ["mem-" + "u" * 40],
+                POOL_ONLY_NS: ["mem-" + "g" * 40],
+                ANON_NS: ["mem-" + "n" * 40],
+            },
+            actors=[ACTOR_ONLY_NS, ANON_NS],
+            subjects=[POOL_ONLY_NS],
+            fail_namespaces=[ACTOR_ONLY_NS],
+        )
+        script = self.blocks[1] + '\necho "after status=$? file=${CANDIDATES_FILE:+set}"\n'
+        result = self._run_paste(script)
+        self.assertEqual(
+            result.stdout.strip(),
+            "after status=1 file=set",
+            "a failed listing must leave status 1, print no leftover row, and keep the shell open",
+        )
+        self.assertIn("discovery is incomplete", result.stderr)
+        self.assertEqual(result.stdout.count("\t"), 0, "no leftover row may print once a listing has failed")
 
     def test_dry_run_steps_delete_nothing(self) -> None:
         self._write_state(
@@ -523,11 +617,17 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
 
     def test_delete_is_exact_namespace_only(self) -> None:
         # A current digest namespace has OLD_NS ("abc") as a full character
-        # prefix. An exact-namespace delete removes only OLD_NS's record.
+        # prefix, and the whole-segment listing for "abc" also returns records
+        # nested under it ("abc/facts") and a leading-slash form ("/abc"). An
+        # exact-namespace delete removes only OLD_NS's own record; dropping the
+        # [?namespaces[0]=='abc'] filter would also delete the nested and
+        # leading-slash records that the whole-segment listing returns.
         self._write_state(
             records={
                 PREFIX_DIGEST_NS: ["mem-" + "d" * 40, "mem-" + "e" * 40],
                 OLD_NS: ["mem-" + "o" * 40],
+                OLD_NS + "/facts": ["mem-" + "f" * 40],
+                "/" + OLD_NS: ["mem-" + "s" * 40],
             },
             actors=[PREFIX_DIGEST_NS, OLD_NS],
             subjects=[],
