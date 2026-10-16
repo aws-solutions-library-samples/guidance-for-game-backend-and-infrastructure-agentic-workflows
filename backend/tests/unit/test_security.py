@@ -74,8 +74,9 @@ class TestInputValidation:
     def test_validate_prompt_whitespace_only_raises_error(self, prompt):
         """Whitespace-only prompts (including Unicode and zero-width) are rejected.
 
-        A prompt that reduces to nothing meaningful would produce an empty
-        Memory search query, so it is rejected with the same bounded response
+        A prompt whose every character is whitespace, a control character
+        (category Cc), or a format character (category Cf) has no content to
+        answer or search for, so it is rejected with the same bounded response
         as an empty prompt before any agent construction or Memory retrieval.
         """
         # Local modules
@@ -92,8 +93,26 @@ class TestInputValidation:
             ("Game\u200bLift fleets", "Game\u200bLift fleets"),
             ("\u200bshow costs", "\u200bshow costs"),
             ("\U0001f468\u200d\U0001f4bb status", "\U0001f468\u200d\U0001f4bb status"),
+            (
+                "\u0643\u064a\u0641 \u062d\u0627\u0644 \u0623\u0633\u0637\u0648\u0644\u064a\u061f",
+                "\u0643\u064a\u0641 \u062d\u0627\u0644 \u0623\u0633\u0637\u0648\u0644\u064a\u061f",
+            ),
+            (
+                "\u3053\u3093\u306b\u3061\u306f\u3001\u8266\u968a\u306e\u72b6\u614b\u306f\uff1f",
+                "\u3053\u3093\u306b\u3061\u306f\u3001\u8266\u968a\u306e\u72b6\u614b\u306f\uff1f",
+            ),
+            ("Game\u00adLift fleets", "Game\u00adLift fleets"),
         ],
-        ids=["edge-spaces", "internal-whitespace-runs", "embedded-zero-width", "leading-zero-width", "emoji-zwj"],
+        ids=[
+            "edge-spaces",
+            "internal-whitespace-runs",
+            "embedded-zero-width",
+            "leading-zero-width",
+            "emoji-zwj",
+            "rtl-sentence",
+            "non-latin-sentence",
+            "embedded-soft-hyphen",
+        ],
     )
     def test_validate_prompt_keeps_real_content_unchanged(self, prompt, expected):
         """Prompts with real content are returned trimmed but otherwise unchanged."""
@@ -113,6 +132,9 @@ class TestInputValidation:
             "\u034f",  # Combining Grapheme Joiner (category Mn)
             "\ufe0f",  # Variation Selector-16 (category Mn)
             "\U000e0100",  # Variation Selector-17 (category Mn)
+            "\u17b4",  # Khmer Vowel Inherent Aq (category Mn)
+            "\u180b",  # Mongolian Free Variation Selector One (category Mn)
+            "\U000e0000",  # unassigned code point (category Cn)
         ],
         ids=[
             "hangul-choseong-filler",
@@ -123,16 +145,20 @@ class TestInputValidation:
             "combining-grapheme-joiner",
             "variation-selector-16",
             "variation-selector-17",
+            "khmer-vowel-inherent-aq",
+            "mongolian-free-variation-selector-one",
+            "unassigned-code-point",
         ],
     )
     def test_validate_prompt_accepts_nonwhitespace_invisible_characters(self, prompt):
         """Invisible-looking characters outside whitespace/Cc/Cf are accepted.
 
-        Hangul fillers (category Lo), the Braille blank (category So), and
-        variation selectors and the combining grapheme joiner (category Mn)
-        each produce a non-empty Memory search query, so they are returned
-        unchanged rather than rejected as empty. Pinning this makes any future
-        widening of the empty-prompt predicate a visible, deliberate change.
+        Hangul fillers (category Lo), the Braille blank (category So), variation
+        selectors, the combining grapheme joiner, the Khmer inherent vowels, and
+        the Mongolian free variation selectors (category Mn), and an unassigned
+        code point (category Cn) are returned unchanged rather than rejected as
+        empty. Pinning this makes widening the empty-prompt predicate to these
+        characters a visible, deliberate change.
         """
         # Local modules
         from utils.security import validate_prompt

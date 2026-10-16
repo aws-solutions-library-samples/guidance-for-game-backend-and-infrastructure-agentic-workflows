@@ -39,10 +39,10 @@ def _get_logger() -> Logger:
 MAX_PROMPT_LENGTH = 32000
 
 # Unicode categories treated as empty alongside whitespace: control characters
-# (category Cc, including DEL) and format characters (category Cf: zero-width
-# spaces and joiners, directional marks, soft hyphens, word joiners, byte-order
-# marks). A prompt made only of whitespace, Cc, and Cf characters reduces to an
-# empty Memory search query.
+# (category Cc, including DEL) and format characters (category Cf, such as
+# zero-width spaces and joiners, directional marks, soft hyphens, word joiners,
+# and byte-order marks). A prompt made only of these has no content to answer
+# or search for.
 _EMPTY_CATEGORIES = frozenset({"Cc", "Cf"})
 
 # Maximum conversation history messages
@@ -135,19 +135,23 @@ def validate_prompt(prompt: str, strict_mode: bool = False) -> str:
 
     # Reject a prompt whose every character is whitespace (str.isspace()),
     # a control character (category Cc), or a format character (category Cf).
-    # str.strip() removes Unicode whitespace only at the ends, and Cc/Cf
-    # characters (zero-width spaces, directional marks, soft hyphens, DEL)
-    # survive it, so a prompt made only of those reduces to an empty Memory
-    # search query. It is rejected here, before agent construction and Memory
-    # retrieval, with the same response as an empty prompt. The trimmed prompt
-    # is returned unchanged, so characters inside real text are kept.
+    # A whitespace-only prompt trims to an empty string, which is not a valid
+    # Memory search query. Characters such as zero-width spaces, directional
+    # marks, soft hyphens, and DEL survive str.strip(), so a prompt made only
+    # of them, in any order and mixed with whitespace, has no content but would
+    # still reach the agent and Memory. Both are rejected here, before agent
+    # construction and Memory retrieval, with the same response as an empty
+    # prompt. The trimmed prompt is returned unchanged, so characters inside
+    # real text are kept.
     #
-    # Other invisible-looking characters are deliberately accepted, because a
-    # prompt made of them produces a non-empty Memory search query: Hangul
-    # fillers U+115F, U+1160, U+3164, U+FFA0 (category Lo); the Braille blank
-    # U+2800 (category So); and variation selectors and the combining grapheme
-    # joiner (category Mn). Widening rejection to these is a deliberate change
-    # pinned by test.
+    # Rejection is deliberately limited to these categories. Other
+    # invisible-looking characters are accepted as content, for example the
+    # Hangul fillers U+115F, U+1160, U+3164, U+FFA0 (category Lo), the Braille
+    # blank U+2800 (category So), and variation selectors, the combining
+    # grapheme joiner, the Khmer inherent vowels U+17B4 and U+17B5, and the
+    # Mongolian free variation selectors U+180B through U+180D (category Mn).
+    # Widening rejection to these characters is a deliberate change pinned by
+    # test.
     if all(char.isspace() or unicodedata.category(char) in _EMPTY_CATEGORIES for char in prompt):
         raise InputValidationError("Prompt cannot be empty")
 
