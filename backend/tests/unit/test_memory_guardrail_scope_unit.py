@@ -15,20 +15,20 @@ mocked), so a dependency upgrade that moves the hook fails loudly.
 """
 
 # Standard library
-import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # Third-party packages
+import bedrock_agentcore.memory.integrations.strands.session_manager as _sdk_session_manager
 import pytest
-from bedrock_agentcore.memory.integrations.strands.bedrock_converter import AgentCoreMemoryConverter
 from bedrock_agentcore.memory.integrations.strands.config import (
     AgentCoreMemoryConfig,
-    PersistenceMode,
     RetrievalConfig,
 )
 from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
 from strands.hooks import HookRegistry, MessageAddedEvent
+from strands.models import BedrockModel
 
 # Local modules
 from models.guardrail_scope import GuardrailScopedBedrockModel
@@ -69,22 +69,35 @@ def _guard_text(block: dict) -> str:
     return block.get("guardContent", {}).get("text", {}).get("text", "")
 
 
-def _new_session_manager() -> MemoryScopedSessionManager:
-    """Build a scoped session manager without running network-bound __init__.
-
-    ``retrieve_customer_context`` only reads ``self.config`` and
-    ``self.memory_client``; bypassing __init__ keeps the test offline while still
-    exercising the real base-class retrieval and the subclass marking.
-    """
-    manager = MemoryScopedSessionManager.__new__(MemoryScopedSessionManager)
-    manager.config = AgentCoreMemoryConfig(
+def _memory_config() -> AgentCoreMemoryConfig:
+    """The memory configuration shared by every manager built in these tests."""
+    return AgentCoreMemoryConfig(
         memory_id="mem-123",
         session_id="s-1",
         actor_id="u-1",
         retrieval_config={"{actorId}": RetrievalConfig(top_k=10, strategy_id="user_facts")},
     )
-    manager.memory_client = MagicMock()
-    return manager
+
+
+@contextmanager
+def _build_session_manager():
+    """Yield a scoped session manager built through its real ``__init__``, offline.
+
+    The AgentCore ``MemoryClient`` and the boto3 session are replaced with mocks,
+    and the client reports no stored events, so the base initializer runs its
+    full new-session setup (including every version-specific attribute the
+    ``RepositorySessionManager`` initializer defines) without any network call.
+    The mocked memory client is returned on the manager so retrieval and
+    persistence behavior can be configured per test.
+    """
+    memory_client = MagicMock()
+    memory_client.list_events.return_value = []
+    with (
+        patch.object(_sdk_session_manager, "MemoryClient", return_value=memory_client),
+        patch.object(_sdk_session_manager.boto3, "Session"),
+    ):
+        manager = MemoryScopedSessionManager(agentcore_memory_config=_memory_config(), region_name="us-west-2")
+    yield manager
 
 
 def _event_with_user_message(text: str) -> SimpleNamespace:
@@ -167,17 +180,94 @@ class TestToolCycle:
         assert _MEMORY_TEXT not in guarded
 
 
+class TestFormatterSignatureCompatibility:
+    """The formatter override tolerates the base signature of every supported version.
+
+    Across supported Strands releases the base ``_format_bedrock_messages`` is
+    called with a varying number of arguments (newer releases add a trailing
+    ``dynamic_trailing_blocks`` argument). The override must accept and forward
+    any extra positional and keyword arguments unchanged while still applying its
+    guardrail-scope rewrite.
+    """
+
+    def test_override_forwards_extra_arguments_to_base(self, monkeypatch):
+        captured = {}
+
+        def _spy(self, messages, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            # Mimic the base guard wrapping so the override's rewrite still runs.
+            wrapped = []
+            for message in messages:
+                new_content = []
+                for block in message.get("content", []):
+                    if "text" in block:
+                        new_content.append({"guardContent": {"text": {"text": block["text"]}}})
+                    else:
+                        new_content.append(block)
+                wrapped.append({"role": message["role"], "content": new_content})
+            return wrapped
+
+        monkeypatch.setattr(BedrockModel, "_format_bedrock_messages", _spy)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    _marked_memory_block(_MEMORY_TEXT),
+                    {"text": _USER_QUESTION},
+                ],
+            }
+        ]
+
+        formatted = _guard_model()._format_bedrock_messages(messages, 7, dynamic_trailing_blocks=3)
+
+        # The override forwarded the extra positional and keyword arguments
+        # unchanged to the base implementation.
+        assert captured["args"] == (7,)
+        assert captured["kwargs"] == {"dynamic_trailing_blocks": 3}
+
+        # The guardrail-scope rewrite still applies: the user's question stays
+        # guarded and the marked memory block is sent as plain text.
+        content = formatted[-1]["content"]
+        guarded = [_guard_text(b) for b in content if "guardContent" in b]
+        plain = [_collect_text(b) for b in content if "text" in b]
+        assert _USER_QUESTION in guarded
+        assert _MEMORY_TEXT in plain
+        assert _MEMORY_TEXT not in guarded
+
+    def test_override_forwards_extra_arguments_when_scoping_disabled(self, monkeypatch):
+        """With latest-message wrapping off, extra arguments still reach the base."""
+        captured = {}
+
+        def _spy(self, messages, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return list(messages)
+
+        monkeypatch.setattr(BedrockModel, "_format_bedrock_messages", _spy)
+
+        model = GuardrailScopedBedrockModel(
+            model_id="anthropic.claude-3-5-haiku-20241022-v1:0",
+            region_name="us-west-2",
+        )
+        model._format_bedrock_messages([{"role": "user", "content": [{"text": "hi"}]}], 2, dynamic_trailing_blocks=5)
+
+        assert captured["args"] == (2,)
+        assert captured["kwargs"] == {"dynamic_trailing_blocks": 5}
+
+
 class TestSessionManagerMarking:
     """The scoped session manager marks only the block it inserts."""
 
     def test_marks_inserted_memory_block(self):
-        manager = _new_session_manager()
-        manager.memory_client.retrieve_memories.return_value = [
-            {"content": {"text": "Game type: BATTLE ROYALE"}, "score": 0.9}
-        ]
-        event = _event_with_user_message(_USER_QUESTION)
+        with _build_session_manager() as manager:
+            manager.memory_client.retrieve_memories.return_value = [
+                {"content": {"text": "Game type: BATTLE ROYALE"}, "score": 0.9}
+            ]
+            event = _event_with_user_message(_USER_QUESTION)
 
-        manager.retrieve_customer_context(event)
+            manager.retrieve_customer_context(event)
 
         content = event.agent.messages[-1]["content"]
         assert len(content) == 2, "memory block should be inserted before the user's text"
@@ -187,11 +277,11 @@ class TestSessionManagerMarking:
         assert MEMORY_CONTEXT_MARKER_KEY not in content[1]
 
     def test_marks_nothing_when_no_records(self):
-        manager = _new_session_manager()
-        manager.memory_client.retrieve_memories.return_value = []
-        event = _event_with_user_message(_USER_QUESTION)
+        with _build_session_manager() as manager:
+            manager.memory_client.retrieve_memories.return_value = []
+            event = _event_with_user_message(_USER_QUESTION)
 
-        manager.retrieve_customer_context(event)
+            manager.retrieve_customer_context(event)
 
         content = event.agent.messages[-1]["content"]
         assert len(content) == 1, "no memory block is inserted when retrieval is empty"
@@ -201,21 +291,21 @@ class TestSessionManagerMarking:
         """If the base appends the context instead of prepending it, object
         identity (not position) selects the block to mark: the appended context
         block is marked and the user's own block stays unmarked and guarded."""
-        manager = _new_session_manager()
-        tag = manager.config.context_tag
+        with _build_session_manager() as manager:
+            tag = manager.config.context_tag
 
-        def _append_context(_self, event):
-            text = f"<{tag}>Game type: BATTLE ROYALE</{tag}>"
-            event.agent.messages[-1]["content"].append({"text": text})
+            def _append_context(_self, event):
+                text = f"<{tag}>Game type: BATTLE ROYALE</{tag}>"
+                event.agent.messages[-1]["content"].append({"text": text})
 
-        monkeypatch.setattr(
-            AgentCoreMemorySessionManager,
-            "retrieve_customer_context",
-            _append_context,
-        )
-        event = _event_with_user_message(_USER_QUESTION)
+            monkeypatch.setattr(
+                AgentCoreMemorySessionManager,
+                "retrieve_customer_context",
+                _append_context,
+            )
+            event = _event_with_user_message(_USER_QUESTION)
 
-        manager.retrieve_customer_context(event)
+            manager.retrieve_customer_context(event)
 
         content = event.agent.messages[-1]["content"]
         assert len(content) == 2
@@ -239,122 +329,83 @@ class TestSessionManagerMarking:
     )
     def test_unexpected_insert_marks_nothing(self, monkeypatch, inserted):
         """Any insert other than one tagged dict block marks nothing (fail closed)."""
-        manager = _new_session_manager()
+        with _build_session_manager() as manager:
 
-        def _insert(_self, event):
-            for block in reversed(inserted):
-                event.agent.messages[-1]["content"].insert(0, block)
+            def _insert(_self, event):
+                for block in reversed(inserted):
+                    event.agent.messages[-1]["content"].insert(0, block)
 
-        monkeypatch.setattr(AgentCoreMemorySessionManager, "retrieve_customer_context", _insert)
-        event = _event_with_user_message(_USER_QUESTION)
+            monkeypatch.setattr(AgentCoreMemorySessionManager, "retrieve_customer_context", _insert)
+            event = _event_with_user_message(_USER_QUESTION)
 
-        manager.retrieve_customer_context(event)
+            manager.retrieve_customer_context(event)
 
         content = event.agent.messages[-1]["content"]
         assert len(content) == len(inserted) + 1
         assert not any(isinstance(b, dict) and MEMORY_CONTEXT_MARKER_KEY in b for b in content)
 
 
-class _FakeConversationManager:
-    """Minimal conversation manager whose state never changes between syncs."""
-
-    def get_state(self):
-        return {}
-
-
-class _FakeVersioned:
-    """Exposes a constant version so sync_agent reports no change."""
-
-    def _get_version(self):
-        return 0
-
-
 class _FakeAgent:
     """A minimal agent object for driving MessageAddedEvent through the hooks.
 
-    It carries only the attributes the registered MessageAddedEvent callbacks
-    read: ``agent_id`` and ``messages`` (append + inject), and the state
-    accessors ``sync_agent`` compares. Seeding ``_last_synced_internal_state``
-    with matching values makes ``sync_agent`` short-circuit without any
-    repository call, keeping the test offline.
+    It carries only the attributes the memory-marking and persistence callbacks
+    read: ``agent_id`` and ``messages`` (append + inject). Session state sync is
+    a separate concern replaced with a no-op in the manager, so the agent needs
+    no state accessors.
     """
 
     def __init__(self, agent_id: str, messages: list):
         self.agent_id = agent_id
         self.messages = messages
-        self.state = _FakeVersioned()
-        self._interrupt_state = _FakeVersioned()
-        self.conversation_manager = _FakeConversationManager()
-        self._model_state = {}
 
 
-def _hook_ready_manager() -> MemoryScopedSessionManager:
-    """Build a scoped manager wired for the real register_hooks path, offline.
+@contextmanager
+def _hook_ready_manager():
+    """Yield a scoped manager wired for the real register_hooks path, offline.
 
-    Sets only the attributes the sync-mode MessageAddedEvent callbacks touch
-    (persistence immediate-send, converter, timestamp state, and the memory
-    client), so the real append + inject hooks run without any network.
+    The manager is built through its real initializer with a mocked memory
+    client, then its retrieval and persistence responses are configured. Session
+    state sync is a separate ``MessageAddedEvent`` callback that is not under
+    test here and would require a full agent, so it is replaced with a no-op.
+    The real append + inject and persistence hooks run without any network.
     """
-    manager = MemoryScopedSessionManager.__new__(MemoryScopedSessionManager)
-    manager.config = AgentCoreMemoryConfig(
-        memory_id="mem-123",
-        session_id="s-1",
-        actor_id="u-1",
-        retrieval_config={"{actorId}": RetrievalConfig(top_k=10, strategy_id="user_facts")},
-    )
-    manager.session_id = manager.config.session_id
-    manager.converter = AgentCoreMemoryConverter
-    manager.persistence_mode = PersistenceMode.FULL
-    manager._timestamp_lock = threading.Lock()
-    manager._last_timestamp = None
-    manager._message_lock = threading.Lock()
-    manager._message_buffer = []
-    manager._latest_agent_message = {}
-    # Pre-seed so sync_agent detects no change and makes no repository call.
-    manager._last_synced_internal_state = {
-        "a-1": {
-            "state_version": 0,
-            "interrupt_state_version": 0,
-            "conversation_manager_state": {},
-            "model_state": {},
-        }
-    }
-    manager.memory_client = MagicMock()
-    manager.memory_client.create_event.return_value = {"eventId": "evt-1"}
-    manager.memory_client.retrieve_memories.return_value = [
-        {"content": {"text": "Game type: BATTLE ROYALE"}, "score": 0.9}
-    ]
-    return manager
+    with _build_session_manager() as manager:
+        manager.memory_client.create_event.return_value = {"eventId": "evt-1"}
+        manager.memory_client.retrieve_memories.return_value = [
+            {"content": {"text": "Game type: BATTLE ROYALE"}, "score": 0.9}
+        ]
+        manager.sync_agent = lambda *args, **kwargs: None  # type: ignore[method-assign]
+        yield manager
 
 
 class TestHookPath:
     """The real register_hooks + MessageAddedEvent path marks and persists correctly."""
 
     def test_dispatch_marks_block_but_persists_neither_marker_nor_memory(self):
-        manager = _hook_ready_manager()
-        registry = HookRegistry()
-        manager.register_hooks(registry)
+        with _hook_ready_manager() as manager:
+            registry = HookRegistry()
+            manager.register_hooks(registry)
 
-        message = {"role": "user", "content": [{"text": _USER_QUESTION}]}
-        agent = _FakeAgent("a-1", [message])
-        event = MessageAddedEvent(agent=agent, message=message)
+            message = {"role": "user", "content": [{"text": _USER_QUESTION}]}
+            agent = _FakeAgent("a-1", [message])
+            event = MessageAddedEvent(agent=agent, message=message)
 
-        registry.invoke_callbacks(event)
+            registry.invoke_callbacks(event)
 
-        # (a) The injected memory block carries the marker after dispatch.
-        content = agent.messages[-1]["content"]
-        marked = [block for block in content if block.get(MEMORY_CONTEXT_MARKER_KEY) is True]
-        assert len(marked) == 1, "the injected memory block must be marked"
-        assert "BATTLE ROYALE" in marked[0]["text"]
+            # (a) The injected memory block carries the marker after dispatch.
+            content = agent.messages[-1]["content"]
+            marked = [block for block in content if block.get(MEMORY_CONTEXT_MARKER_KEY) is True]
+            assert len(marked) == 1, "the injected memory block must be marked"
+            assert "BATTLE ROYALE" in marked[0]["text"]
 
-        # (b) Persistence runs before injection, so the create_event payload
-        # contains neither the marker key nor the memory text. The payload is a
-        # list of (serialized-json, role) tuples.
-        manager.memory_client.create_event.assert_called_once()
-        persisted_messages = manager.memory_client.create_event.call_args.kwargs["messages"]
-        serialized = "".join(text for text, _role in persisted_messages)
-        assert MEMORY_CONTEXT_MARKER_KEY not in serialized, "marker key must not reach persisted events"
-        assert "BATTLE ROYALE" not in serialized, "retrieved memory must not reach persisted events"
+            # (b) Persistence runs before injection, so the create_event payload
+            # contains neither the marker key nor the memory text. The payload is a
+            # list of (serialized-json, role) tuples.
+            manager.memory_client.create_event.assert_called_once()
+            persisted_messages = manager.memory_client.create_event.call_args.kwargs["messages"]
+            serialized = "".join(text for text, _role in persisted_messages)
+            assert MEMORY_CONTEXT_MARKER_KEY not in serialized, "marker key must not reach persisted events"
+            assert "BATTLE ROYALE" not in serialized, "retrieved memory must not reach persisted events"
 
 
 class TestWiring:
