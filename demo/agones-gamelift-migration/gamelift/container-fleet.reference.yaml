@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Reference target for the Agones-to-GameLift reference environment: an Amazon
+  GameLift Servers container fleet hosting the same UDP game server that runs
+  on the Agones simple-game-server fleet. A hand-checked baseline for
+  comparing generated templates. The fleet accepts players only from
+  PlayerSourceCidr, from the moment its instances launch.
+Parameters:
+  GameServerImageUri:
+    Type: String
+    Description: ECR image URI (with tag) of the GameLift-ready game server.
+  GameServerPort:
+    Type: Number
+    Default: 7654
+    MinValue: 1
+    MaxValue: 60000
+    Description: UDP port the game server listens on inside the container.
+  InstanceType:
+    Type: String
+    Default: c6i.large
+  GameServerGroupsPerInstance:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 3
+    Description: At most 3, so that the connection port range below has enough ports.
+  PlayerSourceCidr:
+    Type: String
+    Description: >-
+      The only address range allowed to reach the game ports: the cluster's NAT
+      gateway address (`scripts/demo.sh nat-cidr`). Prefix length /28 to /32.
+    AllowedPattern: "^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(2[89]|3[0-2])$"
+    ConstraintDescription: Must be a single IPv4 address or a narrow range (/28 to /32).
+  ConnectionPortFrom:
+    Type: Number
+    Default: 4192
+    MinValue: 1025
+    MaxValue: 60000
+  ConnectionPortTo:
+    Type: Number
+    Default: 4199
+    MinValue: 1025
+    MaxValue: 60000
+    Description: Must be at least ConnectionPortFrom + 2 x GameServerGroupsPerInstance.
+  BoundaryArn:
+    Type: String
+    Description: Workload permissions boundary (output WorkloadBoundaryArn of iam/operator-role.yaml; `scripts/demo.sh boundary-arn`).
+    AllowedPattern: "^arn:aws[a-z-]*:iam::[0-9]{12}:policy/[A-Za-z0-9+=,.@_/-]+$"
+  DemoEnv:
+    Type: String
+    Description: The environment's cluster name; the operator role allows GameLift changes only on resources with this demo-env tag.
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+Resources:
+  FleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: gamelift.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/GameLiftContainerFleetPolicy
+      PermissionsBoundary: !Ref BoundaryArn
+      Tags:
+        - Key: demo
+          Value: agones-gamelift-migration
+        - Key: demo-env
+          Value: !Ref DemoEnv
+  GameServerContainerGroup:
+    Type: AWS::GameLift::ContainerGroupDefinition
+    Properties:
+      Name: !Sub ${AWS::StackName}-game-server
+      ContainerGroupType: GAME_SERVER
+      OperatingSystem: AMAZON_LINUX_2023
+      TotalMemoryLimitMebibytes: 512
+      TotalVcpuLimit: 0.5
+      GameServerContainerDefinition:
+        ContainerName: game-server
+        ImageUri: !Ref GameServerImageUri
+        ServerSdkVersion: "5.2.0"
+        PortConfiguration:
+          ContainerPortRanges:
+            - FromPort: !Ref GameServerPort
+              ToPort: !Ref GameServerPort
+              Protocol: UDP
+      Tags:
+        - Key: demo
+          Value: agones-gamelift-migration
+        - Key: demo-env
+          Value: !Ref DemoEnv
+  ContainerFleet:
+    Type: AWS::GameLift::ContainerFleet
+    Properties:
+      Description: !Sub Migrated from Agones (${AWS::StackName})
+      FleetRoleArn: !GetAtt FleetRole.Arn
+      GameServerContainerGroupDefinitionName: !GetAtt GameServerContainerGroup.ContainerGroupDefinitionArn
+      GameServerContainerGroupsPerInstance: !Ref GameServerGroupsPerInstance
+      InstanceType: !Ref InstanceType
+      BillingType: ON_DEMAND
+      NewGameSessionProtectionPolicy: FullProtection
+      # Set explicitly so the fleet never gets the default rule, which is open
+      # to every address. The permission must match the connection port range.
+      InstanceConnectionPortRange:
+        FromPort: !Ref ConnectionPortFrom
+        ToPort: !Ref ConnectionPortTo
+      InstanceInboundPermissions:
+        - FromPort: !Ref ConnectionPortFrom
+          ToPort: !Ref ConnectionPortTo
+          IpRange: !Ref PlayerSourceCidr
+          Protocol: UDP
+      Locations:
+        - Location: !Ref AWS::Region
+          LocationCapacity:
+            DesiredEC2Instances: 1
+            MinSize: 1
+            MaxSize: 3
+      ScalingPolicies:
+        - Name: keep-20-percent-available
+          PolicyType: TargetBased
+          MetricName: PercentAvailableGameSessions
+          TargetConfiguration:
+            TargetValue: 20
+      Tags:
+        - Key: demo
+          Value: agones-gamelift-migration
+        - Key: demo-env
+          Value: !Ref DemoEnv
+  GameSessionQueue:
+    Type: AWS::GameLift::GameSessionQueue
+    Properties:
+      Name: !Sub ${AWS::StackName}-queue
+      TimeoutInSeconds: 60
+      Destinations:
+        - DestinationArn: !GetAtt ContainerFleet.FleetArn
+      Tags:
+        - Key: demo
+          Value: agones-gamelift-migration
+        - Key: demo-env
+          Value: !Ref DemoEnv
+Outputs:
+  FleetId:
+    Value: !GetAtt ContainerFleet.FleetId
+  QueueArn:
+    Value: !GetAtt GameSessionQueue.Arn
