@@ -7,15 +7,29 @@ bash blocks and run them against a local fake ``aws`` CLI that emulates the real
 CLI v2's paged, text-mode ``--query`` output. No credentials, AWS calls, or live
 infrastructure are used.
 
+The fake ``list-memory-records`` reproduces the service behavior observed on a
+live memory resource whose records are written under a single-segment
+``namespaces=[actorId]`` layout: ``--namespace`` matches a whole namespace path
+segment (after an optional leading ``/`` is stripped), not an arbitrary
+character prefix, so a one-character value such as ``a`` matches nothing. The
+fake also serves ``list-actors`` and ``cognito-idp list-users`` so discovery can
+build its candidate actor IDs from the live actor list and the user pool's
+subjects.
+
 They assert the properties the runbook must have:
 
-1. Discovery finds inactive old namespaces from the records themselves
-   (not from ``list-actors``, which drops actors once their events expire),
-   including namespaces that start with a digit and with an upper-case letter.
-2. The delete covers only the exact old namespace, even when a current digest
+1. Discovery finds leftover old namespaces by building candidate actor IDs from
+   ``list-actors`` and the Cognito user pool's subjects, dropping 64-hex
+   digests, and listing each candidate by exact namespace. It finds a leftover
+   known only from ``list-actors`` and one known only from the user pool, and
+   skips digests.
+2. A one-character namespace value finds nothing (the real service does not
+   match a character prefix of a single-segment namespace), so a reverted
+   per-character discovery loop discovers no leftovers.
+3. The delete covers only the exact old namespace, even when a current digest
    namespace has the old namespace as a prefix, in batches of at most 100.
-3. The dry-run (list) steps delete nothing.
-4. A failed listing aborts discovery with a non-zero status and no namespace on
+4. The dry-run (list) steps delete nothing.
+5. A failed listing aborts discovery with a non-zero status and no namespace on
    stdout, so a partial list is never mistaken for the complete set, and a
    paste keeps the operator's shell open rather than closing it.
 """
@@ -38,28 +52,31 @@ GUIDE_PATH = REPOSITORY_ROOT / "docs" / "DEPLOYMENT_GUIDE.md"
 RUNBOOK_HEADING = "### Clean Up Memory Records Left Under Raw-Subject Actor IDs"
 
 # The old namespace is a short raw actor ID. A current digest namespace that has
-# the old namespace as a full prefix is present, so a prefix delete (rather than
-# an exact-namespace delete) would also remove the digest's records and fail the
-# exact-namespace test.
+# the old namespace as a full character prefix is present, so a prefix delete
+# (rather than an exact-namespace delete) would also remove the digest's records
+# and fail the exact-namespace test.
 OLD_NS = "abc"
 PREFIX_DIGEST_NS = "abc" + "0" * 61  # a 64-hex digest that starts with OLD_NS
 
-# Discovery fixtures that do not share a single leading character: a raw UUID,
-# a UUID that starts with a digit, an upper-case-leading actor, and "anonymous".
-UUID_NS = "f1e2d3c4-b5a6-7890-1234-567890abcdef"
-DIGIT_UUID_NS = "7f3e9a10-1b2c-4d5e-8f90-a1b2c3d4e5f6"
+# Leftover namespaces, each discoverable from exactly one source so a discovery
+# that drops either source is caught: ACTOR_ONLY_NS still has an actor row (its
+# events have not expired) but no live user; POOL_ONLY_NS has a user-pool subject
+# but no actor row (its events expired). Both still hold long-term records.
+ACTOR_ONLY_NS = "f1e2d3c4-b5a6-7890-1234-567890abcdef"
+POOL_ONLY_NS = "7f3e9a10-1b2c-4d5e-8f90-a1b2c3d4e5f6"
+# An upper-case-leading and an "anonymous" leftover, both present as actors.
 UPPER_NS = "Z9-test"
 ANON_NS = "anonymous"
 
-# A plain 64-hex digest actor (kept) is never a leftover.
+# A plain 64-hex digest actor (kept) is never a leftover. It appears both as an
+# actor and as a records namespace.
 DIGEST_NS = "d4c3b2a1" + "0" * 56
 
-# The fake aws CLI. It serves list-memory-records from a per-namespace fixture as
-# the real CLI v2 does: --namespace is a prefix filter, results are paged with
-# nextToken, and --query is applied to each page in text mode (so a one-value
-# projection prints one tab-joined line per page). It records every
-# batch-delete-memory-records request and refuses list-actors so a test fails
-# loudly if the runbook calls it.
+# The fake aws CLI. It serves list-memory-records, list-actors, and
+# cognito-idp list-users from fixtures, paging the output as the real CLI v2
+# does and applying --query to each page in text mode. --namespace matches a
+# whole namespace path segment (after stripping a leading "/"), not a character
+# prefix. It records every batch-delete-memory-records request.
 AWS_FAKE = r"""
 import json
 import os
@@ -88,29 +105,67 @@ def option(name, default=None):
         return default
 
 
-# The runbook must not use list-actors; it misses actors whose events expired.
+def paged_text(values):
+    # The CLI follows nextToken itself and applies --query to each page in text
+    # mode, so a single-column projection prints one tab-joined line per page.
+    out_lines = []
+    for start in range(0, len(values), PAGE_SIZE):
+        page = [v for v in values[start : start + PAGE_SIZE] if v != ""]
+        if page:
+            out_lines.append("\t".join(page))
+    if out_lines:
+        print("\n".join(out_lines))
+
+
+# list-actors: enumerate the actors the memory resource still tracks (those with
+# unexpired events). A chosen failure flag makes it fail like expired creds.
 if args[:2] == ["bedrock-agentcore", "list-actors"]:
+    if state.get("fail_list_actors"):
+        save()
+        sys.stderr.write("ExpiredTokenException: the security token has expired\n")
+        sys.exit(254)
     save()
-    sys.stderr.write("list-actors must not be used by the cleanup runbook\n")
-    sys.exit(3)
+    paged_text(list(state.get("actors", [])))
+    sys.exit(0)
+
+# cognito-idp list-users: the user pool's subjects. The runbook projects
+# Users[].Attributes[?Name==`sub`].Value, which yields one subject per user.
+if args[:2] == ["cognito-idp", "list-users"]:
+    if state.get("fail_list_users"):
+        save()
+        sys.stderr.write("AccessDeniedException: not authorized to perform cognito-idp:ListUsers\n")
+        sys.exit(254)
+    save()
+    paged_text(list(state.get("subjects", [])))
+    sys.exit(0)
 
 if args[:2] == ["bedrock-agentcore", "list-memory-records"]:
     namespace = option("--namespace") or ""
     query = option("--query") or ""
     fixtures = state["records"]  # {namespace: [recordId, ...]}
 
-    # A chosen set of prefixes fails the listing, as expired credentials or a
+    # A chosen set of namespaces fails the listing, as expired credentials or a
     # missing permission would, so a test can exercise the discovery abort.
-    if namespace in state.get("fail_prefixes", []):
+    if namespace in state.get("fail_namespaces", []):
         save()
         sys.stderr.write("ExpiredTokenException: the security token has expired\n")
         sys.exit(254)
 
-    # --namespace is a server-side prefix filter: build the flat, ordered list of
-    # (namespace, recordId) summaries whose namespace starts with the prefix.
+    # --namespace matches a whole namespace path segment, not a character prefix.
+    # Strip a single leading "/" from both the query value and each stored
+    # namespace, then match when the stored namespace equals the value or falls
+    # under it as a path hierarchy (value == first segment(s), split on "/").
+    want = namespace[1:] if namespace.startswith("/") else namespace
+
+    def segment_match(stored):
+        norm = stored[1:] if stored.startswith("/") else stored
+        if norm == want:
+            return True
+        return norm.startswith(want + "/")
+
     summaries = []
     for ns in sorted(fixtures):
-        if ns.startswith(namespace):
+        if segment_match(ns):
             for rid in fixtures[ns]:
                 summaries.append((ns, rid))
 
@@ -148,10 +203,9 @@ if args[:2] == ["bedrock-agentcore", "list-memory-records"]:
             return "2026-01-01T00:00:00Z"
         return ""
 
-    # The CLI follows nextToken itself and applies --query to each page in text
-    # mode. Walk the pages in order, emitting one tab-joined line per page for a
-    # single-column projection and one row per record for a multi-column one. A
-    # page with no match prints nothing (no blank line).
+    # Walk the pages in order, emitting one tab-joined line per page for a single
+    # column projection and one row per record for a multi-column one. A page
+    # with no match prints nothing (no blank line).
     out_lines = []
     for start in range(0, max(len(summaries), 1), PAGE_SIZE):
         page = summaries[start : start + PAGE_SIZE]
@@ -236,22 +290,46 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         state: dict = json.loads(self.state_path.read_text())
         return state
 
-    def _write_state(self, records: dict, fail_prefixes: list | None = None) -> None:
-        self.state_path.write_text(json.dumps({"records": records, "calls": [], "fail_prefixes": fail_prefixes or []}))
+    def _write_state(
+        self,
+        records: dict,
+        actors: list | None = None,
+        subjects: list | None = None,
+        fail_namespaces: list | None = None,
+        fail_list_actors: bool = False,
+        fail_list_users: bool = False,
+    ) -> None:
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "records": records,
+                    "actors": actors if actors is not None else list(records),
+                    "subjects": subjects or [],
+                    "calls": [],
+                    "fail_namespaces": fail_namespaces or [],
+                    "fail_list_actors": fail_list_actors,
+                    "fail_list_users": fail_list_users,
+                }
+            )
+        )
 
-    def _run(self, script: str) -> subprocess.CompletedProcess:
+    def _env(self) -> dict:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin}:{env['PATH']}"
         env["FAKE_STATE"] = str(self.state_path)
         env["AWS_REGION"] = "us-west-2"
         env["MEMORY_ID"] = "gameagentruntime_mem-0a1b2c3d4e"
         env["AWS_PROFILE"] = "operator-test"
+        env["USER_POOL_ID"] = "us-west-2_EXAMPLE01"
         env["OLD_ACTOR"] = OLD_NS
-        # Keep the discovery working file inside the test temp dir.
+        # Keep the discovery working files inside the test temp dir.
         env["TMPDIR"] = str(self.tmp)
+        return env
+
+    def _run(self, script: str) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", script],
-            env=env,
+            env=self._env(),
             cwd=self.tmp,
             capture_output=True,
             text=True,
@@ -263,91 +341,133 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         # subshell "exit 1" (stops discovery, shell survives) from a caller-level
         # "exit 1" (ends the whole run) and sees a dropped "&&" (classifier runs
         # anyway), which "bash -euo pipefail -c" cannot.
-        env = dict(os.environ)
-        env["PATH"] = f"{self.bin}:{env['PATH']}"
-        env["FAKE_STATE"] = str(self.state_path)
-        env["AWS_REGION"] = "us-west-2"
-        env["MEMORY_ID"] = "gameagentruntime_mem-0a1b2c3d4e"
-        env["AWS_PROFILE"] = "operator-test"
-        env["OLD_ACTOR"] = OLD_NS
-        env["TMPDIR"] = str(self.tmp)
         return subprocess.run(
             ["bash", "-c", script],
-            env=env,
+            env=self._env(),
             cwd=self.tmp,
             capture_output=True,
             text=True,
         )
 
-    def test_discovery_finds_inactive_old_namespaces(self) -> None:
-        # Old namespaces with records but no live events (list-actors would miss
-        # them): a UUID, a UUID that starts with a digit, an upper-case-leading
-        # actor, and "anonymous". A current digest and a digest-prefixed digest
-        # are present and must not be discovered.
+    def test_discovery_finds_leftovers_from_actors_and_the_user_pool(self) -> None:
+        # ACTOR_ONLY_NS has an actor row but no live user; POOL_ONLY_NS has a
+        # user-pool subject but no actor row. Both still hold records, so
+        # discovery must list both. A current digest (present as an actor and as
+        # a subject-free records namespace) and a digest-prefixed digest must not
+        # be discovered.
         self._write_state(
-            {
+            records={
                 DIGEST_NS: ["mem-" + "d" * 40],
                 PREFIX_DIGEST_NS: ["mem-" + "p" * 40],
-                UUID_NS: ["mem-" + "u" * 40],
-                DIGIT_UUID_NS: ["mem-" + "g" * 40],
+                ACTOR_ONLY_NS: ["mem-" + "u" * 40],
+                POOL_ONLY_NS: ["mem-" + "g" * 40],
                 UPPER_NS: ["mem-" + "r" * 40],
                 ANON_NS: ["mem-" + "n" * 40],
-            }
+            },
+            # list-actors returns the digest, the actor-only leftover, the
+            # upper-case and anonymous leftovers -- but NOT the pool-only one.
+            actors=[DIGEST_NS, ACTOR_ONLY_NS, UPPER_NS, ANON_NS],
+            # The user pool returns the digest's user and the pool-only leftover,
+            # but not the actor-only one (that user was deleted from the pool).
+            subjects=[DIGEST_NS, POOL_ONLY_NS],
         )
         result = self._run(self.blocks[1])  # Step 1 discovery
         self.assertEqual(result.returncode, 0, result.stderr)
         discovered = {line for line in result.stdout.splitlines() if line}
-        self.assertIn(UUID_NS, discovered)
-        self.assertIn(DIGIT_UUID_NS, discovered)
+        self.assertIn(ACTOR_ONLY_NS, discovered, "a leftover known only from list-actors must be found")
+        self.assertIn(POOL_ONLY_NS, discovered, "a leftover known only from the user pool must be found")
         self.assertIn(UPPER_NS, discovered)
         self.assertIn(ANON_NS, discovered)
-        self.assertNotIn(DIGEST_NS, discovered)
+        self.assertNotIn(DIGEST_NS, discovered, "a 64-hex digest actor must be skipped")
         self.assertNotIn(PREFIX_DIGEST_NS, discovered)
-        # Discovery never called list-actors.
-        self.assertFalse(
-            any(call[:2] == ["bedrock-agentcore", "list-actors"] for call in self._state()["calls"]),
-            "discovery must not use list-actors",
+
+    def test_one_character_namespace_discovers_nothing(self) -> None:
+        # The real service does not match a character prefix of a single-segment
+        # namespace. A reverted per-character discovery loop would list every
+        # one-character --namespace and find nothing, so pin that semantic in the
+        # fake directly: a one-character --namespace returns no rows even when a
+        # namespace starting with that character holds records.
+        self._write_state(
+            records={ACTOR_ONLY_NS: ["mem-" + "u" * 40], POOL_ONLY_NS: ["mem-" + "g" * 40]},
+            actors=[],
+            subjects=[],
+        )
+        probe = (
+            'aws bedrock-agentcore list-memory-records --memory-id "$MEMORY_ID" '
+            '--region "$AWS_REGION" --namespace "f" '
+            "--query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text"
+        )
+        result = self._run(probe)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "",
+            "a one-character --namespace must match no single-segment namespace",
         )
 
     def test_discovery_aborts_on_a_listing_failure(self) -> None:
-        # When a listing fails (expired credentials, a missing permission), Step 1
-        # must stop with a non-zero status and print nothing on stdout, so a
-        # partial namespace list is never mistaken for the complete set. A
-        # digit-leading namespace is listed before the failing "a" prefix, so a
-        # mutation that only breaks the loop (leaving the collected rows to be
-        # classified) is still caught by the empty-stdout assertion.
+        # When a candidate listing fails (expired credentials, a missing
+        # permission), Step 1 must stop with a non-zero status and print nothing
+        # on stdout, so a partial leftover list is never mistaken for complete.
         self._write_state(
-            {
-                DIGIT_UUID_NS: ["mem-" + "g" * 40],
-                UUID_NS: ["mem-" + "u" * 40],
+            records={
+                ACTOR_ONLY_NS: ["mem-" + "u" * 40],
+                POOL_ONLY_NS: ["mem-" + "g" * 40],
                 ANON_NS: ["mem-" + "n" * 40],
             },
-            fail_prefixes=["a"],
+            actors=[ACTOR_ONLY_NS, ANON_NS],
+            subjects=[POOL_ONLY_NS],
+            fail_namespaces=[ANON_NS],
         )
         result = self._run(self.blocks[1])  # Step 1 discovery
         self.assertNotEqual(result.returncode, 0, "a failed listing must abort discovery")
         self.assertEqual(result.stdout.strip(), "", "no namespaces may be printed when discovery is incomplete")
         self.assertIn("discovery is incomplete", result.stderr)
 
+    def test_discovery_aborts_when_list_actors_fails(self) -> None:
+        self._write_state(
+            records={ACTOR_ONLY_NS: ["mem-" + "u" * 40]},
+            actors=[ACTOR_ONLY_NS],
+            subjects=[POOL_ONLY_NS],
+            fail_list_actors=True,
+        )
+        result = self._run(self.blocks[1])
+        self.assertNotEqual(result.returncode, 0, "a failed list-actors must abort discovery")
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertIn("discovery is incomplete", result.stderr)
+
+    def test_discovery_aborts_when_list_users_fails(self) -> None:
+        self._write_state(
+            records={POOL_ONLY_NS: ["mem-" + "g" * 40]},
+            actors=[],
+            subjects=[POOL_ONLY_NS],
+            fail_list_users=True,
+        )
+        result = self._run(self.blocks[1])
+        self.assertNotEqual(result.returncode, 0, "a failed list-users must abort discovery")
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertIn("discovery is incomplete", result.stderr)
+
     def test_discovery_failure_keeps_the_pasting_shell_open(self) -> None:
         # A paste runs Step 1 in the operator's own interactive shell, which has
         # no "-e", so the shell does not exit when a command fails. The subshell
-        # around the listing loop and the "&&" before the classifier are what
-        # make a failed listing stop discovery (non-zero status, nothing on
-        # stdout) without ending the shell. Running the block under "bash -c"
-        # (no -e) and then echoing a marker reproduces that: if the subshell were
-        # dropped, "exit 1" would end the whole run before the marker; if the
-        # "&&" were dropped, the classifier would run after the failure and print
-        # a partial namespace list with status 0.
+        # around each listing and the "&&" before the classifier are what make a
+        # failed listing stop discovery (non-zero status, nothing on stdout)
+        # without ending the shell. Running the block under "bash -c" (no -e) and
+        # then echoing a marker reproduces that: if a subshell were dropped,
+        # "exit 1" would end the whole run before the marker; if an "&&" were
+        # dropped, the classifier would run after the failure.
         self._write_state(
-            {
-                DIGIT_UUID_NS: ["mem-" + "g" * 40],
-                UUID_NS: ["mem-" + "u" * 40],
+            records={
+                ACTOR_ONLY_NS: ["mem-" + "u" * 40],
+                POOL_ONLY_NS: ["mem-" + "g" * 40],
                 ANON_NS: ["mem-" + "n" * 40],
             },
-            fail_prefixes=["a"],
+            actors=[ACTOR_ONLY_NS, ANON_NS],
+            subjects=[POOL_ONLY_NS],
+            fail_list_actors=True,
         )
-        script = self.blocks[1] + '\necho "after status=$? file=${RECORDS_FILE:+set}"\n'
+        script = self.blocks[1] + '\necho "after status=$? file=${CANDIDATES_FILE:+set}"\n'
         result = self._run_paste(script)
         self.assertEqual(
             result.stdout.strip(),
@@ -357,7 +477,11 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         self.assertIn("discovery is incomplete", result.stderr)
 
     def test_dry_run_steps_delete_nothing(self) -> None:
-        self._write_state({PREFIX_DIGEST_NS: ["mem-" + "d" * 40], OLD_NS: ["mem-" + "o" * 40]})
+        self._write_state(
+            records={PREFIX_DIGEST_NS: ["mem-" + "d" * 40], OLD_NS: ["mem-" + "o" * 40]},
+            actors=[PREFIX_DIGEST_NS, OLD_NS],
+            subjects=[],
+        )
         self._run(self.blocks[1])  # Step 1
         self._run(self.blocks[2])  # Step 2 dry run
         state = self._state()
@@ -367,14 +491,15 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         )
 
     def test_delete_is_exact_namespace_only(self) -> None:
-        # A current digest namespace has OLD_NS ("abc") as a full prefix. A prefix
-        # delete would also remove the digest's records; an exact-namespace delete
-        # removes only OLD_NS's record.
+        # A current digest namespace has OLD_NS ("abc") as a full character
+        # prefix. An exact-namespace delete removes only OLD_NS's record.
         self._write_state(
-            {
+            records={
                 PREFIX_DIGEST_NS: ["mem-" + "d" * 40, "mem-" + "e" * 40],
                 OLD_NS: ["mem-" + "o" * 40],
-            }
+            },
+            actors=[PREFIX_DIGEST_NS, OLD_NS],
+            subjects=[],
         )
         result = self._run(self.blocks[3])  # Step 3 delete
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -384,7 +509,7 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
 
     def test_delete_batches_at_most_100(self) -> None:
         many = ["mem-" + f"{i:040d}" for i in range(250)]
-        self._write_state({OLD_NS: many})
+        self._write_state(records={OLD_NS: many}, actors=[OLD_NS], subjects=[])
         result = self._run(self.blocks[3])  # Step 3 delete
         self.assertEqual(result.returncode, 0, result.stderr)
         batches = self._state()["delete_batches"]
@@ -423,9 +548,11 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
         assert delete_blocks, "no bash block calls batch-delete-memory-records"
         cls.delete_block = delete_blocks[0]
 
-    def test_discovery_does_not_use_list_actors(self) -> None:
-        # The prose explains why list-actors is avoided; no command may invoke it.
-        self.assertNotIn("aws bedrock-agentcore list-actors", self.bash, "no bash block may call list-actors")
+    def test_discovery_builds_candidates_from_actors_and_the_pool(self) -> None:
+        # Discovery derives candidate actor IDs from the live actor list and the
+        # Cognito user pool's subjects; both calls must appear.
+        self.assertIn("aws bedrock-agentcore list-actors", self.bash, "discovery must list actors")
+        self.assertIn("aws cognito-idp list-users", self.bash, "discovery must list user-pool subjects")
 
     def test_delete_uses_exact_namespace_filter(self) -> None:
         self.assertIn("namespaces[0]==", self.delete_block, "the delete must restrict to an exact namespace")
@@ -445,11 +572,9 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
         # The CLI follows nextToken itself, so any option that caps or disables
         # pagination (--no-paginate, --max-items, the hidden --max-results, and
         # their unambiguous prefixes such as --no-pag or --max-i) would truncate
-        # a listing and delete only part of a namespace. Rather than denylisting
-        # spellings the CLI silently accepts, assert that every long option used
-        # in the section's command fences is one of the ones the runbook needs.
-        # A new option (such as --page-size, which returns every record) is added
-        # here deliberately, which also forces a look at whether it truncates.
+        # a listing and discover or delete only part of a namespace. Rather than
+        # denylisting spellings the CLI silently accepts, assert that every long
+        # option used in the section's command fences is one the runbook needs.
         allowed = {
             "--memory-id",
             "--region",
@@ -460,6 +585,7 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
             "--actor-id",
             "--session-id",
             "--event-id",
+            "--user-pool-id",
         }
         used = set(re.findall(r"(?<!\S)(--[a-zA-Z][a-zA-Z0-9-]*)", self.fences))
         unexpected = used - allowed
