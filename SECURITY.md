@@ -229,7 +229,7 @@ The runtime is traced with OpenTelemetry under the AWS OpenTelemetry distro and 
 - System prompts (`gen_ai.system_instructions`, and the `system_prompt` attribute on agent spans)
 - Tool inputs and results, including MCP tool arguments and results
 - Tool and model error text in span status descriptions and `exception` events, and the exception message and stack trace in the Strands MCP client's exception log records (the error type is kept)
-- Knowledge Base passages and memory query or content
+- Knowledge Base passages, which reach telemetry as model/tool message content and are covered by the message-content switch and the redaction token
 
 **How it is enforced**: A startup guard (`backend/src/config/telemetry_guard.py`) runs at application import, before the first Strands tracer and the first MCP client are created, and sets two switches regardless of the deploy environment:
 
@@ -248,6 +248,7 @@ The AgentCore Memory SDK logs the long-term-memory namespace, which embeds the m
 
 - *AWS SDK error text.* The botocore instrumentation records a failed AWS call's exception type and message as the span status description and as an `exception` span event (message and stack trace). A service error message can echo a value from the request (a not-found error can repeat a resource name the user typed) or identify the caller (an access-denied error names the role session that made the call). This reaches exported spans from the runtime process and from the embedded MCP server subprocesses, and the guard does not remove it. A scrubber at the span-exporter boundary is the intended fix; it has to run in the MCP subprocesses as well as the runtime, and it is tracked in #578.
 - *Memory service spans.* When tracing is enabled on the memory resource (the AgentCore CLI enables it for a memory it creates while observability is on), the service emits its own spans for memory calls. The event spans carry the actor ID as `actor.id`, and the retrieval spans carry the namespace, which embeds it ([AgentCore memory observability data](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-memory-metrics.html)). The service produces these spans, so the runtime cannot redact them. The actor ID is stable for a given user, so the spans carry a per-user identifier that anyone who can read the memory resource's trace data can use to correlate that user's activity. When the memory has long-term strategies and service logs are enabled, the extraction logs also carry `actor_id` and `namespace` fields.
+- *Strands memory-span events (latent here).* Strands memory stores emit their own span events through `start_memory_*` / `end_memory_*`, which attach the raw `memory.query`, `memory.content`, and `memory.results` outside the tracer's redaction policy, so the empty `gen_ai_unredacted_attributes=` token does not reach them. This runtime uses only `AgentCoreMemorySessionManager` and no Strands memory store, so these events are not emitted and the gap is latent; it would open if a Strands memory store were introduced without extending the guard to those events.
 - *Failed memory calls.* On a service error during a lookup, the memory client logs a WARNING that can include the resolved namespace (resource not found) or the service's error text. When creating or listing events fails, it logs the service's error text at ERROR. The filter passes WARNING and above by design. The Strands session manager's ERROR for other lookup failures carries the retrieval template key and the exception text.
 - *MCP SDK errors.* The MCP SDK's own validation and receive-loop errors (logged on the root logger with the exception interpolated into the message string) are not reachable by the named-logger filter; if an MCP message that fails protocol validation carried content, the interpolated text could appear in a log record on that uncommon path.
 
@@ -534,7 +535,7 @@ Every other protection is unchanged. `backend/tests/unit/test_guardrail_template
 | Backend (AgentCore) | Sanitized prompt, user context | **Validated** | Input validation, rate limiting, guardrails |
 | AWS service responses | Fleet/cluster info, costs | **Internal** | IAM-scoped read-only access |
 | Logs (CloudWatch) | Sanitized excerpts | **Redacted** | PII/credentials stripped by `sanitize_log_data()`, encrypted at rest |
-| Traces and OpenTelemetry log records | Latency, token counts, model id, finish reason, error type, span structure | **Redacted** | Prompt, response, tool, system-prompt, and memory content redacted by default; see Exported Telemetry Content |
+| Traces and OpenTelemetry log records | Latency, token counts, model id, finish reason, error type, span structure | **Redacted** | Prompt, response, tool, and system-prompt content redacted by default; the memory namespace INFO line is filtered in a hosted runtime; see Exported Telemetry Content for the memory paths left open |
 | Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation (`actor_id`), encrypted at rest, TTL-enforced |
 
 ### Service-to-Service Credentials
