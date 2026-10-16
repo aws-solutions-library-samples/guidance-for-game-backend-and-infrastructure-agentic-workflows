@@ -61,7 +61,13 @@ from pathlib import Path
 from . import checksums, semver
 from .artifact_guard import ALLOWED_ARTIFACT_NAMES, CHECKSUMS_NAME, MANIFEST_NAME, Artifact, assert_artifacts_safe
 from .github_client import GitHubClient
-from .validate import MAIN_BRANCH, ValidationError, _require, validate_environment_protected
+from .validate import (
+    MAIN_BRANCH,
+    ValidationError,
+    _require,
+    validate_environment_policy,
+    validate_tag_ruleset_present,
+)
 
 
 @dataclass(frozen=True)
@@ -144,6 +150,92 @@ def assert_manifest_byte_identical(*, downloaded_manifest: bytes, rebuilt_manife
         )
 
 
+# Bounded retries for the post-publish read-back GETs. No GitHub doc promises
+# read-after-write consistency for these endpoints, so a transient 404 or 5xx
+# immediately after a successful publish PATCH must not fail a run whose write
+# already succeeded. The retries are small and injectable so a test can prove
+# the retry without real sleeps.
+_READBACK_RETRIES = 4
+_READBACK_RETRY_SLEEP_SECONDS = 0.5
+
+
+def _read_with_retries(func, *, is_ready, retries: int = _READBACK_RETRIES, sleep=None):
+    """Call ``func`` until ``is_ready(result)`` or the retry budget is spent.
+
+    ``func`` is a read (GET); ``is_ready`` decides whether the value is usable
+    (for example, a release that has become visible). A raised exception or a
+    not-ready value is retried up to ``retries`` times with a short sleep, then
+    the last result (or exception) is returned (or re-raised). This smooths over
+    read-after-write lag without masking a genuine mismatch, which the caller's
+    own checks still catch on the final value.
+    """
+
+    sleeper = sleep if sleep is not None else _sleep
+    last_exc: BaseException | None = None
+    result = None
+    for attempt in range(retries + 1):
+        try:
+            result = func()
+            if is_ready(result):
+                return result
+            last_exc = None
+        except Exception as error:  # noqa: BLE001 - retry transient read errors
+            last_exc = error
+        if attempt < retries:
+            sleeper(_READBACK_RETRY_SLEEP_SECONDS)
+    if last_exc is not None:
+        raise last_exc
+    return result
+
+
+def _sleep(seconds: float) -> None:
+    # Standard library
+    import time
+
+    time.sleep(seconds)
+
+
+def _check_asset_set(assets, *, inputs: PublishInputs, context: str) -> None:
+    """Shared asset check: exactly the four allowlisted names, each matching the
+    published size and, when GitHub reports a ``digest``, the ``SHA256SUMS`` sha.
+
+    ``context`` names the phase in the error message ("draft" / "post-publish
+    read-back") so an operator knows whether the mismatch is still repairable.
+    """
+
+    local_by_name = {a.name: a.data for a in inputs.artifacts}
+    sums_entries = {e.name: e.digest for e in checksums.parse_sha256sums(inputs.sha256sums)}
+
+    names = sorted(str(a.get("name", "")) for a in assets)
+    _require(
+        set(names) == set(ALLOWED_ARTIFACT_NAMES),
+        f"{context}: attached assets {names} do not equal the four release artifacts",
+    )
+    for asset in assets:
+        name = str(asset.get("name", ""))
+        local = local_by_name.get(name)
+        _require(local is not None, f"{context}: unexpected attached asset {name}")
+        size = asset.get("size")
+        _require(
+            isinstance(size, int) and size == len(local),
+            f"{context}: asset {name} size {size} does not equal the published {len(local)} bytes",
+        )
+        reported = _asset_sha256_from_digest(str(asset.get("digest", "")))
+        if reported is not None:
+            expected = sums_entries.get(name) or checksums.sha256_hex(local)
+            _require(
+                reported == expected,
+                f"{context}: asset {name} digest does not equal its published checksum",
+            )
+
+
+def _verify_draft_assets(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> None:
+    """Confirm the draft's assets before the tag is created (names/sizes/digests)."""
+
+    assets = client.list_release_assets(release_id)
+    _check_asset_set(assets, inputs=inputs, context="pre-tag draft asset check")
+
+
 def _asset_sha256_from_digest(digest: str) -> str | None:
     """Return the hex sha256 from a GitHub asset ``digest`` like ``sha256:<hex>``.
 
@@ -191,7 +283,10 @@ def verify_published_release(
     with a remedy.
     """
 
-    release = client.get_release(release_id)
+    release = _read_with_retries(
+        lambda: client.get_release(release_id),
+        is_ready=lambda r: bool(r) and r.get("draft") is False and r.get("immutable") is True,
+    )
     _require(bool(release), "post-publish read-back: release could not be read")
     _require(release.get("draft") is False, "post-publish read-back: release is still a draft")
     _require(
@@ -200,9 +295,10 @@ def verify_published_release(
     )
     _require(
         release.get("immutable") is True,
-        "post-publish read-back: release is not immutable; enable GitHub's immutable-releases "
-        "setting (Settings -> General -> Releases) and a v* tag ruleset, then re-run "
-        "(see docs/RELEASING.md 'Recommended maintainer settings')",
+        "post-publish read-back: release is not immutable. The release is published and cannot be made "
+        "immutable retroactively (GitHub applies the immutable-releases setting only to future releases), "
+        "and the same tag cannot be re-dispatched while this release and tag ref exist. "
+        "See docs/RELEASING.md 'Manual recovery' -> 'A read-back failed after publication' for the choices.",
     )
 
     _verify_published_assets(client, release_id=release_id, inputs=inputs)
@@ -210,36 +306,18 @@ def verify_published_release(
 
 
 def _verify_published_assets(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> None:
-    local_by_name = {a.name: a.data for a in inputs.artifacts}
-    sums_entries = {e.name: e.digest for e in checksums.parse_sha256sums(inputs.sha256sums)}
-
-    assets = client.list_release_assets(release_id)
-    names = sorted(str(a.get("name", "")) for a in assets)
-    _require(
-        set(names) == set(ALLOWED_ARTIFACT_NAMES),
-        f"post-publish read-back: attached assets {names} do not equal the four release artifacts",
+    assets = _read_with_retries(
+        lambda: client.list_release_assets(release_id),
+        is_ready=lambda a: {str(x.get("name", "")) for x in a} == set(ALLOWED_ARTIFACT_NAMES),
     )
-
-    for asset in assets:
-        name = str(asset.get("name", ""))
-        local = local_by_name.get(name)
-        _require(local is not None, f"post-publish read-back: unexpected attached asset {name}")
-        size = asset.get("size")
-        _require(
-            isinstance(size, int) and size == len(local),
-            f"post-publish read-back: asset {name} size {size} does not equal the published {len(local)} bytes",
-        )
-        reported = _asset_sha256_from_digest(str(asset.get("digest", "")))
-        if reported is not None:
-            expected = sums_entries.get(name) or checksums.sha256_hex(local)
-            _require(
-                reported == expected,
-                f"post-publish read-back: asset {name} digest does not equal its published checksum",
-            )
+    _check_asset_set(assets, inputs=inputs, context="post-publish read-back")
 
 
 def _verify_published_tag(client: GitHubClient, *, inputs: PublishInputs, created_tag_sha: str | None) -> None:
-    ref = client.get_ref(f"tags/{inputs.tag}")
+    ref = _read_with_retries(
+        lambda: client.get_ref(f"tags/{inputs.tag}"),
+        is_ready=lambda r: r is not None and bool((r or {}).get("object", {}).get("sha")),
+    )
     _require(ref is not None, "post-publish read-back: tag ref is absent after publish")
     ref_object = (ref or {}).get("object", {}) or {}
     ref_sha = str(ref_object.get("sha", ""))
@@ -255,7 +333,10 @@ def _verify_published_tag(client: GitHubClient, *, inputs: PublishInputs, create
     # the commit directly (rejected: the release must carry an annotated tag).
     if str(ref_object.get("type", "")) == "commit":
         raise ValidationError("post-publish read-back: tag ref points at a commit, not an annotated tag object")
-    tag_object = client.get_tag_object(ref_sha)
+    tag_object = _read_with_retries(
+        lambda: client.get_tag_object(ref_sha),
+        is_ready=lambda t: bool((t or {}).get("object", {}).get("sha")),
+    )
     target = (tag_object or {}).get("object", {}) or {}
     _require(
         str(target.get("sha", "")) == inputs.commit,
@@ -307,6 +388,14 @@ def publish_release(client: GitHubClient, inputs: PublishInputs) -> PublishResul
                 data=artifact.data,
                 content_type=_content_type_for(artifact.name),
             )
+
+        # Verify the DRAFT's attached assets (names, sizes, and digests where
+        # GitHub reports them) BEFORE creating the tag. A draft asset changed by
+        # another writer between upload and the tag write is caught here, while
+        # the draft can still be cleaned up and the tag name is not yet burned,
+        # instead of at the post-publish read-back once the release is immutable
+        # and its assets are locked.
+        _verify_draft_assets(client, release_id=result.release_id, inputs=inputs)
 
         # 4. Re-check main HEAD and tag absence IMMEDIATELY before the tag
         # write (closes any movement during asset uploads), then create the
@@ -551,8 +640,10 @@ def _cleanup(
 
     A client-visible error does not prove the server rejected the write: a 502
     after the server applied a PATCH, or an interrupt during the final publish,
-    can leave a published release or a created ref. Cleanup therefore RE-READS
-    the remote state and:
+    can leave a published release or a created ref. When the publish PATCH
+    already returned success (``result.published``), cleanup deletes NOTHING and
+    reports the published release and its tag as left intact. Otherwise cleanup
+    RE-READS the remote state and:
 
     * deletes the tag ref first (so a public tag never outlives its release),
       and only if it still points at THIS run's tag object;
@@ -595,10 +686,38 @@ def _cleanup_body(
                 per_request=_ORDINARY_CLEANUP_PER_REQUEST_TIMEOUT_SECONDS,
             )
 
+    # When the publish PATCH already returned success, the release is published
+    # and immutable-eligible; cleanup must NEVER delete anything in that case
+    # (not the release and not the tag ref, which a published release locks).
+    # A read-back failure after a successful publish therefore leaves the
+    # release intact for manual review rather than destroying a published
+    # artifact. This decision uses ``result.published`` (the observed PATCH
+    # outcome) so a stale live read cannot send cleanup down a delete path.
+    if result.published:
+        announced: list[str] = []
+        if created_tag_sha is not None:
+            announced.append(f"tag ref {inputs.tag} -> tag object {created_tag_sha}")
+        if result.release_id:
+            announced.append(f"published release id={result.release_id} for tag {inputs.tag}")
+        print(
+            "release cleanup starting; the release was published, so nothing is deleted. "
+            "Published release left intact for manual verification: " + "; ".join(announced or [f"tag {inputs.tag}"]),
+            file=sys.stderr,
+        )
+        print(
+            "release cleanup could not remove everything; manual recovery required for: "
+            + "; ".join((announced or [f"tag {inputs.tag}"]))
+            + " (see docs/RELEASING.md 'Manual recovery')",
+            file=sys.stderr,
+        )
+        return
+
     # Announce every identifier this run may have created BEFORE touching the
     # API, so even a SIGKILL mid-cleanup leaves an operator the exact things to
     # check. These are "possible" leftovers; the confirmed-removed ones are
-    # subtracted from the final leftover report.
+    # subtracted from the final leftover report. The release id is announced as
+    # a draft here because this path is reached only when the publish PATCH did
+    # NOT return success, so any release this run created is still a draft.
     possible: list[str] = []
     if created_tag_sha is not None:
         possible.append(f"tag ref {inputs.tag} -> tag object {created_tag_sha}")
@@ -789,11 +908,19 @@ def publish_release_from_dir(
         downloaded_manifest = next(a.data for a in artifacts if a.name == MANIFEST_NAME)
         assert_manifest_byte_identical(downloaded_manifest=downloaded_manifest, rebuilt_manifest=rebuilt_manifest)
 
-    # Fail closed unless the deployment environment is protected: a non-dry run
-    # must never publish into an environment GitHub would auto-create
-    # unprotected on first use. (The workflow also runs this as a dedicated
-    # read-only step before this one; both are intentional defense in depth.)
-    validate_environment_protected(client)
+    # Fail closed unless the deployment environment is protected and its policy
+    # is fully confirmable: required reviewers, prevent-self-review, and a
+    # deployment branch policy limited to main. A non-dry run must never publish
+    # into an environment GitHub would auto-create unprotected on first use, nor
+    # one whose machine-checkable policy is weaker than the release gate. (The
+    # workflow also runs the required-reviewers check as a dedicated read-only
+    # step before this one; both are intentional defense in depth.)
+    validate_environment_policy(client)
+
+    # Fail closed unless an active tag ruleset covers refs/tags/v*, so a non-dry
+    # run never publishes a tag the repository does not protect with a ruleset.
+    # The ruleset's ref conditions are readable with Metadata: read.
+    validate_tag_ruleset_present(client)
 
     inputs = PublishInputs(
         tag=metadata.tag,

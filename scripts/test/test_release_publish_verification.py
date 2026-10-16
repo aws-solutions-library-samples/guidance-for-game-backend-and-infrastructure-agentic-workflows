@@ -19,7 +19,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 # Third-party packages
-from _release_fakes import RecordingClient  # noqa: E402
+from _release_fakes import RecordingClient, covering_tag_ruleset, protected_environment  # noqa: E402
 
 # Local modules
 from release import artifacts as artifacts_mod  # noqa: E402
@@ -50,12 +50,7 @@ def _write_artifact_set(out_dir: Path, *, tag="v0.1.0", commit=COMMIT) -> None:
 
 
 def _protected_environment():
-    return {
-        "name": "release",
-        "protection_rules": [
-            {"id": 1, "type": "required_reviewers", "reviewers": [{"type": "User", "reviewer": {"login": "octo"}}]}
-        ],
-    }
+    return protected_environment()
 
 
 def _ready_client(*, environment=None):
@@ -64,6 +59,15 @@ def _ready_client(*, environment=None):
     client.environments = {}
     if environment is not None:
         client.environments["release"] = environment
+        # A full non-dry publish also requires a main-only deployment branch
+        # policy and an active tag ruleset covering v*; supply both so the
+        # happy-path publish is not blocked by the fail-closed gates. The
+        # dedicated environment-protection tests call the checks directly and
+        # are unaffected.
+        client.deployment_branch_policies = {"release": [{"id": 1, "name": "main"}]}
+        summary, detail = covering_tag_ruleset()
+        client.rulesets = [summary]
+        client.ruleset_details = {summary["id"]: detail}
     return client
 
 

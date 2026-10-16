@@ -21,7 +21,10 @@
 #     and publishes exactly those bytes. No syft and no SBOM regeneration run
 #     beside the write token.
 #
-# Every job also runs only when the dispatch ref is `main`: the workflow file
+# A dedicated `guard-ref` job runs on EVERY dispatch with no ref condition, so a
+# dispatch from a non-`main` ref fails LOUDLY there instead of skipping every
+# gated job and showing the run as green. Every other job also runs only when
+# the dispatch ref is `main` and depends on `guard-ref`: the workflow file
 # itself comes from the dispatch ref, so the scripts' commit==main check is not
 # sufficient on its own.
 

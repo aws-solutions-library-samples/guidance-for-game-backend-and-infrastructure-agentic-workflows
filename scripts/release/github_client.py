@@ -73,10 +73,39 @@ def _sanitize_excerpt(body: bytes) -> str:
     return text[:_MAX_ERROR_EXCERPT]
 
 
+class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse any redirect whose target host differs from the original.
+
+    CPython's default redirect handler copies request headers -- including the
+    ``Authorization`` bearer token -- onto the redirect target whatever its
+    host, so a redirect from an API host to another host would carry the token
+    off GitHub. This handler allows a same-host redirect but raises on a
+    cross-host redirect so the token is never forwarded to a different host.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old_host = urllib.parse.urlsplit(req.full_url).netloc
+        new_host = urllib.parse.urlsplit(newurl).netloc
+        if new_host and new_host != old_host:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                code,
+                f"refusing cross-host redirect to {new_host}",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# A module-level opener that refuses cross-host redirects, so the bearer token
+# cannot follow a redirect to a different host on any request.
+_OPENER = urllib.request.build_opener(_NoCrossHostRedirect())
+
+
 def _urllib_transport(request: Request) -> Response:
     req = urllib.request.Request(request.url, data=request.data, method=request.method, headers=request.headers)
     try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_SECONDS) as handle:  # noqa: S310 - fixed https host
+        with _OPENER.open(req, timeout=_HTTP_TIMEOUT_SECONDS) as handle:  # noqa: S310 - fixed https host
             return Response(
                 status=handle.status,
                 headers={k.lower(): v for k, v in handle.headers.items()},
@@ -277,9 +306,9 @@ class GitHubClient:
         Needs only ``Metadata: read`` (the same permission the workflow token
         already carries for reading branch rules). ``target`` filters to a rule
         target such as ``tag``. The list payload summarizes each ruleset
-        (``name``, ``target``, ``enforcement``); the full rule set of a single
-        ruleset needs ``Administration: write`` and is deliberately not read
-        here, so this is a best-effort visibility read only.
+        (``id``, ``name``, ``target``, ``enforcement``) without its ref-name
+        conditions; :meth:`get_ruleset` reads a single ruleset's full
+        ``conditions`` with the same ``Metadata: read`` permission.
         """
         suffix = "/rulesets"
         if target is not None:
@@ -287,19 +316,50 @@ class GitHubClient:
         items = self._paginate(self._repo_path(suffix), operation="list-rulesets")
         return [item for item in items if isinstance(item, dict)]
 
+    def get_ruleset(self, ruleset_id: int) -> dict[str, Any]:
+        """Return one ruleset with its ``conditions`` (``GET /rulesets/{id}``).
+
+        Needs only ``Metadata: read``. The payload carries
+        ``conditions.ref_name.include`` / ``exclude`` (the tag patterns the
+        ruleset targets) and ``enforcement``, so a caller can decide whether an
+        active tag ruleset actually covers a ref such as ``refs/tags/v*``. Only
+        ``bypass_actors`` is withheld from callers without write access, which
+        this check does not need.
+        """
+        url = self._repo_path(f"/rulesets/{int(ruleset_id)}")
+        response = self._call("GET", url, operation="get-ruleset", expected=(200,))
+        return response.json() or {}
+
     def get_environment(self, name: str) -> dict[str, Any] | None:
         """Return the deployment environment payload, or None when absent (404).
 
         Read-only. Uses ``GET /repos/{owner}/{repo}/environments/{name}`` which
         needs only ``actions: read`` on the workflow token. The payload carries
-        ``protection_rules`` (e.g. a ``required_reviewers`` rule) which the
-        caller inspects to decide whether publication may proceed.
+        ``protection_rules`` (e.g. a ``required_reviewers`` rule, which also
+        carries ``prevent_self_review``) and ``deployment_branch_policy``, which
+        the caller inspects to decide whether publication may proceed.
         """
         url = self._repo_path(f"/environments/{urllib.parse.quote(name, safe='')}")
         response = self._call("GET", url, operation="get-environment", expected=(200,), allow_404=True)
         if response.status == 404:
             return None
         return response.json() or {}
+
+    def list_deployment_branch_policies(self, name: str) -> list[dict[str, Any]]:
+        """Return an environment's custom deployment branch policies.
+
+        Uses ``GET /repos/{o}/{r}/environments/{name}/deployment-branch-policies``
+        (``actions: read``). Each entry carries a ``name`` pattern a branch must
+        match to deploy, so a caller can confirm the environment is limited to
+        ``main``.
+        """
+        url = self._repo_path(f"/environments/{urllib.parse.quote(name, safe='')}/deployment-branch-policies")
+        response = self._call("GET", url, operation="list-deployment-branch-policies", expected=(200,))
+        payload = response.json() or {}
+        policies = payload.get("branch_policies") if isinstance(payload, dict) else None
+        if not isinstance(policies, list):
+            return []
+        return [p for p in policies if isinstance(p, dict)]
 
     # -- write surface (publication only) ---------------------------------
 

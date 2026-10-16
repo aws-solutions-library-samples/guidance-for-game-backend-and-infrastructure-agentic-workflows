@@ -296,6 +296,131 @@ def validate_environment_protected(client: GitHubClient, *, environment: str = R
     )
 
 
+def validate_environment_policy(client: GitHubClient, *, environment: str = RELEASE_ENVIRONMENT) -> None:
+    """Fail closed unless the environment's policy is fully machine-confirmable.
+
+    Extends :func:`validate_environment_protected` with the two further rules
+    that are readable with ``actions: read`` and so can be enforced rather than
+    hand-checked before a non-dry run:
+
+    * ``prevent_self_review`` is true on the required-reviewers rule, so the
+      dispatcher cannot approve their own release;
+    * the deployment branch policy is limited to ``main`` -- custom branch
+      policies are enabled (not "any protected branch") and the only configured
+      branch pattern is ``main``.
+
+    Admin bypass has no documented field in the environment payload, so it
+    remains a hand check in the before-first-run checklist.
+    """
+
+    validate_environment_protected(client, environment=environment)
+    payload = client.get_environment(environment) or {}
+    rules = payload.get("protection_rules") or []
+
+    prevents_self_review = any(
+        isinstance(rule, dict)
+        and str(rule.get("type", "")) == _REQUIRED_REVIEWERS_RULE
+        and rule.get("prevent_self_review") is True
+        for rule in rules
+    )
+    _require(
+        prevents_self_review,
+        f"release environment '{environment}' does not prevent self-review; "
+        "enable prevent-self-review so the dispatcher cannot approve their own release",
+    )
+
+    branch_policy = payload.get("deployment_branch_policy")
+    _require(
+        isinstance(branch_policy, dict) and branch_policy.get("custom_branch_policies") is True,
+        f"release environment '{environment}' must restrict deployments to a custom branch policy limited to main",
+    )
+    policies = client.list_deployment_branch_policies(environment)
+    names = sorted(str(p.get("name", "")) for p in policies)
+    _require(
+        names == [MAIN_BRANCH],
+        f"release environment '{environment}' deployment branch policy must be exactly ['{MAIN_BRANCH}'], got {names}",
+    )
+
+
+def _ruleset_include_covers(pattern: str, *, tag_prefix: str) -> bool:
+    """Return True if a ruleset include ``pattern`` covers ``refs/tags/<prefix>*``.
+
+    GitHub ruleset ``conditions.ref_name.include`` entries are either the
+    special ``~ALL`` token (every ref) or an fnmatch-style ref pattern such as
+    ``refs/tags/v*`` or ``refs/tags/v[0-9]*``. A pattern covers the versioned
+    tags when it is ``~ALL`` or matches the representative ref
+    ``refs/tags/<prefix>0.0.0``.
+    """
+
+    # Standard library
+    import fnmatch
+
+    if pattern == "~ALL":
+        return True
+    representative = f"refs/tags/{tag_prefix}0.0.0"
+    return fnmatch.fnmatchcase(representative, pattern)
+
+
+def _ruleset_excludes_v_tags(exclude: list, *, tag_prefix: str) -> bool:
+    """Return True if any exclude pattern removes ``refs/tags/<prefix>*``."""
+
+    # Standard library
+    import fnmatch
+
+    representative = f"refs/tags/{tag_prefix}0.0.0"
+    for pattern in exclude:
+        if isinstance(pattern, str) and fnmatch.fnmatchcase(representative, pattern):
+            return True
+    return False
+
+
+def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag_prefix: str = "v") -> bool:
+    """Return True if an active tag ruleset covers ``refs/tags/<prefix>*``.
+
+    Reads each tag-target ruleset's ``conditions.ref_name`` with
+    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
+    only when it is ``active`` and an include pattern covers the versioned tags
+    (an fnmatch pattern that matches, or ``~ALL``) without an exclude pattern
+    that removes them.
+    """
+
+    for summary in client.list_rulesets(target="tag"):
+        if str(summary.get("enforcement", "")) != "active":
+            continue
+        ruleset_id = summary.get("id")
+        if not isinstance(ruleset_id, int):
+            continue
+        detail = client.get_ruleset(ruleset_id)
+        if str(detail.get("enforcement", summary.get("enforcement", ""))) != "active":
+            continue
+        conditions = (detail.get("conditions") or {}).get("ref_name") or {}
+        include = conditions.get("include") or []
+        exclude = conditions.get("exclude") or []
+        covers = any(
+            _ruleset_include_covers(str(pattern), tag_prefix=tag_prefix)
+            for pattern in include
+            if isinstance(pattern, str)
+        )
+        if covers and not _ruleset_excludes_v_tags(exclude, tag_prefix=tag_prefix):
+            return True
+    return False
+
+
+def validate_tag_ruleset_present(client: GitHubClient, *, tag_prefix: str = "v") -> None:
+    """Fail closed unless an active tag ruleset covers ``refs/tags/<prefix>*``.
+
+    A non-dry run must not publish a tag the repository does not protect with a
+    tag ruleset. The ruleset's ref conditions are readable with ``Metadata:
+    read``, so this is a machine check, not advice.
+    """
+
+    _require(
+        tag_ruleset_covers_v_tags(client, tag_prefix=tag_prefix),
+        f"no active tag ruleset covers refs/tags/{tag_prefix}*; "
+        f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags before releasing",
+    )
+
+
 def report_release_settings(client: GitHubClient, *, tag_prefix: str = "v") -> dict[str, str]:
     """Best-effort, non-failing report of the two settings immutability depends on.
 
@@ -308,25 +433,24 @@ def report_release_settings(client: GitHubClient, *, tag_prefix: str = "v") -> d
       ``"unverifiable-pre-run"``. It is instead enforced after publication by the
       read-back check, which fails the run unless the published release reports
       ``immutable: true``.
-    * ``tag_ruleset``: whether at least one ``tag``-target ruleset exists that
-      could protect ``v*`` tags. Read with ``Metadata: read`` (already granted),
-      so this is reported, but it is advisory only: the list endpoint does not
-      expose each rule's ref-name conditions without admin, so a present ruleset
-      is reported as ``"present"`` and an absent one as ``"absent"`` rather than
-      failing the run.
+    * ``tag_ruleset``: whether an active ``tag``-target ruleset actually covers
+      ``refs/tags/<prefix>*``. Each tag ruleset's ref-name conditions are read
+      with ``Metadata: read`` (already granted), so a ruleset that covers the
+      versioned tags is reported ``"present"`` and one that does not (or no tag
+      ruleset at all) is reported ``"absent"``.
 
-    This never raises and never fails closed; the authoritative immutability
-    gate is the post-publish read-back. A read error is reported as
-    ``"unreadable"`` so a transient API failure cannot block a release here.
+    This never raises; a read error is reported as ``"unreadable"`` so a
+    transient API failure cannot block a release here. The authoritative tag
+    ruleset gate before a non-dry run is :func:`validate_tag_ruleset_present`.
     """
 
     report = {"immutable_releases": "unverifiable-pre-run", "tag_ruleset": "absent"}
     try:
-        tag_rulesets = client.list_rulesets(target="tag")
+        covered = tag_ruleset_covers_v_tags(client, tag_prefix=tag_prefix)
     except Exception:  # noqa: BLE001 - advisory read only; never block on it
         report["tag_ruleset"] = "unreadable"
         return report
-    report["tag_ruleset"] = "present" if tag_rulesets else "absent"
+    report["tag_ruleset"] = "present" if covered else "absent"
     return report
 
 

@@ -27,7 +27,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 # Third-party packages
-from _release_fakes import RecordingClient  # noqa: E402
+from _release_fakes import RecordingClient, apply_release_settings  # noqa: E402
 
 # Local modules
 from release import artifacts as artifacts_mod  # noqa: E402
@@ -470,9 +470,7 @@ class WaiverForwardedThroughCliTests(unittest.TestCase):
 
             client = RecordingClient()
             client.main_head = COMMIT
-            client.environments = {
-                "release": {"protection_rules": [{"type": "required_reviewers", "reviewers": [{"x": 1}]}]}
-            }
+            apply_release_settings(client)
             env = {
                 "GBAW_RELEASE_DRY_RUN": "false",
                 "GBAW_RELEASE_INPUT_DIR": str(input_dir),

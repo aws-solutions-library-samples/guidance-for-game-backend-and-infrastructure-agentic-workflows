@@ -294,9 +294,12 @@ class DispatchRefGuardContractTests(unittest.TestCase):
         # skipping every gated job and reporting green.
         guard = self.jobs.get("guard-ref", "")
         self.assertTrue(guard, "guard-ref job must exist")
+        # Multiline: a job-level `if:` is a 4-space-indented key anywhere in the
+        # block, not only at its first line, so the match must be anchored per
+        # line (re.M) or an `if:` after the first line would slip through.
         self.assertNotRegex(
             guard,
-            r"^\s{4}if:",
+            r"(?m)^\s{4}if:",
             msg="guard-ref must not carry a job-level if: or it could be skipped off-main",
         )
         self.assertRegex(
@@ -304,7 +307,65 @@ class DispatchRefGuardContractTests(unittest.TestCase):
             r"\$GBAW_DISPATCH_REF.{0,40}refs/heads/main|refs/heads/main.{0,40}\$GBAW_DISPATCH_REF",
             msg="guard-ref must compare the dispatch ref to refs/heads/main",
         )
+        # Pin the comparison DIRECTION: the guard must fail when the ref is NOT
+        # main (a `!=` test), so an inverted `=` test that passes off-main is
+        # rejected.
+        self.assertRegex(
+            guard,
+            r'\[\s*"\$GBAW_DISPATCH_REF"\s*!=\s*"refs/heads/main"\s*\]',
+            msg="guard-ref must fail when the ref is NOT refs/heads/main (a != test)",
+        )
         self.assertIn("exit 1", guard, "guard-ref must fail (exit 1) on a non-main dispatch ref")
+
+    def _guard_run_text(self) -> str:
+        """Return the exact ``run:`` body of the guard-ref step."""
+        block = self.jobs["guard-ref"]
+        lines = block.splitlines(keepends=True)
+        run_idx = None
+        run_indent = 0
+        for i, line in enumerate(lines):
+            m = re.match(r"^(\s*)run:\s*\|\s*$", line)
+            if m and "GBAW_DISPATCH_REF" in "".join(lines[i : i + 8]):
+                run_idx = i
+                run_indent = len(m.group(1))
+                break
+        assert run_idx is not None, "could not locate the guard-ref run: block"
+        body: list[str] = []
+        for line in lines[run_idx + 1 :]:
+            if line.strip() == "":
+                body.append("\n")
+                continue
+            if len(line) - len(line.lstrip(" ")) <= run_indent:
+                break
+            body.append(line)
+        # Standard library
+        import textwrap
+
+        return textwrap.dedent("".join(body))
+
+    def test_guard_ref_shell_passes_on_main_and_fails_off_main(self):
+        # Run the guard's real run: text under bash for a main ref and a
+        # non-main ref. main exits 0; a non-main ref exits 1 with an ::error::.
+        # An inverted comparison would pass off-main and fail here.
+        if shutil.which("bash") is None:
+            self.skipTest("bash is unavailable")
+        guard = self._guard_run_text()
+
+        def run(ref_value: str):
+            return subprocess.run(
+                ["bash", "-e", "-c", guard],
+                env={**os.environ, "GBAW_DISPATCH_REF": ref_value},
+                capture_output=True,
+                text=True,
+            )
+
+        on_main = run("refs/heads/main")
+        self.assertEqual(on_main.returncode, 0, msg=f"main ref must pass: {on_main.stdout!r} {on_main.stderr!r}")
+
+        for ref in ("refs/heads/feature/x", "refs/tags/v0.1.0", "refs/heads/mainish"):
+            off = run(ref)
+            self.assertEqual(off.returncode, 1, msg=f"non-main ref {ref!r} must fail: {off.stdout!r}")
+            self.assertIn("::error::", off.stdout, msg=f"non-main ref {ref!r} must print ::error::: {off.stdout!r}")
 
     def test_gated_jobs_depend_on_the_ref_guard(self):
         # validate depends on guard-ref directly; build-artifacts and publish
@@ -315,6 +376,22 @@ class DispatchRefGuardContractTests(unittest.TestCase):
             validate_block,
             r"needs:\s*\[.*guard-ref.*\]",
             msg="validate must depend on guard-ref",
+        )
+
+    def test_guard_ref_holds_no_token_scopes(self):
+        # The ref guard needs no permissions; it must declare empty permissions
+        # so a widened `permissions: write-all` (or any scope) is rejected.
+        guard = self.jobs.get("guard-ref", "")
+        self.assertRegex(
+            guard,
+            r"(?m)^\s{4}permissions:\s*\{\}\s*$",
+            msg="guard-ref must declare empty permissions",
+        )
+        self.assertNotRegex(guard, r"write-all", msg="guard-ref must not hold write-all")
+        self.assertNotRegex(
+            guard,
+            r"(?m)^\s{6}[a-z-]+:\s*write\b",
+            msg="guard-ref must hold no write scope",
         )
 
 

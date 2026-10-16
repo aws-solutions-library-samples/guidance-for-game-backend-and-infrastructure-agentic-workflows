@@ -39,8 +39,10 @@ class RecordingClient(GitHubClient):
         self.check_runs: dict[str, list[dict]] = {}  # name -> runs
         self.comments: dict[int, dict] = {}
         self.environments: dict[str, dict] = {}  # name -> environment payload
+        self.deployment_branch_policies: dict[str, list[dict]] = {}  # env name -> policies
         self.branch_rules: list[dict] = []  # GET /repos/{o}/{r}/rules/branches/{b}
         self.rulesets: list[dict] = []  # GET /repos/{o}/{r}/rulesets
+        self.ruleset_details: dict[int, dict] = {}  # ruleset id -> full ruleset with conditions
         self.collaborator_permissions: dict[str, str] = {}  # login -> permission
         # Post-publish read-back state. Uploaded assets are recorded per release
         # id; a published release reads back immutable by default so the happy
@@ -105,6 +107,21 @@ class RecordingClient(GitHubClient):
         if target is None:
             return rulesets
         return [r for r in rulesets if str(r.get("target", "")) == target]
+
+    def get_ruleset(self, ruleset_id: int):
+        self.calls.append(f"get_ruleset:{ruleset_id}")
+        detail = getattr(self, "ruleset_details", {}).get(ruleset_id)
+        if detail is not None:
+            return dict(detail)
+        # Fall back to the summary; a summary without conditions covers nothing.
+        for summary in getattr(self, "rulesets", []):
+            if summary.get("id") == ruleset_id:
+                return dict(summary)
+        raise KeyError(ruleset_id)
+
+    def list_deployment_branch_policies(self, name: str):
+        self.calls.append(f"list_deployment_branch_policies:{name}")
+        return [dict(p) for p in getattr(self, "deployment_branch_policies", {}).get(name, [])]
 
     def get_release(self, release_id: int):
         self.calls.append(f"get_release:{release_id}")
@@ -209,3 +226,55 @@ def completed_check(name: str, commit: str, conclusion="success", app_id=15368, 
         "app": {"id": app_id},
         "completed_at": completed_at,
     }
+
+
+def protected_environment(name: str = "release") -> dict:
+    """A fully policy-compliant environment payload.
+
+    Carries a required-reviewers rule with ``prevent_self_review: true`` and a
+    deployment branch policy that enables custom branch policies, so the
+    machine-checkable environment policy passes when paired with a ``main``-only
+    branch-policy list (see :func:`apply_release_settings`).
+    """
+
+    return {
+        "name": name,
+        "protection_rules": [
+            {
+                "id": 1,
+                "type": "required_reviewers",
+                "prevent_self_review": True,
+                "reviewers": [{"type": "User", "reviewer": {"login": "octo"}}],
+            }
+        ],
+        "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True},
+    }
+
+
+def covering_tag_ruleset(ruleset_id: int = 42) -> tuple[dict, dict]:
+    """Return (summary, detail) for an active tag ruleset that covers v* tags."""
+
+    summary = {"id": ruleset_id, "name": "protect v*", "target": "tag", "enforcement": "active"}
+    detail = {
+        "id": ruleset_id,
+        "name": "protect v*",
+        "target": "tag",
+        "enforcement": "active",
+        "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+    }
+    return summary, detail
+
+
+def apply_release_settings(client, *, environment_name: str = "release") -> None:
+    """Make ``client`` satisfy the full non-dry publish policy.
+
+    Sets a policy-compliant environment, a ``main``-only deployment branch
+    policy, and an active tag ruleset covering ``refs/tags/v*`` with readable
+    conditions, so a happy-path publish is not blocked by the fail-closed gates.
+    """
+
+    client.environments = {environment_name: protected_environment(environment_name)}
+    client.deployment_branch_policies = {environment_name: [{"id": 1, "name": "main"}]}
+    summary, detail = covering_tag_ruleset()
+    client.rulesets = [summary]
+    client.ruleset_details = {summary["id"]: detail}
