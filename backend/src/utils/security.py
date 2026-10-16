@@ -434,6 +434,50 @@ def classify_exception(exc: BaseException) -> str:
     return ERROR_PROVIDER_ERROR
 
 
+# Upper bound on the number of raise-site frames recorded on the production
+# error path. The innermost frames are the most useful for triage; bounding the
+# count keeps a deep or recursive stack from producing an unbounded log line.
+_MAX_TRACEBACK_FRAMES = 20
+
+
+def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBACK_FRAMES) -> list[str]:
+    """Return a bounded list of ``module:function:lineno`` raise-site frames.
+
+    Each frame contributes only three code-owned values: the dotted module name
+    (``frame.f_globals["__name__"]``, which carries no filesystem path), the
+    function name (``frame.f_code.co_name``), and the line number. The exception
+    message, local variable values, call arguments, and source text are never
+    read, so a provider- or caller-authored string cannot ride along. The module
+    name is passed through :func:`normalize_log_value` as a defensive measure in
+    case an exotic ``__name__`` holds a control character; it carries no CR/LF in
+    normal operation. The innermost ``limit`` frames are kept (the raise site and
+    its nearest callers), which is where triage starts.
+
+    Args:
+        exc: The exception whose traceback frames are summarized.
+        limit: Maximum number of frames to return, from the innermost outward.
+
+    Returns:
+        A list of ``module:function:lineno`` strings, innermost first. Empty when
+        the exception carries no traceback.
+    """
+    frames: list[str] = []
+    tb = exc.__traceback__
+    # Walk outermost-to-innermost, collecting a compact locus per frame, then
+    # reverse so the innermost (raise site) comes first and the bound keeps the
+    # frames closest to the failure.
+    while tb is not None:
+        frame = tb.tb_frame
+        module = frame.f_globals.get("__name__") or frame.f_code.co_filename.rsplit("/", 1)[-1]
+        function = frame.f_code.co_name
+        lineno = tb.tb_lineno
+        frames.append(f"{normalize_log_value(module)}:{function}:{lineno}")
+        tb = tb.tb_next
+    frames.reverse()
+    clamped = max(1, int(limit))
+    return frames[:clamped]
+
+
 def log_sanitized_exception(
     log: Any,
     message: str,
@@ -444,18 +488,22 @@ def log_sanitized_exception(
 ) -> None:
     """Log a bounded, non-sensitive record of an exception.
 
-    Only the exception class name, a typed sanitized error code, and (when
-    available) the request-correlation ID are logged. The raw exception message
-    is **never** emitted on the production path: a provider validation message or
+    The exception class name, a typed sanitized error code, the
+    request-correlation ID (when available), and a bounded list of raise-site
+    frames (``module:function:lineno``) are logged. The raw exception message is
+    **never** emitted on the production path: a provider validation message or
     SDK error body can quote caller-supplied values (prompts, actor/session IDs,
     namespaces) and may itself carry CR/LF that would forge a second log line.
-    The exception object is deliberately not attached, because Loguru's traceback
-    rendering serializes ``str(exc)`` into the sink — the exact disclosure this
-    function prevents.
+    The frame list carries only code-owned values — module name, function name,
+    and line number — and never the message, local variable values, or call
+    arguments, so it restores raise-site triage without reintroducing content.
+    The exception object is deliberately not attached on this path, because
+    Loguru's traceback rendering serializes ``str(exc)`` into the sink — the
+    exact disclosure this function prevents.
 
-    The full traceback is emitted only when debug logging is explicitly enabled
-    (``settings.ENABLE_DEBUG_LOGGING``), a dev-only switch; a caller may override
-    with ``debug_traceback`` for testing.
+    The full, framework-rendered traceback is emitted only when debug logging is
+    explicitly enabled (``settings.ENABLE_DEBUG_LOGGING``), a dev-only switch; a
+    caller may override with ``debug_traceback`` for testing.
 
     Args:
         log: A Loguru logger (or compatible) with ``bind`` and ``error``.
@@ -466,8 +514,9 @@ def log_sanitized_exception(
             server-generated) to tie the record to a request. When ``None``, the
             request ID bound for the current invocation is used so a swallowed
             error still correlates to its request.
-        debug_traceback: Force traceback on/off; defaults to the debug-logging
-            setting.
+        debug_traceback: Force the full rendered traceback on/off; defaults to
+            the debug-logging setting. The bounded frame locus is always
+            recorded regardless of this flag.
     """
     if debug_traceback is None:
         try:
@@ -500,9 +549,11 @@ def log_sanitized_exception(
     # human-readable stdout format (which renders {message}); also bind them as
     # structured extras for structured sinks. The class name is a Python type
     # name and the code is from a fixed vocabulary — neither carries caller or
-    # provider text.
-    composed = f"{message} [class={error_class} code={error_code} request_id={rid}]"
-    bound = log.bind(error_class=error_class, error_code=error_code, request_id=rid)
+    # provider text. The bounded raise-site frames are code-owned loci only.
+    frames = sanitized_traceback_frames(exc)
+    frames_text = " ".join(frames) if frames else "<none>"
+    composed = f"{message} [class={error_class} code={error_code} request_id={rid} frames={frames_text}]"
+    bound = log.bind(error_class=error_class, error_code=error_code, request_id=rid, frames=frames)
     # ``opt(depth=1)`` makes Loguru attribute the record to this helper's caller
     # (the error site in the orchestrator/specialist/entrypoint), not to this
     # helper, so ``{name}:{function}:{line}`` points back to the source.

@@ -199,6 +199,107 @@ def test_log_sanitized_exception_hides_message_keeps_class_and_code():
     assert len(output.strip().splitlines()) == 1  # no injected second line
 
 
+def test_sanitized_exception_logs_bounded_raise_site_frames():
+    """Red-green: the production error path records ``module:function:lineno``
+    raise-site frames so a plain bug (KeyError/TypeError) is triageable, while
+    still never emitting the message, locals, or a filesystem path.
+
+    This fails on a build that logs only ``[class=… code=… request_id=…]`` with
+    no frames, and passes once bounded frames are composed into the record.
+    """
+    # Local modules
+    from utils.security import log_sanitized_exception
+
+    def _inner_boom():
+        # A plain-bug exception whose message embeds a secret-shaped marker.
+        raise KeyError(f"missing {PROMPT_MARKER} for actor {SUBJECT_MARKER}")
+
+    def _outer_call():
+        _inner_boom()
+
+    try:
+        _outer_call()
+    except KeyError as exc:
+        with _CaptureSink() as buffer:
+            log_sanitized_exception(logger, "operation failed", exc, request_id="req-frames", debug_traceback=False)
+            output = buffer.getvalue()
+
+    # Raise-site loci are present as module:function:lineno for each frame.
+    assert "frames=" in output
+    assert f"{__name__}:_inner_boom:" in output
+    assert f"{__name__}:_outer_call:" in output
+    # The innermost frame is the actual raise site (KeyError in _inner_boom).
+    assert "_inner_boom" in output
+
+    # The secret-shaped message content is never emitted, even though the
+    # exception carried it and the frame list references the raising function.
+    assert PROMPT_MARKER not in output
+    assert SUBJECT_MARKER not in output
+    assert "missing" not in output  # no slice of the exception message
+
+    # No filesystem path leaks: only the dotted module name, not a .py path or
+    # an absolute directory, reaches the sink.
+    assert ".py" not in output
+    assert "/" not in output.split("frames=")[1]
+
+    # Still a single line (no injected second line, no rendered traceback block).
+    assert len(output.strip().splitlines()) == 1
+    assert "Traceback (most recent call last)" not in output
+
+
+def test_sanitized_traceback_frames_are_bounded_and_content_free():
+    """The frame helper caps the number of frames and never reads the message.
+
+    A deeply recursive stack must not produce an unbounded line, and the frames
+    must carry only ``module:function:lineno`` loci — a secret-shaped marker in
+    the exception message must not appear in any frame.
+    """
+    # Local modules
+    from utils.security import _MAX_TRACEBACK_FRAMES, sanitized_traceback_frames
+
+    def _recurse(n):
+        if n <= 0:
+            raise ValueError(f"deep failure carrying {PROMPT_MARKER}")
+        _recurse(n - 1)
+
+    try:
+        _recurse(_MAX_TRACEBACK_FRAMES + 25)
+    except ValueError as exc:
+        frames = sanitized_traceback_frames(exc)
+
+    # Bounded: the recursion is far deeper than the cap, yet the list is clamped.
+    assert 0 < len(frames) <= _MAX_TRACEBACK_FRAMES
+    # Each frame is a module:function:lineno locus; none carries message content.
+    for frame in frames:
+        assert frame.count(":") >= 2
+        assert PROMPT_MARKER not in frame
+    # The innermost frame (raise site) is kept.
+    assert any(":_recurse:" in frame for frame in frames)
+
+
+def test_sanitized_exception_debug_mode_still_renders_full_traceback():
+    """Debug mode is unchanged: it still attaches the exception so the framework
+    renders the full traceback, in addition to the bounded frame loci."""
+    # Local modules
+    from utils.security import log_sanitized_exception
+
+    def _boom():
+        raise RuntimeError("debug-mode marker")
+
+    try:
+        _boom()
+    except RuntimeError as exc:
+        with _CaptureSink() as buffer:
+            log_sanitized_exception(logger, "operation failed", exc, request_id="req-dbg", debug_traceback=True)
+            output = buffer.getvalue()
+
+    # Debug attaches the exception, so the rendered traceback block is present.
+    assert "Traceback (most recent call last)" in output
+    assert "RuntimeError" in output
+    # The bounded frame loci are present regardless of debug mode.
+    assert "frames=" in output
+
+
 # ---------------------------------------------------------------------------
 # agentcore_main invocation path
 # ---------------------------------------------------------------------------
