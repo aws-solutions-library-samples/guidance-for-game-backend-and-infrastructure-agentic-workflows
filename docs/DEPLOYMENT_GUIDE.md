@@ -239,7 +239,7 @@ For the deployment smoke test, send one off-topic request expected to activate t
 
 Run this once, as the operator who deploys the upgrade to the pseudonymous memory actor ID, after the update has fully rolled out, from an operator or administrator session that has AgentCore Memory data-plane permissions. Do not run it from the chat runtime: the runtime role has no record-delete permission by design (`infrastructure/cloudformation/01-base-infrastructure.yaml` grants memory record read and write but no delete), and that boundary stays in place. The shell blocks below are bash; see the Windows note for the PowerShell form.
 
-**Operator permissions.** The session needs `bedrock-agentcore:ListMemoryRecords`, `bedrock-agentcore:BatchDeleteMemoryRecords`, and `bedrock-agentcore:DeleteMemoryRecord` for the record cleanup (Steps 1–3), and additionally `bedrock-agentcore:ListActors`, `bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`, and `bedrock-agentcore:DeleteEvent` for the optional short-term-event cleanup (Step 4), on the memory resource.
+**Operator permissions.** The session needs `bedrock-agentcore:ListMemoryRecords`, `bedrock-agentcore:BatchDeleteMemoryRecords`, and `bedrock-agentcore:DeleteMemoryRecord` for the record cleanup (Steps 1–3), and additionally `bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`, and `bedrock-agentcore:DeleteEvent` for the optional short-term-event cleanup (Step 4), on the memory resource.
 
 **Run after the rollout completes.** Old runtime sessions keep writing raw-subject events and records until they end, so a cleanup run while the previous version is still serving will leave fresh orphans behind. Wait until the digest-based runtime has fully replaced the old one before starting.
 
@@ -254,7 +254,7 @@ The actor ID the runtime now uses and the records left behind differ by the shap
 | New actor ID (keep) | 64 lowercase hex characters | `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` |
 | Old actor ID (clean up) | an actor the current runtime does not write: a raw Cognito subject (a 36-character UUID), `anonymous`, or a test actor | `a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6` |
 
-The current runtime only ever writes 64-character lowercase hex digests, so any namespace that is not one is left over from a runtime that did not use this scheme. Cognito subjects are 36-character UUIDs and contain hyphens, which a hex digest never does. (The hosted subject pattern `[A-Za-z0-9][A-Za-z0-9._:-]{2,127}` does admit a 64-hex-shaped string, so the hyphen is what makes real subjects distinguishable; the classifier below keeps any namespace that is not a 64-hex digest, so a borderline all-hex value is kept rather than deleted.)
+The current runtime only writes 64-character lowercase hex digests, so any namespace that is not one is a cleanup candidate. Cognito subjects are 36-character UUIDs with hyphens, which a digest never contains, so a real subject is never mistaken for a digest. The hosted subject pattern `[A-Za-z0-9][A-Za-z0-9._:-]{2,127}` would also admit a 64-character hex string; Step 1 treats such a value as a digest and leaves its records in place, which is the safe direction.
 
 Set your resource and region first. The memory ID is the one the runtime uses (`BEDROCK_AGENTCORE_MEMORY_ID`); the AgentCore CLI names it after the runtime with a short random suffix, for example `gameagentruntime_mem-0a1b2c3d4e`.
 
@@ -267,17 +267,27 @@ export AWS_PROFILE='<operator-profile>'              # an operator/administrator
 **Step 1 — Dry run: discover the old namespaces from the records themselves.** This only lists; it deletes nothing. `list-actors` reports only actors that still have unexpired events, so it misses users whose events have aged out while their long-term records remain. Instead, enumerate records directly. `--namespace` is a prefix filter, so list every one-character prefix (`0`-`9`, `a`-`z`, `A`-`Z`), print each record's namespace and ID, and keep the namespaces that are not a 64-hex digest.
 
 ```bash
-# List one record page per single-character namespace prefix, as "<namespace>\t<recordId>"
+# Write the working file outside the checkout so raw subjects do not land next to
+# tracked content; delete it when you are done.
+RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-records.XXXXXX")"
+
+# List every record under each single-character namespace prefix (the CLI follows
+# pagination), one "<namespace>\t<recordId>" row per record. A failed listing
+# aborts before any delete so discovery is never silently incomplete.
 for p in {0..9} {a..z} {A..Z}; do
   aws bedrock-agentcore list-memory-records \
     --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
     --namespace "$p" \
-    --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text
-done > memory-records.txt
+    --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text \
+    || { echo "listing failed for prefix $p; discovery is incomplete" >&2; exit 1; }
+done > "$RECORDS_FILE"
 
 # The old namespaces: first column is not a 64-hex digest. Cognito subjects contain
 # "-"; digests never do. This keeps raw subjects, "anonymous", and test actors.
-cut -f1 memory-records.txt | sort -u | grep -vE '^[0-9a-f]{64}$'
+cut -f1 "$RECORDS_FILE" | sort -u | grep -vE '^[0-9a-f]{64}$'
+
+# When finished with discovery, remove the working file:
+#   rm -f "$RECORDS_FILE"
 ```
 
 **Step 2 — Dry run: list the records under one old namespace, with their details.** Pick one old namespace from Step 1. List its records by **exact** namespace match (`--namespace` is a prefix filter, so a bare prefix would also match current digest namespaces that happen to share the prefix). Show `namespaces[0]` and `createdAt` so you can confirm what matched. This only lists.
@@ -298,7 +308,10 @@ Confirm these are records you intend to remove, and that every `namespaces[0]` e
 
 ```bash
 # Collect the record IDs for the exact OLD_ACTOR namespace into an array
-mapfile -t RECORD_IDS < <(aws bedrock-agentcore list-memory-records \
+RECORD_IDS=()
+while IFS= read -r id; do
+  [ -n "$id" ] && RECORD_IDS+=("$id")
+done < <(aws bedrock-agentcore list-memory-records \
   --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
   --namespace "$OLD_ACTOR" \
   --query "memoryRecordSummaries[?namespaces[0]=='$OLD_ACTOR'].memoryRecordId" \
@@ -338,14 +351,28 @@ aws bedrock-agentcore delete-event \
   --event-id '<event-id>' --region "$AWS_REGION"
 ```
 
-**Verify.** Re-run Step 1's discovery and Step 2 for each old namespace; both should return no records. The verification reads records only — it does not depend on `list-actors`, whose results drop out as events expire. New 64-hex actors and their records are left untouched.
+**Verify.** Re-run Step 1; its last command should print nothing. For each namespace you deleted, Step 2 should print no rows. Both read records only, so neither depends on `list-actors`, whose results drop out as events expire. New 64-hex actors and their records are left untouched.
 
-**Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but the ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are plain bash with no PowerShell wrapper, and the module exposes no memory-cleanup command. The same AWS CLI v2 operations and parameters work from PowerShell 7+; the following is the discover-and-delete flow for one old namespace. PowerShell uses backtick line continuations and `$env:` for process variables, and splits the tab-separated text output explicitly:
+**Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but the ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are plain bash with no PowerShell wrapper, and the module exposes no memory-cleanup command. The same AWS CLI v2 operations and parameters work from PowerShell 7+; the following is the discover-and-delete flow for one old namespace, matching the bash Steps 1–3. PowerShell uses backtick line continuations and `$env:` for process variables, and splits the tab-separated text output explicitly. Matching and sorting use `-cnotmatch`, `-CaseSensitive`, and `@(...)` so a single record is not unrolled to a scalar:
 
 ```powershell
 $env:AWS_REGION = 'us-west-2'
+$env:AWS_PROFILE = '<operator-profile>'              # an operator/administrator profile
 $MemoryId = 'gameagentruntime_mem-0a1b2c3d4e'   # synthetic; use your resource ID
-$OldActor = 'a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # one old namespace
+
+# Discovery: list every one-character namespace prefix, keep namespaces that are
+# not a 64-hex digest (raw subjects, "anonymous", test actors).
+$rows = foreach ($p in [char[]]'0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+  aws bedrock-agentcore list-memory-records `
+    --memory-id $MemoryId --region $env:AWS_REGION `
+    --namespace "$p" `
+    --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text
+}
+$rows | ForEach-Object { ($_ -split "`t")[0] } |
+  Sort-Object -Unique -CaseSensitive |
+  Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }
+
+$OldActor = 'a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # one old namespace from discovery
 
 # Dry run: records under the exact old namespace
 aws bedrock-agentcore list-memory-records `
@@ -354,12 +381,13 @@ aws bedrock-agentcore list-memory-records `
   --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].[namespaces[0],memoryRecordId,createdAt]" `
   --output text
 
-# Collect the IDs for the exact namespace, then delete in batches of at most 100
-$recordIds = (aws bedrock-agentcore list-memory-records `
+# Collect the IDs for the exact namespace, then delete in batches of at most 100.
+# @(...) keeps a single ID as a one-element array rather than a scalar string.
+$recordIds = @((aws bedrock-agentcore list-memory-records `
   --memory-id $MemoryId --region $env:AWS_REGION `
   --namespace $OldActor `
   --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].memoryRecordId" `
-  --output text) -split '\s+' | Where-Object { $_ }
+  --output text) -split '\s+' | Where-Object { $_ })
 
 for ($i = 0; $i -lt $recordIds.Count; $i += 100) {
   $chunk = $recordIds[$i..([Math]::Min($i + 99, $recordIds.Count - 1))]
