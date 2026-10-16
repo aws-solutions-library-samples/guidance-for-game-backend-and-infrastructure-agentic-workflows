@@ -51,7 +51,8 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
   The default path reads the current trace destination, detects whether the
   account already supports Transaction Search (destination `CloudWatchLogs` and
   `aws/spans` present), and if it does not, prints an actionable warning —
-  recommending the opt-in only when `aws/spans` already exists, and otherwise the
+  recommending the opt-in only when `aws/spans` already exists and the
+  destination was read, and otherwise the
   one-time console or destination-toggle step — without failing the deploy for
   that reason alone. (`agentcore launch` runs its
   own Transaction Search setup independently of this opt-in; see "Ownership and

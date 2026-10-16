@@ -15,8 +15,9 @@ Before you begin, ensure you have the following installed and configured:
 | **UV** | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **Docker** | Latest | [Install Guide](https://docs.docker.com/get-docker/) |
 | **yq** | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
+| **python3** | 3.8+ | [Download](https://www.python.org/downloads/) |
 
-**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`).
+**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`). UV does not add a `python3` to `PATH`, so a standalone Python 3 is still required: the deployment scripts call `python3` directly to parse AWS CLI responses in the account-observability steps.
 
 **Windows users:** Native PowerShell deployment scripts are available in `scripts/powershell/`. See [scripts/powershell/README.md](../scripts/powershell/README.md) for setup and usage. Requires PowerShell 7.0+ and AWS CLI v2 — no WSL2 or Linux environment needed.
 
@@ -206,10 +207,10 @@ account.
 account-wide Transaction Search settings changes. They read the current trace
 destination, detect whether the account already supports what the runtime needs,
 and — if it does not — print an actionable warning. That warning recommends the
-opt-in only when the AWS-reserved `aws/spans` log group already exists (so the
-opt-in can finish the job); otherwise it points to the one-time console enable or
-a destination toggle keyed on the current destination, because the opt-in cannot
-create that group. A default deployment is **not** failed for a missing account
+opt-in only when the AWS-reserved `aws/spans` log group already exists and the
+destination was read (so the opt-in can finish the job); otherwise it points to
+the one-time console enable or a destination toggle keyed on the current
+destination, because the opt-in cannot create that group. A default deployment is **not** failed for a missing account
 configuration; the per-runtime trace delivery is still created and verified.
 
 > **Residual not controlled by this opt-in.** `agentcore launch` — which the
@@ -258,9 +259,10 @@ or a destination toggle does), the opt-in **fails** — with the one-time consol
 or toggle step — rather than reporting success when `aws/spans` is still absent
 after the enable. On a fresh account whose destination starts at `XRay`, the
 opt-in has by then already written the shared resource policy and switched the
-trace destination to `CloudWatchLogs`; those changes stay in place (the
-destination rollback command was printed earlier in the run), and only the
-console or a destination toggle creates `aws/spans`. If it cannot read the
+trace destination to `CloudWatchLogs` (and, if you set
+`GBAW_XRAY_DEFAULT_INDEXING_PERCENT`, changed the `Default` indexing rule); those
+changes stay in place (the destination rollback command was printed earlier in
+the run), and only the console or a destination toggle creates `aws/spans`. If it cannot read the
 current trace destination, the opt-in refuses to change it and fails rather than
 guessing. The
 account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
