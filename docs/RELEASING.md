@@ -246,12 +246,12 @@ prove the server rejected the write, so a release whose publish PATCH was
 applied server-side and then answered with an error is reported as a **published
 release left intact** rather than deleted — cleanup never deletes a published
 release. On the cancel path, cleanup never leaves a stable-looking tag it had
-time to remove. (One caveat: if the `v*` tag ruleset carries a `deletion` rule
-and this workflow's identity is not a bypass actor, deleting `refs/tags/<tag>`
-is itself refused, so cleanup reports the ref as left intact for manual
-recovery. Restrict release tags with an `update` rule only, which leaves this
-workflow's create and cleanup writes alone, so cleanup can remove the ref — see
-"Recommended maintainer settings".)
+time to remove. (One caveat: if any ruleset covering `refs/tags/<tag>` carries
+a `deletion` rule and this workflow's identity is not a bypass actor, deleting
+`refs/tags/<tag>` is itself refused, so cleanup reports the ref as left intact
+for manual recovery. Restrict release tags with an `update` rule only, which
+leaves this workflow's create and cleanup writes alone, so cleanup can remove
+the ref — see "Recommended maintainer settings".)
 
 ### Manual recovery
 
@@ -287,10 +287,12 @@ To recover whatever remains:
 2. If a **published** release exists for the tag, the publish PATCH succeeded.
    A run that exited without a `post-publish read-back` error is NOT, on its
    own, proof the release met the guarantee: a PATCH that GitHub applied but
-   answered with an error, a read-back whose reads kept failing, and a run
-   cancelled during the read-back all exit without that error and without a
-   completed read-back, and in the first case the release can still be
-   **mutable**. So confirm it by hand rather than trusting the absence of an
+   answered with an error, and a run cancelled during the read-back, both exit
+   without that error and without a completed read-back, and in the first case
+   the release can still be **mutable**. (A read-back whose reads kept failing
+   does fail with a `post-publish read-back` error — the failed read is
+   collected as an entry — so it is covered by the last paragraph of this step,
+   not here.) So confirm it by hand rather than trusting the absence of an
    error:
    - `immutable: true` on the release (`gh release view <tag> --json` or the
      REST `GET /releases/{id}`);
@@ -305,9 +307,10 @@ To recover whatever remains:
    intact), go straight to that section — it names every check that failed.
 3. If only a **draft** release or an orphaned tag ref remains, delete the tag
    ref first (if it still points at the run's tag object), then delete the
-   draft, then re-dispatch. If the `v*` tag ruleset carries a `deletion` rule
-   and your identity is not a bypass actor, deleting the ref is refused, so
-   bypass the ruleset (or temporarily relax it) to remove the orphaned ref.
+   draft, then re-dispatch. If any ruleset covering `refs/tags/<tag>` carries a
+   `deletion` rule and your identity is not a bypass actor, deleting the ref is
+   refused, so bypass the ruleset (or temporarily relax it) to remove the
+   orphaned ref.
    With GitHub immutable releases enabled, a deleted release's tag name cannot
    be reused, so pick the next tag if the name was
    burned.
@@ -420,9 +423,9 @@ them, with the existing `GITHUB_TOKEN`, is:
   (for example `refs/tags/v0.*`, or `v*` minus a `v*-rc.*` exclude) does not pass
   for a tag it does not protect. GitHub does **not** support a backslash as a
   quoting character or a `[^...]` complement in ruleset patterns; the matcher
-  follows Ruby's `File.fnmatch` for those forms (a backslash escapes the next
-  character and `[^...]` is a complement), so the two never diverge for the
-  patterns GitHub does support. A matching ruleset counts only when it also
+  treats a backslash **outside** a bracket set as an escape of the next
+  character and honors `[^...]` as a complement, which covers GitHub's supported
+  patterns (those use neither). A matching ruleset counts only when it also
   carries at least one `creation`, `update`, or `deletion` rule.
 
   Which rule type to use matters, because the publish job writes the tag ref
@@ -516,13 +519,16 @@ environments; the guarantees in this document depend on these being set:
   already has. A **`creation`** rule (restricting who may create a matching
   tag) or a **`deletion`** rule (restricting who may delete one, GitHub's
   default) would block this workflow's own writes — it creates `refs/tags/<tag>`
-  and deletes it during cleanup. GitHub does not document the Actions identity
-  behind `GITHUB_TOKEN` as an eligible bypass actor, so the publish job fails
-  closed before the draft if any covering ruleset carries `creation` or
-  `deletion` and its `current_user_can_bypass` is not a bypass value for the
-  workflow token. GitHub aggregates every covering ruleset, so a second covering
-  `creation`/`deletion` ruleset (for example an organization or enterprise
-  `~ALL` ruleset) is caught too.
+  and deletes it during cleanup. The publish job fails closed before the draft
+  if any covering ruleset carries `creation` or `deletion` and its
+  `current_user_can_bypass` is not a bypass value for the workflow token. GitHub
+  does not document the Actions identity behind `GITHUB_TOKEN` as an eligible
+  bypass actor, so that value is normally not a bypass and an `update` rule is
+  the setup that works with the token this workflow already has. GitHub
+  aggregates every covering ruleset, so a second covering `creation`/`deletion`
+  ruleset (for example an organization or enterprise `~ALL` ruleset) is caught
+  too; the refusal names the blocking ruleset so a maintainer can exclude the
+  release tags from it or ask its owner when it is one they cannot edit.
 - The **`release` environment** (used by the publish job) with **required
   reviewers**, **prevent self-review** enabled, and **administrators not allowed
   to bypass** the protection rule, plus a **deployment branch rule limiting the
