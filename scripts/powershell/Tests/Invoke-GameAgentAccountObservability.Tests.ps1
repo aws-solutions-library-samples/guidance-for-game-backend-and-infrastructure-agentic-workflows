@@ -245,4 +245,41 @@ Describe 'Invoke-GameAgentAccountObservability' {
         } | Should -Throw '*maximum of 10*'
         $mutations | Should -Not -Contain 'logs put-resource-policy'
     }
+
+    It 'Opt-in fails closed when aws/spans is still absent after a first-time enable' {
+        # A first-time API enable (destination XRay -> CloudWatchLogs) does not
+        # create the AWS-reserved aws/spans log group (issue #457). The opt-in
+        # enables additively and never toggles, so a still-absent group must fail
+        # with the one-time manual step, not report success.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
+        {
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
+        } | Should -Throw "*'aws/spans' log group does not exist*"
+        $mutations | Should -Contain 'xray update-trace-segment-destination'
+    }
+
+    It 'Opt-in completes when aws/spans is present after the enable' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
+        $mutations | Should -Contain 'xray update-trace-segment-destination'
+        ($script:StatusMessages -join ' ') | Should -Match 'configured \(opt-in\)'
+    }
+
+    It 'ReportOnly reports active without mutating when Transaction Search is set up' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
+        $mutations | Should -Not -Contain 'logs put-resource-policy'
+    }
+
+    It 'ReportOnly warns without mutating or throwing when aws/spans is absent' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $false -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
+        ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+    }
 }

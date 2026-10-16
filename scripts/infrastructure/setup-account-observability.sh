@@ -17,12 +17,17 @@ set -euo pipefail
 # runtime needs, and prints the opt-in instruction if it does not — WITHOUT
 # failing the deployment for that reason alone.
 #
-# BACKGROUND: The AgentCore CLI enables Transaction Search via API during
-# `agentcore launch`, but the API path does not always create the internal
-# 'aws/spans' log group that X-Ray needs. Enabling Transaction Search (or
-# toggling it) through the account-observability path creates it. The runtime
-# trace delivery (traces source -> X-Ray destination) is handled separately and
-# verified in scripts/deploy.sh (Step 2b).
+# BACKGROUND: X-Ray Transaction Search writes spans to the AWS-reserved
+# 'aws/spans' log group. A first-time API enable of Transaction Search
+# (destination -> CloudWatchLogs) does NOT create that log group; it is created
+# only by enabling Transaction Search in the AWS console or by a disable ->
+# re-enable toggle of the shared destination. This script enables Transaction
+# Search additively and never toggles the shared destination, so when the
+# account starts from destination 'XRay' the opt-in cannot create 'aws/spans'
+# on its own. The opt-in therefore fails (rather than exiting 0) when 'aws/spans'
+# is still absent after the enable, and prints the console / toggle steps the
+# operator must run once. The runtime trace delivery (traces source -> X-Ray
+# destination) is handled separately and verified in scripts/deploy.sh (Step 2b).
 # See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
 
 AWS_REGION="${AWS_REGION:-us-west-2}"
@@ -462,19 +467,65 @@ configure_account_observability() {
     return 1
   fi
 
+  # 'aws/spans' is AWS-reserved: a first-time API enable does not create it (see
+  # the file header and issue #457). An additive, no-toggle enable therefore
+  # cannot create it when the account started from destination 'XRay', so a
+  # missing group here is a hard failure with the one-time manual step, not a
+  # soft warning that lets the deploy report success it did not achieve.
   if spans_log_group_exists; then
     echo "  ✅ 'aws/spans' log group present"
   else
-    echo "  ⚠️  'aws/spans' log group not visible yet. It is created by AWS shortly after"
-    echo "      Transaction Search is enabled; if traces do not appear, enable Transaction"
-    echo "      Search once via the AWS console."
+    echo "❌ Transaction Search is enabled (destination CloudWatchLogs) but the" >&2
+    echo "   AWS-reserved 'aws/spans' log group does not exist. A first-time API" >&2
+    echo "   enable does not create it; create it once with EITHER:" >&2
+    echo "     - the AWS X-Ray / CloudWatch console (enable Transaction Search), OR" >&2
+    echo "     - a one-time destination toggle:" >&2
+    echo "         aws xray update-trace-segment-destination --destination XRay --region ${AWS_REGION}" >&2
+    echo "         # wait for Status ACTIVE, then:" >&2
+    echo "         aws xray update-trace-segment-destination --destination CloudWatchLogs --region ${AWS_REGION}" >&2
+    echo "   Then re-run the deployment. Spans cannot flow until 'aws/spans' exists." >&2
+    return 1
   fi
 
   echo ""
   echo "✅ Account-wide observability configured (opt-in)"
 }
 
+# --- Read-only post-launch recheck (safe in every mode) ---
+
+# Report, without mutating anything, whether the account currently supports
+# Transaction Search for the runtime. Intended to run AFTER `agentcore launch`,
+# which performs its own Transaction Search enable: this surfaces a destination
+# that is not CloudWatchLogs or a missing 'aws/spans' log group so a deploy does
+# not silently finish with no spans flowing. Always returns 0 (non-blocking).
+report_transaction_search_state() {
+  local destination
+  destination="$(get_trace_destination)"
+  echo "  🔎 X-Ray trace segment destination: ${destination}"
+  if [ "$destination" = "CloudWatchLogs" ] && spans_log_group_exists; then
+    echo "  ✅ Transaction Search is active (destination CloudWatchLogs, 'aws/spans' present)."
+    return 0
+  fi
+  echo "  ⚠️  Transaction Search does not yet appear active for the runtime."
+  if [ "$destination" != "CloudWatchLogs" ]; then
+    echo "      Trace destination is '${destination}', not 'CloudWatchLogs'."
+  else
+    echo "      The AWS-reserved 'aws/spans' log group is not present."
+  fi
+  echo "      Spans will not flow until destination is 'CloudWatchLogs' and 'aws/spans' exists."
+  echo "      Enable Transaction Search once in the AWS X-Ray / CloudWatch console, or opt in"
+  echo "      with GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true, then re-run the deployment."
+  return 0
+}
+
 main() {
+  # A single argument selects the post-launch read-only recheck; with no
+  # argument the script runs the default/opt-in account-observability setup.
+  if [ "${1:-}" = "report-transaction-search" ]; then
+    echo "🔍 Post-launch Transaction Search recheck (region ${AWS_REGION})..."
+    report_transaction_search_state
+    return 0
+  fi
   echo "🔍 Account-wide observability (region ${AWS_REGION})..."
   if [ "$GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY" = "true" ]; then
     configure_account_observability
@@ -485,5 +536,5 @@ main() {
 
 # Only run main when executed directly, so tests can source the functions.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-  main
+  main "$@"
 fi

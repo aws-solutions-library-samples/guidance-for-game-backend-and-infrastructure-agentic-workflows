@@ -345,6 +345,15 @@ function Deploy-GameAgent {
             @deliveryRetryArgs
         Write-GameAgentStatus 'Runtime traces delivery configured' -Type Success
         Write-Host ''
+
+        # ── Step 2c: Post-launch Transaction Search recheck (read-only) ──
+        # agentcore launch performs its own Transaction Search enable, which a
+        # first-time API enable does not complete on its own ('aws/spans' is
+        # created only by the console or a destination toggle). This read-only
+        # recheck reports whether spans can flow; it never mutates or fails.
+        Write-GameAgentStatus 'Step 2c: Rechecking Transaction Search state...' -Type Info
+        Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ReportOnly
+        Write-Host ''
     } finally { Pop-Location }
 
     # ── Step 3: Observability stack ──

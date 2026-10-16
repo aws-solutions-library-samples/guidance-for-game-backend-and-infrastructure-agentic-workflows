@@ -748,3 +748,97 @@ def test_account_obs_optin_proceeds_when_identity_lookup_warns_on_stderr(shell):
     assert "identity lookup returned no account ID" not in result.stderr
     assert "MUTATION: logs put-resource-policy" in result.stdout
     assert '"aws:SourceAccount": "123456789012"' in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Account-wide observability opt-in: a first-time enable cannot create the
+# AWS-reserved 'aws/spans' log group, so the opt-in must fail closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_fails_when_spans_absent_after_enable(shell):
+    """A first-time API enable (destination XRay -> CloudWatchLogs) does not
+    create the AWS-reserved 'aws/spans' log group (issue #457). The opt-in
+    enables additively and never toggles, so when 'aws/spans' is still absent
+    after the enable it must fail with the one-time manual step, not exit 0 with
+    a soft warning that reports success it did not achieve.
+    """
+    result = _account_obs_harness("true", _obs_mock(destination="XRay", spans=False), shell=shell)
+    assert "rc=1" in result.stdout
+    # The destination enable still happens, but the run fails on the missing group.
+    assert "MUTATION: xray update-trace-segment-destination" in result.stdout
+    assert "'aws/spans' log group does not exist" in result.stderr
+    # The one-time remediation names both the console and the toggle path.
+    assert "update-trace-segment-destination --destination XRay" in result.stderr
+    assert "Account-wide observability configured" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_succeeds_when_spans_present_after_enable(shell):
+    """When 'aws/spans' is already present, the opt-in completes and reports
+    success (the existing additive, state-preserving behavior is unchanged)."""
+    result = _account_obs_harness("true", _obs_mock(destination="XRay", spans=True), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "'aws/spans' log group present" in result.stdout
+    assert "Account-wide observability configured" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Post-launch Transaction Search recheck (read-only, non-blocking)
+# ---------------------------------------------------------------------------
+
+
+def _recheck_harness(aws_mock: str, shell: str = "bash") -> "subprocess.CompletedProcess[str]":
+    """Run the script's read-only 'report-transaction-search' mode."""
+    command = "\n".join(
+        (
+            'export AWS_REGION="us-west-2"',
+            'MUTATION_LOG="$(mktemp)"; export MUTATION_LOG',
+            aws_mock,
+            "export -f aws",
+            f'{shell} "{ACCOUNT_OBS_SCRIPT}" report-transaction-search; echo "rc=$?"',
+            'echo "MUTATIONS:"; cat "$MUTATION_LOG"; rm -f "$MUTATION_LOG"',
+        )
+    )
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+def _recheck_mock(*, destination: str = "CloudWatchLogs", spans: bool = True) -> str:
+    spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    return (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        f'    echo "{destination}"; return 0; fi\n'
+        f'  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{spans_json}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_reports_active_without_mutation(shell):
+    result = _recheck_harness(_recheck_mock(destination="CloudWatchLogs", spans=True), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "Transaction Search is active" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_warns_when_spans_absent_without_mutation_or_failure(shell):
+    """After launch, a missing 'aws/spans' is surfaced as a non-blocking WARN;
+    the recheck never mutates account state and never fails the deploy."""
+    result = _recheck_harness(_recheck_mock(destination="CloudWatchLogs", spans=False), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "'aws/spans' log group is not present" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_warns_when_destination_not_cloudwatchlogs(shell):
+    result = _recheck_harness(_recheck_mock(destination="XRay", spans=False), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "not 'CloudWatchLogs'" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
