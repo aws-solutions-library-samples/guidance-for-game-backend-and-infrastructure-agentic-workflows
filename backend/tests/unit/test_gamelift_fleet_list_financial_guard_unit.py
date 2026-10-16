@@ -20,14 +20,13 @@ The listing is rendered two ways, both drawn from the deployed envelope: a table
 and a bullet layout in the GameLift prompt's own style (``## headers``,
 ``**bold**``, bullet points). The guard must keep both.
 
-The guard is keyed on value-language next to financial labels, not on bare
-numbers, so the tests also prove it is not vacuous: a money-shaped billing
-figure trips it, and a billing label glued to a bare count on one line is
-withheld. The envelope carries the container ``BillingType`` enum
-(``ON_DEMAND``/``SPOT``) and typed signal codes (``access_denied``,
-``throttled``) sourced from ``agents.gamelift_projections``; it never carries a
-currency amount or provider phrasing such as "rate exceeded", which is why a
-faithful rendering stays clean.
+Bare numbers do not trip the guard, but a financial label next to a number does,
+so the tests also prove it is not vacuous: a dollar amount on a billing line
+trips it, and so does ``Billing: 999``. The envelope carries the container
+``BillingType`` enum (``ON_DEMAND``/``SPOT``) and typed signal codes
+(``access_denied``, ``throttled``) sourced from ``agents.gamelift_projections``;
+it never carries a currency amount or provider phrasing such as "rate exceeded",
+which is why a faithful rendering stays clean.
 """
 
 # Standard library
@@ -280,8 +279,8 @@ def _render_degraded_markdown(result: dict[str, Any]) -> str:
     """Render a degraded listing, relaying the status and the typed code faithfully.
 
     A throttled partial listing carries no top-level ``error`` key; its typed
-    code lives in ``Warnings[].Code``. The relay therefore reads the code from
-    the warnings, not from ``error.code``.
+    code lives in ``Warnings[].Code``. The relay uses ``error.code`` when present
+    and otherwise the first ``Warnings[].Code``.
     """
     status = result["status"]
     error_code = result.get("error", {}).get("code")
@@ -352,7 +351,7 @@ class TestFleetListingSurvivesFinancialGuard:
 
         This proves the passing assertions above are meaningful: the guard does
         fire for a currency amount next to a billing label, and for a billing
-        label glued to a bare count on one line, so a clean pass is a property
+        label glued to a bare number on one line, so a clean pass is a property
         of the rendering, not of an inert guard. The single-line form is why the
         renderings keep billing in a table column or on its own bullet.
         """

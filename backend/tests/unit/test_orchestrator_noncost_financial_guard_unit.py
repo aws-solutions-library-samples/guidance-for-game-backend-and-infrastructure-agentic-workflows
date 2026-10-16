@@ -5,8 +5,7 @@ the model's own prose: if the routing model volunteers an unvalidated monetary
 figure for a query the classifier did not treat as a cost topic, that figure
 must not escape. The call site is the ``elif
 contains_unvalidated_financial_content(str(response))`` branch in
-``run_orchestrator``; deleting it leaves the whole unit suite otherwise green,
-so this test pins that branch directly.
+``run_orchestrator``, and this module drives that branch directly.
 
 The project autouse fixture replaces the ``agents.orchestrator.run_orchestrator``
 module attribute with a mock, so a test that calls it through the module reaches
@@ -17,7 +16,7 @@ patch of the module attribute does not rebind.
 
 # Standard library
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 # Third-party packages
 import pytest
@@ -42,9 +41,15 @@ class _FakeAgent:
 
 def _run_with_model_response(query: str, response: str) -> str:
     agent = _FakeAgent(response)
+    # Patch the model factories so the orchestrator does not build a real
+    # ``BedrockModel`` (which would resolve the ambient AWS profile and fail
+    # when none is configured). The query takes the non-memory, non-session
+    # path, so a stubbed model is sufficient to reach the guard.
     with (
         patch("agents.orchestrator.Agent", lambda *a, **k: agent),
         patch("agents.orchestrator.USE_BEDROCK_SESSIONS", False),
+        patch("agents.orchestrator.create_bedrock_model_with_overrides", MagicMock()),
+        patch("agents.orchestrator.create_cached_bedrock_model", MagicMock()),
     ):
         return str(_real_run_orchestrator(query, context=None))
 
