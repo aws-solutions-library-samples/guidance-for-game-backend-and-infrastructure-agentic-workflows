@@ -17,16 +17,20 @@ alike. It lists both the current default models and the documented
 earlier-generation rollback IDs, so a rollback resolves silently without a
 warning.
 
-An ID the table cannot match - including an opaque application inference
-profile ARN - falls back to the earlier-generation shape (keep
-``temperature``, no ``thinking`` field) and emits a warning, logged once per
-distinct model ID. That fallback is only safe for a genuinely earlier model.
-Claude 5.x and Opus 4.7+ models (and application inference profiles that wrap
-one) reject ``temperature`` with a 400, so the warning states that an
-unrecognized newer model or such a profile will be rejected and points to the
-listed model IDs or the ``global.`` system inference profile ID. Application
-inference profiles over the 5.5 models stay unsupported until #421 lands the
-capability-aware model factory, which can resolve the model a profile wraps.
+An ID the table cannot match - including an application inference profile
+ARN - falls back to the earlier-generation shape (keep ``temperature``, no
+``thinking`` field) and emits a warning, logged once per distinct model ID.
+That fallback is only correct for a genuinely earlier model. An ID that looks
+like a Claude 5.x or Opus 4.7+ model likely rejects ``temperature`` with a
+400, so the warning says the request will likely fail and points to a listed
+model ID or a new capability entry. The runtime cannot tell which model an
+application inference profile wraps, so the warning for a profile ARN is
+conditional: it fails with a 400 only if the profile wraps Claude Haiku 5.5,
+Claude Sonnet 5.5, or another model that rejects ``temperature``, and the
+``global.`` system inference profile ID resolves those models directly.
+Application inference profiles over the 5.5 models stay unsupported until #421
+lands the capability-aware model factory, which can resolve the model a
+profile wraps.
 
 #421 tracks the longer-term capability-aware model factory that would replace
 this table with provider-reported capabilities.
@@ -85,10 +89,10 @@ _CAPABILITY_PATTERNS: tuple[tuple[str, ModelCapabilities], ...] = (
     ("claude-sonnet-4-6", _LEGACY_CLAUDE),
 )
 
-# An unrecognized ID that still looks like a newer Claude generation most likely
-# rejects temperature. Claude 5.x (any family) and Opus 4.7 through 4.9 take the
-# newer parameter rules, so the fallback shape would draw a 400 from them. The
-# warning calls this out instead of implying the fallback is always safe.
+# An unrecognized ID that still looks like a newer Claude generation likely
+# rejects temperature. Claude 5.x (any family) and Opus 4.7 through 4.9 take
+# the newer parameter rules, so the fallback shape would likely draw a 400 from
+# them. The warning hedges the prediction and names the real remedy.
 _LIKELY_REJECTS_TEMPERATURE = re.compile(r"claude-(?:haiku|sonnet|opus)-5|opus-4-[7-9]")
 
 
@@ -103,11 +107,12 @@ def get_model_capabilities(model_id: str) -> ModelCapabilities:
     An ID that matches nothing falls back to the earlier-generation behavior
     (send ``temperature``, no ``thinking`` field) and logs a warning once per
     distinct ID. That fallback is only correct for a genuinely earlier model.
-    When the unrecognized ID still looks like a Claude 5.x or Opus 4.7+ model -
-    or is an opaque application inference profile ARN, which cannot be matched
-    by pattern - the fallback sends ``temperature`` to a model that rejects it
-    and the request draws a 400. The warning states that explicitly and points
-    to a listed model ID or the ``global.`` system inference profile ID.
+    When the unrecognized ID looks like a Claude 5.x or Opus 4.7+ model, the
+    fallback likely sends ``temperature`` to a model that rejects it and the
+    request likely draws a 400; the warning says so and points to a listed
+    model ID or a new capability entry. For an application inference profile
+    ARN the warning is conditional, because the runtime cannot tell which model
+    the profile wraps.
     """
     normalized = model_id.lower()
     for pattern, capabilities in _CAPABILITY_PATTERNS:
@@ -121,10 +126,12 @@ def get_model_capabilities(model_id: str) -> ModelCapabilities:
 def _warn_unmatched_once(model_id: str, normalized: str) -> None:
     """Log the unmatched-ID fallback warning once per distinct model ID.
 
-    The message names the real cause: an unrecognized ID gets the
-    earlier-generation shape, which a newer model (Claude 5.x, Opus 4.7+) or an
-    application inference profile wrapping one will reject because it receives a
-    ``temperature`` parameter.
+    The message names the cause: an unrecognized ID gets the
+    earlier-generation shape, which sends a ``temperature`` parameter. For an
+    ID that looks like a Claude 5.x or Opus 4.7+ model, that parameter is
+    likely rejected with a 400, and the remedy is a listed model ID or a new
+    capability entry. For an application inference profile ARN the warning is
+    conditional, because the runtime cannot tell which model the profile wraps.
     """
     with _warned_lock:
         if model_id in _warned_model_ids:
@@ -132,24 +139,31 @@ def _warn_unmatched_once(model_id: str, normalized: str) -> None:
         _warned_model_ids.add(model_id)
 
     is_profile = "application-inference-profile" in normalized
-    likely_rejects = is_profile or bool(_LIKELY_REJECTS_TEMPERATURE.search(normalized))
 
     message = (
         f"No inference-capability entry matched model ID '{model_id}'; "
         "sending temperature with no thinking field (earlier-generation behavior)."
     )
-    if likely_rejects:
+    if is_profile:
         message += (
-            " This ID looks like a Claude 5.x or Opus 4.7+ model or an application "
-            "inference profile wrapping one, which rejects the temperature parameter, "
-            "so requests will fail with a 400. Use a listed foundation model ID or the "
-            "'global.' system inference profile ID instead (application inference "
-            "profiles over the 5.5 models are unsupported until #421)."
+            " The runtime cannot tell which model an application inference profile "
+            "wraps. If it wraps Claude Haiku 5.5, Claude Sonnet 5.5, or another model "
+            "that rejects the temperature parameter, every request fails with a 400; "
+            "use the 'global.' system inference profile ID for those models "
+            "(application inference profiles over the 5.5 models are unsupported "
+            "until #421)."
+        )
+    elif _LIKELY_REJECTS_TEMPERATURE.search(normalized):
+        message += (
+            " This ID looks like a Claude 5.x or Opus 4.7+ model, which likely rejects "
+            "the temperature parameter, so the request will likely fail with a 400. Use "
+            "a model ID listed in config/model_capabilities.py or add a capability entry "
+            "for this model."
         )
     else:
         message += (
             " This is correct only for a genuinely earlier Claude model; a newer model "
-            "that rejects temperature will fail with a 400."
+            "that rejects temperature would fail with a 400."
         )
 
     logger.warning(message)

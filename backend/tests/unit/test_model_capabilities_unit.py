@@ -43,8 +43,18 @@ class TestModelCapabilityTable:
         assert caps.thinking == {"type": "between_tools"}
 
     def test_cross_region_prefixes_match(self):
-        # The ``us.`` prefix resolves the same as ``global.``.
-        assert get_model_capabilities("us.anthropic.claude-sonnet-5-5").thinking == {"type": "between_tools"}
+        # The ``us.`` prefix resolves the same as ``global.``, and so do the
+        # other geographic prefixes, a bare foundation ID, and mixed-case input;
+        # the table matches a case-insensitive substring.
+        for model_id in (
+            "us.anthropic.claude-sonnet-5-5",
+            "eu.anthropic.claude-sonnet-5-5",
+            "au.anthropic.claude-sonnet-5-5",
+            "jp.anthropic.claude-sonnet-5-5",
+            "anthropic.claude-sonnet-5-5",
+            "GLOBAL.ANTHROPIC.CLAUDE-SONNET-5-5",
+        ):
+            assert get_model_capabilities(model_id).thinking == {"type": "between_tools"}, model_id
 
     def test_earlier_claude_keeps_temperature_and_no_thinking(self):
         caps = get_model_capabilities("global.anthropic.claude-haiku-4-5-20251001-v1:0")
@@ -61,20 +71,42 @@ class TestModelCapabilityTable:
         assert sonnet.send_temperature is True and sonnet.thinking is None
         mock_logger.warning.assert_not_called()
 
-    def test_unmatched_newer_model_warns_that_it_will_be_rejected(self):
+    def test_unmatched_newer_model_warns_that_it_will_likely_be_rejected(self):
         # An unrecognized ID that still looks like a newer generation (Claude
         # 5.x or Opus 4.7+) gets the earlier-generation fallback shape, which
-        # that model rejects. The warning must name that cause, not imply the
-        # fallback is safe.
+        # that model likely rejects. The warning must name that branch: a
+        # hedged 400 prediction and a remedy of a listed model or a new entry,
+        # not the profile advice and not the softer earlier-model note.
+        for model_id in ("global.anthropic.claude-opus-5-5", "global.anthropic.claude-opus-4-7"):
+            reset_capability_warnings()
+            with patch("config.model_capabilities.logger") as mock_logger:
+                caps = get_model_capabilities(model_id)
+            assert caps.send_temperature is True, model_id
+            mock_logger.warning.assert_called_once()
+            message = mock_logger.warning.call_args.args[0]
+            assert "temperature" in message, model_id
+            assert "400" in message, model_id
+            assert "likely" in message, model_id
+            assert "add a capability entry" in message, model_id
+            # This branch must not borrow the profile wording.
+            assert "application inference profile" not in message, model_id
+
+    def test_unmatched_earlier_model_warns_softly_without_predicting_rejection(self):
+        # An unrecognized ID that does not look like a newer generation gets the
+        # soft note: the fallback is correct for a genuinely earlier model. It
+        # must not claim the request will fail, so an over-broad classifier that
+        # routed it to the reject-400 branch is caught here.
         with patch("config.model_capabilities.logger") as mock_logger:
-            caps = get_model_capabilities("global.anthropic.claude-opus-5-5")
+            caps = get_model_capabilities("global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         assert caps.send_temperature is True
+        assert caps.thinking is None
         mock_logger.warning.assert_called_once()
         message = mock_logger.warning.call_args.args[0]
-        assert "temperature" in message
-        assert "400" in message
+        assert "genuinely earlier" in message
+        assert "likely fail" not in message
+        assert "add a capability entry" not in message
 
-    def test_unmatched_profile_falls_back_and_warns(self):
+    def test_unmatched_profile_falls_back_and_warns_conditionally(self):
         with patch("config.model_capabilities.logger") as mock_logger:
             caps = get_model_capabilities(
                 "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/abcd1234"
@@ -82,11 +114,13 @@ class TestModelCapabilityTable:
         assert caps.send_temperature is True
         assert caps.thinking is None
         mock_logger.warning.assert_called_once()
-        # The warning tells the operator the profile receives temperature and so
-        # fails with a 400, and points to the system profile IDs.
+        # The runtime cannot know what the profile wraps, so the warning must be
+        # conditional ("if it wraps ... that rejects") rather than asserting a
+        # certain 400 for every profile, and it points to the system profile ID.
         message = mock_logger.warning.call_args.args[0]
-        assert "temperature" in message
-        assert "400" in message
+        assert "application inference profile" in message
+        assert "cannot tell which model" in message
+        assert "if it wraps" in message.lower()
         assert "global." in message
 
     def test_unmatched_id_warns_once_per_distinct_id(self):
