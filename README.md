@@ -527,11 +527,25 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs, suggest
 
 ## Releases
 
-Milestone releases are immutable annotated tags published by the manually
-dispatched [`.github/workflows/release.yml`](.github/workflows/release.yml)
-workflow. A release records an exact accepted `main` source state and never
-deploys to AWS. See [docs/RELEASING.md](docs/RELEASING.md) for the release
-policy, evidence-comment format, attached artifacts, and rollback guidance.
+Milestone releases are annotated tags published by the manually dispatched
+[`.github/workflows/release.yml`](.github/workflows/release.yml) workflow. A
+release records an exact accepted `main` source state and never deploys to AWS.
+
+The "immutable milestone" guarantee — a published tag and its assets cannot be
+changed or deleted after the fact — holds only once two repository settings are
+enabled: GitHub's **immutable-releases** setting and a **`v*` tag ruleset**. The
+workflow cannot read the immutable-releases setting ahead of time with its
+`GITHUB_TOKEN`, so it enforces the guarantee after publication: it reads the
+release back and fails the run unless GitHub reports the release as `immutable`.
+See [docs/RELEASING.md](docs/RELEASING.md) for the release policy,
+evidence-comment format, attached artifacts, the before-first-run checklist, and
+rollback guidance.
+
+Build-provenance attestation is deferred, consistent with the no-AWS-credentials
+design: the workflow holds no `id-token` or `attestations` permission, and the
+attached SBOMs plus the `SHA256SUMS` manifest are the stated supply-chain
+boundary. When the immutable-releases setting is enabled, GitHub additionally
+generates a release attestation automatically.
 
 ## License
 

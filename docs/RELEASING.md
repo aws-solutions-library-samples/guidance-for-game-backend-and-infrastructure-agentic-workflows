@@ -30,7 +30,10 @@ credentials.
   workflow artifact, but never touches tags or releases. The validate job runs
   the environment-protection check, so the `release` environment must exist and
   be protected **before any run, dry or not** — a dry run fails closed if it is
-  missing. A dry run is otherwise not a full rehearsal of publication: the
+  missing. The validate job's `verify-environment` step also **reports** whether
+  GitHub's immutable-releases setting can be confirmed (it cannot be read ahead
+  of a run with the workflow token, so it is enforced after publish instead) and
+  whether a `v*` tag ruleset is present. A dry run is otherwise not a full rehearsal of publication: the
   read-only validate/build jobs cannot list draft releases (only a token with
   push access can), so a draft that already holds the tag is detected only at
   publish time. Run a dry run, inspect the artifacts, then dispatch again with
@@ -123,15 +126,17 @@ from the exact tag:
 | Artifact | Contents |
 | --- | --- |
 | `release-manifest.json` | Schema version, tag/name, commit and commit date, default operations mode (proven `disabled` by a fail-closed scan of **every tracked file**, regardless of suffix: the ADR declares the default and no tracked file references `GBAW_OPERATIONS_MODE` except Markdown files and files under `docs/`, `scripts/release/`, and `scripts/test/`), SHA-256 of dependency locks, managed-prompt sources, and every `*.yaml`/`*.yml` under `infrastructure/` (both CloudFormation templates and the Kubernetes RBAC manifests, under `hashes.infrastructure_templates`), required-check conclusions, the evidence digest, gate summary, and waiver issue references, and the attached file names. Serialized with sorted keys, two-space indent, ASCII, LF, trailing newline. |
-| `backend-sbom.spdx.json` | Backend SPDX SBOM from a pinned syft over `dir:backend` **without installing dependencies**, normalized (creation time set to the commit date in UTC `YYYY-MM-DDThh:mm:ssZ`, a namespace made unique per release from the source name, tag, and commit, and absolute paths removed). syft records only public package-registry hosts, so no hostname scrubbing is performed; the exclusion guard independently rejects a fixed list of AWS-owned host suffixes (the AWS service domain, the retail domain, and the AWS developer-tools domain) plus the internal-domain markers it lists, so a release carrying one of those fails closed rather than publishing it. |
+| `backend-sbom.spdx.json` | Backend SPDX SBOM from a pinned syft over `dir:backend` **without installing dependencies**, normalized (creation time set to the commit date in UTC `YYYY-MM-DDThh:mm:ssZ`, a namespace made unique per release from the source name, tag, and commit, and absolute paths removed). syft records only public package-registry hosts, so no hostname scrubbing is performed; the exclusion guard independently rejects any hostname that is not an allowlisted public package-registry host (reporting an AWS/Amazon-owned suffix distinctly), so a release carrying an internal, private, or otherwise unexpected host fails closed rather than publishing it. |
 | `frontend-sbom.spdx.json` | Frontend SPDX SBOM over `dir:ui`, normalized the same way. |
 | `SHA256SUMS` | `sha256sum`-format checksums, sorted by filename, covering every other attached file. |
 
 An exclusion guard rejects any artifact outside this allowlist and any content
 containing ARNs, account-ID patterns, credentials/tokens, `.env` /
-`.bedrock_agentcore` material, private registry or internal hostnames, or source
-archives. **GitHub supplies the source `.zip`/`.tar.gz` automatically for the
-tag; the workflow never attaches one.**
+`.bedrock_agentcore` material, source archives, or any hostname that is not an
+allowlisted public package-registry host — so an internal or unknown private
+registry host (for example one carried in a lockfile index URL) fails closed
+rather than being published. **GitHub supplies the source `.zip`/`.tar.gz`
+automatically for the tag; the workflow never attaches one.**
 
 ## Failure behavior
 
@@ -170,7 +175,13 @@ Validation runs entirely before any write. In the publish job, the ordering is:
    write (closing the race between the earlier check and the write), then create
    the annotated tag object and the `refs/tags/<tag>` ref at the exact commit;
 6. publish the draft (`prerelease` and non-latest for `-rc.N`; a stable tag is
-   set `make_latest` explicitly).
+   set `make_latest` explicitly);
+7. read the published release back and fail the run unless every post-publish
+   check passes: the release reads back as a published, **immutable** release
+   (`immutable: true`), exactly the four allowlisted assets are attached with a
+   size equal to the published bytes and, when GitHub reports an asset
+   `digest`, a sha256 equal to its `SHA256SUMS` entry, and the tag ref resolves
+   through this run's annotated tag object to the released commit.
 
 The annotated tag object's **tagger date is the commit date**, not the
 publication time, so re-running the publish for the same commit produces a
@@ -270,6 +281,71 @@ When GitHub immutable releases are enabled (see recommended settings below), the
 baseline you roll back to is byte-identical to what was validated when it was
 published; `release-manifest.json` for that tag lets you confirm the
 dependency-lock, prompt-source, and infrastructure-template hashes.
+
+## Immutability: what the workflow enforces
+
+The "immutable milestone" guarantee depends on two repository settings that the
+release tooling deliberately does not change: GitHub's **immutable-releases**
+setting and a **`v*` tag ruleset**. What the workflow can and cannot do about
+them, with the existing `GITHUB_TOKEN`, is:
+
+- **Immutable-releases setting (enforced after publish).** The setting itself
+  cannot be read ahead of a run with the workflow token — reading it needs
+  repository-admin permission that `GITHUB_TOKEN` cannot be granted, and the
+  project adds no personal access token or extra permission for it. Instead, the
+  publish job follows GitHub's recommended draft-then-publish order and then
+  **reads the release back**: a published release reports `immutable: true` only
+  when the setting is enabled, so the read-back **fails the run with a remedy**
+  if it is not. This is positive, after-the-fact enforcement, not a pre-flight
+  gate; a release can be created and will then fail its own read-back if the
+  setting is off, leaving a published-but-flagged release for an operator to
+  review.
+- **`v*` tag ruleset (reported, not enforced).** The `verify-environment` step
+  reads the repository's tag-target rulesets (`GET /repos/{owner}/{repo}/rulesets?targets=tag`,
+  which needs only `Metadata: read`) and reports whether one is **present** or
+  **absent**. It is advisory only: the list endpoint does not expose each
+  ruleset's ref-name conditions without admin, so the step cannot prove a
+  present ruleset actually covers `v*`, and it never fails the run on this
+  signal.
+
+Options considered for the setting check were: (a) a documentation-only
+dependency; (b) a pre-run read of the setting (not possible with the workflow
+token); (c) the post-publish read-back of the `immutable` flag. The workflow
+implements **(c)**, the strongest check available without adding a secret or a
+new token permission, together with the advisory ruleset report.
+
+## Before-first-run checklist
+
+Confirm all of the following in repository settings **before the first
+dispatch, dry or not** — several are not machine-enforced by the workflow:
+
+- [ ] **`release` environment exists** and has a **required-reviewers** rule
+      with at least one reviewer. (Machine-checked: `verify-environment` fails
+      closed without it.)
+- [ ] **Prevent self-review** enabled on the `release` environment, so the
+      dispatcher cannot approve their own release. (Not machine-checked — the
+      token cannot read it; confirm by hand.)
+- [ ] **Administrators cannot bypass** the `release` environment protection
+      rule. (Not machine-checked; confirm by hand.)
+- [ ] **Deployment branch rule** limits the `release` environment to `main`.
+      (Not machine-checked; confirm by hand.)
+- [ ] **GitHub immutable-releases setting enabled** for the repository.
+      (Enforced after publish by the read-back, which fails the run unless the
+      published release is `immutable`.)
+- [ ] **`v*` tag ruleset** configured to restrict who can create or update
+      release tags. (Reported as present/absent by `verify-environment`; not
+      failed on.)
+
+## Build provenance and attestation
+
+Build-provenance attestation is **deferred**, consistent with the
+no-AWS-credentials design. The workflow holds no `id-token` or `attestations`
+permission and signs nothing itself; the attached SBOMs and the `SHA256SUMS`
+manifest are the stated supply-chain boundary. When the immutable-releases
+setting is enabled, GitHub automatically generates a release attestation (a
+cryptographically verifiable record of the tag, commit SHA, and assets), so
+enabling that setting is also what provides attestation today. A dedicated,
+workflow-signed provenance attestation is tracked as a follow-up.
 
 ## Recommended maintainer settings
 
