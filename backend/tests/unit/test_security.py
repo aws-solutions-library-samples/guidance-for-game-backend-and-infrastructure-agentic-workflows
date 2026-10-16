@@ -102,6 +102,43 @@ class TestInputValidation:
 
         assert validate_prompt(prompt) == expected
 
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            "\u115f",  # Hangul Choseong Filler (category Lo)
+            "\u1160",  # Hangul Jungseong Filler (category Lo)
+            "\u3164",  # Hangul Filler (category Lo)
+            "\uffa0",  # Halfwidth Hangul Filler (category Lo)
+            "\u2800",  # Braille Pattern Blank (category So)
+            "\u034f",  # Combining Grapheme Joiner (category Mn)
+            "\ufe0f",  # Variation Selector-16 (category Mn)
+            "\U000e0100",  # Variation Selector-17 (category Mn)
+        ],
+        ids=[
+            "hangul-choseong-filler",
+            "hangul-jungseong-filler",
+            "hangul-filler",
+            "halfwidth-hangul-filler",
+            "braille-blank",
+            "combining-grapheme-joiner",
+            "variation-selector-16",
+            "variation-selector-17",
+        ],
+    )
+    def test_validate_prompt_accepts_nonwhitespace_invisible_characters(self, prompt):
+        """Invisible-looking characters outside whitespace/Cc/Cf are accepted.
+
+        Hangul fillers (category Lo), the Braille blank (category So), and
+        variation selectors and the combining grapheme joiner (category Mn)
+        each produce a non-empty Memory search query, so they are returned
+        unchanged rather than rejected as empty. Pinning this makes any future
+        widening of the empty-prompt predicate a visible, deliberate change.
+        """
+        # Local modules
+        from utils.security import validate_prompt
+
+        assert validate_prompt(prompt) == prompt
+
     def test_validate_prompt_non_string_raises_error(self):
         """Non-string prompts should raise InputValidationError."""
         # Local modules
