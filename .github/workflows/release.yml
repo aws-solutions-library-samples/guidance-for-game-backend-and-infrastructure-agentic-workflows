@@ -58,6 +58,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  guard-ref:
+    name: guard-ref
+    # Runs on EVERY dispatch, with no ref condition, so a dispatch from a
+    # non-main ref fails LOUDLY here instead of skipping every gated job and
+    # showing the run as green. The other jobs still carry their own
+    # `github.ref == 'refs/heads/main'` guard (defense in depth) and depend on
+    # this job, so a non-main dispatch cannot reach validation, build, or
+    # publish.
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require dispatch from the main branch
+        env:
+          GBAW_DISPATCH_REF: ${{ github.ref }}
+        run: |
+          if [ "$GBAW_DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "::error::release must be dispatched from the main branch; got $GBAW_DISPATCH_REF"
+            exit 1
+          fi
+          echo "dispatch ref is main"
+
   validate:
     name: validate
     # The workflow file comes from the dispatch ref; only ever run from main.
@@ -67,6 +88,7 @@ jobs:
     # must stay reachable to fail loudly on a stale or mistyped SHA.
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+    needs: [guard-ref]
     permissions:
       contents: read # checkout the release commit; read tags/refs/releases
       checks: read # read required-check runs on the commit

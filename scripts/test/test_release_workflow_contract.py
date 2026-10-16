@@ -272,15 +272,50 @@ class DispatchRefGuardContractTests(unittest.TestCase):
         self.jobs = _split_jobs(self.text)
 
     def test_every_job_guarded_on_main_ref(self):
-        # Each job must only run when the dispatch ref is refs/heads/main; the
-        # workflow file itself comes from the dispatch ref, so the scripts'
-        # commit==main check is not sufficient on its own.
+        # Each job (except the always-on ref guard) must only run when the
+        # dispatch ref is refs/heads/main; the workflow file itself comes from
+        # the dispatch ref, so the scripts' commit==main check is not sufficient
+        # on its own. ``guard-ref`` is the deliberate exception: it runs on
+        # EVERY dispatch so a non-main ref fails loudly instead of skipping
+        # every gated job and showing green (see test_guard_ref_* below).
         for job_id, block in self.jobs.items():
+            if job_id == "guard-ref":
+                continue
             self.assertRegex(
                 block,
                 r"github\.ref\s*==\s*'refs/heads/main'",
                 msg=f"job {job_id} is not guarded on the main dispatch ref",
             )
+
+    def test_guard_ref_runs_unconditionally_and_fails_off_main(self):
+        # The ref guard must have NO job-level `if:` (so it is never skipped)
+        # and must exit non-zero unless the dispatch ref is refs/heads/main, so
+        # a dispatch from a non-main ref fails the run with a message instead of
+        # skipping every gated job and reporting green.
+        guard = self.jobs.get("guard-ref", "")
+        self.assertTrue(guard, "guard-ref job must exist")
+        self.assertNotRegex(
+            guard,
+            r"^\s{4}if:",
+            msg="guard-ref must not carry a job-level if: or it could be skipped off-main",
+        )
+        self.assertRegex(
+            guard,
+            r"\$GBAW_DISPATCH_REF.{0,40}refs/heads/main|refs/heads/main.{0,40}\$GBAW_DISPATCH_REF",
+            msg="guard-ref must compare the dispatch ref to refs/heads/main",
+        )
+        self.assertIn("exit 1", guard, "guard-ref must fail (exit 1) on a non-main dispatch ref")
+
+    def test_gated_jobs_depend_on_the_ref_guard(self):
+        # validate depends on guard-ref directly; build-artifacts and publish
+        # depend on it transitively through validate, so a non-main dispatch
+        # cannot reach any of them.
+        validate_block = self.jobs.get("validate", "")
+        self.assertRegex(
+            validate_block,
+            r"needs:\s*\[.*guard-ref.*\]",
+            msg="validate must depend on guard-ref",
+        )
 
 
 class ActionPinContractTests(unittest.TestCase):
@@ -450,6 +485,11 @@ class CommitEqualsShaGuardContractTests(unittest.TestCase):
 
     def test_every_job_requires_commit_equals_github_sha(self):
         for job_id, block in self.jobs.items():
+            if job_id == "guard-ref":
+                # guard-ref checks only the dispatch REF (fail loudly off-main);
+                # it runs before and independently of the commit binding, which
+                # the gated jobs it protects enforce.
+                continue
             if job_id == "validate":
                 # validate binds the commit in a shell guard (inputs.commit is
                 # surfaced as GBAW_RELEASE_COMMIT and compared to GITHUB_SHA),
