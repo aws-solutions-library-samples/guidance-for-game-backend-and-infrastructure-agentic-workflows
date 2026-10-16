@@ -119,21 +119,25 @@ class RecordingClient(GitHubClient):
                 return dict(summary)
         raise KeyError(ruleset_id)
 
-    def _ruleset_enforcement_for_ref(self, ref: str) -> "tuple[set[str], str]":
-        """Return (restricting rule types, current_user_can_bypass) for the
-        active tag ruleset that covers ``ref``, modeling GitHub's enforcement of
-        ``creation``/``update``/``deletion`` against a bypass-less identity.
+    def _ruleset_enforcement_for_ref(self, ref: str) -> "list[tuple[set[str], str]]":
+        """Return ``(restricting rule types, current_user_can_bypass)`` for EVERY
+        active tag ruleset that covers ``ref``, modeling GitHub's aggregation of
+        the rules of every covering ruleset against a bypass-less identity.
 
         ``create_ref`` / ``delete_ref`` consult this so the fakes refuse a ref
-        write GitHub would refuse: a ``creation`` rule blocks creating the ref
-        and a ``deletion`` rule blocks deleting it unless the calling identity
-        can bypass (``current_user_can_bypass`` is a bypass value). This keeps
-        the compliant happy-path fixture one GitHub would actually accept.
+        write GitHub would refuse: a ``creation`` rule in any covering ruleset
+        blocks creating the ref, and a ``deletion`` rule in any covering ruleset
+        blocks deleting it, unless the calling identity can bypass that same
+        ruleset (``current_user_can_bypass`` is a bypass value). GitHub reports
+        ``current_user_can_bypass`` per ruleset, so each covering ruleset is
+        returned with its own value. This keeps the compliant happy-path fixture
+        one GitHub would actually accept.
         """
 
         # Local modules
         from release.validate import _ruleset_pattern_matches_ref
 
+        covering: list[tuple[set[str], str]] = []
         for summary in getattr(self, "rulesets", []):
             if str(summary.get("enforcement", "")) != "active" or str(summary.get("target", "")) != "tag":
                 continue
@@ -149,16 +153,16 @@ class RecordingClient(GitHubClient):
                 continue
             rule_types = {str(r.get("type", "")) for r in (detail.get("rules") or []) if isinstance(r, dict)}
             bypass = str(detail.get("current_user_can_bypass", "never"))
-            return rule_types, bypass
-        return set(), "never"
+            covering.append((rule_types, bypass))
+        return covering
 
     def _assert_ref_write_allowed(self, ref: str, rule_type: str) -> None:
-        rule_types, bypass = self._ruleset_enforcement_for_ref(ref)
-        can_bypass = bypass in ("always", "pull_requests_only")
-        if rule_type in rule_types and not can_bypass:
-            raise RuntimeError(
-                f"ref write refused by ruleset {rule_type} rule: only bypass actors may {rule_type} {ref}"
-            )
+        for rule_types, bypass in self._ruleset_enforcement_for_ref(ref):
+            can_bypass = bypass in ("always", "exempt")
+            if rule_type in rule_types and not can_bypass:
+                raise RuntimeError(
+                    f"ref write refused by ruleset {rule_type} rule: only bypass actors may {rule_type} {ref}"
+                )
 
     def list_deployment_branch_policies(self, name: str):
         self.calls.append(f"list_deployment_branch_policies:{name}")

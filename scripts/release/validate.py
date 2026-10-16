@@ -390,10 +390,15 @@ _TAG_RESTRICTING_RULE_TYPES = frozenset({"creation", "update", "deletion"})
 _TAG_WRITE_BLOCKING_RULE_TYPES = frozenset({"creation", "deletion"})
 
 # ``current_user_can_bypass`` values on the single-ruleset GET that mean the
-# calling token IS a bypass actor for the ruleset. Any other value (notably
-# ``never``) or an absent field means it is not, so a ``creation``/``deletion``
+# calling token IS a bypass actor for a direct ref write. GitHub reports
+# ``always``, ``pull_requests_only``, ``never``, or ``exempt``. ``always`` and
+# ``exempt`` both let the actor skip the rules for a direct write (with
+# ``exempt`` the rules are not run for that actor at all). ``pull_requests_only``
+# lets the actor bypass only on a pull request, which a direct ``refs/tags/<tag>``
+# write is not, so it does NOT bypass here. Any other value (notably ``never``)
+# or an absent field is likewise not a bypass, so a ``creation``/``deletion``
 # rule would refuse the workflow's own tag write.
-_CAN_BYPASS_VALUES = frozenset({"always", "pull_requests_only"})
+_CAN_BYPASS_VALUES = frozenset({"always", "exempt"})
 
 
 def _fnm_pathname_regex(pattern: str) -> str:
@@ -408,12 +413,19 @@ def _fnm_pathname_regex(pattern: str) -> str:
     directories" only when it is a whole path segment, i.e. ``**/`` at the start
     of the pattern or immediately after a ``/`` (so ``refs/tags/**/*`` DOES match
     ``refs/tags/v1.0.0``); a ``**`` that does not start a segment (for example
-    ``v**``) collapses to a single-segment ``*`` that never crosses ``/``. A
-    backslash escapes the next character, as ``fnmatch`` documents when
-    ``FNM_NOESCAPE`` is not set, so ``\\v`` is a literal ``v``. ``~ALL`` is the
-    caller's special case and never reaches here. ``FNM_EXTGLOB`` is unsupported
-    by GitHub and is not emulated; a ``[!...]`` or ``[^...]`` negation is honored
-    as fnmatch documents it, and a bracket set never matches ``/``.
+    ``v**``) collapses to a single-segment ``*`` that never crosses ``/``.
+    ``~ALL`` is the caller's special case and never reaches here.
+
+    A bracket set follows Ruby: it ends at the first ``]``, so ``[]...`` is an
+    empty set that matches no character and ``[!]...`` / ``[^]...`` is a
+    negated-empty set that matches any one character. A backslash escapes the
+    next character, as Ruby's ``File.fnmatch`` does when ``FNM_NOESCAPE`` is not
+    set, so ``\\v`` is a literal ``v``; and ``[^...]`` is honored as a complement.
+    GitHub itself does NOT support either a backslash quoting character or a
+    ``[^...]`` complement in ruleset patterns, and does not support
+    ``FNM_EXTGLOB``; this matcher follows Ruby's ``File.fnmatch`` for those
+    forms so the gate's view of coverage tracks the semantics GitHub documents
+    for the patterns it does support, and a bracket set never matches ``/``.
     """
 
     i = 0
@@ -449,8 +461,6 @@ def _fnm_pathname_regex(pattern: str) -> str:
             j = i + 1
             if j < n and pattern[j] in "!^":
                 j += 1
-            if j < n and pattern[j] == "]":
-                j += 1
             while j < n and pattern[j] != "]":
                 j += 1
             if j >= n:
@@ -458,13 +468,20 @@ def _fnm_pathname_regex(pattern: str) -> str:
                 i += 1
             else:
                 stuff = pattern[i + 1 : j]
-                if stuff.startswith("!"):
-                    stuff = "^" + stuff[1:]
-                stuff = stuff.replace("\\", "\\\\")
-                # A bracket set never matches ``/`` under FNM_PATHNAME. Guard the
-                # class with a negative lookahead so ``[/]`` (or any set that
-                # lists ``/``) cannot join two path segments.
-                out.append("(?:(?![/])[" + stuff + "])")
+                negated = stuff.startswith(("!", "^"))
+                body = stuff[1:] if negated else stuff
+                body = body.replace("\\", "\\\\")
+                if not body:
+                    # Ruby ends a bracket set at the first ``]``, so ``[]...`` is
+                    # an EMPTY set (matches no character) and ``[!]...`` / ``[^]...``
+                    # is a negated-empty set (matches any one character). A bracket
+                    # set never matches ``/`` under FNM_PATHNAME.
+                    out.append("[^/]" if negated else "(?!)")
+                else:
+                    class_body = ("^" + body) if negated else body
+                    # Guard the class with a negative lookahead so ``[/]`` (or any
+                    # set that lists ``/``) cannot join two path segments.
+                    out.append("(?:(?![/])[" + class_body + "])")
                 i = j + 1
         else:
             out.append(re.escape(char))
@@ -499,19 +516,24 @@ def _dispatched_tag_ref(tag: str, *, tag_prefix: str) -> str:
     return f"refs/tags/{tag}" if tag else f"refs/tags/{tag_prefix}"
 
 
-def _covering_tag_ruleset_detail(client: GitHubClient, *, ref: str) -> dict | None:
-    """Return the detail of the active tag ruleset that covers ``ref`` and
-    restricts who may create, update, or delete it, or ``None``.
+def _covering_tag_rulesets(client: GitHubClient, *, ref: str) -> list[dict]:
+    """Return the details of every active tag ruleset that covers ``ref``.
+
+    GitHub aggregates the rules of EVERY ruleset that targets a ref (see
+    GitHub's "About rule layering": the rules in each covering ruleset are
+    aggregated and the most restrictive version applies), so the gate must look
+    at all covering rulesets, not just the first.
 
     Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
     ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
-    only when it is ``active``; an include pattern matches ``ref`` (``~ALL`` or
-    an ``FNM_PATHNAME`` pattern) with no exclude pattern that removes it; and it
-    carries at least one restricting rule type (``creation`` / ``update`` /
-    ``deletion``). The first such ruleset's detail is returned so the caller can
-    inspect its rule types and ``current_user_can_bypass``.
+    only when it is ``active`` and an include pattern matches ``ref`` (``~ALL``
+    or an ``FNM_PATHNAME`` pattern) with no exclude pattern that removes it. The
+    returned list preserves the order GitHub lists the rulesets in, so the
+    caller can inspect each ruleset's rule types and ``current_user_can_bypass``
+    independently (``current_user_can_bypass`` is reported per ruleset).
     """
 
+    covering: list[dict] = []
     for summary in client.list_rulesets(target="tag"):
         if str(summary.get("enforcement", "")) != "active":
             continue
@@ -529,37 +551,42 @@ def _covering_tag_ruleset_detail(client: GitHubClient, *, ref: str) -> dict | No
             continue
         if any(_ruleset_pattern_matches_ref(str(pattern), ref) for pattern in exclude if isinstance(pattern, str)):
             continue
-        rule_types = {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
-        if rule_types & _TAG_RESTRICTING_RULE_TYPES:
-            return detail
-    return None
+        covering.append(detail)
+    return covering
+
+
+def _ruleset_rule_types(detail: dict) -> set[str]:
+    return {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
 
 
 def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> bool:
-    """Return True if an active tag ruleset actually covers ``refs/tags/<tag>``
-    and restricts who may create, update, or delete it.
+    """Return True if at least one active tag ruleset actually covers
+    ``refs/tags/<tag>`` and restricts who may create, update, or delete it.
 
     Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
-    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
-    only when it is ``active``; an include pattern matches ``refs/tags/<tag>``
-    (``~ALL`` or an ``FNM_PATHNAME`` pattern) with no exclude pattern that
-    removes it; and it carries at least one restricting rule type
-    (``creation`` / ``update`` / ``deletion``), so matching alone — without any
-    rule that gates the write — does not pass the gate.
+    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). Rulesets are
+    aggregated the way GitHub aggregates them: coverage holds when any active
+    covering ruleset carries at least one restricting rule type (``creation`` /
+    ``update`` / ``deletion``), so matching alone — without any rule that gates
+    the write — does not pass the gate.
     """
 
     ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
-    return _covering_tag_ruleset_detail(client, ref=ref) is not None
+    covering = _covering_tag_rulesets(client, ref=ref)
+    return any(_ruleset_rule_types(detail) & _TAG_RESTRICTING_RULE_TYPES for detail in covering)
 
 
 def _ruleset_token_can_bypass(detail: dict) -> bool:
     """Return True if ``current_user_can_bypass`` marks the calling token a
-    bypass actor for the ruleset.
+    bypass actor for a direct ref write under this ruleset.
 
     The single-ruleset GET returns ``current_user_can_bypass`` for the calling
-    token's own identity. Any value other than ``always`` / ``pull_requests_only``
-    (including ``never`` or an absent field) means the token is not a bypass
-    actor, so a ``creation`` or ``deletion`` rule would refuse its tag write.
+    token's own identity. ``always`` and ``exempt`` both let the actor skip the
+    rules for a direct write. ``pull_requests_only`` bypasses only on a pull
+    request, which a direct ``refs/tags/<tag>`` write is not, so it is not a
+    bypass here; ``never`` and an absent field are likewise not a bypass. For a
+    non-bypass value a ``creation`` or ``deletion`` rule would refuse the
+    token's tag write.
     """
 
     return str(detail.get("current_user_can_bypass", "")) in _CAN_BYPASS_VALUES
@@ -574,39 +601,74 @@ def validate_tag_ruleset_present(client: GitHubClient, *, tag: str, tag_prefix: 
     create, update, or delete it. The ruleset's ref conditions and rule list are
     readable with ``Metadata: read``, so this is a machine check, not advice.
 
-    Beyond requiring a covering, restricting ruleset, this also refuses before
-    the draft when that ruleset would block the workflow's OWN tag writes:
-    GitHub lets only bypass actors create a ref matching a ``creation`` rule or
-    delete one matching a ``deletion`` rule, and the workflow creates
-    ``refs/tags/<tag>`` and deletes it during cleanup. So when the covering
-    ruleset carries ``creation`` or ``deletion`` and the single-ruleset GET
-    reports ``current_user_can_bypass`` as ``never`` or absent for this token,
-    the gate fails closed with a remedy rather than letting the run fail at the
-    tag write (``creation``) or leave an orphaned tag at cleanup (``deletion``).
-    An ``update``-only ruleset restricts moving an existing tag, which the
-    workflow never does, so it passes.
+    GitHub aggregates the rules of EVERY ruleset that covers the ref (see
+    GitHub's "About rule layering"), so this inspects every active covering
+    ruleset, not just the first:
+
+    * at least one covering ruleset must carry a restricting rule
+      (``creation`` / ``update`` / ``deletion``); otherwise the tag is not
+      protected and the gate fails closed;
+    * the gate also refuses before the draft when ANY covering ruleset would
+      block the workflow's OWN tag writes. GitHub lets only bypass actors create
+      a ref matching a ``creation`` rule or delete one matching a ``deletion``
+      rule, and the workflow creates ``refs/tags/<tag>`` and deletes it during
+      cleanup. ``current_user_can_bypass`` is reported per ruleset, so a
+      ``creation`` or ``deletion`` rule in any covering ruleset whose
+      ``current_user_can_bypass`` is not a bypass value refuses the run with a
+      remedy rather than letting it fail at the tag write (``creation``) or
+      leave an orphaned tag at cleanup (``deletion``). An ``update``-only
+      ruleset restricts moving an existing tag, which the workflow never does,
+      so it passes.
     """
 
     ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
-    detail = _covering_tag_ruleset_detail(client, ref=ref)
+    covering = _covering_tag_rulesets(client, ref=ref)
+    restricting = [detail for detail in covering if _ruleset_rule_types(detail) & _TAG_RESTRICTING_RULE_TYPES]
     _require(
-        detail is not None,
+        bool(restricting),
         f"no active tag ruleset covers {ref} with a creation/update/deletion rule; "
         f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags and restricts "
         "who may create, update, or delete them before releasing",
     )
-    assert detail is not None  # for type-checkers; _require already enforced it
-    rule_types = {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
-    blocking = sorted(rule_types & _TAG_WRITE_BLOCKING_RULE_TYPES)
-    if blocking and not _ruleset_token_can_bypass(detail):
+
+    blocking: set[str] = set()
+    for detail in covering:
+        rule_types = _ruleset_rule_types(detail)
+        if rule_types & _TAG_WRITE_BLOCKING_RULE_TYPES and not _ruleset_token_can_bypass(detail):
+            blocking |= rule_types & _TAG_WRITE_BLOCKING_RULE_TYPES
+    if blocking:
+        rules = "/".join(sorted(blocking))
         raise ValidationError(
-            f"the tag ruleset covering {ref} carries a {'/'.join(blocking)} rule that only bypass actors can "
-            "satisfy, and this workflow's token is not a bypass actor (current_user_can_bypass is never or "
-            "absent), so it could not create the tag ref (creation) or delete it during cleanup (deletion). "
-            "Use an 'update' rule to restrict who moves release tags (which leaves this workflow's create and "
-            "cleanup writes alone), or add this workflow's identity to the ruleset's bypass list. "
-            "See docs/RELEASING.md 'Recommended maintainer settings'."
+            f"a tag ruleset covering {ref} carries a {rules} rule that only bypass actors can satisfy, and this "
+            "workflow's token is not a bypass actor for it, so it could not create the tag ref (creation) or "
+            "delete it during cleanup (deletion). Restrict release tags with an 'update' rule only, which leaves "
+            "this workflow's create and cleanup writes alone. See docs/RELEASING.md 'Recommended maintainer "
+            "settings'."
         )
+
+
+def _covering_tag_ruleset_status(client: GitHubClient, *, tag: str, tag_prefix: str) -> str:
+    """Classify the covering tag rulesets for the dispatched ref.
+
+    Returns one of:
+
+    * ``"absent"`` -- no active covering ruleset carries a restricting rule, so
+      the tag is not protected;
+    * ``"would-block"`` -- a covering ruleset is restricting but at least one
+      covering ruleset carries a ``creation`` or ``deletion`` rule this token
+      cannot bypass, so the publish gate would refuse before the draft;
+    * ``"present"`` -- a restricting ruleset covers the ref and none of the
+      covering rulesets would block the workflow's own tag writes.
+    """
+
+    ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
+    covering = _covering_tag_rulesets(client, ref=ref)
+    if not any(_ruleset_rule_types(detail) & _TAG_RESTRICTING_RULE_TYPES for detail in covering):
+        return "absent"
+    for detail in covering:
+        if _ruleset_rule_types(detail) & _TAG_WRITE_BLOCKING_RULE_TYPES and not _ruleset_token_can_bypass(detail):
+            return "would-block"
+    return "present"
 
 
 def report_release_settings(client: GitHubClient, *, tag: str = "", tag_prefix: str = "v") -> dict[str, str]:
@@ -621,13 +683,17 @@ def report_release_settings(client: GitHubClient, *, tag: str = "", tag_prefix: 
       ``"unverifiable-pre-run"``. It is instead enforced after publication by the
       read-back check, which fails the run unless the published release reports
       ``immutable: true``.
-    * ``tag_ruleset``: whether an active ``tag``-target ruleset actually covers
-      the dispatched ``refs/tags/<tag>`` (or, when no tag is supplied, the
-      representative ``refs/tags/<prefix>``) and restricts who may create,
-      update, or delete it. Each tag ruleset's ref-name conditions and rule list
-      are read with ``Metadata: read`` (already granted), so a ruleset that
-      covers and restricts the tag is reported ``"present"`` and one that does
-      not (or no tag ruleset at all) is reported ``"absent"``.
+    * ``tag_ruleset``: how the active ``tag``-target rulesets cover the
+      dispatched ``refs/tags/<tag>`` (or, when no tag is supplied, the
+      representative ``refs/tags/<prefix>``). Each tag ruleset's ref-name
+      conditions and rule list are read with ``Metadata: read`` (already
+      granted), and the rulesets are aggregated the way GitHub aggregates them.
+      It is ``"present"`` when a restricting ruleset covers the ref and nothing
+      would block the workflow's own tag writes; ``"would-block"`` when a
+      covering ruleset carries a ``creation`` or ``deletion`` rule this token
+      cannot bypass (the publish gate would refuse before the draft, so a dry
+      run can warn before approval); and ``"absent"`` when no covering ruleset
+      restricts the tag.
 
     This never raises; a read error is reported as ``"unreadable"`` so a
     transient API failure cannot block a release here. The authoritative tag
@@ -637,11 +703,9 @@ def report_release_settings(client: GitHubClient, *, tag: str = "", tag_prefix: 
 
     report = {"immutable_releases": "unverifiable-pre-run", "tag_ruleset": "absent"}
     try:
-        covered = tag_ruleset_covers_v_tags(client, tag=tag, tag_prefix=tag_prefix)
+        report["tag_ruleset"] = _covering_tag_ruleset_status(client, tag=tag, tag_prefix=tag_prefix)
     except Exception:  # noqa: BLE001 - advisory read only; never block on it
         report["tag_ruleset"] = "unreadable"
-        return report
-    report["tag_ruleset"] = "present" if covered else "absent"
     return report
 
 

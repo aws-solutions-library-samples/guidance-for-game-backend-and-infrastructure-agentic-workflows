@@ -16,8 +16,9 @@ ref is ``main``, and validation succeeded):
    downloaded manifest to be byte-identical to it;
 3. fail closed unless the ``release`` environment's policy is fully
    machine-confirmable (required reviewers, prevent-self-review, a main-only
-   deployment branch policy) and an active tag ruleset covers the dispatched
-   ``refs/tags/<tag>`` with a rule set this workflow's own identity can satisfy;
+   deployment branch policy) and the active tag rulesets covering the dispatched
+   ``refs/tags/<tag>`` -- aggregated the way GitHub aggregates them -- carry a
+   rule set this workflow's own identity can satisfy;
 4. re-run the pre-write validations against the live API: commit is still
    ``main`` HEAD, tag ref still absent and strictly greater;
 5. install the SIGTERM-to-exception handler, then create a **draft** release
@@ -308,26 +309,41 @@ def verify_published_release(
 
     failures: list[str] = []
 
-    release = _read_with_retries(
-        lambda: client.get_release(release_id),
-        is_ready=lambda r: bool(r) and r.get("draft") is False and r.get("immutable") is True,
-    )
-    if not release:
-        raise ValidationError("post-publish read-back: release could not be read")
-    if release.get("draft") is not False:
-        failures.append("post-publish read-back: release is still a draft")
-    if str(release.get("tag_name", "")) != inputs.tag:
-        failures.append("post-publish read-back: released tag_name does not equal the intended tag")
-    if release.get("immutable") is not True:
-        failures.append(
-            "post-publish read-back: release is not immutable. The release is published and cannot be made "
-            "immutable retroactively (GitHub applies the immutable-releases setting only to future releases), "
-            "and the same tag cannot be re-dispatched while this release and tag ref exist. "
-            "See docs/RELEASING.md 'Manual recovery' -> 'A read-back failed after publication' for the choices."
+    _read_failed = object()
+    try:
+        release = _read_with_retries(
+            lambda: client.get_release(release_id),
+            is_ready=lambda r: bool(r) and r.get("draft") is False and r.get("immutable") is True,
         )
+    except Exception as error:  # noqa: BLE001 - a persistent read error becomes a failure entry, not an escape
+        # A release read that keeps failing (for example a persistent 5xx after
+        # its retries) must become a failure ENTRY rather than escaping and
+        # discarding the asset and tag checks that still run below. The release
+        # fields that depend on this read are skipped; the entry names the read
+        # error so an operator can act on it with the Manual recovery hand checks.
+        failures.append(f"post-publish read-back: the release read failed and could not be confirmed: {error}")
+        release = _read_failed  # type: ignore[assignment]
 
-    # Assets and tag are read back regardless of the immutability result, so a
-    # mutable-but-also-wrong-assets release reports both, not just the first.
+    if release is not _read_failed:
+        if not release:
+            failures.append("post-publish read-back: release could not be read")
+        else:
+            if release.get("draft") is not False:
+                failures.append("post-publish read-back: release is still a draft")
+            if str(release.get("tag_name", "")) != inputs.tag:
+                failures.append("post-publish read-back: released tag_name does not equal the intended tag")
+            if release.get("immutable") is not True:
+                failures.append(
+                    "post-publish read-back: release is not immutable. The release is published and cannot be "
+                    "made immutable retroactively (GitHub applies the immutable-releases setting only to future "
+                    "releases), and the same tag cannot be re-dispatched while this release and tag ref exist. "
+                    "See docs/RELEASING.md 'Manual recovery' -> 'A read-back failed after publication' for the "
+                    "choices."
+                )
+
+    # Assets and tag are read back regardless of the release-read result, so a
+    # mutable-but-also-wrong-assets release (or a failed release read) still
+    # reports every failure, not just the first.
     failures.extend(_collect_published_asset_failures(client, release_id=release_id, inputs=inputs))
     failures.extend(_collect_published_tag_failures(client, inputs=inputs, created_tag_sha=created_tag_sha))
 
@@ -986,8 +1002,11 @@ def publish_release_from_dir(
     # Fail closed unless an active tag ruleset covers the dispatched
     # refs/tags/<tag> and restricts who may create, update, or delete it, so a
     # non-dry run never publishes a tag the repository does not protect with a
-    # ruleset. The ruleset's ref conditions and rule list are readable with
-    # Metadata: read.
+    # ruleset. GitHub aggregates every covering ruleset, so this also refuses
+    # before the draft when any covering ruleset carries a creation or deletion
+    # rule this workflow's token cannot bypass (which would fail the tag write
+    # or orphan the tag at cleanup). The ruleset ref conditions and rule list
+    # are readable with Metadata: read.
     validate_tag_ruleset_present(client, tag=metadata.tag)
 
     inputs = PublishInputs(

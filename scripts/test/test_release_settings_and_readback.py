@@ -223,6 +223,41 @@ class PostPublishReadBackTests(unittest.TestCase):
         self.assertIn("immutable", message)
         # The asset read error is reported as a failure entry.
         self.assertIn("502", message)
+
+    def test_persistent_release_read_error_becomes_a_failure_entry(self):
+        # If the release read itself keeps failing (for example a persistent
+        # 503), it must become a failure ENTRY rather than escaping as a bare
+        # GitHubError and skipping the asset and tag checks. The asset and tag
+        # checks must still run and report their own failures, so the operator
+        # sees the full picture rather than only the transport error.
+        # Local modules
+        from release.github_client import GitHubError
+
+        inputs = _artifact_inputs()
+        client = _ready_client()
+        client.releases.append({"id": 625, "tag_name": "v0.1.0", "draft": False})
+        # The tag ref is absent (a tag check failure) and the assets are missing
+        # (an asset check failure), so both downstream checks have something to
+        # report once the release read is collected instead of escaping.
+
+        def boom(release_id):
+            raise GitHubError(503, "get-release")
+
+        client.get_release = boom  # type: ignore[assignment]
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=625, inputs=inputs, created_tag_sha="t" * 40)
+        message = str(ctx.exception).lower()
+        # The release read error is a failure entry, not a bare escape.
+        self.assertIn("503", message)
+        # The asset and tag checks still ran and reported their own failures.
+        self.assertIn("post-publish read-back", message)
+        self.assertIn("tag ref", message)
+
+    def test_missing_asset_fails_read_back(self):
+        # If one of the four assets is never recorded on the published release
+        # (for example an upload that reported success but attached nothing),
+        # the read-back's name-set check must fail the run.
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "release-artifacts"
             _write_artifact_set(out)
@@ -352,6 +387,56 @@ class SettingsReportTests(unittest.TestCase):
         client.rulesets = [{"id": 3, "name": "branch stuff", "target": "branch"}]
         report = validate_mod.report_release_settings(client, tag="v0.1.0")
         self.assertEqual(report["tag_ruleset"], "absent")
+
+    def test_tag_ruleset_would_block_reported_for_unbypassable_creation(self):
+        # A covering ruleset with a creation rule the token cannot bypass would
+        # be refused by the publish gate before the draft. The dry-run report
+        # surfaces that as "would-block" (not "present"), so the dry run warns
+        # before approval rather than the refusal arriving only after it.
+        client = RecordingClient()
+        summary = {"id": 55, "name": "v creation", "target": "tag", "enforcement": "active"}
+        detail = {
+            "id": 55,
+            "target": "tag",
+            "enforcement": "active",
+            "current_user_can_bypass": "never",
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+            "rules": [{"type": "creation"}],
+        }
+        client.rulesets = [summary]
+        client.ruleset_details = {55: detail}
+        report = validate_mod.report_release_settings(client, tag="v0.1.0")
+        self.assertEqual(report["tag_ruleset"], "would-block")
+
+    def test_tag_ruleset_would_block_from_a_second_covering_ruleset(self):
+        # An update-only v* ruleset plus a ~ALL deletion ruleset the token
+        # cannot bypass: the aggregate would be refused, so the report is
+        # "would-block" even though the first covering ruleset alone is fine.
+        client = RecordingClient()
+        client.rulesets = [
+            {"id": 61, "name": "update v*", "target": "tag", "enforcement": "active"},
+            {"id": 62, "name": "all deletion", "target": "tag", "enforcement": "active"},
+        ]
+        client.ruleset_details = {
+            61: {
+                "id": 61,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+                "rules": [{"type": "update"}],
+            },
+            62: {
+                "id": 62,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+                "rules": [{"type": "deletion"}],
+            },
+        }
+        report = validate_mod.report_release_settings(client, tag="v0.1.0")
+        self.assertEqual(report["tag_ruleset"], "would-block")
 
     def test_report_never_raises_on_read_error(self):
         client = _ready_client()
@@ -521,6 +606,88 @@ class TagRulesetGateTests(unittest.TestCase):
         client.ruleset_details[42]["current_user_can_bypass"] = "always"
         validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")  # does not raise
 
+    def test_exempt_bypass_passes(self):
+        # `exempt` is a documented current_user_can_bypass value under which
+        # GitHub does not run the rules for the actor, so a creation/deletion
+        # rule does not block the workflow's writes and the gate passes.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "creation"}, {"type": "deletion"}])
+        client.ruleset_details[42]["current_user_can_bypass"] = "exempt"
+        validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")  # does not raise
+
+    def test_pull_requests_only_bypass_fails_closed(self):
+        # `pull_requests_only` lets the actor bypass only on a pull request; a
+        # direct refs/tags/<tag> write is not a pull request, so a creation rule
+        # still blocks the workflow's own write and the gate must fail closed.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "creation"}])
+        client.ruleset_details[42]["current_user_can_bypass"] = "pull_requests_only"
+        with self.assertRaises(validate_mod.ValidationError) as ctx:
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+        self.assertIn("creation", str(ctx.exception).lower())
+
+    def _two_rulesets(self, first, second, *, order=("first", "second")):
+        # Build a client carrying two active tag rulesets. ``first`` and
+        # ``second`` are (include, rules, bypass) tuples; ``order`` controls the
+        # order they are listed in (GitHub does not promise an order, and the
+        # gate must behave the same way regardless).
+        specs = {"first": (10, first), "second": (20, second)}
+        client = RecordingClient()
+        summaries = []
+        details = {}
+        for key in order:
+            rid, (include, rules, bypass) = specs[key]
+            summaries.append({"id": rid, "name": key, "target": "tag", "enforcement": "active"})
+            detail = {
+                "id": rid,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": bypass,
+                "conditions": {"ref_name": {"include": list(include), "exclude": []}},
+                "rules": list(rules),
+            }
+            details[rid] = detail
+        client.rulesets = summaries
+        client.ruleset_details = details
+        return client
+
+    def test_two_rulesets_update_then_deletion_fails_closed_both_orders(self):
+        # GitHub aggregates the rules of EVERY covering ruleset. An update-only
+        # v* ruleset plus a ~ALL deletion ruleset means the deletion rule still
+        # applies to refs/tags/v0.1.0, so cleanup's tag delete would be refused
+        # and leave an orphaned tag. The gate must refuse in BOTH list orders,
+        # not depend on which ruleset GitHub lists first.
+        update_only = (["refs/tags/v*"], [{"type": "update"}], "never")
+        all_deletion = (["~ALL"], [{"type": "deletion"}], "never")
+        for order in (("first", "second"), ("second", "first")):
+            with self.subTest(order=order):
+                client = self._two_rulesets(update_only, all_deletion, order=order)
+                with self.assertRaises(validate_mod.ValidationError) as ctx:
+                    validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+                self.assertIn("deletion", str(ctx.exception).lower())
+
+    def test_two_rulesets_update_then_creation_fails_closed_both_orders(self):
+        # An update-only v* ruleset plus a second covering creation ruleset:
+        # the creation rule would refuse the workflow's own tag-ref write, so
+        # the gate must refuse regardless of list order.
+        update_only = (["refs/tags/v*"], [{"type": "update"}], "never")
+        creation = (["refs/tags/v*"], [{"type": "creation"}], "never")
+        for order in (("first", "second"), ("second", "first")):
+            with self.subTest(order=order):
+                client = self._two_rulesets(update_only, creation, order=order)
+                with self.assertRaises(validate_mod.ValidationError) as ctx:
+                    validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+                self.assertIn("creation", str(ctx.exception).lower())
+
+    def test_two_update_only_rulesets_pass(self):
+        # Two covering update-only rulesets carry no write-blocking rule, so the
+        # aggregate leaves the workflow's create and cleanup writes alone and the
+        # gate passes in either order.
+        a = (["refs/tags/v*"], [{"type": "update"}], "never")
+        b = (["~ALL"], [{"type": "update"}], "never")
+        for order in (("first", "second"), ("second", "first")):
+            with self.subTest(order=order):
+                client = self._two_rulesets(a, b, order=order)
+                validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")  # does not raise
+
     def test_fakes_model_github_creation_enforcement(self):
         # The fakes must model GitHub's documented enforcement: a create_ref
         # for a ref covered by a bypass-less `creation` rule is refused, the way
@@ -554,6 +721,40 @@ class TagRulesetGateTests(unittest.TestCase):
         apply_release_settings(client)
         client.create_ref(ref="refs/tags/v0.1.0", sha="t" * 40)  # no raise
         client.delete_ref("tags/v0.1.0")  # no raise
+
+    def test_fakes_aggregate_two_rulesets_for_a_ref_write(self):
+        # The fakes must aggregate the rules of EVERY covering ruleset the way
+        # GitHub does: an update-only v* ruleset plus a ~ALL deletion ruleset
+        # means the create succeeds (no creation rule) but the cleanup delete is
+        # refused (the deletion rule from the second ruleset still applies). A
+        # first-match fake that only consulted the update ruleset would wrongly
+        # allow the delete.
+        client = RecordingClient()
+        client.rulesets = [
+            {"id": 11, "name": "update v*", "target": "tag", "enforcement": "active"},
+            {"id": 12, "name": "all deletion", "target": "tag", "enforcement": "active"},
+        ]
+        client.ruleset_details = {
+            11: {
+                "id": 11,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+                "rules": [{"type": "update"}],
+            },
+            12: {
+                "id": 12,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+                "rules": [{"type": "deletion"}],
+            },
+        }
+        client.create_ref(ref="refs/tags/v0.1.0", sha="t" * 40)  # no creation rule: allowed
+        with self.assertRaises(RuntimeError):
+            client.delete_ref("tags/v0.1.0")  # deletion rule from the ~ALL ruleset applies
 
     def test_matcher_table_matches_github_fnm_pathname(self):
         # Pin every row of the matcher table against GitHub's
@@ -602,6 +803,15 @@ class TagRulesetGateTests(unittest.TestCase):
             # A backslash escapes the next character (fnmatch default), so `\\v`
             # is a literal `v` and the pattern DOES cover the tag ref.
             (["refs/tags/\\v*"], [], "v0.1.0", True),
+            # A bracket set ends at the FIRST `]` (Ruby), so `[]v]*` is an empty
+            # set (matches no character) followed by the literals `v]`; it covers
+            # no tag ref. Python's own fnmatch would instead treat the leading
+            # `]` as a set member and fail open here.
+            (["refs/tags/[]v]*"], [], "v0.1.0", False),
+            # `[!]]*` is a negated-empty set (matches any one character) followed
+            # by the literals `]`; `refs/tags/<char>]...` never matches a tag ref,
+            # so it covers no tag. Python's fnmatch would fail open.
+            (["refs/tags/[!]]*"], [], "v0.1.0", False),
         ]
         for include, exclude, tag, expected in cases:
             with self.subTest(include=include, exclude=exclude, tag=tag):
@@ -663,6 +873,22 @@ class EnvironmentPolicyGateTests(unittest.TestCase):
         client = self._client()
         client.deployment_branch_policies["release"] = [{"id": 1, "name": "main", "type": "branch"}]
         validate_mod.validate_environment_policy(client)  # does not raise
+
+    def test_report_flags_tag_typed_main_branch_policy(self):
+        # report_environment_policy applies the same branch-typed main check as
+        # the gate: a policy entry named "main" but typed "tag" admits the TAG
+        # main, not the branch, so the report must say branch_policy=missing. A
+        # names-only comparison in the report would wrongly say ok.
+        client = self._client()
+        client.deployment_branch_policies["release"] = [{"id": 1, "name": "main", "type": "tag"}]
+        report = validate_mod.report_environment_policy(client)
+        self.assertEqual(report["branch_policy"], "missing")
+
+    def test_report_accepts_branch_typed_main_branch_policy(self):
+        client = self._client()
+        client.deployment_branch_policies["release"] = [{"id": 1, "name": "main", "type": "branch"}]
+        report = validate_mod.report_environment_policy(client)
+        self.assertEqual(report["branch_policy"], "ok")
 
 
 class ReadBackRetryTests(unittest.TestCase):
@@ -1115,6 +1341,40 @@ class CliVerifyEnvironmentReportTests(unittest.TestCase):
         ):
             cli.cmd_verify_environment(mock.MagicMock())
         self.assertIn("v* tag ruleset=absent", buf.getvalue())
+
+    def test_reports_would_block_for_unbypassable_rule(self):
+        # A covering ruleset with a creation rule the token cannot bypass prints
+        # "would-block" and the before-approval note, so the dry run warns that
+        # the publish gate would refuse before the draft.
+        # Standard library
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        # Local modules
+        from release import cli
+
+        client = _ready_client()
+        client.rulesets = [{"id": 71, "name": "v creation", "target": "tag", "enforcement": "active"}]
+        client.ruleset_details = {
+            71: {
+                "id": 71,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+                "rules": [{"type": "creation"}],
+            }
+        }
+        buf = io.StringIO()
+        with (
+            mock.patch.object(cli, "_client", return_value=(client, "o", "r")),
+            redirect_stdout(buf),
+        ):
+            cli.cmd_verify_environment(mock.MagicMock())
+        out = buf.getvalue()
+        self.assertIn("v* tag ruleset=would-block", out)
+        self.assertIn("cannot bypass", out)
 
     def test_report_uses_the_dispatched_tag_from_the_environment(self):
         # The settings report must be built with the dispatched GBAW_RELEASE_TAG,

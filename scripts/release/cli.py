@@ -246,6 +246,13 @@ def cmd_verify_environment(_args: argparse.Namespace) -> int:
             "so published tags and assets are immutable "
             "(see docs/RELEASING.md 'Recommended maintainer settings')"
         )
+    elif settings["tag_ruleset"] == "would-block":
+        print(
+            "note: a tag ruleset covering refs/tags/v* carries a creation or deletion rule this workflow's "
+            "token cannot bypass; the publish step fails closed before the draft. Restrict release tags with "
+            "an 'update' rule only, which leaves this workflow's create and cleanup writes alone "
+            "(see docs/RELEASING.md 'Recommended maintainer settings')"
+        )
     # Report the two environment-policy rules the publish step enforces after
     # approval (prevent-self-review and the main-only branch policy), so a dry
     # run surfaces a weak policy before the non-dry run fails post-approval.
