@@ -15,8 +15,8 @@ dependencies = [
     # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
     "mcp>=1.30.0",
 
-    # AWS SDK. The floor tracks the locked boto3/botocore so a fresh
-    # resolution cannot drop below the validated graph.
+    # AWS SDK. The floor tracks the locked boto3/botocore versions so a fresh
+    # resolution cannot select older ones.
     "boto3>=1.43.108",
     "botocore>=1.43.108",
 
