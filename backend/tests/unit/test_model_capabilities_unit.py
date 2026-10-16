@@ -51,6 +51,29 @@ class TestModelCapabilityTable:
         assert caps.send_temperature is True
         assert caps.thinking is None
 
+    def test_documented_rollback_ids_resolve_silently(self):
+        # The documented rollback IDs are listed in the table, so resolving
+        # them keeps temperature, sends no thinking field, and does not warn.
+        with patch("config.model_capabilities.logger") as mock_logger:
+            haiku = get_model_capabilities("global.anthropic.claude-haiku-4-5-20251001-v1:0")
+            sonnet = get_model_capabilities("global.anthropic.claude-sonnet-4-6")
+        assert haiku.send_temperature is True and haiku.thinking is None
+        assert sonnet.send_temperature is True and sonnet.thinking is None
+        mock_logger.warning.assert_not_called()
+
+    def test_unmatched_newer_model_warns_that_it_will_be_rejected(self):
+        # An unrecognized ID that still looks like a newer generation (Claude
+        # 5.x or Opus 4.7+) gets the earlier-generation fallback shape, which
+        # that model rejects. The warning must name that cause, not imply the
+        # fallback is safe.
+        with patch("config.model_capabilities.logger") as mock_logger:
+            caps = get_model_capabilities("global.anthropic.claude-opus-5-5")
+        assert caps.send_temperature is True
+        mock_logger.warning.assert_called_once()
+        message = mock_logger.warning.call_args.args[0]
+        assert "temperature" in message
+        assert "400" in message
+
     def test_unmatched_profile_falls_back_and_warns(self):
         with patch("config.model_capabilities.logger") as mock_logger:
             caps = get_model_capabilities(
@@ -59,11 +82,11 @@ class TestModelCapabilityTable:
         assert caps.send_temperature is True
         assert caps.thinking is None
         mock_logger.warning.assert_called_once()
-        # The warning tells the operator the profile is rejected because it
-        # receives temperature, and points to the system profile IDs.
+        # The warning tells the operator the profile receives temperature and so
+        # fails with a 400, and points to the system profile IDs.
         message = mock_logger.warning.call_args.args[0]
         assert "temperature" in message
-        assert "rejected" in message
+        assert "400" in message
         assert "global." in message
 
     def test_unmatched_id_warns_once_per_distinct_id(self):
