@@ -214,10 +214,14 @@ echo "🤖 Step 2: Launching AgentCore Runtime..."
 cd "$PROJECT_ROOT/backend"
 
 # Ensure backend dependencies (including agentcore CLI) are installed.
-# The preflight already synced and verified the venv is bootable (#517); this
+# The preflight already synced and ran the runtime path guard (#517); this
 # re-sync is idempotent and keeps Step 2 self-contained.
 echo "📦 Installing backend dependencies..."
-uv sync > /dev/null 2>&1
+if ! _uv_sync_out=$(uv sync 2>&1); then
+    echo "❌ 'uv sync' failed:" >&2
+    echo "$_uv_sync_out" >&2
+    exit 1
+fi
 
 # Resolve model roles through the same canonical Python configuration used by
 # local runtime. Process variables override ui/.env.local; canonical role names

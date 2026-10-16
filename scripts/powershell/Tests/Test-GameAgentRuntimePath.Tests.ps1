@@ -64,17 +64,18 @@ Describe 'Test-GameAgentRuntimePath' {
 
     It 'Default runner runs the shared guard from the physical backend directory' {
         # Selection correctness: the default GuardRunner must run the shared
-        # Python guard inside the uv-selected environment, from the physical
-        # backend directory `agentcore launch` resolves the project from, so the
-        # guard measures the real <env>/bin/python3 (honoring
-        # UV_PROJECT_ENVIRONMENT) rather than a reconstructed or symlinked path.
-        # Assert against the function body so the test needs no uv or real venv.
+        # Python guard inside the uv-selected environment, from the backend
+        # directory `agentcore launch` resolves the project from, so uv's child
+        # process discovers the same environment and the guard measures the real
+        # <env>/bin/python3 (honoring UV_PROJECT_ENVIRONMENT) rather than a
+        # reconstructed path. Assert against the function body so the test needs
+        # no uv or real venv.
         $body = (Get-Command Test-GameAgentRuntimePath).ScriptBlock.ToString()
         $body | Should -Match 'Push-Location \$Backend'
         $body | Should -Match '\$PWD\.ProviderPath'
         $body | Should -Match 'uv run python \$Script'
         # The default runner must not pin a logical --project path that bypasses
-        # the physical working directory.
+        # the physical working directory uv's child process would discover.
         $body | Should -Not -Match 'uv run --project \$Backend'
     }
 }

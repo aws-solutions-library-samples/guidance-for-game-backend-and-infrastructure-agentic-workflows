@@ -138,7 +138,11 @@ function Deploy-GameAgent {
     try {
         $uvSyncOutput = uv sync 2>&1
         if ($LASTEXITCODE -ne 0) {
-            $uvSyncOutput | ForEach-Object { Write-GameAgentStatus $_ -Type Error }
+            # uv prints blank lines between its diagnostic sections; render the
+            # captured output as one block so Write-GameAgentStatus's mandatory
+            # Message parameter is not bound to an empty string.
+            $uvSyncText = ($uvSyncOutput | Out-String).TrimEnd()
+            if ($uvSyncText) { Write-GameAgentStatus $uvSyncText -Type Error }
             throw "uv sync failed (exit code $LASTEXITCODE)"
         }
     } finally { Pop-Location }
@@ -234,7 +238,11 @@ function Deploy-GameAgent {
         # runtime path guard runs in the earlier preflight block.
         $uvSyncOutput = uv sync 2>&1
         if ($LASTEXITCODE -ne 0) {
-            $uvSyncOutput | ForEach-Object { Write-GameAgentStatus $_ -Type Error }
+            # uv prints blank lines between its diagnostic sections; render the
+            # captured output as one block so Write-GameAgentStatus's mandatory
+            # Message parameter is not bound to an empty string.
+            $uvSyncText = ($uvSyncOutput | Out-String).TrimEnd()
+            if ($uvSyncText) { Write-GameAgentStatus $uvSyncText -Type Error }
             throw "uv sync failed (exit code $LASTEXITCODE)"
         }
 

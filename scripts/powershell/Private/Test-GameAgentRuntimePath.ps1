@@ -24,9 +24,10 @@ function Test-GameAgentRuntimePath {
         Optional scriptblock that runs the shared guard and returns a hashtable
         with ExitCode and Output keys. Injected by tests to avoid invoking uv or
         touching a real venv; defaults to running the Python guard from inside
-        the physical backend directory (the working directory `agentcore launch`
-        resolves the project from) so it measures the same interpreter uv embeds
-        into the packaged console scripts.
+        the backend directory (the working directory `agentcore launch` resolves
+        the project from, so uv's child process discovers the same environment)
+        so it measures the same interpreter uv embeds into the packaged console
+        scripts.
     .EXAMPLE
         Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
     #>
@@ -49,11 +50,14 @@ function Test-GameAgentRuntimePath {
     if (-not $GuardRunner) {
         $GuardRunner = {
             param([string]$Script, [string]$Backend)
-            # Run the shared guard from inside the physical backend directory —
-            # the same working directory `agentcore launch` resolves the project
-            # from — so uv selects the same environment and the guard measures
-            # the interpreter path that actually ships. Push-Location then
-            # $PWD.ProviderPath canonicalizes a symlinked checkout path.
+            # Run the shared guard from inside the backend directory — the same
+            # working directory `agentcore launch` resolves the project from — so
+            # uv's child process discovers the project from that physical working
+            # directory and selects the same environment, and the guard measures
+            # the interpreter path that actually ships. `$PWD.ProviderPath` passes
+            # the location as entered (it maps only the PowerShell drive root, and
+            # may keep a symlink spelling); it affects only the remedy wording,
+            # which canonicalizes directories before comparing.
             Push-Location $Backend
             try {
                 $physicalBackend = $PWD.ProviderPath
