@@ -64,7 +64,7 @@ class TestCachedBedrockModels:
         assert call_args["region_name"] == AWS_REGION
         assert call_args["cache_prompt"] == "default"
         assert call_args["cache_tools"] == "default"
-        # The default specialist model rejects temperature and turns thinking off.
+        # The default specialist model rejects temperature and gets between_tools thinking.
         assert "temperature" not in call_args
         assert call_args["additional_request_fields"] == {"thinking": {"type": "between_tools"}}
         assert result == mock_model

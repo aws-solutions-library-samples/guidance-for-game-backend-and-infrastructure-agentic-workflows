@@ -2,10 +2,12 @@
 
 Different Claude model generations accept different inference parameters. The
 Claude 5.5 models reject the ``temperature`` and ``top_p`` sampling parameters
-and run adaptive thinking unless an explicit ``thinking`` field turns it off,
-while earlier Claude models accept ``temperature`` and take no ``thinking``
-field. This module keeps that knowledge in one small, explicit table so the
-model-construction path can decide, per model:
+and take an explicit ``thinking`` field that selects the thinking mode (Haiku
+5.5 accepts ``disabled``; Sonnet 5.5 rejects ``disabled`` and takes
+``between_tools``, whose progress between tool calls comes back as thinking
+blocks), while earlier Claude models accept ``temperature`` and take no
+``thinking`` field. This module keeps that knowledge in one small, explicit
+table so the model-construction path can decide, per model:
 
 * whether to send ``temperature`` in the Converse ``inferenceConfig``, and
 * which ``thinking`` value to send through the Strands ``BedrockModel``
@@ -80,8 +82,9 @@ _CAPABILITY_PATTERNS: tuple[tuple[str, ModelCapabilities], ...] = (
     # Claude Haiku 5.5 rejects temperature/top_p and turns thinking off with
     # {"type": "disabled"}.
     ("claude-haiku-5-5", ModelCapabilities(send_temperature=False, thinking={"type": "disabled"})),
-    # Claude Sonnet 5.5 rejects temperature/top_p and turns thinking off with
-    # {"type": "between_tools"}; it rejects {"type": "disabled"}.
+    # Claude Sonnet 5.5 rejects temperature/top_p and {"type": "disabled"}; with
+    # {"type": "between_tools"} its progress between tool calls comes back as
+    # thinking blocks.
     ("claude-sonnet-5-5", ModelCapabilities(send_temperature=False, thinking={"type": "between_tools"})),
     # Previous default rollback targets. These earlier models accept temperature
     # and take no thinking field; listing them keeps a rollback silent.
