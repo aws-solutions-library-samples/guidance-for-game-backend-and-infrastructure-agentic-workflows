@@ -123,7 +123,7 @@ deployment predicts these launch-side changes before every launch and warns
 about them, and a fail-closed stop switch
 (`GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true`, PowerShell
 `-StopOnAccountObservabilityChange`) can halt the deploy before `agentcore
-launch` makes any of these changes so no shared setting is modified. The residual
+launch` makes any of these changes. The residual
 is that, without the stop switch, the
 toolkit still performs this setup during `agentcore launch`; it exposes no flag
 to skip only that step.

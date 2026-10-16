@@ -390,7 +390,12 @@ Enable Transaction Search once in the AWS X-Ray / CloudWatch console. That
 creates the AWS-reserved `aws/spans` log group, switches the trace destination,
 and sets the `Default` indexing rule. Then re-run with the stop switch still set.
 If the preflight still reports the resource policy, the account has no policy
-with the toolkit's exact name yet.
+with the toolkit's exact name yet. If another policy already grants `aws/spans`
+access under a different name, such as this repository's
+`GameAgentTransactionSearchXRayAccess`, neither the console nor the opt-in adds
+the name `TransactionSearchXRayAccess`. Add a policy named exactly
+`TransactionSearchXRayAccess`, or run one deploy without the stop switch so the
+toolkit adds it.
 
 This repository's opt-in uses the project-owned name
 `GameAgentTransactionSearchXRayAccess` by default, which does **not** satisfy the
@@ -399,7 +404,8 @@ own policy write when another policy already grants `xray.amazonaws.com` access
 to `aws/spans`. So it reaches a passing state only when `aws/spans` already
 exists and no other policy grants that access. On such an account, run the opt-in
 with the matching policy name to switch the destination and add the policy the
-toolkit looks for:
+toolkit looks for (the opt-in leaves the shared `Default` indexing rule in place,
+so the console enable above still creates it when it is missing):
 
 ```bash
 GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
