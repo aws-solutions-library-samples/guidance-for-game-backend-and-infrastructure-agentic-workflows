@@ -504,11 +504,12 @@ def invoke_agent(prompt, context=None):
 
     except Exception as e:
         # Record a bounded, non-sensitive failure: the exception class, a typed
-        # sanitized error code, and the request ID for correlation. The raw
-        # exception message is deliberately not emitted — a provider validation
-        # error or SDK error body can quote caller values (prompt text, actor or
-        # session IDs) and may itself carry CR/LF. The full traceback is written
-        # only when debug logging is explicitly enabled (a dev-only switch).
+        # sanitized error code, the request ID for correlation, and bounded
+        # raise-site frames (module:function:lineno). The raw exception message
+        # is deliberately not emitted — a provider validation error or SDK error
+        # body can quote caller values (prompt text, actor or session IDs) and
+        # may itself carry CR/LF. The full rendered traceback is written only
+        # when debug logging is explicitly enabled (a dev-only switch).
         logger.error("=" * 80)
         log_sanitized_exception(
             logger,

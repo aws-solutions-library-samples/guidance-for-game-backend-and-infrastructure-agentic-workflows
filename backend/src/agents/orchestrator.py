@@ -398,8 +398,9 @@ def run_orchestrator(query: str, context: dict = None):
             elif cost_report_followup:
                 # The failing call is the orchestrator model loop over the user
                 # prompt; its exception message can quote the prompt or a
-                # provider validation payload, so record only the sanitized
-                # class/code/request-id rather than the raw message or traceback.
+                # provider validation payload, so record the sanitized
+                # class/code/request-id and bounded raise-site frames rather than
+                # the raw message or rendered traceback.
                 log_sanitized_exception(
                     logger, "Cost report ID follow-up failed before producing a deterministic rendering", exc
                 )

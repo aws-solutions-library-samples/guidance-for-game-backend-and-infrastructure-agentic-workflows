@@ -136,11 +136,12 @@ def create_specialist_agent(
 
                 except Exception as exc:
                     # Record a bounded, non-sensitive failure server-side: the
-                    # exception class and a typed sanitized code, never the raw
-                    # message. A provider or SDK error body can embed ARNs, stack
-                    # frames, or caller values; the full traceback is emitted only
-                    # when debug logging is explicitly enabled. The user-facing
-                    # string is always generic.
+                    # exception class, a typed sanitized code, and bounded
+                    # raise-site frames, never the raw message. A provider or SDK
+                    # error body can embed ARNs, stack frames, or caller values;
+                    # the full rendered traceback is emitted only when debug
+                    # logging is explicitly enabled. The user-facing string is
+                    # always generic.
                     log_sanitized_exception(logger, f"❌ {service_name} agent failed", exc)
                     if fallback_fn:
                         fallback_message = fallback_fn(AWS_REGION)

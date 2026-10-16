@@ -119,10 +119,10 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
         return True
 
     except Exception as e:
-        # Record only the exception class and a sanitized error code. The raw
-        # message is withheld: an AgentCore Memory validation error can quote the
-        # record text or actor namespace, which are exactly the values this
-        # function must keep out of logs.
+        # Record the exception class, a sanitized error code, and bounded
+        # raise-site frames. The raw message is withheld: an AgentCore Memory
+        # validation error can quote the record text or actor namespace, which
+        # are exactly the values this function must keep out of logs.
         log_sanitized_exception(logger, "❌ Failed to save semantic memory", e)
         return False
 

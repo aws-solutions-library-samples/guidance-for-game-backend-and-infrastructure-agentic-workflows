@@ -182,18 +182,22 @@ or raw session/thread identifiers.
 - The request-handling error paths that can see prompt or identity values — the
   AgentCore entrypoint, the orchestrator (including the model-loop failure over
   the user prompt), the specialists, agent timing, and semantic memory — record
-  the exception class name and a typed, sanitized error code (plus the request
-  ID) through `log_sanitized_exception()`, never the exception message, since a
-  provider or SDK error body can quote caller values. The full traceback is
-  emitted only when debug logging is explicitly enabled (a non-production
-  switch). Authentication errors are generic to clients and logs. Separately
-  governed diagnostic paths that do not carry prompt or identity values retain
-  the exception message to classify the failure: startup credential and
-  container pre-warm checks and the memory-ID config read in `agentcore_main`,
-  the GameLift specialist's AWS SDK describe/list calls, the Cost Explorer
-  diagnostic path, the cost-report snapshot store's DynamoDB failure paths, and
-  the Bedrock Prompt Management load fallback. Prepared operations and executor payloads must not contain
-  tokens, email addresses, or display names.
+  the exception class name, a typed, sanitized error code, the request ID, and a
+  bounded list of `module:function:lineno` raise-site frames (no message,
+  locals, arguments, source text, or file paths) through
+  `log_sanitized_exception()`, never the exception message, since a provider or
+  SDK error body can quote caller values. The bounded raise-site frames restore
+  bug triage without reintroducing caller- or provider-authored content. The
+  full rendered traceback is emitted only when debug logging is explicitly
+  enabled (a non-production switch). Authentication errors are generic to clients
+  and logs. Separately governed diagnostic paths that do not carry prompt or
+  identity values retain the exception message to classify the failure: startup
+  credential and container pre-warm checks and the memory-ID config read in
+  `agentcore_main`, the GameLift specialist's AWS SDK describe/list calls, the
+  Cost Explorer diagnostic path, the cost-report snapshot store's DynamoDB
+  failure paths, and the Bedrock Prompt Management load fallback. Prepared
+  operations and executor payloads must not contain tokens, email addresses, or
+  display names.
 
 A static regression test
 (`backend/tests/unit/test_log_static_regression_unit.py`) scans every module in

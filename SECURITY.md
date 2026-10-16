@@ -732,16 +732,21 @@ or raw session/thread identifiers.
 - The request-handling error paths that can see prompt or identity values — the
   AgentCore entrypoint, the orchestrator (including the model-loop failure over
   the user prompt), the specialists, agent timing, and semantic memory — record
-  the exception class name and a typed, sanitized error code (and the request
-  ID) through `log_sanitized_exception()`, never the exception message, which
-  can embed a provider validation payload or caller value. The full traceback is
-  emitted only when debug logging is explicitly enabled (a non-production
-  switch). Separately governed diagnostic paths that cannot carry prompt or
-  identity values do retain the exception message to classify the failure:
-  startup credential and container pre-warm checks and the memory-ID config read
-  in `agentcore_main`, the GameLift specialist's AWS SDK describe/list calls, the
-  Cost Explorer diagnostic path, the cost-report snapshot store's DynamoDB failure
-  paths, and the Bedrock Prompt Management load fallback.
+  the exception class name, a typed, sanitized error code, the request ID, and a
+  bounded list of `module:function:lineno` raise-site frames (no message,
+  locals, arguments, source text, or file paths) through
+  `log_sanitized_exception()`, never the exception message, which can embed a
+  provider validation payload or caller value. The raise-site frames restore
+  bug triage without reintroducing caller- or provider-authored content, and the
+  frame count and each component are bounded so a deep stack cannot produce an
+  unbounded line. The full rendered traceback is emitted only when debug logging
+  is explicitly enabled (a non-production switch). Separately governed diagnostic
+  paths that cannot carry prompt or identity values do retain the exception
+  message to classify the failure: startup credential and container pre-warm
+  checks and the memory-ID config read in `agentcore_main`, the GameLift
+  specialist's AWS SDK describe/list calls, the Cost Explorer diagnostic path,
+  the cost-report snapshot store's DynamoDB failure paths, and the Bedrock Prompt
+  Management load fallback.
 
 ### Secrets Management
 

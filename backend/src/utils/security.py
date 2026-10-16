@@ -439,19 +439,51 @@ def classify_exception(exc: BaseException) -> str:
 # count keeps a deep or recursive stack from producing an unbounded log line.
 _MAX_TRACEBACK_FRAMES = 20
 
+# Upper bound on the length of each component (module and function name) in a
+# single frame locus. A caller or dynamically generated frame can carry an
+# arbitrarily long ``__name__`` or ``co_name``; capping each component keeps a
+# single frame from producing an unbounded log line.
+_MAX_FRAME_COMPONENT_LENGTH = 128
+
+# Constant used in place of a frame's module name when ``__name__`` is missing
+# or is not a ``str``. A code-owned sentinel is used rather than a filesystem
+# path so a frame locus can never disclose ``co_filename``.
+_UNKNOWN_FRAME_MODULE = "<unknown>"
+
+
+def _frame_component(value: Any) -> str:
+    """Normalize and bound-cap a single frame component.
+
+    The value is collapsed to a single injection-safe line and truncated to
+    :data:`_MAX_FRAME_COMPONENT_LENGTH` characters so no single component can
+    forge a log line or grow without bound.
+    """
+    text = normalize_log_value(value)
+    if len(text) > _MAX_FRAME_COMPONENT_LENGTH:
+        text = text[:_MAX_FRAME_COMPONENT_LENGTH]
+    return text
+
 
 def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBACK_FRAMES) -> list[str]:
     """Return a bounded list of ``module:function:lineno`` raise-site frames.
 
     Each frame contributes only three code-owned values: the dotted module name
-    (``frame.f_globals["__name__"]``, which carries no filesystem path), the
-    function name (``frame.f_code.co_name``), and the line number. The exception
-    message, local variable values, call arguments, and source text are never
-    read, so a provider- or caller-authored string cannot ride along. The module
-    name is passed through :func:`normalize_log_value` as a defensive measure in
-    case an exotic ``__name__`` holds a control character; it carries no CR/LF in
-    normal operation. The innermost ``limit`` frames are kept (the raise site and
-    its nearest callers), which is where triage starts.
+    (``frame.f_globals["__name__"]`` when it is a string, which carries no
+    filesystem path), the function name (``frame.f_code.co_name``), and the line
+    number. The exception message, local variable values, call arguments, and
+    source text are never read, so a provider- or caller-authored string cannot
+    ride along. When a frame's ``__name__`` is missing or is not a string, a
+    code-owned ``<unknown>`` sentinel is used rather than ``co_filename``, so a
+    frame locus can never disclose a file path. Each component is passed through
+    :func:`normalize_log_value` and length-capped, so an exotic ``__name__`` or
+    ``co_name`` holding control characters or an unbounded length cannot forge a
+    log line. The innermost ``limit`` frames are kept (the raise site and its
+    nearest callers), which is where triage starts.
+
+    The walk is wrapped so the helper is total: it never raises, even for a frame
+    whose ``__name__`` is an object whose ``__str__`` raises. On any failure it
+    returns the frames gathered so far, so a sanitized error record is always
+    produced.
 
     Args:
         exc: The exception whose traceback frames are summarized.
@@ -462,19 +494,30 @@ def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBAC
         the exception carries no traceback.
     """
     frames: list[str] = []
-    tb = exc.__traceback__
-    # Walk outermost-to-innermost, collecting a compact locus per frame, then
-    # reverse so the innermost (raise site) comes first and the bound keeps the
-    # frames closest to the failure.
-    while tb is not None:
-        frame = tb.tb_frame
-        module = frame.f_globals.get("__name__") or frame.f_code.co_filename.rsplit("/", 1)[-1]
-        function = frame.f_code.co_name
-        lineno = tb.tb_lineno
-        frames.append(f"{normalize_log_value(module)}:{function}:{lineno}")
-        tb = tb.tb_next
-    frames.reverse()
-    clamped = max(1, int(limit))
+    try:
+        tb = exc.__traceback__
+        # Walk outermost-to-innermost, collecting a compact locus per frame, then
+        # reverse so the innermost (raise site) comes first and the bound keeps
+        # the frames closest to the failure.
+        while tb is not None:
+            frame = tb.tb_frame
+            raw_module = frame.f_globals.get("__name__")
+            # Use the module name only when it is genuinely a string. A non-string
+            # (or missing) ``__name__`` resolves to a code-owned sentinel rather
+            # than a file path, so ``co_filename`` never reaches the log.
+            module = _frame_component(raw_module) if isinstance(raw_module, str) else _UNKNOWN_FRAME_MODULE
+            function = _frame_component(frame.f_code.co_name)
+            lineno = tb.tb_lineno
+            frames.append(f"{module}:{function}:{lineno}")
+            tb = tb.tb_next
+        frames.reverse()
+    except Exception:
+        # Keep the helper total: a sanitized error record must still be produced
+        # even if an exotic frame makes the walk raise. Return whatever was
+        # gathered (outermost-first here, but the caller only needs a bounded,
+        # content-free list).
+        pass
+    clamped = max(1, int(limit)) if isinstance(limit, int) else _MAX_TRACEBACK_FRAMES
     return frames[:clamped]
 
 

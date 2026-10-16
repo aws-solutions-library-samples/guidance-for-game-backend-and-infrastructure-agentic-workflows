@@ -57,6 +57,30 @@ class _CaptureSink:
         logger.remove(self._sink_id)
 
 
+class _StructuredSink:
+    """A callable loguru sink that captures each record's structured parts.
+
+    A callable sink receives the loguru ``Message`` whose ``.record`` exposes the
+    bound ``extra`` dict and the attached ``exception`` without rendering only
+    ``{message}``. This lets a test inspect the structured ``frames`` extra and
+    the exception a sink would serialize (for example a ``serialize=True`` sink),
+    so a leak hidden in ``bind(...)`` rather than the message line is caught.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+        self._sink_id = logger.add(self._write, level="DEBUG", format="{message}", backtrace=False, diagnose=False)
+
+    def _write(self, message: "object") -> None:
+        self.records.append(dict(message.record))  # type: ignore[attr-defined]
+
+    def __enter__(self) -> "_StructuredSink":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        logger.remove(self._sink_id)
+
+
 # ---------------------------------------------------------------------------
 # Control-character normalization (sanitizer + redaction helpers)
 # ---------------------------------------------------------------------------
@@ -200,12 +224,9 @@ def test_log_sanitized_exception_hides_message_keeps_class_and_code():
 
 
 def test_sanitized_exception_logs_bounded_raise_site_frames():
-    """Red-green: the production error path records ``module:function:lineno``
-    raise-site frames so a plain bug (KeyError/TypeError) is triageable, while
-    still never emitting the message, locals, or a filesystem path.
-
-    This fails on a build that logs only ``[class=… code=… request_id=…]`` with
-    no frames, and passes once bounded frames are composed into the record.
+    """The production error path records ``module:function:lineno`` raise-site
+    frames so a plain bug (KeyError/TypeError) is triageable, while still never
+    emitting the message, locals, or a filesystem path.
     """
     # Local modules
     from utils.security import log_sanitized_exception
@@ -248,11 +269,13 @@ def test_sanitized_exception_logs_bounded_raise_site_frames():
 
 
 def test_sanitized_traceback_frames_are_bounded_and_content_free():
-    """The frame helper caps the number of frames and never reads the message.
+    """The frame helper caps the number of frames, orders them innermost-first,
+    and never reads the message.
 
-    A deeply recursive stack must not produce an unbounded line, and the frames
-    must carry only ``module:function:lineno`` loci — a secret-shaped marker in
-    the exception message must not appear in any frame.
+    A deeply recursive stack must not produce an unbounded line, the raise site
+    must come first, the outermost (test) frame must be dropped once the stack
+    exceeds the cap, and the frames must carry only ``module:function:lineno``
+    loci — a secret-shaped marker in the exception message must not appear.
     """
     # Local modules
     from utils.security import _MAX_TRACEBACK_FRAMES, sanitized_traceback_frames
@@ -273,8 +296,174 @@ def test_sanitized_traceback_frames_are_bounded_and_content_free():
     for frame in frames:
         assert frame.count(":") >= 2
         assert PROMPT_MARKER not in frame
-    # The innermost frame (raise site) is kept.
-    assert any(":_recurse:" in frame for frame in frames)
+    # Innermost-first ordering: frames[0] is the actual raise site (the ``raise``
+    # inside ``_recurse``), not an outer frame.
+    assert frames[0].startswith(f"{__name__}:_recurse:")
+    assert all(":_recurse:" in frame for frame in frames)
+    # The stack is deeper than the cap, so the outermost frame — this test
+    # function, which called ``_recurse`` — is dropped by the innermost-first
+    # bound.
+    assert not any(
+        f"{__name__}:test_sanitized_traceback_frames_are_bounded_and_content_free:" in frame for frame in frames
+    )
+
+
+def test_sanitized_exception_structured_frames_extra_is_content_free():
+    """The structured ``frames`` extra (what a serialize=True sink emits) carries
+    only ``module:function:lineno`` loci, never the exception message.
+
+    This inspects ``record["extra"]`` and the attached exception directly through
+    a callable sink, so a leak bound into ``bind(...)`` — or folded into the
+    bound ``frames`` list — is caught even though the stdout format renders only
+    ``{message}``.
+    """
+    # Local modules
+    from utils.security import log_sanitized_exception
+
+    def _inner_boom():
+        raise KeyError(f"missing {PROMPT_MARKER} for actor {SUBJECT_MARKER}")
+
+    try:
+        _inner_boom()
+    except KeyError as exc:
+        with _StructuredSink() as sink:
+            log_sanitized_exception(logger, "operation failed", exc, request_id="req-extra", debug_traceback=False)
+
+    assert sink.records, "expected a captured record"
+    record = sink.records[-1]
+    extra = record["extra"]
+
+    # The bound frames extra is a list of loci and references the raising
+    # function, proving it is populated.
+    frames_extra = extra["frames"]
+    assert isinstance(frames_extra, list) and frames_extra
+    assert any(":_inner_boom:" in frame for frame in frames_extra)
+
+    # No bound extra value — including a leaked error string — carries the
+    # secret-shaped message content.
+    for key, value in extra.items():
+        assert PROMPT_MARKER not in str(value), f"marker leaked into extra[{key!r}]"
+        assert SUBJECT_MARKER not in str(value), f"marker leaked into extra[{key!r}]"
+        assert "missing" not in str(value), f"message slice leaked into extra[{key!r}]"
+
+    # The production path attaches no exception object, so a serialize=True sink
+    # cannot render str(exc) into its "exception" field.
+    assert record["exception"] is None
+
+
+@pytest.mark.parametrize(
+    "name_value, name_label",
+    [
+        pytest.param(None, "missing", id="missing-name"),
+        pytest.param(0, "non-string", id="non-string-name"),
+    ],
+)
+def test_sanitized_traceback_frames_total_for_hostile_frames(name_value, name_label, monkeypatch):
+    """The helper never raises and never leaks a file path for a hostile frame.
+
+    A frame whose module ``__name__`` is missing or a non-string whose
+    ``__str__`` raises must not make the helper raise (which would hand the
+    original exception to the SDK's unredacted formatter), and must resolve to a
+    code-owned ``<unknown>`` sentinel rather than ``co_filename``.
+    """
+    # Local modules
+    from utils.security import _UNKNOWN_FRAME_MODULE, sanitized_traceback_frames
+
+    class _ExplodingName:
+        def __str__(self) -> str:
+            raise RuntimeError(f"boom {PROMPT_MARKER}")
+
+        def __repr__(self) -> str:
+            raise RuntimeError(f"boom {PROMPT_MARKER}")
+
+    chosen = _ExplodingName() if name_label == "non-string" else name_value
+
+    def _boom():
+        raise ValueError("hostile frame")
+
+    try:
+        _boom()
+    except ValueError as exc:
+        # Rewrite the raising frame's module __name__ to the hostile value. The
+        # frame shares this module's globals, so save and restore __name__ around
+        # the call to avoid leaking the mutation into other tests.
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        assert tb is not None
+        globals_dict = tb.tb_frame.f_globals
+        saved = globals_dict.get("__name__")
+        globals_dict["__name__"] = chosen
+        try:
+            # The helper must stay total.
+            frames = sanitized_traceback_frames(exc)
+        finally:
+            globals_dict["__name__"] = saved
+
+    assert frames, "helper returned no frames for a valid traceback"
+    # The hostile frame resolved to the sentinel, not a filesystem path.
+    innermost = frames[0]
+    assert innermost.startswith(f"{_UNKNOWN_FRAME_MODULE}:")
+    # No file path or marker leaked from the hostile frame.
+    assert ".py" not in innermost
+    assert PROMPT_MARKER not in innermost
+
+
+def test_sanitized_traceback_frames_cap_component_length():
+    """A pathologically long module ``__name__`` is length-capped per component,
+    so one frame cannot produce an unbounded line."""
+    # Local modules
+    from utils.security import _MAX_FRAME_COMPONENT_LENGTH, sanitized_traceback_frames
+
+    def _boom():
+        raise ValueError("long name")
+
+    try:
+        _boom()
+    except ValueError as exc:
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_next is not None:
+            tb = tb.tb_next
+        assert tb is not None
+        globals_dict = tb.tb_frame.f_globals
+        saved = globals_dict.get("__name__")
+        globals_dict["__name__"] = "m" * 100_000
+        try:
+            frames = sanitized_traceback_frames(exc)
+        finally:
+            globals_dict["__name__"] = saved
+
+    module = frames[0].split(":", 1)[0]
+    assert len(module) <= _MAX_FRAME_COMPONENT_LENGTH
+
+
+def test_sanitized_traceback_frames_normalize_function_name():
+    """CR/LF in a frame's ``co_name`` is normalized, so it cannot forge a second
+    line in the structured ``frames`` extra or the message."""
+    # Standard library
+    import types
+
+    # Local modules
+    from utils.security import sanitized_traceback_frames
+
+    def _raiser():
+        raise ValueError("crlf co_name")
+
+    # Build a function whose code object carries a CR/LF-bearing co_name, so the
+    # raising frame's function name holds control characters without touching the
+    # read-only f_code of a live frame.
+    forged_code = _raiser.__code__.replace(co_name="victim\r\nINJECTED-FUNC")
+    forged = types.FunctionType(forged_code, _raiser.__globals__, "forged")
+
+    try:
+        forged()
+    except ValueError as exc:
+        frames = sanitized_traceback_frames(exc)
+
+    locus = frames[0]
+    assert "\r" not in locus
+    assert "\n" not in locus
+    assert "INJECTED-FUNC" in locus  # content kept, but collapsed to one line
 
 
 def test_sanitized_exception_debug_mode_still_renders_full_traceback():
