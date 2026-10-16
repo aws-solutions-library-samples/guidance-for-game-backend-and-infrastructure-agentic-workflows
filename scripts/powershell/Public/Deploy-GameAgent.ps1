@@ -125,14 +125,17 @@ function Deploy-GameAgent {
     # does not ship this venv's console scripts: the AgentCore starter toolkit
     # rebuilds a dependency bundle with its own `uv pip install --target` inside
     # the uv-selected project environment and zips that into dependencies.zip.
-    # uv selects <env>/bin/python3 for that install and embeds its absolute
-    # local path; an over-limit or space-bearing POSIX interpreter path makes uv
-    # emit a /bin/sh trampoline that dies at exec in the container — silently,
-    # since deploy still exits 0 and the control plane reaches READY. Running
-    # the guard here, after local `uv sync` and before Step 1 (the first stack
-    # deploy), fails a doomed deploy fast with zero AWS side effects. On native
-    # Windows the shared guard is a no-op (uv ships a native launcher binary,
-    # not a shebang trampoline).
+    # uv embeds the environment interpreter's absolute local path into each
+    # console script's launcher line; the embedded basename is the longer of the
+    # names uv may embed (`<env>/bin/python3` or `<env>/bin/python` depending on
+    # the uv version), so the shared guard measures `<env>/bin/python3`. An
+    # over-limit or space-bearing POSIX interpreter path makes uv emit a /bin/sh
+    # trampoline that dies at exec in the container — silently, since deploy
+    # still exits 0 and the control plane reaches READY. Running the guard here,
+    # after local `uv sync` and before Step 1 (the first stack deploy), fails a
+    # doomed deploy fast with zero AWS side effects. The shared guard does not
+    # check native Windows hosts (tracked as a follow-up issue), so on a Windows
+    # host it is a no-op.
     Write-GameAgentStatus 'Preflight: Installing backend dependencies...' -Type Info
     Push-Location $backendPath
     try {

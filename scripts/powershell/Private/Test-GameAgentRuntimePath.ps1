@@ -8,8 +8,9 @@ function Test-GameAgentRuntimePath {
         (scripts/infrastructure/check_runtime_path.py) so the shell and
         PowerShell deploy paths enforce one implementation of uv's shebang
         rule — over 124 filesystem bytes or a space in the interpreter path on
-        POSIX; never a false rejection on native Windows, where uv emits a
-        native launcher binary rather than a /bin/sh shebang trampoline.
+        POSIX. The guard does not check native Windows deploy hosts (out of
+        scope; follow-up issue): on a Windows host it is a no-op and never
+        rejects.
 
         Throws (so the Stop-preference caller aborts) when the resolved
         interpreter path is unbootable, surfacing the Python guard's actionable

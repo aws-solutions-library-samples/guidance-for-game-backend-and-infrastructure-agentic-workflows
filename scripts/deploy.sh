@@ -88,8 +88,10 @@ echo ""
 # `agentcore launch` (Step 2) does not ship this venv's console scripts: the
 # AgentCore starter toolkit rebuilds a dependency bundle with its own
 # `uv pip install --target` inside the uv-selected project environment and zips
-# that into dependencies.zip. uv selects <env>/bin/python3 for that install and
-# embeds its absolute local path into each console script's launcher line. When
+# that into dependencies.zip. uv embeds the environment interpreter's absolute
+# local path into each console script's launcher line; the embedded basename is
+# the longer of the names uv may embed (`<env>/bin/python3` or `<env>/bin/python`
+# depending on the uv version), so this guard measures `<env>/bin/python3`. When
 # that interpreter path is over the uv shebang byte limit or contains a space,
 # uv emits a /bin/sh trampoline instead of a portable shebang, producing a
 # runtime that dies at exec — silently, because deploy still exits 0 and the

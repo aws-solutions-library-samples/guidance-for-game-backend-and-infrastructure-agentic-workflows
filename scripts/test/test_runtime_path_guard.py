@@ -27,7 +27,7 @@ These tests prove behavior, not restate assumptions:
   caused #517.
 
 * ``RuntimeInterpreterSelection`` pins which interpreter name the guard measures
-  (``<env>/bin/python3``, the name the ``--target`` install embeds) and that the
+  (``<env>/bin/python3``, the longer of the names uv may embed) and that the
   environment is derived from ``sys.prefix`` so ``UV_PROJECT_ENVIRONMENT`` is
   honored.
 
@@ -148,8 +148,8 @@ class RuntimePathPredicate(unittest.TestCase):
         self.assertIn(".venv", resolved)
 
     def test_fallback_measures_the_embedded_python3_name(self) -> None:
-        # The non-uv fallback reconstructs the `python3` name the toolkit's
-        # `--target` install embeds, not the one-byte-shorter `python`.
+        # The non-uv fallback reconstructs the `python3` name — the longer of the
+        # names uv may embed — not the one-byte-shorter `python`.
         resolved = guard.resolve_venv_interpreter(Path("/srv/app/backend"))
         self.assertTrue(resolved.endswith("/bin/python3"), resolved)
 
@@ -165,10 +165,12 @@ class RuntimeInterpreterSelection(unittest.TestCase):
     environment, so ``sys.prefix`` is the environment uv packages. The toolkit's
     ``uv pip install --target`` embeds the ``<env>/bin/python3`` name into the
     packaged console scripts and keys its shebang-vs-trampoline choice on that
-    path, while ``uv run ... python`` reports ``sys.executable`` as the same
-    ``<env>/bin/python3``. These tests pin that selection by controlling
-    ``sys.prefix``, ``sys.executable``, and ``VIRTUAL_ENV`` exactly as ``uv run``
-    sets them -- no uv or real venv needed.
+    path, while ``uv run ... python`` reports ``sys.executable`` as
+    ``<env>/bin/python3`` or ``<env>/bin/python`` depending on the uv version.
+    The guard measures ``<env>/bin/python3`` -- the longer of the names uv may
+    embed -- from ``sys.prefix``, not from ``sys.executable``. These tests pin
+    that selection by controlling ``sys.prefix``, ``sys.executable``, and
+    ``VIRTUAL_ENV`` exactly as ``uv run`` sets them -- no uv or real venv needed.
     """
 
     def setUp(self) -> None:
@@ -185,10 +187,10 @@ class RuntimeInterpreterSelection(unittest.TestCase):
             os.environ["VIRTUAL_ENV"] = self._orig_virtual_env
 
     def _simulate_uv_run(self, env_dir: str) -> None:
-        """Mimic ``uv run ... python``: VIRTUAL_ENV and sys.prefix are the env,
-        and sys.executable is the ``<env>/bin/python3`` name uv run canonicalizes
-        to -- the same name the toolkit's ``--target`` install embeds into the
-        packaged console scripts."""
+        """Mimic ``uv run ... python``: VIRTUAL_ENV and sys.prefix are the env.
+        sys.executable is set to the ``<env>/bin/python3`` spelling here, but the
+        guard derives the measured name from sys.prefix, so the executable
+        basename a given uv version reports does not change the result."""
         os.environ["VIRTUAL_ENV"] = env_dir
         guard.sys.prefix = env_dir
         guard.sys.executable = str(Path(env_dir) / "bin" / "python3")
@@ -227,8 +229,8 @@ class RuntimeInterpreterSelection(unittest.TestCase):
         self.assertTrue(guard.venv_python_is_bootable(resolved, os_name="posix"))
 
     def test_embedded_python3_name_is_measured(self) -> None:
-        # The embedded name the toolkit's `--target` install writes is
-        # `<env>/bin/python3`. At <env>/bin/python == 124 and python3 == 125 the
+        # The guard measures `<env>/bin/python3`, the longer of the names uv may
+        # embed. At <env>/bin/python == 124 and python3 == 125 the
         # packaged artifact trampolines (uv embeds python3), so the guard must
         # measure python3 (125, over the limit) and REJECT -- not the one-byte
         # shorter python (124) which would falsely pass.
@@ -277,23 +279,55 @@ class RuntimeInterpreterSelection(unittest.TestCase):
         resolved = guard.resolve_runtime_interpreter(backend)
         self.assertEqual(resolved, os.path.abspath(guard.sys.executable))
 
+    def test_resolver_measures_python3_even_when_executable_is_python(self) -> None:
+        # Pins the decision to derive the measured name from sys.prefix rather
+        # than sys.executable. uv 0.12.22 and later report `uv run python` as
+        # `<env>/bin/python` (one byte shorter than the `python3` path the
+        # toolkit's `--target` install packages), so a resolver that returned
+        # `os.path.abspath(sys.executable)` would measure the shorter name and
+        # pass a 125-byte `python3` path that the packaged artifact trampolines.
+        # The resolver must return `<env>/bin/python3` regardless of the
+        # executable basename uv's child process reports.
+        env_dir = "/srv/app/.venv"
+        os.environ["VIRTUAL_ENV"] = env_dir
+        guard.sys.prefix = env_dir
+        guard.sys.executable = str(Path(env_dir) / "bin" / "python")
+        resolved = guard.resolve_runtime_interpreter(Path("/srv/app/backend"))
+        self.assertEqual(resolved, str(Path(env_dir) / "bin" / "python3"))
+        self.assertTrue(resolved.endswith("/bin/python3"), resolved)
+
 
 class RemediationMessage(unittest.TestCase):
     """Remediation must match where the unbootable interpreter came from.
 
     A path under the default ``<backend>/.venv`` is repaired by a shorter
-    checkout. An interpreter uv selected via ``UV_PROJECT_ENVIRONMENT`` (outside
-    ``<backend>/.venv``) cannot be fixed by moving the checkout, so the message
-    must point at the override instead. Advising a shorter checkout is wrong for
-    an external environment.
+    checkout (or a short, space-free absolute ``UV_PROJECT_ENVIRONMENT``). An
+    interpreter uv selected via an absolute ``UV_PROJECT_ENVIRONMENT`` (outside
+    ``<backend>/.venv``) is not fixed by moving the checkout, so the message
+    must point at the override instead. Advising only a shorter checkout is
+    wrong for an external environment.
     """
+
+    # Phrase that appears only in the external-override remedy branch.
+    OVERRIDE_MARKER = "uv selected this interpreter via UV_PROJECT_ENVIRONMENT"
 
     def test_default_venv_path_advises_shortening_checkout(self) -> None:
         backend = Path("/srv/app/backend")
         interp = str(backend / ".venv" / "bin" / ("p" * 200))
         msg = guard.remediation_message(interp, backend_dir=backend)
         self.assertIn("shorter", msg.lower())
-        self.assertNotIn("UV_PROJECT_ENVIRONMENT", msg)
+        # The default-checkout branch is not the external-override branch.
+        self.assertNotIn(self.OVERRIDE_MARKER, msg)
+
+    def test_default_venv_path_also_offers_short_project_environment(self) -> None:
+        # The default-checkout remedy also offers a short, space-free absolute
+        # UV_PROJECT_ENVIRONMENT, which keeps backend/.env.local and
+        # .bedrock_agentcore.yaml in place.
+        backend = Path("/srv/app/backend")
+        interp = str(backend / ".venv" / "bin" / ("p" * 200))
+        msg = guard.remediation_message(interp, backend_dir=backend)
+        self.assertIn("UV_PROJECT_ENVIRONMENT", msg)
+        self.assertRegex(msg, r"short.*absolute")
 
     def test_default_venv_path_mentions_cached_dependencies_zip(self) -> None:
         # A dependency bundle cached from an earlier deploy can outlive a move to
@@ -311,8 +345,26 @@ class RemediationMessage(unittest.TestCase):
         interp = "/" + "e" * 200 + "/bin/python3"
         msg = guard.remediation_message(interp, backend_dir=backend)
         self.assertIn("UV_PROJECT_ENVIRONMENT", msg)
-        # Must not misdirect the user to shorten the checkout for an override.
+        self.assertIn(self.OVERRIDE_MARKER, msg)
+        # Must not tell the user to simply move the checkout for an override.
         self.assertNotRegex(msg.lower(), r"deploy from a checkout")
+
+    def test_external_environment_does_not_claim_checkout_cannot_help(self) -> None:
+        # A relative UV_PROJECT_ENVIRONMENT resolves under backend/, so the
+        # override remedy must not claim shortening the checkout cannot help.
+        backend = Path("/srv/app/backend")
+        interp = "/" + "e" * 200 + "/bin/python3"
+        msg = guard.remediation_message(interp, backend_dir=backend)
+        self.assertNotRegex(msg.lower(), r"will not help")
+
+    def test_external_environment_mentions_cached_dependencies_zip(self) -> None:
+        # The override remedy carries the same cached-bundle advice as the
+        # default-checkout remedy.
+        backend = Path("/srv/app/backend")
+        interp = "/" + "e" * 200 + "/bin/python3"
+        msg = guard.remediation_message(interp, backend_dir=backend)
+        self.assertIn("dependencies.zip", msg)
+        self.assertIn("--force-rebuild-deps", msg)
 
     def test_external_detection_true_for_outside_path(self) -> None:
         backend = Path("/srv/app/backend")
@@ -364,7 +416,7 @@ class RemediationMessage(unittest.TestCase):
             msg = guard.remediation_message(interp, backend_dir=backend)
             self.assertIn("shorter", msg.lower())
             self.assertIn("dependencies.zip", msg)
-            self.assertNotIn("UV_PROJECT_ENVIRONMENT", msg)
+            self.assertNotIn(self.OVERRIDE_MARKER, msg)
 
     def test_symlinked_checkout_default_venv_with_symlinked_python3_is_not_override(self) -> None:
         # The checkout path itself is a symlink (logical spelling) while the
@@ -387,7 +439,7 @@ class RemediationMessage(unittest.TestCase):
             )
             msg = guard.remediation_message(physical_interp, backend_dir=logical_backend)
             self.assertIn("shorter", msg.lower())
-            self.assertNotIn("UV_PROJECT_ENVIRONMENT", msg)
+            self.assertNotIn(self.OVERRIDE_MARKER, msg)
 
     def test_external_project_environment_with_symlinked_python3_is_override(self) -> None:
         # An external UV_PROJECT_ENVIRONMENT whose `bin/python3` is a real
@@ -500,7 +552,9 @@ class UvPackagedEntrypointBoundary(unittest.TestCase):
     --only-binary :all: --upgrade -r <reqs>``, run inside the uv-selected project
     environment, and zips ``<t>`` into dependencies.zip. uv's ``format_shebang``
     decides at install time whether each console script is a portable ``#!``
-    shebang or an unbootable ``/bin/sh`` trampoline embedding ``<env>/bin/python3``.
+    shebang or an unbootable ``/bin/sh`` trampoline embedding the environment
+    interpreter path (the longer of the names uv may embed is
+    ``<env>/bin/python3``).
 
     These tests reproduce that oracle offline: build a minimal local wheel (no
     network) that ships a console script, create a uv environment whose
@@ -644,8 +698,9 @@ class UvPackagedEntrypointBoundary(unittest.TestCase):
             str(reqs),
         ]
         # Run from the project directory inside the uv-selected environment:
-        # VIRTUAL_ENV points at env_dir, so uv selects <env>/bin/python3 and
-        # embeds that path into the packaged console script.
+        # VIRTUAL_ENV points at env_dir, so uv selects that environment and
+        # embeds its interpreter path (the longer of the names it may embed is
+        # <env>/bin/python3) into the packaged console script.
         env = dict(os.environ, VIRTUAL_ENV=str(env_dir))
         env.pop("UV_PROJECT_ENVIRONMENT", None)
         env["PATH"] = str(env_dir / "bin") + os.pathsep + env.get("PATH", "")

@@ -48,11 +48,11 @@ Three facts drive this guard:
    ``len > 124``: the trampoline fires when the interpreter path is **over 124
    filesystem bytes**, or when it **contains a space** -- not when the whole
    line is "over 127 characters".
-2. The byte/space check is gated on ``os_name == "posix"``. On native Windows
-   uv wraps the script in a native launcher binary
-   (``uv_trampoline_builder::windows_script_launcher``) that natively supports
-   long and relocatable paths, so a POSIX shebang predicate must **not** reject
-   a Windows interpreter path.
+2. The byte/space check is gated on ``os_name == "posix"``. This guard does not
+   check native Windows deploy hosts: on ``os.name == "nt"`` it returns early and
+   never rejects a Windows interpreter path. What a native Windows host packages
+   is out of scope and tracked as a follow-up issue, so a POSIX shebang predicate
+   must not reject a Windows interpreter path here.
 3. The path that matters is the **interpreter name uv embeds** into the console
    scripts the toolkit's ``--target`` install writes. The embedded basename
    depends on the uv version the toolkit runs: some uv versions embed
@@ -106,15 +106,16 @@ def interpreter_path_bytes(interpreter_path: str) -> int:
 
 
 def uses_native_windows_launcher(os_name: str | None = None) -> bool:
-    """True when uv wraps console scripts in a native Windows launcher binary.
+    """True on a native Windows host, where this guard does not check the path.
 
-    uv's shebang rule is gated entirely on the target environment's OS
+    uv's POSIX shebang rule is gated on the target environment's OS
     (``format_shebang`` runs its length/space check only under
-    ``os_name == "posix"``), and on Windows ``write_script_entrypoints`` wraps
-    each launcher in a native ``.exe`` trampoline
-    (``uv_trampoline_builder::windows_script_launcher``) that natively supports
-    long and relocatable interpreter paths. So the decision is purely the OS uv
-    runs under -- NOT a property of the interpreter path string.
+    ``os_name == "posix"``). This guard scopes native Windows deploy hosts out
+    and does not check them: on Windows it returns early and never rejects an
+    interpreter path. What a native Windows host packages into the Linux runtime
+    bundle is not verified here and is tracked as a follow-up issue. The decision
+    is purely the OS uv runs under -- NOT a property of the interpreter path
+    string.
 
     The ``.exe`` suffix is deliberately NOT consulted: on a POSIX host uv never
     emits a Windows launcher, so a long or space-bearing ``/.../python.exe`` path
@@ -123,8 +124,7 @@ def uses_native_windows_launcher(os_name: str | None = None) -> bool:
 
     ``os_name`` defaults to the running ``os.name``: the deploy host that runs
     ``agentcore launch`` is the host whose uv packages the dependency bundle, so
-    its OS is authoritative for whether the shipped scripts are launchers or
-    shebangs.
+    its OS is authoritative for whether this POSIX guard applies.
     """
     resolved_os_name = os_name if os_name is not None else os.name
     return resolved_os_name == "nt"
@@ -136,10 +136,9 @@ def venv_python_is_bootable(interpreter_path: str, *, os_name: str | None = None
     This predicate models uv's POSIX ``format_shebang`` rule only. On POSIX it
     returns False exactly for the case uv turns into the unbootable ``/bin/sh``
     trampoline: an interpreter path over 124 filesystem bytes, or one containing
-    a space. On a native-Windows target uv does not apply that POSIX rule (it
-    wraps console scripts in a native launcher binary), so this POSIX
-    length/space check does not apply and the function returns True; what a
-    Windows deploy host actually packages is out of this guard's scope.
+    a space. This guard does not check native Windows deploy hosts (out of scope;
+    follow-up issue): on ``os.name == "nt"`` the POSIX length/space check does
+    not apply and the function returns True.
     """
     if uses_native_windows_launcher(os_name):
         return True
@@ -270,9 +269,12 @@ def remediation_message(interpreter_path: str, *, backend_dir: Path | None = Non
 
     The fix differs by where the unbootable interpreter came from. A path under
     the default ``<backend>/.venv`` is repaired by deploying from a shorter,
-    space-free checkout. An interpreter uv selected via ``UV_PROJECT_ENVIRONMENT``
-    (outside ``<backend>/.venv``) cannot be fixed by moving the checkout; the
-    override itself must be unset or pointed at a short, space-free directory.
+    space-free checkout, or by pointing ``UV_PROJECT_ENVIRONMENT`` at a short,
+    space-free absolute directory. An interpreter uv selected via an absolute
+    ``UV_PROJECT_ENVIRONMENT`` (outside ``<backend>/.venv``) is not repaired by
+    moving the checkout; the override itself must be unset or pointed at a short,
+    space-free directory. A relative ``UV_PROJECT_ENVIRONMENT`` resolves under
+    ``backend/``, so a shorter checkout can still help it.
     """
     byte_length = interpreter_path_bytes(interpreter_path)
     has_space = " " in interpreter_path
@@ -284,17 +286,25 @@ def remediation_message(interpreter_path: str, *, backend_dir: Path | None = Non
     if _interpreter_is_external_override(interpreter_path, backend_dir):
         fix = (
             "   uv selected this interpreter via UV_PROJECT_ENVIRONMENT (it is not\n"
-            "   under backend/.venv), so shortening the checkout will not help.\n"
-            "   Unset UV_PROJECT_ENVIRONMENT, or point it at a shorter, space-free\n"
+            "   under backend/.venv). If UV_PROJECT_ENVIRONMENT is a relative path\n"
+            "   it resolves under backend/, so a shorter checkout can help; an\n"
+            "   absolute override is unaffected by the checkout path. Unset\n"
+            "   UV_PROJECT_ENVIRONMENT, or point it at a shorter, space-free\n"
             f"   directory so the selected interpreter is at most {INTERPRETER_BYTE_LIMIT} bytes and\n"
-            "   contains no space, then re-run the deployment."
+            "   contains no space, then re-run the deployment. A dependency bundle\n"
+            "   cached from an earlier deploy can outlive the change, so also\n"
+            "   delete\n"
+            "   backend/.bedrock_agentcore/gameagentruntime/dependencies.zip to force\n"
+            "   a rebuild (the deploy scripts do not forward --force-rebuild-deps;\n"
+            "   that flag only applies to a manual agentcore launch)."
         )
     else:
         fix = (
             "   Deploy from a checkout whose path is shorter and space-free so that\n"
-            f"   the backend .venv interpreter is at most {INTERPRETER_BYTE_LIMIT} bytes, then\n"
-            "   re-run the deployment. A dependency bundle cached from an earlier\n"
-            "   deploy can outlive the move, so also delete\n"
+            f"   the backend .venv interpreter is at most {INTERPRETER_BYTE_LIMIT} bytes, or set\n"
+            "   UV_PROJECT_ENVIRONMENT to a short, space-free absolute directory,\n"
+            "   then re-run the deployment. A dependency bundle cached from an\n"
+            "   earlier deploy can outlive the move, so also delete\n"
             "   backend/.bedrock_agentcore/gameagentruntime/dependencies.zip to force\n"
             "   a rebuild (the deploy scripts do not forward --force-rebuild-deps;\n"
             "   that flag only applies to a manual agentcore launch)."
