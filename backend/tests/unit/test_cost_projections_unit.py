@@ -198,6 +198,36 @@ class TestComputeOptimizer:
         data = {"recommendations": [{"last_refresh_timestamp": "2026-10-01T00:00:00Z", "renamed_field": {"x": 1}}]}
         assert project_compute_optimizer(data) is None
 
+    def test_finding_only_row_is_kept(self):
+        # An Auto Scaling group row shaped like the Billing MCP output: its only
+        # projectable content is a finding (the group name is not a resource id,
+        # the current configuration carries no instance type, and there are no
+        # options). The finding alone keeps the row ``ok`` with its finding.
+        data = {
+            "recommendations": [
+                {
+                    "auto_scaling_group_name": "my_asg",
+                    "current_configuration": {"finding": "OVERPROVISIONED"},
+                    "recommendation_options": [],
+                    "last_refresh_timestamp": "2026-10-01T00:00:00Z",
+                }
+            ]
+        }
+        out = project_compute_optimizer(data)
+        _no_sensitive(out)
+        assert out["status"] == "ok"
+        assert out["recommendations"][0]["finding"] == "OVERPROVISIONED"
+
+    def test_resource_id_only_row_is_kept(self):
+        # A row whose only projectable content is a resource id (no finding, no
+        # current type, no options) is still a recommendation and stays ``ok``
+        # with its resource id.
+        data = {"recommendations": [{"resource_id": "i-0abc123", "recommendation_options": []}]}
+        out = project_compute_optimizer(data)
+        _no_sensitive(out)
+        assert out["status"] == "ok"
+        assert out["recommendations"][0]["resource_id"] == "i-0abc123"
+
 
 class TestCostOptimizationHub:
     def test_recommendation_omits_arn_account_tags(self):
