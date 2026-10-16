@@ -162,10 +162,11 @@ or raw session/thread identifiers.
   is never read from the environment, so a token is stable only within a single
   process and does not correlate across processes, restarts, or tiers. The
   frontend also logs AgentCore's service request ID from the `x-amzn-RequestId`
-  response header, which identifies the invocation to the service; it differs
-  from the request ID the runtime container logs, so it does not join frontend
-  and runtime log lines. That value is not derived from caller identity or
-  content and is logged normalized rather than redacted.
+  response header, which identifies the invocation to the service; it comes
+  from a different header than the request ID the runtime container logs, so
+  the two are not known to match and it is treated as a service-call identifier
+  rather than a cross-tier correlation key. That value is not derived from
+  caller identity or content and is logged normalized rather than redacted.
 - Every externally influenced log field is normalized before emission so
   carriage returns, line feeds, other C0/C1/DEL control characters, the Unicode
   line and paragraph separators, and bidirectional-formatting controls cannot

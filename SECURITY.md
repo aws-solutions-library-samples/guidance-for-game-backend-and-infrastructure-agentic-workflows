@@ -713,9 +713,11 @@ or raw session/thread identifiers.
   correlate across processes, restarts, or tiers. The frontend additionally
   records AgentCore's service request ID from the `x-amzn-RequestId` response
   header, which identifies the invocation to the service (for example in a
-  support case). It differs from the request ID the runtime container logs, so
-  it does not join frontend and runtime log lines. It is not derived from
-  caller identity or content and is logged normalized rather than redacted.
+  support case). It comes from a different header than the request ID the
+  runtime container logs, so the two are not known to match and it is treated
+  as a service-call identifier rather than a cross-tier correlation key. It is
+  not derived from caller identity or content and is logged normalized rather
+  than redacted.
 - Externally influenced fields are normalized before emission so carriage
   returns, line feeds, other C0/C1/DEL control characters, the Unicode line and
   paragraph separators, and bidirectional-formatting controls cannot inject
