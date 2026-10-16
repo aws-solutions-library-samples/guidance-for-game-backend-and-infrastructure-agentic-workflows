@@ -16,9 +16,9 @@ set -euo pipefail
 # reports current state and detects whether the account already supports what
 # the runtime needs — WITHOUT failing the deployment for that reason alone. When
 # it does not, the default path recommends the opt-in only when the AWS-reserved
-# 'aws/spans' log group already exists (so the opt-in can finish the job by
-# switching the destination or adding the policy); otherwise it points to the
-# one-time console enable or a destination toggle keyed on the current
+# 'aws/spans' log group already exists and the destination was read (so the
+# opt-in can finish the job by switching the destination); otherwise it points
+# to the one-time console enable or a destination toggle keyed on the current
 # destination, because the opt-in cannot create 'aws/spans'.
 #
 # BACKGROUND: X-Ray Transaction Search writes spans to the AWS-reserved
@@ -86,8 +86,11 @@ get_trace_destination() {
 # 'unreadable' rather than mistaken for 'absent'. '--output json' is requested
 # explicitly so a CLI profile whose default output is 'text', 'table', or 'yaml'
 # cannot render an existing group in a form that omits the quoted name and so
-# reads as 'absent'. Output that cannot be parsed as the expected JSON object is
-# reported as 'unreadable' rather than 'absent', matching the PowerShell reader.
+# reads as 'absent'. Only output that cannot be parsed as JSON at all is
+# reported as 'unreadable'; parsed JSON that lacks an 'aws/spans' entry (an
+# object without 'logGroups', an empty list, or null) is 'absent', matching the
+# PowerShell reader. The real CLI with '--output json' always returns an object
+# with a 'logGroups' key, so these edge shapes do not occur in practice.
 spans_log_group_state() {
   local output code=0
   output="$(aws logs describe-log-groups \
@@ -107,9 +110,9 @@ try:
     payload = json.loads(os.environ["OBS_SPANS_JSON"])
 except (ValueError, KeyError):
     sys.exit(3)
-if not isinstance(payload, dict) or "logGroups" not in payload:
-    sys.exit(3)
-groups = payload.get("logGroups") or []
+groups = []
+if isinstance(payload, dict):
+    groups = payload.get("logGroups") or []
 present = any(
     isinstance(g, dict) and g.get("logGroupName") == "aws/spans" for g in groups
 )
@@ -128,25 +131,33 @@ print_account_scope() {
   echo "            '/aws/application-signals/data')"
 }
 
-# Print the one-time remedy for a missing-or-unknown 'aws/spans' group, keyed on
-# the current trace destination so the advice never prescribes a toggle that
-# cannot create the group:
+# Print the one-time remedy for the Transaction Search state, keyed on BOTH the
+# current trace destination and the 'aws/spans' state so the advice never
+# prescribes a toggle that cannot create the group, and never tells the operator
+# to create a group that already exists:
 #   $1 destination  : XRay | CloudWatchLogs | UNREADABLE
 #   $2 spans_state  : present | absent | unreadable
 #   $3 indent       : leading whitespace for the printed lines
+#   $4 mode         : default | recheck (the recheck runs AFTER the final launch)
 # A first-time API enable (destination -> CloudWatchLogs) does NOT create the
 # AWS-reserved 'aws/spans' group; only the console or a disable/re-enable toggle
 # of an already-CloudWatchLogs destination does (file header, starter-toolkit
 # issue 457). So:
-#   - destination CloudWatchLogs, group absent : disable/re-enable toggle;
-#   - destination XRay                         : the console once, or let the
-#     deploy's own 'agentcore launch' perform the first enable and read the
-#     post-launch recheck (no XRay->CloudWatchLogs pair, which is the first-time
-#     enable that does not create the group);
-#   - destination unreadable (or group read failed): confirm in the console, no
-#     toggle commands, because the current destination is unknown.
+#   - either read failed                       : confirm in the console, no
+#     toggle commands, because the current state is unknown;
+#   - destination XRay, group PRESENT          : the group already exists; only
+#     the trace destination needs switching to 'CloudWatchLogs', through the
+#     console or the opt-in Step 1.7 already offers for this state;
+#   - destination XRay, group absent, default  : the launch switches the
+#     destination (which does not create the group by itself); Step 5c then
+#     prints the one-time toggle from 'CloudWatchLogs';
+#   - destination XRay, group absent, recheck  : the launch already ran and did
+#     NOT switch the destination (see the toolkit's "Transaction Search
+#     configuration failed" warning in the launch output); enable Transaction
+#     Search once in the console, then re-run;
+#   - destination CloudWatchLogs, group absent : disable/re-enable toggle.
 print_spans_remedy() {
-  local destination="$1" spans_state="$2" indent="$3"
+  local destination="$1" spans_state="$2" indent="$3" mode="${4:-default}"
   if [ "$destination" = "UNREADABLE" ] || [ "$spans_state" = "unreadable" ]; then
     echo "${indent}The current trace destination or the 'aws/spans' log group could not be read"
     echo "${indent}(the call was denied, throttled, or otherwise failed), so Transaction Search"
@@ -154,13 +165,29 @@ print_spans_remedy() {
     echo "${indent}console, then re-run the deployment."
     return 0
   fi
+  if [ "$destination" = "XRay" ] && [ "$spans_state" = "present" ]; then
+    echo "${indent}The AWS-reserved 'aws/spans' log group already exists, but the trace"
+    echo "${indent}destination is 'XRay', not 'CloudWatchLogs', so spans do not flow yet."
+    echo "${indent}Switch the destination to 'CloudWatchLogs' by enabling Transaction Search"
+    echo "${indent}in the AWS X-Ray / CloudWatch console, or re-run with the opt-in:"
+    echo "${indent}    GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh"
+    return 0
+  fi
   if [ "$destination" = "XRay" ]; then
+    if [ "$mode" = "recheck" ]; then
+      echo "${indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+      echo "${indent}is not present. The launch has already run and did NOT switch the"
+      echo "${indent}destination. Look in the launch output for the toolkit warning"
+      echo "${indent}'Transaction Search configuration failed', then enable Transaction Search"
+      echo "${indent}once in the AWS X-Ray / CloudWatch console and re-run the deployment."
+      return 0
+    fi
     echo "${indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
-    echo "${indent}is not present. A first-time API enable (destination -> CloudWatchLogs) does"
-    echo "${indent}NOT create it. Create it once by enabling Transaction Search in the AWS"
-    echo "${indent}X-Ray / CloudWatch console; otherwise the deployment's own 'agentcore launch'"
-    echo "${indent}performs the first enable, and the post-launch recheck reports whether the"
-    echo "${indent}group was created. Then re-run the deployment if it was not."
+    echo "${indent}is not present. The deployment's own 'agentcore launch' switches the"
+    echo "${indent}destination to 'CloudWatchLogs', which does NOT create the group by itself;"
+    echo "${indent}the post-launch recheck (Step 5c) then prints the one-time toggle. You can"
+    echo "${indent}instead enable Transaction Search once in the AWS X-Ray / CloudWatch console"
+    echo "${indent}now."
     return 0
   fi
   # destination CloudWatchLogs with the group absent: a disable/re-enable toggle
@@ -218,7 +245,7 @@ report_without_mutation() {
     echo "      To let the deployment configure them, re-run with the opt-in:"
     echo "          GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh"
   else
-    print_spans_remedy "$destination" "$spans_state" "      "
+    print_spans_remedy "$destination" "$spans_state" "      " "default"
   fi
   echo "  ℹ️  Continuing deployment (default account-observability is non-blocking)."
 }
@@ -605,7 +632,7 @@ report_transaction_search_state() {
     echo "      Trace destination is '${destination}', not 'CloudWatchLogs'."
     echo "      Spans will not flow until destination is 'CloudWatchLogs' and 'aws/spans' exists."
   fi
-  print_spans_remedy "$destination" "$spans_state" "      "
+  print_spans_remedy "$destination" "$spans_state" "      " "recheck"
   return 0
 }
 

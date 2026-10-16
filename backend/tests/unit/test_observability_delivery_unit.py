@@ -564,7 +564,7 @@ def test_account_obs_default_offers_opt_in_only_when_spans_present():
 
 
 def test_account_obs_default_does_not_offer_opt_in_when_destination_unreadable_and_spans_present():
-    # Issue: an unreadable destination with 'aws/spans' present must NOT offer the
+    # An unreadable destination with 'aws/spans' present must NOT offer the
     # opt-in. The opt-in refuses before any write when it cannot read the
     # destination, so recommending it would send the operator to a path that
     # fails. Treat it like the unreadable branch: confirm in the console, no
@@ -1021,20 +1021,304 @@ def test_recheck_confirms_in_console_when_destination_unreadable(shell):
 
 @pytest.mark.parametrize("shell", _OBS_SHELLS)
 def test_recheck_warns_when_destination_not_cloudwatchlogs(shell):
-    """After launch, a destination still 'XRay' is surfaced as a non-blocking
-    WARN. Because a first-time enable FROM 'XRay' does not create 'aws/spans',
-    the recheck must NOT print the XRay -> CloudWatchLogs toggle pair and must
-    NOT recommend the opt-in; it points to the console or the deploy's own
-    launch + recheck. Pins mutation M7 (the recheck XRay branch recommending the
-    opt-in or the toggle)."""
+    """After launch, a destination still 'XRay' with 'aws/spans' absent is
+    surfaced as a non-blocking WARN. The launch has already run and did not
+    switch the destination, so the recheck must point to the toolkit's
+    "Transaction Search configuration failed" warning and the one-time console
+    enable, NOT to another launch, NOT to the XRay -> CloudWatchLogs toggle
+    pair, and NOT to the opt-in. Pins the recheck XRay/absent branch."""
     result = _recheck_harness(_recheck_mock(destination="XRay", spans=False), shell=shell)
     assert "rc=0" in result.stdout
     assert "does not yet appear active" in result.stdout
     assert "not 'CloudWatchLogs'" in result.stdout
-    assert "agentcore launch" in result.stdout
+    assert "Transaction Search configuration failed" in result.stdout
+    assert "enable Transaction Search" in result.stdout
+    # The launch already ran, so the recheck must not send the operator back to
+    # the deploy's own launch, and must not print a destination toggle.
     assert "update-trace-segment-destination" not in result.stdout
     assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_reports_existing_spans_as_present_when_destination_xray(shell):
+    """Recheck with destination 'XRay' and 'aws/spans' already PRESENT: the
+    group exists, so the remedy must NOT claim it is missing. Only the trace
+    destination needs switching to 'CloudWatchLogs' (console or the opt-in).
+    This is the state a launch leaves behind when its Transaction Search step
+    failed on an account that already had an 'aws/spans' grant."""
+    result = _recheck_harness(_recheck_mock(destination="XRay", spans=True), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "already exists" in result.stdout
+    # It must NOT say the group is missing/not present.
+    assert "is not present" not in result.stdout
+    assert "does not exist" not in result.stdout
+    # The destination needs switching; the opt-in is one route for this state.
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+# ---------------------------------------------------------------------------
+# Behavior matrix: mode x destination x aws/spans state
+# ---------------------------------------------------------------------------
+
+
+def _spans_reader_harness(describe_output: str, exit_code: int, shell: str = "bash"):
+    """Source the whole script (which only runs main when executed directly) and
+    call spans_log_group_state over a mocked 'aws logs describe-log-groups'."""
+    aws_mock = "aws() {\n" f'  printf "%s" {describe_output}; return {exit_code};\n' "}"
+    command = "\n".join(
+        (
+            'AWS_REGION="us-west-2"',
+            f'source "{ACCOUNT_OBS_SCRIPT}"',
+            aws_mock,
+            "spans_log_group_state",
+        )
+    )
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+@pytest.mark.parametrize(
+    "describe_output,exit_code,expected",
+    [
+        ('\'{"logGroups":[{"logGroupName":"aws/spans"}]}\'', 0, "present"),
+        ("'{\"logGroups\":[]}'", 0, "absent"),
+        ('\'{"logGroups":[{"logGroupName":"aws/spans-archive"}]}\'', 0, "absent"),
+        # Parsed JSON that lacks an 'aws/spans' entry maps to 'absent' in BOTH
+        # shells (empty object, empty list, null, logGroups:null).
+        ("'{}'", 0, "absent"),
+        ("'[]'", 0, "absent"),
+        ("'null'", 0, "absent"),
+        ("'{\"logGroups\":null}'", 0, "absent"),
+        # Output that cannot be parsed as JSON at all is 'unreadable', never
+        # 'absent'. A text/table rendering of an existing group lands here.
+        ("'not json at all'", 0, "unreadable"),
+        ('"LOGGROUPS\taws/spans"', 0, "unreadable"),
+        # A non-zero CLI exit (denied / throttled) is 'unreadable'.
+        ("''", 254, "unreadable"),
+    ],
+)
+def test_spans_reader_state_alignment(describe_output, exit_code, expected, shell):
+    """Pin the shell reader's state mapping so it matches the PowerShell reader:
+    only a non-JSON parse (or a non-zero exit) is 'unreadable'; any parsed JSON
+    without an exact 'aws/spans' entry is 'absent'."""
+    result = _spans_reader_harness(describe_output, exit_code, shell=shell)
+    assert result.stdout.strip() == expected, result.stdout + result.stderr
+
+
+# One mock drives every cell of the matrix. 'describe-log-groups' renders JSON
+# only when '--output json' is requested (so a reader that drops the flag reads
+# an existing group as absent); 'present' is matched on the EXACT name
+# 'aws/spans', never a prefix such as 'aws/spans-archive'. 'unreadable' is a
+# non-zero CLI exit for the relevant read.
+
+
+def _matrix_mock(destination: str, spans: str) -> str:
+    # spans: "present" | "absent" | "unreadable" | "archive_only" | "non_json"
+    if spans == "present":
+        spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}'
+    elif spans == "archive_only":
+        # Only 'aws/spans-archive' — a prefix match would wrongly call this
+        # present; the exact-name check must call it absent.
+        spans_json = '{"logGroups":[{"logGroupName":"aws/spans-archive"}]}'
+    else:
+        spans_json = '{"logGroups":[]}'
+    spans_text = "LOGGROUPS\taws/spans\t1700000000000" if spans in ("present", "archive_only") else ""
+
+    if destination == "UNREADABLE":
+        dest_block = '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+    else:
+        dest_block = (
+            '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+            f'    echo "{destination}"; return 0; fi\n'
+        )
+
+    if spans == "unreadable":
+        spans_block = (
+            '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+            '    echo "An error occurred (AccessDeniedException)" >&2; return 254; fi\n'
+        )
+    elif spans == "non_json":
+        # Exit 0 but not JSON (a profile rendering table/text output). Must be
+        # classified 'unreadable', not 'absent'.
+        spans_block = (
+            '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+            '    printf "%s\\n" "not-json-output aws/spans"; return 0; fi\n'
+        )
+    else:
+        spans_block = (
+            '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+            '    case " $* " in\n'
+            f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+            f'      *) printf "%s\\n" "{spans_text}"; return 0;;\n'
+            "    esac\n"
+            "  fi\n"
+        )
+    return (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        f"{dest_block}"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then echo "5"; return 0; fi\n'
+        f"{spans_block}"
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{"resourcePolicies":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"\n'
+        "  return 0\n"
+        "}"
+    )
+
+
+# Each cell names a distinguishing substring that MUST appear and (optionally)
+# substrings that must NOT appear. The matrix pins the full routing so the
+# surviving mutations (unparseable-as-absent, prefix match, XRay-before-
+# unreadable ordering, dropped console sentence, not-CloudWatchLogs line for
+# UNREADABLE) are all caught. Keyed by (mode, destination, spans).
+_MATRIX_CELLS = {
+    # default mode
+    ("default", "CloudWatchLogs", "present"): (["already supports Transaction Search"], []),
+    ("default", "CloudWatchLogs", "absent"): (
+        ["already 'CloudWatchLogs'", "update-trace-segment-destination --destination XRay"],
+        ["GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "CloudWatchLogs", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "CloudWatchLogs", "non_json"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "CloudWatchLogs", "archive_only"): (
+        ["already 'CloudWatchLogs'", "update-trace-segment-destination --destination XRay"],
+        [],
+    ),
+    ("default", "XRay", "present"): (
+        ["GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true", "X-Ray trace segment destination"],
+        [],
+    ),
+    ("default", "XRay", "absent"): (
+        ["agentcore launch", "switches the"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "XRay", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "XRay", "archive_only"): (
+        ["agentcore launch", "switches the"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "UNREADABLE", "present"): (
+        ["could not be read"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "UNREADABLE", "absent"): (
+        ["could not be read"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "UNREADABLE", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    # recheck mode
+    ("recheck", "CloudWatchLogs", "present"): (["Transaction Search is active"], []),
+    ("recheck", "CloudWatchLogs", "absent"): (
+        ["already 'CloudWatchLogs'", "update-trace-segment-destination --destination XRay"],
+        ["GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("recheck", "CloudWatchLogs", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "CloudWatchLogs", "non_json"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "CloudWatchLogs", "archive_only"): (
+        ["update-trace-segment-destination --destination XRay"],
+        [],
+    ),
+    ("recheck", "XRay", "present"): (
+        ["already exists", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+        ["is not present", "does not exist"],
+    ),
+    ("recheck", "XRay", "absent"): (
+        ["Transaction Search configuration failed", "not 'CloudWatchLogs'"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("recheck", "XRay", "unreadable"): (
+        ["not 'CloudWatchLogs'", "could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "XRay", "archive_only"): (
+        ["Transaction Search configuration failed"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "UNREADABLE", "present"): (
+        ["could not be read"],
+        # The not-CloudWatchLogs line must NOT print for an unreadable
+        # destination (pins the surviving UNREADABLE-prints-not-CWL mutation).
+        ["not 'CloudWatchLogs'", "update-trace-segment-destination"],
+    ),
+    ("recheck", "UNREADABLE", "absent"): (
+        ["could not be read"],
+        ["not 'CloudWatchLogs'", "update-trace-segment-destination"],
+    ),
+    ("recheck", "UNREADABLE", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+}
+
+
+def _run_matrix_cell(mode: str, destination: str, spans: str, shell: str):
+    mock = _matrix_mock(destination, spans)
+    if mode == "recheck":
+        return _recheck_harness(mock, shell=shell)
+    return _account_obs_harness("false", mock, shell=shell)
+
+
+@pytest.mark.parametrize("cell", list(_MATRIX_CELLS.keys()), ids=lambda c: f"{c[0]}-{c[1]}-{c[2]}")
+def test_remedy_behavior_matrix(cell):
+    """Pin every cell of the behavior matrix (mode x destination x aws/spans
+    state) to its distinguishing message route. Both the default Step 1.7 path
+    and the Step 5c recheck stay read-only (no mutation) and return 0."""
+    mode, destination, spans = cell
+    must_contain, must_not_contain = _MATRIX_CELLS[cell]
+    result = _run_matrix_cell(mode, destination, spans, "bash")
+    assert "rc=0" in result.stdout, result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    for needle in must_contain:
+        assert needle in result.stdout, f"{cell}: expected {needle!r}\n{result.stdout}"
+    for needle in must_not_contain:
+        assert needle not in result.stdout, f"{cell}: unexpected {needle!r}\n{result.stdout}"
+
+
+# The whole matrix is byte-identical under the login `bash` and the macOS system
+# `/bin/bash` (3.2). Re-run the cells that exercise the keyed remedy branches
+# under `/bin/bash` so a bash-4+ construct cannot regress 3.2.
+_MATRIX_PARITY_CELLS = [
+    ("default", "XRay", "present"),
+    ("default", "XRay", "absent"),
+    ("recheck", "XRay", "present"),
+    ("recheck", "XRay", "absent"),
+    ("recheck", "XRay", "unreadable"),
+    ("recheck", "UNREADABLE", "present"),
+    ("default", "CloudWatchLogs", "non_json"),
+]
+
+
+@pytest.mark.parametrize("cell", _MATRIX_PARITY_CELLS, ids=lambda c: f"{c[0]}-{c[1]}-{c[2]}")
+def test_remedy_behavior_matrix_under_bash_3_2(cell):
+    mode, destination, spans = cell
+    must_contain, must_not_contain = _MATRIX_CELLS[cell]
+    result = _run_matrix_cell(mode, destination, spans, "/bin/bash")
+    assert "rc=0" in result.stdout, result.stdout
+    for needle in must_contain:
+        assert needle in result.stdout, f"{cell}: expected {needle!r}\n{result.stdout}"
+    for needle in must_not_contain:
+        assert needle not in result.stdout, f"{cell}: unexpected {needle!r}\n{result.stdout}"
 
 
 # ---------------------------------------------------------------------------

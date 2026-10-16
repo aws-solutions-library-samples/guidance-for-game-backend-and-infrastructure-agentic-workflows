@@ -11,8 +11,9 @@ function Invoke-GameAgentAccountObservability {
         account already supports what the runtime needs, WITHOUT failing the
         deployment for that reason alone. When it does not, the default path
         recommends the opt-in only when the AWS-reserved 'aws/spans' log group
-        already exists (so the opt-in can finish the job); otherwise it points to
-        the one-time console enable or a destination toggle keyed on the current
+        already exists and the destination was read (so the opt-in can finish
+        the job by switching the destination); otherwise it points to the
+        one-time console enable or a destination toggle keyed on the current
         destination, because the opt-in cannot create 'aws/spans'.
 
         Mirrors scripts/infrastructure/setup-account-observability.sh.
@@ -129,19 +130,26 @@ function Invoke-GameAgentAccountObservability {
         Write-Host "            '/aws/application-signals/data')"
     }
 
-    # Print the one-time remedy for a missing-or-unknown 'aws/spans' group, keyed
-    # on the current trace destination so the advice never prescribes a toggle
-    # that cannot create the group. Mirrors print_spans_remedy in the shell
-    # script:
-    #   - destination CloudWatchLogs, group absent : disable/re-enable toggle;
-    #   - destination XRay                         : the console once, or let the
-    #     deploy's own 'agentcore launch' perform the first enable and read the
-    #     post-launch recheck (no XRay->CloudWatchLogs pair, which is the
-    #     first-time enable that does not create the group);
-    #   - destination unreadable (or group read failed): confirm in the console,
-    #     with no toggle commands, because the current destination is unknown.
+    # Print the one-time remedy for the Transaction Search state, keyed on BOTH
+    # the current trace destination and the 'aws/spans' state so the advice
+    # never prescribes a toggle that cannot create the group, and never tells
+    # the operator to create a group that already exists. Mirrors
+    # print_spans_remedy in the shell script:
+    #   - either read failed                       : confirm in the console, no
+    #     toggle commands, because the current state is unknown;
+    #   - destination XRay, group PRESENT          : the group already exists;
+    #     only the trace destination needs switching to 'CloudWatchLogs',
+    #     through the console or the opt-in Step 1.7 already offers;
+    #   - destination XRay, group absent, default  : the launch switches the
+    #     destination (which does not create the group by itself); Step 5c then
+    #     prints the one-time toggle from 'CloudWatchLogs';
+    #   - destination XRay, group absent, recheck  : the launch already ran and
+    #     did NOT switch the destination (see the toolkit's 'Transaction Search
+    #     configuration failed' warning); enable Transaction Search once in the
+    #     console, then re-run;
+    #   - destination CloudWatchLogs, group absent : disable/re-enable toggle.
     function Write-SpansRemedy {
-        param([string]$Destination, [string]$SpansState, [string]$Indent)
+        param([string]$Destination, [string]$SpansState, [string]$Indent, [string]$Mode = 'default')
         if ($Destination -eq 'UNREADABLE' -or $SpansState -eq 'unreadable') {
             Write-Host "${Indent}The current trace destination or the 'aws/spans' log group could not be read"
             Write-Host "${Indent}(the call was denied, throttled, or otherwise failed), so Transaction Search"
@@ -149,13 +157,29 @@ function Invoke-GameAgentAccountObservability {
             Write-Host "${Indent}console, then re-run the deployment."
             return
         }
+        if ($Destination -eq 'XRay' -and $SpansState -eq 'present') {
+            Write-Host "${Indent}The AWS-reserved 'aws/spans' log group already exists, but the trace"
+            Write-Host "${Indent}destination is 'XRay', not 'CloudWatchLogs', so spans do not flow yet."
+            Write-Host "${Indent}Switch the destination to 'CloudWatchLogs' by enabling Transaction Search"
+            Write-Host "${Indent}in the AWS X-Ray / CloudWatch console, or re-run with the opt-in:"
+            Write-Host "${Indent}    Deploy-GameAgent -ConfigureAccountObservability"
+            return
+        }
         if ($Destination -eq 'XRay') {
+            if ($Mode -eq 'recheck') {
+                Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+                Write-Host "${Indent}is not present. The launch has already run and did NOT switch the"
+                Write-Host "${Indent}destination. Look in the launch output for the toolkit warning"
+                Write-Host "${Indent}'Transaction Search configuration failed', then enable Transaction Search"
+                Write-Host "${Indent}once in the AWS X-Ray / CloudWatch console and re-run the deployment."
+                return
+            }
             Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
-            Write-Host "${Indent}is not present. A first-time API enable (destination -> CloudWatchLogs) does"
-            Write-Host "${Indent}NOT create it. Create it once by enabling Transaction Search in the AWS"
-            Write-Host "${Indent}X-Ray / CloudWatch console; otherwise the deployment's own 'agentcore launch'"
-            Write-Host "${Indent}performs the first enable, and the post-launch recheck reports whether the"
-            Write-Host "${Indent}group was created. Then re-run the deployment if it was not."
+            Write-Host "${Indent}is not present. The deployment's own 'agentcore launch' switches the"
+            Write-Host "${Indent}destination to 'CloudWatchLogs', which does NOT create the group by itself;"
+            Write-Host "${Indent}the post-launch recheck (Step 5c) then prints the one-time toggle. You can"
+            Write-Host "${Indent}instead enable Transaction Search once in the AWS X-Ray / CloudWatch console"
+            Write-Host "${Indent}now."
             return
         }
         # destination CloudWatchLogs with the group absent.
@@ -198,7 +222,7 @@ function Invoke-GameAgentAccountObservability {
             Write-Host "      Trace destination is '$destination', not 'CloudWatchLogs'."
             Write-Host "      Spans will not flow until destination is 'CloudWatchLogs' and 'aws/spans' exists."
         }
-        Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      '
+        Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      ' -Mode 'recheck'
         return
     }
 
@@ -232,7 +256,7 @@ function Invoke-GameAgentAccountObservability {
             Write-Host '      To let the deployment configure them, re-run with the opt-in:'
             Write-Host '          Deploy-GameAgent -ConfigureAccountObservability'
         } else {
-            Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      '
+            Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      ' -Mode 'default'
         }
         Write-Host '  Continuing deployment (default account-observability is non-blocking).'
         return

@@ -76,6 +76,15 @@ BeforeAll {
                 'logs describe-log-groups' {
                     if ($spansUnreadableLocal) { $global:LASTEXITCODE = 254; return '' }
                     $global:LASTEXITCODE = 0
+                    # The AWS CLI only renders the quoted log-group name in JSON
+                    # output. Emulate that: return JSON only when '--output json'
+                    # is requested, and a 'text' rendering otherwise, so a reader
+                    # that drops the flag reads an existing group as 'absent' and
+                    # the PowerShell '--output json' request is pinned.
+                    if ($allArgs -notmatch '--output json') {
+                        if ($spansLocal) { return "LOGGROUPS`taws/spans`t1700000000000" }
+                        return ''
+                    }
                     if ($spansLocal) { return '{"logGroups":[{"logGroupName":"aws/spans"}]}' }
                     return '{"logGroups":[]}'
                 }
@@ -316,23 +325,41 @@ Describe 'Invoke-GameAgentAccountObservability' {
         # The disable/re-enable toggle is the correct remedy from CloudWatchLogs.
         $host_ | Should -Match 'update-trace-segment-destination --destination XRay'
         $host_ | Should -Match 'update-trace-segment-destination --destination CloudWatchLogs'
+        # The recheck never offers the opt-in (it cannot create the group).
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
 
-    It 'ReportOnly warns and points to the console or launch when the destination is XRay' {
-        # agentcore launch may leave the destination at XRay. The recheck must
-        # surface it, stay read-only, and point to the console or the deploy's
-        # own launch rather than print the XRay -> CloudWatchLogs toggle pair (a
-        # first-time enable from XRay does not create the group) or recommend the
-        # opt-in (which cannot create it either).
+    It 'ReportOnly points to the toolkit warning and the console (no launch, no opt-in) when the destination is XRay and aws/spans is absent' {
+        # The recheck runs AFTER the final launch. If the destination is still
+        # XRay, the launch did not switch it, so the recheck must point to the
+        # toolkit's "Transaction Search configuration failed" warning and the
+        # one-time console enable, NOT back to another launch and NOT to the
+        # XRay -> CloudWatchLogs toggle pair or the opt-in.
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
         $mutations.Count | Should -Be 0
         ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
         $host_ = $script:HostMessages -join "`n"
-        $host_ | Should -Match 'agentcore launch'
+        $host_ | Should -Match 'Transaction Search configuration failed'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
-        $host_ | Should -Not -Match 'GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'ReportOnly reports an existing aws/spans as present (not missing) when the destination is XRay' {
+        # A launch whose Transaction Search step failed on an account that
+        # already had an 'aws/spans' grant leaves the destination at XRay with
+        # the group present. The recheck must NOT claim the group is missing;
+        # only the destination needs switching (console or opt-in).
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations.Count | Should -Be 0
+        ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'already exists'
+        $host_ | Should -Not -Match 'is not present'
+        $host_ | Should -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
 
     It 'ReportOnly reports unreadable aws/spans and prints no toggle commands' {
@@ -345,6 +372,7 @@ Describe 'Invoke-GameAgentAccountObservability' {
         # Unreadable spans: confirm in the console, no toggle commands.
         $host_ | Should -Match 'could not be read'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
 
     It 'ReportOnly confirms in the console and prints no toggle when the destination is unreadable' {
@@ -356,6 +384,7 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $host_ = $script:HostMessages -join "`n"
         $host_ | Should -Match 'could not be read'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
 
     It 'Default mode offers the opt-in only when aws/spans already exists' {
@@ -397,6 +426,9 @@ Describe 'Invoke-GameAgentAccountObservability' {
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
         $mutations.Count | Should -Be 0
         $host_ = $script:HostMessages -join "`n"
+        # Positive assertion: the unreadable branch is actually printed, so this
+        # spec cannot pass merely because nothing was written.
+        $host_ | Should -Match 'could not be read'
         $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
     }

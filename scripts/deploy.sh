@@ -57,6 +57,18 @@ if ! command -v jq &> /dev/null; then
     echo "   ✅ jq installed"
 fi
 
+# python3 is required to parse AWS CLI JSON in the account-observability steps
+# (Step 1.7 default read, Step 2b trace-delivery verification, and the Step 5c
+# recheck). uv installs Python 3.13 for the backend but does not put it on PATH,
+# so a standalone python3 is a hard prerequisite. Unlike jq it is not
+# auto-installed: fail with a clear message rather than guess an interpreter.
+if ! command -v python3 &> /dev/null; then
+    echo "❌ python3 not found. It is required to parse AWS responses in the"
+    echo "   account-observability steps. Install Python 3 from https://www.python.org/downloads/"
+    echo "   (or your OS package manager) and re-run."
+    exit 1
+fi
+
 # Docker is optional — backend deploys without it, but frontend (Steps 6-8) will be skipped
 DOCKER_AVAILABLE=true
 if ! command -v docker &> /dev/null; then
@@ -173,9 +185,9 @@ echo ""
 # default the deployment is read-only here: it detects whether the account
 # already supports Transaction Search and, if not, prints an actionable warning
 # without failing. That warning recommends the opt-in only when the AWS-reserved
-# 'aws/spans' log group already exists; otherwise it points to the one-time
-# console enable or a destination toggle, because the opt-in cannot create that
-# group. See docs/OBSERVABILITY_ADOT_EXPORTER.md.
+# 'aws/spans' log group already exists and the destination was read; otherwise
+# it points to the one-time console enable or a destination toggle, because the
+# opt-in cannot create that group. See docs/OBSERVABILITY_ADOT_EXPORTER.md.
 echo "📡 Step 1.7: Account-wide observability..."
 GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY="${GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY:-false}" \
   AWS_REGION="$AWS_REGION" \
