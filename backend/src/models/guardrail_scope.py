@@ -42,13 +42,18 @@ class GuardrailScopedBedrockModel(BedrockModel):
     position are never used to recognize them.
     """
 
-    def _format_bedrock_messages(self, messages: Messages) -> list[dict[str, Any]]:
+    def _format_bedrock_messages(self, messages: Messages, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        # The base ``_format_bedrock_messages`` signature varies across supported
+        # Strands versions (newer releases pass extra positional/keyword
+        # arguments such as ``dynamic_trailing_blocks``). Accept and forward any
+        # additional arguments unchanged so the override stays compatible with
+        # every version while applying its guardrail-scope rewrite.
         if not self.config.get("guardrail_latest_message", False):
-            return super()._format_bedrock_messages(messages)
+            return super()._format_bedrock_messages(messages, *args, **kwargs)
 
         last_user_idx = self._find_last_user_text_message_index(messages)
         if last_user_idx is None:
-            return super()._format_bedrock_messages(messages)
+            return super()._format_bedrock_messages(messages, *args, **kwargs)
 
         # Map a fresh nonce to each marked block's original text, without
         # mutating the caller's message list. Only the last user text message
@@ -70,7 +75,7 @@ class GuardrailScopedBedrockModel(BedrockModel):
         source["content"] = staged_content
         staged_messages[last_user_idx] = source
 
-        formatted = super()._format_bedrock_messages(cast(Messages, staged_messages))
+        formatted = super()._format_bedrock_messages(cast(Messages, staged_messages), *args, **kwargs)
         if not nonce_to_text:
             return formatted
 
