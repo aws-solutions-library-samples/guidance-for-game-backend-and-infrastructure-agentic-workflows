@@ -74,23 +74,26 @@ def _sanitize_excerpt(body: bytes) -> str:
 
 
 class _NoCrossHostRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse any redirect whose target host differs from the original.
+    """Refuse any redirect that changes the host or downgrades the scheme.
 
     CPython's default redirect handler copies request headers -- including the
     ``Authorization`` bearer token -- onto the redirect target whatever its
-    host, so a redirect from an API host to another host would carry the token
-    off GitHub. This handler allows a same-host redirect but raises on a
-    cross-host redirect so the token is never forwarded to a different host.
+    host or scheme, so a redirect from an API host to another host, or a
+    downgrade from ``https`` to ``http`` on the same host, would carry the token
+    off GitHub or onto a cleartext connection. This handler allows a redirect
+    only when the target scheme and host both equal the original; otherwise it
+    raises, naming the refused target so the error is actionable, and the token
+    is never forwarded.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old_host = urllib.parse.urlsplit(req.full_url).netloc
-        new_host = urllib.parse.urlsplit(newurl).netloc
-        if new_host and new_host != old_host:
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(newurl)
+        if new.netloc and (new.netloc != old.netloc or new.scheme != old.scheme):
             raise urllib.error.HTTPError(
                 req.full_url,
                 code,
-                f"refusing cross-host redirect to {new_host}",
+                f"refusing redirect to {new.scheme}://{new.netloc}",
                 headers,
                 fp,
             )
@@ -112,10 +115,19 @@ def _urllib_transport(request: Request) -> Response:
                 body=handle.read(),
             )
     except urllib.error.HTTPError as error:  # pragma: no cover - exercised via fakes
+        body = error.read() or b""
+        if not body:
+            # A refused redirect (raised by _NoCrossHostRedirect) carries its
+            # actionable reason in ``reason``/``msg`` but no body; surface it so
+            # the sanitized error excerpt still names the refused target instead
+            # of an opaque "status 302".
+            reason = getattr(error, "reason", None) or getattr(error, "msg", None)
+            if reason:
+                body = str(reason).encode("utf-8", "replace")
         return Response(
             status=error.code,
             headers={k.lower(): v for k, v in (error.headers or {}).items()},
-            body=error.read() or b"",
+            body=body,
         )
 
 

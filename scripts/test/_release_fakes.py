@@ -261,6 +261,7 @@ def covering_tag_ruleset(ruleset_id: int = 42) -> tuple[dict, dict]:
         "target": "tag",
         "enforcement": "active",
         "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+        "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}],
     }
     return summary, detail
 

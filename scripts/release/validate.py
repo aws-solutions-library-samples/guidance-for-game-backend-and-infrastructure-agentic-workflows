@@ -14,6 +14,7 @@ from __future__ import annotations
 
 # Standard library
 import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -342,48 +343,115 @@ def validate_environment_policy(client: GitHubClient, *, environment: str = RELE
     )
 
 
-def _ruleset_include_covers(pattern: str, *, tag_prefix: str) -> bool:
-    """Return True if a ruleset include ``pattern`` covers ``refs/tags/<prefix>*``.
+# The ruleset rule types that restrict who may create, update, or delete a tag.
+# A covering ruleset is only a real gate on tag writes when it carries at least
+# one of these; a ruleset that merely matches the ref (for example one holding
+# only ``non_fast_forward`` and ``required_deployments``) covers the tag without
+# restricting who creates or updates it. The single ruleset GET returns ``rules``
+# without write access, so this is machine-checked, not hand-checked.
+_TAG_RESTRICTING_RULE_TYPES = frozenset({"creation", "update", "deletion"})
 
-    GitHub ruleset ``conditions.ref_name.include`` entries are either the
-    special ``~ALL`` token (every ref) or an fnmatch-style ref pattern such as
-    ``refs/tags/v*`` or ``refs/tags/v[0-9]*``. A pattern covers the versioned
-    tags when it is ``~ALL`` or matches the representative ref
-    ``refs/tags/<prefix>0.0.0``.
+
+def _fnm_pathname_regex(pattern: str) -> str:
+    """Translate a ruleset ref pattern to a regex with ``File.fnmatch`` +
+    ``FNM_PATHNAME`` semantics.
+
+    GitHub matches ``conditions.ref_name.include`` / ``exclude`` entries against
+    a concrete ref with Ruby's ``File.fnmatch(pattern, ref, File::FNM_PATHNAME)``
+    (see GitHub's "Creating rulesets" article). Under ``FNM_PATHNAME`` the
+    wildcards ``*``, ``?``, and ``[...]`` never cross a ``/``, so ``refs/*`` does
+    NOT match ``refs/tags/v1.0.0``. GitHub additionally treats a ``**`` path
+    segment (``**/``) as zero or more directories, so ``refs/tags/**/*`` DOES
+    match ``refs/tags/v1.0.0``. ``~ALL`` is the caller's special case and never
+    reaches here. ``FNM_EXTGLOB`` and ``[^...]`` complement are unsupported by
+    GitHub and are not emulated; a ``[!...]`` negation is honored as fnmatch
+    documents it.
     """
 
-    # Standard library
-    import fnmatch
+    i = 0
+    n = len(pattern)
+    out = ["\\A"]
+    while i < n:
+        char = pattern[i]
+        if char == "*":
+            if pattern[i : i + 3] == "**/":
+                out.append("(?:[^/]*/)*")  # zero or more directories
+                i += 3
+                continue
+            if pattern[i : i + 2] == "**":
+                out.append("[^/]*")  # trailing ** behaves as a single-segment *
+                i += 2
+                continue
+            out.append("[^/]*")
+            i += 1
+        elif char == "?":
+            out.append("[^/]")
+            i += 1
+        elif char == "[":
+            j = i + 1
+            if j < n and pattern[j] in "!^":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape("["))
+                i += 1
+            else:
+                stuff = pattern[i + 1 : j]
+                if stuff.startswith("!"):
+                    stuff = "^" + stuff[1:]
+                stuff = stuff.replace("\\", "\\\\")
+                out.append("[" + stuff + "]")
+                i = j + 1
+        else:
+            out.append(re.escape(char))
+            i += 1
+    out.append("\\Z")
+    return "".join(out)
+
+
+def _ruleset_pattern_matches_ref(pattern: str, ref: str) -> bool:
+    """Return True if a ruleset ``pattern`` matches ``ref`` the way GitHub does.
+
+    ``~ALL`` matches every ref. Any other pattern is matched with the
+    ``FNM_PATHNAME`` translation above, so ``*`` does not cross ``/``.
+    """
 
     if pattern == "~ALL":
         return True
-    representative = f"refs/tags/{tag_prefix}0.0.0"
-    return fnmatch.fnmatchcase(representative, pattern)
+    return re.match(_fnm_pathname_regex(pattern), ref) is not None
 
 
-def _ruleset_excludes_v_tags(exclude: list, *, tag_prefix: str) -> bool:
-    """Return True if any exclude pattern removes ``refs/tags/<prefix>*``."""
+def _dispatched_tag_ref(tag: str, *, tag_prefix: str) -> str:
+    """Return the concrete ref the ruleset must cover for ``tag``.
 
-    # Standard library
-    import fnmatch
-
-    representative = f"refs/tags/{tag_prefix}0.0.0"
-    for pattern in exclude:
-        if isinstance(pattern, str) and fnmatch.fnmatchcase(representative, pattern):
-            return True
-    return False
-
-
-def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag_prefix: str = "v") -> bool:
-    """Return True if an active tag ruleset covers ``refs/tags/<prefix>*``.
-
-    Reads each tag-target ruleset's ``conditions.ref_name`` with
-    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
-    only when it is ``active`` and an include pattern covers the versioned tags
-    (an fnmatch pattern that matches, or ``~ALL``) without an exclude pattern
-    that removes them.
+    The gate checks the exact ref that will be written (``refs/tags/<tag>``) so
+    a ruleset that covers only a subset of the versioned tags (for example
+    ``refs/tags/v0.*`` or a ``v*`` include minus a ``v*-rc.*`` exclude) does not
+    pass for a tag it does not actually protect. When no concrete tag is
+    available (a best-effort report), the representative ``refs/tags/<prefix>``
+    with no version suffix is used.
     """
 
+    return f"refs/tags/{tag}" if tag else f"refs/tags/{tag_prefix}"
+
+
+def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> bool:
+    """Return True if an active tag ruleset actually covers ``refs/tags/<tag>``
+    and restricts who may create, update, or delete it.
+
+    Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
+    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
+    only when it is ``active``; an include pattern matches ``refs/tags/<tag>``
+    (``~ALL`` or an ``FNM_PATHNAME`` pattern) with no exclude pattern that
+    removes it; and it carries at least one restricting rule type
+    (``creation`` / ``update`` / ``deletion``), so matching alone — without any
+    rule that gates the write — does not pass the gate.
+    """
+
+    ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
     for summary in client.list_rulesets(target="tag"):
         if str(summary.get("enforcement", "")) != "active":
             continue
@@ -396,32 +464,35 @@ def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag_prefix: str = "v") ->
         conditions = (detail.get("conditions") or {}).get("ref_name") or {}
         include = conditions.get("include") or []
         exclude = conditions.get("exclude") or []
-        covers = any(
-            _ruleset_include_covers(str(pattern), tag_prefix=tag_prefix)
-            for pattern in include
-            if isinstance(pattern, str)
-        )
-        if covers and not _ruleset_excludes_v_tags(exclude, tag_prefix=tag_prefix):
+        covers = any(_ruleset_pattern_matches_ref(str(pattern), ref) for pattern in include if isinstance(pattern, str))
+        if not covers:
+            continue
+        if any(_ruleset_pattern_matches_ref(str(pattern), ref) for pattern in exclude if isinstance(pattern, str)):
+            continue
+        rule_types = {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
+        if rule_types & _TAG_RESTRICTING_RULE_TYPES:
             return True
     return False
 
 
-def validate_tag_ruleset_present(client: GitHubClient, *, tag_prefix: str = "v") -> None:
-    """Fail closed unless an active tag ruleset covers ``refs/tags/<prefix>*``.
+def validate_tag_ruleset_present(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> None:
+    """Fail closed unless an active tag ruleset covers ``refs/tags/<tag>``.
 
     A non-dry run must not publish a tag the repository does not protect with a
-    tag ruleset. The ruleset's ref conditions are readable with ``Metadata:
-    read``, so this is a machine check, not advice.
+    tag ruleset that both matches the dispatched ref and restricts who may
+    create, update, or delete it. The ruleset's ref conditions and rule list are
+    readable with ``Metadata: read``, so this is a machine check, not advice.
     """
 
     _require(
-        tag_ruleset_covers_v_tags(client, tag_prefix=tag_prefix),
-        f"no active tag ruleset covers refs/tags/{tag_prefix}*; "
-        f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags before releasing",
+        tag_ruleset_covers_v_tags(client, tag=tag, tag_prefix=tag_prefix),
+        f"no active tag ruleset covers refs/tags/{tag_prefix}* with a creation/update/deletion rule; "
+        f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags and restricts "
+        "who may create, update, or delete them before releasing",
     )
 
 
-def report_release_settings(client: GitHubClient, *, tag_prefix: str = "v") -> dict[str, str]:
+def report_release_settings(client: GitHubClient, *, tag: str = "", tag_prefix: str = "v") -> dict[str, str]:
     """Best-effort, non-failing report of the two settings immutability depends on.
 
     Returns a small status mapping for the two repository settings the
@@ -434,23 +505,66 @@ def report_release_settings(client: GitHubClient, *, tag_prefix: str = "v") -> d
       read-back check, which fails the run unless the published release reports
       ``immutable: true``.
     * ``tag_ruleset``: whether an active ``tag``-target ruleset actually covers
-      ``refs/tags/<prefix>*``. Each tag ruleset's ref-name conditions are read
-      with ``Metadata: read`` (already granted), so a ruleset that covers the
-      versioned tags is reported ``"present"`` and one that does not (or no tag
-      ruleset at all) is reported ``"absent"``.
+      the dispatched ``refs/tags/<tag>`` (or, when no tag is supplied, the
+      representative ``refs/tags/<prefix>``) and restricts who may create,
+      update, or delete it. Each tag ruleset's ref-name conditions and rule list
+      are read with ``Metadata: read`` (already granted), so a ruleset that
+      covers and restricts the tag is reported ``"present"`` and one that does
+      not (or no tag ruleset at all) is reported ``"absent"``.
 
     This never raises; a read error is reported as ``"unreadable"`` so a
     transient API failure cannot block a release here. The authoritative tag
-    ruleset gate before a non-dry run is :func:`validate_tag_ruleset_present`.
+    ruleset gate before a non-dry run is :func:`validate_tag_ruleset_present`,
+    which checks the same dispatched ref.
     """
 
     report = {"immutable_releases": "unverifiable-pre-run", "tag_ruleset": "absent"}
     try:
-        covered = tag_ruleset_covers_v_tags(client, tag_prefix=tag_prefix)
+        covered = tag_ruleset_covers_v_tags(client, tag=tag, tag_prefix=tag_prefix)
     except Exception:  # noqa: BLE001 - advisory read only; never block on it
         report["tag_ruleset"] = "unreadable"
         return report
     report["tag_ruleset"] = "present" if covered else "absent"
+    return report
+
+
+def report_environment_policy(client: GitHubClient, *, environment: str = RELEASE_ENVIRONMENT) -> dict[str, str]:
+    """Best-effort, non-failing report of the two machine-checkable environment
+    rules a dry run cannot otherwise surface.
+
+    ``validate_environment_policy`` enforces prevent-self-review and the
+    main-only deployment branch policy, but only in the publish step after
+    approval. A dry run never reaches that step, so this read-only report lets
+    ``verify-environment`` warn about either before approval. Returns a mapping
+    with ``prevent_self_review`` and ``branch_policy`` each one of ``"ok"``,
+    ``"missing"``, or ``"unreadable"``; it never raises.
+    """
+
+    report = {"prevent_self_review": "missing", "branch_policy": "missing"}
+    try:
+        payload = client.get_environment(environment) or {}
+        rules = payload.get("protection_rules") or []
+        report["prevent_self_review"] = (
+            "ok"
+            if any(
+                isinstance(rule, dict)
+                and str(rule.get("type", "")) == _REQUIRED_REVIEWERS_RULE
+                and rule.get("prevent_self_review") is True
+                for rule in rules
+            )
+            else "missing"
+        )
+        branch_policy = payload.get("deployment_branch_policy")
+        names = sorted(str(p.get("name", "")) for p in client.list_deployment_branch_policies(environment))
+        report["branch_policy"] = (
+            "ok"
+            if isinstance(branch_policy, dict)
+            and branch_policy.get("custom_branch_policies") is True
+            and names == [MAIN_BRANCH]
+            else "missing"
+        )
+    except Exception:  # noqa: BLE001 - advisory read only; never block on it
+        return {"prevent_self_review": "unreadable", "branch_policy": "unreadable"}
     return report
 
 

@@ -317,6 +317,37 @@ class DispatchRefGuardContractTests(unittest.TestCase):
         )
         self.assertIn("exit 1", guard, "guard-ref must fail (exit 1) on a non-main dispatch ref")
 
+    def test_guard_ref_env_is_pinned_to_github_ref(self):
+        # The guard reads the dispatch ref from GBAW_DISPATCH_REF, which must be
+        # mapped to the trusted ${{ github.ref }} and nothing else. Hardcoding
+        # it (e.g. to refs/heads/main) would make the shell comparison pass on
+        # every dispatch and restore the green run off main.
+        guard = self.jobs.get("guard-ref", "")
+        self.assertRegex(
+            guard,
+            r"(?m)^\s{10}GBAW_DISPATCH_REF:\s*\$\{\{\s*github\.ref\s*\}\}\s*$",
+            msg="guard-ref must map GBAW_DISPATCH_REF to ${{ github.ref }} (not a hardcoded value)",
+        )
+
+    def test_guard_ref_has_no_if_or_continue_on_error(self):
+        # Neither the guard JOB nor its STEP may carry an `if:` (which could
+        # skip the guard off main) or `continue-on-error:` (which would let its
+        # failure be ignored and the run still show green off main).
+        guard = self.jobs.get("guard-ref", "")
+        self.assertTrue(guard, "guard-ref job must exist")
+        # No job-level if: (4-space key) and no step-level if: (anywhere).
+        self.assertNotRegex(
+            guard,
+            r"(?m)^\s*if:",
+            msg="guard-ref must carry no if: at the job or step level",
+        )
+        # No continue-on-error at the job or step level.
+        self.assertNotRegex(
+            guard,
+            r"(?m)^\s*continue-on-error:",
+            msg="guard-ref must not set continue-on-error (its failure must stop the run)",
+        )
+
     def _guard_run_text(self) -> str:
         """Return the exact ``run:`` body of the guard-ref step."""
         block = self.jobs["guard-ref"]

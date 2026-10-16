@@ -488,5 +488,89 @@ class WaiverForwardedThroughCliTests(unittest.TestCase):
             self.assertIn("create_release", client.calls)
 
 
+class PublishGateCallSiteTests(unittest.TestCase):
+    """Both fail-closed gates must be wired into ``publish_release_from_dir``:
+    the environment-policy gate and the tag-ruleset gate. A fully valid,
+    byte-matching artifact set whose repository fails ONE gate must be refused
+    before any write, so removing either gate call from the publish path turns
+    a test red."""
+
+    def _valid_input_dir(self, d: Path, *, tag="v0.1.0"):
+        out = d / "release-artifacts"
+        out.mkdir(parents=True)
+        manifest_bytes = (
+            '{\n  "attached_files": [\n    "SHA256SUMS",\n'
+            '    "backend-sbom.spdx.json",\n    "frontend-sbom.spdx.json",\n'
+            '    "release-manifest.json"\n  ],\n'
+            f'  "commit": "{COMMIT}",\n'
+            '  "schema_version": "gbaw.release-manifest.v1",\n'
+            f'  "tag": "{tag}"\n}}\n'
+        ).encode("utf-8")
+        arts, _sums = artifacts_mod.assemble_artifacts(
+            manifest_bytes=manifest_bytes,
+            backend_sbom_bytes=b'{"spdx": "backend"}\n',
+            frontend_sbom_bytes=b'{"spdx": "frontend"}\n',
+        )
+        for art in arts:
+            (out / art.name).write_bytes(art.data)
+        return out
+
+    def _metadata(self, tag="v0.1.0"):
+        return publish.PublishMetadata(
+            tag=tag,
+            commit=COMMIT,
+            release_name=tag,
+            notes="# notes\n",
+            tagger_name="Bot",
+            tagger_email="release@example.com",
+            commit_date="2024-01-02T03:04:05Z",
+        )
+
+    def test_tag_ruleset_gate_is_wired_into_publish_path(self):
+        # The environment policy is fully compliant, but NO tag ruleset covers
+        # the dispatched tag. publish_release_from_dir must refuse before any
+        # write (removing validate_tag_ruleset_present from the path makes this
+        # pass through to a write).
+        # Standard library
+        import tempfile
+
+        # Local modules
+        from release import validate as validate_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            out = self._valid_input_dir(Path(d))
+            client = RecordingClient()
+            client.main_head = COMMIT
+            apply_release_settings(client)
+            client.rulesets = []  # drop the covering tag ruleset
+            client.ruleset_details = {}
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.publish_release_from_dir(client, out, self._metadata())
+            self.assertIn("tag ruleset", str(ctx.exception).lower())
+            self.assertNotIn("create_release", client.calls)
+
+    def test_environment_policy_gate_is_wired_into_publish_path(self):
+        # The tag ruleset is fully compliant, but the environment does not
+        # prevent self-review. publish_release_from_dir must refuse before any
+        # write (reverting to validate_environment_protected, which does not
+        # check self-review, makes this pass through to a write).
+        # Standard library
+        import tempfile
+
+        # Local modules
+        from release import validate as validate_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            out = self._valid_input_dir(Path(d))
+            client = RecordingClient()
+            client.main_head = COMMIT
+            apply_release_settings(client)
+            client.environments["release"]["protection_rules"][0]["prevent_self_review"] = False
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.publish_release_from_dir(client, out, self._metadata())
+            self.assertIn("self-review", str(ctx.exception).lower())
+            self.assertNotIn("create_release", client.calls)
+
+
 if __name__ == "__main__":
     unittest.main()

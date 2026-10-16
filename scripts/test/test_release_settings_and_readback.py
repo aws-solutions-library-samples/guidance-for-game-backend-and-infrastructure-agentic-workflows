@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPTS_ROOT) not in sys.path:
@@ -140,6 +141,39 @@ class PostPublishReadBackTests(unittest.TestCase):
                 publish.publish_release_from_dir(client, out, _metadata())
             self.assertIn("immutable", str(ctx.exception).lower())
 
+    def test_immutable_failure_remedy_states_the_two_constraints(self):
+        # The remedy must say the release cannot be made immutable retroactively
+        # and the same tag cannot be re-dispatched while the release/ref exist,
+        # not an unqualified "re-run". Reverting the text to a bare re-run fails.
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "release-artifacts"
+            _write_artifact_set(out)
+            client = _ready_client(published_immutable=False)
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.publish_release_from_dir(client, out, _metadata())
+            message = str(ctx.exception).lower()
+            self.assertIn("retroactively", message)
+            self.assertIn("re-dispatched", message)
+
+    def test_mutable_release_with_bad_asset_reports_both_failures(self):
+        # verify_published_release runs every check even when immutability
+        # fails, so an operator sees the asset mismatch too (not just the first
+        # failure). Checking immutable before assets/tag and short-circuiting
+        # would drop the asset failure.
+        inputs = _artifact_inputs()
+        client = _ready_client(published_immutable=False)
+        client.releases.append({"id": 600, "tag_name": "v0.1.0", "draft": False})
+        _record_assets(client, 600, inputs)
+        # Corrupt one recorded asset size so the asset check also fails.
+        client.release_assets[600][0]["size"] = client.release_assets[600][0]["size"] + 3
+        client.existing_refs["tags/v0.1.0"] = "t" * 40
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=600, inputs=inputs, created_tag_sha="t" * 40)
+        message = str(ctx.exception).lower()
+        self.assertIn("immutable", message)
+        self.assertIn("does not equal the published", message)
+
     def test_missing_asset_fails_read_back(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "release-artifacts"
@@ -245,7 +279,7 @@ class SettingsReportTests(unittest.TestCase):
         summary, detail = covering_tag_ruleset()
         client.rulesets = [summary]
         client.ruleset_details = {summary["id"]: detail}
-        report = validate_mod.report_release_settings(client)
+        report = validate_mod.report_release_settings(client, tag="v0.1.0")
         self.assertEqual(report["tag_ruleset"], "present")
 
     def test_tag_ruleset_absent_when_conditions_do_not_cover_v_tags(self):
@@ -258,16 +292,17 @@ class SettingsReportTests(unittest.TestCase):
             "target": "tag",
             "enforcement": "active",
             "conditions": {"ref_name": {"include": ["refs/tags/untagged-*"], "exclude": []}},
+            "rules": [{"type": "deletion"}],
         }
         client.rulesets = [summary]
         client.ruleset_details = {7: detail}
-        report = validate_mod.report_release_settings(client)
+        report = validate_mod.report_release_settings(client, tag="v0.1.0")
         self.assertEqual(report["tag_ruleset"], "absent")
 
     def test_tag_ruleset_absent_reported(self):
         client = RecordingClient()
         client.rulesets = [{"id": 3, "name": "branch stuff", "target": "branch"}]
-        report = validate_mod.report_release_settings(client)
+        report = validate_mod.report_release_settings(client, tag="v0.1.0")
         self.assertEqual(report["tag_ruleset"], "absent")
 
     def test_report_never_raises_on_read_error(self):
@@ -277,7 +312,7 @@ class SettingsReportTests(unittest.TestCase):
             raise RuntimeError("api down")
 
         client.list_rulesets = boom  # type: ignore[assignment]
-        report = validate_mod.report_release_settings(client)
+        report = validate_mod.report_release_settings(client, tag="v0.1.0")
         self.assertEqual(report["tag_ruleset"], "unreadable")
         self.assertEqual(report["immutable_releases"], "unverifiable-pre-run")
 
@@ -338,71 +373,102 @@ class UploadHostContractTests(unittest.TestCase):
 
 class TagRulesetGateTests(unittest.TestCase):
     """The non-dry publish must fail closed unless an active tag ruleset covers
-    refs/tags/v*; a dry-run report observes coverage without failing."""
+    refs/tags/<dispatched tag> and restricts who may create/update/delete it; a
+    dry-run report observes coverage without failing."""
+
+    def _ruleset(self, include, *, exclude=None, rules=None, ruleset_id=42, enforcement="active"):
+        summary = {"id": ruleset_id, "name": "tag rs", "target": "tag", "enforcement": enforcement}
+        detail = {
+            "id": ruleset_id,
+            "target": "tag",
+            "enforcement": enforcement,
+            "conditions": {"ref_name": {"include": list(include), "exclude": list(exclude or [])}},
+            "rules": list(rules if rules is not None else [{"type": "creation"}, {"type": "deletion"}]),
+        }
+        client = RecordingClient()
+        client.rulesets = [summary]
+        client.ruleset_details = {ruleset_id: detail}
+        return client
 
     def test_gate_passes_when_v_tags_covered(self):
         client = RecordingClient()
         apply_release_settings(client)
         # Does not raise.
-        validate_mod.validate_tag_ruleset_present(client)
+        validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
 
     def test_gate_fails_when_no_tag_ruleset(self):
         client = RecordingClient()
         with self.assertRaises(validate_mod.ValidationError):
-            validate_mod.validate_tag_ruleset_present(client)
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
 
     def test_gate_fails_when_ruleset_does_not_cover_v_tags(self):
-        client = RecordingClient()
-        summary = {"id": 7, "name": "untagged", "target": "tag", "enforcement": "active"}
-        detail = {
-            "id": 7,
-            "target": "tag",
-            "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["refs/tags/untagged-*"], "exclude": []}},
-        }
-        client.rulesets = [summary]
-        client.ruleset_details = {7: detail}
+        client = self._ruleset(["refs/tags/untagged-*"])
         with self.assertRaises(validate_mod.ValidationError):
-            validate_mod.validate_tag_ruleset_present(client)
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
 
     def test_tilde_all_include_covers_v_tags(self):
-        client = RecordingClient()
-        summary = {"id": 9, "name": "all", "target": "tag", "enforcement": "active"}
-        detail = {
-            "id": 9,
-            "target": "tag",
-            "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
-        }
-        client.rulesets = [summary]
-        client.ruleset_details = {9: detail}
-        self.assertTrue(validate_mod.tag_ruleset_covers_v_tags(client))
+        client = self._ruleset(["~ALL"])
+        self.assertTrue(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
 
     def test_exclude_of_v_tags_defeats_coverage(self):
-        client = RecordingClient()
-        summary = {"id": 10, "name": "all-but-v", "target": "tag", "enforcement": "active"}
-        detail = {
-            "id": 10,
-            "target": "tag",
-            "enforcement": "active",
-            "conditions": {"ref_name": {"include": ["~ALL"], "exclude": ["refs/tags/v*"]}},
-        }
-        client.rulesets = [summary]
-        client.ruleset_details = {10: detail}
-        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client))
+        client = self._ruleset(["~ALL"], exclude=["refs/tags/v*"])
+        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
 
     def test_inactive_ruleset_does_not_cover(self):
-        client = RecordingClient()
-        summary = {"id": 11, "name": "disabled", "target": "tag", "enforcement": "disabled"}
-        detail = {
-            "id": 11,
-            "target": "tag",
-            "enforcement": "disabled",
-            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
-        }
-        client.rulesets = [summary]
-        client.ruleset_details = {11: detail}
-        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client))
+        client = self._ruleset(["refs/tags/v*"], enforcement="disabled")
+        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
+
+    def test_covering_ruleset_without_restricting_rule_does_not_count(self):
+        # A ruleset that matches the ref but carries only non-restricting rules
+        # (for example non_fast_forward + required_deployments) covers the tag
+        # without restricting who creates or updates it, so it must not pass.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "non_fast_forward"}, {"type": "required_deployments"}])
+        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
+        with self.assertRaises(validate_mod.ValidationError):
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+
+    def test_matcher_table_matches_github_fnm_pathname(self):
+        # Pin every row of the matcher table against GitHub's
+        # documented File.fnmatch + FNM_PATHNAME semantics (* does not cross /,
+        # **/ matches zero or more directories, ~ALL matches everything). Each
+        # row lists the include pattern(s), the dispatched tag, and whether the
+        # gate must pass. The fail-open rows (Python's fnmatch would accept
+        # them) and the false-refusal rows (Python would reject them) are both
+        # pinned so a regression in either direction fails.
+        cases = [
+            # (include, exclude, tag, expected_covers)
+            (["refs/tags/v*"], [], "v0.1.0", True),
+            (["refs/tags/v*"], [], "v1.0.0", True),
+            (["refs/tags/v*"], [], "v0.1.0-rc.1", True),
+            (["refs/tags/v*"], [], "v10.2.3", True),
+            (["refs/tags/v[0-9]*"], [], "v0.1.0", True),
+            (["~ALL"], [], "v1.0.0", True),
+            (["refs/tags/untagged-*"], [], "v0.1.0", False),
+            # Subset includes: fail-open under Python's fnmatch, correct here.
+            (["refs/tags/v0.*"], [], "v1.0.0", False),
+            (["refs/tags/v0.*"], [], "v0.1.0", True),
+            (["refs/tags/v0.0.0"], [], "v0.1.0", False),
+            # v* minus an rc exclude: the rc tag is NOT covered.
+            (["refs/tags/v*"], ["refs/tags/v*-rc.*"], "v0.1.0-rc.1", False),
+            (["refs/tags/v*"], ["refs/tags/v*-rc.*"], "v0.1.0", True),
+            # v* minus v1*: v1.0.0 and v10.2.3 are NOT covered.
+            (["refs/tags/v*"], ["refs/tags/v1*"], "v1.0.0", False),
+            (["refs/tags/v*"], ["refs/tags/v1*"], "v0.1.0", True),
+            # refs/* does NOT cross '/', so it does not cover a two-segment tag ref.
+            (["refs/*"], [], "v0.1.0", False),
+            # refs/tags/**/* DOES cover a tag (**/ matches zero or more dirs).
+            (["refs/tags/**/*"], [], "v0.1.0", True),
+            # ~ALL minus refs/*: refs/* does not match the tag ref, so ~ALL still covers.
+            (["~ALL"], ["refs/*"], "v0.1.0", True),
+        ]
+        for include, exclude, tag, expected in cases:
+            with self.subTest(include=include, exclude=exclude, tag=tag):
+                client = self._ruleset(include, exclude=exclude)
+                self.assertEqual(
+                    validate_mod.tag_ruleset_covers_v_tags(client, tag=tag),
+                    expected,
+                    f"include={include} exclude={exclude} tag={tag}",
+                )
 
 
 class EnvironmentPolicyGateTests(unittest.TestCase):
@@ -462,8 +528,8 @@ class ReadBackRetryTests(unittest.TestCase):
 
             client.get_release = flaky_get_release  # type: ignore[assignment]
             # Make the retry sleep a no-op so the test does not wait.
-            publish._sleep = lambda _s: None  # type: ignore[assignment]
-            result = publish.publish_release_from_dir(client, out, _metadata())
+            with mock.patch.object(publish, "_sleep", lambda _s: None):
+                result = publish.publish_release_from_dir(client, out, _metadata())
             self.assertTrue(result.published)
             self.assertGreaterEqual(calls["n"], 2)
 
@@ -474,12 +540,52 @@ class ReadBackRetryTests(unittest.TestCase):
             out = Path(d) / "release-artifacts"
             _write_artifact_set(out)
             client = _ready_client(published_immutable=False)
-            publish._sleep = lambda _s: None  # type: ignore[assignment]
-            with self.assertRaises(validate_mod.ValidationError):
-                publish.publish_release_from_dir(client, out, _metadata())
+            with mock.patch.object(publish, "_sleep", lambda _s: None):
+                with self.assertRaises(validate_mod.ValidationError):
+                    publish.publish_release_from_dir(client, out, _metadata())
             self.assertNotIn("delete_release", client.calls)
             self.assertNotIn("delete_ref", client.calls)
             self.assertTrue(any(not r.get("draft", True) for r in client.releases))
+
+    def test_stale_draft_read_after_successful_publish_deletes_nothing(self):
+        # A stale-read scenario: the publish PATCH succeeded (result.published is
+        # True), but get_release / list_releases return a STALE draft:true read.
+        # The read-back fails "still a draft", yet because the PATCH already
+        # succeeded cleanup must delete NOTHING. If cleanup re-read live state
+        # (instead of trusting result.published) it would see a draft and delete
+        # the release and tag ref -- destroying a published release.
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "release-artifacts"
+            _write_artifact_set(out)
+
+            class StaleDraftReadClient(RecordingClient):
+                def update_release(self, release_id, *, draft=None, prerelease=None, make_latest=None):
+                    # The PATCH succeeds server-side (recorded), but the record
+                    # keeps draft=True so every later READ is a stale draft read.
+                    self.calls.append("update_release")
+                    return {"id": release_id, "draft": True}
+
+                def get_release(self, release_id):
+                    payload = super().get_release(release_id)
+                    payload["draft"] = True  # stale read
+                    return payload
+
+                def list_releases(self):
+                    out = super().list_releases()
+                    for rec in out:
+                        rec["draft"] = True  # stale read
+                    return out
+
+            client = StaleDraftReadClient()
+            client.main_head = COMMIT
+            apply_release_settings(client)
+            with mock.patch.object(publish, "_sleep", lambda _s: None):
+                with self.assertRaises(validate_mod.ValidationError) as ctx:
+                    publish.publish_release_from_dir(client, out, _metadata())
+            self.assertIn("draft", str(ctx.exception).lower())
+            # Despite the live state reading as a draft, nothing was deleted.
+            self.assertNotIn("delete_release", client.calls)
+            self.assertNotIn("delete_ref", client.calls)
 
 
 class PreTagDraftAssetCheckTests(unittest.TestCase):
@@ -508,6 +614,31 @@ class PreTagDraftAssetCheckTests(unittest.TestCase):
             self.assertIn("pre-tag", str(ctx.exception).lower())
             # The tag object was never created, so the tag name is not burned.
             self.assertNotIn("create_tag_object", client.calls)
+
+    def test_lagging_draft_asset_list_is_retried_before_the_tag(self):
+        # The pre-tag draft asset list reads through the retry helper, so a
+        # list that lags once (returns fewer than four assets) immediately
+        # after the uploads is retried rather than failing the run before the
+        # tag exists.
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "release-artifacts"
+            _write_artifact_set(out)
+            client = _ready_client()
+
+            real_list = client.list_release_assets
+            state = {"n": 0}
+
+            def flaky_list(release_id):
+                state["n"] += 1
+                if state["n"] == 1:
+                    return []  # the list lags once right after upload
+                return real_list(release_id)
+
+            client.list_release_assets = flaky_list  # type: ignore[assignment]
+            with mock.patch.object(publish, "_sleep", lambda _s: None):
+                result = publish.publish_release_from_dir(client, out, _metadata())
+            self.assertTrue(result.published)
+            self.assertGreaterEqual(state["n"], 2)
 
 
 class DigestOptionalWhenAbsentTests(unittest.TestCase):
@@ -561,6 +692,90 @@ class RedirectHostContractTests(unittest.TestCase):
         req = urllib.request.Request("https://api.github.com/repos/o/r/releases/1")
         result = handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com/repos/o/r/releases/2")
         self.assertIsNotNone(result)
+
+    def test_https_to_http_same_host_downgrade_is_refused(self):
+        # A same-host redirect that downgrades https -> http would carry the
+        # bearer token in cleartext; the handler must refuse it and keep the
+        # refused target in the message.
+        # Standard library
+        import urllib.request
+
+        # Local modules
+        from release.github_client import _NoCrossHostRedirect
+
+        handler = _NoCrossHostRedirect()
+        req = urllib.request.Request("https://api.github.com/repos/o/r/releases/1")
+        with self.assertRaises(Exception) as ctx:
+            handler.redirect_request(req, None, 302, "Found", {}, "http://api.github.com/repos/o/r/releases/1")
+        self.assertIn("http://api.github.com", str(ctx.exception))
+
+    def test_real_transport_refuses_cross_host_and_keeps_token_off_the_second_host(self):
+        # Through the REAL urllib transport (not the handler in isolation): a
+        # local server redirects to a second local server on another port. The
+        # client must refuse the redirect (so the second server never sees the
+        # Authorization header) and the error must name the refused target.
+        # Standard library
+        import http.server
+        import threading
+
+        # Local modules
+        from release.github_client import GitHubClient, GitHubError
+
+        seen_headers: list[dict] = []
+
+        def make_server(handler_cls):
+            server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            return server, thread
+
+        # Second host: records whether it ever received the bearer token.
+        class SecondHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib naming
+                seen_headers.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *_args):  # silence
+                pass
+
+        second_server, second_thread = make_server(SecondHandler)
+        second_port = second_server.server_address[1]
+
+        # First host: redirects to the second host (different port => different netloc).
+        class FirstHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib naming
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{second_port}/elsewhere")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        first_server, first_thread = make_server(FirstHandler)
+        first_port = first_server.server_address[1]
+
+        try:
+            client = GitHubClient(
+                owner="o",
+                repo="r",
+                token="secret-token",  # noqa: S106 - test token
+                api_root=f"http://127.0.0.1:{first_port}",
+            )
+            with self.assertRaises(GitHubError) as ctx:
+                client.get_release(1)
+            # The refused target (the second host) is named in the error.
+            self.assertIn(f"127.0.0.1:{second_port}", str(ctx.exception))
+            # The second server never received the request (so never the token).
+            self.assertEqual(seen_headers, [])
+        finally:
+            first_server.shutdown()
+            second_server.shutdown()
+            first_thread.join(timeout=5)
+            second_thread.join(timeout=5)
+            first_server.server_close()
+            second_server.server_close()
 
 
 class ReadMethodTransportUrlTests(unittest.TestCase):
@@ -621,18 +836,6 @@ class ReadBackCheckMutationTests(unittest.TestCase):
     still-a-draft, tag_name, ref==this run's tag object, lightweight-ref, and
     absent-ref."""
 
-    def _args(self, client, release_id, inputs, created_tag_sha="t" * 40):
-        return dict(client=client, release_id=release_id, inputs=inputs, created_tag_sha=created_tag_sha)
-
-    def _publish_once(self, **overrides):
-        with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "release-artifacts"
-            _write_artifact_set(out)
-            client = _ready_client(**overrides)
-            publish._sleep = lambda _s: None  # type: ignore[assignment]
-            publish.publish_release_from_dir(client, out, _metadata())
-            return client
-
     def test_still_a_draft_check_rejects_a_draft_readback(self):
         # If the release reads back as still a draft, the read-back must fail.
         with tempfile.TemporaryDirectory() as d:
@@ -640,17 +843,15 @@ class ReadBackCheckMutationTests(unittest.TestCase):
             _write_artifact_set(out)
             client = _ready_client()
 
-            real_update = client.update_release
-
             def no_publish(release_id, *, draft=None, prerelease=None, make_latest=None):
                 # Record the call but leave the release a draft.
                 client.calls.append("update_release")
                 return {"id": release_id, "draft": True}
 
             client.update_release = no_publish  # type: ignore[assignment]
-            publish._sleep = lambda _s: None  # type: ignore[assignment]
-            with self.assertRaises(validate_mod.ValidationError) as ctx:
-                publish.publish_release_from_dir(client, out, _metadata())
+            with mock.patch.object(publish, "_sleep", lambda _s: None):
+                with self.assertRaises(validate_mod.ValidationError) as ctx:
+                    publish.publish_release_from_dir(client, out, _metadata())
             self.assertIn("draft", str(ctx.exception).lower())
 
     def test_tag_name_mismatch_fails(self):
@@ -679,9 +880,9 @@ class ReadBackCheckMutationTests(unittest.TestCase):
         client.published_immutable = True
         _record_assets(client, 501, inputs)
         client.existing_refs["tags/v0.1.0"] = "OTHERSHA"  # ref points elsewhere
-        publish._sleep = lambda _s: None  # type: ignore[assignment]
-        with self.assertRaises(validate_mod.ValidationError) as ctx:
-            publish.verify_published_release(client, release_id=501, inputs=inputs, created_tag_sha="t" * 40)
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=501, inputs=inputs, created_tag_sha="t" * 40)
         self.assertIn("annotated tag object", str(ctx.exception).lower())
 
     def test_lightweight_ref_rejected(self):
@@ -706,9 +907,9 @@ class ReadBackCheckMutationTests(unittest.TestCase):
         client.published_immutable = True
         _record_assets(client, 503, inputs)
         # No ref recorded -> get_ref returns None.
-        publish._sleep = lambda _s: None  # type: ignore[assignment]
-        with self.assertRaises(validate_mod.ValidationError) as ctx:
-            publish.verify_published_release(client, release_id=503, inputs=inputs, created_tag_sha=None)
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=503, inputs=inputs, created_tag_sha=None)
         self.assertIn("tag ref is absent", str(ctx.exception).lower())
 
 

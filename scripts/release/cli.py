@@ -232,7 +232,8 @@ def cmd_verify_environment(_args: argparse.Namespace) -> int:
     client, _owner, _repo = _client()
     validate_mod.validate_environment_protected(client)
     print(f"release environment '{validate_mod.RELEASE_ENVIRONMENT}' is protected by required reviewers")
-    settings = validate_mod.report_release_settings(client)
+    tag = os.environ.get("GBAW_RELEASE_TAG", "")
+    settings = validate_mod.report_release_settings(client, tag=tag)
     print(
         "release settings: immutable-releases="
         f"{settings['immutable_releases']} (enforced after publish by read-back); "
@@ -240,8 +241,25 @@ def cmd_verify_environment(_args: argparse.Namespace) -> int:
     )
     if settings["tag_ruleset"] == "absent":
         print(
-            "note: no tag-target ruleset found; enable a v* tag ruleset and GitHub's "
-            "immutable-releases setting so published tags and assets are immutable "
+            "note: no active tag ruleset covers refs/tags/v*; enable a v* tag ruleset "
+            "(with a creation/update/deletion rule) and GitHub's immutable-releases setting "
+            "so published tags and assets are immutable "
+            "(see docs/RELEASING.md 'Recommended maintainer settings')"
+        )
+    # Report the two environment-policy rules the publish step enforces after
+    # approval (prevent-self-review and the main-only branch policy), so a dry
+    # run surfaces a weak policy before the non-dry run fails post-approval.
+    policy = validate_mod.report_environment_policy(client)
+    print(
+        "release environment policy: "
+        f"prevent-self-review={policy['prevent_self_review']}; "
+        f"main-only branch policy={policy['branch_policy']} "
+        "(both enforced before any write in the publish step)"
+    )
+    if "ok" not in (policy["prevent_self_review"], policy["branch_policy"]) or "missing" in policy.values():
+        print(
+            "note: the publish step fails closed unless the release environment prevents self-review "
+            "and limits deployments to a main-only custom branch policy "
             "(see docs/RELEASING.md 'Recommended maintainer settings')"
         )
     return 0

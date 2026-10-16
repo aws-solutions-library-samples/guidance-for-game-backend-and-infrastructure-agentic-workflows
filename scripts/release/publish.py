@@ -230,9 +230,18 @@ def _check_asset_set(assets, *, inputs: PublishInputs, context: str) -> None:
 
 
 def _verify_draft_assets(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> None:
-    """Confirm the draft's assets before the tag is created (names/sizes/digests)."""
+    """Confirm the draft's assets before the tag is created (names/sizes/digests).
 
-    assets = client.list_release_assets(release_id)
+    Reads the asset list through :func:`_read_with_retries` with the same
+    name-set readiness the post-publish read-back uses, so a list that lags
+    immediately after the uploads is retried rather than failing the run before
+    the tag exists.
+    """
+
+    assets = _read_with_retries(
+        lambda: client.list_release_assets(release_id),
+        is_ready=lambda a: {str(x.get("name", "")) for x in a} == set(ALLOWED_ARTIFACT_NAMES),
+    )
     _check_asset_set(assets, inputs=inputs, context="pre-tag draft asset check")
 
 
@@ -281,28 +290,60 @@ def verify_published_release(
     pre-write checks: an operator (and the workflow) learns that the published
     artifacts, tag, and immutability are exactly as intended, or the run fails
     with a remedy.
+
+    Every check runs even when an earlier one fails, so an operator sees ALL
+    the failures at once (for example, "not immutable" AND an asset mismatch)
+    rather than only the first. The run then raises a single
+    :class:`ValidationError` listing them; a non-empty list fails the run.
     """
+
+    failures: list[str] = []
 
     release = _read_with_retries(
         lambda: client.get_release(release_id),
         is_ready=lambda r: bool(r) and r.get("draft") is False and r.get("immutable") is True,
     )
-    _require(bool(release), "post-publish read-back: release could not be read")
-    _require(release.get("draft") is False, "post-publish read-back: release is still a draft")
-    _require(
-        str(release.get("tag_name", "")) == inputs.tag,
-        "post-publish read-back: released tag_name does not equal the intended tag",
-    )
-    _require(
-        release.get("immutable") is True,
-        "post-publish read-back: release is not immutable. The release is published and cannot be made "
-        "immutable retroactively (GitHub applies the immutable-releases setting only to future releases), "
-        "and the same tag cannot be re-dispatched while this release and tag ref exist. "
-        "See docs/RELEASING.md 'Manual recovery' -> 'A read-back failed after publication' for the choices.",
-    )
+    if not release:
+        raise ValidationError("post-publish read-back: release could not be read")
+    if release.get("draft") is not False:
+        failures.append("post-publish read-back: release is still a draft")
+    if str(release.get("tag_name", "")) != inputs.tag:
+        failures.append("post-publish read-back: released tag_name does not equal the intended tag")
+    if release.get("immutable") is not True:
+        failures.append(
+            "post-publish read-back: release is not immutable. The release is published and cannot be made "
+            "immutable retroactively (GitHub applies the immutable-releases setting only to future releases), "
+            "and the same tag cannot be re-dispatched while this release and tag ref exist. "
+            "See docs/RELEASING.md 'Manual recovery' -> 'A read-back failed after publication' for the choices."
+        )
 
-    _verify_published_assets(client, release_id=release_id, inputs=inputs)
-    _verify_published_tag(client, inputs=inputs, created_tag_sha=created_tag_sha)
+    # Assets and tag are read back regardless of the immutability result, so a
+    # mutable-but-also-wrong-assets release reports both, not just the first.
+    failures.extend(_collect_published_asset_failures(client, release_id=release_id, inputs=inputs))
+    failures.extend(_collect_published_tag_failures(client, inputs=inputs, created_tag_sha=created_tag_sha))
+
+    if failures:
+        raise ValidationError("; ".join(failures))
+
+
+def _collect(check) -> list[str]:
+    """Run a check that raises :class:`ValidationError`; return [] or [message]."""
+
+    try:
+        check()
+    except ValidationError as error:
+        return [str(error)]
+    return []
+
+
+def _collect_published_asset_failures(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> list[str]:
+    return _collect(lambda: _verify_published_assets(client, release_id=release_id, inputs=inputs))
+
+
+def _collect_published_tag_failures(
+    client: GitHubClient, *, inputs: PublishInputs, created_tag_sha: str | None
+) -> list[str]:
+    return _collect(lambda: _verify_published_tag(client, inputs=inputs, created_tag_sha=created_tag_sha))
 
 
 def _verify_published_assets(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> None:
@@ -347,11 +388,14 @@ def _verify_published_tag(client: GitHubClient, *, inputs: PublishInputs, create
 def publish_release(client: GitHubClient, inputs: PublishInputs) -> PublishResult:
     """Execute the ordered publication with strict, outcome-aware cleanup.
 
-    Cleanup decides from the live remote state, not local flags, and runs on any
-    ``BaseException`` (including a cancelled step's ``KeyboardInterrupt`` /
-    SIGTERM) so an interrupted run never leaves a stable-looking tag or a
-    published release. The SIGTERM-to-exception handler is installed BEFORE the
-    draft is created so an interrupt during draft creation is also cleaned up.
+    Cleanup runs on any ``BaseException`` (including a cancelled step's
+    ``KeyboardInterrupt`` / SIGTERM) so an interrupted run never leaves a
+    stable-looking tag or a published release. When the publish PATCH already
+    returned success it deletes nothing (it decides that from the observed PATCH
+    outcome, ``result.published``); otherwise it re-reads the live remote state
+    and removes only what this run created while it is still a draft. The
+    SIGTERM-to-exception handler is installed BEFORE the draft is created so an
+    interrupt during draft creation is also cleaned up.
     """
 
     preflight(client, inputs)
@@ -636,14 +680,15 @@ def _cleanup(
     interrupted: bool = True,
     budget=None,
 ) -> None:
-    """Outcome-aware cleanup. Never raises; decides from live remote state.
+    """Outcome-aware cleanup. Never raises; deletes only when it is safe.
 
     A client-visible error does not prove the server rejected the write: a 502
     after the server applied a PATCH, or an interrupt during the final publish,
     can leave a published release or a created ref. When the publish PATCH
     already returned success (``result.published``), cleanup deletes NOTHING and
-    reports the published release and its tag as left intact. Otherwise cleanup
-    RE-READS the remote state and:
+    reports the published release and its tag as left intact — it decides this
+    from the observed PATCH outcome so a stale live read cannot send it down a
+    delete path. Otherwise cleanup RE-READS the remote state and:
 
     * deletes the tag ref first (so a public tag never outlives its release),
       and only if it still points at THIS run's tag object;
@@ -917,10 +962,12 @@ def publish_release_from_dir(
     # step before this one; both are intentional defense in depth.)
     validate_environment_policy(client)
 
-    # Fail closed unless an active tag ruleset covers refs/tags/v*, so a non-dry
-    # run never publishes a tag the repository does not protect with a ruleset.
-    # The ruleset's ref conditions are readable with Metadata: read.
-    validate_tag_ruleset_present(client)
+    # Fail closed unless an active tag ruleset covers the dispatched
+    # refs/tags/<tag> and restricts who may create, update, or delete it, so a
+    # non-dry run never publishes a tag the repository does not protect with a
+    # ruleset. The ruleset's ref conditions and rule list are readable with
+    # Metadata: read.
+    validate_tag_ruleset_present(client, tag=metadata.tag)
 
     inputs = PublishInputs(
         tag=metadata.tag,
