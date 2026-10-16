@@ -454,16 +454,18 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         cleanup = self._documented_cleanup_line()
         report = (
             '\nfor f in "$RAW_CANDIDATES_FILE" "$CANDIDATES_FILE" "$LEFTOVERS_FILE"; do\n'
-            '  printf "mode %s\\n" "$(stat -f "%Lp" "$f" 2>/dev/null || stat -c "%a" "$f")"\n'
+            '  printf "path %s\\n" "$f"\n'
             "done\n"
         )
         script = "umask 022\n" + self.blocks[1] + "\n" + cleanup + "\n" + self.blocks[1] + report
         result = self._run_paste(script)
         self.assertEqual(result.returncode, 0, result.stderr)
-        modes = [line.split()[1] for line in result.stdout.splitlines() if line.startswith("mode ")]
-        self.assertEqual(len(modes), 3, f"expected three working files, saw: {result.stdout!r}")
+        paths = [line.split(" ", 1)[1] for line in result.stdout.splitlines() if line.startswith("path ")]
+        self.assertEqual(len(paths), 3, f"expected three working files, saw: {result.stdout!r}")
+        # Read the modes in Python: BSD and GNU stat take different flags.
+        modes = [oct(stat.S_IMODE(os.stat(path).st_mode)) for path in paths]
         self.assertTrue(
-            all(mode == "600" for mode in modes),
+            all(mode == "0o600" for mode in modes),
             f"a re-run after the documented cleanup must recreate 0600 files, saw {modes}",
         )
 
