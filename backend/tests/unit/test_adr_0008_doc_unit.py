@@ -15,14 +15,17 @@ drift from invariants a reader of the default-deployment source depends on:
 3. Semantics: the token-audience gate is a precondition for *any*
    write-adjacent or control route, carried in every location that frames it
    (the ADR context, decision 1, and Implementation child 1; the threat model
-   Status banner, Phase Model, OP-H7, and the P1 list), and the chat-renderer
-   requirement is stated as planned, not as current behavior.
+   Status banner, Phase Model, O9 narrative, OP-H7, the attack-tree leaf, and
+   the P1 list), and the chat-renderer requirement is stated as planned, not as
+   current behavior.
 
-Phrase checks normalize whitespace and drop Markdown emphasis first, so a
-re-wrapped paragraph or a bold/italic marker cannot silently disable a guard.
-The gate check keys on the stable phrase "write-adjacent or control route" so a
-meaning-preserving reword of the enumerated routes (for example "approve or
-reject") does not trip it, while deleting the gate from any one location does.
+Phrase checks strip blockquote markers, fold en and em dashes to a
+hyphen-minus, drop ``*`` and ``_`` emphasis, and collapse whitespace first, so
+a re-wrapped paragraph, a quoted banner, a dash style, or a bold/italic marker
+cannot silently disable a guard. The gate check keys on the stable phrase
+"write-adjacent or control route" so a meaning-preserving reword of the
+enumerated routes (for example "approve or reject") does not trip it, while
+deleting the gate from any one framing sentence does.
 """
 
 from __future__ import annotations
@@ -42,13 +45,21 @@ _THREAT_MODEL = _DOCS / "THREAT_MODEL.md"
 
 
 def _normalize(value: str) -> str:
-    """Lowercase, drop ``*`` emphasis, and collapse all runs of whitespace.
+    """Lowercase, strip blockquote markers, fold dashes and emphasis, and
+    collapse all runs of whitespace.
 
+    Stripping a leading ``>`` quote marker on each line means a phrase assertion
+    holds inside a blockquote (the threat model's Status banner) and is not
+    tripped by a re-wrap that moves a line break into the middle of the phrase.
+    Folding en and em dashes to a hyphen-minus, and dropping ``*`` and ``_``
+    emphasis, means a dash or emphasis style cannot silently disable a guard.
     Collapsing whitespace means a phrase assertion holds whether or not the
     sentence it belongs to was re-wrapped across lines.
     """
-    without_emphasis = value.replace("*", "")
-    collapsed = re.sub(r"\s+", " ", without_emphasis)
+    without_quotes = re.sub(r"(?m)^\s*>\s?", "", value)
+    without_emphasis = without_quotes.replace("*", "").replace("_", "")
+    folded_dashes = without_emphasis.replace("\u2014", "-").replace("\u2013", "-")
+    collapsed = re.sub(r"\s+", " ", folded_dashes)
     return collapsed.lower()
 
 
@@ -79,20 +90,42 @@ def _slice(text: str, start_marker: str, *end_markers: str) -> str:
     return norm[start:end]
 
 
-# The seven locations that must each carry the token-audience gate. Each entry
-# is (human name, document key, start marker, end marker). Removing the gate
-# from any one of these fails ``test_token_audience_gate_in_every_location``.
+# The locations that must each carry the token-audience gate. Each entry is
+# (human name, document key, start marker, end markers, min_gate_sentences,
+# require_precondition). ``min_gate_sentences`` is the number of distinct gate
+# sentences the location frames: the ADR context and child 1 each state it twice
+# (an opening/title framing and a closing framing), so reverting or deleting
+# either one of the two drops the count below the minimum and fails the guard.
+# ``require_precondition`` additionally pins the literal word "precondition" in
+# the locations that frame the gate as one, so weakening "precondition" to
+# "consideration" (or similar) across the threat model fails here too.
 _GATE_LOCATIONS = (
-    ("ADR context", "adr", "Decision 1 therefore makes token-audience", "## Decision"),
-    ("ADR decision 1", "adr", "### 1. The operations API must accept only", "Chosen mechanism"),
-    ("ADR child 1", "adr", "Operations token-audience separation", "2. **Proposal proxy."),
-    ("TM Status banner", "tm", "Status banner.", "## Phase Model"),
-    ("TM Phase Model", "tm", "## Phase Model", "## Operations Trust Boundaries"),
-    ("TM OP-H7", "tm", "| OP-H7 |", "Deployed today:"),
-    ("TM P1 list", "tm", "Before enabling any operations write", "## Review Schedule"),
+    ("ADR context", "adr", "Decision 1 therefore makes token-audience", ("## Decision",), 2, False),
+    ("ADR decision 1", "adr", "### 1. The operations API must accept only", ("Chosen mechanism",), 1, True),
+    ("ADR child 1", "adr", "Operations token-audience separation", ("2. **Proposal proxy.",), 2, False),
+    ("TM Status banner", "tm", "Status banner.", ("## Phase Model",), 1, True),
+    ("TM Phase Model", "tm", "## Phase Model", ("## Operations Trust Boundaries",), 1, False),
+    (
+        "TM O9 narrative",
+        "tm",
+        "### O9 \u2014 Chat proposal handoff",
+        ("## Operations Trust Boundaries", "| OP-H1 |"),
+        1,
+        True,
+    ),
+    ("TM OP-H7", "tm", "| OP-H7 |", ("Deployed today:",), 1, True),
+    ("TM P1 list", "tm", "Before enabling any operations write", ("## Review Schedule",), 1, False),
 )
 
 _GATE_PHRASE = "write-adjacent or control"
+
+# The attack-tree leaf frames the gate with a different route enumeration
+# ("approve, reject, dispatch, or control route"), so it is checked for the
+# stable precondition clause rather than the ADR/banner phrase. Deleting the
+# leaf sentence or rewriting it to drop the precondition framing fails here.
+_LEAF_START = "One Cognito audience is shared across the planned operations APIs"
+_LEAF_END = "Model output submitted as an authoritative proposal"
+_LEAF_GATE = "a precondition for enabling any"
 
 
 @pytest.fixture(scope="module")
@@ -206,12 +239,20 @@ def test_unmerged_surfaces_are_not_asserted_as_shipped(adr_norm: str, tm_norm: s
         # separation of the approver from the requester.
         "a distinct `admin` must approve",
         "a distinct admin must approve",
+    ]
+    # Scoped to the ADR only: a threat model legitimately describes an executor
+    # or automation identity as "distinct from the requester" (O4, OP-ID1), so
+    # this approver-rule phrasing is forbidden in the ADR's decision text alone.
+    forbidden_adr_only = [
         "distinct from the requester",
     ]
     for phrase in forbidden:
         needle = _normalize(phrase)
         assert needle not in adr_norm, f"ADR 0008 asserts a forbidden phrase: {phrase!r}"
         assert needle not in tm_norm, f"THREAT_MODEL O9 asserts a forbidden phrase: {phrase!r}"
+    for phrase in forbidden_adr_only:
+        needle = _normalize(phrase)
+        assert needle not in adr_norm, f"ADR 0008 asserts a forbidden phrase: {phrase!r}"
 
 
 @pytest.mark.unit
@@ -228,22 +269,32 @@ def test_dependency_grounding_is_visible(adr_norm: str) -> None:
 @pytest.mark.unit
 @pytest.mark.fast
 def test_token_audience_gate_in_every_location(adr_text: str, tm_text: str) -> None:
-    """The gate must appear in each location that frames it.
+    """The gate must appear in each sentence that frames it, not once per slice.
 
-    Keying on the stable phrase ``write-adjacent or control route`` means a
+    Keying on the stable phrase ``write-adjacent or control`` means a
     meaning-preserving reword of the enumerated routes (``approve or reject``,
-    ``approval, rejection, dispatch``) still passes, while deleting the gate
-    from the context, decision 1, child 1, the Status banner, the Phase Model,
-    OP-H7, or the P1 list fails here rather than being masked by the same words
-    elsewhere in the document.
+    ``approval, rejection, dispatch``) still passes. Requiring the phrase as many
+    times as the location frames it means deleting *one* of the two gate
+    sentences in the ADR context or child 1 (for example reverting only the
+    opening sentence or only the child-1 title to a "blocker of E2 activation"
+    phrasing) fails here, rather than being masked by the sibling sentence that
+    still carries the phrase. The O9 narrative and the attack-tree leaf are
+    checked too, so dropping the gate from either of those also fails.
     """
     docs = {"adr": adr_text, "tm": tm_text}
-    for name, doc_key, start_marker, end_marker in _GATE_LOCATIONS:
-        section = _slice(docs[doc_key], start_marker, end_marker)
-        assert _GATE_PHRASE in section, f"{name}: token-audience gate ('{_GATE_PHRASE} route') is missing"
-    # And the ADR frames it explicitly as a precondition in the decision.
-    decision = _slice(adr_text, "### 1. The operations API must accept only", "Chosen mechanism")
-    assert "precondition" in decision, "ADR decision 1 must frame the gate as a precondition"
+    for name, doc_key, start_marker, end_markers, min_sentences, require_precondition in _GATE_LOCATIONS:
+        section = _slice(docs[doc_key], start_marker, *end_markers)
+        count = section.count(_GATE_PHRASE)
+        assert count >= min_sentences, (
+            f"{name}: token-audience gate ('{_GATE_PHRASE} route') must appear in "
+            f"{min_sentences} framing sentence(s), found {count}"
+        )
+        if require_precondition:
+            assert "precondition" in section, f"{name}: the gate must be framed as a precondition"
+
+    # The attack-tree leaf frames the gate with its own route enumeration.
+    leaf = _slice(tm_text, _LEAF_START, _LEAF_END)
+    assert _normalize(_LEAF_GATE) in leaf, "TM attack-tree leaf: the gate precondition clause is missing"
 
 
 @pytest.mark.unit
