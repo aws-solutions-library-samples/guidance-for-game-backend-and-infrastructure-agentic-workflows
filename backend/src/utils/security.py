@@ -454,10 +454,10 @@ _UNKNOWN_FRAME_MODULE = "<unknown>"
 def _frame_component(value: Any) -> str:
     """Normalize and bound-cap a single frame component.
 
-    The value is collapsed to a single injection-safe line, stripped of lone
-    surrogate code points so a strict UTF-8 sink can always encode the line, and
-    truncated to :data:`_MAX_FRAME_COMPONENT_LENGTH` characters so no single
-    component can forge a log line or grow without bound.
+    The value is collapsed to a single injection-safe line, with each lone
+    surrogate replaced by its backslash escape so a strict UTF-8 sink can always
+    encode the line, and truncated to :data:`_MAX_FRAME_COMPONENT_LENGTH`
+    characters so no single component can forge a log line or grow without bound.
     """
     text = normalize_log_value(value)
     # A frame's ``__name__`` or ``co_name`` can hold lone surrogate code points
@@ -509,14 +509,21 @@ def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBAC
         # the frames closest to the failure.
         while tb is not None:
             frame = tb.tb_frame
-            raw_module = frame.f_globals.get("__name__")
+            # Read ``__name__`` with ``dict.get`` applied directly to
+            # ``f_globals`` so a mapping subclass cannot route the lookup through
+            # an overridden ``get`` that returns attacker-chosen text.
+            raw_module = dict.get(frame.f_globals, "__name__")
             # Use the module name only when it is genuinely a ``str`` (an exact
             # type check, so a ``str`` subclass cannot supply its own ``__str__``
             # text). A non-string (or missing) ``__name__`` resolves to a
             # code-owned sentinel rather than a file path, so ``co_filename``
             # never reaches the log.
             module = _frame_component(raw_module) if type(raw_module) is str else _UNKNOWN_FRAME_MODULE
-            function = _frame_component(frame.f_code.co_name)
+            # Apply the same exact ``str`` type check to ``co_name`` so a
+            # ``str`` subclass whose ``__str__`` is overridden cannot render its
+            # own text into the function component.
+            raw_function = frame.f_code.co_name
+            function = _frame_component(raw_function) if type(raw_function) is str else _UNKNOWN_FRAME_MODULE
             lineno = tb.tb_lineno
             frames.append(f"{module}:{function}:{lineno}")
             tb = tb.tb_next

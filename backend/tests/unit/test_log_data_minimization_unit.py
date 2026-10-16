@@ -431,6 +431,61 @@ def test_sanitized_traceback_frames_total_for_hostile_frames(name_label):
     assert PROMPT_MARKER not in innermost
 
 
+def test_sanitized_traceback_frames_reject_subclass_coname_and_overridden_globals_get():
+    """A ``str``-subclass ``co_name`` and a mapping whose ``get`` is overridden
+    cannot inject attacker-chosen text into a frame locus.
+
+    The function component is read through an exact ``type(...) is str`` check,
+    so a ``str`` subclass whose ``__str__`` is overridden resolves to the
+    code-owned sentinel instead of its own text. The module component is read
+    with ``dict.get`` applied directly to ``f_globals``, so a ``dict`` subclass
+    whose ``get`` returns other text is bypassed and the genuine ``__name__``
+    (or the sentinel) is used.
+    """
+    # Standard library
+    import types
+
+    # Local modules
+    from utils.security import _UNKNOWN_FRAME_MODULE, sanitized_traceback_frames
+
+    class _DisclosingCoName(str):
+        def __str__(self) -> str:
+            return f"leaked {SUBJECT_MARKER}"
+
+    class _DisclosingGlobals(dict):
+        def get(self, key, default=None):  # type: ignore[override]
+            if key == "__name__":
+                return f"leaked {PROMPT_MARKER}"
+            return super().get(key, default)
+
+    def _raiser():
+        raise ValueError("subclass co_name and overridden get")
+
+    # A code object whose ``co_name`` is a ``str`` subclass, run with a mapping
+    # subclass as its globals whose ``get`` returns attacker-chosen text.
+    forged_code = _raiser.__code__.replace(co_name=_DisclosingCoName("realname"))
+    hostile_globals = _DisclosingGlobals(_raiser.__globals__)
+    hostile_globals["__name__"] = "genuine.module"
+    forged = types.FunctionType(forged_code, hostile_globals, "forged")
+
+    try:
+        forged()
+    except ValueError as exc:
+        frames = sanitized_traceback_frames(exc)
+
+    assert frames, "helper returned no frames for a valid traceback"
+    innermost = frames[0]
+    # The overridden ``get`` text never reaches the module component: the real
+    # ``__name__`` is read through ``dict.get``.
+    assert innermost.startswith("genuine.module:")
+    assert PROMPT_MARKER not in innermost
+    # The ``str``-subclass ``co_name`` is rejected by the exact-type check and
+    # resolves to the code-owned sentinel, not the subclass-authored text.
+    function = innermost.split(":")[1]
+    assert function == _UNKNOWN_FRAME_MODULE
+    assert SUBJECT_MARKER not in innermost
+
+
 def test_sanitized_traceback_frames_total_when_component_helper_raises(monkeypatch):
     """The ``except`` totality wrapper is exercised: when building a frame
     component raises, the helper swallows it and returns an innermost-first,
@@ -519,6 +574,25 @@ def test_sanitized_traceback_frames_cap_component_length():
 
     function = frames[0].split(":")[1]
     assert len(function) <= _MAX_FRAME_COMPONENT_LENGTH
+
+    # A function name made entirely of lone surrogates must also stay within the
+    # cap. Each surrogate expands to a six-character backslash escape, so the
+    # escape has to run before the cap: capping first would leave up to
+    # _MAX_FRAME_COMPONENT_LENGTH surrogates that then expand to six times the
+    # bound. Asserting the final length pins the escape-before-cap order.
+    surrogate_name = "".join(chr(0xD800 + (i % 0x400)) for i in range(_MAX_FRAME_COMPONENT_LENGTH * 4))
+    surrogate_code = _boom.__code__.replace(co_name=surrogate_name)
+    surrogate_fn = types.FunctionType(surrogate_code, _boom.__globals__, "forged")
+    try:
+        surrogate_fn()
+    except ValueError as exc:
+        frames = sanitized_traceback_frames(exc)
+
+    surrogate_function = frames[0].split(":")[1]
+    assert len(surrogate_function) <= _MAX_FRAME_COMPONENT_LENGTH
+    # No raw lone surrogate survived; each was replaced by its backslash escape
+    # before the cap, so the component is strict-UTF-8 encodable.
+    surrogate_function.encode("utf-8")
 
 
 def test_sanitized_traceback_frames_normalize_function_name():
