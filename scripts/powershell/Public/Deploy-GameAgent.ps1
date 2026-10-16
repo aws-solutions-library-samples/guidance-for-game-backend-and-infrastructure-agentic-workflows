@@ -17,7 +17,11 @@ function Deploy-GameAgent {
     .PARAMETER ConfigureAccountObservability
         Opt in to account-wide X-Ray / CloudWatch Logs changes (trace segment
         destination, default indexing rule, shared Logs resource policy). Omitted
-        by default so the deployment makes no shared, cross-application changes.
+        by default so this repository's scripts make no shared, cross-application
+        changes. Note that `agentcore launch` performs its own Transaction Search
+        setup on every launch regardless of this switch (it may add a
+        TransactionSearchXRayAccess resource policy, switch the trace segment
+        destination, and set the Default indexing rule to 1%).
     .EXAMPLE
         Deploy-GameAgent
     .EXAMPLE
@@ -38,9 +42,11 @@ function Deploy-GameAgent {
     $ErrorActionPreference = 'Stop'
 
     # Honor the shell-equivalent opt-in environment variable when the switch is
-    # not explicitly supplied, so both shells share one opt-in trigger.
+    # not explicitly supplied, so both shells share one opt-in trigger. The
+    # comparison is case-sensitive ('-ceq'), matching bash's exact 'true' check,
+    # so 'TRUE' or 'True' does not opt in on one shell but not the other.
     if (-not $PSBoundParameters.ContainsKey('ConfigureAccountObservability') -and
-        $env:GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -eq 'true') {
+        $env:GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -ceq 'true') {
         $ConfigureAccountObservability = $true
     }
 
@@ -345,15 +351,6 @@ function Deploy-GameAgent {
             @deliveryRetryArgs
         Write-GameAgentStatus 'Runtime traces delivery configured' -Type Success
         Write-Host ''
-
-        # ── Step 2c: Post-launch Transaction Search recheck (read-only) ──
-        # agentcore launch performs its own Transaction Search enable, which a
-        # first-time API enable does not complete on its own ('aws/spans' is
-        # created only by the console or a destination toggle). This read-only
-        # recheck reports whether spans can flow; it never mutates or fails.
-        Write-GameAgentStatus 'Step 2c: Rechecking Transaction Search state...' -Type Info
-        Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ReportOnly
-        Write-Host ''
     } finally { Pop-Location }
 
     # ── Step 3: Observability stack ──
@@ -415,6 +412,22 @@ function Deploy-GameAgent {
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
+
+        # ── Step 5c: Post-launch Transaction Search recheck (read-only) ──
+        # agentcore launch performs its own Transaction Search enable on every
+        # launch (Step 2 and Step 5b). A first-time API enable does not complete
+        # it ('aws/spans' is created only by the console or a destination
+        # toggle). Running this after the run's final launch reports whether
+        # spans can flow. The recheck runs in a child scope with a local
+        # 'Continue' preference so a redirected native stderr cannot become a
+        # terminating error on PowerShell 7.0/7.1; the read-only recheck can
+        # neither mutate account state nor fail the deploy, and the surrounding
+        # 'Stop' preference is unaffected for the frontend steps that follow.
+        Write-GameAgentStatus 'Step 5c: Rechecking Transaction Search state...' -Type Info
+        & {
+            $ErrorActionPreference = 'Continue'
+            Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ReportOnly
+        }
     } finally { Pop-Location }
     Write-Host ''
 

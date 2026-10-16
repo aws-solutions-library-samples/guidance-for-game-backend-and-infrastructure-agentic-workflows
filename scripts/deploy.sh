@@ -893,18 +893,6 @@ fi
 echo "✅ Runtime traces delivery configured"
 echo ""
 
-# Step 2c: Post-launch Transaction Search recheck (read-only, non-blocking)
-# `agentcore launch` (Step 2) performs its own Transaction Search enable, which
-# a first-time API enable does not complete on its own: the AWS-reserved
-# 'aws/spans' log group is created only by the console or a destination toggle.
-# This read-only recheck reports whether spans can actually flow so a deploy
-# does not finish silently with no Transaction Search. It never mutates account
-# state and never fails the deploy.
-# See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
-echo "📡 Step 2c: Rechecking Transaction Search state..."
-AWS_REGION="$AWS_REGION" \
-  bash "$SCRIPT_DIR/infrastructure/setup-account-observability.sh" report-transaction-search
-echo ""
 echo "📊 Step 3: Deploying observability stack..."
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/03-agentcore-observability.yaml" \
@@ -957,6 +945,21 @@ uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 echo "✅ AgentCore Runtime updated with role models and available service configuration"
 
 cd "$PROJECT_ROOT"
+echo ""
+
+# Step 5c: Post-launch Transaction Search recheck (read-only, non-blocking)
+# `agentcore launch` performs its own Transaction Search enable on every launch
+# (Step 2 and Step 5b). A first-time API enable does not complete it: the
+# AWS-reserved 'aws/spans' log group is created only by the console or a
+# destination toggle. Running this recheck after the run's final launch reports
+# whether spans can actually flow so a deploy does not finish silently with no
+# Transaction Search. The `|| true` keeps the recheck non-blocking at the call
+# site regardless of the child's exit status; the recheck never mutates account
+# state.
+# See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
+echo "📡 Step 5c: Rechecking Transaction Search state..."
+AWS_REGION="$AWS_REGION" \
+  bash "$SCRIPT_DIR/infrastructure/setup-account-observability.sh" report-transaction-search || true
 echo ""
 
 # Steps 6-8: Frontend build, deploy, and security (require Docker)

@@ -14,6 +14,7 @@ BeforeAll {
         param(
             [string]$Destination = 'XRay',
             [bool]$SpansExists = $false,
+            [bool]$SpansUnreadable = $false,
             [bool]$DestinationUnreadable = $false,
             [string]$IndexingPercent = '5',
             [bool]$IndexingUnreadable = $false,
@@ -26,6 +27,7 @@ BeforeAll {
         )
         $destLocal = $Destination
         $spansLocal = $SpansExists
+        $spansUnreadableLocal = $SpansUnreadable
         $unreadableLocal = $DestinationUnreadable
         $indexingLocal = $IndexingPercent
         $indexingUnreadableLocal = $IndexingUnreadable
@@ -56,6 +58,7 @@ BeforeAll {
                     $global:LASTEXITCODE = 0; return $indexingLocal
                 }
                 'logs describe-log-groups' {
+                    if ($spansUnreadableLocal) { $global:LASTEXITCODE = 254; return '' }
                     $global:LASTEXITCODE = 0
                     if ($spansLocal) { return '{"logGroups":[{"logGroupName":"aws/spans"}]}' }
                     return '{"logGroups":[]}'
@@ -248,15 +251,27 @@ Describe 'Invoke-GameAgentAccountObservability' {
 
     It 'Opt-in fails closed when aws/spans is still absent after a first-time enable' {
         # A first-time API enable (destination XRay -> CloudWatchLogs) does not
-        # create the AWS-reserved aws/spans log group (issue #457). The opt-in
-        # enables additively and never toggles, so a still-absent group must fail
-        # with the one-time manual step, not report success.
+        # create the AWS-reserved aws/spans log group (starter-toolkit issue
+        # 457). The opt-in enables additively and never toggles, so a
+        # still-absent group must fail with the one-time manual step, not report
+        # success.
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
         {
             Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
         } | Should -Throw "*'aws/spans' log group does not exist*"
         $mutations | Should -Contain 'xray update-trace-segment-destination'
+    }
+
+    It 'Opt-in fails with an accurate message when the aws/spans read is unreadable' {
+        # A denied/throttled describe must be reported as unreadable, not as a
+        # missing group, so the operator is not sent to create a group that may
+        # already exist.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -SpansUnreadable $true -Mutations $mutations
+        {
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
+        } | Should -Throw '*could not be read*'
     }
 
     It 'Opt-in completes when aws/spans is present after the enable' {
@@ -271,15 +286,63 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $true -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
-        $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
-        $mutations | Should -Not -Contain 'logs put-resource-policy'
+        $mutations.Count | Should -Be 0
     }
 
     It 'ReportOnly warns without mutating or throwing when aws/spans is absent' {
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $false -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
-        $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
+        $mutations.Count | Should -Be 0
         ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+    }
+
+    It 'ReportOnly warns and points to the console or toggle when the destination is XRay' {
+        # agentcore launch may leave the destination at XRay. The recheck must
+        # surface it, stay read-only, and point to the console or the one-time
+        # toggle rather than recommend the opt-in (which cannot create the group).
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations.Count | Should -Be 0
+        ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+    }
+
+    It 'ReportOnly reports unreadable aws/spans without mutating or throwing' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $true -SpansUnreadable $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations.Count | Should -Be 0
+        ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+    }
+}
+
+
+Describe 'Deploy-GameAgent recheck wiring' {
+    BeforeAll {
+        $script:DeployScript = (Join-Path $PSScriptRoot '..' 'Public' 'Deploy-GameAgent.ps1' | Resolve-Path)
+        $script:DeployContent = Get-Content $script:DeployScript -Raw
+    }
+
+    It 'dispatches the read-only recheck after the final launch' {
+        # The recheck must run after the last `agentcore launch` (Step 5b) so it
+        # reports the post-launch state even on a refresh deploy.
+        $lastLaunch = $script:DeployContent.LastIndexOf('agentcore launch')
+        $recheck = $script:DeployContent.IndexOf('-ReportOnly')
+        $lastLaunch | Should -BeGreaterThan -1
+        $recheck | Should -BeGreaterThan -1
+        $recheck | Should -BeGreaterThan $lastLaunch
+    }
+
+    It 'runs the recheck non-blocking under a Continue preference' {
+        # The recheck is read-only and must not fail the deploy, even if a
+        # redirected native stderr would otherwise terminate under 'Stop'.
+        $script:DeployContent | Should -Match "ErrorActionPreference\s*=\s*'Continue'"
+    }
+
+    It 'honors the opt-in environment variable with a case-sensitive comparison' {
+        # Match bash's exact 'true' check so 'TRUE' does not opt in on one shell
+        # but not the other.
+        $script:DeployContent | Should -Match 'GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -ceq '
     }
 }
