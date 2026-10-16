@@ -145,7 +145,7 @@ class TestModelCapabilityTable:
         assert "if it wraps" in message.lower()
         assert "global." in message
         # The 400 is stated only under the "if it wraps" condition, never as an
-        # unconditional outcome, so a mutation that appends a certain 400 is caught.
+        # unconditional outcome, so a message that adds a certain 400 fails here.
         assert message.count("400") == 1
         prediction = message.lower().split("if it wraps", 1)[1]
         assert "400" in prediction
