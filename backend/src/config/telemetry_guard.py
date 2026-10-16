@@ -106,8 +106,8 @@ logger = logging.getLogger(__name__)
 # path leaves a content export open, so it is surfaced at WARNING -- at each
 # runtime process start, where an operator sees it. The log carries only this
 # message and the skipped path name; it never includes the exception message or
-# stack trace, which can carry content. The signature-pin unit tests are a
-# separate, detail-level drift guard that runs in CI.
+# stack trace, which can carry content. The signature-pin and direct-import unit
+# tests are a separate drift guard that runs in CI.
 GUARD_PATH_SKIPPED_MESSAGE = (
     "Telemetry redaction guard path skipped; a trace-content export may be open. Path: %s. Exception type: %s."
 )

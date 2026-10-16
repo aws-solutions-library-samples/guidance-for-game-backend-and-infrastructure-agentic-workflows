@@ -690,9 +690,10 @@ class TestEntrypointTelemetryGuardWiring:
 
         This exercises the whole wiring: the guard records the skipped path on the
         decision, the module-level posture call runs at import, and the WARNING is
-        rendered through the application logger (loguru). A reverted wiring, or a
-        ``%``-style posture message that loguru drops, fails this check because the
-        drifted path name never reaches the captured output.
+        rendered through the application logger (loguru). A posture call that
+        ignores the decision, or a ``%``-style posture message that loguru drops,
+        fails this check because the drifted path name never reaches the captured
+        output.
         """
         # Standard library
         import importlib
@@ -769,8 +770,10 @@ class TestEntrypointTelemetryGuardWiring:
         rendered = "".join(str(r) for r in records)
         # The posture WARNING ran at import and named the drifted path, rendered
         # through loguru with the count and path substituted (no stray %d/%s).
-        assert "WARNING|" in rendered
-        assert "redaction incomplete" in rendered.lower()
+        # Pin the level and the posture text on the SAME record, so demoting the
+        # skipped-path branch below WARNING fails here (the unrelated
+        # memory-disabled WARNING also starts with "WARNING|").
+        assert any(str(r).startswith("WARNING|") and "redaction incomplete" in str(r).lower() for r in records)
         assert "_end_span" in rendered
         assert "1 guard path(s) were skipped" in rendered
         assert "%d" not in rendered

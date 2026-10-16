@@ -898,6 +898,9 @@ def test_strands_wrapper_attribute_drift_logs_warning_without_exception_text(mon
     assert _GUARD_SKIP_EXC_MARKER not in text
     assert all(r.exc_info is None for r in warnings)
     assert all(r.exc_text is None for r in warnings)
+    # Exactly one WARNING for this path: the handler must not double-log.
+    path_records = [r for r in warnings if "strands span wrappers" in r.getMessage()]
+    assert len(path_records) == 1
 
 
 def test_uninstrument_mcp_import_failure_logs_warning_without_exception_text(monkeypatch, caplog):
@@ -923,6 +926,9 @@ def test_uninstrument_mcp_import_failure_logs_warning_without_exception_text(mon
     text = "\n".join(r.getMessage() for r in warnings)
     assert "MCP instrumentor" in text
     assert _GUARD_SKIP_EXC_MARKER not in text
+    # Exactly one WARNING for this path: the handler must not double-log.
+    path_records = [r for r in warnings if "MCP instrumentor" in r.getMessage()]
+    assert len(path_records) == 1
 
 
 def test_memory_client_filter_failure_logs_warning_without_exception_text(monkeypatch, caplog):
@@ -954,6 +960,9 @@ def test_memory_client_filter_failure_logs_warning_without_exception_text(monkey
     text = "\n".join(r.getMessage() for r in warnings)
     assert "memory client logging filter" in text
     assert _GUARD_SKIP_EXC_MARKER not in text
+    # Exactly one WARNING for this path: the handler must not double-log.
+    path_records = [r for r in warnings if "memory client logging filter" in r.getMessage()]
+    assert len(path_records) == 1
 
 
 def test_mcp_logging_filter_install_failure_logs_warning_without_exception_text(monkeypatch, caplog):
@@ -1135,7 +1144,7 @@ def test_start_agent_span_drift_still_wraps_end_span_and_names_it_incomplete(mon
     # start_agent_span drifts (access raises), but _end_span is sound. The two
     # methods are wrapped independently, so _end_span must still be wrapped (its
     # error-text content path closed) and the skip must name start_agent_span as
-    # the still-open method rather than returning before trying _end_span.
+    # the still-open method, and _end_span must still be attempted.
     # Standard library
     import types
 
