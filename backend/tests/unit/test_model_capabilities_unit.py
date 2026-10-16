@@ -12,6 +12,7 @@ the repository ships regardless of any role IDs resolved from a developer's
 """
 
 # Standard library
+import re
 from unittest.mock import Mock, patch
 
 # Third-party packages
@@ -61,8 +62,8 @@ class TestModelCapabilityTable:
         assert caps.send_temperature is True
         assert caps.thinking is None
 
-    def test_documented_rollback_ids_resolve_silently(self):
-        # The documented rollback IDs are listed in the table, so resolving
+    def test_previous_default_rollback_ids_resolve_silently(self):
+        # The previous default rollback IDs are listed in the table, so resolving
         # them keeps temperature, sends no thinking field, and does not warn.
         with patch("config.model_capabilities.logger") as mock_logger:
             haiku = get_model_capabilities("global.anthropic.claude-haiku-4-5-20251001-v1:0")
@@ -73,7 +74,7 @@ class TestModelCapabilityTable:
 
     def test_unmatched_newer_model_warns_that_it_will_likely_be_rejected(self):
         # An unrecognized ID that still looks like a newer generation (Claude
-        # 5.x or Opus 4.7+) gets the earlier-generation fallback shape, which
+        # 5.x or Opus 4.7 through 4.9) gets the earlier-generation fallback shape, which
         # that model likely rejects. The warning must name that branch: a
         # hedged 400 prediction and a remedy of a listed model or a new entry,
         # not the profile advice and not the softer earlier-model note.
@@ -115,6 +116,14 @@ class TestModelCapabilityTable:
         # the newer-model branch's hedged 400 prediction.
         assert "likely fail" not in message
         assert "likely rejects" not in message
+        # It must name the remedy for a misclassified newer model: its model ID
+        # plus a capability entry. Reverting the branch to a bare note (dropping
+        # the remedy) is caught here.
+        assert "add a capability entry" in message
+        # The soft branch must not call every unmatched ID a Claude model; the
+        # fallback serves any earlier model, so a blanket "Claude model" claim
+        # (or an unconditional rejection phrased around one) is caught.
+        assert "Claude model" not in message
         # It must not borrow the profile branch's wording.
         assert "application inference profile" not in message
         assert "system inference profile" not in message
@@ -140,6 +149,18 @@ class TestModelCapabilityTable:
         assert message.count("400") == 1
         prediction = message.lower().split("if it wraps", 1)[1]
         assert "400" in prediction
+        # Every failure or rejection statement must sit inside the "if it wraps"
+        # condition: the runtime cannot tell what the profile wraps, so it must
+        # not assert that requests fail or are rejected outright. Any sentence
+        # that predicts a failure, a rejection, or a 400 must carry the
+        # conditional marker, so an added unconditional rejection sentence is
+        # caught whatever its wording (with or without the literal "400").
+        lowered = message.lower()
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", lowered) if s.strip()]
+        failure_terms = ("fail", "reject", "400", "will not work", "unusable")
+        for sentence in sentences:
+            if any(term in sentence for term in failure_terms):
+                assert "if it wraps" in sentence, sentence
         # The ``global.`` system inference profile ID fixes only the two listed
         # 5.5 models. For any other model that rejects temperature, the remedy is
         # its own model ID plus a capability entry, so the message must name that.
