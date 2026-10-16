@@ -223,9 +223,14 @@ configuration; the per-runtime trace delivery is still created and verified.
 > policy already grants access), switches the account trace segment destination
 > to `CloudWatchLogs` when it is not already `CloudWatchLogs`, and sets the
 > `Default` X-Ray indexing rule to 1% sampling when no `Default` rule exists.
-> This is behavior of the toolkit, not of this repository's scripts, and is
-> tracked in
-> [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
+> This is behavior of the toolkit, not of this repository's scripts. The
+> deployment predicts these changes before every launch and warns about them,
+> and a fail-closed stop switch
+> (`GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true`, PowerShell
+> `-StopOnAccountObservabilityChange`) can halt the deploy before any launch so
+> no shared setting is modified. The residual is that, without the stop switch,
+> the toolkit still performs its own setup during `agentcore launch`; the
+> toolkit exposes no flag to skip only that step.
 > A read-only post-launch recheck (Step 5c) reports the resulting Transaction
 > Search state without changing it.
 
@@ -379,20 +384,29 @@ toolkit's launch-time step would be a no-op:
 - the X-Ray trace segment destination set to `CloudWatchLogs`, and
 - an X-Ray indexing rule named `Default`.
 
+The reliable way to reach that state is to enable Transaction Search once in the
+AWS X-Ray / CloudWatch console. That creates the AWS-reserved `aws/spans` log
+group, switches the trace destination, and establishes the `Default` indexing
+rule, so all three conditions hold. Once they do, the deploy proceeds without
+changing any shared setting, with the stop switch still in place — leave it set
+so later deploys stay guarded.
+
 This repository's opt-in uses the project-owned name
 `GameAgentTransactionSearchXRayAccess` by default, which does **not** satisfy the
-toolkit's name-only check. To create a policy with the exact name the toolkit
-looks for, run the opt-in with the matching name on an account that has no other
-`aws/spans` grant:
+toolkit's name-only check. The opt-in cannot create `aws/spans`, so it reaches a
+passing state only when that log group already exists: on such an account you can
+instead run the opt-in with the matching policy name to switch the destination
+and add the policy the toolkit looks for:
 
 ```bash
 GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
   GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh
 ```
 
-or enable Transaction Search once in the AWS X-Ray / CloudWatch console. Once all
-three conditions hold, the deploy proceeds without changing any shared setting,
-with the stop switch still in place — leave it set so later deploys stay guarded.
+On an account **without** `aws/spans`, do not use the opt-in to clear the stop
+switch: it would write the shared policy and switch the destination but still stop
+at Step 1.7, because it cannot create the group. Use the console enable above
+instead.
 
 **Cleanup.** The warning prints only the rollback commands for the changes it
 predicted. If the toolkit added its own policy, remove it after launch (only once

@@ -250,7 +250,7 @@ function Deploy-GameAgent {
 
     # ── Step 1.7: Account-wide observability (scoped, opt-in) ──
     Write-GameAgentStatus 'Step 1.7: Account-wide observability...' -Type Info
-    Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ConfigureAccountObservability:$ConfigureAccountObservability
+    Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ConfigureAccountObservability:$ConfigureAccountObservability -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
     Write-Host ''
 
     # When the fail-closed stop switch is set, run the preflight ONCE up front so

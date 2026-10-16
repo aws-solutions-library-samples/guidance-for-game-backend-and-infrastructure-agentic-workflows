@@ -565,6 +565,47 @@ def test_account_obs_default_points_to_console_or_launch_when_xray_and_spans_abs
     assert "update-trace-segment-destination" not in result.stdout
 
 
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_default_stop_switch_does_not_promise_launch_when_xray_and_spans_absent(shell):
+    # Destination XRay, 'aws/spans' absent, with the stop switch set to exactly
+    # 'true'. The stop-switch preflight halts the deploy before 'agentcore
+    # launch', so the Step 1.7 remedy must NOT promise that the launch switches
+    # the destination or that a Step 5c recheck prints the toggle. It must point
+    # to the one-time console enable instead.
+    result = _account_obs_harness(
+        "false",
+        _obs_mock(destination="XRay", spans=False),
+        extra_env="export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true",
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "The stop switch is set" in result.stdout
+    assert "stops before" in result.stdout
+    assert "'agentcore launch'" in result.stdout
+    assert "AWS X-Ray / CloudWatch console" in result.stdout
+    # The launch/Step 5c promise must be gone when the stop switch is set.
+    assert "the post-launch recheck (Step 5c)" not in result.stdout
+    assert "'agentcore launch' switches the" not in result.stdout
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_default_stop_switch_off_keeps_launch_wording(shell):
+    # Any value other than exactly 'true' leaves the stop switch off, so the
+    # default remedy keeps the launch + Step 5c wording.
+    result = _account_obs_harness(
+        "false",
+        _obs_mock(destination="XRay", spans=False),
+        extra_env="export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=TRUE",
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "The stop switch is set" not in result.stdout
+    assert "agentcore launch" in result.stdout
+    assert "the post-launch recheck (Step 5c)" in result.stdout
+
+
 def test_account_obs_default_prints_toggle_when_cloudwatchlogs_and_spans_absent():
     # Destination already CloudWatchLogs but 'aws/spans' absent: a disable/
     # re-enable toggle (or the console) creates the group, so the toggle pair is
@@ -931,6 +972,7 @@ def _preflight_mock(
     destination_read_fails: bool = False,
     policies_read_fails: bool = False,
     indexing_read_fails: bool = False,
+    spans: bool = False,
 ) -> str:
     # describe-resource-policies feeds both the toolkit name-only check and the
     # project-owned grant annotation (find_existing_spans_policy).
@@ -956,6 +998,7 @@ def _preflight_mock(
     dest_block = "    return 254" if destination_read_fails else f'    echo "{destination}"; return 0'
     policies_block = "    return 254" if policies_read_fails else f"    echo '{policies_json}'; return 0"
     indexing_block = "    return 254" if indexing_read_fails else f"    echo '{indexing_json}'; return 0"
+    spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
     return (
         "aws() {\n"
         '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
@@ -966,6 +1009,12 @@ def _preflight_mock(
         "  fi\n"
         '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then\n'
         f"{indexing_block}\n"
+        "  fi\n"
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+        "      *) return 0;;\n"
+        "    esac\n"
         "  fi\n"
         '  echo "unexpected: $*" >&2; return 1\n'
         "}"
@@ -1071,7 +1120,37 @@ def test_preflight_stop_switch_halts_when_toolkit_would_change(shell):
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
-def test_preflight_stop_switch_halts_on_unknown_read_failure(shell):
+def test_preflight_stop_switch_remedy_leads_with_console_when_spans_absent(shell):
+    """When the stop switch halts and 'aws/spans' is absent, the remedy must lead
+    with the one-time console enable and must NOT recommend the opt-in run: the
+    opt-in cannot create 'aws/spans', so without it the opt-in writes the policy,
+    switches the destination, and still stops at Step 1.7."""
+    result = _preflight_harness(
+        _preflight_mock(destination="XRay", toolkit_policy_present=False, default_indexing_present=True, spans=False),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+    assert "AWS X-Ray / CloudWatch console" in result.stderr
+    # The opt-in route must not be offered when 'aws/spans' is absent.
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_remedy_offers_opt_in_only_when_spans_present(shell):
+    """When 'aws/spans' already exists, the opt-in can finish the job (switch the
+    destination / add the policy), so the remedy may offer the opt-in route in
+    addition to the console."""
+    result = _preflight_harness(
+        _preflight_mock(destination="XRay", toolkit_policy_present=False, default_indexing_present=True, spans=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+    assert "AWS X-Ray / CloudWatch console" in result.stderr
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" in result.stderr
     """Fail-closed: the stop switch also halts when the toolkit's effect is UNKNOWN."""
     result = _preflight_harness(
         _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, indexing_read_fails=True),

@@ -28,6 +28,13 @@ function Invoke-GameAgentAccountObservability {
         # present) without mutating anything. Mirrors the shell script's
         # 'report-transaction-search' mode.
         [switch]$ReportOnly,
+        # Fail-closed stop switch state, mirrored from the shell
+        # GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE opt-in. When set, the deploy
+        # halts before 'agentcore launch', so the default XRay/'aws/spans'-absent
+        # remedy must not promise a launch destination switch or a Step 5c toggle.
+        # Resolved from the environment when the caller does not pass it, with the
+        # same case-sensitive 'true'-only rule the shell path uses.
+        [switch]$StopOnAccountObservabilityChange = (Resolve-GameAgentStopSwitch -Value $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE),
         # Project-owned name for the shared Logs resource policy. The default is
         # read from the GBAW-prefixed environment variable so it cannot collide
         # with an unrelated environment value.
@@ -166,6 +173,16 @@ function Invoke-GameAgentAccountObservability {
                 Write-Host "${Indent}destination. Look in the launch output for the toolkit warning"
                 Write-Host "${Indent}'Transaction Search configuration failed', then enable Transaction Search"
                 Write-Host "${Indent}once in the AWS X-Ray / CloudWatch console and re-run the deployment."
+                return
+            }
+            if ($StopOnAccountObservabilityChange) {
+                # The stop-switch preflight halts the deploy before 'agentcore
+                # launch', so the launch never switches the destination and no
+                # Step 5c recheck runs.
+                Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+                Write-Host "${Indent}is not present. The stop switch is set, so the deployment stops before"
+                Write-Host "${Indent}'agentcore launch' and nothing will switch the destination. Enable"
+                Write-Host "${Indent}Transaction Search once in the AWS X-Ray / CloudWatch console, then re-run."
                 return
             }
             Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"

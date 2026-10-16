@@ -118,6 +118,21 @@ function Invoke-GameAgentTransactionSearchPreflight {
         return 'absent'
     }
 
+    # Returns 'present', 'absent', or 'unreadable' for the AWS-reserved
+    # 'aws/spans' log group. Only JSON output renders the quoted group name a
+    # parse needs, so request JSON and classify a text/denied read as unreadable.
+    function Get-SpansLogGroupState {
+        try {
+            $raw = (& aws logs describe-log-groups --log-group-name-prefix 'aws/spans' --region $Region @ProfileArgs --output json 2>$null)
+        } catch { return 'unreadable' }
+        if ($LASTEXITCODE -ne 0) { return 'unreadable' }
+        try { $parsed = $raw | ConvertFrom-Json } catch { return 'unreadable' }
+        foreach ($group in @($parsed.logGroups)) {
+            if ($group.logGroupName -eq 'aws/spans') { return 'present' }
+        }
+        return 'absent'
+    }
+
     $changes = [System.Collections.Generic.List[string]]::new()
     $detail = [System.Collections.Generic.List[string]]::new()
     $unknown = $false
@@ -223,7 +238,17 @@ function Invoke-GameAgentTransactionSearchPreflight {
     }
 
     if ($StopOnAccountObservabilityChange -and $wouldChange -ne 0) {
-        Write-GameAgentStatus "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. To let the deploy continue without any shared change, the account must already satisfy all three toolkit conditions: a CloudWatch Logs resource policy named literally 'TransactionSearchXRayAccess', the X-Ray trace segment destination set to 'CloudWatchLogs', and an X-Ray indexing rule named 'Default'. One way to reach that state is this repository's opt-in with the matching policy name (GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess) on an account with no other 'aws/spans' grant, or enable Transaction Search once in the AWS console. Once all three conditions hold, the deploy proceeds without changing any shared setting, with the stop switch still in place." -Type Error
+        # The opt-in cannot create the AWS-reserved 'aws/spans' log group. Lead
+        # with the one-time console enable and offer the opt-in route only when
+        # 'aws/spans' already exists, so an operator on an account without that
+        # group is not sent to an opt-in that writes the policy, switches the
+        # destination, and still stops at Step 1.7.
+        $spansState = Get-SpansLogGroupState
+        $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. To reach a passing run without any shared change, enable Transaction Search once in the AWS X-Ray / CloudWatch console. The account then already satisfies the three toolkit conditions (a CloudWatch Logs resource policy named 'TransactionSearchXRayAccess', the X-Ray trace segment destination 'CloudWatchLogs', and an X-Ray 'Default' indexing rule), so the deploy proceeds without changing any shared setting, with the stop switch still in place."
+        if ($spansState -eq 'present') {
+            $message += " Because the AWS-reserved 'aws/spans' log group already exists, you can instead reach that state with this repository's opt-in, which switches the destination and adds the matching policy: GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess with -ConfigureAccountObservability (GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true)."
+        }
+        Write-GameAgentStatus $message -Type Error
         return $false
     }
     return $true
