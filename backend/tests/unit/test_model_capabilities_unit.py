@@ -77,7 +77,12 @@ class TestModelCapabilityTable:
         # that model likely rejects. The warning must name that branch: a
         # hedged 400 prediction and a remedy of a listed model or a new entry,
         # not the profile advice and not the softer earlier-model note.
-        for model_id in ("global.anthropic.claude-opus-5-5", "global.anthropic.claude-opus-4-7"):
+        for model_id in (
+            "global.anthropic.claude-opus-5-5",
+            "global.anthropic.claude-opus-4-7",
+            "global.anthropic.claude-sonnet-5",
+            "global.anthropic.claude-haiku-5-0",
+        ):
             reset_capability_warnings()
             with patch("config.model_capabilities.logger") as mock_logger:
                 caps = get_model_capabilities(model_id)
@@ -90,12 +95,15 @@ class TestModelCapabilityTable:
             assert "add a capability entry" in message, model_id
             # This branch must not borrow the profile wording.
             assert "application inference profile" not in message, model_id
+            # Nor the profile branch's remedy: a newer model is not fixed by a
+            # system inference profile ID, so that advice must not reappear here.
+            assert "system inference profile" not in message, model_id
 
     def test_unmatched_earlier_model_warns_softly_without_predicting_rejection(self):
         # An unrecognized ID that does not look like a newer generation gets the
         # soft note: the fallback is correct for a genuinely earlier model. It
-        # must not claim the request will fail, so an over-broad classifier that
-        # routed it to the reject-400 branch is caught here.
+        # must not predict that the request will likely fail, so an over-broad
+        # classifier that routed it to the reject-400 branch is caught here.
         with patch("config.model_capabilities.logger") as mock_logger:
             caps = get_model_capabilities("global.anthropic.claude-sonnet-4-5-20250929-v1:0")
         assert caps.send_temperature is True
@@ -103,8 +111,13 @@ class TestModelCapabilityTable:
         mock_logger.warning.assert_called_once()
         message = mock_logger.warning.call_args.args[0]
         assert "genuinely earlier" in message
+        # The soft branch states the earlier-model case plainly; it must not use
+        # the newer-model branch's hedged 400 prediction.
         assert "likely fail" not in message
-        assert "add a capability entry" not in message
+        assert "likely rejects" not in message
+        # It must not borrow the profile branch's wording.
+        assert "application inference profile" not in message
+        assert "system inference profile" not in message
 
     def test_unmatched_profile_falls_back_and_warns_conditionally(self):
         with patch("config.model_capabilities.logger") as mock_logger:
@@ -122,6 +135,15 @@ class TestModelCapabilityTable:
         assert "cannot tell which model" in message
         assert "if it wraps" in message.lower()
         assert "global." in message
+        # The 400 is stated only under the "if it wraps" condition, never as an
+        # unconditional outcome, so a mutation that appends a certain 400 is caught.
+        assert message.count("400") == 1
+        prediction = message.lower().split("if it wraps", 1)[1]
+        assert "400" in prediction
+        # The ``global.`` system inference profile ID fixes only the two listed
+        # 5.5 models. For any other model that rejects temperature, the remedy is
+        # its own model ID plus a capability entry, so the message must name that.
+        assert "add a capability entry" in message
 
     def test_unmatched_id_warns_once_per_distinct_id(self):
         # The lookup runs on every model construction, so the fallback warning
