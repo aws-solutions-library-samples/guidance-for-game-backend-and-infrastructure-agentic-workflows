@@ -504,13 +504,26 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | **1** | User → ECS Express (ALB) | **Cognito JWT** | HttpOnly/Secure/SameSite cookies; `CognitoJwtVerifier` validates signature, expiration, and audience. Users must be in `admin` or `users` group. |
 | **2** | ECS Express → AgentCore | **Cognito JWT (bearer)** | The proxy forwards the end user's verified Cognito **access token** as an `Authorization: Bearer` header over HTTPS (TLS 1.2+). The AgentCore runtime independently verifies the token and reconstructs authority. No SigV4 and no task-role signing — the bearer token is the credential, so the ECS task role needs no `bedrock-agentcore` grant and has no identity policies. |
 | **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` condition. Read-only for GameLift, EKS, Cost Explorer. Scoped by region. |
-| **4** | Prompts → Model | **Bedrock Guardrails** | Input/output content filtering: topic blocking, PII anonymization, prompt injection detection, profanity filtering. |
+| **4** | Prompts → Model | **Bedrock Guardrails** | Input and output: Personal Advice topic blocking, harmful-content filters, the managed profanity word list, and blocking of AWS access and secret keys, passwords, card numbers, SSNs, and the Kubernetes-secret regex. Output only: anonymization of email, phone, IP address, and username, and the AWS account ID and internal-hostname regexes; user input containing them reaches the model unmasked. Input only: prompt-attack detection. The scope topics (General Programming Help, Entertainment and Casual Chat) block on input only; on output they are detect-only (`OutputAction: NONE`), and a match appears only in the per-request Guardrail trace. See [Guardrail residual risk](#guardrail-residual-risk). |
 
 **Configuration Locations**:
 - Cognito: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 12-73)
 - ECS task role: `infrastructure/cloudformation/01-base-infrastructure.yaml`
 - AgentCore execution role: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 145-399)
 - Guardrails: `infrastructure/cloudformation/04-bedrock-guardrails.yaml`
+
+### Guardrail Residual Risk
+
+The two scope topics (General Programming Help, Entertainment and Casual Chat) block on user input and are detect-only on model output (#530). Valid infrastructure answers (kubectl commands, GameLift Server SDK steps, CloudFormation templates) were being blocked on output as off-topic. Accepted residual risk:
+
+- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
+- **Language coverage.** The Guardrail uses the default CLASSIC topic tier, which supports English, French, and Spanish. An off-topic request in another language can pass the input check, and the output check will not catch it.
+- **No user-visible fallback for scope detections on output.** The answer is returned unchanged. Personal Advice, content-filter, PII, and regex blocks still replace the entire response with the blocked-output message.
+- **Detections are not recorded.** A scope-topic match on output appears only in the per-request Guardrail trace. The application does not log or store it.
+- **Anonymize-type values in user input are not masked.** Email, phone, IP address, account ID, and internal hostnames in a user's message reach the model unchanged; anonymization applies to model output. Blocked types (keys, passwords, card numbers, SSNs, the Kubernetes-secret regex) are blocked on input too.
+- **Masked values in generated templates.** `IP_ADDRESS` anonymization rewrites addresses and CIDR ranges in generated templates (for example `0.0.0.0/0` becomes `{IP_ADDRESS}`). Those templates do not deploy as written.
+
+Every other protection is unchanged. `backend/tests/unit/test_guardrail_template_unit.py` pins the whole policy, including topic definitions, examples, and the blocked messages. `backend/tests/fixtures/guardrail_eval_corpus.json` is the evaluation corpus; `backend/tests/integration/test_guardrail_corpus_cloud.py` runs it against a deployed Guardrail with `ApplyGuardrail`.
 
 ### Data Classification by Stage
 
@@ -528,7 +541,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 
 No static credentials (access keys, passwords, tokens) exist in the codebase or deployment configuration. Service-to-service authentication uses IAM roles with automatic credential rotation, except the frontend→AgentCore hop, which carries the end user's short-lived Cognito access token:
 
-- **ECS Express → AgentCore**: the user's verified Cognito access token as a bearer token over HTTPS (no SigV4, no task-role grant). The ECS task role (`ecs-tasks.amazonaws.com`, `aws:SourceAccount` condition) has no identity-based permissions; it exists only so ECS can vend task credentials to the container. The supported chat path's one AWS call, `sts:GetCallerIdentity` (to build the runtime ARN), requires no IAM allow, so no policy is attached. Dormant Cognito Admin/List routes remain intentionally unprivileged pending removal in #473.
+- **ECS Express → AgentCore**: the user's verified Cognito access token as a bearer token over HTTPS (no SigV4, no task-role grant). The ECS task role (`ecs-tasks.amazonaws.com`, `aws:SourceAccount` condition) has no identity-based permissions; it exists only so ECS can vend task credentials to the container. The supported chat path's one AWS call, `sts:GetCallerIdentity` (to build the runtime ARN), requires no IAM allow, so no policy is attached. The sample ships no in-app account-management route, so the role is never granted Cognito administrator permissions; access is administrator-provisioned with `add-admin-user.sh` or the PowerShell `Add-GameAgentAdmin`.
 - **AgentCore → AWS Services**: AgentCore execution role (`bedrock-agentcore.amazonaws.com`) with `aws:SourceAccount` condition
 - **MCP Servers**: Run as subprocesses via stdio transport (no network access), inherit the AgentCore execution role credentials
 
