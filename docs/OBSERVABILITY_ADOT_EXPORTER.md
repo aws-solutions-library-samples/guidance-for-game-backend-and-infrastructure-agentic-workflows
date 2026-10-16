@@ -50,8 +50,10 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
   this repository's scripts*.
   The default path reads the current trace destination, detects whether the
   account already supports Transaction Search (destination `CloudWatchLogs` and
-  `aws/spans` present), and prints an actionable opt-in warning if it does not —
-  without failing the deploy for that reason alone. (`agentcore launch` runs its
+  `aws/spans` present), and if it does not, prints an actionable warning —
+  recommending the opt-in only when `aws/spans` already exists, and otherwise the
+  one-time console or destination-toggle step — without failing the deploy for
+  that reason alone. (`agentcore launch` runs its
   own Transaction Search setup independently of this opt-in; see "Ownership and
   upstream tracking" below.);
 - apply changes only under the purpose-named opt-in
@@ -105,13 +107,15 @@ OpenTelemetry for Python and the Bedrock AgentCore starter toolkit. The related
 trace-delivery setup gap is tracked upstream at
 `aws/bedrock-agentcore-starter-toolkit` issue 457 (a *different* failure mode).
 Separately, `agentcore launch` calls the toolkit's own Transaction Search setup
-on every launch — which the deploy script runs in its Step 2 and Step 5b
-launches. On an account without Transaction Search, the toolkit may make up to
-three shared changes independently of this repository's opt-in: it adds a
+on every launch — which the deploy script runs in its Step 2 (only on a first
+deploy) and Step 5b launches. On every launch, the toolkit may make up to three
+shared changes independently of this repository's opt-in, each also when its own
+read fails: it adds a
 `TransactionSearchXRayAccess` resource policy whenever no policy already has that
 exact name (even when this opt-in's own policy already grants access), switches
-the account trace segment destination to `CloudWatchLogs`, and sets the `Default`
-X-Ray indexing rule to 1% sampling. Because a first-time API enable does not
+the account trace segment destination to `CloudWatchLogs` when it is not already
+`CloudWatchLogs`, and sets the `Default`
+X-Ray indexing rule to 1% sampling when no `Default` rule exists. Because a first-time API enable does not
 create the AWS-reserved `aws/spans` log group, that launch-side enable can leave
 Transaction Search incomplete; the read-only Step 5c recheck reports it. This
 residual is tracked in
@@ -224,7 +228,8 @@ example, the detection check or the account-observability setup) regresses,
 revert that focused change; AgentCore-managed baseline observability continues to
 operate while the upstream timing behavior is tracked.
 
-Account-wide changes from *this repository's scripts* are made only under the
+Account-wide Transaction Search settings changes from *this repository's
+scripts* are made only under the
 `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in. (`agentcore launch` performs
 its own Transaction Search setup independently; see "Ownership and upstream
 tracking" and [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).)

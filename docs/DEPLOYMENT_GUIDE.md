@@ -205,19 +205,23 @@ account.
 **Scope.** By default this repository's deployment scripts make **no**
 account-wide Transaction Search settings changes. They read the current trace
 destination, detect whether the account already supports what the runtime needs,
-and — if it does not — print an actionable warning with the opt-in instruction. A
-default deployment is **not** failed for a missing account configuration; the
-per-runtime trace delivery is still created and verified.
+and — if it does not — print an actionable warning. That warning recommends the
+opt-in only when the AWS-reserved `aws/spans` log group already exists (so the
+opt-in can finish the job); otherwise it points to the one-time console enable or
+a destination toggle keyed on the current destination, because the opt-in cannot
+create that group. A default deployment is **not** failed for a missing account
+configuration; the per-runtime trace delivery is still created and verified.
 
 > **Residual not controlled by this opt-in.** `agentcore launch` — which the
-> deploy script runs in its Step 2 and Step 5b launches — performs its own
-> Transaction Search setup on every launch, regardless of
-> `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. On an account that does not yet have
-> Transaction Search, the AgentCore starter toolkit may make up to three shared
-> changes: it adds a `TransactionSearchXRayAccess` resource policy whenever no
-> policy already has that exact name (even when this opt-in's own policy already
-> grants access), switches the account trace segment destination to
-> `CloudWatchLogs`, and sets the `Default` X-Ray indexing rule to 1% sampling.
+> deploy script runs in its Step 2 (only on a first deploy) and Step 5b
+> launches — performs its own Transaction Search setup on every launch,
+> regardless of `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. On every launch, the
+> AgentCore starter toolkit may make up to three shared changes, each also when
+> its own read fails: it adds a `TransactionSearchXRayAccess` resource policy
+> whenever no policy already has that exact name (even when this opt-in's own
+> policy already grants access), switches the account trace segment destination
+> to `CloudWatchLogs` when it is not already `CloudWatchLogs`, and sets the
+> `Default` X-Ray indexing rule to 1% sampling when no `Default` rule exists.
 > This is behavior of the toolkit, not of this repository's scripts, and is
 > tracked in
 > [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
@@ -252,8 +256,13 @@ already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
 enable does not create the AWS-reserved `aws/spans` log group (only the console
 or a destination toggle does), the opt-in **fails** — with the one-time console
 or toggle step — rather than reporting success when `aws/spans` is still absent
-after the enable. If it cannot read the current trace
-destination, the opt-in refuses to change it and fails rather than guessing. The
+after the enable. On a fresh account whose destination starts at `XRay`, the
+opt-in has by then already written the shared resource policy and switched the
+trace destination to `CloudWatchLogs`; those changes stay in place (the
+destination rollback command was printed earlier in the run), and only the
+console or a destination toggle creates `aws/spans`. If it cannot read the
+current trace destination, the opt-in refuses to change it and fails rather than
+guessing. The
 account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
 modified only when you set `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` to an integer in
 `[0, 100]`, and only then is a rollback command printed with the prior value. The
