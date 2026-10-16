@@ -296,6 +296,40 @@ def validate_environment_protected(client: GitHubClient, *, environment: str = R
     )
 
 
+def report_release_settings(client: GitHubClient, *, tag_prefix: str = "v") -> dict[str, str]:
+    """Best-effort, non-failing report of the two settings immutability depends on.
+
+    Returns a small status mapping for the two repository settings the
+    "immutable milestone" guarantee relies on:
+
+    * ``immutable_releases``: GitHub's immutable-releases setting cannot be read
+      with the workflow ``GITHUB_TOKEN`` (reading it needs repository-admin
+      permission the token cannot be granted), so this is always
+      ``"unverifiable-pre-run"``. It is instead enforced after publication by the
+      read-back check, which fails the run unless the published release reports
+      ``immutable: true``.
+    * ``tag_ruleset``: whether at least one ``tag``-target ruleset exists that
+      could protect ``v*`` tags. Read with ``Metadata: read`` (already granted),
+      so this is reported, but it is advisory only: the list endpoint does not
+      expose each rule's ref-name conditions without admin, so a present ruleset
+      is reported as ``"present"`` and an absent one as ``"absent"`` rather than
+      failing the run.
+
+    This never raises and never fails closed; the authoritative immutability
+    gate is the post-publish read-back. A read error is reported as
+    ``"unreadable"`` so a transient API failure cannot block a release here.
+    """
+
+    report = {"immutable_releases": "unverifiable-pre-run", "tag_ruleset": "absent"}
+    try:
+        tag_rulesets = client.list_rulesets(target="tag")
+    except Exception:  # noqa: BLE001 - advisory read only; never block on it
+        report["tag_ruleset"] = "unreadable"
+        return report
+    report["tag_ruleset"] = "present" if tag_rulesets else "absent"
+    return report
+
+
 def validate_release_notes(repo_root: Path, tag: str, *, scan_fn) -> None:
     notes = repo_root / "docs" / "releases" / f"{tag}.md"
     _require(notes.is_file(), f"release notes file missing: docs/releases/{tag}.md")

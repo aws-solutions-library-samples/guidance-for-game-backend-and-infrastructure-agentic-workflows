@@ -240,6 +240,53 @@ class GitHubClient:
         response = self._call("GET", url, operation="get-issue-comment", expected=(200,))
         return response.json() or {}
 
+    def get_release(self, release_id: int) -> dict[str, Any]:
+        """Return a single release payload (``GET /releases/{id}``).
+
+        Used for the post-publish read-back. The payload carries ``immutable``
+        (true once GitHub's immutable-releases setting is on and the release is
+        published), ``tag_name``, ``draft``, and ``assets``. Needs only
+        ``contents: read``.
+        """
+        url = self._repo_path(f"/releases/{int(release_id)}")
+        response = self._call("GET", url, operation="get-release", expected=(200,))
+        return response.json() or {}
+
+    def list_release_assets(self, release_id: int) -> list[dict[str, Any]]:
+        """Return every asset attached to a release across all pages.
+
+        Each asset carries ``name`` and ``size`` and, on current GitHub, a
+        ``digest`` of the form ``sha256:<hex>``. Needs only ``contents: read``.
+        """
+        return self._paginate(self._repo_path(f"/releases/{int(release_id)}/assets"), operation="list-release-assets")
+
+    def get_tag_object(self, sha: str) -> dict[str, Any]:
+        """Return an annotated tag object (``GET /git/tags/{sha}``).
+
+        The payload's ``object`` names the commit the tag points at (``sha`` and
+        ``type``), so the read-back can resolve tag ref -> tag object -> commit.
+        Needs only ``contents: read``.
+        """
+        url = self._repo_path(f"/git/tags/{urllib.parse.quote(sha, safe='')}")
+        response = self._call("GET", url, operation="get-tag-object", expected=(200,))
+        return response.json() or {}
+
+    def list_rulesets(self, *, target: str | None = None) -> list[dict[str, Any]]:
+        """Return the repository's rulesets (``GET /repos/{o}/{r}/rulesets``).
+
+        Needs only ``Metadata: read`` (the same permission the workflow token
+        already carries for reading branch rules). ``target`` filters to a rule
+        target such as ``tag``. The list payload summarizes each ruleset
+        (``name``, ``target``, ``enforcement``); the full rule set of a single
+        ruleset needs ``Administration: write`` and is deliberately not read
+        here, so this is a best-effort visibility read only.
+        """
+        suffix = "/rulesets"
+        if target is not None:
+            suffix += f"?targets={urllib.parse.quote(target, safe='')}"
+        items = self._paginate(self._repo_path(suffix), operation="list-rulesets")
+        return [item for item in items if isinstance(item, dict)]
+
     def get_environment(self, name: str) -> dict[str, Any] | None:
         """Return the deployment environment payload, or None when absent (404).
 
@@ -311,6 +358,10 @@ class GitHubClient:
     def upload_release_asset(self, upload_url: str, *, name: str, data: bytes, content_type: str) -> dict[str, Any]:
         # ``upload_url`` from create_release is templated: strip the ``{?...}``.
         base = upload_url.split("{", 1)[0]
+        # The upload host comes back from the API over TLS, but a bearer token
+        # must never follow it to an unexpected host. Require the scheme and
+        # host to equal the configured uploads origin before attaching the token.
+        self._require_uploads_host(base)
         url = f"{base}?name={urllib.parse.quote(name)}"
         response = self._call(
             "POST",
@@ -321,6 +372,21 @@ class GitHubClient:
             expected=(201,),
         )
         return response.json() or {}
+
+    def _require_uploads_host(self, url: str) -> None:
+        """Fail unless ``url`` is https on the configured uploads host.
+
+        ``create_release`` returns the ``upload_url`` the asset POST targets.
+        Although it arrives from the GitHub API over TLS, the request carries
+        the bearer token, so the host is pinned to the configured uploads origin
+        (``uploads.github.com`` by default) and the scheme to https. A mismatch
+        raises before the token is attached, so a redirected or substituted host
+        can never receive the token.
+        """
+        parsed = urllib.parse.urlsplit(url)
+        expected = urllib.parse.urlsplit(self.uploads_root)
+        if parsed.scheme != "https" or parsed.netloc != expected.netloc:
+            raise GitHubError(0, "upload-asset", f"refusing asset upload to unexpected host: {parsed.netloc or 'none'}")
 
     def create_tag_object(
         self, *, tag: str, message: str, commit: str, tagger_name: str, tagger_email: str, date: str

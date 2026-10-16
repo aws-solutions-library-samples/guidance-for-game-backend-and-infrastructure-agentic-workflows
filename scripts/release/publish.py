@@ -144,6 +144,125 @@ def assert_manifest_byte_identical(*, downloaded_manifest: bytes, rebuilt_manife
         )
 
 
+def _asset_sha256_from_digest(digest: str) -> str | None:
+    """Return the hex sha256 from a GitHub asset ``digest`` like ``sha256:<hex>``.
+
+    Returns None when the field is absent or not a sha256 digest, so the caller
+    falls back to the size check rather than failing on an API that does not yet
+    surface the digest.
+    """
+
+    if not isinstance(digest, str):
+        return None
+    prefix = "sha256:"
+    if not digest.startswith(prefix):
+        return None
+    value = digest[len(prefix) :].strip().lower()
+    if len(value) == 64 and all(c in "0123456789abcdef" for c in value):
+        return value
+    return None
+
+
+def verify_published_release(
+    client: GitHubClient,
+    *,
+    release_id: int,
+    inputs: PublishInputs,
+    created_tag_sha: str | None,
+) -> None:
+    """Read the published release back and confirm it matches what we published.
+
+    Fails closed (raises :class:`ValidationError`) unless every check passes:
+
+    * the release reads back as a published, non-draft release;
+    * ``immutable`` is true -- the only positive signal, readable with the
+      publish token, that GitHub's immutable-releases setting is enabled, since
+      that setting cannot be read ahead of time with the workflow token;
+    * exactly the four allowlisted assets are attached, each with a size equal
+      to the bytes we uploaded and, when GitHub reports an asset ``digest``, a
+      sha256 equal to the ``SHA256SUMS`` entry (``SHA256SUMS`` is matched by its
+      own bytes);
+    * the tag ref resolves to this run's annotated tag object, and the tag
+      object points at the released commit.
+
+    This is positive confirmation after the write, complementing the strong
+    pre-write checks: an operator (and the workflow) learns that the published
+    artifacts, tag, and immutability are exactly as intended, or the run fails
+    with a remedy.
+    """
+
+    release = client.get_release(release_id)
+    _require(bool(release), "post-publish read-back: release could not be read")
+    _require(release.get("draft") is False, "post-publish read-back: release is still a draft")
+    _require(
+        str(release.get("tag_name", "")) == inputs.tag,
+        "post-publish read-back: released tag_name does not equal the intended tag",
+    )
+    _require(
+        release.get("immutable") is True,
+        "post-publish read-back: release is not immutable; enable GitHub's immutable-releases "
+        "setting (Settings -> General -> Releases) and a v* tag ruleset, then re-run "
+        "(see docs/RELEASING.md 'Recommended maintainer settings')",
+    )
+
+    _verify_published_assets(client, release_id=release_id, inputs=inputs)
+    _verify_published_tag(client, inputs=inputs, created_tag_sha=created_tag_sha)
+
+
+def _verify_published_assets(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> None:
+    local_by_name = {a.name: a.data for a in inputs.artifacts}
+    sums_entries = {e.name: e.digest for e in checksums.parse_sha256sums(inputs.sha256sums)}
+
+    assets = client.list_release_assets(release_id)
+    names = sorted(str(a.get("name", "")) for a in assets)
+    _require(
+        set(names) == set(ALLOWED_ARTIFACT_NAMES),
+        f"post-publish read-back: attached assets {names} do not equal the four release artifacts",
+    )
+
+    for asset in assets:
+        name = str(asset.get("name", ""))
+        local = local_by_name.get(name)
+        _require(local is not None, f"post-publish read-back: unexpected attached asset {name}")
+        size = asset.get("size")
+        _require(
+            isinstance(size, int) and size == len(local),
+            f"post-publish read-back: asset {name} size {size} does not equal the published {len(local)} bytes",
+        )
+        reported = _asset_sha256_from_digest(str(asset.get("digest", "")))
+        if reported is not None:
+            expected = sums_entries.get(name) or checksums.sha256_hex(local)
+            _require(
+                reported == expected,
+                f"post-publish read-back: asset {name} digest does not equal its published checksum",
+            )
+
+
+def _verify_published_tag(client: GitHubClient, *, inputs: PublishInputs, created_tag_sha: str | None) -> None:
+    ref = client.get_ref(f"tags/{inputs.tag}")
+    _require(ref is not None, "post-publish read-back: tag ref is absent after publish")
+    ref_object = (ref or {}).get("object", {}) or {}
+    ref_sha = str(ref_object.get("sha", ""))
+    _require(bool(ref_sha), "post-publish read-back: tag ref has no object sha")
+    if created_tag_sha is not None:
+        _require(
+            ref_sha == str(created_tag_sha),
+            "post-publish read-back: tag ref does not point at this run's annotated tag object",
+        )
+
+    # Resolve the tag object -> commit. An annotated tag ref points at a tag
+    # object whose ``object`` is the commit; a lightweight ref would point at
+    # the commit directly (rejected: the release must carry an annotated tag).
+    if str(ref_object.get("type", "")) == "commit":
+        raise ValidationError("post-publish read-back: tag ref points at a commit, not an annotated tag object")
+    tag_object = client.get_tag_object(ref_sha)
+    target = (tag_object or {}).get("object", {}) or {}
+    _require(
+        str(target.get("sha", "")) == inputs.commit,
+        "post-publish read-back: annotated tag object does not point at the released commit",
+    )
+
+
 def publish_release(client: GitHubClient, inputs: PublishInputs) -> PublishResult:
     """Execute the ordered publication with strict, outcome-aware cleanup.
 
@@ -219,6 +338,15 @@ def publish_release(client: GitHubClient, inputs: PublishInputs) -> PublishResul
             release_id=result.release_id, draft=False, prerelease=prerelease, make_latest=not prerelease
         )
         result.published = True
+
+        # 6. Post-publish read-back: positive confirmation that the published
+        # release carries exactly the four assets (size and, when reported,
+        # digest), that the tag ref resolves through this run's annotated tag
+        # object to the released commit, and that GitHub marked the release
+        # immutable. A failure here raises; cleanup then sees a PUBLISHED
+        # release and leaves it intact (it never deletes a published release),
+        # so the run fails loudly with a remedy without destroying the artifact.
+        verify_published_release(client, release_id=result.release_id, inputs=inputs, created_tag_sha=created_tag_sha)
         return result
     except BaseException as error:
         # Choose the cleanup budget by WHAT interrupted us. A cancellation

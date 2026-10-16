@@ -232,6 +232,18 @@ def cmd_verify_environment(_args: argparse.Namespace) -> int:
     client, _owner, _repo = _client()
     validate_mod.validate_environment_protected(client)
     print(f"release environment '{validate_mod.RELEASE_ENVIRONMENT}' is protected by required reviewers")
+    settings = validate_mod.report_release_settings(client)
+    print(
+        "release settings: immutable-releases="
+        f"{settings['immutable_releases']} (enforced after publish by read-back); "
+        f"v* tag ruleset={settings['tag_ruleset']}"
+    )
+    if settings["tag_ruleset"] == "absent":
+        print(
+            "note: no tag-target ruleset found; enable a v* tag ruleset and GitHub's "
+            "immutable-releases setting so published tags and assets are immutable "
+            "(see docs/RELEASING.md 'Recommended maintainer settings')"
+        )
     return 0
 
 

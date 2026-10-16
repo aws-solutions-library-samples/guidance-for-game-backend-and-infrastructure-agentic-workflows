@@ -40,7 +40,14 @@ class RecordingClient(GitHubClient):
         self.comments: dict[int, dict] = {}
         self.environments: dict[str, dict] = {}  # name -> environment payload
         self.branch_rules: list[dict] = []  # GET /repos/{o}/{r}/rules/branches/{b}
+        self.rulesets: list[dict] = []  # GET /repos/{o}/{r}/rulesets
         self.collaborator_permissions: dict[str, str] = {}  # login -> permission
+        # Post-publish read-back state. Uploaded assets are recorded per release
+        # id; a published release reads back immutable by default so the happy
+        # path confirms. Tests flip these to exercise the read-back failures.
+        self.release_assets: dict[int, list[dict]] = {}
+        self.published_immutable = True
+        self.tag_objects: dict[str, dict] = {}  # tag-object sha -> {"object": {...}}
         # Write behavior
         self.fail_on: str | None = None  # method name to raise in
         self._next_release_id = 100
@@ -92,6 +99,34 @@ class RecordingClient(GitHubClient):
         self.calls.append(f"get_branch_rules:{branch}")
         return [dict(rule) for rule in getattr(self, "branch_rules", [])]
 
+    def list_rulesets(self, *, target=None):
+        self.calls.append(f"list_rulesets:{target}")
+        rulesets = [dict(r) for r in getattr(self, "rulesets", [])]
+        if target is None:
+            return rulesets
+        return [r for r in rulesets if str(r.get("target", "")) == target]
+
+    def get_release(self, release_id: int):
+        self.calls.append(f"get_release:{release_id}")
+        for rec in self.releases:
+            if rec["id"] == release_id:
+                payload = dict(rec)
+                payload.setdefault("immutable", bool(self.published_immutable) and not rec.get("draft", True))
+                return payload
+        raise KeyError(release_id)
+
+    def list_release_assets(self, release_id: int):
+        self.calls.append(f"list_release_assets:{release_id}")
+        return [dict(a) for a in self.release_assets.get(release_id, [])]
+
+    def get_tag_object(self, sha: str):
+        self.calls.append(f"get_tag_object:{sha}")
+        payload = self.tag_objects.get(sha)
+        if payload is None:
+            # Default annotated tag object pointing at the current main head.
+            return {"sha": sha, "object": {"sha": self.main_head, "type": "commit"}}
+        return dict(payload)
+
     def get_collaborator_permission(self, username: str) -> str:
         self.calls.append(f"get_collaborator_permission:{username}")
         return getattr(self, "collaborator_permissions", {}).get(username, "none")
@@ -128,11 +163,31 @@ class RecordingClient(GitHubClient):
 
     def upload_release_asset(self, upload_url, *, name, data, content_type):
         self._maybe_fail(f"upload_release_asset:{name}")
+        # Record the asset against the release id embedded in the upload_url so
+        # the post-publish read-back can confirm name, size, and digest.
+        # Standard library
+        import hashlib
+
+        rid = self._next_release_id - 1
+        for rec in self.releases:
+            if str(rec.get("upload_url", "")).startswith(upload_url.split("{", 1)[0]):
+                rid = rec["id"]
+                break
+        self.release_assets.setdefault(rid, []).append(
+            {
+                "name": name,
+                "size": len(data),
+                "digest": f"sha256:{hashlib.sha256(data).hexdigest()}",
+                "state": "uploaded",
+            }
+        )
         return {"name": name, "state": "uploaded"}
 
     def create_tag_object(self, *, tag, message, commit, tagger_name, tagger_email, date):
         self._maybe_fail("create_tag_object")
-        return self._tag_object_sha
+        sha = self._tag_object_sha
+        self.tag_objects[sha] = {"sha": sha, "object": {"sha": commit, "type": "commit"}}
+        return sha
 
     def create_ref(self, *, ref, sha):
         self._maybe_fail("create_ref")
