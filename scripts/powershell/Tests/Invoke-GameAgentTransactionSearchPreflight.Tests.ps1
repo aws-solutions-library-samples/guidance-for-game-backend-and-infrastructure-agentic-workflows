@@ -19,7 +19,9 @@ BeforeAll {
             [bool]$ProjectGrantPresent = $false,
             [bool]$DestinationReadFails = $false,
             [bool]$PoliciesReadFails = $false,
-            [bool]$IndexingReadFails = $false
+            [bool]$IndexingReadFails = $false,
+            [bool]$SpansExists = $false,
+            [bool]$SpansReadFails = $false
         )
         $destLocal = $Destination
         $toolkitLocal = $ToolkitPolicyPresent
@@ -28,6 +30,8 @@ BeforeAll {
         $destFailLocal = $DestinationReadFails
         $policiesFailLocal = $PoliciesReadFails
         $indexingFailLocal = $IndexingReadFails
+        $spansExistsLocal = $SpansExists
+        $spansFailLocal = $SpansReadFails
 
         # Count how many times describe-resource-policies is called, so a test
         # can assert the preflight reads it exactly once per run.
@@ -46,6 +50,11 @@ BeforeAll {
         } else {
             '{"IndexingRules":[]}'
         }
+        $spansJson = if ($spansExistsLocal) {
+            '{"logGroups":[{"logGroupName":"aws/spans"}]}'
+        } else {
+            '{"logGroups":[]}'
+        }
 
         $mock = {
             $op = "$($args[0]) $($args[1])"
@@ -62,6 +71,10 @@ BeforeAll {
                 'xray get-indexing-rules' {
                     if ($indexingFailLocal) { $global:LASTEXITCODE = 254; return '' }
                     $global:LASTEXITCODE = 0; return $indexingJson
+                }
+                'logs describe-log-groups' {
+                    if ($spansFailLocal) { $global:LASTEXITCODE = 254; return '' }
+                    $global:LASTEXITCODE = 0; return $spansJson
                 }
                 default { $global:LASTEXITCODE = 1; return '' }
             }
@@ -167,6 +180,54 @@ Describe 'Invoke-GameAgentTransactionSearchPreflight' {
         Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true
         $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
         $result | Should -BeTrue
+    }
+
+    It 'Stop-switch remedy leads with the console and offers the opt-in only when aws/spans is present' {
+        # XRay destination, resource policy absent (a definite change), with the
+        # AWS-reserved 'aws/spans' group present. The remedy must lead with the
+        # console enable and offer the opt-in with the matching policy name and
+        # the no-other-grant condition.
+        Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true -SpansExists $true
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Match 'AWS X-Ray / CloudWatch console'
+        $text | Should -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess'
+        $text | Should -Match 'no other'
+    }
+
+    It 'Stop-switch remedy does not offer the opt-in when aws/spans is absent' {
+        Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true -SpansExists $false
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Match 'AWS X-Ray / CloudWatch console'
+        $text | Should -Not -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME'
+    }
+
+    It 'Stop-switch remedy does not offer the opt-in when the aws/spans read fails' {
+        # An unreadable 'aws/spans' read leaves the group's state unknown, so the
+        # opt-in route (correct only when the group is known to exist) must not
+        # be offered. The definite trace-destination change still triggers the
+        # console-first remedy.
+        Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true -SpansReadFails $true
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Match 'AWS X-Ray / CloudWatch console'
+        $text | Should -Not -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME'
+    }
+
+    It 'Stop-switch remedy for an UNKNOWN-only halt leads with restoring the read' {
+        # The halt is caused only by an unreadable state (no definite change), so
+        # the remedy must lead with restoring the read (credentials or
+        # permissions), not the console-enable guidance for a definite change.
+        Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -IndexingReadFails $true
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Match 'could not be read'
+        ($text -match 'credentials' -or $text -match 'permission') | Should -BeTrue
     }
 
     It 'Notes the project grant (via Write-Host) but says the toolkit still adds its own policy' {

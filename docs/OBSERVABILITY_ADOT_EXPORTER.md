@@ -122,8 +122,9 @@ Transaction Search incomplete; the read-only Step 5c recheck reports it. The
 deployment predicts these launch-side changes before every launch and warns
 about them, and a fail-closed stop switch
 (`GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true`, PowerShell
-`-StopOnAccountObservabilityChange`) can halt the deploy before any launch so no
-shared setting is modified. The residual is that, without the stop switch, the
+`-StopOnAccountObservabilityChange`) can halt the deploy before `agentcore
+launch` makes any of these changes so no shared setting is modified. The residual
+is that, without the stop switch, the
 toolkit still performs this setup during `agentcore launch`; it exposes no flag
 to skip only that step.
 

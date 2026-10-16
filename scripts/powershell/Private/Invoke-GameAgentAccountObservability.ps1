@@ -264,8 +264,23 @@ function Invoke-GameAgentAccountObservability {
             Write-Host '      The opt-in WOULD change these shared, account-wide settings'
             Write-Host '      (every X-Ray / Transaction Search consumer):'
             Write-AccountScope
-            Write-Host '      To let the deployment configure them, re-run with the opt-in:'
-            Write-Host '          Deploy-GameAgent -ConfigureAccountObservability'
+            if ($StopOnAccountObservabilityChange) {
+                # Under the stop switch the deploy halts before 'agentcore
+                # launch', so the account must reach a toolkit-passing state
+                # before the opt-in clears the halt. The default policy name
+                # does not satisfy the toolkit's name-only check, so offer the
+                # matching-name command, and only on an account with no other
+                # 'aws/spans' grant (the opt-in keeps an existing grant and skips
+                # its own write); otherwise use the console enable.
+                Write-Host '      With the stop switch set, re-run the opt-in with the matching policy name,'
+                Write-Host "      on an account with no other 'aws/spans' grant (with one in place, the opt-in"
+                Write-Host '      keeps it and skips its own write; use the console enable instead):'
+                Write-Host '          Deploy-GameAgent -ConfigureAccountObservability (with'
+                Write-Host '          GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess set)'
+            } else {
+                Write-Host '      To let the deployment configure them, re-run with the opt-in:'
+                Write-Host '          Deploy-GameAgent -ConfigureAccountObservability'
+            }
         } else {
             Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      ' -Mode 'default'
         }

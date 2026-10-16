@@ -148,9 +148,11 @@ print_account_scope() {
 #   - destination XRay, group PRESENT          : the group already exists; only
 #     the trace destination needs switching to 'CloudWatchLogs', through the
 #     console or the opt-in Step 1.7 already offers for this state;
-#   - destination XRay, group absent, default  : the launch switches the
-#     destination (which does not create the group by itself); Step 5c then
-#     prints the one-time toggle from 'CloudWatchLogs';
+#   - destination XRay, group absent, default  : with the stop switch off, the
+#     launch switches the destination (which does not create the group by
+#     itself) and Step 5c then prints the one-time toggle from 'CloudWatchLogs';
+#     with the stop switch set, the deploy halts before 'agentcore launch', so
+#     the advice is the one-time console enable instead;
 #   - destination XRay, group absent, recheck  : the launch already ran and did
 #     NOT switch the destination (see the toolkit's "Transaction Search
 #     configuration failed" warning in the launch output); enable Transaction
@@ -543,7 +545,9 @@ resource_policy_grant_present() {
 # Entry point used by scripts/deploy.sh before each `agentcore launch`. Runs the
 # read-only preflight, then enforces the fail-closed stop switch. Returns:
 #   0  safe to launch (no change, or operator accepted the warning);
-#   1  stop requested AND the toolkit would (or might) change shared settings.
+#   1  stop requested AND the toolkit would (or might) change shared settings, OR
+#      python3 is not on PATH (the readers parse AWS CLI JSON with python3, so
+#      the preflight cannot run without it).
 # A read failure (UNKNOWN) is treated as a possible change, so the stop switch
 # halts on it too (fail closed).
 run_transaction_search_preflight() {
@@ -564,26 +568,37 @@ run_transaction_search_preflight() {
 
   if [ "$GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE" = "true" ] \
     && [ "${TOOLKIT_WOULD_CHANGE:-0}" -ne 0 ]; then
-    # The opt-in cannot create the AWS-reserved 'aws/spans' log group. Lead with
-    # the one-time console enable (which always reaches a passing state) and only
-    # offer the opt-in route when 'aws/spans' already exists, so an operator on an
-    # account without that group is not sent to an opt-in that writes the policy,
-    # switches the destination, and still stops at Step 1.7.
+    # The opt-in cannot create the AWS-reserved 'aws/spans' log group, and it
+    # skips its own policy write when another policy already grants the access.
+    # When the halt is a definite change, lead with the one-time console enable
+    # and offer the opt-in route only when 'aws/spans' already exists AND no
+    # other grant is present. When the halt is caused only by an unreadable
+    # state (TOOLKIT_WOULD_CHANGE=2 with no definite change), lead with
+    # restoring the read instead, because the stop is about missing information,
+    # not a known change.
     local remedy_spans_state
     remedy_spans_state="$(spans_log_group_state)"
     echo "❌ GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true and the AgentCore starter toolkit" >&2
     echo "   would change (or might change) account-wide X-Ray / CloudWatch Logs settings." >&2
     echo "   Stopping before 'agentcore launch' so no shared setting is modified." >&2
-    echo "   To reach a passing run without any shared change, enable Transaction Search once" >&2
-    echo "   in the AWS X-Ray / CloudWatch console. The account then already satisfies the three" >&2
-    echo "   toolkit conditions (a CloudWatch Logs resource policy named 'TransactionSearchXRayAccess'," >&2
-    echo "   the X-Ray trace segment destination 'CloudWatchLogs', and an X-Ray 'Default' indexing" >&2
-    echo "   rule), so this deploy proceeds without changing any shared setting, with the stop" >&2
-    echo "   switch still in place." >&2
+    if [ "${TOOLKIT_WOULD_CHANGE:-0}" -eq 2 ]; then
+      echo "   One or more account settings could not be read, so the toolkit's effect is" >&2
+      echo "   unknown. First restore the read — most often expired credentials or a missing" >&2
+      echo "   permission on the describe calls — then re-run; this preflight names any" >&2
+      echo "   condition that still fails." >&2
+      return 1
+    fi
+    echo "   To reach a passing run without any shared change, the account must already" >&2
+    echo "   satisfy the toolkit's three conditions: a CloudWatch Logs resource policy named" >&2
+    echo "   exactly 'TransactionSearchXRayAccess', the X-Ray trace segment destination" >&2
+    echo "   'CloudWatchLogs', and an X-Ray 'Default' indexing rule. Enable Transaction Search" >&2
+    echo "   once in the AWS X-Ray / CloudWatch console, then re-run; this preflight names any" >&2
+    echo "   condition that still fails." >&2
     if [ "$remedy_spans_state" = "present" ]; then
-      echo "   Because the AWS-reserved 'aws/spans' log group already exists, you can instead reach" >&2
-      echo "   that state with this repository's opt-in, which switches the destination and adds the" >&2
-      echo "   matching policy:" >&2
+      echo "   Because the AWS-reserved 'aws/spans' log group already exists, this repository's" >&2
+      echo "   opt-in with the matching policy name can also reach that state, on an account" >&2
+      echo "   with no other 'aws/spans' grant (with one in place, the opt-in keeps it and" >&2
+      echo "   skips its own write):" >&2
       echo "     GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \\" >&2
       echo "       GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh" >&2
     fi
@@ -632,8 +647,23 @@ report_without_mutation() {
     echo "      The opt-in WOULD change these shared, account-wide settings"
     echo "      (every X-Ray / Transaction Search consumer):"
     print_account_scope
-    echo "      To let the deployment configure them, re-run with the opt-in:"
-    echo "          GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh"
+    if [ "$GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE" = "true" ]; then
+      # Under the stop switch the deploy halts before 'agentcore launch', so the
+      # account must reach a toolkit-passing state before the opt-in clears the
+      # halt. The default policy name does not satisfy the toolkit's name-only
+      # check, so a bare opt-in would halt on the policy name every run. Offer
+      # the matching-name command, and only on an account with no other
+      # 'aws/spans' grant (the opt-in keeps an existing grant and skips its own
+      # write). Otherwise point to the stop-switch remedy's console enable.
+      echo "      With the stop switch set, re-run the opt-in with the matching policy name,"
+      echo "      on an account with no other 'aws/spans' grant (with one in place, the opt-in"
+      echo "      keeps it and skips its own write; use the console enable instead):"
+      echo "          GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \\"
+      echo "            GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh"
+    else
+      echo "      To let the deployment configure them, re-run with the opt-in:"
+      echo "          GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh"
+    fi
   else
     print_spans_remedy "$destination" "$spans_state" "      " "default"
   fi

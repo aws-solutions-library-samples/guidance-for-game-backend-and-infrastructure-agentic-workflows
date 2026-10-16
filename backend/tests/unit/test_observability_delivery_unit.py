@@ -588,6 +588,13 @@ def test_account_obs_default_stop_switch_does_not_promise_launch_when_xray_and_s
     assert "the post-launch recheck (Step 5c)" not in result.stdout
     assert "'agentcore launch' switches the" not in result.stdout
     assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    # No wording may promise that a launch (or "the deployment") reaches the
+    # passing state: the stop switch halts before any launch, so nothing will
+    # switch the destination.
+    assert "nothing will switch the destination" in result.stdout
+    assert "let the deployment" not in result.stdout.lower()
+    assert "launch' switch it" not in result.stdout
+    assert "launch' will switch" not in result.stdout
 
 
 @pytest.mark.parametrize("shell", _OBS_SHELLS)
@@ -643,6 +650,31 @@ def test_account_obs_default_offers_opt_in_only_when_spans_present():
     assert "X-Ray trace segment destination" in result.stdout
     assert "X-Ray default indexing rule" in result.stdout
     assert "CloudWatch Logs resource policy" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_default_stop_switch_opt_in_offer_names_matching_policy(shell):
+    # Destination XRay, 'aws/spans' present, stop switch set to exactly 'true'.
+    # The default-named opt-in writes 'GameAgentTransactionSearchXRayAccess',
+    # which never satisfies the toolkit, so a stop-switch run would halt on the
+    # policy name and leave the account looping. The Step 1.7 offer must instead
+    # carry the matching policy name and state the no-other-grant condition (or
+    # point to the stop-switch remedy), never the bare default-named opt-in.
+    result = _account_obs_harness(
+        "false",
+        _obs_mock(destination="XRay", spans=True),
+        extra_env="export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true",
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess" in result.stdout
+    assert "no other" in result.stdout
+    # The bare default-named opt-in line must not appear on its own: every
+    # opt-in command printed here carries the matching policy name.
+    for line in result.stdout.splitlines():
+        if "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" in line and line.strip().endswith("./deploy-all.sh"):
+            assert "GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess" in line
 
 
 def test_account_obs_default_does_not_offer_opt_in_when_destination_unreadable_and_spans_present():
@@ -973,6 +1005,7 @@ def _preflight_mock(
     policies_read_fails: bool = False,
     indexing_read_fails: bool = False,
     spans: bool = False,
+    spans_read_fails: bool = False,
 ) -> str:
     # describe-resource-policies feeds both the toolkit name-only check and the
     # project-owned grant annotation (find_existing_spans_policy).
@@ -999,6 +1032,7 @@ def _preflight_mock(
     policies_block = "    return 254" if policies_read_fails else f"    echo '{policies_json}'; return 0"
     indexing_block = "    return 254" if indexing_read_fails else f"    echo '{indexing_json}'; return 0"
     spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    spans_body = "    return 254" if spans_read_fails else f"echo '{spans_json}'; return 0"
     return (
         "aws() {\n"
         '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
@@ -1012,7 +1046,7 @@ def _preflight_mock(
         "  fi\n"
         '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
         '    case " $* " in\n'
-        f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+        f"      *' --output json '*) {spans_body};;\n"
         "      *) return 0;;\n"
         "    esac\n"
         "  fi\n"
@@ -1151,6 +1185,16 @@ def test_preflight_stop_switch_remedy_offers_opt_in_only_when_spans_present(shel
     assert "Stopping before 'agentcore launch'" in result.stderr
     assert "AWS X-Ray / CloudWatch console" in result.stderr
     assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" in result.stderr
+    # The offered opt-in command must carry the matching policy name so it
+    # actually satisfies the toolkit's name-only check.
+    assert "GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess" in result.stderr
+    # The route works only on an account with no other 'aws/spans' grant, so the
+    # remedy must state that condition rather than offer the opt-in unqualified.
+    assert "no other" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_halts_on_unknown_read_failure(shell):
     """Fail-closed: the stop switch also halts when the toolkit's effect is UNKNOWN."""
     result = _preflight_harness(
         _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, indexing_read_fails=True),
@@ -1159,6 +1203,67 @@ def test_preflight_stop_switch_remedy_offers_opt_in_only_when_spans_present(shel
     )
     assert "rc=1" in result.stdout
     assert "Stopping before 'agentcore launch'" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_remedy_does_not_offer_opt_in_when_spans_unreadable(shell):
+    """When the 'aws/spans' read itself fails, its state is unknown, so the
+    remedy must NOT offer the opt-in route (which is correct only when the group
+    is known to exist). It must lead with the console instead."""
+    result = _preflight_harness(
+        _preflight_mock(
+            destination="XRay",
+            toolkit_policy_present=False,
+            default_indexing_present=True,
+            spans_read_fails=True,
+        ),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+    assert "AWS X-Ray / CloudWatch console" in result.stderr
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_remedy_never_promises_a_launch(shell):
+    """The stop switch halts before 'agentcore launch', so the remedy must never
+    tell the operator to let a launch reach the passing state — not when
+    'aws/spans' is absent and not when it is present."""
+    for spans in (False, True):
+        result = _preflight_harness(
+            _preflight_mock(
+                destination="XRay",
+                toolkit_policy_present=False,
+                default_indexing_present=True,
+                spans=spans,
+            ),
+            extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+            shell=shell,
+        )
+        assert "rc=1" in result.stdout
+        # No wording that promises a launch will finish the job.
+        assert "'agentcore launch' switch" not in result.stderr
+        assert "let the deployment" not in result.stderr.lower()
+        assert "will switch" not in result.stderr.lower()
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_unknown_read_remedy_leads_with_restoring_the_read(shell):
+    """When the halt is caused only by an unreadable state (for example expired
+    credentials), the remedy must lead with restoring the read rather than the
+    console-enable guidance for a definite change."""
+    result = _preflight_harness(
+        _preflight_mock(destination="CloudWatchLogs", toolkit_policy_present=True, policies_read_fails=True),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+    # Lead with the read fix: credentials/permissions, not a console enable.
+    assert "could not be read" in result.stderr
+    assert "credentials" in result.stderr or "permission" in result.stderr
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
@@ -2012,18 +2117,21 @@ def test_spans_reader_state_alignment(describe_output, exit_code, expected, shel
 
 
 @pytest.mark.parametrize("shell", _OBS_SHELLS)
-def test_script_fails_fast_when_python3_is_missing(shell):
+@pytest.mark.parametrize("mode_args", [[], ["--toolkit-preflight"]])
+def test_script_fails_fast_when_python3_is_missing(shell, mode_args):
     """A standalone run of the setup script without python3 on PATH must stop at
     the start of main with a clear 'python3 not found' message, before any AWS
     read, rather than letting the describe calls be misread as denied or
-    throttled. The readers parse JSON with python3, so the check guards them."""
+    throttled. The readers parse JSON with python3, so the check guards them.
+    The toolkit-preflight dispatch bypasses main(), so it carries its own guard
+    and must fail the same way."""
     # Resolve the shell binary with the real PATH, then run it with an empty
     # PATH so python3 cannot be found. Everything main needs to reach the check
     # (variable assignments, 'command -v', 'echo') is a shell builtin, so no
     # PATH entries are required past locating the interpreter itself.
     shell_bin = shutil.which(shell) or shell
     result = subprocess.run(
-        [shell_bin, str(ACCOUNT_OBS_SCRIPT)],
+        [shell_bin, str(ACCOUNT_OBS_SCRIPT), *mode_args],
         capture_output=True,
         text=True,
         env={"PATH": "", "AWS_REGION": "us-west-2"},

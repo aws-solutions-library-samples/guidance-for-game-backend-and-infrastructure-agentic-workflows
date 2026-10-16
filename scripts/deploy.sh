@@ -202,8 +202,10 @@ echo ""
 # Transaction Search step, run before each `agentcore launch`. The script is run
 # as a SUBPROCESS (not sourced) so its own `set -euo pipefail` cannot leak into
 # this deploy's shell options; deploy.sh keeps its own options and variables.
-# Returns non-zero only when the fail-closed stop switch is set and the toolkit
-# would (or might) change account-wide settings.
+# Returns non-zero when the fail-closed stop switch is set and the toolkit would
+# (or might) change account-wide settings, or when python3 is not on PATH (the
+# preflight parses AWS CLI JSON with python3). deploy.sh checks python3 as a
+# prerequisite above, so a full deploy reaches this only for the stop-switch case.
 run_toolkit_preflight() {
   AWS_REGION="$AWS_REGION" \
     GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="${GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE:-false}" \

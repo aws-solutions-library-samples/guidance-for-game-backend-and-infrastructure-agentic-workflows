@@ -737,8 +737,8 @@ so this project treats them as a blast-radius concern:
   `Invoke-GameAgentAccountObservability` PowerShell function) make no account-wide
   change unless the operator sets `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true`
   (PowerShell `-ConfigureAccountObservability`). They read existing state first,
-  enable Transaction Search additively (never a disable/re-enable toggle), and fail
-  closed on an unreadable state rather than guessing.
+  enable Transaction Search additively (never a disable/re-enable toggle), and refuse
+  to write when a state they need cannot be read, rather than guessing.
 - **`agentcore launch` is a separate source of account-wide change.** When runtime
   observability is enabled (the setting that also selects the
   `opentelemetry-instrument` entrypoint), the AgentCore starter toolkit (0.3.11)
