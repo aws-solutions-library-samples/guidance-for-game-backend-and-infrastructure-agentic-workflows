@@ -352,19 +352,21 @@ def test_sanitized_exception_structured_frames_extra_is_content_free():
 
 
 @pytest.mark.parametrize(
-    "name_value, name_label",
+    "name_label",
     [
-        pytest.param(None, "missing", id="missing-name"),
-        pytest.param(0, "non-string", id="non-string-name"),
+        pytest.param("missing", id="missing-name"),
+        pytest.param("non-string", id="non-string-name"),
+        pytest.param("str-subclass", id="str-subclass-name"),
     ],
 )
-def test_sanitized_traceback_frames_total_for_hostile_frames(name_value, name_label, monkeypatch):
+def test_sanitized_traceback_frames_total_for_hostile_frames(name_label):
     """The helper never raises and never leaks a file path for a hostile frame.
 
-    A frame whose module ``__name__`` is missing or a non-string whose
-    ``__str__`` raises must not make the helper raise (which would hand the
-    original exception to the SDK's unredacted formatter), and must resolve to a
-    code-owned ``<unknown>`` sentinel rather than ``co_filename``.
+    A frame whose module ``__name__`` is deleted entirely, is a non-string whose
+    ``__str__`` raises, or is a ``str`` subclass supplying its own ``__str__``
+    text must not make the helper raise (which would hand the original exception
+    to the SDK's unredacted formatter), and must resolve to a code-owned
+    ``<unknown>`` sentinel rather than ``co_filename`` or subclass-authored text.
     """
     # Local modules
     from utils.security import _UNKNOWN_FRAME_MODULE, sanitized_traceback_frames
@@ -376,7 +378,17 @@ def test_sanitized_traceback_frames_total_for_hostile_frames(name_value, name_la
         def __repr__(self) -> str:
             raise RuntimeError(f"boom {PROMPT_MARKER}")
 
-    chosen = _ExplodingName() if name_label == "non-string" else name_value
+    class _DisclosingName(str):
+        # An ``isinstance(..., str)`` guard would accept this subclass and then
+        # read its overridden ``__str__``; an exact ``type(...) is str`` check
+        # rejects it, so the subclass-authored text never reaches the log.
+        def __str__(self) -> str:
+            return f"leaked {PROMPT_MARKER}"
+
+    hostile = {
+        "non-string": _ExplodingName(),
+        "str-subclass": _DisclosingName("placeholder"),
+    }
 
     def _boom():
         raise ValueError("hostile frame")
@@ -384,24 +396,34 @@ def test_sanitized_traceback_frames_total_for_hostile_frames(name_value, name_la
     try:
         _boom()
     except ValueError as exc:
-        # Rewrite the raising frame's module __name__ to the hostile value. The
-        # frame shares this module's globals, so save and restore __name__ around
-        # the call to avoid leaking the mutation into other tests.
+        # Make the raising frame's module ``__name__`` hostile. The frame shares
+        # this module's globals, so save and restore the key around the call to
+        # avoid leaking the mutation into other tests. The missing-name case
+        # deletes the key entirely so the ``.get("__name__")`` lookup returns
+        # ``None``; the other cases install a non-string or a ``str`` subclass.
         tb = exc.__traceback__
         while tb is not None and tb.tb_next is not None:
             tb = tb.tb_next
         assert tb is not None
         globals_dict = tb.tb_frame.f_globals
-        saved = globals_dict.get("__name__")
-        globals_dict["__name__"] = chosen
+        sentinel = object()
+        saved = globals_dict.get("__name__", sentinel)
+        if name_label in hostile:
+            globals_dict["__name__"] = hostile[name_label]
+        else:
+            globals_dict.pop("__name__", None)
         try:
             # The helper must stay total.
             frames = sanitized_traceback_frames(exc)
         finally:
-            globals_dict["__name__"] = saved
+            if saved is sentinel:
+                globals_dict.pop("__name__", None)
+            else:
+                globals_dict["__name__"] = saved
 
     assert frames, "helper returned no frames for a valid traceback"
-    # The hostile frame resolved to the sentinel, not a filesystem path.
+    # The hostile frame resolved to the sentinel, not a filesystem path or
+    # subclass-authored text.
     innermost = frames[0]
     assert innermost.startswith(f"{_UNKNOWN_FRAME_MODULE}:")
     # No file path or marker leaked from the hostile frame.
@@ -409,9 +431,59 @@ def test_sanitized_traceback_frames_total_for_hostile_frames(name_value, name_la
     assert PROMPT_MARKER not in innermost
 
 
+def test_sanitized_traceback_frames_total_when_component_helper_raises(monkeypatch):
+    """The ``except`` totality wrapper is exercised: when building a frame
+    component raises, the helper swallows it and returns an innermost-first,
+    content-free list rather than propagating to the SDK's unredacted formatter.
+    """
+    # Local modules
+    from utils import security
+    from utils.security import sanitized_traceback_frames
+
+    def _inner():
+        raise ValueError("component helper will raise")
+
+    def _outer():
+        _inner()
+
+    calls = {"n": 0}
+    real_component = security._frame_component
+
+    def _raising_component(value):
+        # Let the two outer frames build normally, then raise while composing the
+        # innermost frame, so several frames are already gathered (outermost
+        # first) when the walk fails. This drives the ``except`` path with a
+        # multi-element partial list whose order the wrapper must still fix.
+        calls["n"] += 1
+        if calls["n"] >= 5:
+            raise RuntimeError("component boom")
+        return real_component(value)
+
+    monkeypatch.setattr(security, "_frame_component", _raising_component)
+
+    try:
+        _outer()
+    except ValueError as exc:
+        # Must not raise even though the component helper does.
+        frames = sanitized_traceback_frames(exc)
+
+    # Two frames were gathered before the failure. The ``except`` path reverses
+    # the partial list, so it stays innermost-first (matching the success-path
+    # ordering the docstring promises): the deeper ``_outer`` frame leads the
+    # shallower test frame rather than trailing it.
+    assert len(frames) >= 2, "expected a multi-frame partial list from the totality wrapper"
+    assert frames[0].startswith(f"{__name__}:_outer:")
+    assert frames[-1].startswith(f"{__name__}:test_sanitized_traceback_frames_total_when_component_helper_raises:")
+    # No message content leaked through the failed walk.
+    assert all("component boom" not in frame for frame in frames)
+
+
 def test_sanitized_traceback_frames_cap_component_length():
-    """A pathologically long module ``__name__`` is length-capped per component,
-    so one frame cannot produce an unbounded line."""
+    """A pathologically long module ``__name__`` or function ``co_name`` is
+    length-capped per component, so one frame cannot produce an unbounded line."""
+    # Standard library
+    import types
+
     # Local modules
     from utils.security import _MAX_FRAME_COMPONENT_LENGTH, sanitized_traceback_frames
 
@@ -435,6 +507,18 @@ def test_sanitized_traceback_frames_cap_component_length():
 
     module = frames[0].split(":", 1)[0]
     assert len(module) <= _MAX_FRAME_COMPONENT_LENGTH
+
+    # A very long function name is capped the same way, so neither component of a
+    # frame locus can grow without bound.
+    forged_code = _boom.__code__.replace(co_name="f" * 100_000)
+    forged = types.FunctionType(forged_code, _boom.__globals__, "forged")
+    try:
+        forged()
+    except ValueError as exc:
+        frames = sanitized_traceback_frames(exc)
+
+    function = frames[0].split(":")[1]
+    assert len(function) <= _MAX_FRAME_COMPONENT_LENGTH
 
 
 def test_sanitized_traceback_frames_normalize_function_name():
@@ -466,9 +550,58 @@ def test_sanitized_traceback_frames_normalize_function_name():
     assert "INJECTED-FUNC" in locus  # content kept, but collapsed to one line
 
 
+def test_sanitized_traceback_frames_lone_surrogate_is_strict_utf8_encodable():
+    """A lone surrogate in a frame component is escaped, so a strict UTF-8 sink
+    can encode the composed line.
+
+    A frame ``co_name`` holding a lone surrogate would make a strict UTF-8 sink
+    raise ``UnicodeEncodeError``; a sink failure during a log call inside an
+    ``except`` block drives Loguru's handler-error path, which prints the
+    in-flight exception to stderr. The component must therefore be strict-UTF-8
+    encodable.
+    """
+    # Standard library
+    import io
+    import types
+
+    # Local modules
+    from utils.security import log_sanitized_exception, sanitized_traceback_frames
+
+    def _raiser():
+        raise ValueError("lone surrogate co_name")
+
+    # A lone high surrogate (U+D800) cannot be encoded by a strict UTF-8 codec.
+    forged_code = _raiser.__code__.replace(co_name="victim\ud800x")
+    forged = types.FunctionType(forged_code, _raiser.__globals__, "forged")
+
+    try:
+        forged()
+    except ValueError as exc:
+        frames = sanitized_traceback_frames(exc)
+        # Every component is strict-UTF-8 encodable (no raised UnicodeEncodeError).
+        for frame in frames:
+            frame.encode("utf-8")
+        # The raw lone surrogate does not survive; it is replaced by an escape.
+        assert "\ud800" not in frames[0]
+
+        # A strict UTF-8 sink writes the composed line without the handler-error
+        # path triggering.
+        strict_buffer = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", errors="strict", newline="")
+        sink_id = logger.add(strict_buffer, level="DEBUG", format="{message}", backtrace=False, diagnose=False)
+        try:
+            log_sanitized_exception(logger, "operation failed", exc, request_id="req-surrogate", debug_traceback=False)
+        finally:
+            logger.remove(sink_id)
+        strict_buffer.flush()
+        written = strict_buffer.buffer.getvalue().decode("utf-8")  # type: ignore[attr-defined]
+
+    assert "operation failed" in written
+    assert "frames=" in written
+
+
 def test_sanitized_exception_debug_mode_still_renders_full_traceback():
-    """Debug mode is unchanged: it still attaches the exception so the framework
-    renders the full traceback, in addition to the bounded frame loci."""
+    """Debug mode attaches the exception so the framework renders the full
+    traceback, in addition to the bounded frame loci."""
     # Local modules
     from utils.security import log_sanitized_exception
 

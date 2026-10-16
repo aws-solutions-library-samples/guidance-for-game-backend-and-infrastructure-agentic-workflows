@@ -454,11 +454,19 @@ _UNKNOWN_FRAME_MODULE = "<unknown>"
 def _frame_component(value: Any) -> str:
     """Normalize and bound-cap a single frame component.
 
-    The value is collapsed to a single injection-safe line and truncated to
-    :data:`_MAX_FRAME_COMPONENT_LENGTH` characters so no single component can
-    forge a log line or grow without bound.
+    The value is collapsed to a single injection-safe line, stripped of lone
+    surrogate code points so a strict UTF-8 sink can always encode the line, and
+    truncated to :data:`_MAX_FRAME_COMPONENT_LENGTH` characters so no single
+    component can forge a log line or grow without bound.
     """
     text = normalize_log_value(value)
+    # A frame's ``__name__`` or ``co_name`` can hold lone surrogate code points
+    # that a strict UTF-8 sink rejects with ``UnicodeEncodeError``; such a sink
+    # failure during a log call made inside an ``except`` block drives Loguru's
+    # handler-error path, which prints the in-flight exception to stderr. Replace
+    # each lone surrogate with its backslash escape so the component is always
+    # encodable while staying distinguishing.
+    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
     if len(text) > _MAX_FRAME_COMPONENT_LENGTH:
         text = text[:_MAX_FRAME_COMPONENT_LENGTH]
     return text
@@ -481,9 +489,9 @@ def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBAC
     nearest callers), which is where triage starts.
 
     The walk is wrapped so the helper is total: it never raises, even for a frame
-    whose ``__name__`` is an object whose ``__str__`` raises. On any failure it
-    returns the frames gathered so far, so a sanitized error record is always
-    produced.
+    whose ``__name__`` is an object whose ``__str__`` raises or a component that
+    cannot be normalized. On any failure it returns the frames gathered so far,
+    innermost first, so a sanitized error record is always produced.
 
     Args:
         exc: The exception whose traceback frames are summarized.
@@ -502,10 +510,12 @@ def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBAC
         while tb is not None:
             frame = tb.tb_frame
             raw_module = frame.f_globals.get("__name__")
-            # Use the module name only when it is genuinely a string. A non-string
-            # (or missing) ``__name__`` resolves to a code-owned sentinel rather
-            # than a file path, so ``co_filename`` never reaches the log.
-            module = _frame_component(raw_module) if isinstance(raw_module, str) else _UNKNOWN_FRAME_MODULE
+            # Use the module name only when it is genuinely a ``str`` (an exact
+            # type check, so a ``str`` subclass cannot supply its own ``__str__``
+            # text). A non-string (or missing) ``__name__`` resolves to a
+            # code-owned sentinel rather than a file path, so ``co_filename``
+            # never reaches the log.
+            module = _frame_component(raw_module) if type(raw_module) is str else _UNKNOWN_FRAME_MODULE
             function = _frame_component(frame.f_code.co_name)
             lineno = tb.tb_lineno
             frames.append(f"{module}:{function}:{lineno}")
@@ -513,10 +523,10 @@ def sanitized_traceback_frames(exc: BaseException, *, limit: int = _MAX_TRACEBAC
         frames.reverse()
     except Exception:
         # Keep the helper total: a sanitized error record must still be produced
-        # even if an exotic frame makes the walk raise. Return whatever was
-        # gathered (outermost-first here, but the caller only needs a bounded,
-        # content-free list).
-        pass
+        # even if an exotic frame makes the walk raise. Reverse the frames
+        # gathered so far so the result stays innermost-first, matching the
+        # success path, and return that bounded, content-free list.
+        frames.reverse()
     clamped = max(1, int(limit)) if isinstance(limit, int) else _MAX_TRACEBACK_FRAMES
     return frames[:clamped]
 
