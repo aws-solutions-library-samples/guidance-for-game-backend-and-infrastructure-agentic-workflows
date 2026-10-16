@@ -345,37 +345,18 @@ class TestSessionManagerMarking:
         assert not any(isinstance(b, dict) and MEMORY_CONTEXT_MARKER_KEY in b for b in content)
 
 
-class _FakeConversationManager:
-    """Minimal conversation manager whose state never changes between syncs."""
-
-    def get_state(self):
-        return {}
-
-
-class _FakeVersioned:
-    """Exposes a constant version so sync_agent reports no change."""
-
-    def _get_version(self):
-        return 0
-
-
 class _FakeAgent:
     """A minimal agent object for driving MessageAddedEvent through the hooks.
 
-    It carries only the attributes the registered MessageAddedEvent callbacks
-    read: ``agent_id`` and ``messages`` (append + inject), and the state
-    accessors ``sync_agent`` compares. Seeding ``_last_synced_internal_state``
-    with matching values makes ``sync_agent`` short-circuit without any
-    repository call, keeping the test offline.
+    It carries only the attributes the memory-marking and persistence callbacks
+    read: ``agent_id`` and ``messages`` (append + inject). Session state sync is
+    a separate concern replaced with a no-op in the manager, so the agent needs
+    no state accessors.
     """
 
     def __init__(self, agent_id: str, messages: list):
         self.agent_id = agent_id
         self.messages = messages
-        self.state = _FakeVersioned()
-        self._interrupt_state = _FakeVersioned()
-        self.conversation_manager = _FakeConversationManager()
-        self._model_state = {}
 
 
 @contextmanager
@@ -383,23 +364,17 @@ def _hook_ready_manager():
     """Yield a scoped manager wired for the real register_hooks path, offline.
 
     The manager is built through its real initializer with a mocked memory
-    client, then its retrieval and persistence responses are configured and the
-    per-agent synced-state cache is pre-seeded so ``sync_agent`` detects no
-    change and makes no repository call. The real append + inject hooks run
-    without any network.
+    client, then its retrieval and persistence responses are configured. Session
+    state sync is a separate ``MessageAddedEvent`` callback that is not under
+    test here and would require a full agent, so it is replaced with a no-op.
+    The real append + inject and persistence hooks run without any network.
     """
     with _build_session_manager() as manager:
         manager.memory_client.create_event.return_value = {"eventId": "evt-1"}
         manager.memory_client.retrieve_memories.return_value = [
             {"content": {"text": "Game type: BATTLE ROYALE"}, "score": 0.9}
         ]
-        # Pre-seed so sync_agent detects no change and makes no repository call.
-        manager._last_synced_internal_state["a-1"] = {
-            "state_version": 0,
-            "interrupt_state_version": 0,
-            "conversation_manager_state": {},
-            "model_state": {},
-        }
+        manager.sync_agent = lambda *args, **kwargs: None  # type: ignore[method-assign]
         yield manager
 
 
