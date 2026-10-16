@@ -32,12 +32,16 @@ credentials.
   be protected **before any run, dry or not** — a dry run fails closed if it is
   missing. The validate job's `verify-environment` step also **reports** whether
   GitHub's immutable-releases setting can be confirmed (it cannot be read ahead
-  of a run with the workflow token, so it is enforced after publish instead) and
-  whether an active `v*` tag ruleset covers the versioned tags. A dry run is otherwise not a full rehearsal of publication: the
-  read-only validate/build jobs cannot list draft releases (only a token with
-  push access can), so a draft that already holds the tag is detected only at
-  publish time. Run a dry run, inspect the artifacts, then dispatch again with
-  `dry_run: false`.
+  of a run with the workflow token, so it is enforced after publish instead),
+  whether an active `v*` tag ruleset covers the versioned tags and restricts who
+  may create, update, or delete them, and whether the environment prevents
+  self-review and limits deployments to a `main`-only branch policy (the latter
+  two are enforced in the publish step after approval, so the dry-run report is
+  the only pre-approval warning of a weak policy). A dry run is otherwise not a
+  full rehearsal of publication: the read-only validate/build jobs cannot list
+  draft releases (only a token with push access can), so a draft that already
+  holds the tag is detected only at publish time. Run a dry run, inspect the
+  artifacts, then dispatch again with `dry_run: false`.
 
 ## Dispatch inputs
 
@@ -164,27 +168,37 @@ Validation runs entirely before any write. In the publish job, the ordering is:
    exclusion guard;
 2. verify the manifest's tag, commit, and attached-file list equal the dispatch
    inputs (the downloaded bytes are never trusted to assert their own identity);
-3. verify the `release` environment exists and is protected by a
-   required-reviewers rule (fail closed), re-verify `main` HEAD still equals the
-   commit and the tag ref is still absent, and require the downloaded manifest
-   to be **byte-identical** to a manifest rebuilt from this checkout and the
-   publish-time re-validation result (so an evidence edit during the approval
-   wait, or manifest tampering in the build job, cannot be published);
+3. verify the `release` environment exists and its policy is fully
+   machine-confirmable — a required-reviewers rule, **prevent-self-review**, and
+   a deployment branch policy limited to **`main`** (fail closed) — and verify
+   that an **active `v*` tag ruleset** covers the dispatched `refs/tags/<tag>`
+   and carries a `creation`/`update`/`deletion` rule (fail closed); re-verify
+   `main` HEAD still equals the commit and the tag ref is still absent, and
+   require the downloaded manifest to be **byte-identical** to a manifest
+   rebuilt from this checkout and the publish-time re-validation result (so an
+   evidence edit during the approval wait, or manifest tampering in the build
+   job, cannot be published);
 4. install the SIGTERM-to-exception handler, then create a **draft** release
    with notes and upload the verified assets (draft creation sits inside the
    guarded block, so an ambiguous or interrupted creation is cleaned up by
    `tag_name`);
-5. re-check `main` HEAD and tag-ref absence **immediately before** the tag
+5. verify the **draft's** attached assets (names, sizes, and digests where
+   GitHub reports them) **before** creating the tag, so a draft asset altered
+   between upload and the tag write is caught while the draft can still be
+   cleaned up and the tag name is not yet burned;
+6. re-check `main` HEAD and tag-ref absence **immediately before** the tag
    write (closing the race between the earlier check and the write), then create
    the annotated tag object and the `refs/tags/<tag>` ref at the exact commit;
-6. publish the draft (`prerelease` and non-latest for `-rc.N`; a stable tag is
+7. publish the draft (`prerelease` and non-latest for `-rc.N`; a stable tag is
    set `make_latest` explicitly);
-7. read the published release back and fail the run unless every post-publish
+8. read the published release back and fail the run unless every post-publish
    check passes: the release reads back as a published, **immutable** release
    (`immutable: true`), exactly the four allowlisted assets are attached with a
    size equal to the published bytes and, when GitHub reports an asset
    `digest`, a sha256 equal to its `SHA256SUMS` entry, and the tag ref resolves
-   through this run's annotated tag object to the released commit.
+   through this run's annotated tag object to the released commit. Every check
+   runs even when an earlier one fails, so the run reports all the failures at
+   once rather than only the first.
 
 The annotated tag object's **tagger date is the commit date**, not the
 publication time, so re-running the publish for the same commit produces a
@@ -195,10 +209,14 @@ runner replaces the `bash -e` step wrapper with Python. A cancelled step's
 SIGINT and the follow-up SIGTERM then reach the publisher directly rather than
 stopping at the shell. Publication HTTP calls use a finite timeout so a stalled
 call cannot hold the run. Cleanup runs on any interruption (including a
-cancelled step's SIGINT and the follow-up SIGTERM) and decides from the **live
-remote state**, not local flags: the draft is deleted only while it is still a
-draft, and the tag ref is deleted only while it still points at this run's tag
-object and no published release uses the tag. Cleanup itself blocks SIGINT and
+cancelled step's SIGINT and the follow-up SIGTERM). When the publish PATCH
+already returned success, cleanup deletes **nothing** — a published release and
+its locked tag are left intact for manual verification (it decides this from the
+observed PATCH outcome, so a stale live read cannot send it down a delete path).
+Otherwise it re-reads the **live remote state**: the draft is deleted only while
+it is still a draft, and the tag ref is deleted only while it still points at
+this run's tag object and no published release uses the tag. Cleanup itself
+blocks SIGINT and
 SIGTERM for its duration so the follow-up SIGTERM cannot abort it halfway.
 The runner sends SIGKILL about **10 seconds** after the SIGINT that starts a
 cancellation. Cleanup chooses its budget by **what interrupted it**. On the
@@ -233,12 +251,16 @@ time to remove.
 ### Manual recovery
 
 Cleanup prints to stderr, and the combination of lines tells you exactly what
-state the run left behind. It always prints an **announcement** line first —
-`release cleanup starting; possible leftovers to verify: ...` — naming every
+state the run left behind. Its first line is an **announcement**. On the
+failure/interrupt paths (the publish PATCH did not return success) that line is
+`release cleanup starting; possible leftovers to verify: ...`, naming every
 identifier the run may have created (the tag, the tag-object SHA, and the draft
-release id, whatever was known). After that one of three things happens, and
-the runner sends **SIGKILL about 10 seconds** after the SIGINT that starts a
-cancellation, so a kill can land before cleanup finishes:
+release id, whatever was known). When the publish PATCH **did** return success,
+cleanup deletes nothing and the first line instead reads `release cleanup
+starting; the release was published, so nothing is deleted. Published release
+left intact for manual verification: ...`. After the announcement one of three
+things happens, and the runner sends **SIGKILL about 10 seconds** after the
+SIGINT that starts a cancellation, so a kill can land before cleanup finishes:
 
 - **Announcement + `release cleanup complete; nothing left to remove`.**
   Everything announced was confirmed removed. There is nothing to do.
@@ -258,13 +280,24 @@ To recover whatever remains:
    the announcement line names the exact tag, tag-object SHA, and draft release
    id to look for.
 2. If a **published** release exists for the tag, the publish PATCH succeeded.
-   Whether that is a success or a failure depends on the post-publish read-back:
-   - If the run **passed** its read-back (no `post-publish read-back` error),
-     the release is published and confirmed; confirm its assets and stop.
-   - If the run **failed** its read-back (a `post-publish read-back: ...` error
-     with the release left intact), follow **"A read-back failed after
-     publication"** below instead — the release is published but did not meet
-     the guarantee.
+   A run that exited without a `post-publish read-back` error is NOT, on its
+   own, proof the release met the guarantee: a PATCH that GitHub applied but
+   answered with an error, a read-back whose reads kept failing, and a run
+   cancelled during the read-back all exit without that error and without a
+   completed read-back, and in the first case the release can still be
+   **mutable**. So confirm it by hand rather than trusting the absence of an
+   error:
+   - `immutable: true` on the release (`gh release view <tag> --json` or the
+     REST `GET /releases/{id}`);
+   - the four attached assets each match their `SHA256SUMS` entry (download them
+     and re-check, or compare each asset's reported digest);
+   - `refs/tags/<tag>` resolves through this run's annotated **tag object** to
+     the released commit (`git ls-remote`, then the REST `GET /git/tags/{sha}`).
+
+   If every hand check passes, the release is good; keep it and stop. If any
+   fails, follow **"A read-back failed after publication"** below. If the run
+   **did** fail with a `post-publish read-back: ...` error (the release left
+   intact), go straight to that section — it names every check that failed.
 3. If only a **draft** release or an orphaned tag ref remains, delete the tag
    ref first (if it still points at the run's tag object), then delete the
    draft, then re-dispatch. With GitHub immutable releases enabled, a deleted
@@ -275,11 +308,23 @@ To recover whatever remains:
 
 The publish job reads the release back and fails the run if the release is not
 immutable, if an asset or the tag does not match, or if the tag ref does not
-resolve through this run's annotated tag object to the released commit. The
-release is **already published** and cleanup never deletes it, so a re-dispatch
-of the same tag is refused (the tag ref now exists) and GitHub will not make an
-existing release immutable after the fact (the setting applies only to future
-releases). The real choices depend on which check failed:
+resolve through this run's annotated tag object to the released commit. **Every
+check runs even when an earlier one fails**, so the error lists all the failures
+at once (for example "not immutable" and an asset mismatch together), not just
+the first.
+
+**First, re-run the checks by hand.** A read-back can fail on a stale read of a
+release that is actually fine — a `release is still a draft` or a `tag_name`
+mismatch read back moments after the publish PATCH, or a list that had not yet
+caught up. Repeat the three hand checks from step 2 above (`immutable: true`,
+the four assets against `SHA256SUMS`, and `refs/tags/<tag>` through the run's
+tag object to the commit). **If they all pass, the release is good — keep it and
+stop.** Only if a check genuinely fails do the choices below apply.
+
+The release is **already published** and cleanup never deletes it, so a
+re-dispatch of the same tag is refused (the tag ref now exists) and GitHub will
+not make an existing release immutable after the fact (the setting applies only
+to future releases). The real choices depend on which check genuinely failed:
 
 - **The release is not immutable (nothing is locked yet).** Because the
   immutable-releases setting was off when it was published, the release and its
@@ -288,8 +333,16 @@ releases). The real choices depend on which check failed:
     milestone); or
   - delete the release and then `refs/tags/<tag>` (both are deletable while the
     setting is off), enable GitHub's immutable-releases setting, and dispatch the
-    **same** tag again. Because nothing was immutable, the tag name can be
-    reused.
+    **same** tag again. Two constraints apply to this path:
+    - **Deleting the tag ref may require a ruleset bypass.** The required `v*`
+      tag ruleset blocks deleting `refs/tags/<tag>` when it carries a `deletion`
+      rule, so you may need to bypass that ruleset (or temporarily relax it) to
+      delete the ref.
+    - **Re-dispatching the same tag needs the commit to still be `main` HEAD.**
+      The workflow refuses unless the dispatched commit still equals `main`
+      HEAD; if `main` has moved, re-dispatch against the new head with fresh
+      evidence instead.
+    Because nothing was immutable, the tag name can be reused.
 - **The release is immutable but an asset or tag check failed.** The assets and
   tag are now locked, so the release **cannot be repaired**. Delete it if you do
   not want it (deleting an immutable release is allowed; the tag name is then
@@ -337,24 +390,33 @@ them, with the existing `GITHUB_TOKEN`, is:
   recover (see "A read-back failed after publication" under Manual recovery).
 - **`v*` tag ruleset (reported in a dry run, enforced before a non-dry run).**
   The `verify-environment` step reads the repository's tag-target rulesets and
-  each one's ref-name conditions (`GET /repos/{owner}/{repo}/rulesets` then
-  `GET /repos/{owner}/{repo}/rulesets/{id}`, both of which need only
-  `Metadata: read`) and reports whether an active ruleset's conditions cover
-  `refs/tags/v*` (an include that matches the `v*` pattern or `~ALL`, without a
-  matching exclude). A dry run only reports present/absent. Before a non-dry
-  publish the same coverage check **fails closed**: a release will not be
-  published unless an active tag ruleset covers the versioned tags.
+  each one's ref-name conditions and rule list (`GET /repos/{owner}/{repo}/rulesets`
+  then `GET /repos/{owner}/{repo}/rulesets/{id}`, both of which need only
+  `Metadata: read`) and reports whether an active ruleset covers the dispatched
+  `refs/tags/<tag>` and restricts who may create, update, or delete it. Coverage
+  is decided the way GitHub decides it — Ruby's `File.fnmatch` with
+  `File::FNM_PATHNAME`, so a `*` never crosses a `/` (`refs/*` does not cover a
+  two-segment tag ref) and a `**/` segment matches zero or more directories —
+  evaluated against the exact ref being written, not a single representative
+  tag, so a ruleset that covers only part of the versioned tags (for example
+  `refs/tags/v0.*`, or `v*` minus a `v*-rc.*` exclude) does not pass for a tag
+  it does not protect. A matching ruleset counts only when it also carries at
+  least one `creation`, `update`, or `deletion` rule. A dry run only reports
+  present/absent. Before a non-dry publish the same check **fails closed**: a
+  release will not be published unless an active tag ruleset both covers the
+  dispatched tag ref and restricts who writes it.
 
 Options considered for the setting check were: (a) a documentation-only
 dependency; (b) a pre-run read of the setting (not possible with the workflow
 token); (c) the post-publish read-back of the `immutable` flag. The workflow
 implements **(c)**, the strongest check available without adding a secret or a
-new token permission, together with the advisory ruleset report.
+new token permission, together with the machine-checked tag-ruleset gate.
 
 ## Before-first-run checklist
 
 Confirm all of the following in repository settings **before the first
-dispatch, dry or not** — several are not machine-enforced by the workflow:
+dispatch, dry or not**. All but one are machine-checked by the workflow; only
+the administrator-bypass rule remains a hand check:
 
 - [ ] **`release` environment exists** and has a **required-reviewers** rule
       with at least one reviewer. (Machine-checked: `verify-environment` fails
@@ -372,9 +434,11 @@ dispatch, dry or not** — several are not machine-enforced by the workflow:
 - [ ] **GitHub immutable-releases setting enabled** for the repository.
       (Enforced after publish by the read-back, which fails the run unless the
       published release is `immutable`.)
-- [ ] **`v*` tag ruleset** configured to restrict who can create or update
-      release tags. (Machine-checked before a non-dry run: an active tag ruleset
-      must cover `refs/tags/v*`; reported present/absent in a dry run.)
+- [ ] **`v*` tag ruleset** that both covers the versioned tags and restricts who
+      can create, update, or delete release tags. (Machine-checked before a
+      non-dry run: an active tag ruleset must cover the dispatched
+      `refs/tags/<tag>` and carry at least one `creation`/`update`/`deletion`
+      rule; reported present/absent in a dry run.)
 
 ## Build provenance and attestation
 
