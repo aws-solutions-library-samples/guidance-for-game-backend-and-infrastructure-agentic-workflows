@@ -1024,17 +1024,17 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "bedrock-agentcore-starter-toolkit", specifier = ">=0.3.11" },
+    { name = "bedrock-agentcore-starter-toolkit", specifier = ">=0.3.13" },
     { name = "black", specifier = ">=26.5.1" },
-    { name = "isort", specifier = ">=8.0.1" },
-    { name = "mypy", specifier = ">=2.3.0" },
-    { name = "pre-commit", specifier = ">=4.6.1" },
+    { name = "isort", specifier = ">=9.0.2" },
+    { name = "mypy", specifier = ">=2.4.0" },
+    { name = "pre-commit", specifier = ">=4.6.2" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },
     { name = "strands-agents-builder", specifier = ">=0.1.10" },
-    { name = "uv", specifier = ">=0.12.0" },
+    { name = "uv", specifier = ">=0.12.22" },
 ]
 
 [[package]]
