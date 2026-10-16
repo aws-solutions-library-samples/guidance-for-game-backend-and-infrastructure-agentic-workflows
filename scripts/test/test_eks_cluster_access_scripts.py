@@ -70,6 +70,13 @@ if command == ("sts", "get-caller-identity"):
         print("123456789012")
     else:
         print("arn:aws:sts::123456789012:assumed-role/TestRole/test-session")
+elif command == ("iam", "get-role"):
+    save()
+    error = state.get("get_role_error")
+    if error:
+        print(f"An error occurred ({error}) when calling the GetRole operation", file=sys.stderr)
+        sys.exit(254)
+    print(f"arn:aws:iam::123456789012:role{state.get('iam_role_path', '/')}{option('--role-name')}")
 elif command == ("eks", "describe-cluster"):
     save()
     print(state.get("authentication_mode", "API"))
@@ -1132,6 +1139,127 @@ class EksClusterAccessScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertTrue(any(call.startswith("create iamidentitymapping") for call in state["eksctl_calls"]))
         self.assertFalse(any("create-access-entry" in call for call in state["aws_calls"]))
+
+
+class EksClusterAccessRolePathTests(unittest.TestCase):
+    """Roles under an IAM path, such as boundary-enforced /workloads/ roles."""
+
+    PATH_ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/workloads/game-agent-agentcore-execution-role"
+
+    def setUp(self) -> None:
+        self.fixture = ScriptFixture(include_eksctl=True)
+        self.fixture.update_state(iam_role_path="/workloads/")
+
+    def tearDown(self) -> None:
+        self.fixture.close()
+
+    def test_role_arn_is_resolved_through_iam_instead_of_assembled(self) -> None:
+        result = self.fixture.run("enroll-cluster.sh")
+        state = self.fixture.read_state()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("iam get-role --role-name game-agent-agentcore-execution-role --query Role.Arn --output text", state["aws_calls"])
+
+    def test_access_entry_uses_full_path_arn_and_default_rbac_names(self) -> None:
+        result = self.fixture.run("enroll-cluster.sh")
+        state = self.fixture.read_state()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(state["access_entry"]["principalArn"], self.PATH_ROLE_ARN)
+        self.assertEqual(state["access_entry"]["kubernetesGroups"], [MONITORING_GROUP])
+        self.assertIn(MONITORING_BINDING, state["bindings"])
+
+    def test_config_map_mapping_strips_the_role_path(self) -> None:
+        self.fixture.update_state(authentication_mode="CONFIG_MAP")
+
+        result = self.fixture.run("enroll-cluster.sh")
+        state = self.fixture.read_state()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual([entry["rolearn"] for entry in state["config_map_entries"]], [ROLE_ARN])
+        self.assertFalse(any("/workloads/" in call for call in state["eksctl_calls"]))
+
+    def test_config_map_enrollment_recognizes_existing_path_free_mapping(self) -> None:
+        self.fixture.update_state(authentication_mode="CONFIG_MAP", config_map_entries=[config_map_entry()])
+        self.fixture.update_state(
+            role_exists=True,
+            bindings={MONITORING_BINDING: binding_document(MONITORING_BINDING, MONITORING_GROUP)},
+        )
+
+        result = self.fixture.run("enroll-cluster.sh")
+        state = self.fixture.read_state()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(state["eksctl_calls"], [])
+        self.assertIn("identity mapping already exists", result.stdout)
+
+    def test_config_map_deregistration_removes_path_free_mapping(self) -> None:
+        self.fixture.update_state(authentication_mode="CONFIG_MAP")
+        enrollment = self.fixture.run("enroll-cluster.sh")
+        self.assertEqual(enrollment.returncode, 0, enrollment.stdout)
+
+        deregistration = self.fixture.run("deregister-cluster.sh", input_text="y\n")
+        state = self.fixture.read_state()
+
+        self.assertEqual(deregistration.returncode, 0, deregistration.stdout)
+        self.assertEqual(state["config_map_entries"], [])
+        self.assertTrue(
+            any(call.startswith("delete iamidentitymapping") and ROLE_ARN in call for call in state["eksctl_calls"])
+        )
+
+    def test_api_deregistration_removes_path_arn_access_entry(self) -> None:
+        enrollment = self.fixture.run("enroll-cluster.sh")
+        self.assertEqual(enrollment.returncode, 0, enrollment.stdout)
+
+        deregistration = self.fixture.run("deregister-cluster.sh", input_text="y\n")
+        state = self.fixture.read_state()
+
+        self.assertEqual(deregistration.returncode, 0, deregistration.stdout)
+        self.assertIsNone(state["access_entry"])
+        self.assertIn(f"--principal-arn {self.PATH_ROLE_ARN}", " ".join(state["aws_calls"]))
+
+    def test_explicit_role_arn_skips_iam_lookup(self) -> None:
+        self.fixture.update_state(get_role_error="AccessDenied")
+
+        result = self.fixture.run("enroll-cluster.sh", extra_args=("--role-arn", self.PATH_ROLE_ARN))
+        state = self.fixture.read_state()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(any(call.startswith("iam get-role") for call in state["aws_calls"]))
+        self.assertEqual(state["access_entry"]["principalArn"], self.PATH_ROLE_ARN)
+        self.assertEqual(state["access_entry"]["kubernetesGroups"], [MONITORING_GROUP])
+
+    def test_role_lookup_failure_stops_before_any_cluster_change(self) -> None:
+        self.fixture.update_state(get_role_error="NoSuchEntity")
+
+        for script in ("enroll-cluster.sh", "deregister-cluster.sh"):
+            with self.subTest(script=script):
+                result = self.fixture.run(script, input_text="y\n")
+                state = self.fixture.read_state()
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Failed to resolve IAM role", result.stdout)
+                self.assertFalse(any(call.startswith("eks ") for call in state["aws_calls"]))
+                self.assertEqual(state["kubectl_calls"], [])
+                self.assertEqual(state["eksctl_calls"], [])
+
+    def test_role_name_and_role_arn_are_mutually_exclusive(self) -> None:
+        for script in ("enroll-cluster.sh", "deregister-cluster.sh"):
+            with self.subTest(script=script):
+                result = self.fixture.run(
+                    script,
+                    input_text="y\n",
+                    extra_args=("--role-name", "custom-role", "--role-arn", self.PATH_ROLE_ARN),
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("either --role-name or --role-arn", result.stdout)
+
+    def test_malformed_role_arn_is_rejected(self) -> None:
+        result = self.fixture.run("enroll-cluster.sh", extra_args=("--role-arn", "arn:aws:iam::123456789012:user/someone"))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Not an IAM role ARN", result.stdout)
 
 
 if __name__ == "__main__":

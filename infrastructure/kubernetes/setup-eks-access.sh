@@ -7,6 +7,7 @@ set -e
 
 CLUSTER_NAME="eks-workshop"
 REGION="us-west-2"
+IAM_ROLE_NAME="${IAM_ROLE_NAME:-game-agent-agentcore-execution-role}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "🔧 Setting up Kubernetes API access for Game Agent AgentCore Runtime"
@@ -19,6 +20,17 @@ if ! command -v kubectl &> /dev/null; then
     echo "❌ kubectl not found. Please install kubectl first."
     exit 1
 fi
+
+# Resolve the role ARN. The role may live under an IAM path (for example
+# /workloads/), but aws-auth mapRoles entries cannot include a path, so the
+# mapping uses the path-free form arn:<partition>:iam::<account>:role/<name>.
+if ! IAM_ROLE_ARN=$(aws iam get-role --role-name "$IAM_ROLE_NAME" --query 'Role.Arn' --output text); then
+    echo "❌ Failed to resolve IAM role ${IAM_ROLE_NAME}."
+    exit 1
+fi
+AUTH_MAP_ROLE_ARN="${IAM_ROLE_ARN%%:role/*}:role/${IAM_ROLE_NAME}"
+echo "   IAM Role: ${IAM_ROLE_ARN}"
+echo ""
 
 # Update kubeconfig
 echo "📋 Step 1: Updating kubeconfig..."
@@ -39,7 +51,7 @@ echo "✅ Backup created"
 
 # Check if our role is already in aws-auth
 echo "📋 Step 4: Checking if role is already configured..."
-if kubectl get configmap aws-auth -n kube-system -o yaml | grep -q "game-agent-agentcore-execution-role"; then
+if kubectl get configmap aws-auth -n kube-system -o yaml | grep -qF "$AUTH_MAP_ROLE_ARN"; then
     echo "⚠️  Role already exists in aws-auth ConfigMap"
     read -p "Do you want to continue anyway? (y/n) " -n 1 -r
     echo
@@ -60,9 +72,12 @@ echo ""
 echo "⚠️  MANUAL STEP REQUIRED:"
 echo "   Run: kubectl edit configmap aws-auth -n kube-system"
 echo ""
-echo "   Add this entry to the mapRoles section:"
+echo "   Add this entry to the mapRoles section (aws-auth rolearn values cannot include an IAM path):"
 echo "   ---"
-cat "${SCRIPT_DIR}/aws-auth-patch.yaml" | grep -A 4 "mapRoles:"
+echo "   - groups:"
+echo "     - game-agent-monitoring-group"
+echo "     rolearn: ${AUTH_MAP_ROLE_ARN}"
+echo "     username: game-agent-agentcore-user"
 echo "   ---"
 echo ""
 read -p "Press Enter when you've updated the ConfigMap, or Ctrl+C to abort..."
@@ -94,7 +109,7 @@ echo "📊 Summary:"
 echo "   - RBAC configured: game-agent-monitoring-role (read-only)"
 echo "   - ClusterRoleBinding: game-agent-monitoring-binding"
 echo "   - Group: game-agent-monitoring-group"
-echo "   - IAM Role: game-agent-agentcore-execution-role"
+echo "   - IAM Role: ${IAM_ROLE_ARN}"
 echo ""
 echo "🔍 To verify:"
 echo "   kubectl auth can-i list pods --as=game-agent-agentcore-user"

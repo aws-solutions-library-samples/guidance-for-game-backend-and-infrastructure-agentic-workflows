@@ -38,8 +38,28 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: Enable relaxed rate limiting for AI chat applications (higher limits, body size rules)
 
+  RolePath:
+    Type: String
+    Default: /
+    AllowedPattern: '^/$|^/[!-~]+/$'
+    Description: >-
+      IAM path for the role this stack creates, for accounts that only allow
+      workload roles under a fixed path (for example /workloads/). Keep the
+      default for existing deployments: IAM role paths cannot change in place,
+      and CloudFormation cannot replace this named role.
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:policy/.+$'
+    Description: >-
+      Optional managed-policy ARN attached as the permissions boundary of the
+      role this stack creates. Leave empty when the account does not require one.
+
 Conditions:
   IsAIChatMode: !Equals [!Ref AIChatMode, 'true']
+  HasCustomRolePath: !Not [!Equals [!Ref RolePath, '/']]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
 
 Resources:
   # ====================
@@ -172,6 +192,8 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${ProjectName}-cloudtrail-cloudwatch-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

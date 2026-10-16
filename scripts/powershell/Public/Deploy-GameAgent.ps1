@@ -38,6 +38,10 @@ function Deploy-GameAgent {
     $Profile = $resolved.Profile
     $profileArgs = $resolved.ProfileArgs
 
+    # Optional IAM role path and permissions boundary for every role-creating
+    # stack (GBAW_IAM_ROLE_PATH / GBAW_IAM_PERMISSIONS_BOUNDARY_ARN).
+    $iamRoleParams = Get-GameAgentIamRoleParameters
+
     # Helper: run aws cli and throw on failure
     function Invoke-Aws {
         param([Parameter(ValueFromRemainingArguments)][string[]]$AwsArgs)
@@ -79,6 +83,7 @@ function Deploy-GameAgent {
     Write-Host ('=' * 60) -ForegroundColor Cyan
     Write-Host "Region:  $Region"
     Write-Host "Profile: $($Profile ?? 'default')"
+    Write-Host "IAM role placement: $($iamRoleParams -join ' ')"
     Write-Host ''
 
     # ── Prerequisites ──
@@ -128,7 +133,7 @@ function Deploy-GameAgent {
     Write-GameAgentStatus 'Step 1: Deploying base infrastructure...' -Type Info
     Deploy-Stack -StackName "$ProjectName-infrastructure" `
         -TemplateFile (Join-Path $infraPath '01-base-infrastructure.yaml') `
-        -Params @("ProjectName=$ProjectName")
+        -Params (@("ProjectName=$ProjectName") + $iamRoleParams)
     Write-Host ''
 
     # Resolve Cognito bindings for AgentCore JWT bearer authorization.
@@ -244,6 +249,14 @@ function Deploy-GameAgent {
         $executionRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreExecutionRoleArn'
         Write-Host "Using execution role: $executionRoleArn"
 
+        # Pre-created CodeBuild role, so the starter toolkit never creates its own
+        # at the root IAM path without a permissions boundary.
+        $codeBuildRoleArn = Get-StackOutput "$ProjectName-infrastructure" 'AgentCoreCodeBuildRoleArn'
+        if (-not $codeBuildRoleArn -or $codeBuildRoleArn -eq 'None') {
+            throw 'Base stack did not export AgentCoreCodeBuildRoleArn. Redeploy the base infrastructure stack.'
+        }
+        Write-Host "Using CodeBuild role: $codeBuildRoleArn"
+
         # Export requirements.txt from uv.lock
         Write-GameAgentStatus 'Exporting requirements.txt...' -Type Info
         uv export --format requirements-txt --no-dev --no-hashes --output-file requirements.txt.tmp 2>$null
@@ -276,6 +289,7 @@ function Deploy-GameAgent {
             --name gameagentruntime `
             --region $Region `
             --execution-role $executionRoleArn `
+            --code-build-execution-role $codeBuildRoleArn `
             --requirements-file requirements.txt `
             --authorizer-config $agentCoreAuthorizerConfig `
             --request-header-allowlist Authorization `
@@ -339,7 +353,7 @@ function Deploy-GameAgent {
 
     # ── Step 4: Knowledge Bases ──
     Write-GameAgentStatus 'Step 4: Deploying Knowledge Bases...' -Type Info
-    Invoke-GameAgentKBDeploy -Region $Region -ProfileArgs $profileArgs -ProjectName $ProjectName
+    Invoke-GameAgentKBDeploy -Region $Region -ProfileArgs $profileArgs -ProjectName $ProjectName -IamRoleParams $iamRoleParams
     Write-Host ''
 
     # ── Step 5: Seed Knowledge Bases ──
@@ -447,7 +461,7 @@ function Deploy-GameAgent {
 
         Deploy-Stack -StackName "$ProjectName-security" `
             -TemplateFile (Join-Path $infraPath '05-security-infrastructure.yaml') `
-            -Params @("ProjectName=$ProjectName", "FrontendResourceArn=$frontendAlbArn", "RateLimitPerIP=2000", "AuthAdminRateLimitPerIP=100", "CloudTrailRetentionDays=90", "AIChatMode=true")
+            -Params (@("ProjectName=$ProjectName", "FrontendResourceArn=$frontendAlbArn", "RateLimitPerIP=2000", "AuthAdminRateLimitPerIP=100", "CloudTrailRetentionDays=90", "AIChatMode=true") + $iamRoleParams)
 
         # Enable Inspector
         Write-GameAgentStatus 'Step 8b: Enabling AWS Inspector for ECR scanning...' -Type Info

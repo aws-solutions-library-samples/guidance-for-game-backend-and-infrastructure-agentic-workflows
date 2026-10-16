@@ -16,6 +16,28 @@ Parameters:
       Absolute Cognito application-session lifetime in hours. Refresh tokens
       expire at this boundary and require a fresh user authentication.
 
+  RolePath:
+    Type: String
+    Default: /
+    AllowedPattern: '^/$|^/[!-~]+/$'
+    Description: >-
+      IAM path for every role this stack creates, for accounts that only allow
+      workload roles under a fixed path (for example /workloads/). Keep the
+      default for existing deployments: IAM role paths cannot change in place,
+      and CloudFormation cannot replace these named roles.
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:iam::[0-9]{12}:policy/.+$'
+    Description: >-
+      Optional managed-policy ARN attached as the permissions boundary of every
+      role this stack creates. Leave empty when the account does not require one.
+
+Conditions:
+  HasCustomRolePath: !Not [!Equals [!Ref RolePath, '/']]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
 Resources:
   # Cognito User Pool
   UserPool:
@@ -164,6 +186,8 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${ProjectName}-agentcore-execution-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -469,6 +493,8 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${ProjectName}-ecs-task-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -493,6 +519,8 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${ProjectName}-ecs-task-execution-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -516,6 +544,8 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${ProjectName}-ecs-infrastructure-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -528,6 +558,78 @@ Resources:
                 aws:SourceAccount: !Ref AWS::AccountId
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRoleforExpressGatewayServices
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # IAM Role for AgentCore CodeBuild image builds
+  # Pre-created so `agentcore configure --code-build-execution-role` never asks
+  # the starter toolkit to create its own role at the root IAM path without a
+  # permissions boundary, which path- and boundary-enforcing accounts reject.
+  # The toolkit uses CodeBuild only for container deployments; the default
+  # direct_code_deploy path does not assume this role. Permissions mirror the
+  # toolkit's own CodeBuild role, scoped to the repository, source bucket, and
+  # log groups the toolkit derives for the `gameagentruntime` agent.
+  AgentCoreCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-agentcore-codebuild-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: AgentCoreCodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushRuntimeImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-agentcore-gameagentruntime'
+              - Sid: CodeBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/bedrock-agentcore-*'
+              - Sid: CodeBuildSourceBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}/*'
+                Condition:
+                  StringEquals:
+                    s3:ResourceAccount: !Ref AWS::AccountId
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -656,6 +758,12 @@ Outputs:
     Value: !GetAtt AgentCoreExecutionRole.Arn
     Export:
       Name: !Sub '${ProjectName}-AgentCoreExecutionRoleArn'
+
+  AgentCoreCodeBuildRoleArn:
+    Description: AgentCore CodeBuild Execution Role ARN
+    Value: !GetAtt AgentCoreCodeBuildRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-AgentCoreCodeBuildRoleArn'
 
   ECSTaskExecutionRoleArn:
     Description: ECS Task Execution Role ARN

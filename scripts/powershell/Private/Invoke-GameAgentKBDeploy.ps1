@@ -1,7 +1,13 @@
 function Invoke-GameAgentKBDeploy {
     <# Deploys all 3 Knowledge Base CFN stacks and writes KB IDs to .env.local. #>
     [CmdletBinding()]
-    param([string]$Region, [string[]]$ProfileArgs, [string]$ProjectName = 'game-agent')
+    param(
+        [string]$Region,
+        [string[]]$ProfileArgs,
+        [string]$ProjectName = 'game-agent',
+        # RolePath= and PermissionsBoundaryArn= overrides from Get-GameAgentIamRoleParameters.
+        [string[]]$IamRoleParams = @()
+    )
 
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
     $infraPath = Join-Path $repoRoot 'infrastructure/cloudformation'
@@ -51,7 +57,7 @@ function Invoke-GameAgentKBDeploy {
         $deployArgs = @('cloudformation', 'deploy',
             '--template-file', (Join-Path $infraPath $kb.Template),
             '--stack-name', $stackName,
-            '--parameter-overrides', "ProjectName=$ProjectName",
+            '--parameter-overrides', "ProjectName=$ProjectName") + $IamRoleParams + @(
             '--capabilities', 'CAPABILITY_NAMED_IAM',
             '--no-fail-on-empty-changeset',
             '--region', $Region) + $ProfileArgs

@@ -18,11 +18,30 @@ if [ -z "$AWS_PROFILE" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
     [ -n "$_profile" ] && export AWS_PROFILE="$_profile"
 fi
 
+# Optional IAM role placement for accounts that only allow workload roles under
+# a fixed path and/or with a required permissions boundary. The process
+# environment wins; otherwise ui/.env.local is read. Defaults keep the root
+# path and no boundary, which leaves existing deployments unchanged.
+for _iam_setting in GBAW_IAM_ROLE_PATH GBAW_IAM_PERMISSIONS_BOUNDARY_ARN; do
+    if [ -z "${!_iam_setting:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
+        _value=$(grep "^${_iam_setting}=" "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+        [ -n "$_value" ] && printf -v "$_iam_setting" '%s' "$_value"
+    fi
+done
+export GBAW_IAM_ROLE_PATH="${GBAW_IAM_ROLE_PATH:-/}"
+export GBAW_IAM_PERMISSIONS_BOUNDARY_ARN="${GBAW_IAM_PERMISSIONS_BOUNDARY_ARN:-}"
+IAM_ROLE_PARAMETER_OVERRIDES=(
+    "RolePath=$GBAW_IAM_ROLE_PATH"
+    "PermissionsBoundaryArn=$GBAW_IAM_PERMISSIONS_BOUNDARY_ARN"
+)
+
 echo "=================================================="
 echo "🚀 Game Agent - Complete Deployment"
 echo "=================================================="
 echo "Region: $AWS_REGION"
 echo "Project: $PROJECT_NAME"
+echo "IAM role path: $GBAW_IAM_ROLE_PATH"
+echo "IAM permissions boundary: ${GBAW_IAM_PERMISSIONS_BOUNDARY_ARN:-none}"
 echo ""
 
 # Prerequisite checks
@@ -104,7 +123,7 @@ echo "📦 Step 1: Deploying base infrastructure..."
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/01-base-infrastructure.yaml" \
   --stack-name "${PROJECT_NAME}-infrastructure" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 
@@ -462,6 +481,19 @@ EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
 
 echo "Using execution role: $EXECUTION_ROLE_ARN"
 
+# Pre-created CodeBuild role, so the starter toolkit never creates its own at
+# the root IAM path without a permissions boundary.
+CODEBUILD_ROLE_ARN=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT_NAME}-infrastructure" \
+  --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`AgentCoreCodeBuildRoleArn`].OutputValue' \
+  --output text)
+if [ -z "${CODEBUILD_ROLE_ARN:-}" ] || [ "$CODEBUILD_ROLE_ARN" = "None" ]; then
+  echo "❌ Base stack did not export AgentCoreCodeBuildRoleArn. Redeploy the base infrastructure stack." >&2
+  exit 1
+fi
+echo "Using CodeBuild role: $CODEBUILD_ROLE_ARN"
+
 # Export requirements.txt from uv.lock for AgentCore compatibility
 echo "📦 Exporting requirements.txt from uv.lock..."
 if command -v uv &> /dev/null; then
@@ -488,6 +520,7 @@ uv run agentcore configure \
   --name gameagentruntime \
   --region "$AWS_REGION" \
   --execution-role "$EXECUTION_ROLE_ARN" \
+  --code-build-execution-role "$CODEBUILD_ROLE_ARN" \
   --requirements-file requirements.txt \
   --authorizer-config "$AGENTCORE_AUTHORIZER_CONFIG" \
   --request-header-allowlist Authorization \
@@ -749,6 +782,7 @@ aws cloudformation deploy \
     AuthAdminRateLimitPerIP=100 \
     CloudTrailRetentionDays=90 \
     AIChatMode=true \
+    "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION
 

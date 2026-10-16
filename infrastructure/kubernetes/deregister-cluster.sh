@@ -24,13 +24,29 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 usage() {
-    echo -e "${RED}Usage: $0 <cluster-name> <region> [--role-name ROLE] [--kube-role-arn ARN] [--disable-audit-logs]${NC}"
+    echo -e "${RED}Usage: $0 <cluster-name> <region> [--role-name ROLE | --role-arn ARN] [--kube-role-arn ARN] [--disable-audit-logs]${NC}"
+    echo ""
+    echo "The role ARN is resolved with iam:GetRole, so roles under an IAM path"
+    echo "(for example /workloads/) work. Pass --role-arn to skip the lookup, for"
+    echo "example when the role has already been deleted."
     echo ""
     echo "Examples:"
     echo "  $0 my-cluster us-west-2"
     echo "  $0 my-cluster us-west-2 --kube-role-arn arn:aws:iam::123456789012:role/eks-admin"
     echo "  $0 my-cluster us-west-2 --disable-audit-logs"
     echo "  $0 my-cluster us-west-2 --role-name my-custom-role"
+    echo "  $0 my-cluster us-west-2 --role-arn arn:aws:iam::123456789012:role/workloads/my-custom-role"
+}
+
+# Splits an IAM role ARN into its name and its path-free form. aws-auth
+# mapRoles entries cannot include a path, while EKS access entries take the
+# full ARN. Sets IAM_ROLE_NAME and AUTH_MAP_ROLE_ARN from IAM_ROLE_ARN.
+derive_role_identity_from_arn() {
+    if [[ ! "$IAM_ROLE_ARN" =~ ^arn:[a-z-]+:iam::[0-9]{12}:role/(.+/)?([A-Za-z0-9+=,.@_-]+)$ ]]; then
+        fail "Not an IAM role ARN: ${IAM_ROLE_ARN}"
+    fi
+    IAM_ROLE_NAME=${BASH_REMATCH[2]}
+    AUTH_MAP_ROLE_ARN="${IAM_ROLE_ARN%%:role/*}:role/${IAM_ROLE_NAME}"
 }
 
 fail() {
@@ -80,7 +96,7 @@ aws_auth_has_role() {
     if ! entries=$(parse_aws_auth_entries "$yaml"); then
         return 2
     fi
-    jq -e --arg arn "$IAM_ROLE_ARN" 'any(.[]?; .rolearn == $arn)' <<< "$entries" > /dev/null
+    jq -e --arg arn "$AUTH_MAP_ROLE_ARN" 'any(.[]?; .rolearn == $arn)' <<< "$entries" > /dev/null
 }
 
 checked_can_i() {
@@ -159,6 +175,8 @@ CLUSTER_NAME=$1
 REGION=$2
 DISABLE_AUDIT_LOGS=false
 KUBE_ROLE_ARN=""
+IAM_ROLE_ARN=""
+ROLE_NAME_GIVEN=false
 shift 2
 
 while [ "$#" -gt 0 ]; do
@@ -166,6 +184,12 @@ while [ "$#" -gt 0 ]; do
         --role-name)
             require_option_value "$1" "$#" "${2:-}"
             IAM_ROLE_NAME=$2
+            ROLE_NAME_GIVEN=true
+            shift 2
+            ;;
+        --role-arn)
+            require_option_value "$1" "$#" "${2:-}"
+            IAM_ROLE_ARN=$2
             shift 2
             ;;
         --kube-role-arn)
@@ -226,7 +250,17 @@ if ! CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text 2>/dev/n
     fail "Failed to determine the AWS partition from the caller identity."
 fi
 IFS=':' read -r _ AWS_PARTITION _ <<< "$CALLER_ARN"
-IAM_ROLE_ARN="arn:${AWS_PARTITION}:iam::${AWS_ACCOUNT_ID}:role/${IAM_ROLE_NAME}"
+if [ -n "$IAM_ROLE_ARN" ] && [ "$ROLE_NAME_GIVEN" = true ]; then
+    fail "Pass either --role-name or --role-arn, not both."
+fi
+if [ -z "$IAM_ROLE_ARN" ]; then
+    # Resolve the real ARN so a role under an IAM path is matched exactly.
+    if ! IAM_ROLE_ARN=$(aws iam get-role --role-name "$IAM_ROLE_NAME" --query 'Role.Arn' --output text 2>&1); then
+        echo "$IAM_ROLE_ARN" >&2
+        fail "Failed to resolve IAM role ${IAM_ROLE_NAME}. Check that it exists and that you can call iam:GetRole, or pass --role-arn."
+    fi
+fi
+derive_role_identity_from_arn
 
 if [ "$IAM_ROLE_NAME" = "$DEFAULT_IAM_ROLE_NAME" ]; then
     K8S_USERNAME="$LEGACY_K8S_USERNAME"
@@ -404,10 +438,10 @@ if [ "$AUTH_MODE" = "CONFIG_MAP" ] || [ "$AUTH_MODE" = "API_AND_CONFIG_MAP" ]; t
         if ! AWS_AUTH_ENTRIES_JSON=$(parse_aws_auth_entries "$AWS_AUTH_YAML"); then
             fail "Failed to parse aws-auth mapRoles. No changes were made."
         fi
-        ROLE_MAPPING_COUNT=$(jq -r --arg arn "$IAM_ROLE_ARN" \
+        ROLE_MAPPING_COUNT=$(jq -r --arg arn "$AUTH_MAP_ROLE_ARN" \
             '[.[]? | select(.rolearn == $arn)] | length' <<< "$AWS_AUTH_ENTRIES_JSON")
         EXPECTED_MAPPING_COUNT=$(jq -r \
-            --arg arn "$IAM_ROLE_ARN" \
+            --arg arn "$AUTH_MAP_ROLE_ARN" \
             --arg username "$K8S_USERNAME" \
             --arg group "$K8S_GROUP" '
             [.[]? | select(
@@ -416,7 +450,7 @@ if [ "$AUTH_MODE" = "CONFIG_MAP" ] || [ "$AUTH_MODE" = "API_AND_CONFIG_MAP" ]; t
               ((.groups // []) == [$group]))] | length
             ' <<< "$AWS_AUTH_ENTRIES_JSON")
         LEGACY_MAPPING_COUNT=$(jq -r \
-            --arg arn "$IAM_ROLE_ARN" \
+            --arg arn "$AUTH_MAP_ROLE_ARN" \
             --arg username "$LEGACY_K8S_USERNAME" \
             --arg group "$LEGACY_K8S_GROUP" '
             [.[]? | select(
@@ -457,11 +491,11 @@ if [ "$LEGACY_MAPPING_PRESENT" = true ]; then
         if ! eksctl delete iamidentitymapping \
             --cluster "$CLUSTER_NAME" \
             --region "$REGION" \
-            --arn "$IAM_ROLE_ARN" > /dev/null 2>&1; then
+            --arn "$AUTH_MAP_ROLE_ARN" > /dev/null 2>&1; then
             fail "Failed to remove the exact aws-auth mapping; the EKS access entry was left unchanged."
         fi
     else
-        echo -e "${YELLOW}⚠️  eksctl not found; remove the exact aws-auth entry whose rolearn is ${IAM_ROLE_ARN}.${NC}"
+        echo -e "${YELLOW}⚠️  eksctl not found; remove the exact aws-auth entry whose rolearn is ${AUTH_MAP_ROLE_ARN}.${NC}"
         read -r -p "Press Enter after removing the entry, or Ctrl+C to abort..."
     fi
     if CURRENT_AWS_AUTH=$(kubectl get configmap aws-auth -n kube-system -o yaml 2>&1); then

@@ -9,6 +9,20 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 REGION="${AWS_REGION:-us-west-2}"
 PROJECT_NAME="game-agent"
 
+# Optional IAM role placement (see scripts/deploy.sh). deploy.sh exports these;
+# a standalone run falls back to ui/.env.local, then to the root path and no
+# permissions boundary.
+for _iam_setting in GBAW_IAM_ROLE_PATH GBAW_IAM_PERMISSIONS_BOUNDARY_ARN; do
+  if [ -z "${!_iam_setting:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
+    _value=$(grep "^${_iam_setting}=" "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+    [ -n "$_value" ] && printf -v "$_iam_setting" '%s' "$_value"
+  fi
+done
+IAM_ROLE_PARAMETER_OVERRIDES=(
+  "RolePath=${GBAW_IAM_ROLE_PATH:-/}"
+  "PermissionsBoundaryArn=${GBAW_IAM_PERMISSIONS_BOUNDARY_ARN:-}"
+)
+
 echo "=================================================="
 echo " 🧠 Deploying Knowledge Base Stacks"
 echo "=================================================="
@@ -76,7 +90,7 @@ echo "🎮 Deploying GameLift Knowledge Base..."
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/knowledge-base-gamelift.yaml" \
   --stack-name "${PROJECT_NAME}-kb-gamelift" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION"
 
@@ -94,7 +108,7 @@ echo "☸️  Deploying EKS Knowledge Base..."
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/knowledge-base-eks.yaml" \
   --stack-name "${PROJECT_NAME}-kb-eks" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION"
 
@@ -112,7 +126,7 @@ echo "💰 Deploying Cost Optimization Knowledge Base..."
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/knowledge-base-cost.yaml" \
   --stack-name "${PROJECT_NAME}-kb-cost" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region "$REGION"
 

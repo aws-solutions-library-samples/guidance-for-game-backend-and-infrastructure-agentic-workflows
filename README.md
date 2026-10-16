@@ -203,6 +203,24 @@ The CloudFormation templates use `CAPABILITY_NAMED_IAM` to create scoped service
 
 </details>
 
+<details>
+<summary><strong>Accounts that require a role path or permissions boundary (click to expand)</strong></summary>
+
+Some accounts only let deployers create roles under a fixed IAM path and with a required permissions boundary. Set both values in `ui/.env.local` (or the environment) before running `./deploy-all.sh` or `Deploy-GameAgent`:
+
+```bash
+GBAW_IAM_ROLE_PATH=/workloads/
+GBAW_IAM_PERMISSIONS_BOUNDARY_ARN=arn:aws:iam::<account-id>:policy/<boundary-policy-name>
+```
+
+Every role the deployment creates gets that path and boundary, including the AgentCore CodeBuild role. The deployment creates that role itself and passes it to `agentcore configure`, so the starter toolkit never creates one of its own. The boundary must allow every action the runtime role is granted, or those calls fail at run time.
+
+Choose these values before the first deployment. IAM cannot change a role's path in place, and CloudFormation cannot replace the named roles, so changing the path of an existing deployment requires a teardown first.
+
+EKS enrollment resolves the role ARN with `iam:GetRole`, so it handles a role path. Pass `--role-arn` to skip the lookup. `aws-auth` ConfigMap entries cannot include a path, so ConfigMap-mode enrollment writes the path-free ARN. EKS access entries use the full ARN.
+
+</details>
+
 To enable Bedrock models:
 
 1. Open the [Amazon Bedrock console](https://console.aws.amazon.com/bedrock/)
