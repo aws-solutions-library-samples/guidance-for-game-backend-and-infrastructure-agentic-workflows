@@ -268,8 +268,10 @@ export AWS_PROFILE='<operator-profile>'              # an operator/administrator
 
 ```bash
 # Write the working file outside the checkout so raw subjects do not land next to
-# tracked content; delete it when you are done.
-RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-records.XXXXXX")"
+# tracked content; delete it when you are done. Reusing an already-set
+# RECORDS_FILE means re-running Step 1 after a failed listing overwrites the same
+# file (the ">" below truncates it) instead of leaving the failed run's file behind.
+RECORDS_FILE="${RECORDS_FILE:-$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-records.XXXXXX")}"
 
 # List every record under each single-character namespace prefix (the CLI follows
 # pagination), one "<namespace>\t<recordId>" row per record. The loop runs in a
@@ -352,7 +354,7 @@ aws bedrock-agentcore delete-event \
   --event-id '<event-id>' --region "$AWS_REGION"
 ```
 
-**Verify.** Re-run Step 1; its last command should print nothing. For each namespace you deleted, Step 2 should print no rows. Both read records only, so neither depends on `list-actors`, whose results drop out as events expire. New 64-hex actors and their records are left untouched.
+**Verify.** Re-run Step 1; it should print nothing at all, with no namespace and no `discovery is incomplete` line. For each namespace you deleted, Step 2 should print no rows. Both read records only, so neither depends on `list-actors`, whose results drop out as events expire. New 64-hex actors and their records are left untouched.
 
 **Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but the ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are plain bash with no PowerShell wrapper, and the module exposes no memory-cleanup command. The same AWS CLI v2 operations and parameters work from PowerShell 7+; the following is the discover-and-delete flow for one old namespace, matching the bash Steps 1–3 as three separate blocks so nothing is deleted until you run the last one. PowerShell uses backtick line continuations and `$env:` for process variables, and splits the tab-separated text output explicitly. Matching and sorting use `-cnotmatch` and `-CaseSensitive` because PowerShell ignores case by default, and `@(...)` keeps a single record ID as a one-element array.
 
@@ -364,19 +366,21 @@ $env:AWS_PROFILE = '<operator-profile>'              # an operator/administrator
 $MemoryId = 'gameagentruntime_mem-0a1b2c3d4e'   # synthetic; use your resource ID
 ```
 
-PowerShell Step 1 — Discovery: list every one-character namespace prefix and keep the namespaces that are not a 64-hex digest (raw subjects, `anonymous`, test actors). A failed listing throws so discovery is never silently incomplete. This only lists:
+PowerShell Step 1 — Discovery: list every one-character namespace prefix and keep the namespaces that are not a 64-hex digest (raw subjects, `anonymous`, test actors). The two statements run inside a `& { ... }` script block so a failed listing throws and stops discovery before any namespace is printed, rather than letting a line-by-line paste classify a partial list. This only lists:
 
 ```powershell
-$rows = foreach ($p in [char[]]'0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') {
-  aws bedrock-agentcore list-memory-records `
-    --memory-id $MemoryId --region $env:AWS_REGION `
-    --namespace "$p" `
-    --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text
-  if ($LASTEXITCODE -ne 0) { throw "listing failed for prefix $p; discovery is incomplete" }
+& {
+  $rows = foreach ($p in [char[]]'0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') {
+    aws bedrock-agentcore list-memory-records `
+      --memory-id $MemoryId --region $env:AWS_REGION `
+      --namespace "$p" `
+      --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text
+    if ($LASTEXITCODE -ne 0) { throw "listing failed for prefix $p; discovery is incomplete" }
+  }
+  $rows | ForEach-Object { ($_ -split "`t")[0] } |
+    Sort-Object -Unique -CaseSensitive |
+    Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }
 }
-$rows | ForEach-Object { ($_ -split "`t")[0] } |
-  Sort-Object -Unique -CaseSensitive |
-  Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }
 ```
 
 PowerShell Step 2 — Dry run: pick one old namespace from discovery and list its records by exact namespace match. This only lists:
