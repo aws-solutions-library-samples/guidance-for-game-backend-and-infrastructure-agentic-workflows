@@ -15,6 +15,9 @@ They assert the properties the runbook must have:
 2. The delete covers only the exact old namespace, even when a current digest
    namespace has the old namespace as a prefix, in batches of at most 100.
 3. The dry-run (list) steps delete nothing.
+4. A failed listing aborts discovery with a non-zero status and no namespace on
+   stdout, so a partial list is never mistaken for the complete set, and a
+   paste keeps the operator's shell open rather than closing it.
 """
 
 from __future__ import annotations
@@ -254,6 +257,28 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
             text=True,
         )
 
+    def _run_paste(self, script: str) -> subprocess.CompletedProcess:
+        # Run a block the way a terminal paste does: a plain "bash -c" with no
+        # "-e", so a failed command does not end the shell. This distinguishes a
+        # subshell "exit 1" (stops discovery, shell survives) from a caller-level
+        # "exit 1" (ends the whole run) and sees a dropped "&&" (classifier runs
+        # anyway), which "bash -euo pipefail -c" cannot.
+        env = dict(os.environ)
+        env["PATH"] = f"{self.bin}:{env['PATH']}"
+        env["FAKE_STATE"] = str(self.state_path)
+        env["AWS_REGION"] = "us-west-2"
+        env["MEMORY_ID"] = "gameagentruntime_mem-0a1b2c3d4e"
+        env["AWS_PROFILE"] = "operator-test"
+        env["OLD_ACTOR"] = OLD_NS
+        env["TMPDIR"] = str(self.tmp)
+        return subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            cwd=self.tmp,
+            capture_output=True,
+            text=True,
+        )
+
     def test_discovery_finds_inactive_old_namespaces(self) -> None:
         # Old namespaces with records but no live events (list-actors would miss
         # them): a UUID, a UUID that starts with a digit, an upper-case-leading
@@ -304,6 +329,33 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "", "no namespaces may be printed when discovery is incomplete")
         self.assertIn("discovery is incomplete", result.stderr)
 
+    def test_discovery_failure_keeps_the_pasting_shell_open(self) -> None:
+        # A paste runs Step 1 in the operator's own interactive shell, which has
+        # no "-e", so the shell does not exit when a command fails. The subshell
+        # around the listing loop and the "&&" before the classifier are what
+        # make a failed listing stop discovery (non-zero status, nothing on
+        # stdout) without ending the shell. Running the block under "bash -c"
+        # (no -e) and then echoing a marker reproduces that: if the subshell were
+        # dropped, "exit 1" would end the whole run before the marker; if the
+        # "&&" were dropped, the classifier would run after the failure and print
+        # a partial namespace list with status 0.
+        self._write_state(
+            {
+                DIGIT_UUID_NS: ["mem-" + "g" * 40],
+                UUID_NS: ["mem-" + "u" * 40],
+                ANON_NS: ["mem-" + "n" * 40],
+            },
+            fail_prefixes=["a"],
+        )
+        script = self.blocks[1] + '\necho "after status=$? file=${RECORDS_FILE:+set}"\n'
+        result = self._run_paste(script)
+        self.assertEqual(
+            result.stdout.strip(),
+            "after status=1 file=set",
+            "a failed listing must leave status 1, print no namespace, and keep the shell open",
+        )
+        self.assertIn("discovery is incomplete", result.stderr)
+
     def test_dry_run_steps_delete_nothing(self) -> None:
         self._write_state({PREFIX_DIGEST_NS: ["mem-" + "d" * 40], OLD_NS: ["mem-" + "o" * 40]})
         self._run(self.blocks[1])  # Step 1
@@ -351,6 +403,7 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
     section: str
     delete_block: str
     bash: str
+    fences: str
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -361,6 +414,10 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
         cls.section = rest[: nxt.start()] if nxt else rest
         blocks = re.findall(r"```bash\n(.*?)```", cls.section, flags=re.DOTALL)
         cls.bash = "\n".join(blocks)
+        # Every command fence in the section, bash and PowerShell, for the option
+        # allowlist. The two forms must stay aligned, so both are scanned.
+        ps_blocks = re.findall(r"```powershell\n(.*?)```", cls.section, flags=re.DOTALL)
+        cls.fences = "\n".join(blocks + ps_blocks)
         # Step 3 is the delete block: the one that calls batch-delete-memory-records.
         delete_blocks = [b for b in blocks if "batch-delete-memory-records" in b]
         assert delete_blocks, "no bash block calls batch-delete-memory-records"
@@ -384,12 +441,33 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
     def test_dry_run_shows_namespace_and_createdat(self) -> None:
         self.assertIn("createdAt", self.section, "the dry run must show createdAt")
 
-    def test_no_pagination_truncation_flags(self) -> None:
-        # The CLI follows nextToken itself; adding --no-paginate or --max-items
-        # would truncate the listing to one page (or N items) and delete only
-        # part of the namespace. Neither flag may appear in any bash block.
-        self.assertNotIn("--no-paginate", self.bash, "no bash block may use --no-paginate (truncates to one page)")
-        self.assertNotIn("--max-items", self.bash, "no bash block may use --max-items (truncates the listing)")
+    def test_cli_options_are_limited_to_a_known_allowlist(self) -> None:
+        # The CLI follows nextToken itself, so any option that caps or disables
+        # pagination (--no-paginate, --max-items, the hidden --max-results, and
+        # their unambiguous prefixes such as --no-pag or --max-i) would truncate
+        # a listing and delete only part of a namespace. Rather than denylisting
+        # spellings the CLI silently accepts, assert that every long option used
+        # in the section's command fences is one of the ones the runbook needs.
+        # A new option (such as --page-size, which returns every record) is added
+        # here deliberately, which also forces a look at whether it truncates.
+        allowed = {
+            "--memory-id",
+            "--region",
+            "--namespace",
+            "--query",
+            "--output",
+            "--records",
+            "--actor-id",
+            "--session-id",
+            "--event-id",
+        }
+        used = set(re.findall(r"(?<!\S)(--[a-zA-Z][a-zA-Z0-9-]*)", self.fences))
+        unexpected = used - allowed
+        self.assertEqual(
+            unexpected,
+            set(),
+            f"unexpected CLI options in the runbook fences (truncation risk): {sorted(unexpected)}",
+        )
 
 
 if __name__ == "__main__":
