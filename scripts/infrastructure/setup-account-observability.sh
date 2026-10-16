@@ -13,6 +13,12 @@ set -e
 # This script works around the issue by toggling Transaction Search if the
 # log group is missing, which triggers AWS to create it.
 #
+# ORDER MATTERS: X-Ray rejects UpdateTraceSegmentDestination (AccessDenied,
+# "An unknown error occurred") until a CloudWatch Logs resource policy lets
+# xray.amazonaws.com write spans. The policy is therefore created first, so a
+# fresh account that has never enabled Transaction Search succeeds on the first
+# run. See https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Enable-TransactionSearch.html
+#
 # Additionally, the direct-code-deploy path in the CLI does not set up the
 # CloudWatch delivery (traces source → X-Ray destination) for the runtime,
 # which is required for the Bedrock AgentCore Observability console page.
@@ -24,7 +30,53 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 echo "🔍 Setting up account-wide observability..."
 
-# Step 1: Ensure 'aws/spans' log group exists (AWS-reserved namespace)
+# Runs a mutating AWS call. Output is discarded, but on failure the AWS error is
+# printed and the script stops, instead of exiting silently under `set -e`.
+run_aws() {
+    local description=$1
+    shift
+    local output
+    if ! output=$(aws "$@" 2>&1); then
+        echo "  ❌ ${description} failed:" >&2
+        echo "$output" | sed 's/^/     /' >&2
+        exit 1
+    fi
+}
+
+set_trace_destination() {
+    run_aws "Setting the X-Ray trace segment destination to $1" \
+        xray update-trace-segment-destination --destination "$1" --region "$AWS_REGION"
+}
+
+# Step 1: Create CloudWatch Logs resource policy for X-Ray to write spans.
+# Must precede any UpdateTraceSegmentDestination call (see ORDER MATTERS above).
+# X-Ray's internal service role needs PutLogEvents on 'aws/spans' (no leading /).
+# The resource ARN uses 'log-group:aws/spans:*' (matching the actual log group name).
+echo "  📝 Ensuring CloudWatch Logs resource policy..."
+run_aws "Creating the CloudWatch Logs resource policy for X-Ray" \
+  logs put-resource-policy \
+  --policy-name TransactionSearchXRayAccess \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Sid\": \"TransactionSearchXRayAccess\",
+      \"Effect\": \"Allow\",
+      \"Principal\": {\"Service\": \"xray.amazonaws.com\"},
+      \"Action\": \"logs:PutLogEvents\",
+      \"Resource\": [
+        \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:aws/spans:*\",
+        \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/application-signals/data:*\"
+      ],
+      \"Condition\": {
+        \"ArnLike\": {\"aws:SourceArn\": \"arn:aws:xray:${AWS_REGION}:${ACCOUNT_ID}:*\"},
+        \"StringEquals\": {\"aws:SourceAccount\": \"${ACCOUNT_ID}\"}
+      }
+    }]
+  }" \
+  --region "$AWS_REGION"
+echo "  ✅ CloudWatch Logs resource policy configured"
+
+# Step 2: Ensure 'aws/spans' log group exists (AWS-reserved namespace)
 # X-Ray Transaction Search writes spans to log group 'aws/spans' (WITHOUT leading /)
 # with log stream 'default'. This is in the AWS-reserved namespace — only AWS services
 # can create it. The only way to trigger creation via API is to toggle Transaction Search.
@@ -40,7 +92,7 @@ else
     if [ "$CURRENT_DEST" = "CloudWatchLogs" ]; then
         # Already enabled — need to toggle: disable first, wait, then re-enable
         echo "  🔄 Disabling Transaction Search temporarily..."
-        aws xray update-trace-segment-destination --destination XRay --region $AWS_REGION > /dev/null 2>&1
+        set_trace_destination XRay
 
         # Wait for PENDING → ACTIVE
         echo "  ⏳ Waiting for disable to complete..."
@@ -53,11 +105,11 @@ else
         done
 
         echo "  🔄 Re-enabling Transaction Search..."
-        aws xray update-trace-segment-destination --destination CloudWatchLogs --region $AWS_REGION > /dev/null 2>&1
+        set_trace_destination CloudWatchLogs
     else
         # Not enabled yet — just enable
         echo "  🎯 Enabling Transaction Search..."
-        aws xray update-trace-segment-destination --destination CloudWatchLogs --region $AWS_REGION > /dev/null 2>&1
+        set_trace_destination CloudWatchLogs
     fi
 
     # Wait for enable to complete and log group to appear
@@ -77,13 +129,13 @@ else
     # Fallback: if first-time enable didn't create log group, force a toggle
     if [ "$LG_CREATED" = "false" ]; then
         echo "  ⚠️  Log group not created by initial enable — forcing toggle..."
-        aws xray update-trace-segment-destination --destination XRay --region $AWS_REGION > /dev/null 2>&1
+        set_trace_destination XRay
         for i in $(seq 1 30); do
             STATUS=$(aws xray get-trace-segment-destination --region $AWS_REGION --query 'Status' --output text 2>/dev/null)
             [ "$STATUS" = "ACTIVE" ] && break
             sleep 10
         done
-        aws xray update-trace-segment-destination --destination CloudWatchLogs --region $AWS_REGION > /dev/null 2>&1
+        set_trace_destination CloudWatchLogs
         for i in $(seq 1 30); do
             STATUS=$(aws xray get-trace-segment-destination --region $AWS_REGION --query 'Status' --output text 2>/dev/null)
             HAS_LG=$(aws logs describe-log-groups --log-group-name-prefix "aws/spans" --region $AWS_REGION 2>/dev/null | grep -c '"aws/spans"' || echo 0)
@@ -101,50 +153,23 @@ else
     fi
 fi
 
-# Step 2: Create CloudWatch Logs resource policy for X-Ray to write spans
-# X-Ray's internal service role needs PutLogEvents on 'aws/spans' (no leading /).
-# The resource ARN uses 'log-group:aws/spans:*' (matching the actual log group name).
-echo "  📝 Ensuring CloudWatch Logs resource policy..."
-aws logs put-resource-policy \
-  --policy-name TransactionSearchXRayAccess \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Sid\": \"TransactionSearchXRayAccess\",
-      \"Effect\": \"Allow\",
-      \"Principal\": {\"Service\": \"xray.amazonaws.com\"},
-      \"Action\": \"logs:PutLogEvents\",
-      \"Resource\": [
-        \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:aws/spans:*\",
-        \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/application-signals/data:*\"
-      ],
-      \"Condition\": {
-        \"ArnLike\": {\"aws:SourceArn\": \"arn:aws:xray:${AWS_REGION}:${ACCOUNT_ID}:*\"},
-        \"StringEquals\": {\"aws:SourceAccount\": \"${ACCOUNT_ID}\"}
-      }
-    }]
-  }" \
-  --region $AWS_REGION > /dev/null 2>&1
-echo "  ✅ CloudWatch Logs resource policy configured"
-
 # Step 3: Ensure Transaction Search destination is CloudWatch Logs
 CURRENT_STATUS=$(aws xray get-trace-segment-destination --region $AWS_REGION 2>/dev/null || echo '{"Destination":"NOT_CONFIGURED"}')
 if echo "$CURRENT_STATUS" | grep -q "CloudWatchLogs"; then
     echo "  ✅ X-Ray trace destination already set to CloudWatch Logs"
 else
     echo "  🎯 Setting CloudWatch Logs as span destination..."
-    aws xray update-trace-segment-destination \
-      --destination CloudWatchLogs \
-      --region $AWS_REGION > /dev/null 2>&1
+    set_trace_destination CloudWatchLogs
     echo "  ✅ X-Ray trace destination configured"
 fi
 
 # Step 4: Configure 1% sampling (free tier)
 echo "  📊 Configuring span sampling (1% free tier)..."
-aws xray update-indexing-rule \
+run_aws "Configuring the X-Ray indexing rule" \
+  xray update-indexing-rule \
   --name "Default" \
   --rule '{"Probabilistic": {"DesiredSamplingPercentage": 1}}' \
-  --region $AWS_REGION > /dev/null 2>&1
+  --region "$AWS_REGION"
 echo "  ✅ X-Ray indexing rule configured"
 
 echo ""

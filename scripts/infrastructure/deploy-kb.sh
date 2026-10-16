@@ -92,7 +92,8 @@ aws cloudformation deploy \
   --stack-name "${PROJECT_NAME}-kb-gamelift" \
   --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region "$REGION"
+  --region "$REGION" \
+  --no-fail-on-empty-changeset
 
 GAMELIFT_KB_ID=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-kb-gamelift" \
@@ -110,7 +111,8 @@ aws cloudformation deploy \
   --stack-name "${PROJECT_NAME}-kb-eks" \
   --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region "$REGION"
+  --region "$REGION" \
+  --no-fail-on-empty-changeset
 
 EKS_KB_ID=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-kb-eks" \
@@ -128,7 +130,8 @@ aws cloudformation deploy \
   --stack-name "${PROJECT_NAME}-kb-cost" \
   --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region "$REGION"
+  --region "$REGION" \
+  --no-fail-on-empty-changeset
 
 COST_KB_ID=$(aws cloudformation describe-stacks \
   --stack-name "${PROJECT_NAME}-kb-cost" \

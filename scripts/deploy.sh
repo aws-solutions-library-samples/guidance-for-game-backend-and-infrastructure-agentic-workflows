@@ -125,7 +125,8 @@ aws cloudformation deploy \
   --stack-name "${PROJECT_NAME}-infrastructure" \
   --parameter-overrides ProjectName="$PROJECT_NAME" "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region $AWS_REGION
+  --region $AWS_REGION \
+  --no-fail-on-empty-changeset
 
 echo "✅ Base infrastructure deployed"
 echo ""
@@ -160,7 +161,8 @@ aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/04-bedrock-guardrails.yaml" \
   --stack-name "${PROJECT_NAME}-guardrails" \
   --parameter-overrides ProjectName="$PROJECT_NAME" \
-  --region $AWS_REGION
+  --region $AWS_REGION \
+  --no-fail-on-empty-changeset
 
 # Get guardrail ID for AgentCore configuration
 GUARDRAIL_ID=$(aws cloudformation describe-stacks \
@@ -613,7 +615,8 @@ aws cloudformation deploy \
     ProjectName="$PROJECT_NAME" \
     RuntimeId="$RUNTIME_ID" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region $AWS_REGION
+  --region $AWS_REGION \
+  --no-fail-on-empty-changeset
 
 echo "✅ Observability stack deployed"
 echo ""
@@ -723,7 +726,8 @@ aws cloudformation deploy \
     TenantId="$GBAW_TENANT_ID" \
     WorkspaceId="$GBAW_WORKSPACE_ID" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region $AWS_REGION
+  --region $AWS_REGION \
+  --no-fail-on-empty-changeset
 
 # Get frontend URL
 FRONTEND_URL=$(aws cloudformation describe-stacks \
@@ -784,7 +788,8 @@ aws cloudformation deploy \
     AIChatMode=true \
     "${IAM_ROLE_PARAMETER_OVERRIDES[@]}" \
   --capabilities CAPABILITY_NAMED_IAM \
-  --region $AWS_REGION
+  --region $AWS_REGION \
+  --no-fail-on-empty-changeset
 
 # Step 8b: Enable AWS Inspector for ECR vulnerability scanning via CLI
 # AWS::Inspector2::Enabler is not a valid CloudFormation resource type in all regions,
