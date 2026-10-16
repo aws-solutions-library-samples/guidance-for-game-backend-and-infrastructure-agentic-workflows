@@ -19,13 +19,15 @@ OpenTelemetry log records:
   ``gen_ai.output.messages``, ``gen_ai.system_instructions``). Omitting the token
   leaves them unredacted.
 * The Strands tracer also carries two content paths the redaction token does not
-  reach. ``start_agent_span`` copies a ``system_prompt`` keyword argument onto the
-  ``invoke_agent`` span as a plain attribute, which the distro's log-record
-  handler emits as a ``system`` message. ``_end_span`` records tool/model error
-  text as the span status description and, for exceptions, as an ``exception``
-  span event (message and stack trace). While redacting, the guard installs
-  narrow wrappers on these two ``Tracer`` methods that drop the ``system_prompt``
-  attribute and reduce an error to its type while keeping the error status.
+  reach. On versions that copy a raw ``system_prompt`` keyword argument onto the
+  ``invoke_agent`` span as a plain attribute, the distro's log-record handler
+  emits it as a ``system`` message; on versions that route the system prompt
+  through the redaction policy instead, there is no raw attribute. ``_end_span``
+  records tool/model error text as the span status description and, for
+  exceptions, as an ``exception`` span event (message and stack trace). While
+  redacting, the guard installs narrow wrappers on these two ``Tracer`` methods
+  that drop the ``system_prompt`` keyword (a no-op where it is not set as a raw
+  attribute) and reduce an error to its type while keeping the error status.
 * Under agent observability the distro installs an OpenTelemetry logging handler
   on the root logger, so a library ``logger.exception(...)`` becomes a log record
   whose attributes carry the exception type, message, and stack trace. The MCP
@@ -94,21 +96,28 @@ disabled-instrumentations list untouched.
 import functools
 import logging
 import os
-from dataclasses import dataclass
-from typing import Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
 # Fixed, bounded, content-free message logged at WARNING when a redaction guard
 # path is skipped (a missing or renamed internal, or attribute drift). A skipped
-# path leaves a content export open, so it is surfaced at WARNING at deploy time
-# rather than hidden at DEBUG. The log carries only this message and the skipped
-# path name; it never includes the exception message or stack trace, which can
-# carry content, so the signature-pin unit tests remain the detail-level guard
-# against drift in CI.
+# path leaves a content export open, so it is surfaced at WARNING -- at each
+# runtime process start, where it is visible -- rather than kept at DEBUG. The
+# log carries only this message and the skipped path name; it never includes the
+# exception message or stack trace, which can carry content. The signature-pin
+# unit tests are a separate, detail-level drift guard that runs in CI.
 GUARD_PATH_SKIPPED_MESSAGE = (
     "Telemetry redaction guard path skipped; a trace-content export may be open. Path: %s. Exception type: %s."
 )
+
+# When set by ``apply_trace_content_guard`` for the duration of one guard run,
+# every ``_warn_guard_path_skipped`` call also appends the skipped path name here
+# so the resolved ``TraceContentDecision`` can report that redaction is
+# incomplete and name the open paths. The install helpers can also be called
+# directly (in tests), where no collector is set and only the WARNING is logged.
+_SKIPPED_PATHS: Optional[List[str]] = None
 
 
 def _warn_guard_path_skipped(path: str, exc: BaseException) -> None:
@@ -116,9 +125,12 @@ def _warn_guard_path_skipped(path: str, exc: BaseException) -> None:
 
     Records the guard path name and the exception *type* only. The exception
     message and stack trace are deliberately omitted because they can carry
-    prompt, response, or tool content.
+    prompt, response, or tool content. When a guard run is collecting skips, the
+    path name is also recorded so the startup posture line can name it.
     """
     logger.warning(GUARD_PATH_SKIPPED_MESSAGE, path, type(exc).__name__)
+    if _SKIPPED_PATHS is not None and path not in _SKIPPED_PATHS:
+        _SKIPPED_PATHS.append(path)
 
 
 # The Strands redaction token name and the botocore content-capture switch.
@@ -183,6 +195,11 @@ class TraceContentDecision:
     semconv_opt_in: str  # value for OTEL_SEMCONV_STABILITY_OPT_IN
     # Value for OTEL_PYTHON_DISABLED_INSTRUMENTATIONS, or None to leave it unset.
     disabled_instrumentations: Optional[str] = None
+    # Redaction guard paths that could not be installed on this run (a missing or
+    # renamed internal, or attribute drift). Empty when every path installed. A
+    # non-empty value means redaction is incomplete and those content paths are
+    # exportable until the drift is fixed.
+    skipped_paths: tuple[str, ...] = field(default_factory=tuple)
 
 
 def _merge_semconv_opt_in(existing: str, *, redact: bool) -> str:
@@ -301,9 +318,12 @@ def _install_strands_span_wrappers() -> None:
     """Wrap the Strands ``Tracer`` methods that export content the token misses.
 
     * ``start_agent_span`` -- drop the ``system_prompt`` keyword so it is not set
-      as a plain span attribute (and so the distro's log-record handler cannot
+      as a plain span attribute on Strands versions that copy raw string keyword
+      arguments onto the agent span (and so the distro's log-record handler cannot
       turn it into a ``system`` message). The system prompt is still reported,
-      redacted, through ``gen_ai.system_instructions`` on model spans.
+      redacted, through ``gen_ai.system_instructions`` on model spans. On Strands
+      versions that route the system prompt through the redaction policy instead
+      of setting a raw attribute, dropping the keyword is simply a no-op.
     * ``_end_span`` -- replace an error's status description with its exception
       type (or a fixed non-content string for an error-status tool result) and
       drop the exception object so no ``exception`` event with message/stack
@@ -317,17 +337,23 @@ def _install_strands_span_wrappers() -> None:
     silently leaking.
 
     A missing Strands tracer, or attribute drift on the wrapped ``Tracer``
-    methods, leaves these two content paths open. The whole install -- the
-    import and the ``Tracer`` attribute access -- is guarded so drift cannot
-    crash startup, and any skip is logged at WARNING (content-free) so the open
-    path is visible at deploy time rather than silent.
+    methods, leaves these content paths open. The whole install -- the import and
+    the ``Tracer`` attribute access -- is guarded so drift cannot crash startup.
+    The two methods are wrapped independently: if one wraps and the other drifts,
+    the skip is reported as incomplete and names the method still open, rather
+    than claiming the whole path was skipped, so the posture line is accurate.
     """
     try:
         # Third-party packages
         from strands.telemetry.tracer import Tracer
+    except Exception as exc:
+        _warn_guard_path_skipped("strands span wrappers", exc)
+        return
 
-        marker = "_gbaw_trace_content_guard"
+    marker = "_gbaw_trace_content_guard"
+    installed: List[str] = []
 
+    try:
         original_start_agent_span = Tracer.start_agent_span
         if not getattr(original_start_agent_span, marker, False):
 
@@ -339,7 +365,12 @@ def _install_strands_span_wrappers() -> None:
 
             setattr(start_agent_span, marker, True)
             Tracer.start_agent_span = start_agent_span  # type: ignore[method-assign]
+        installed.append(STRANDS_SYSTEM_PROMPT_KWARG)
+    except Exception as exc:
+        _warn_guard_path_skipped(_strands_skip_path(installed, "start_agent_span"), exc)
+        return
 
+    try:
         original_end_span = Tracer._end_span
         if not getattr(original_end_span, marker, False):
 
@@ -370,7 +401,19 @@ def _install_strands_span_wrappers() -> None:
             setattr(_end_span, marker, True)
             Tracer._end_span = _end_span  # type: ignore[method-assign]
     except Exception as exc:
-        _warn_guard_path_skipped("strands span wrappers", exc)
+        _warn_guard_path_skipped(_strands_skip_path(installed, "_end_span"), exc)
+
+
+def _strands_skip_path(installed: "List[str]", failed_method: str) -> str:
+    """Name the skipped Strands guard path, flagging a partial install.
+
+    When one of the two ``Tracer`` wrappers is already in place and the other
+    drifts, the install is incomplete rather than skipped, so name the method
+    that is still open; otherwise the whole path is skipped.
+    """
+    if installed:
+        return f"strands span wrappers (incomplete: {failed_method})"
+    return "strands span wrappers"
 
 
 def _mcp_client_wrapper_layer_remains() -> bool:
@@ -517,9 +560,17 @@ def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = 
     if decision.disabled_instrumentations is not None:
         target[DISABLED_INSTRUMENTATIONS_VAR] = decision.disabled_instrumentations
     if not decision.capture_enabled:
-        _install_strands_span_wrappers()
-        _install_mcp_logging_filter()
-        _uninstrument_mcp()
-        if _hosted_runtime(target):
-            _install_memory_client_filter()
+        global _SKIPPED_PATHS
+        collector: List[str] = []
+        _SKIPPED_PATHS = collector
+        try:
+            _install_strands_span_wrappers()
+            _install_mcp_logging_filter()
+            _uninstrument_mcp()
+            if _hosted_runtime(target):
+                _install_memory_client_filter()
+        finally:
+            _SKIPPED_PATHS = None
+        if collector:
+            decision = replace(decision, skipped_paths=tuple(collector))
     return decision

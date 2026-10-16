@@ -177,15 +177,35 @@ prewarm_container()
 
 app = BedrockAgentCoreApp()
 
+
+def _log_trace_content_posture(decision, log) -> None:
+    """Log the exported-telemetry content posture. No content values are logged.
+
+    A clean redacting run reports that exported telemetry carries no content. A
+    run with skipped guard paths reports, at WARNING, that redaction is
+    incomplete and names the open paths rather than claiming no content. The
+    opt-in reports that content capture is enabled.
+    """
+    if decision.capture_enabled:
+        log.warning(
+            "⚠️ Trace content capture is ENABLED (GBAW_CAPTURE_TRACE_CONTENT opt-in). "
+            "For non-production use only: exported spans and OpenTelemetry log records "
+            "may carry prompt and response content."
+        )
+    elif decision.skipped_paths:
+        log.warning(
+            "⚠️ Trace content redaction incomplete: %d guard path(s) were skipped, so some "
+            "exported telemetry may carry prompt, response, tool, or error content until fixed. "
+            "Open path(s): %s",
+            len(decision.skipped_paths),
+            "; ".join(decision.skipped_paths),
+        )
+    else:
+        log.info("🔒 Trace content redaction active: exported telemetry carries no prompt or response content")
+
+
 # Record the exported-telemetry content posture (no content values are logged).
-if _TRACE_CONTENT_DECISION.capture_enabled:
-    logger.warning(
-        "⚠️ Trace content capture is ENABLED (GBAW_CAPTURE_TRACE_CONTENT opt-in). "
-        "For non-production use only: exported spans and OpenTelemetry log records "
-        "may carry prompt and response content."
-    )
-else:
-    logger.info("🔒 Trace content redaction active: exported telemetry carries no prompt or response content")
+_log_trace_content_posture(_TRACE_CONTENT_DECISION, logger)
 
 # Memory ID from environment (set by AgentCore CLI or deployment)
 MEMORY_ID = os.getenv("BEDROCK_AGENTCORE_MEMORY_ID")

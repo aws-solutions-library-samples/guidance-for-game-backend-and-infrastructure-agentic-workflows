@@ -863,11 +863,16 @@ def test_strands_wrapper_attribute_drift_logs_warning_without_exception_text(mon
 
     fake_module = types.ModuleType("strands.telemetry.tracer")
 
-    class _DriftedTracer:
-        # The real method name is gone; accessing it raises AttributeError whose
-        # message carries the marker.
-        def __getattr__(self, name):
+    class _DriftedTracerMeta(type):
+        # The guard reads the method off the Tracer *class*, so the drift has to
+        # live on the metaclass: an instance ``__getattr__`` never runs for class
+        # attribute access, which would let the marker-free default AttributeError
+        # mask whether the exception text actually reaches the log record.
+        def __getattr__(cls, name):
             raise AttributeError(f"{_GUARD_SKIP_EXC_MARKER}:{name}")
+
+    class _DriftedTracer(metaclass=_DriftedTracerMeta):
+        pass
 
     fake_module.Tracer = _DriftedTracer  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", fake_module)
@@ -885,7 +890,14 @@ def test_strands_wrapper_attribute_drift_logs_warning_without_exception_text(mon
     assert warnings, "attribute drift must log at WARNING"
     text = "\n".join(r.getMessage() for r in warnings)
     assert "strands span wrappers" in text
+    # The drift exception message carries the marker; it must not reach the log.
+    # With the real metaclass __getattr__ above, the exception the guard catches
+    # does carry the marker, so appending exception text to the helper would make
+    # this assertion fail instead of passing vacuously.
+    assert "AttributeError" in text
     assert _GUARD_SKIP_EXC_MARKER not in text
+    assert all(r.exc_info is None for r in warnings)
+    assert all(r.exc_text is None for r in warnings)
 
 
 def test_uninstrument_mcp_import_failure_logs_warning_without_exception_text(monkeypatch, caplog):
@@ -942,3 +954,189 @@ def test_memory_client_filter_failure_logs_warning_without_exception_text(monkey
     text = "\n".join(r.getMessage() for r in warnings)
     assert "memory client logging filter" in text
     assert _GUARD_SKIP_EXC_MARKER not in text
+
+
+def test_mcp_logging_filter_install_failure_logs_warning_without_exception_text(monkeypatch, caplog):
+    # Make addFilter on an MCP client logger raise with a marker message, and
+    # confirm the skip is a content-free WARNING rather than a crash or a
+    # silently swallowed error.
+    # Local modules
+    import config.telemetry_guard as guard
+
+    real_get_logger = logging.getLogger
+
+    def _fake_get_logger(name=None):
+        lg = real_get_logger(name)
+        if name in guard.MCP_EXCEPTION_LOGGER_NAMES:
+
+            def _raise(_flt):
+                raise RuntimeError(_GUARD_SKIP_EXC_MARKER)
+
+            monkeypatch.setattr(lg, "addFilter", _raise, raising=False)
+            monkeypatch.setattr(lg, "filters", [], raising=False)
+        return lg
+
+    monkeypatch.setattr(guard.logging, "getLogger", _fake_get_logger)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        guard._install_mcp_logging_filter()
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a skipped MCP logging-filter path must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "MCP client logging filter" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+    assert all(r.exc_info is None for r in warnings)
+
+
+def test_uninstrument_mcp_operational_failure_logs_warning_without_exception_text(monkeypatch, caplog):
+    # The import of the ADOT instrumentor succeeds, but uninstrumenting it raises.
+    # The operational handler (distinct from the import handler) must surface a
+    # content-free WARNING, not crash startup or demote the skip to DEBUG.
+    # Standard library
+    import types
+
+    # Local modules
+    import config.telemetry_guard as guard
+
+    class _BoomInstrumentor:
+        is_instrumented_by_opentelemetry = True
+
+        def uninstrument(self):
+            raise RuntimeError(_GUARD_SKIP_EXC_MARKER)
+
+    fake_module = types.ModuleType("amazon.opentelemetry.distro.instrumentation.mcp")
+    fake_module.McpInstrumentor = _BoomInstrumentor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "amazon.opentelemetry.distro.instrumentation.mcp", fake_module)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        guard._uninstrument_mcp()
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a failed uninstrument must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "MCP instrumentor uninstrument" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+    assert all(r.exc_info is None for r in warnings)
+
+
+def test_each_skipped_path_warns_exactly_once(monkeypatch, caplog):
+    # The helper logs one record per call. Driving a single skip must leave
+    # exactly one WARNING record for that path, so no handler double-logs.
+    # Standard library
+    import types
+
+    # Local modules
+    from config.telemetry_guard import _install_strands_span_wrappers
+
+    broken = types.ModuleType("strands.telemetry.tracer")
+
+    def _raise_on_access(name):
+        raise ImportError(_GUARD_SKIP_EXC_MARKER)
+
+    broken.__getattr__ = _raise_on_access  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", broken)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        _install_strands_span_wrappers()
+
+    path_records = [r for r in _warning_records(caplog) if "strands span wrappers" in r.getMessage()]
+    assert len(path_records) == 1
+
+
+def test_partial_strands_install_reports_incomplete_and_names_the_method(monkeypatch, caplog):
+    # start_agent_span wraps cleanly, but _end_span drifts. The skip message must
+    # say the install is incomplete and name the still-open method rather than
+    # claim the whole path was skipped.
+    # Standard library
+    import types
+
+    # Third-party packages
+    from strands.telemetry.tracer import Tracer
+
+    # Local modules
+    from config.telemetry_guard import _install_strands_span_wrappers
+
+    class _PartialTracerMeta(type):
+        def __getattr__(cls, name):
+            if name == "_end_span":
+                raise AttributeError(f"{_GUARD_SKIP_EXC_MARKER}:{name}")
+            raise AttributeError(name)
+
+    def _ok_start_agent_span(self, *args, **kwargs):  # pragma: no cover - not called
+        return None
+
+    class _PartialTracer(metaclass=_PartialTracerMeta):
+        start_agent_span = _ok_start_agent_span
+
+    fake_module = types.ModuleType("strands.telemetry.tracer")
+    fake_module.Tracer = _PartialTracer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", fake_module)
+
+    original_start = Tracer.start_agent_span
+    original_end = Tracer._end_span
+    try:
+        with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+            _install_strands_span_wrappers()
+    finally:
+        Tracer.start_agent_span = original_start
+        Tracer._end_span = original_end
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a partial install must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "incomplete" in text
+    assert "_end_span" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+
+
+# --- The resolved decision records which paths were skipped ---------------------
+#
+# The entrypoint uses TraceContentDecision.skipped_paths to log, at WARNING, that
+# redaction is incomplete and name the open paths, instead of claiming no content
+# is exported. Both outcomes are pinned here.
+
+
+def test_apply_records_no_skipped_paths_when_every_path_installs(monkeypatch):
+    _set_guard_env(monkeypatch, opt_in=False)
+
+    decision = apply_trace_content_guard()
+
+    assert decision.capture_enabled is False
+    assert decision.skipped_paths == ()
+
+
+def test_apply_records_skipped_paths_when_a_guard_path_fails(monkeypatch):
+    # Force the Strands wrapper install to skip; the decision must name that path
+    # so the startup posture line can report redaction is incomplete.
+    # Standard library
+    import types
+
+    # Local modules
+    import config.telemetry_guard as guard
+
+    _set_guard_env(monkeypatch, opt_in=False)
+
+    broken = types.ModuleType("strands.telemetry.tracer")
+
+    def _raise_on_access(name):
+        raise ImportError("synthetic strands import failure")
+
+    broken.__getattr__ = _raise_on_access  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", broken)
+
+    decision = guard.apply_trace_content_guard()
+
+    assert decision.capture_enabled is False
+    assert "strands span wrappers" in decision.skipped_paths
+
+
+def test_opt_in_decision_has_no_skipped_paths(monkeypatch):
+    # The opt-in installs nothing, so there is nothing to skip and the decision
+    # must not claim an incomplete redaction.
+    _set_guard_env(monkeypatch, opt_in=True)
+
+    decision = apply_trace_content_guard()
+
+    assert decision.capture_enabled is True
+    assert decision.skipped_paths == ()

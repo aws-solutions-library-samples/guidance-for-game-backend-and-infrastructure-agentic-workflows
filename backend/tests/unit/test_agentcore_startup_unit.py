@@ -587,9 +587,12 @@ class TestEntrypointTelemetryGuardWiring:
         return recorded
 
     def test_guard_applied_and_mcp_unwrapped_before_first_client(self):
-        pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
-        pytest.importorskip("mcp")
-
+        # ``mcp`` and ``aws-opentelemetry-distro`` are direct dependencies, so the
+        # ADOT MCP instrumentor must import. This test imports it directly (no
+        # importorskip): if the ADOT MCP module moves or is renamed upstream, the
+        # import fails and this required check fails rather than skipping, which is
+        # how CI catches ADOT MCP drift before a deploy leaves the MCP tool-content
+        # path open.
         recorded = self._fresh_import_with_recording()
 
         # The entrypoint created at least one MCP client during prewarm.
@@ -619,10 +622,10 @@ class TestEntrypointTelemetryGuardWiring:
         import logging
         import os
 
-        pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
-        pytest.importorskip("mcp")
-
         # Third-party packages
+        # ``mcp`` and ``aws-opentelemetry-distro`` are direct dependencies; import
+        # the ADOT MCP module directly so drift fails this check rather than
+        # skipping it.
         from strands.telemetry.tracer import Tracer
 
         # Local modules
@@ -682,3 +685,72 @@ class TestEntrypointTelemetryGuardWiring:
         assert _guard_filter_count() == filters_before
         assert not hasattr(Tracer.start_agent_span, "__wrapped__")
         assert not hasattr(Tracer._end_span, "__wrapped__")
+
+
+class TestTraceContentPostureLine:
+    """The startup posture line must match the resolved decision.
+
+    A clean redacting run says exported telemetry carries no content; a run with
+    a skipped guard path must not make that claim and must instead report, at
+    WARNING, that redaction is incomplete and name the open path.
+    """
+
+    def test_clean_redaction_logs_no_content_at_info(self):
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import TraceContentDecision
+
+        decision = TraceContentDecision(
+            capture_enabled=False,
+            capture_message_content="false",
+            semconv_opt_in="gen_ai_unredacted_attributes=",
+            skipped_paths=(),
+        )
+        log = MagicMock()
+
+        _log_trace_content_posture(decision, log)
+
+        log.info.assert_called_once()
+        log.warning.assert_not_called()
+        assert "carries no prompt or response content" in log.info.call_args.args[0]
+
+    def test_skipped_path_logs_incomplete_at_warning_and_names_the_path(self):
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import TraceContentDecision
+
+        decision = TraceContentDecision(
+            capture_enabled=False,
+            capture_message_content="false",
+            semconv_opt_in="gen_ai_unredacted_attributes=",
+            skipped_paths=("strands span wrappers",),
+        )
+        log = MagicMock()
+
+        _log_trace_content_posture(decision, log)
+
+        # It must warn, name the open path, and never claim no content is exported.
+        log.warning.assert_called_once()
+        log.info.assert_not_called()
+        rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
+        assert "redaction incomplete" in rendered.lower()
+        assert "strands span wrappers" in rendered
+        assert "carries no prompt or response content" not in rendered
+
+    def test_opt_in_logs_capture_enabled_at_warning(self):
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import TraceContentDecision
+
+        decision = TraceContentDecision(
+            capture_enabled=True,
+            capture_message_content="true",
+            semconv_opt_in="",
+            skipped_paths=(),
+        )
+        log = MagicMock()
+
+        _log_trace_content_posture(decision, log)
+
+        log.warning.assert_called_once()
+        assert "capture is ENABLED" in log.warning.call_args.args[0]

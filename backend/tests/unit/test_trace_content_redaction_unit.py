@@ -165,8 +165,12 @@ def test_strands_start_agent_span_accepts_system_prompt_kwarg():
     # Third-party packages
     from strands.telemetry.tracer import Tracer
 
-    # start_agent_span takes **kwargs and copies string kwargs onto the span, so
-    # a system_prompt keyword is a span attribute unless the guard removes it.
+    # start_agent_span takes **kwargs, so a system_prompt keyword is accepted.
+    # On Strands versions that copy raw string kwargs onto the agent span, that
+    # keyword becomes a span attribute unless the guard drops it; on versions that
+    # route the system prompt through the redaction policy instead, dropping the
+    # keyword is a no-op. The guard drops it either way, so the pin only asserts
+    # the keyword is still accepted (the behavioral tests cover redaction).
     params = inspect.signature(Tracer.start_agent_span).parameters
     assert any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
