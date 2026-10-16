@@ -9,8 +9,10 @@ two independent rules before any artifact is uploaded:
    for the tag -- is rejected.
 
 2. **Forbidden content.** No ARNs, account-ID patterns, credentials/tokens,
-   ``.env`` / ``.bedrock_agentcore`` material, private registry or internal
-   hostnames, or source-archive signatures may appear in any attached bytes.
+   ``.env`` / ``.bedrock_agentcore`` material, source-archive signatures, or any
+   hostname outside the allowlisted public package registries (an internal,
+   private, or otherwise unknown host fails closed) may appear in any attached
+   bytes.
 
 The guard is intentionally conservative: it fails closed. It reuses the
 repository public-content rules where possible but adds release-specific
@@ -186,9 +188,15 @@ def scan_content(name: str, data: bytes) -> list[str]:
         bare = host[4:] if host.startswith("www.") else host
         if host in ALLOWED_REGISTRY_HOSTS or bare in ALLOWED_REGISTRY_HOSTS:
             continue
+        # Fail closed on ANY host that is not an allowlisted public registry,
+        # not only AWS/Amazon suffixes: an unknown host (for example a private
+        # registry index URL carried in a lockfile) must not pass the scan. The
+        # specific AWS/Amazon-owned suffixes are still reported distinctly so
+        # the violation code points an operator at the likeliest leak.
         if any(host.endswith(suffix) for suffix in _NON_PUBLIC_HOST_SUFFIXES):
             violations.append("non-public-registry-host")
-            break
+        else:
+            violations.append("unexpected-host")
 
     return sorted(set(violations))
 

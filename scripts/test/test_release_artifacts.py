@@ -123,6 +123,23 @@ class ExclusionGuardTests(unittest.TestCase):
         result = artifact_guard.guard_artifacts(artifacts)
         self.assertTrue(result.ok, msg=str(result.violations))
 
+    def test_unknown_private_host_rejected(self):
+        # A host that is neither an allowlisted public registry nor an
+        # AWS/Amazon suffix (for example a private registry index URL carried in
+        # a lockfile) must fail the scan, so the guard matches its "private
+        # registry or internal hostnames" claim rather than skipping unknown
+        # hosts.
+        artifacts = _safe_set()
+        artifacts[1] = Artifact(
+            name=artifact_guard.BACKEND_SBOM_NAME,
+            data=b'{"url": "https://nexus.internal.example.com/repository/pypi/x.whl"}\n',
+        )
+        result = artifact_guard.guard_artifacts(artifacts)
+        self.assertTrue(
+            any(artifact_guard.BACKEND_SBOM_NAME in v for v in result.violations),
+            msg=f"unknown host should be rejected; violations={result.violations}",
+        )
+
     def test_credential_rejected(self):
         token = b"ghp_" + (b"a" * 36)
         artifacts = _safe_set()
