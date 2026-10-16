@@ -203,20 +203,25 @@ group. Changing these affects every X-Ray and Transaction Search consumer in the
 account.
 
 **Scope.** By default this repository's deployment scripts make **no**
-account-wide X-Ray or CloudWatch Logs changes. They read the current trace
+account-wide Transaction Search settings changes. They read the current trace
 destination, detect whether the account already supports what the runtime needs,
 and — if it does not — print an actionable warning with the opt-in instruction. A
 default deployment is **not** failed for a missing account configuration; the
 per-runtime trace delivery is still created and verified.
 
-> **Residual not controlled by this opt-in.** `agentcore launch` (run during
-> Step 2) performs its own Transaction Search setup. On an account that does not
-> yet have Transaction Search, it may switch the account trace destination to
-> `CloudWatchLogs` and create a `TransactionSearchXRayAccess` resource policy,
-> regardless of `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. This is behavior of the
-> AgentCore starter toolkit, not of this repository's scripts, and is tracked in
+> **Residual not controlled by this opt-in.** `agentcore launch` — which the
+> deploy script runs in its Step 2 and Step 5b launches — performs its own
+> Transaction Search setup on every launch, regardless of
+> `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. On an account that does not yet have
+> Transaction Search, the AgentCore starter toolkit may make up to three shared
+> changes: it adds a `TransactionSearchXRayAccess` resource policy whenever no
+> policy already has that exact name (even when this opt-in's own policy already
+> grants access), switches the account trace segment destination to
+> `CloudWatchLogs`, and sets the `Default` X-Ray indexing rule to 1% sampling.
+> This is behavior of the toolkit, not of this repository's scripts, and is
+> tracked in
 > [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
-> A read-only post-launch recheck (Step 2c) reports the resulting Transaction
+> A read-only post-launch recheck (Step 5c) reports the resulting Transaction
 > Search state without changing it.
 
 **Opt-in.** To let the deployment configure the shared settings, set the
