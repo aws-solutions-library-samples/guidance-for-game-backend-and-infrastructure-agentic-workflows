@@ -111,7 +111,11 @@ describe('/api/copilot/chat - chart fence proxy round-trip', () => {
   it('passes the chart fence through intact and the contract accepts it', async () => {
     const { req, res } = createMocks({
       method: 'POST',
-      headers: { cookie: 'cognito_access_token=access-token; cognito_id_token=id-token' },
+      headers: {
+        host: 'app.example.com',
+        origin: 'https://app.example.com',
+        cookie: 'cognito_access_token=access-token; cognito_id_token=id-token',
+      },
       body: {
         operationName: 'generateCopilotResponse',
         variables: {
