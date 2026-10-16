@@ -515,7 +515,7 @@ class TagRulesetGateTests(unittest.TestCase):
 
     def test_creation_rule_with_bypass_passes(self):
         # When the token IS a bypass actor (current_user_can_bypass=always), a
-        # creation/deletion rule no longer blocks the workflow's writes, so the
+        # creation/deletion rule does not block the workflow's writes, so the
         # gate passes.
         client = self._ruleset(["refs/tags/v*"], rules=[{"type": "creation"}, {"type": "deletion"}])
         client.ruleset_details[42]["current_user_can_bypass"] = "always"
