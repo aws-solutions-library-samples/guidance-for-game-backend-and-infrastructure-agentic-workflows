@@ -537,9 +537,9 @@ editable; while the release exists its tag cannot be deleted, and deleting the
 release makes the tag deletable but its name still cannot be reused) — holds
 only once two repository settings are enabled: GitHub's **immutable-releases**
 setting and a **`v*` tag ruleset**. The workflow cannot read the
-immutable-releases setting ahead of time with its `GITHUB_TOKEN`, so it detects
-whether the setting was in force after publication: it reads the release back
-and fails the run unless GitHub reports the release as `immutable`.
+immutable-releases setting ahead of time with its `GITHUB_TOKEN`, so it is
+enforced after publish: the run reads the release back and fails unless GitHub
+reports the release as `immutable`.
 See [docs/RELEASING.md](docs/RELEASING.md) for the release policy,
 evidence-comment format, attached artifacts, the before-first-run checklist, and
 rollback guidance.

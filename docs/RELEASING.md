@@ -183,9 +183,9 @@ Validation runs entirely before any write. In the publish job, the ordering is:
    guarded block, so an ambiguous or interrupted creation is cleaned up by
    `tag_name`);
 5. verify the **draft's** attached assets (names, sizes, and digests where
-   GitHub reports them) **before** creating the tag, so a draft asset altered
-   between upload and the tag write is caught while the draft can still be
-   cleaned up and the tag name is not yet burned;
+   GitHub reports them) **before** creating the tag, so a draft whose attached
+   assets do not match the published set at that point is caught while the draft
+   can still be cleaned up and the tag name is not yet burned;
 6. re-check `main` HEAD and tag-ref absence **immediately before** the tag
    write (closing the race between the earlier check and the write), then create
    the annotated tag object and the `refs/tags/<tag>` ref at the exact commit;
@@ -246,7 +246,11 @@ prove the server rejected the write, so a release whose publish PATCH was
 applied server-side and then answered with an error is reported as a **published
 release left intact** rather than deleted — cleanup never deletes a published
 release. On the cancel path, cleanup never leaves a stable-looking tag it had
-time to remove.
+time to remove. (One caveat: if the `v*` tag ruleset carries a `deletion` rule
+and this workflow's identity is not a bypass actor, deleting `refs/tags/<tag>`
+is itself refused, so cleanup reports the ref as left intact for manual
+recovery. Use an `update` rule, or add the workflow to the ruleset's bypass
+list, so cleanup can remove the ref — see "Recommended maintainer settings".)
 
 ### Manual recovery
 
@@ -300,11 +304,14 @@ To recover whatever remains:
    intact), go straight to that section — it names every check that failed.
 3. If only a **draft** release or an orphaned tag ref remains, delete the tag
    ref first (if it still points at the run's tag object), then delete the
-   draft, then re-dispatch. With GitHub immutable releases enabled, a deleted
-   release's tag name cannot be reused, so pick the next tag if the name was
+   draft, then re-dispatch. If the `v*` tag ruleset carries a `deletion` rule
+   and your identity is not a bypass actor, deleting the ref is refused, so
+   bypass the ruleset (or temporarily relax it) to remove the orphaned ref.
+   With GitHub immutable releases enabled, a deleted release's tag name cannot
+   be reused, so pick the next tag if the name was
    burned.
 
-### A read-back failed after publication
+#### A read-back failed after publication
 
 The publish job reads the release back and fails the run if the release is not
 immutable, if an asset or the tag does not match, or if the tag ref does not
@@ -388,6 +395,13 @@ them, with the existing `GITHUB_TOKEN`, is:
   setting is off. GitHub does not mark the release in any way — only the run
   fails — so the published release is left intact for an operator to review and
   recover (see "A read-back failed after publication" under Manual recovery).
+  Per GitHub's immutable-releases documentation, once an immutable release is
+  published its associated Git tag is locked to the commit and cannot be moved
+  or deleted while the release exists (deleting the release lets you delete the
+  tag, but its name cannot be reused), and the release assets cannot be modified
+  or deleted; only the title, notes, and the pre-release / latest flags stay
+  editable. Enabling the setting also makes GitHub generate a release
+  attestation automatically.
 - **`v*` tag ruleset (reported in a dry run, enforced before a non-dry run).**
   The `verify-environment` step reads the repository's tag-target rulesets and
   each one's ref-name conditions and rule list (`GET /repos/{owner}/{repo}/rulesets`
@@ -396,15 +410,30 @@ them, with the existing `GITHUB_TOKEN`, is:
   `refs/tags/<tag>` and restricts who may create, update, or delete it. Coverage
   is decided the way GitHub decides it — Ruby's `File.fnmatch` with
   `File::FNM_PATHNAME`, so a `*` never crosses a `/` (`refs/*` does not cover a
-  two-segment tag ref) and a `**/` segment matches zero or more directories —
-  evaluated against the exact ref being written, not a single representative
-  tag, so a ruleset that covers only part of the versioned tags (for example
-  `refs/tags/v0.*`, or `v*` minus a `v*-rc.*` exclude) does not pass for a tag
-  it does not protect. A matching ruleset counts only when it also carries at
-  least one `creation`, `update`, or `deletion` rule. A dry run only reports
-  present/absent. Before a non-dry publish the same check **fails closed**: a
-  release will not be published unless an active tag ruleset both covers the
-  dispatched tag ref and restricts who writes it.
+  two-segment tag ref), a `**/` matches zero or more directories only as a whole
+  path segment, a bracket set never matches `/`, and a backslash escapes the
+  next character — evaluated against the exact ref being written, not a single
+  representative tag, so a ruleset that covers only part of the versioned tags
+  (for example `refs/tags/v0.*`, or `v*` minus a `v*-rc.*` exclude) does not pass
+  for a tag it does not protect. A matching ruleset counts only when it also
+  carries at least one `creation`, `update`, or `deletion` rule.
+
+  Which rule type to use matters, because the publish job writes the tag ref
+  itself and deletes it during cleanup. Per GitHub's "Available rules for
+  rulesets": **`creation`** lets only bypass actors create a matching tag,
+  **`deletion`** (GitHub's default) lets only bypass actors delete one, and
+  **`update`** lets only bypass actors push to (move) one. So an **`update`**
+  rule is the one that leaves this workflow's own writes alone — it never moves
+  an existing tag — while a `creation` rule would block the workflow's tag-ref
+  write and a `deletion` rule would block cleanup's tag-ref delete, unless this
+  workflow's identity is on the ruleset's **bypass actor** list (a GitHub App /
+  `Integration` bypass actor). The single-ruleset GET returns
+  `current_user_can_bypass` for the calling token: before a non-dry publish the
+  gate **fails closed** when a covering ruleset carries `creation` or `deletion`
+  and that field is `never` or absent for the workflow token, with a remedy that
+  points at the `update` rule or a bypass-list entry. Otherwise the gate fails
+  closed only when no active tag ruleset covers the dispatched tag ref with a
+  restricting rule. A dry run only reports present/absent.
 
 Options considered for the setting check were: (a) a documentation-only
 dependency; (b) a pre-run read of the setting (not possible with the workflow
@@ -415,8 +444,9 @@ new token permission, together with the machine-checked tag-ruleset gate.
 ## Before-first-run checklist
 
 Confirm all of the following in repository settings **before the first
-dispatch, dry or not**. All but one are machine-checked by the workflow; only
-the administrator-bypass rule remains a hand check:
+dispatch, dry or not**. Most are machine-checked by the workflow; the
+administrator-bypass rule and the tag ruleset's bypass-actor list remain hand
+checks:
 
 - [ ] **`release` environment exists** and has a **required-reviewers** rule
       with at least one reviewer. (Machine-checked: `verify-environment` fails
@@ -435,10 +465,19 @@ the administrator-bypass rule remains a hand check:
       (Enforced after publish by the read-back, which fails the run unless the
       published release is `immutable`.)
 - [ ] **`v*` tag ruleset** that both covers the versioned tags and restricts who
-      can create, update, or delete release tags. (Machine-checked before a
-      non-dry run: an active tag ruleset must cover the dispatched
-      `refs/tags/<tag>` and carry at least one `creation`/`update`/`deletion`
-      rule; reported present/absent in a dry run.)
+      can create, update, or delete release tags. Prefer an **`update`** rule,
+      which leaves this workflow's own tag creation and cleanup deletion alone.
+      (Machine-checked before a non-dry run: an active tag ruleset must cover the
+      dispatched `refs/tags/<tag>` and carry at least one
+      `creation`/`update`/`deletion` rule; reported present/absent in a dry run.)
+- [ ] **`v*` tag ruleset bypass list** — if the ruleset carries a `creation` or
+      `deletion` rule, confirm this workflow's identity is a bypass actor on the
+      ruleset (otherwise the workflow cannot create the tag ref or delete it
+      during cleanup). (Partly machine-checked: the publish job fails closed
+      before the draft when a covering ruleset carries `creation`/`deletion` and
+      `current_user_can_bypass` reads `never` for the workflow token; confirm the
+      bypass-actor list by hand, since the full bypass list is not readable with
+      the workflow token.)
 
 ## Build provenance and attestation
 
@@ -453,15 +492,24 @@ workflow-signed provenance attestation is tracked as a follow-up.
 
 ## Recommended maintainer settings
 
-These harden releases further and should be configured in repository settings.
+These harden releases and, for the environment and the tag ruleset, are
+**required before a non-dry publish** (the workflow fails closed without them).
 The release tooling intentionally does not change settings, rulesets, or
-environments; several guarantees in this document depend on these being set:
+environments; the guarantees in this document depend on these being set:
 
 - **GitHub immutable releases** for the repository, so published release assets
   and tags cannot be altered after the fact. The "immutable milestone" guarantee
   above holds only once this is enabled.
-- A **`v*` tag ruleset** restricting who can create or update release tags and
-  requiring them to be created by this workflow.
+- A **`v*` tag ruleset** restricting who can move release tags. Use an
+  **`update`** rule: it restricts pushing (moving) an existing tag, which this
+  workflow never does, so it leaves the workflow's own tag creation and cleanup
+  deletion alone. A **`creation`** rule (restricting who may create a matching
+  tag) or a **`deletion`** rule (restricting who may delete one, GitHub's
+  default) would block this workflow's own writes — it creates `refs/tags/<tag>`
+  and deletes it during cleanup — unless this workflow's identity is on the
+  ruleset's **bypass actor** list; the publish job fails closed before the draft
+  if a covering ruleset carries `creation` or `deletion` and its
+  `current_user_can_bypass` reads `never` for the workflow token.
 - The **`release` environment** (used by the publish job) with **required
   reviewers**, **prevent self-review** enabled, and **administrators not allowed
   to bypass** the protection rule, plus a **deployment branch rule limiting the
