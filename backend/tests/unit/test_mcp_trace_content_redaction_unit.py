@@ -84,9 +84,11 @@ def _drive_mcp_client_span(exporter: InMemorySpanExporter) -> None:
 @pytest.fixture
 def _provider(monkeypatch):
     # ``mcp`` and ``aws-opentelemetry-distro`` are direct dependencies, so the
-    # ADOT MCP wrapper must import. Importing it directly (no importorskip) means
-    # ADOT MCP drift fails this test rather than skipping it, which is how CI
-    # catches a moved or renamed ADOT MCP module before a deploy.
+    # ADOT MCP wrapper imported where this provider's spans are driven
+    # (``_drive_mcp_client_span`` and the test body) must import. Importing it
+    # directly (no importorskip) means ADOT MCP drift fails the test rather than
+    # skipping it, which is how CI catches a moved or renamed ADOT MCP module
+    # before a deploy.
     exporter = InMemorySpanExporter()
     provider = SDKTracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))

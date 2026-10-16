@@ -18,7 +18,7 @@ OpenTelemetry log records:
   routes through its redaction policy (``gen_ai.input.messages``,
   ``gen_ai.output.messages``, ``gen_ai.system_instructions``). Omitting the token
   leaves them unredacted.
-* The Strands tracer also carries two content paths the redaction token does not
+* The Strands tracer also carries content paths the redaction token does not
   reach. On versions that copy a raw ``system_prompt`` keyword argument onto the
   ``invoke_agent`` span as a plain attribute, the distro's log-record handler
   emits it as a ``system`` message; on versions that route the system prompt
@@ -104,10 +104,10 @@ logger = logging.getLogger(__name__)
 # Fixed, bounded, content-free message logged at WARNING when a redaction guard
 # path is skipped (a missing or renamed internal, or attribute drift). A skipped
 # path leaves a content export open, so it is surfaced at WARNING -- at each
-# runtime process start, where it is visible -- rather than kept at DEBUG. The
-# log carries only this message and the skipped path name; it never includes the
-# exception message or stack trace, which can carry content. The signature-pin
-# unit tests are a separate, detail-level drift guard that runs in CI.
+# runtime process start, where an operator sees it. The log carries only this
+# message and the skipped path name; it never includes the exception message or
+# stack trace, which can carry content. The signature-pin unit tests are a
+# separate, detail-level drift guard that runs in CI.
 GUARD_PATH_SKIPPED_MESSAGE = (
     "Telemetry redaction guard path skipped; a trace-content export may be open. Path: %s. Exception type: %s."
 )
@@ -352,6 +352,8 @@ def _install_strands_span_wrappers() -> None:
 
     marker = "_gbaw_trace_content_guard"
     installed: List[str] = []
+    failed: List[str] = []
+    first_exc: Optional[BaseException] = None
 
     try:
         original_start_agent_span = Tracer.start_agent_span
@@ -365,10 +367,10 @@ def _install_strands_span_wrappers() -> None:
 
             setattr(start_agent_span, marker, True)
             Tracer.start_agent_span = start_agent_span  # type: ignore[method-assign]
-        installed.append(STRANDS_SYSTEM_PROMPT_KWARG)
+        installed.append("start_agent_span")
     except Exception as exc:
-        _warn_guard_path_skipped(_strands_skip_path(installed, "start_agent_span"), exc)
-        return
+        failed.append("start_agent_span")
+        first_exc = exc
 
     try:
         original_end_span = Tracer._end_span
@@ -400,19 +402,27 @@ def _install_strands_span_wrappers() -> None:
 
             setattr(_end_span, marker, True)
             Tracer._end_span = _end_span  # type: ignore[method-assign]
+        installed.append("_end_span")
     except Exception as exc:
-        _warn_guard_path_skipped(_strands_skip_path(installed, "_end_span"), exc)
+        failed.append("_end_span")
+        if first_exc is None:
+            first_exc = exc
+
+    if failed and first_exc is not None:
+        _warn_guard_path_skipped(_strands_skip_path(installed, failed), first_exc)
 
 
-def _strands_skip_path(installed: "List[str]", failed_method: str) -> str:
+def _strands_skip_path(installed: "List[str]", failed_methods: "List[str]") -> str:
     """Name the skipped Strands guard path, flagging a partial install.
 
-    When one of the two ``Tracer`` wrappers is already in place and the other
-    drifts, the install is incomplete rather than skipped, so name the method
-    that is still open; otherwise the whole path is skipped.
+    When one of the two ``Tracer`` wrappers is in place and the other drifts, the
+    install is incomplete rather than skipped, so name the method still open;
+    when both drift the whole path is skipped. The two methods are attempted
+    independently: a failure on one still attempts the other, so a drifted
+    ``start_agent_span`` does not leave ``_end_span`` unwrapped.
     """
     if installed:
-        return f"strands span wrappers (incomplete: {failed_method})"
+        return f"strands span wrappers (incomplete: {', '.join(failed_methods)})"
     return "strands span wrappers"
 
 
@@ -469,11 +479,16 @@ def _uninstrument_mcp() -> None:
             instrumentor.uninstrument()
         if _mcp_client_wrapper_layer_remains():
             # An MCP client wrapped the SDK before the guard ran, so an ADOT
-            # content-writing layer survives underneath. No content is logged.
+            # content-writing layer survives underneath. Record it as an open
+            # path so the startup posture line reports redaction as incomplete,
+            # and warn content-free (no tool arguments or results are logged).
             logger.warning(
                 "MCP tool-content instrumentation may remain active: an MCP client was "
                 "created before telemetry redaction was applied."
             )
+            path = "MCP tool-content instrumentation layer"
+            if _SKIPPED_PATHS is not None and path not in _SKIPPED_PATHS:
+                _SKIPPED_PATHS.append(path)
     except Exception as exc:  # pragma: no cover - defensive, never fail startup
         _warn_guard_path_skipped("MCP instrumentor uninstrument", exc)
 

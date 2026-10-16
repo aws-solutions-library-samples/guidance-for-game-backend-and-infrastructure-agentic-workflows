@@ -623,9 +623,8 @@ class TestEntrypointTelemetryGuardWiring:
         import os
 
         # Third-party packages
-        # ``mcp`` and ``aws-opentelemetry-distro`` are direct dependencies; import
-        # the ADOT MCP module directly so drift fails this check rather than
-        # skipping it.
+        # ``strands-agents`` is a direct dependency; import the Strands tracer
+        # directly so Strands drift fails this check rather than skipping it.
         from strands.telemetry.tracer import Tracer
 
         # Local modules
@@ -686,19 +685,132 @@ class TestEntrypointTelemetryGuardWiring:
         assert not hasattr(Tracer.start_agent_span, "__wrapped__")
         assert not hasattr(Tracer._end_span, "__wrapped__")
 
+    def test_entrypoint_posture_warning_names_the_skipped_path_through_logger(self):
+        """Importing the entrypoint under drift logs the posture WARNING for real.
+
+        This exercises the whole wiring: the guard records the skipped path on the
+        decision, the module-level posture call runs at import, and the WARNING is
+        rendered through the application logger (loguru). A reverted wiring, or a
+        ``%``-style posture message that loguru drops, fails this check because the
+        drifted path name never reaches the captured output.
+        """
+        # Standard library
+        import importlib
+        import logging
+        import os
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        # Third-party packages
+        from mcp.shared.session import BaseSession
+        from strands.telemetry.tracer import Tracer
+
+        # Local modules
+        from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES
+        from utils.logger import logger as app_logger
+
+        def _unwrap(method):
+            while hasattr(method, "__wrapped__"):
+                method = method.__wrapped__
+            return method
+
+        saved_start = _unwrap(Tracer.start_agent_span)
+        saved_end = _unwrap(Tracer._end_span)
+        Tracer.start_agent_span = saved_start
+        Tracer._end_span = saved_end
+        saved_filters = {name: list(logging.getLogger(name).filters) for name in MCP_EXCEPTION_LOGGER_NAMES}
+
+        otel_vars = (
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+            "OTEL_SEMCONV_STABILITY_OPT_IN",
+            "GBAW_CAPTURE_TRACE_CONTENT",
+            "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS",
+        )
+        preserved = {k: os.environ.pop(k, None) for k in otel_vars}
+
+        records: list = []
+        sink_id = app_logger.add(
+            lambda message: records.append(message),
+            level="INFO",
+            format="{level}|{message}",
+        )
+
+        sys.modules.pop("agentcore_main", None)
+        try:
+            # Simulate ``_end_span`` attribute drift: accessing it raises, so the
+            # guard wraps ``start_agent_span`` but reports ``_end_span`` as open.
+            del Tracer._end_span
+            with (
+                patch("boto3.client") as mock_boto3,
+                patch("utils.mcp_client_factory.create_mcp_client", return_value=MagicMock()),
+                patch("models.cached_bedrock.create_cached_bedrock_model", return_value=MagicMock()),
+                patch("utils.kb_tools.create_kb_retrieve_tool", return_value=MagicMock()),
+            ):
+                mock_sts = MagicMock()
+                mock_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+                mock_boto3.return_value = mock_sts
+                importlib.import_module("agentcore_main")
+        finally:
+            app_logger.remove(sink_id)
+            Tracer._end_span = saved_end
+            Tracer.start_agent_span = saved_start
+            for k, v in preserved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for name, flts in saved_filters.items():
+                lg = logging.getLogger(name)
+                for flt in list(lg.filters):
+                    if flt not in flts:
+                        lg.removeFilter(flt)
+            sys.modules.pop("agentcore_main", None)
+
+        rendered = "".join(str(r) for r in records)
+        # The posture WARNING ran at import and named the drifted path, rendered
+        # through loguru with the count and path substituted (no stray %d/%s).
+        assert "WARNING|" in rendered
+        assert "redaction incomplete" in rendered.lower()
+        assert "_end_span" in rendered
+        assert "1 guard path(s) were skipped" in rendered
+        assert "%d" not in rendered
+        assert "%s" not in rendered
+
 
 class TestTraceContentPostureLine:
     """The startup posture line must match the resolved decision.
 
     A clean redacting run says exported telemetry carries no content; a run with
     a skipped guard path must not make that claim and must instead report, at
-    WARNING, that redaction is incomplete and name the open path.
+    WARNING, that redaction is incomplete and name the open path. The posture
+    line is rendered through the application logger (loguru), which formats with
+    ``str.format`` and ignores ``%``-style positional arguments, so these tests
+    render through the real logger rather than a mock.
     """
+
+    @staticmethod
+    @contextmanager
+    def _capture_loguru():
+        """Capture rendered records from the application logger (loguru)."""
+        # Local modules
+        from utils.logger import logger as app_logger
+
+        records: list = []
+        sink_id = app_logger.add(
+            lambda message: records.append(message),
+            level="INFO",
+            format="{level}|{message}",
+        )
+        try:
+            yield records
+        finally:
+            app_logger.remove(sink_id)
 
     def test_clean_redaction_logs_no_content_at_info(self):
         # Local modules
         from agentcore_main import _log_trace_content_posture
         from config.telemetry_guard import TraceContentDecision
+        from utils.logger import logger as app_logger
 
         decision = TraceContentDecision(
             capture_enabled=False,
@@ -706,41 +818,54 @@ class TestTraceContentPostureLine:
             semconv_opt_in="gen_ai_unredacted_attributes=",
             skipped_paths=(),
         )
-        log = MagicMock()
 
-        _log_trace_content_posture(decision, log)
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
 
-        log.info.assert_called_once()
-        log.warning.assert_not_called()
-        assert "carries no prompt or response content" in log.info.call_args.args[0]
+        rendered = "".join(str(r) for r in records)
+        assert "INFO|" in rendered
+        assert "WARNING|" not in rendered
+        assert "carries no prompt or response content" in rendered
 
     def test_skipped_path_logs_incomplete_at_warning_and_names_the_path(self):
+        """The posture WARNING must substitute the count and open paths.
+
+        Rendered through the real loguru logger: ``%d``/``%s`` placeholders would
+        print literally and drop the values, so this asserts the substituted
+        values are present and no literal placeholder survives.
+        """
         # Local modules
         from agentcore_main import _log_trace_content_posture
         from config.telemetry_guard import TraceContentDecision
+        from utils.logger import logger as app_logger
 
         decision = TraceContentDecision(
             capture_enabled=False,
             capture_message_content="false",
             semconv_opt_in="gen_ai_unredacted_attributes=",
-            skipped_paths=("strands span wrappers",),
+            skipped_paths=("strands span wrappers", "memory client logging filter"),
         )
-        log = MagicMock()
 
-        _log_trace_content_posture(decision, log)
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
 
-        # It must warn, name the open path, and never claim no content is exported.
-        log.warning.assert_called_once()
-        log.info.assert_not_called()
-        rendered = log.warning.call_args.args[0] % log.warning.call_args.args[1:]
-        assert "redaction incomplete" in rendered.lower()
+        rendered = "".join(str(r) for r in records)
+        assert "WARNING|" in rendered
+        # The count and both open paths are substituted into the message.
+        assert "2 guard path(s) were skipped" in rendered
         assert "strands span wrappers" in rendered
+        assert "memory client logging filter" in rendered
+        # No literal format placeholders survive.
+        assert "%d" not in rendered
+        assert "%s" not in rendered
+        assert "redaction incomplete" in rendered.lower()
         assert "carries no prompt or response content" not in rendered
 
     def test_opt_in_logs_capture_enabled_at_warning(self):
         # Local modules
         from agentcore_main import _log_trace_content_posture
         from config.telemetry_guard import TraceContentDecision
+        from utils.logger import logger as app_logger
 
         decision = TraceContentDecision(
             capture_enabled=True,
@@ -748,9 +873,10 @@ class TestTraceContentPostureLine:
             semconv_opt_in="",
             skipped_paths=(),
         )
-        log = MagicMock()
 
-        _log_trace_content_posture(decision, log)
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
 
-        log.warning.assert_called_once()
-        assert "capture is ENABLED" in log.warning.call_args.args[0]
+        rendered = "".join(str(r) for r in records)
+        assert "WARNING|" in rendered
+        assert "capture is ENABLED" in rendered

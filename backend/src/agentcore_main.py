@@ -193,12 +193,12 @@ def _log_trace_content_posture(decision, log) -> None:
             "may carry prompt and response content."
         )
     elif decision.skipped_paths:
+        open_paths = "; ".join(decision.skipped_paths)
         log.warning(
-            "⚠️ Trace content redaction incomplete: %d guard path(s) were skipped, so some "
-            "exported telemetry may carry prompt, response, tool, or error content until fixed. "
-            "Open path(s): %s",
-            len(decision.skipped_paths),
-            "; ".join(decision.skipped_paths),
+            "⚠️ Trace content redaction incomplete: "
+            f"{len(decision.skipped_paths)} guard path(s) were skipped, so some exported telemetry "
+            "may carry content or identifiers that the skipped path would remove, until fixed. "
+            f"Open path(s): {open_paths}"
         )
     else:
         log.info("🔒 Trace content redaction active: exported telemetry carries no prompt or response content")

@@ -987,6 +987,9 @@ def test_mcp_logging_filter_install_failure_logs_warning_without_exception_text(
     assert "MCP client logging filter" in text
     assert _GUARD_SKIP_EXC_MARKER not in text
     assert all(r.exc_info is None for r in warnings)
+    # Exactly one WARNING for this path: the handler must not double-log.
+    path_records = [r for r in warnings if "MCP client logging filter" in r.getMessage()]
+    assert len(path_records) == 1
 
 
 def test_uninstrument_mcp_operational_failure_logs_warning_without_exception_text(monkeypatch, caplog):
@@ -1018,6 +1021,44 @@ def test_uninstrument_mcp_operational_failure_logs_warning_without_exception_tex
     assert "MCP instrumentor uninstrument" in text
     assert _GUARD_SKIP_EXC_MARKER not in text
     assert all(r.exc_info is None for r in warnings)
+    # Exactly one WARNING for this path: the handler must not double-log.
+    path_records = [r for r in warnings if "MCP instrumentor uninstrument" in r.getMessage()]
+    assert len(path_records) == 1
+
+
+def test_mcp_wrapper_layer_remaining_is_recorded_as_a_skipped_path(monkeypatch, caplog):
+    # When an MCP client wrapped the SDK before the guard ran, an ADOT content
+    # layer can survive uninstrument. That WARNING must also register the path on
+    # the active collector so the startup posture line reports redaction as
+    # incomplete rather than active.
+    # Standard library
+    import types
+
+    # Local modules
+    import config.telemetry_guard as guard
+
+    class _NoopInstrumentor:
+        is_instrumented_by_opentelemetry = False
+
+        def uninstrument(self):  # pragma: no cover - not reached
+            raise AssertionError("uninstrument should not run when not instrumented")
+
+    fake_module = types.ModuleType("amazon.opentelemetry.distro.instrumentation.mcp")
+    fake_module.McpInstrumentor = _NoopInstrumentor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "amazon.opentelemetry.distro.instrumentation.mcp", fake_module)
+    monkeypatch.setattr(guard, "_mcp_client_wrapper_layer_remains", lambda: True)
+
+    collector: list = []
+    monkeypatch.setattr(guard, "_SKIPPED_PATHS", collector)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        guard._uninstrument_mcp()
+
+    warnings = _warning_records(caplog)
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "may remain active" in text
+    # The path is recorded so the posture line names it as an open path.
+    assert any("MCP tool-content instrumentation layer" in p for p in collector)
 
 
 def test_each_skipped_path_warns_exactly_once(monkeypatch, caplog):
@@ -1087,6 +1128,51 @@ def test_partial_strands_install_reports_incomplete_and_names_the_method(monkeyp
     text = "\n".join(r.getMessage() for r in warnings)
     assert "incomplete" in text
     assert "_end_span" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+
+
+def test_start_agent_span_drift_still_wraps_end_span_and_names_it_incomplete(monkeypatch, caplog):
+    # start_agent_span drifts (access raises), but _end_span is sound. The two
+    # methods are wrapped independently, so _end_span must still be wrapped (its
+    # error-text content path closed) and the skip must name start_agent_span as
+    # the still-open method rather than returning before trying _end_span.
+    # Standard library
+    import types
+
+    # Local modules
+    from config.telemetry_guard import _install_strands_span_wrappers
+
+    marker_attr = "_gbaw_trace_content_guard"
+
+    def _ok_end_span(self, span, attributes=None, error=None, error_message=None):  # pragma: no cover
+        return None
+
+    class _PartialTracerMeta(type):
+        def __getattr__(cls, name):
+            if name == "start_agent_span":
+                raise AttributeError(f"{_GUARD_SKIP_EXC_MARKER}:{name}")
+            raise AttributeError(name)
+
+    class _PartialTracer(metaclass=_PartialTracerMeta):
+        _end_span = _ok_end_span
+
+    fake_module = types.ModuleType("strands.telemetry.tracer")
+    fake_module.Tracer = _PartialTracer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", fake_module)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        _install_strands_span_wrappers()
+
+    # _end_span was wrapped despite start_agent_span drift.
+    assert getattr(_PartialTracer._end_span, marker_attr, False) is True
+    assert hasattr(_PartialTracer._end_span, "__wrapped__")
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a partial install must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "incomplete" in text
+    assert "start_agent_span" in text
+    assert "_end_span" not in text
     assert _GUARD_SKIP_EXC_MARKER not in text
 
 
