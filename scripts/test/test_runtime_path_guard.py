@@ -42,6 +42,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -149,33 +150,42 @@ class RuntimeInterpreterSelection(unittest.TestCase):
     (the one whose interpreter path ``agentcore launch`` embeds) can live outside
     ``<backend>/.venv``. Both deploy paths run this guard via
     ``uv run --project <backend>``, which executes it *inside* that selected
-    environment; the running ``sys.executable`` is therefore the authoritative
-    path. These tests pin that selection by controlling ``sys.executable`` and
-    ``VIRTUAL_ENV`` exactly as ``uv run`` sets them -- no uv or real venv needed.
+    environment, so ``sys.prefix`` is the environment uv packages. uv embeds the
+    ``<env>/bin/python`` name into the console scripts and keys its
+    shebang-vs-trampoline choice on that path, while ``uv run ... python``
+    reports ``sys.executable`` as the one-byte-longer ``<env>/bin/python3``.
+    These tests pin that selection by controlling ``sys.prefix``,
+    ``sys.executable``, and ``VIRTUAL_ENV`` exactly as ``uv run`` sets them --
+    no uv or real venv needed.
     """
 
     def setUp(self) -> None:
         self._orig_executable = guard.sys.executable
+        self._orig_prefix = guard.sys.prefix
         self._orig_virtual_env = os.environ.get("VIRTUAL_ENV")
 
     def tearDown(self) -> None:
         guard.sys.executable = self._orig_executable
+        guard.sys.prefix = self._orig_prefix
         if self._orig_virtual_env is None:
             os.environ.pop("VIRTUAL_ENV", None)
         else:
             os.environ["VIRTUAL_ENV"] = self._orig_virtual_env
 
     def _simulate_uv_run(self, env_dir: str) -> None:
-        """Mimic ``uv run``: VIRTUAL_ENV is the env, sys.executable is inside it."""
+        """Mimic ``uv run ... python``: VIRTUAL_ENV and sys.prefix are the env,
+        and sys.executable is the ``python3`` name uv run canonicalizes to -- one
+        byte longer than the ``python`` name uv embeds into console scripts, so a
+        guard measuring sys.executable would over-measure by a byte."""
         os.environ["VIRTUAL_ENV"] = env_dir
+        guard.sys.prefix = env_dir
         guard.sys.executable = str(Path(env_dir) / "bin" / "python3")
 
     def test_long_project_environment_overrides_short_backend_venv(self) -> None:
         # The release-path mismatch: a SHORT backend/.venv path (would pass the
         # old reconstructing guard) while uv actually selected a LONG project
         # environment via UV_PROJECT_ENVIRONMENT. The guard must measure the
-        # real selected interpreter and REJECT it. RED against the old
-        # resolve_venv_interpreter-only guard; GREEN once sys.executable wins.
+        # python name uv embeds for the real selected environment and REJECT it.
         short_backend = Path("/srv/app/backend")
         self.assertLessEqual(
             guard.interpreter_path_bytes(guard.resolve_venv_interpreter(short_backend)),
@@ -187,6 +197,8 @@ class RuntimeInterpreterSelection(unittest.TestCase):
 
         resolved = guard.resolve_runtime_interpreter(short_backend)
         self.assertTrue(resolved.startswith(long_env), resolved)
+        # The embedded python name is measured, not a reconstructed backend path.
+        self.assertTrue(resolved.endswith("/bin/python"), resolved)
         self.assertGreater(guard.interpreter_path_bytes(resolved), INTERPRETER_BYTE_LIMIT)
         self.assertFalse(
             guard.venv_python_is_bootable(resolved, os_name="posix"),
@@ -202,23 +214,55 @@ class RuntimeInterpreterSelection(unittest.TestCase):
         self.assertTrue(resolved.startswith(short_env), resolved)
         self.assertTrue(guard.venv_python_is_bootable(resolved, os_name="posix"))
 
+    def test_embedded_python_name_measured_not_longer_executable(self) -> None:
+        # The boundary defect, as a unit: uv embeds `<env>/bin/python` (124
+        # bytes, bootable) into the console scripts, while uv run reports
+        # sys.executable as the one-byte-longer `<env>/bin/python3` (125 bytes).
+        # A guard measuring sys.executable would FALSELY REJECT this bootable
+        # runtime. The guard must measure the embedded `python` name and accept
+        # it. RED if the guard returns the longer sys.executable.
+        env_dir = "/" + "e" * 108 + "/env"  # <env>/bin/python == 124, python3 == 125
+        self._simulate_uv_run(env_dir)
+        self.assertEqual(
+            guard.interpreter_path_bytes(str(Path(env_dir) / "bin" / "python3")), INTERPRETER_BYTE_LIMIT + 1
+        )
+        resolved = guard.resolve_runtime_interpreter(Path("/srv/app/backend"))
+        self.assertTrue(resolved.endswith("/bin/python"), resolved)
+        self.assertEqual(guard.interpreter_path_bytes(resolved), INTERPRETER_BYTE_LIMIT)
+        self.assertTrue(guard.venv_python_is_bootable(resolved, os_name="posix"))
+
+    def test_embedded_python_over_limit_is_rejected(self) -> None:
+        # When the embedded `python` name itself exceeds 124 bytes uv ships a
+        # trampoline; the guard must reject it. python == 125 here.
+        env_dir = "/" + "e" * 109 + "/env"  # <env>/bin/python == 125
+        self._simulate_uv_run(env_dir)
+        self.assertEqual(
+            guard.interpreter_path_bytes(str(Path(env_dir) / "bin" / "python")), INTERPRETER_BYTE_LIMIT + 1
+        )
+        resolved = guard.resolve_runtime_interpreter(Path("/srv/app/backend"))
+        self.assertTrue(resolved.endswith("/bin/python"), resolved)
+        self.assertFalse(guard.venv_python_is_bootable(resolved, os_name="posix"))
+
     def test_falls_back_to_backend_venv_outside_project_environment(self) -> None:
         # A bare system python3 (no VIRTUAL_ENV, executable not under
         # backend/.venv) is not trusted to represent the runtime, so the guard
         # falls back to the deterministic backend/.venv reconstruction.
         os.environ.pop("VIRTUAL_ENV", None)
         guard.sys.executable = "/usr/bin/python3"
+        guard.sys.prefix = "/usr"
         backend = REPOSITORY_ROOT / "backend"
         resolved = guard.resolve_runtime_interpreter(backend)
         self.assertEqual(resolved, guard.resolve_venv_interpreter(backend))
 
     def test_default_venv_layout_is_trusted_without_virtual_env(self) -> None:
-        # A direct `<backend>/.venv/bin/python3 check_runtime_path.py` call sets
+        # A direct `<backend>/.venv/bin/python check_runtime_path.py` call sets
         # no VIRTUAL_ENV but still runs the real runtime interpreter; the guard
-        # must trust it via the default-layout check and measure sys.executable.
+        # must trust it via the default-layout check and measure the embedded
+        # python name derived from the environment prefix.
         os.environ.pop("VIRTUAL_ENV", None)
         backend = Path("/srv/app/backend")
-        guard.sys.executable = str(backend / ".venv" / "bin" / "python3")
+        guard.sys.prefix = str(backend / ".venv")
+        guard.sys.executable = str(backend / ".venv" / "bin" / "python")
         resolved = guard.resolve_runtime_interpreter(backend)
         self.assertEqual(resolved, os.path.abspath(guard.sys.executable))
 
@@ -297,13 +341,16 @@ class RuntimePathCli(unittest.TestCase):
     def _run_default_path(self, *, virtual_env: str, executable_env: str) -> subprocess.CompletedProcess:
         """Invoke the CLI with NO ``--interpreter`` so it exercises the default
         ``resolve_runtime_interpreter`` path, with ``VIRTUAL_ENV`` and a
-        bootstrap interpreter chosen to mimic ``uv run`` selecting ``executable_env``.
+        bootstrap that points ``sys.prefix`` (and ``sys.executable``) at the
+        simulated uv-selected environment, exactly as ``uv run`` presents it.
         """
         # A tiny bootstrap re-execs the guard's main() after pointing
-        # sys.executable at the simulated uv-selected environment interpreter,
-        # exactly as `uv run` would present it to the guard process.
+        # sys.prefix and sys.executable at the simulated uv-selected environment,
+        # exactly as `uv run` would present them to the guard process. The guard
+        # derives the embedded `<prefix>/bin/python` name from sys.prefix.
         bootstrap = (
             "import os, sys, runpy;"
+            f"sys.prefix = {virtual_env!r};"
             f"sys.executable = {executable_env!r};"
             f"sys.argv = [{str(GUARD_PY)!r}, '--backend-dir', '/srv/app/backend'];"
             f"runpy.run_path({str(GUARD_PY)!r}, run_name='__main__')"
@@ -407,6 +454,15 @@ class UvGeneratedEntrypointBoundary(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         cls._tmp.cleanup()
+
+    def setUp(self) -> None:
+        # Short, process-unique env bases created outside the class temp dir
+        # (which is too long for the 124/125 boundary); cleaned up per test.
+        self._env_bases: list[Path] = []
+
+    def tearDown(self) -> None:
+        for base in self._env_bases:
+            shutil.rmtree(base, ignore_errors=True)
 
     def _make_venv_with_interpreter_bytes(self, target_bytes: int) -> tuple[str, str] | None:
         """Create a uv venv whose POSIX ``bin/python3`` path is ``target_bytes``.
@@ -542,6 +598,146 @@ class UvGeneratedEntrypointBoundary(unittest.TestCase):
         self.assertIn("124", combined)
         # Remediation must name the override, not misdirect to shortening the checkout.
         self.assertIn("UV_PROJECT_ENVIRONMENT", combined)
+
+    def _run_guard_via_uv_run(self, backend: Path, env_dir: Path) -> subprocess.CompletedProcess:
+        """Run the guard exactly as the deploy scripts do: ``uv run --project
+        <backend> python check_runtime_path.py`` with ``env_dir`` selected via
+        ``UV_PROJECT_ENVIRONMENT``. This executes the guard inside the uv-selected
+        environment, so it measures what uv embeds for that environment.
+        """
+        env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(env_dir))
+        return subprocess.run(
+            ["uv", "run", "--project", str(backend), "python", str(GUARD_PY), "--backend-dir", str(backend)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def _short_env_base(self) -> Path | None:
+        """A short, process-unique base directory for building boundary envs.
+
+        The 124/125-byte boundary leaves no room for a long system temp prefix
+        (macOS ``/var/folders/...`` is ~50 bytes), so these tests need a short
+        absolute root. Prefer ``/tmp`` (POSIX deploy hosts have it); fall back to
+        the system temp dir when it is short enough. Returns ``None`` when no
+        base is short enough to construct the target boundary path.
+        """
+        for candidate in ("/tmp", tempfile.gettempdir()):
+            root = Path(candidate)
+            if not root.is_dir():
+                continue
+            try:
+                base = Path(tempfile.mkdtemp(prefix="g524_", dir=str(root)))
+            except OSError:
+                continue
+            self._env_bases.append(base)
+            return base
+        return None
+
+    def _boundary_backend_and_env(self, python_bytes: int) -> tuple[Path, Path, bool, str] | None:
+        """Build a backend project that depends on the local wheel plus a
+        not-yet-created ``UV_PROJECT_ENVIRONMENT`` whose ``<env>/bin/python`` is
+        exactly ``python_bytes``; let ``uv sync`` create that env (the real
+        deploy flow ``agentcore launch`` packages) and return
+        ``(backend, env_dir, uv_bootable, first_line)`` where ``uv_bootable`` is
+        True when uv wrote a portable ``#!`` shebang and False when it wrote the
+        unbootable ``/bin/sh`` trampoline.
+
+        ``uv sync`` writes each console script's launcher line against
+        ``<env>/bin/python`` and keys the shebang-vs-trampoline choice on that
+        path's byte length. ``uv run ... python`` then reports ``sys.executable``
+        as the one-byte-longer ``<env>/bin/python3``, so a guard measuring
+        ``sys.executable`` over-measures by a byte on the boundary.
+        """
+        base = self._short_env_base()
+        if base is None:
+            return None
+        backend = base / "backend"
+        backend.mkdir()
+        wheel_url = self._wheel.resolve().as_uri()
+        (backend / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "beb"\n'
+            'version = "0.0.1"\n'
+            'requires-python = ">=3.8"\n'
+            f'dependencies = ["samplepkg @ {wheel_url}"]\n',
+            encoding="utf-8",
+        )
+        # uv resolves the base through any symlink (e.g. macOS /tmp -> /private/tmp)
+        # before measuring, so size the name against the real path uv will see.
+        real_base = Path(os.path.realpath(str(base)))
+        tail = "/bin/python"
+        name_len = python_bytes - len(os.fsencode(str(real_base))) - 1 - len(tail)
+        if name_len < 1:
+            return None
+        env_dir = real_base / ("v" * name_len)  # must NOT pre-exist; uv sync creates it
+        if len(os.fsencode(str(env_dir / "bin" / "python"))) != python_bytes:
+            return None
+        synced = subprocess.run(
+            ["uv", "sync"],
+            cwd=str(backend),
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, UV_PROJECT_ENVIRONMENT=str(env_dir)),
+        )
+        if synced.returncode != 0:
+            return None
+        script = env_dir / "bin" / "sampletool"
+        if not script.exists():
+            return None
+        first_line = script.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        uv_bootable = first_line.startswith("#!") and not first_line.startswith("#!/bin/sh")
+        return backend, env_dir, uv_bootable, first_line
+
+    def test_guard_through_uv_run_matches_uv_artifact_at_124_bytes(self) -> None:
+        # The boundary false-rejection this fix closes. `uv sync` creates a
+        # UV_PROJECT_ENVIRONMENT whose `<env>/bin/python` is 124 bytes, so uv
+        # writes a portable shebang -- the runtime is BOOTABLE. Under `uv run ...
+        # python`, sys.executable is the one-byte-longer `<env>/bin/python3`
+        # (125 bytes), so a guard measuring sys.executable reads 125 and FALSELY
+        # REJECTS a bootable runtime. Measuring the embedded `<env>/bin/python`
+        # (124) agrees with uv and passes. RED (exit!=0) on the old
+        # sys.executable measurement; GREEN (exit 0) on the embedded-name one.
+        made = self._boundary_backend_and_env(124)
+        if made is None:
+            self.skipTest("no short temp base to construct a 124-byte env interpreter path")
+        backend, env_dir, uv_bootable, first_line = made
+        self.assertTrue(uv_bootable, f"expected a portable shebang at python=124 bytes: {first_line!r}")
+        result = self._run_guard_via_uv_run(backend, env_dir)
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"guard must pass a 124-byte-python bootable env uv ships as a shebang: "
+            f"{first_line!r}\n{result.stdout}{result.stderr}",
+        )
+
+    def test_guard_through_uv_run_matches_uv_artifact_at_125_bytes(self) -> None:
+        # The other side of the boundary: `uv sync` creates a
+        # UV_PROJECT_ENVIRONMENT whose `<env>/bin/python` is 125 bytes, so uv
+        # writes a `/bin/sh` trampoline -- UNBOOTABLE. The guard must reject it.
+        made = self._boundary_backend_and_env(125)
+        if made is None:
+            self.skipTest("no short temp base to construct a 125-byte env interpreter path")
+        backend, env_dir, uv_bootable, first_line = made
+        self.assertFalse(
+            uv_bootable,
+            f"expected uv to emit a /bin/sh trampoline at python=125 bytes: {first_line!r}",
+        )
+        # The embedded `python` name is 125 bytes (over the limit); the guard
+        # must reject it. `python3` would be 126 bytes -- either reading rejects
+        # here, so this side confirms the guard does not wrongly accept.
+        self.assertEqual(
+            guard.interpreter_path_bytes(str(env_dir / "bin" / "python")),
+            INTERPRETER_BYTE_LIMIT + 1,
+            "precondition: the embedded python name is 125 bytes (over the limit)",
+        )
+        result = self._run_guard_via_uv_run(backend, env_dir)
+        self.assertNotEqual(
+            result.returncode,
+            0,
+            f"guard must reject a 125-byte-python env uv ships as a /bin/sh trampoline: {result.stdout}{result.stderr}",
+        )
+        self.assertIn("125", result.stdout + result.stderr)
 
 
 def _strip_shell_comments(text: str) -> str:

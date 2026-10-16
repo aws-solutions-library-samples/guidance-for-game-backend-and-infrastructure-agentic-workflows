@@ -41,17 +41,24 @@ Three facts drive this guard and were the root causes of the first rejected fix:
    (``uv_trampoline_builder::windows_script_launcher``) that natively supports
    long and relocatable paths, so a POSIX shebang predicate must **not** reject
    a Windows interpreter path.
-3. The path that matters is the **actual interpreter uv selected** for the
-   project environment and wrote the console scripts against
-   (``layout.sys_executable``). uv 0.12.0 lets ``UV_PROJECT_ENVIRONMENT``
+3. The path that matters is the **actual interpreter name uv embeds** into the
+   console scripts for the selected project environment. ``agentcore launch``
+   packages the scripts ``uv sync`` generates, and uv writes each POSIX script's
+   launcher line against ``<env>/bin/python`` and keys its shebang-vs-trampoline
+   choice on that path's byte length. uv 0.12.0 lets ``UV_PROJECT_ENVIRONMENT``
    redirect that environment away from ``<backend>/.venv``, so a guard that
-   reconstructs ``.venv/bin/python3`` from the backend directory can measure a
-   *different* interpreter than the one that ships -- passing a short synthetic
-   path while uv packages a long real one. Both deploy paths invoke this guard
-   with ``uv run --project <backend>``, which runs it *inside* that selected
-   environment, so the running ``sys.executable`` IS the interpreter uv embeds.
-   The guard therefore measures ``sys.executable`` by default and treats the
-   backend ``.venv`` reconstruction only as a fallback for a non-uv invocation.
+   reconstructs a path from the backend directory can measure a *different*
+   interpreter than the one that ships -- passing a short synthetic path while
+   uv packages a long real one. Both deploy paths invoke this guard with
+   ``uv run --project <backend> python``, which runs it *inside* that selected
+   environment, so ``sys.prefix`` is the environment uv packages. The guard
+   derives the environment from ``sys.prefix`` and measures ``<env>/bin/python``,
+   the exact path uv embeds. ``sys.executable`` is deliberately NOT measured:
+   a process launched as ``uv run ... python`` reports ``<env>/bin/python3``,
+   one byte longer than the ``<env>/bin/python`` uv embeds, which on the exact
+   124/125-byte boundary would reject a runtime uv actually ships as bootable.
+   The backend ``.venv`` reconstruction is only a fallback for a non-uv
+   invocation.
 
 This module is both an importable predicate (for tests) and a CLI the shell and
 PowerShell deploy paths invoke right after local ``uv sync`` and before the
@@ -131,21 +138,22 @@ def resolve_venv_interpreter(backend_dir: Path) -> str:
     """Reconstruct the deterministic ``.venv`` interpreter path under ``backend_dir``.
 
     This is a **fallback** for a non-uv invocation only. It assumes uv's default
-    project environment layout (``.venv/bin/python3`` on POSIX,
-    ``.venv/Scripts/python.exe`` on Windows). It must NOT be used when the guard
-    runs inside the uv-selected environment, because ``UV_PROJECT_ENVIRONMENT``
-    can point the real environment elsewhere; use :func:`resolve_runtime_interpreter`
+    project environment layout (``.venv/bin/python`` on POSIX,
+    ``.venv/Scripts/python.exe`` on Windows) and the ``python`` interpreter name
+    uv embeds into the console scripts. It must NOT be used when the guard runs
+    inside the uv-selected environment, because ``UV_PROJECT_ENVIRONMENT`` can
+    point the real environment elsewhere; use :func:`resolve_runtime_interpreter`
     for the authoritative selection.
 
-    The path is returned absolute and unresolved: uv embeds the path as invoked
-    (``layout.sys_executable``), and symlink resolution could mask the real
-    on-disk length that ships in the trampoline.
+    The path is returned absolute and unresolved: uv embeds the path as invoked,
+    and symlink resolution could mask the real on-disk length that ships in the
+    trampoline.
     """
     venv_dir = backend_dir / ".venv"
     if os.name == "nt":
         interpreter = venv_dir / "Scripts" / "python.exe"
     else:
-        interpreter = venv_dir / "bin" / "python3"
+        interpreter = venv_dir / "bin" / "python"
     return os.path.abspath(interpreter)
 
 
@@ -172,21 +180,45 @@ def _running_in_project_environment(backend_dir: Path) -> bool:
     return any(candidate in executable.parents for candidate in candidates)
 
 
-def resolve_runtime_interpreter(backend_dir: Path) -> str:
-    """Resolve the interpreter uv wrote the venv's console scripts against.
+def _embedded_interpreter_name_for_prefix(prefix: str) -> str:
+    """Interpreter path uv embeds into console scripts for environment ``prefix``.
 
-    Prefer the running ``sys.executable`` when the guard is executing inside the
-    uv-selected project environment: that is exactly the interpreter whose path
-    uv embeds into the console scripts that ``agentcore launch`` packages,
-    including any ``UV_PROJECT_ENVIRONMENT`` redirect. Only when the guard is
-    *not* running inside that environment (a bare ``python3`` fallback before
-    the venv is usable) do we reconstruct the deterministic ``.venv`` path, so
-    the length/space check stays meaningful.
+    ``agentcore launch`` packages the console scripts ``uv sync`` generates for
+    the project environment. uv writes each POSIX script's launcher line against
+    the environment's ``<env>/bin/python`` interpreter and keys its
+    shebang-vs-trampoline choice on that path's byte length. ``sys.prefix`` is
+    the environment uv selected and packages -- including a
+    ``UV_PROJECT_ENVIRONMENT`` redirect -- so ``<prefix>/bin/python`` is the
+    exact path whose length decides whether the shipped script is a portable
+    shebang or an unbootable ``/bin/sh`` trampoline. On Windows the native
+    launcher makes the name immaterial; ``Scripts/python.exe`` is returned for
+    symmetry.
+    """
+    prefix_path = Path(os.path.abspath(prefix))
+    if os.name == "nt":
+        return os.path.abspath(prefix_path / "Scripts" / "python.exe")
+    return os.path.abspath(prefix_path / "bin" / "python")
+
+
+def resolve_runtime_interpreter(backend_dir: Path) -> str:
+    """Resolve the interpreter path uv embeds into the venv's console scripts.
+
+    When the guard is executing inside the uv-selected project environment,
+    derive the environment from ``sys.prefix`` (which honors any
+    ``UV_PROJECT_ENVIRONMENT`` redirect) and return the ``<env>/bin/python``
+    interpreter name uv writes into the console scripts that ``agentcore
+    launch`` packages -- the path whose byte length decides uv's
+    shebang-vs-trampoline choice. ``sys.executable`` is unreliable for this: a
+    process launched as ``uv run ... python`` reports ``<env>/bin/python3``, one
+    byte longer than the ``<env>/bin/python`` uv embeds, which would reject a
+    bootable runtime on the exact byte boundary. Only when the guard is *not*
+    running inside that environment (a bare ``python3`` fallback before the venv
+    is usable) is the deterministic ``.venv`` path reconstructed instead.
 
     Returned absolute and unresolved (see :func:`resolve_venv_interpreter`).
     """
     if _running_in_project_environment(backend_dir):
-        return os.path.abspath(sys.executable)
+        return _embedded_interpreter_name_for_prefix(sys.prefix)
     return resolve_venv_interpreter(backend_dir)
 
 
