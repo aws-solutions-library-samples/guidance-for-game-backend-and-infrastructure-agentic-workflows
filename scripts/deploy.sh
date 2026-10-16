@@ -85,19 +85,33 @@ echo ""
 # Preflight: install backend dependencies locally, then guard against an
 # unbootable long-path runtime BEFORE any AWS-mutating command runs (#517).
 #
-# `agentcore launch` (Step 2) packages this venv's console scripts into
-# dependencies.zip. When the venv interpreter path is over the uv shebang byte
-# limit or contains a space, uv emits a /bin/sh trampoline embedding the
-# absolute local path instead of a portable shebang, producing a runtime that
-# dies at exec — silently, because deploy still exits 0 and the control plane
-# reaches READY. Running the check here, right after local `uv sync` and before
-# Step 0.5 (the first `aws cloudformation deploy`), means a doomed deploy fails
-# fast with a clear remediation and leaves zero AWS side effects behind.
+# `agentcore launch` (Step 2) does not ship this venv's console scripts: the
+# AgentCore starter toolkit rebuilds a dependency bundle with its own
+# `uv pip install --target` inside the uv-selected project environment and zips
+# that into dependencies.zip. uv selects <env>/bin/python3 for that install and
+# embeds its absolute local path into each console script's launcher line. When
+# that interpreter path is over the uv shebang byte limit or contains a space,
+# uv emits a /bin/sh trampoline instead of a portable shebang, producing a
+# runtime that dies at exec — silently, because deploy still exits 0 and the
+# control plane reaches READY. Running the check here, right after local
+# `uv sync` and before Step 0.5 (the first `aws cloudformation deploy`), means a
+# doomed deploy fails fast with a clear remediation and leaves zero AWS side
+# effects behind. The guard runs from inside the physical backend directory
+# (the same working directory `agentcore launch` resolves the project from) so
+# it measures the interpreter path that actually ships.
 echo "📦 Preflight: Installing backend dependencies..."
-(cd "$PROJECT_ROOT/backend" && uv sync > /dev/null 2>&1)
+if ! _uv_sync_out=$(cd "$PROJECT_ROOT/backend" && uv sync 2>&1); then
+    echo "❌ Preflight: 'uv sync' failed:" >&2
+    echo "$_uv_sync_out" >&2
+    exit 1
+fi
 echo "🔎 Preflight: Verifying the runtime interpreter path is bootable..."
-uv run --project "$PROJECT_ROOT/backend" python \
-  "$SCRIPT_DIR/infrastructure/check_runtime_path.py" --backend-dir "$PROJECT_ROOT/backend"
+(
+  cd "$PROJECT_ROOT/backend"
+  _backend_physical="$(pwd -P)"
+  uv run python \
+    "$SCRIPT_DIR/infrastructure/check_runtime_path.py" --backend-dir "$_backend_physical"
+)
 echo "✅ Runtime interpreter path is portable"
 echo ""
 

@@ -122,18 +122,25 @@ function Deploy-GameAgent {
     # ── Preflight: local dependency setup + runtime path guard (#517) ──
     # Install backend dependencies locally and verify the venv interpreter path
     # is bootable BEFORE any AWS-mutating command. agentcore launch (Step 2)
-    # packages this venv's console scripts into dependencies.zip; an over-limit
-    # or space-bearing POSIX interpreter path makes uv emit a /bin/sh trampoline
-    # that dies at exec in the container — silently, since deploy still exits 0
-    # and the control plane reaches READY. Running the guard here, after local
-    # `uv sync` and before Step 1 (the first stack deploy), fails a doomed
-    # deploy fast with zero AWS side effects. On native Windows the shared guard
-    # is a no-op (uv ships a native launcher binary, not a shebang trampoline).
+    # does not ship this venv's console scripts: the AgentCore starter toolkit
+    # rebuilds a dependency bundle with its own `uv pip install --target` inside
+    # the uv-selected project environment and zips that into dependencies.zip.
+    # uv selects <env>/bin/python3 for that install and embeds its absolute
+    # local path; an over-limit or space-bearing POSIX interpreter path makes uv
+    # emit a /bin/sh trampoline that dies at exec in the container — silently,
+    # since deploy still exits 0 and the control plane reaches READY. Running
+    # the guard here, after local `uv sync` and before Step 1 (the first stack
+    # deploy), fails a doomed deploy fast with zero AWS side effects. On native
+    # Windows the shared guard is a no-op (uv ships a native launcher binary,
+    # not a shebang trampoline).
     Write-GameAgentStatus 'Preflight: Installing backend dependencies...' -Type Info
     Push-Location $backendPath
     try {
-        uv sync 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
+        $uvSyncOutput = uv sync 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $uvSyncOutput | ForEach-Object { Write-GameAgentStatus $_ -Type Error }
+            throw "uv sync failed (exit code $LASTEXITCODE)"
+        }
     } finally { Pop-Location }
     Write-GameAgentStatus 'Preflight: Verifying the runtime interpreter path is bootable...' -Type Info
     Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
@@ -223,10 +230,13 @@ function Deploy-GameAgent {
     Push-Location $backendPath
     try {
         Write-GameAgentStatus 'Installing backend dependencies...' -Type Info
-        uv sync 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
-        # The preflight already synced and verified this venv is bootable (#517);
-        # this re-sync is idempotent and keeps Step 2 self-contained.
+        # This re-sync is idempotent and keeps Step 2 self-contained; the
+        # runtime path guard runs in the earlier preflight block.
+        $uvSyncOutput = uv sync 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $uvSyncOutput | ForEach-Object { Write-GameAgentStatus $_ -Type Error }
+            throw "uv sync failed (exit code $LASTEXITCODE)"
+        }
 
         # Resolve both model roles through the canonical Python configuration.
         $settingsLoader = Join-Path $repoRoot 'config/load_deployment_settings.py'

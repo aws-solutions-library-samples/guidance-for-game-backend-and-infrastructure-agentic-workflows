@@ -23,9 +23,10 @@ function Test-GameAgentRuntimePath {
     .PARAMETER GuardRunner
         Optional scriptblock that runs the shared guard and returns a hashtable
         with ExitCode and Output keys. Injected by tests to avoid invoking uv or
-        touching a real venv; defaults to running the Python guard through the
-        backend venv so it measures the same interpreter uv wrote the console
-        scripts against.
+        touching a real venv; defaults to running the Python guard from inside
+        the physical backend directory (the working directory `agentcore launch`
+        resolves the project from) so it measures the same interpreter uv embeds
+        into the packaged console scripts.
     .EXAMPLE
         Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
     #>
@@ -48,10 +49,18 @@ function Test-GameAgentRuntimePath {
     if (-not $GuardRunner) {
         $GuardRunner = {
             param([string]$Script, [string]$Backend)
-            # Run the shared guard through the backend venv so it measures the
-            # same interpreter uv wrote the console scripts against.
-            $output = (uv run --project $Backend python $Script --backend-dir $Backend 2>&1) | Out-String
-            return @{ ExitCode = $LASTEXITCODE; Output = $output }
+            # Run the shared guard from inside the physical backend directory —
+            # the same working directory `agentcore launch` resolves the project
+            # from — so uv selects the same environment and the guard measures
+            # the interpreter path that actually ships. Push-Location then
+            # $PWD.ProviderPath canonicalizes a symlinked checkout path.
+            Push-Location $Backend
+            try {
+                $physicalBackend = $PWD.ProviderPath
+                $output = (uv run python $Script --backend-dir $physicalBackend 2>&1) | Out-String
+                $exit = $LASTEXITCODE
+            } finally { Pop-Location }
+            return @{ ExitCode = $exit; Output = $output }
         }
     }
 
