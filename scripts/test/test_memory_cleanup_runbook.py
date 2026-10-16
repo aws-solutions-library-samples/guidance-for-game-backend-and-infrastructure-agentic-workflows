@@ -48,8 +48,7 @@ DIGIT_UUID_NS = "7f3e9a10-1b2c-4d5e-8f90-a1b2c3d4e5f6"
 UPPER_NS = "Z9-test"
 ANON_NS = "anonymous"
 
-# A plain 64-hex digest actor (kept) and a strategy-path namespace (not a prefix
-# of any single character the discovery enumerates, so it is never listed).
+# A plain 64-hex digest actor (kept) is never a leftover.
 DIGEST_NS = "d4c3b2a1" + "0" * 56
 
 # The fake aws CLI. It serves list-memory-records from a per-namespace fixture as
@@ -96,6 +95,13 @@ if args[:2] == ["bedrock-agentcore", "list-memory-records"]:
     namespace = option("--namespace") or ""
     query = option("--query") or ""
     fixtures = state["records"]  # {namespace: [recordId, ...]}
+
+    # A chosen set of prefixes fails the listing, as expired credentials or a
+    # missing permission would, so a test can exercise the discovery abort.
+    if namespace in state.get("fail_prefixes", []):
+        save()
+        sys.stderr.write("ExpiredTokenException: the security token has expired\n")
+        sys.exit(254)
 
     # --namespace is a server-side prefix filter: build the flat, ordered list of
     # (namespace, recordId) summaries whose namespace starts with the prefix.
@@ -227,8 +233,8 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         state: dict = json.loads(self.state_path.read_text())
         return state
 
-    def _write_state(self, records: dict) -> None:
-        self.state_path.write_text(json.dumps({"records": records, "calls": []}))
+    def _write_state(self, records: dict, fail_prefixes: list | None = None) -> None:
+        self.state_path.write_text(json.dumps({"records": records, "calls": [], "fail_prefixes": fail_prefixes or []}))
 
     def _run(self, script: str) -> subprocess.CompletedProcess:
         env = dict(os.environ)
@@ -277,6 +283,26 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
             any(call[:2] == ["bedrock-agentcore", "list-actors"] for call in self._state()["calls"]),
             "discovery must not use list-actors",
         )
+
+    def test_discovery_aborts_on_a_listing_failure(self) -> None:
+        # When a listing fails (expired credentials, a missing permission), Step 1
+        # must stop with a non-zero status and print nothing on stdout, so a
+        # partial namespace list is never mistaken for the complete set. A
+        # digit-leading namespace is listed before the failing "a" prefix, so a
+        # mutation that only breaks the loop (leaving the collected rows to be
+        # classified) is still caught by the empty-stdout assertion.
+        self._write_state(
+            {
+                DIGIT_UUID_NS: ["mem-" + "g" * 40],
+                UUID_NS: ["mem-" + "u" * 40],
+                ANON_NS: ["mem-" + "n" * 40],
+            },
+            fail_prefixes=["a"],
+        )
+        result = self._run(self.blocks[1])  # Step 1 discovery
+        self.assertNotEqual(result.returncode, 0, "a failed listing must abort discovery")
+        self.assertEqual(result.stdout.strip(), "", "no namespaces may be printed when discovery is incomplete")
+        self.assertIn("discovery is incomplete", result.stderr)
 
     def test_dry_run_steps_delete_nothing(self) -> None:
         self._write_state({PREFIX_DIGEST_NS: ["mem-" + "d" * 40], OLD_NS: ["mem-" + "o" * 40]})
@@ -357,6 +383,13 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
 
     def test_dry_run_shows_namespace_and_createdat(self) -> None:
         self.assertIn("createdAt", self.section, "the dry run must show createdAt")
+
+    def test_no_pagination_truncation_flags(self) -> None:
+        # The CLI follows nextToken itself; adding --no-paginate or --max-items
+        # would truncate the listing to one page (or N items) and delete only
+        # part of the namespace. Neither flag may appear in any bash block.
+        self.assertNotIn("--no-paginate", self.bash, "no bash block may use --no-paginate (truncates to one page)")
+        self.assertNotIn("--max-items", self.bash, "no bash block may use --max-items (truncates the listing)")
 
 
 if __name__ == "__main__":
