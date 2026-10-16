@@ -7,7 +7,7 @@
 
 ## Status Rationale
 
-This record is **Proposed**. It follows ADR 0005's two-step acceptance path:
+This record is **Proposed**. It follows ADR 0005's acceptance path:
 this record merges as **Proposed**, and a later small pull request flips it to
 **Accepted**. That follow-up changes the `Status:` line to `Accepted`, adds an
 `Accepted:` date line (matching ADR 0005's format), rewrites this paragraph to
@@ -23,48 +23,44 @@ repeatable path, not on the summarized numbers in the Evidence section.
 
 "Reproduced" has a specific meaning here: the committed measurement artifacts,
 run in the pinned CI image, confirm each Evidence E-result's **conclusion**
-(for example, "the current UI's chunks carry no Cloudscape code", "the strict
-policy reports exactly three `style-src-attr` violations against server
-attributes", "the Cloudscape shell server-renders with no hydration warnings"),
+(for example, "the current UI's chunks carry no Cloudscape code", "every
+strict-policy violation is a `style-src-attr` report against a server-rendered
+attribute", "the Cloudscape shell server-renders with no hydration warnings"),
 with the absolute sizes re-baselined in that image rather than matched to the
 spike's numbers. Absolute byte-for-byte equality is explicitly not the bar:
-gzip sizes depend on the zlib build in the Node that runs the check, and the
-#547 bundle baseline already records the same build output measuring about
-6 KiB smaller for `/` under an older zlib — 828.4 KiB in the CI image against
-the spike's 822.6 KiB. Growth is therefore judged only against a measurement
-taken in the same CI image, re-recorded whenever that image is bumped.
+gzip sizes depend on the zlib build in the Node that runs the check. Measured
+for #547 in the CI image, `/` is 828.4 KiB against the spike's 822.6 KiB, and
+the same build output measures about 6 KiB smaller under a Node with zlib
+1.2.12. Growth is therefore judged only against a measurement taken in the same
+CI image, re-recorded whenever that image is bumped.
 
 The acceptance precondition is that these E1–E11 conclusions are reproduced by
 committed measurement artifacts owned across the child issues and that the
 reproduction is reviewed and accepted:
 
-- #547 owns the bundle-size and content-isolation script and the per-shell
-  browser checks (E1, E2, E6, E7, E8, E9).
-- #548 owns the ungated pre-auth render that E3 and E5 depend on — the raw
-  server HTML `awsui_` count with no hydration warnings (E3) and the
-  server-rendered `style` attributes the strict policy reports against (E5).
-- #549 owns the chat-parity and highlighter measurements (E4, E10, E11).
-- #553 owns the strict-CSP check under decision 7 (the `style-src-elem 'self'`
-  without a nonce plus `style-src-attr 'unsafe-inline'` verification in a
-  deployed environment), which confirms E5's conclusion against the deployed
-  policy.
+- #547 owns the bundle-size and content-isolation script, the per-shell browser
+  checks, and the build, Jest, and theme-token checks (E1, E2, E6, E7, E8, E10,
+  E11).
+- #548 owns the ungated pre-auth render that E3 and E5 depend on and its
+  committed measurement: Cloudscape (`awsui_`) markup in the raw server HTML
+  with no hydration warnings (E3), and strict-policy violations that are all
+  `style-src-attr` reports against server-rendered `style` attributes (E5).
+- #549 owns the chat-parity and highlighter measurements (E4, E9).
 
-These issues do not yet list those artifacts; the fourth acceptance condition
-of #546 (child issues updated to match these decisions) adds the ownership
-before the flip, after which the issues own the artifacts named here. Until
-that evidence exists and is accepted, this record stays **Proposed** and
-commits nothing.
+After cutover, #553's deployed strict-CSP check under decision 7 confirms E5
+against the deployed policy. That check lands after the soak, so it is not part
+of this precondition. The fourth acceptance condition of #546 (child issues
+updated to match these decisions) records this ownership in each issue before
+the flip. Until that evidence exists and is accepted, this record stays
+**Proposed** and commits nothing.
 
-The sequencing is explicit. #547 is currently "Blocked by: #546" and scopes the
-"accepted ADR"; condition 4 changes its blocker to the merge of this
-**Proposed** record, so that merging this record (which commits nothing)
-unblocks the foundation work rather than waiting for #546 to close. #546 stays
-open while the record is Proposed (`Closes #546` is not used), and the
-dependency chain #549 → #548 → #547 then runs forward from the Proposed merge.
-The flip to **Accepted** waits for the chat conversation (#549) in the gate, so
-the record stays Proposed until the reproduced evidence is accepted, the child
-issues are
-updated, and the status-flip pull request lands.
+Under that condition, #547's blocker is the merge of this **Proposed** record,
+not #546 closing, and #547 consumes this record while it is Proposed, so merging
+it (which commits nothing) unblocks the foundation work. #546 stays open while
+the record is Proposed (`Closes #546` is not used), and the chain #547, #548,
+#549 runs forward from the Proposed merge. The flip to **Accepted** waits for
+the last owner in the gate, the chat conversation (#549), and then for the
+status-flip pull request.
 
 ## Context
 
@@ -198,15 +194,16 @@ public shell routes only — `/` and the internal shell route (for example
 `/shell-cloudscape`) — and never matches `/api/copilot/chat` or `/api/auth/*`,
 so it never runs in front of the authentication boundary. The identity cookies
 are `Path=/` and do arrive on the requests the proxy handles; the proxy must
-not read, write, or forward them. It selects the shell only from the
-server-only selector of decision 2 (and, if one is added, the
-presentation-only preview signal of decisions 2 and 10), performs an internal
-rewrite with no redirect, sets no identity or cookie, and sets, removes, or
-weakens no security header or Content Security Policy; the only header it
-causes is Next's `x-middleware-rewrite` (decision 2). These statements hold
-whether the shell foundation (#547) lands before or after this record, because
-the chat and auth routes and their verification code are unchanged by the shell
-work.
+not read or write them, copy them into another header, or send them to another
+origin. It selects the shell only from the server-only selector of decision 2
+(and, if one is added, the presentation-only preview signal of decisions 2 and
+10), performs an internal rewrite with no redirect, sets no identity or cookie,
+and sets, removes, or weakens no security header or Content Security Policy; the
+only headers it causes are Next's rewrite headers, `x-middleware-rewrite` and,
+on Pages Router data requests, `x-nextjs-rewrite` (decision 2). These statements
+hold whether the shell foundation (#547) lands before or after this record,
+because the chat and auth routes and their verification code are unchanged by
+the shell work.
 
 ### 2. Shell selection — same URL, request-time rewrite, server-only default
 
@@ -243,12 +240,12 @@ bundles at build time.
   carries an `x-middleware-rewrite` header naming it. This grants nothing: the
   preview is a presentation choice that is not role-aware and is open to any
   caller, selecting only which design system renders. It never enables an
-  operator or approval surface (decision 9),
-  which stays behind the #437 gate regardless of shell; approver access comes
-  from that gate and the backend, never from previewing or selecting a shell
-  (see the authentication boundary under decision 1). If #547 prefers to hide
-  the internal route, the proxy can return 404 for direct requests to it; either
-  way the preview confers no authority.
+  operator or approval surface (decision 9), which stays behind the #437 gate
+  regardless of shell; approver access comes from that gate and the backend,
+  never from previewing or selecting a shell (see the authentication boundary
+  under decision 1). If #547 prefers to hide the internal route, the proxy can
+  return 404 for direct requests to it; either way the preview confers no
+  authority.
 
 #### Config-only cutover path (new, required by decisions 2 and 10)
 
@@ -296,10 +293,7 @@ to both workflows.
 - That pre-auth server HTML is built with no request and must contain only
   static chrome: no user, group, tenant, workspace, or operator data and no
   operator or approval markup; anything identity-dependent renders on the
-  client after the session settles. Today the risk is bounded because
-  `/shell-cloudscape` is prerendered statically with no request; #548 moves
-  Cloudscape markup into that pre-auth HTML, so the rule belongs in the record
-  before that happens.
+  client after the session settles.
 - Code splitting keeps all Cloudscape code on the Cloudscape route only; the
   current UI's chunks contain no Cloudscape code (Evidence E2).
 
@@ -609,6 +603,8 @@ Rules:
   would otherwise double-count against the +0-per-page intent. A script
   (committed by #547) enforces the no-Cloudscape-module check and the 2 KiB
   ceiling.
+- The table's baselines are the spike's; the enforced baseline for each page is
+  the value re-recorded in the pinned CI image (see Status Rationale).
 - The spike measured `/` moving from 822.6 to 823.7 KiB with the second shell
   present (+1.1 KiB), and the content scan found no Cloudscape code in `/`'s
   chunks. That +1.1 KiB is **unexplained**: it is not Cloudscape code, and the
@@ -802,9 +798,13 @@ Commands: `git archive HEAD ui | tar -x`; `npm ci`;
   internal shell route whenever the Cloudscape shell is not selected, so nothing
   serves the Cloudscape shell once the default is back to `current`. No child
   issue builds a per-request preview signal that survives a rollback. This is an
-  open risk, not a resolved one: either #441 waits for cutover (#552) before it
-  relies on a Cloudscape-only approval view, or a presentation-only preview
-  signal is added and owned. Proposed owner: #441 records which path it takes.
+  open risk, not a resolved one: either a presentation-only preview signal that
+  survives a rollback is added and owned before #441 relies on the
+  Cloudscape-only approval view, or #441 waits until #553 removes the current
+  shell, after which a rollback is no longer a configuration change. Waiting
+  only for cutover (#552) does not close the gap, because a rollback during the
+  soak returns the default to `current`. Proposed owner: #441 records which
+  path it takes.
 - **Harness auth.** The spike ran without a live Cognito backend, so the
   authenticated journeys (sign-in, refresh, idle warning) were not exercised
   end to end; #547 and #548 validate those against both shells.
