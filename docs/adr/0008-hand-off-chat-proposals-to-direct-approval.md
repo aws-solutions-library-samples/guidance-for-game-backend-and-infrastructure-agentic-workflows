@@ -12,13 +12,14 @@ default-disabled deployment. [ADR 0002](0002-use-protocol-neutral-operations-ser
 places all product authorization in protocol-neutral application services that
 adapters call but never duplicate. [ADR 0003](0003-isolate-provider-writes.md)
 keeps the AgentCore chat role provider-read-only and isolates every write
-behind a separate prepared executor. The E2 advice-and-approval work (#414,
-#429) defines, as a **separate API Gateway HTTP API plus Lambda stack** with
-its own Cognito JWT authorizer, the routes `POST /operations/observe`,
-`POST /operations/prepare`, `POST /operations/{operationId}/approve`,
-`POST /operations/{operationId}/reject`, `POST /operations/{operationId}/cancel`,
-and `GET /operations/{operationId}`; the default deployment provisions none of
-them. The approval boundary is defined in
+behind a separate prepared executor. The E1 and E2 work defines, as a
+**separate API Gateway HTTP API plus Lambda stack** with its own Cognito JWT
+authorizer, the routes `POST /operations/observe`, `POST /operations/prepare`,
+`POST /operations/{operationId}/approve`, `POST /operations/{operationId}/reject`,
+`POST /operations/{operationId}/cancel`, and `GET /operations/{operationId}`
+(observe and the evidence read in the E1 stack, #413 and #428; prepare, approve,
+reject, and cancel in the E2 advise stack, #414 and #431); the default
+deployment provisions none of them. The approval boundary is defined in
 [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md#approval-identity)
 and the versioned proposal contracts in
 [Operations Contracts](../OPERATIONS_CONTRACTS.md#trusted-context).
@@ -128,9 +129,9 @@ client's own credentials from within a managed-login session.**
   server-side operations proxy tier (shared with the #554 approve and reject
   proxies) reads the server-side operations cookie instead. The proxies call
   different operations APIs: the cancel proxy (on the E4 operator-UI branch,
-  #416) calls the E1/E2 action API
-  (`GBAW_OPERATIONS_ACTION_API_BASE_URL`), while the capability-discovery proxy
-  calls the E4 control-plane API (`GBAW_OPERATIONS_API_BASE_URL`). Moving only
+  #416) calls the E1/E2 action API (`GBAW_OPERATIONS_ACTION_API_BASE_URL`),
+  while the capability-discovery proxy calls the E4 control-plane API
+  (`GBAW_OPERATIONS_API_BASE_URL`). Moving only
   the E1/E2 authorizer therefore breaks the cancel proxy, which forwards the
   chat token to the action API; the discovery proxy would break when the E4
   authorizer moves. To avoid a mixed state, **all** operator-console proxies
@@ -213,7 +214,8 @@ client's own credentials from within a managed-login session.**
   decision 1, and Implementation child 1, the threat model O9/OP-H1/OP-H7
   narrative, Status banner, Phase Model, the "Before enabling any operations
   write" P1 list, and the attack-tree leaf, and the version history must say
-  "accepted residual" and list those compensating controls instead of "closed".
+  "accepted residual" and list those compensating controls in place of the
+  precondition.
 
 Until decision 1 is implemented, the chat runtime **does** hold a bearer token
 every operations API accepts. This record and the threat model state that
@@ -288,7 +290,7 @@ versioned, fail-closed fenced contract, mirroring
 
 The proxy maps the confirmed fields to the versioned
 `gamelift-capacity-proposal-request` body plus the proxy-obtained
-`observation_id` (see Contract Impact). The E2 `PrepareOrchestrator` (#414, #429)
+`observation_id` (see Contract Impact). The E2 `PrepareOrchestrator` (#414; #429 and #430)
 enforces the exact key set, recomputes advice from the trusted current-state
 read, selects the playbook in code, binds identity from the verified principal,
 and stores one immutable prepared operation with its canonical hash. Free text
@@ -384,7 +386,7 @@ chat text, model output, tool arguments, and browser-supplied identity cannot
 establish or override requester, approver, tenant, workspace, group, or any
 authorization value. The approver is a verified principal supplied separately to
 the approve route; whether the approver may be the requester follows the
-server-owned separation-of-duties policy in
+server-owned approval policy in
 [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md#approval-identity),
 consistent with decision 3.
 
@@ -399,13 +401,12 @@ the proposal and in-chat affordance only when the discovery `capabilities`
 array contains an entry whose `capability_id` is `gamelift.capacity-adjustment`
 with `phases.prepare === true`.
 Discovery is served from the control-plane base (`GBAW_OPERATIONS_API_BASE_URL`)
-through a proposer-scoped proxy: this record's proposal-proxy child (child 2)
-lets the `operations-proposer` group read
-capability discovery (the E4 operator-UI discovery proxy admits only `admin`),
-so a non-admin proposer sees the
-affordance for which it is authorized. The proposer-scoped discovery proxy is
-part of the proposal-proxy child issue (child 2). An E2-only (`advise`)
-deployment without the E4 discovery control plane therefore never renders the
+through a proposer-scoped proxy that is part of this record's proposal-proxy
+child (child 2): it lets the `operations-proposer` group read capability
+discovery (the E4 operator-UI discovery proxy admits only `admin`), so a
+non-admin proposer sees the affordance for which it is authorized. An E2-only
+(`advise`) deployment without the E4 discovery control plane therefore never
+renders the
 affordance, which is the intended fail-closed dependency. A trusted UI notice — not model output — tells
 the user that the assistant can describe but not start a change, and the prompt
 directive (decision 3) tells the model it never starts a change itself; the
@@ -451,10 +452,9 @@ token in a shared workspace would replay the one stored operation rather than
 create a second. That narrower fingerprint is a deviation from ADR 0005's
 canonical fingerprint; the cross-requester replay it allows under a known token
 is recorded here as a residual and should be reconciled in the E2 capacity
-implementation note that #429 adds to ADR 0005 on the E2 branch. Preparation
-touches no
-provider, so a submission produces at most one immutable `pending_approval`
-record awaiting a direct human approval, never a provider write.
+implementation note that the E2 advise-stack branch (#431) adds to ADR 0005.
+Preparation touches no provider, so a submission produces at most one immutable
+`pending_approval` record awaiting a direct human approval, never a provider write.
 
 ### 9. Audit
 
@@ -566,13 +566,15 @@ not Closes.
    second, **confidential** Cognito app client for the operations API; **every**
    operations JWT authorizer (E1/E2 action, E3 dispatch, E4 control plane) and
    every handler trusted audience (`GBAW_OPERATIONS_TRUSTED_AUDIENCE` — the
-   E1/E2 action, E3 dispatch, and E4 control handlers) lists only that client; the `deploy-operations.sh` (E1/E2),
+   E1/E2 action, E3 dispatch, and E4 control handlers) lists only that client;
+   the `deploy-operations.sh` (E1/E2),
    `deploy-operations-execution.sh` (E3), and `deploy-operations-control.sh` (E4)
    bash deploy wrappers that take `CognitoClientId` are given the operations
    client ID (no PowerShell operations wrapper exists; one would need the same
-   binding if introduced); every operator-console proxy (including the planned
-   cancel proxy on the E1/E2 action API and the discovery proxy on the E4
-   control-plane API) moves to the server-side operations token; the
+   binding if introduced); every operator-console proxy delivered by the E4
+   operator-UI work (#416) — the cancel proxy on the E1/E2 action API and the
+   discovery proxy on the E4 control-plane API — moves to the server-side
+   operations token; the
    AgentCore authorizer keeps only the chat client. Primary sign-in moves to
    Cognito managed login (authorization-code + PKCE for the chat client), and the
    frontend server obtains the operations client's token within that session
@@ -644,9 +646,10 @@ not Closes.
   managed login and introduces a second (operations) Cognito app client, so on
   acceptance [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md) must
   be updated: its "The current Cognito sign-in flow is unchanged" statement stops
-  holding once the managed-login flow lands, and its summary line that this work
-  "does not enable operations or change the customer sign-in experience" stops
-  holding for the same reason. The chat path's
+  holding once the managed-login flow lands, and the sign-in clause of its summary
+  line that this work "does not enable operations or change the customer sign-in
+  experience" stops holding for the same reason (the "does not enable operations"
+  clause stays true). The chat path's
   `client_id` must-equal-`COGNITO_CLIENT_ID` row keeps holding for the chat
   token; the Identity doc gains a separate row binding the operations token's
   `client_id` to the operations app client. This ADR does not edit that
