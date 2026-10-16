@@ -287,7 +287,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$369 at ~10,000 queries/month | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Both run with thinking off. Scales with query volume |
+| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$480 at ~10,000 queries/month | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Token volumes scaled up ~30% from the equivalent Claude 4.x workload for the newer tokenizer; Haiku 5.5 thinking is disabled, Sonnet 5.5 uses `between_tools` whose thinking blocks bill as output. Scales with query volume |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
 | Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
@@ -301,7 +301,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | Cognito | Free | Up to 50,000 MAUs |
 
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
-**AI usage (variable)**: ~$369/month at ~10,000 queries/month (Claude Sonnet 5.5 + Haiku 5.5, thinking off); scales with query volume and conversation length
+**AI usage (variable)**: ~$480/month at ~10,000 queries/month (Claude Sonnet 5.5 + Haiku 5.5; Haiku thinking disabled, Sonnet `between_tools`); scales with query volume and conversation length
 
 ### Optional operations control plane (E1)
 
