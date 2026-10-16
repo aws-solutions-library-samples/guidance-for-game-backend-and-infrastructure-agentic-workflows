@@ -418,14 +418,14 @@ def _fnm_pathname_regex(pattern: str) -> str:
 
     A bracket set follows Ruby: it ends at the first ``]``, so ``[]...`` is an
     empty set that matches no character and ``[!]...`` / ``[^]...`` is a
-    negated-empty set that matches any one character. A backslash escapes the
-    next character, as Ruby's ``File.fnmatch`` does when ``FNM_NOESCAPE`` is not
-    set, so ``\\v`` is a literal ``v``; and ``[^...]`` is honored as a complement.
-    GitHub itself does NOT support either a backslash quoting character or a
-    ``[^...]`` complement in ruleset patterns, and does not support
-    ``FNM_EXTGLOB``; this matcher follows Ruby's ``File.fnmatch`` for those
-    forms so the gate's view of coverage tracks the semantics GitHub documents
-    for the patterns it does support, and a bracket set never matches ``/``.
+    negated-empty set that matches any one character. A backslash OUTSIDE a
+    bracket set escapes the next character to a literal, so ``\\v`` is a literal
+    ``v``; and ``[^...]`` is honored as a complement. GitHub itself does NOT
+    support either a backslash quoting character or a ``[^...]`` complement in
+    ruleset patterns, and does not support ``FNM_EXTGLOB``; the patterns GitHub
+    does support use none of those forms, so this matcher's view of coverage
+    agrees with GitHub on every supported pattern. A bracket set never matches
+    ``/``.
     """
 
     i = 0
@@ -434,8 +434,8 @@ def _fnm_pathname_regex(pattern: str) -> str:
     while i < n:
         char = pattern[i]
         if char == "\\":
-            # Escape the next character to a literal (fnmatch default). A
-            # trailing backslash is a literal backslash.
+            # Escape the next character to a literal. A trailing backslash is a
+            # literal backslash.
             if i + 1 < n:
                 out.append(re.escape(pattern[i + 1]))
                 i += 2
@@ -559,21 +559,25 @@ def _ruleset_rule_types(detail: dict) -> set[str]:
     return {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
 
 
-def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> bool:
-    """Return True if at least one active tag ruleset actually covers
-    ``refs/tags/<tag>`` and restricts who may create, update, or delete it.
+def _describe_ruleset(detail: dict) -> str:
+    """Render a ruleset as ``name (id N, source_type)`` for an error message.
 
-    Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
-    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). Rulesets are
-    aggregated the way GitHub aggregates them: coverage holds when any active
-    covering ruleset carries at least one restricting rule type (``creation`` /
-    ``update`` / ``deletion``), so matching alone — without any rule that gates
-    the write — does not pass the gate.
+    The single-ruleset GET carries ``name``, ``id``, and ``source_type``
+    (``Repository``, ``Organization``, or ``Enterprise``). Naming the ruleset
+    and where it comes from tells the maintainer which one to change: a
+    repository ruleset they can edit directly, versus an organization or
+    enterprise ruleset they may only be able to exclude the release tags from or
+    ask its owner to change.
     """
 
-    ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
-    covering = _covering_tag_rulesets(client, ref=ref)
-    return any(_ruleset_rule_types(detail) & _TAG_RESTRICTING_RULE_TYPES for detail in covering)
+    name = str(detail.get("name") or "").strip() or "unnamed"
+    ruleset_id = detail.get("id")
+    source_type = str(detail.get("source_type") or "").strip()
+    parts = [f"id {ruleset_id}"] if isinstance(ruleset_id, int) else []
+    if source_type:
+        parts.append(source_type)
+    suffix = f" ({', '.join(parts)})" if parts else ""
+    return f"'{name}'{suffix}"
 
 
 def _ruleset_token_can_bypass(detail: dict) -> bool:
@@ -627,23 +631,29 @@ def validate_tag_ruleset_present(client: GitHubClient, *, tag: str, tag_prefix: 
     _require(
         bool(restricting),
         f"no active tag ruleset covers {ref} with a creation/update/deletion rule; "
-        f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags and restricts "
-        "who may create, update, or delete them before releasing",
+        f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags and restricts who may create, "
+        "update, or delete them before releasing. Use an 'update' rule, which restricts moving an existing tag and "
+        "leaves this workflow's own tag creation and cleanup deletion alone; a creation or deletion rule would "
+        "instead block those writes unless the workflow token is a bypass actor",
     )
 
     blocking: set[str] = set()
+    blocking_rulesets: list[str] = []
     for detail in covering:
         rule_types = _ruleset_rule_types(detail)
         if rule_types & _TAG_WRITE_BLOCKING_RULE_TYPES and not _ruleset_token_can_bypass(detail):
             blocking |= rule_types & _TAG_WRITE_BLOCKING_RULE_TYPES
+            blocking_rulesets.append(_describe_ruleset(detail))
     if blocking:
         rules = "/".join(sorted(blocking))
+        named = "; ".join(blocking_rulesets)
         raise ValidationError(
-            f"a tag ruleset covering {ref} carries a {rules} rule that only bypass actors can satisfy, and this "
-            "workflow's token is not a bypass actor for it, so it could not create the tag ref (creation) or "
-            "delete it during cleanup (deletion). Restrict release tags with an 'update' rule only, which leaves "
-            "this workflow's create and cleanup writes alone. See docs/RELEASING.md 'Recommended maintainer "
-            "settings'."
+            f"tag ruleset {named} covering {ref} carries a {rules} rule that only bypass actors can satisfy, and "
+            "this workflow's token is not a bypass actor for it, so it could not create the tag ref (creation) or "
+            "delete it during cleanup (deletion). If it is a repository ruleset, restrict release tags with an "
+            "'update' rule only, which leaves this workflow's create and cleanup writes alone; if it is an "
+            "organization or enterprise ruleset you cannot edit, exclude the release tags from its ref-name "
+            "condition or ask its owner to. See docs/RELEASING.md 'Recommended maintainer settings'."
         )
 
 

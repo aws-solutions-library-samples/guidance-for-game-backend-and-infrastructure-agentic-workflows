@@ -251,13 +251,17 @@ class PostPublishReadBackTests(unittest.TestCase):
         # The release read error is a failure entry, not a bare escape.
         self.assertIn("503", message)
         # The asset and tag checks still ran and reported their own failures.
-        self.assertIn("post-publish read-back", message)
+        # Pinning both the asset message and the tag message proves the asset
+        # check is not skipped after a failed release read (the release entry
+        # alone would satisfy a bare "post-publish read-back" check).
+        self.assertIn("attached assets", message)
         self.assertIn("tag ref", message)
 
     def test_missing_asset_fails_read_back(self):
         # If one of the four assets is never recorded on the published release
         # (for example an upload that reported success but attached nothing),
-        # the read-back's name-set check must fail the run.
+        # the pre-tag draft asset check fails the run before the tag is created,
+        # while the draft is still removable and the tag name is unburned.
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "release-artifacts"
             _write_artifact_set(out)
@@ -271,8 +275,13 @@ class PostPublishReadBackTests(unittest.TestCase):
                 return original(upload_url, name=name, data=data, content_type=content_type)
 
             client.upload_release_asset = drop_one  # type: ignore[assignment]
-            with self.assertRaises(validate_mod.ValidationError):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
                 publish.publish_release_from_dir(client, out, _metadata())
+        message = str(ctx.exception).lower()
+        # The failure is the pre-tag draft asset check, named as such, and it
+        # fires before the tag ref is created.
+        self.assertIn("attached assets", message)
+        self.assertNotIn("create_ref", client.calls)
 
     def test_asset_size_mismatch_fails_read_back(self):
         with tempfile.TemporaryDirectory() as d:
@@ -523,6 +532,18 @@ class TagRulesetGateTests(unittest.TestCase):
         client.ruleset_details = {ruleset_id: detail}
         return client
 
+    def _covers_with_restriction(self, client, tag):
+        # Observe coverage through the gate's own code path: the dispatched ref
+        # is covered by a restricting ruleset iff `_covering_tag_rulesets`
+        # returns a covering ruleset that carries a creation/update/deletion
+        # rule. This is exactly what `validate_tag_ruleset_present` requires
+        # before it then checks the per-ruleset bypass values.
+        ref = f"refs/tags/{tag}"
+        covering = validate_mod._covering_tag_rulesets(client, ref=ref)
+        return any(
+            validate_mod._ruleset_rule_types(detail) & validate_mod._TAG_RESTRICTING_RULE_TYPES for detail in covering
+        )
+
     def test_gate_passes_when_v_tags_covered(self):
         client = RecordingClient()
         apply_release_settings(client)
@@ -531,8 +552,12 @@ class TagRulesetGateTests(unittest.TestCase):
 
     def test_gate_fails_when_no_tag_ruleset(self):
         client = RecordingClient()
-        with self.assertRaises(validate_mod.ValidationError):
+        with self.assertRaises(validate_mod.ValidationError) as ctx:
             validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+        # The absent-ruleset remedy recommends an `update` rule (which leaves
+        # the workflow's own writes alone), not a bare creation/deletion rule
+        # that would itself produce a would-block refusal on the next run.
+        self.assertIn("'update' rule", str(ctx.exception))
 
     def test_gate_fails_when_ruleset_does_not_cover_v_tags(self):
         client = self._ruleset(["refs/tags/untagged-*"])
@@ -541,22 +566,22 @@ class TagRulesetGateTests(unittest.TestCase):
 
     def test_tilde_all_include_covers_v_tags(self):
         client = self._ruleset(["~ALL"])
-        self.assertTrue(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
+        self.assertTrue(self._covers_with_restriction(client, "v0.1.0"))
 
     def test_exclude_of_v_tags_defeats_coverage(self):
         client = self._ruleset(["~ALL"], exclude=["refs/tags/v*"])
-        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
+        self.assertFalse(self._covers_with_restriction(client, "v0.1.0"))
 
     def test_inactive_ruleset_does_not_cover(self):
         client = self._ruleset(["refs/tags/v*"], enforcement="disabled")
-        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
+        self.assertFalse(self._covers_with_restriction(client, "v0.1.0"))
 
     def test_covering_ruleset_without_restricting_rule_does_not_count(self):
         # A ruleset that matches the ref but carries only non-restricting rules
         # (for example non_fast_forward + required_deployments) covers the tag
         # without restricting who creates or updates it, so it must not pass.
         client = self._ruleset(["refs/tags/v*"], rules=[{"type": "non_fast_forward"}, {"type": "required_deployments"}])
-        self.assertFalse(validate_mod.tag_ruleset_covers_v_tags(client, tag="v0.1.0"))
+        self.assertFalse(self._covers_with_restriction(client, "v0.1.0"))
         with self.assertRaises(validate_mod.ValidationError):
             validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
 
@@ -624,6 +649,35 @@ class TagRulesetGateTests(unittest.TestCase):
             validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
         self.assertIn("creation", str(ctx.exception).lower())
 
+    def test_blocking_refusal_names_the_ruleset_and_source(self):
+        # The refusal must name the blocking ruleset (name, id, source_type) so a
+        # maintainer knows which one to change — a repository ruleset they can
+        # edit, versus an inherited organization/enterprise ruleset they may only
+        # exclude the release tags from or ask its owner about.
+        client = RecordingClient()
+        client.rulesets = [{"id": 77, "name": "org tag lock", "target": "tag", "enforcement": "active"}]
+        client.ruleset_details = {
+            77: {
+                "id": 77,
+                "name": "org tag lock",
+                "source_type": "Organization",
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+                "rules": [{"type": "creation"}],
+            }
+        }
+        with self.assertRaises(validate_mod.ValidationError) as ctx:
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+        message = str(ctx.exception)
+        self.assertIn("org tag lock", message)
+        self.assertIn("77", message)
+        self.assertIn("Organization", message)
+        # And it points at excluding the release tags or asking the owner, not
+        # only at editing the ruleset to an update rule.
+        self.assertIn("ask its owner", message.lower())
+
     def _two_rulesets(self, first, second, *, order=("first", "second")):
         # Build a client carrying two active tag rulesets. ``first`` and
         # ``second`` are (include, rules, bypass) tuples; ``order`` controls the
@@ -687,6 +741,22 @@ class TagRulesetGateTests(unittest.TestCase):
             with self.subTest(order=order):
                 client = self._two_rulesets(a, b, order=order)
                 validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")  # does not raise
+
+    def test_bypass_is_per_ruleset_not_pooled_across_rulesets(self):
+        # current_user_can_bypass is reported per ruleset, so a bypass on one
+        # covering ruleset must NOT excuse an unbypassable rule in another. A
+        # creation rule the token CAN bypass on v* plus a second ~ALL creation
+        # rule the token CANNOT bypass still blocks the workflow's own tag-ref
+        # create, so the gate must refuse in BOTH list orders. Pooling the
+        # bypass value across covering rulesets would wrongly let this pass.
+        bypassable = (["refs/tags/v*"], [{"type": "creation"}], "always")
+        unbypassable = (["~ALL"], [{"type": "creation"}], "never")
+        for order in (("first", "second"), ("second", "first")):
+            with self.subTest(order=order):
+                client = self._two_rulesets(bypassable, unbypassable, order=order)
+                with self.assertRaises(validate_mod.ValidationError) as ctx:
+                    validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+                self.assertIn("creation", str(ctx.exception).lower())
 
     def test_fakes_model_github_creation_enforcement(self):
         # The fakes must model GitHub's documented enforcement: a create_ref
@@ -756,6 +826,40 @@ class TagRulesetGateTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             client.delete_ref("tags/v0.1.0")  # deletion rule from the ~ALL ruleset applies
 
+    def _fake_with_creation_bypass(self, bypass):
+        # A client carrying one active v* tag ruleset with a `creation` rule and
+        # the given ``current_user_can_bypass`` value.
+        client = RecordingClient()
+        client.rulesets = [{"id": 7, "name": "v creation", "target": "tag", "enforcement": "active"}]
+        client.ruleset_details = {
+            7: {
+                "id": 7,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": bypass,
+                "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+                "rules": [{"type": "creation"}],
+            }
+        }
+        return client
+
+    def test_fakes_treat_exempt_as_a_bypass(self):
+        # `exempt` is a bypass value (GitHub does not run the rules for the
+        # actor), so the fakes must ALLOW the create a bypass-less identity
+        # would be refused. A fake that treated `exempt` as "not a bypass"
+        # would wrongly refuse this write.
+        client = self._fake_with_creation_bypass("exempt")
+        client.create_ref(ref="refs/tags/v0.1.0", sha="t" * 40)  # no raise
+
+    def test_fakes_treat_pull_requests_only_as_not_a_bypass(self):
+        # `pull_requests_only` bypasses only on a pull request; a direct
+        # refs/tags/<tag> write is not one, so the fakes must REFUSE the create
+        # the way GitHub would. A fake that treated `pull_requests_only` as a
+        # bypass would wrongly allow this write.
+        client = self._fake_with_creation_bypass("pull_requests_only")
+        with self.assertRaises(RuntimeError):
+            client.create_ref(ref="refs/tags/v0.1.0", sha="t" * 40)
+
     def test_matcher_table_matches_github_fnm_pathname(self):
         # Pin every row of the matcher table against GitHub's
         # documented File.fnmatch + FNM_PATHNAME semantics (* does not cross /,
@@ -812,12 +916,32 @@ class TagRulesetGateTests(unittest.TestCase):
             # by the literals `]`; `refs/tags/<char>]...` never matches a tag ref,
             # so it covers no tag. Python's fnmatch would fail open.
             (["refs/tags/[!]]*"], [], "v0.1.0", False),
+            # The empty set `[]...` alone matches NO character (Ruby ends the set
+            # at the first `]`), so `[]0.1.0` consumes no character and then needs
+            # a literal `0.1.0` the ref `v0.1.0` does not start with: no coverage.
+            # (If `[]` were read as "matches any character", this would be True.)
+            (["refs/tags/[]0.1.0"], [], "v0.1.0", False),
+            # The negated-empty set `[!]...` matches ANY one character, so
+            # `[!]0.1.0` matches the leading `v` and then `0.1.0`: it covers the
+            # tag ref. (If `[!]` matched nothing, this would be False.)
+            (["refs/tags/[!]0.1.0"], [], "v0.1.0", True),
         ]
         for include, exclude, tag, expected in cases:
             with self.subTest(include=include, exclude=exclude, tag=tag):
                 client = self._ruleset(include, exclude=exclude)
+                # Observe coverage through the gate's own code path: a covering
+                # ruleset carries a restricting rule (the default fixture rules
+                # are creation/deletion), so coverage holds iff
+                # `_covering_tag_rulesets` returns a restricting ruleset for the
+                # dispatched ref.
+                ref = f"refs/tags/{tag}"
+                covering = validate_mod._covering_tag_rulesets(client, ref=ref)
+                covers = any(
+                    validate_mod._ruleset_rule_types(detail) & validate_mod._TAG_RESTRICTING_RULE_TYPES
+                    for detail in covering
+                )
                 self.assertEqual(
-                    validate_mod.tag_ruleset_covers_v_tags(client, tag=tag),
+                    covers,
                     expected,
                     f"include={include} exclude={exclude} tag={tag}",
                 )

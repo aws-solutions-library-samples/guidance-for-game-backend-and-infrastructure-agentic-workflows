@@ -242,16 +242,19 @@ def cmd_verify_environment(_args: argparse.Namespace) -> int:
     if settings["tag_ruleset"] == "absent":
         print(
             "note: no active tag ruleset covers refs/tags/v*; enable a v* tag ruleset "
-            "(with a creation/update/deletion rule) and GitHub's immutable-releases setting "
+            "(use an 'update' rule, which leaves this workflow's own tag creation and cleanup deletion alone) "
+            "and GitHub's immutable-releases setting "
             "so published tags and assets are immutable "
             "(see docs/RELEASING.md 'Recommended maintainer settings')"
         )
     elif settings["tag_ruleset"] == "would-block":
         print(
             "note: a tag ruleset covering refs/tags/v* carries a creation or deletion rule this workflow's "
-            "token cannot bypass; the publish step fails closed before the draft. Restrict release tags with "
-            "an 'update' rule only, which leaves this workflow's create and cleanup writes alone "
-            "(see docs/RELEASING.md 'Recommended maintainer settings')"
+            "token cannot bypass; the publish step fails closed before the draft and names the blocking ruleset "
+            "(its name, id, and source_type). If it is a repository ruleset, restrict release tags with an "
+            "'update' rule only, which leaves this workflow's create and cleanup writes alone; if it is an "
+            "organization or enterprise ruleset you cannot edit, exclude the release tags from it or ask its "
+            "owner (see docs/RELEASING.md 'Recommended maintainer settings')"
         )
     # Report the two environment-policy rules the publish step enforces after
     # approval (prevent-self-review and the main-only branch policy), so a dry
