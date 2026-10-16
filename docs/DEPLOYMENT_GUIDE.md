@@ -17,7 +17,7 @@ Before you begin, ensure you have the following installed and configured:
 | **yq** | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
 | **python3** | 3.8+ | [Download](https://www.python.org/downloads/) |
 
-**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`). UV does not add a `python3` to `PATH`, so a standalone Python 3 is still required: the deployment scripts call `python3` directly to parse AWS CLI responses in the account-observability steps.
+**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`). UV does not add a `python3` to `PATH`, so a standalone Python 3 is still required: the deployment scripts call `python3` directly to parse AWS CLI responses in the account-observability steps (the Step 1.7 default read, the Step 2b trace-delivery verification, and the Step 5c post-launch recheck).
 
 **Windows users:** Native PowerShell deployment scripts are available in `scripts/powershell/`. See [scripts/powershell/README.md](../scripts/powershell/README.md) for setup and usage. Requires PowerShell 7.0+ and AWS CLI v2 — no WSL2 or Linux environment needed.
 

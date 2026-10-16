@@ -31,6 +31,7 @@ BeforeAll {
             [string]$Destination = 'XRay',
             [bool]$SpansExists = $false,
             [bool]$SpansUnreadable = $false,
+            [string]$SpansRaw = '__UNSET__',
             [bool]$DestinationUnreadable = $false,
             [string]$IndexingPercent = '5',
             [bool]$IndexingUnreadable = $false,
@@ -44,6 +45,7 @@ BeforeAll {
         $destLocal = $Destination
         $spansLocal = $SpansExists
         $spansUnreadableLocal = $SpansUnreadable
+        $spansRawLocal = $SpansRaw
         $unreadableLocal = $DestinationUnreadable
         $indexingLocal = $IndexingPercent
         $indexingUnreadableLocal = $IndexingUnreadable
@@ -78,13 +80,18 @@ BeforeAll {
                     $global:LASTEXITCODE = 0
                     # The AWS CLI only renders the quoted log-group name in JSON
                     # output. Emulate that: return JSON only when '--output json'
-                    # is requested, and a 'text' rendering otherwise, so a reader
-                    # that drops the flag reads an existing group as 'absent' and
-                    # the PowerShell '--output json' request is pinned.
+                    # is requested, and a 'text' rendering otherwise. The reader
+                    # parses the output as JSON, so a 'text' rendering does not
+                    # parse and reads as 'unreadable' (not 'absent'), which pins
+                    # the PowerShell '--output json' request.
                     if ($allArgs -notmatch '--output json') {
                         if ($spansLocal) { return "LOGGROUPS`taws/spans`t1700000000000" }
                         return ''
                     }
+                    # A raw override feeds arbitrary parsed-JSON shapes (an empty
+                    # object/array, null) or non-JSON text to the reader so a
+                    # spec can pin how each shape is classified.
+                    if ($spansRawLocal -ne '__UNSET__') { return $spansRawLocal }
                     if ($spansLocal) { return '{"logGroups":[{"logGroupName":"aws/spans"}]}' }
                     return '{"logGroups":[]}'
                 }
@@ -342,6 +349,8 @@ Describe 'Invoke-GameAgentAccountObservability' {
         ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
         $host_ = $script:HostMessages -join "`n"
         $host_ | Should -Match 'Transaction Search configuration failed'
+        $host_ | Should -Match 'AWS X-Ray / CloudWatch console'
+        $host_ | Should -Not -Match 'agentcore launch'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
         $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
@@ -359,6 +368,7 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $host_ = $script:HostMessages -join "`n"
         $host_ | Should -Match 'already exists'
         $host_ | Should -Not -Match 'is not present'
+        $host_ | Should -Match 'AWS X-Ray / CloudWatch console'
         $host_ | Should -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
 
@@ -373,6 +383,49 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $host_ | Should -Match 'could not be read'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
         $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'ReportOnly reports unreadable aws/spans when the destination is XRay and prints no toggle or launch' {
+        # XRay destination with an unreadable 'aws/spans' read: the state is
+        # unknown, so the recheck must say the read failed and must NOT print a
+        # toggle, the opt-in, or another launch.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansUnreadable $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations.Count | Should -Be 0
+        ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'could not be read'
+        $host_ | Should -Not -Match 'update-trace-segment-destination'
+        $host_ | Should -Not -Match 'agentcore launch'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'Get-SpansLogGroupState classifies parsed-JSON shapes as absent and non-JSON as unreadable' -ForEach @(
+        @{ Raw = '{}';   Expected = 'absent' }
+        @{ Raw = '[]';   Expected = 'absent' }
+        @{ Raw = 'null'; Expected = 'absent' }
+        @{ Raw = '{"logGroups":null}'; Expected = 'absent' }
+        @{ Raw = 'not json at all';    Expected = 'unreadable' }
+    ) {
+        # Feed each shape to the reader through a readable CloudWatchLogs
+        # destination so the two states are distinguishable from the printed
+        # remedy: 'absent' prints the disable/re-enable toggle, while
+        # 'unreadable' prints 'could not be read' and no toggle. The shell
+        # reader is pinned to the same mapping by
+        # test_spans_reader_state_alignment.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansRaw $Raw -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        if ($Expected -eq 'absent') {
+            $host_ | Should -Match 'update-trace-segment-destination --destination XRay'
+            $host_ | Should -Not -Match 'could not be read'
+        } else {
+            $host_ | Should -Match 'could not be read'
+            $host_ | Should -Not -Match 'update-trace-segment-destination'
+        }
     }
 
     It 'ReportOnly confirms in the console and prints no toggle when the destination is unreadable' {
@@ -403,6 +456,7 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $mutations.Count | Should -Be 0
         $host_ = $script:HostMessages -join "`n"
         $host_ | Should -Match 'agentcore launch'
+        $host_ | Should -Match 'AWS X-Ray / CloudWatch console'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
         $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }

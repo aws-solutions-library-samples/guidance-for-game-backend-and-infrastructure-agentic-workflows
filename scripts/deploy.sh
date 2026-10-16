@@ -64,8 +64,10 @@ fi
 # auto-installed: fail with a clear message rather than guess an interpreter.
 if ! command -v python3 &> /dev/null; then
     echo "❌ python3 not found. It is required to parse AWS responses in the"
-    echo "   account-observability steps. Install Python 3 from https://www.python.org/downloads/"
-    echo "   (or your OS package manager) and re-run."
+    echo "   account-observability steps (Step 1.7 default read, Step 2b"
+    echo "   trace-delivery verification, and the Step 5c recheck). Install"
+    echo "   Python 3 from https://www.python.org/downloads/ (or your OS package"
+    echo "   manager) and re-run."
     exit 1
 fi
 

@@ -637,6 +637,18 @@ report_transaction_search_state() {
 }
 
 main() {
+  # The read-only state readers parse AWS CLI JSON with python3 (the shell
+  # cannot). A standalone run of this script therefore needs python3 on PATH;
+  # without it the describe calls would be misread as denied or throttled, so
+  # fail here with an accurate message before any read. (scripts/deploy.sh runs
+  # the same check with its other prerequisites.)
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "❌ python3 not found. It is required to parse AWS responses in this" >&2
+    echo "   account-observability step. Install Python 3 from" >&2
+    echo "   https://www.python.org/downloads/ (or your OS package manager) and" >&2
+    echo "   re-run." >&2
+    return 1
+  fi
   # A single argument selects the post-launch read-only recheck; with no
   # argument the script runs the default/opt-in account-observability setup.
   if [ "${1:-}" = "report-transaction-search" ]; then

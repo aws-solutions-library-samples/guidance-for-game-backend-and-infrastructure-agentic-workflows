@@ -10,6 +10,7 @@ are synthetic.
 # Standard library
 import pathlib
 import re
+import shutil
 import subprocess
 
 # Third-party packages
@@ -454,11 +455,12 @@ def _obs_mock(
     spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
     # The AWS CLI only renders the quoted log-group name in JSON output. When a
     # profile's default output is 'text' (or 'table'/'yaml'), an existing group
-    # is rendered WITHOUT the quoted name a text match would look for. This mock
-    # emulates that: 'describe-log-groups' returns JSON only when '--output json'
-    # is requested, and a 'text' rendering otherwise. A reader that does not
-    # request JSON therefore reads an existing group as 'absent', which the test
-    # asserts against — so dropping '--output json' from the reader fails.
+    # is rendered WITHOUT the quoted name a JSON parse needs. This mock emulates
+    # that: 'describe-log-groups' returns JSON only when '--output json' is
+    # requested, and a 'text' rendering otherwise. The reader parses the output
+    # as JSON, so a 'text' rendering does not parse and is classified as
+    # 'unreadable' (not 'absent') — dropping '--output json' from the reader
+    # therefore fails the tests.
     spans_text = "LOGGROUPS\taws/spans\t1700000000000\t/aws/spans" if spans else ""
     # When fail_operation names a mutating "$1 $2" pair (e.g.
     # "logs put-resource-policy"), the mock returns that AWS error on stderr
@@ -1035,6 +1037,7 @@ def test_recheck_warns_when_destination_not_cloudwatchlogs(shell):
     assert "enable Transaction Search" in result.stdout
     # The launch already ran, so the recheck must not send the operator back to
     # the deploy's own launch, and must not print a destination toggle.
+    assert "agentcore launch" not in result.stdout
     assert "update-trace-segment-destination" not in result.stdout
     assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
@@ -1108,11 +1111,36 @@ def test_spans_reader_state_alignment(describe_output, exit_code, expected, shel
     assert result.stdout.strip() == expected, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_script_fails_fast_when_python3_is_missing(shell):
+    """A standalone run of the setup script without python3 on PATH must stop at
+    the start of main with a clear 'python3 not found' message, before any AWS
+    read, rather than letting the describe calls be misread as denied or
+    throttled. The readers parse JSON with python3, so the check guards them."""
+    # Resolve the shell binary with the real PATH, then run it with an empty
+    # PATH so python3 cannot be found. Everything main needs to reach the check
+    # (variable assignments, 'command -v', 'echo') is a shell builtin, so no
+    # PATH entries are required past locating the interpreter itself.
+    shell_bin = shutil.which(shell) or shell
+    result = subprocess.run(
+        [shell_bin, str(ACCOUNT_OBS_SCRIPT)],
+        capture_output=True,
+        text=True,
+        env={"PATH": "", "AWS_REGION": "us-west-2"},
+    )
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "python3 not found" in combined, combined
+    # It must not reach the read path and blame a denied/throttled call.
+    assert "denied, throttled" not in combined, combined
+
+
 # One mock drives every cell of the matrix. 'describe-log-groups' renders JSON
-# only when '--output json' is requested (so a reader that drops the flag reads
-# an existing group as absent); 'present' is matched on the EXACT name
-# 'aws/spans', never a prefix such as 'aws/spans-archive'. 'unreadable' is a
-# non-zero CLI exit for the relevant read.
+# only when '--output json' is requested; without the flag it renders a 'text'
+# listing that does not parse as JSON, which the reader classifies as
+# 'unreadable' (not 'absent'), so a reader that drops the flag fails every cell.
+# 'present' is matched on the EXACT name 'aws/spans', never a prefix such as
+# 'aws/spans-archive'. 'unreadable' is a non-zero CLI exit for the relevant read.
 
 
 def _matrix_mock(destination: str, spans: str) -> str:
@@ -1169,11 +1197,9 @@ def _matrix_mock(destination: str, spans: str) -> str:
     )
 
 
-# Each cell names a distinguishing substring that MUST appear and (optionally)
-# substrings that must NOT appear. The matrix pins the full routing so the
-# surviving mutations (unparseable-as-absent, prefix match, XRay-before-
-# unreadable ordering, dropped console sentence, not-CloudWatchLogs line for
-# UNREADABLE) are all caught. Keyed by (mode, destination, spans).
+# Each cell lists substrings that must appear and substrings that must not, so a
+# change to the cell's routing fails the test. Keyed by (mode, destination,
+# spans).
 _MATRIX_CELLS = {
     # default mode
     ("default", "CloudWatchLogs", "present"): (["already supports Transaction Search"], []),
@@ -1198,7 +1224,7 @@ _MATRIX_CELLS = {
         [],
     ),
     ("default", "XRay", "absent"): (
-        ["agentcore launch", "switches the"],
+        ["agentcore launch", "switches the", "AWS X-Ray / CloudWatch console"],
         ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
     ),
     ("default", "XRay", "unreadable"): (
@@ -1240,12 +1266,12 @@ _MATRIX_CELLS = {
         [],
     ),
     ("recheck", "XRay", "present"): (
-        ["already exists", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+        ["already exists", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true", "AWS X-Ray / CloudWatch console"],
         ["is not present", "does not exist"],
     ),
     ("recheck", "XRay", "absent"): (
-        ["Transaction Search configuration failed", "not 'CloudWatchLogs'"],
-        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+        ["Transaction Search configuration failed", "not 'CloudWatchLogs'", "AWS X-Ray / CloudWatch console"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true", "agentcore launch"],
     ),
     ("recheck", "XRay", "unreadable"): (
         ["not 'CloudWatchLogs'", "could not be read"],
@@ -1257,8 +1283,8 @@ _MATRIX_CELLS = {
     ),
     ("recheck", "UNREADABLE", "present"): (
         ["could not be read"],
-        # The not-CloudWatchLogs line must NOT print for an unreadable
-        # destination (pins the surviving UNREADABLE-prints-not-CWL mutation).
+        # The not-CloudWatchLogs line must not print for an unreadable
+        # destination.
         ["not 'CloudWatchLogs'", "update-trace-segment-destination"],
     ),
     ("recheck", "UNREADABLE", "absent"): (
