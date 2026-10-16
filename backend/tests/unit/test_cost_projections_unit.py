@@ -181,6 +181,23 @@ class TestComputeOptimizer:
         assert len(out["recommendations"]) == 1
         assert out["recommendations"][0]["current_type"] == "m5.large"
 
+    def test_options_only_row_is_kept(self):
+        # A row whose only usable content is a recommended option (a type and a
+        # performance risk) still carries a recommendation and stays ``ok``.
+        data = {
+            "recommendations": [{"recommendation_options": [{"instance_type": "m5.large", "performance_risk": "Low"}]}]
+        }
+        out = project_compute_optimizer(data)
+        _no_sensitive(out)
+        assert out["status"] == "ok"
+        assert out["recommendations"][0]["recommended_options"] == [{"type": "m5.large", "performance_risk": "Low"}]
+
+    def test_refresh_time_only_row_is_dropped(self):
+        # A drifted row that keeps only its refresh time is not a recommendation,
+        # so a collection containing only it fails closed instead of reporting ``ok``.
+        data = {"recommendations": [{"last_refresh_timestamp": "2026-10-01T00:00:00Z", "renamed_field": {"x": 1}}]}
+        assert project_compute_optimizer(data) is None
+
 
 class TestCostOptimizationHub:
     def test_recommendation_omits_arn_account_tags(self):

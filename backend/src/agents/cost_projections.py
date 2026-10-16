@@ -412,13 +412,15 @@ def _project_compute_optimizer_item(item: Mapping[str, Any]) -> dict[str, Any] |
     if refresh is not None:
         out["last_refresh"] = refresh
 
-    # ``recommended_options`` is always assigned (possibly empty), so it cannot
-    # stand in for operational content. A row whose only key is that empty list
-    # — a ``{}`` row, a row whose every field fails its grammar, or a drifted
-    # upstream schema — carries nothing projectable and is dropped (returns
-    # ``None``) so the collection projector flips to incomplete + partial +
-    # malformed_response instead of reporting an empty shell as ``ok``.
-    if not any(key != "recommended_options" for key in out):
+    # A row must carry a resource id, a finding, a current type, or at least one
+    # recommended option. The options list is always assigned and adds nothing
+    # when it is empty, and a refresh time alone is not a recommendation. A row
+    # without any of these (a ``{}`` row, a row whose every field fails its
+    # grammar, or a drifted upstream schema) is dropped. A collection whose rows
+    # are all dropped returns ``None``, which the guard reports as
+    # ``malformed_response``; a mixed collection keeps its usable rows and is
+    # marked incomplete + partial + malformed_response.
+    if not recommended and not any(key in out for key in ("resource_id", "finding", "current_type")):
         return None
     return out
 
