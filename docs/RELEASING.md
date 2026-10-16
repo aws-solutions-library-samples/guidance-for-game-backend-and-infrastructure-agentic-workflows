@@ -249,8 +249,9 @@ release. On the cancel path, cleanup never leaves a stable-looking tag it had
 time to remove. (One caveat: if the `v*` tag ruleset carries a `deletion` rule
 and this workflow's identity is not a bypass actor, deleting `refs/tags/<tag>`
 is itself refused, so cleanup reports the ref as left intact for manual
-recovery. Use an `update` rule, or add the workflow to the ruleset's bypass
-list, so cleanup can remove the ref — see "Recommended maintainer settings".)
+recovery. Restrict release tags with an `update` rule only, which leaves this
+workflow's create and cleanup writes alone, so cleanup can remove the ref — see
+"Recommended maintainer settings".)
 
 ### Manual recovery
 
@@ -400,22 +401,28 @@ them, with the existing `GITHUB_TOKEN`, is:
   or deleted while the release exists (deleting the release lets you delete the
   tag, but its name cannot be reused), and the release assets cannot be modified
   or deleted; only the title, notes, and the pre-release / latest flags stay
-  editable. Enabling the setting also makes GitHub generate a release
-  attestation automatically.
+  editable. Creating an immutable release is what makes GitHub generate a
+  release attestation automatically.
 - **`v*` tag ruleset (reported in a dry run, enforced before a non-dry run).**
   The `verify-environment` step reads the repository's tag-target rulesets and
   each one's ref-name conditions and rule list (`GET /repos/{owner}/{repo}/rulesets`
   then `GET /repos/{owner}/{repo}/rulesets/{id}`, both of which need only
   `Metadata: read`) and reports whether an active ruleset covers the dispatched
-  `refs/tags/<tag>` and restricts who may create, update, or delete it. Coverage
-  is decided the way GitHub decides it — Ruby's `File.fnmatch` with
-  `File::FNM_PATHNAME`, so a `*` never crosses a `/` (`refs/*` does not cover a
-  two-segment tag ref), a `**/` matches zero or more directories only as a whole
-  path segment, a bracket set never matches `/`, and a backslash escapes the
-  next character — evaluated against the exact ref being written, not a single
+  `refs/tags/<tag>` and restricts who may create, update, or delete it. GitHub
+  aggregates the rules of **every** ruleset that covers a tag (see GitHub's
+  "About rule layering"), so the report and the gate look at all covering
+  rulesets, not just the first. Coverage is decided with Ruby's `File.fnmatch`
+  and `File::FNM_PATHNAME` — the same matcher GitHub documents — so a `*` never
+  crosses a `/` (`refs/*` does not cover a two-segment tag ref), a `**/` matches
+  zero or more directories only as a whole path segment, and a bracket set never
+  matches `/`. It is evaluated against the exact ref being written, not a single
   representative tag, so a ruleset that covers only part of the versioned tags
   (for example `refs/tags/v0.*`, or `v*` minus a `v*-rc.*` exclude) does not pass
-  for a tag it does not protect. A matching ruleset counts only when it also
+  for a tag it does not protect. GitHub does **not** support a backslash as a
+  quoting character or a `[^...]` complement in ruleset patterns; the matcher
+  follows Ruby's `File.fnmatch` for those forms (a backslash escapes the next
+  character and `[^...]` is a complement), so the two never diverge for the
+  patterns GitHub does support. A matching ruleset counts only when it also
   carries at least one `creation`, `update`, or `deletion` rule.
 
   Which rule type to use matters, because the publish job writes the tag ref
@@ -425,15 +432,22 @@ them, with the existing `GITHUB_TOKEN`, is:
   **`update`** lets only bypass actors push to (move) one. So an **`update`**
   rule is the one that leaves this workflow's own writes alone — it never moves
   an existing tag — while a `creation` rule would block the workflow's tag-ref
-  write and a `deletion` rule would block cleanup's tag-ref delete, unless this
-  workflow's identity is on the ruleset's **bypass actor** list (a GitHub App /
-  `Integration` bypass actor). The single-ruleset GET returns
-  `current_user_can_bypass` for the calling token: before a non-dry publish the
-  gate **fails closed** when a covering ruleset carries `creation` or `deletion`
-  and that field is `never` or absent for the workflow token, with a remedy that
-  points at the `update` rule or a bypass-list entry. Otherwise the gate fails
+  write and a `deletion` rule would block cleanup's tag-ref delete. GitHub
+  documents repository admins, organization and enterprise owners, the
+  maintain/write role, teams, GitHub Apps, and Dependabot as eligible bypass
+  actors; it does not document the GitHub Actions identity behind `GITHUB_TOKEN`
+  as one, so **an `update` rule is the setup that works with the token this
+  workflow already has**. The single-ruleset GET returns `current_user_can_bypass`
+  for the calling token (`always` and `exempt` bypass the rules for a direct
+  write; `pull_requests_only` bypasses only on a pull request, which a direct
+  tag-ref write is not; `never` and an absent field are not a bypass). Before a
+  non-dry publish the gate **fails closed** when any covering ruleset carries
+  `creation` or `deletion` and the workflow token is not a bypass actor for it,
+  with a remedy that points at the `update` rule. Otherwise the gate fails
   closed only when no active tag ruleset covers the dispatched tag ref with a
-  restricting rule. A dry run only reports present/absent.
+  restricting rule. A dry run reports `present`, `absent`, or `would-block`
+  (a covering `creation`/`deletion` rule the token cannot bypass), so the
+  bypass condition is surfaced before approval.
 
 Options considered for the setting check were: (a) a documentation-only
 dependency; (b) a pre-run read of the setting (not possible with the workflow
@@ -445,8 +459,7 @@ new token permission, together with the machine-checked tag-ruleset gate.
 
 Confirm all of the following in repository settings **before the first
 dispatch, dry or not**. Most are machine-checked by the workflow; the
-administrator-bypass rule and the tag ruleset's bypass-actor list remain hand
-checks:
+administrator-bypass rule remains a hand check:
 
 - [ ] **`release` environment exists** and has a **required-reviewers** rule
       with at least one reviewer. (Machine-checked: `verify-environment` fails
@@ -465,19 +478,14 @@ checks:
       (Enforced after publish by the read-back, which fails the run unless the
       published release is `immutable`.)
 - [ ] **`v*` tag ruleset** that both covers the versioned tags and restricts who
-      can create, update, or delete release tags. Prefer an **`update`** rule,
-      which leaves this workflow's own tag creation and cleanup deletion alone.
-      (Machine-checked before a non-dry run: an active tag ruleset must cover the
-      dispatched `refs/tags/<tag>` and carry at least one
-      `creation`/`update`/`deletion` rule; reported present/absent in a dry run.)
-- [ ] **`v*` tag ruleset bypass list** — if the ruleset carries a `creation` or
-      `deletion` rule, confirm this workflow's identity is a bypass actor on the
-      ruleset (otherwise the workflow cannot create the tag ref or delete it
-      during cleanup). (Partly machine-checked: the publish job fails closed
-      before the draft when a covering ruleset carries `creation`/`deletion` and
-      `current_user_can_bypass` reads `never` for the workflow token; confirm the
-      bypass-actor list by hand, since the full bypass list is not readable with
-      the workflow token.)
+      can create, update, or delete release tags. Use an **`update`** rule,
+      which leaves this workflow's own tag creation and cleanup deletion alone —
+      it is the setup that works with the token this workflow already has.
+      (Machine-checked before a non-dry run: every active tag ruleset covering
+      the dispatched `refs/tags/<tag>` is aggregated, at least one must carry a
+      `creation`/`update`/`deletion` rule, and the run fails closed if any
+      covering ruleset carries a `creation`/`deletion` rule the token cannot
+      bypass; reported `present`/`absent`/`would-block` in a dry run.)
 
 ## Build provenance and attestation
 
@@ -485,10 +493,11 @@ Build-provenance attestation is **deferred**, consistent with the
 no-AWS-credentials design. The workflow holds no `id-token` or `attestations`
 permission and signs nothing itself; the attached SBOMs and the `SHA256SUMS`
 manifest are the stated supply-chain boundary. When the immutable-releases
-setting is enabled, GitHub automatically generates a release attestation (a
-cryptographically verifiable record of the tag, commit SHA, and assets), so
-enabling that setting is also what provides attestation today. A dedicated,
-workflow-signed provenance attestation is tracked as a follow-up.
+setting is enabled, creating an immutable release makes GitHub generate a
+release attestation (a cryptographically verifiable record of the tag, commit
+SHA, and assets), so enabling that setting is also what provides attestation
+today. A dedicated, workflow-signed provenance attestation is tracked as a
+follow-up.
 
 ## Recommended maintainer settings
 
@@ -503,13 +512,17 @@ environments; the guarantees in this document depend on these being set:
 - A **`v*` tag ruleset** restricting who can move release tags. Use an
   **`update`** rule: it restricts pushing (moving) an existing tag, which this
   workflow never does, so it leaves the workflow's own tag creation and cleanup
-  deletion alone. A **`creation`** rule (restricting who may create a matching
+  deletion alone, and it is the setup that works with the token this workflow
+  already has. A **`creation`** rule (restricting who may create a matching
   tag) or a **`deletion`** rule (restricting who may delete one, GitHub's
   default) would block this workflow's own writes — it creates `refs/tags/<tag>`
-  and deletes it during cleanup — unless this workflow's identity is on the
-  ruleset's **bypass actor** list; the publish job fails closed before the draft
-  if a covering ruleset carries `creation` or `deletion` and its
-  `current_user_can_bypass` reads `never` for the workflow token.
+  and deletes it during cleanup. GitHub does not document the Actions identity
+  behind `GITHUB_TOKEN` as an eligible bypass actor, so the publish job fails
+  closed before the draft if any covering ruleset carries `creation` or
+  `deletion` and its `current_user_can_bypass` is not a bypass value for the
+  workflow token. GitHub aggregates every covering ruleset, so a second covering
+  `creation`/`deletion` ruleset (for example an organization or enterprise
+  `~ALL` ruleset) is caught too.
 - The **`release` environment** (used by the publish job) with **required
   reviewers**, **prevent self-review** enabled, and **administrators not allowed
   to bypass** the protection rule, plus a **deployment branch rule limiting the

@@ -547,8 +547,8 @@ rollback guidance.
 Build-provenance attestation is deferred, consistent with the no-AWS-credentials
 design: the workflow holds no `id-token` or `attestations` permission, and the
 attached SBOMs plus the `SHA256SUMS` manifest are the stated supply-chain
-boundary. When the immutable-releases setting is enabled, GitHub additionally
-generates a release attestation automatically.
+boundary. When the immutable-releases setting is enabled, creating an immutable
+release makes GitHub generate a release attestation automatically.
 
 ## License
 
