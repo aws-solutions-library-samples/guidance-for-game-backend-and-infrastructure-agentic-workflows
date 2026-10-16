@@ -152,9 +152,9 @@ class TestModelCapabilityTable:
         # Every failure or rejection statement must sit inside the "if it wraps"
         # condition: the runtime cannot tell what the profile wraps, so it must
         # not assert that requests fail or are rejected outright. Any sentence
-        # that predicts a failure, a rejection, or a 400 must carry the
-        # conditional marker, so an added unconditional rejection sentence is
-        # caught whatever its wording (with or without the literal "400").
+        # that uses one of the failure terms below must carry the conditional
+        # marker, so an added unconditional sentence that uses one of those
+        # terms is caught, with or without the literal "400".
         lowered = message.lower()
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", lowered) if s.strip()]
         failure_terms = ("fail", "reject", "400", "will not work", "unusable")

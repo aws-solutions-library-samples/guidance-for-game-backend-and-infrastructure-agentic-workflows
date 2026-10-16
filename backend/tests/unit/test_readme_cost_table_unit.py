@@ -13,9 +13,9 @@ as roughly 30% more tokens than the equivalent Claude 4.x workload, so the
 model rows carry 1.3x the 4.x volumes and exclude any allowance for
 ``between_tools`` thinking blocks. The checks here only verify internal
 consistency (volume x rate = row cost, rows sum to the subtotal, model plus
-non-model equals the total, the share and subtotal in the note and the guide
-follow from the sums); they do not re-derive the per-token rates from an
-external source.
+non-model equals the total up to a one-dollar rounding gap, the share and
+subtotal in the note and the guide follow from the sums); they do not re-derive
+the per-token rates from an external source.
 
 Nothing here hard-codes a dollar figure that the table also states, so a
 correct price change that updates every dependent figure passes, while a change
@@ -139,17 +139,19 @@ def _non_model_subtotal(readme: str) -> float:
 
 
 def test_sonnet_row_arithmetic(readme: str) -> None:
-    in_m, out_m, row = _row_cost(readme, "Claude Sonnet 5.5")
-    # 1.3x the 80M/20M Claude 4.x workload.
+    in_m, out_m, _row = _row_cost(readme, "Claude Sonnet 5.5")
+    # 1.3x the 80M/20M Claude 4.x workload. The row cost itself is checked
+    # against volume x rate inside ``_row_cost``, so no dollar figure is pinned
+    # here and a correct rate change passes.
     assert (in_m, out_m) == (104, 26)
-    assert row == pytest.approx(468.00, abs=0.01)
 
 
 def test_haiku_row_arithmetic(readme: str) -> None:
-    in_m, out_m, row = _row_cost(readme, "Claude Haiku 5.5")
-    # 1.3x the 40M/10M Claude 4.x workload.
+    in_m, out_m, _row = _row_cost(readme, "Claude Haiku 5.5")
+    # 1.3x the 40M/10M Claude 4.x workload. The row cost itself is checked
+    # against volume x rate inside ``_row_cost``, so no dollar figure is pinned
+    # here and a correct rate change passes.
     assert (in_m, out_m) == (52, 13)
-    assert row == pytest.approx(11.70, abs=0.01)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +169,7 @@ def test_overview_total_is_the_sum_of_the_rows(readme: str) -> None:
     # change to any row that is not carried through to the overview fails.
     overview = re.search(
         r"approximately\s+\*\*~\$([\d,]+)/month\*\*.*?"
-        r"Claude model tokens account for\s+~\$([\d,]+)/month\s+and all other services for\s+~\$([\d,]+)/month",
+        r"Claude\s+model\s+tokens\s+account\s+for\s+~\$([\d,]+)/month\s+and\s+all\s+other\s+services\s+for\s+~\$([\d,]+)/month",
         readme,
         re.DOTALL,
     )
@@ -177,8 +179,10 @@ def test_overview_total_is_the_sum_of_the_rows(readme: str) -> None:
     assert model == round(model_subtotal)
     assert non_model == round(non_model_subtotal)
     assert total == round(derived_total)
-    # The three stated figures must themselves be consistent.
-    assert total == model + non_model
+    # The three stated figures must themselves be consistent. Each is rounded
+    # independently, so the rounded parts need not sum to the rounded total;
+    # allow a one-dollar rounding gap.
+    assert abs(total - (model + non_model)) <= 1
 
 
 def test_total_row_matches_the_sum(readme: str) -> None:
@@ -194,7 +198,7 @@ def test_dominant_cost_note_share_and_subtotal(readme: str) -> None:
 
     # The note repeats the model subtotal and the model share; both derive from
     # the rows. A line break inside the phrase is tolerated with DOTALL.
-    note = re.search(r"Sonnet \+ Haiku = \$([\d,]+),\s+or ~(\d+)% of total", readme, re.DOTALL)
+    note = re.search(r"Sonnet\s+\+\s+Haiku\s+=\s+\$([\d,]+),\s+or ~(\d+)% of total", readme, re.DOTALL)
     assert note, "could not find the dominant-cost note"
     assert int(note.group(1).replace(",", "")) == round(model_subtotal)
     assert int(note.group(2)) == round(model_subtotal / derived_total * 100)
