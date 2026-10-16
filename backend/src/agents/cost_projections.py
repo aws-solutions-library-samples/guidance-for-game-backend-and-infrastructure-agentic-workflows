@@ -52,7 +52,6 @@ ENVELOPE_VERSION = "cost-guard-1"
 # --------------------------------------------------------------------------- #
 MAX_ITEMS = 50  # per-collection item cap (recommendations / forecast periods)
 MAX_STRING = 128  # per-string char cap for identifiers/tokens
-MAX_RESOURCE_TYPES = 10  # per-recommendation resource-type list cap
 MAX_ABS_NUMBER = 1e12  # finite numeric magnitude bound
 MAX_DECIMAL_PLACES = 4  # projected numeric precision
 
@@ -412,7 +411,16 @@ def _project_compute_optimizer_item(item: Mapping[str, Any]) -> dict[str, Any] |
     refresh = _typed_string(item.get("last_refresh_timestamp"), _DATE)
     if refresh is not None:
         out["last_refresh"] = refresh
-    return out or None
+
+    # ``recommended_options`` is always assigned (possibly empty), so it cannot
+    # stand in for operational content. A row whose only key is that empty list
+    # — a ``{}`` row, a row whose every field fails its grammar, or a drifted
+    # upstream schema — carries nothing projectable and is dropped (returns
+    # ``None``) so the collection projector flips to incomplete + partial +
+    # malformed_response instead of reporting an empty shell as ``ok``.
+    if not any(key != "recommended_options" for key in out):
+        return None
+    return out
 
 
 def project_compute_optimizer(data: Mapping[str, Any], bound: int = MAX_ITEMS) -> dict[str, Any] | None:

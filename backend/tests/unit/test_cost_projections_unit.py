@@ -141,6 +141,46 @@ class TestComputeOptimizer:
         assert out["paginated"] is True
         assert "opaque" not in json.dumps(out)
 
+    def test_empty_row_is_dropped_not_ok(self):
+        # A row that projects to nothing but ``recommended_options`` (an empty
+        # list) carries no operational content and must be dropped. With the row
+        # as the only entry, the whole collection has no projectable rows, so the
+        # projector fails closed (returns ``None``, which the guard maps to
+        # ``malformed_response``) instead of reporting an empty shell as ``ok``.
+        assert project_compute_optimizer({"recommendations": [{}]}) is None
+
+    def test_only_rejected_fields_row_is_dropped_not_ok(self):
+        # Every field fails its grammar: the ARN is unsafe (12-digit account) and
+        # leaves no usable resource_id, and the finding carries whitespace that
+        # the token grammar rejects. The row has no projectable content, so a
+        # collection containing only it fails closed rather than surfacing ``ok``.
+        data = {
+            "recommendations": [
+                {
+                    "instance_arn": f"arn:aws:ec2:us-east-1:{ACCT}:instance/{ACCT}",
+                    "current_instance": {"finding": "x y"},
+                }
+            ]
+        }
+        assert project_compute_optimizer(data) is None
+
+    def test_mixed_valid_and_empty_rows_marks_partial(self):
+        # One usable row and one empty shell: the collection keeps the usable row
+        # but reports the empty one as a dropped, partial result.
+        data = {
+            "recommendations": [
+                {"current_instance": {"instance_type": "m5.large", "finding": "OVERPROVISIONED"}},
+                {},
+            ]
+        }
+        out = project_compute_optimizer(data)
+        _no_sensitive(out)
+        assert out["status"] == "incomplete"
+        assert out["partial"] is True
+        assert out["error"]["code"] == "malformed_response"
+        assert len(out["recommendations"]) == 1
+        assert out["recommendations"][0]["current_type"] == "m5.large"
+
 
 class TestCostOptimizationHub:
     def test_recommendation_omits_arn_account_tags(self):

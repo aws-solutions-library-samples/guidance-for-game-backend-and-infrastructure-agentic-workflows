@@ -397,6 +397,48 @@ def test_compute_optimizer_drops_arn_account_and_derives_resource_id():
     assert env["estimated"] is True
 
 
+def test_compute_optimizer_empty_row_is_typed_malformed_not_ok():
+    # A Compute Optimizer row that projects to nothing (an empty dict, or a row
+    # whose every field fails its grammar) carries no operational content. The
+    # guard must emit a typed malformed outcome, never a clean ``ok`` with an
+    # empty-shell recommendation.
+    for data in (
+        {"recommendations": [{}]},
+        {
+            "recommendations": [
+                {
+                    "instance_arn": f"arn:aws:ec2:us-east-1:{ACCT}:instance/{ACCT}",  # suffix is the account id
+                    "current_instance": {"finding": "needs attention"},  # whitespace fails token grammar
+                }
+            ]
+        },
+    ):
+        result = _invoke(_one("compute-optimizer", _success(data)), {"operation": "get_ec2_instance_recommendations"})
+        _assert_no_sensitive(result)
+        env = _env(result)
+        assert env["status"] == "incomplete"
+        assert env["error"]["code"] == "malformed_response"
+
+
+def test_compute_optimizer_mixed_rows_keep_valid_and_mark_partial():
+    # One usable row and one empty shell: the guard retains the usable row and
+    # reports the empty one as a dropped, partial result rather than ``ok``.
+    data = {
+        "recommendations": [
+            {"current_instance": {"instance_type": "m5.large", "finding": "OVERPROVISIONED"}},
+            {},
+        ]
+    }
+    result = _invoke(_one("compute-optimizer", _success(data)), {"operation": "get_ec2_instance_recommendations"})
+    _assert_no_sensitive(result)
+    env = _env(result)
+    assert env["status"] == "incomplete"
+    assert env["partial"] is True
+    assert env["error"]["code"] == "malformed_response"
+    assert len(env["recommendations"]) == 1
+    assert env["recommendations"][0]["current_type"] == "m5.large"
+
+
 def test_cost_optimization_recommendation_drops_arn_tags_account():
     data = {
         "recommendations": [
