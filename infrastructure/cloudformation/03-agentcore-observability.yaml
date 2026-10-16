@@ -64,9 +64,13 @@ Resources:
   # NOTE: Account-wide resources are NOT managed by this stack
   #
   # aws/spans (NO leading /) - AWS-reserved log group for X-Ray Transaction Search
-  #   Created by AWS when Transaction Search is enabled (destination CloudWatchLogs).
-  #   The opt-in path in setup-account-observability.sh enables it additively; the
-  #   first enable creates this log group in the AWS-reserved namespace.
+  #   Created by AWS only when Transaction Search is enabled in the console or
+  #   toggled (destination disabled then re-enabled). A first-time API enable of
+  #   Transaction Search does NOT create this AWS-reserved log group.
+  #   The opt-in path in setup-account-observability.sh enables Transaction Search
+  #   additively and never toggles the shared destination, so it fails (with the
+  #   one-time console / toggle step) rather than silently succeeding when the
+  #   group is still absent.
   #   Log stream 'default' inside this log group receives sampled spans.
   #   See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
   #

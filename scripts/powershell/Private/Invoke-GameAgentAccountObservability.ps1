@@ -7,9 +7,14 @@ function Invoke-GameAgentAccountObservability {
         (trace segment destination, default indexing rule, shared Logs resource
         policy) are account-wide, cross-application settings. This function only
         mutates them when -ConfigureAccountObservability is supplied. The default
-        path is read-only: it reports current state, detects whether the account
-        already supports what the runtime needs, and prints the opt-in instruction
-        if it does not, WITHOUT failing the deployment for that reason alone.
+        path is read-only: it reports current state and detects whether the
+        account already supports what the runtime needs, WITHOUT failing the
+        deployment for that reason alone. When it does not, the default path
+        recommends the opt-in only when the AWS-reserved 'aws/spans' log group
+        already exists and the destination was read (so the opt-in can finish
+        the job by switching the destination); otherwise it points to the
+        one-time console enable or a destination toggle keyed on the current
+        destination, because the opt-in cannot create 'aws/spans'.
 
         Mirrors scripts/infrastructure/setup-account-observability.sh.
     #>
@@ -18,6 +23,11 @@ function Invoke-GameAgentAccountObservability {
         [string]$Region,
         [string[]]$ProfileArgs,
         [switch]$ConfigureAccountObservability,
+        # Read-only post-launch recheck. Reports whether Transaction Search is
+        # active for the runtime (destination CloudWatchLogs and 'aws/spans'
+        # present) without mutating anything. Mirrors the shell script's
+        # 'report-transaction-search' mode.
+        [switch]$ReportOnly,
         # Project-owned name for the shared Logs resource policy. The default is
         # read from the GBAW-prefixed environment variable so it cannot collide
         # with an unrelated environment value.
@@ -55,7 +65,11 @@ function Invoke-GameAgentAccountObservability {
 
     $legacyPolicyName = 'TransactionSearchXRayAccess'
 
-    Write-GameAgentStatus "Account-wide observability (region $Region)..." -Type Info
+    if ($ReportOnly) {
+        Write-GameAgentStatus "Post-launch Transaction Search recheck (region $Region)..." -Type Info
+    } else {
+        Write-GameAgentStatus "Account-wide observability (region $Region)..." -Type Info
+    }
 
     # Returns XRay | CloudWatchLogs, or UNREADABLE if the read did not succeed.
     # Delegates to the shared Get-GameAgentTraceDestination so the opt-in path
@@ -65,16 +79,28 @@ function Invoke-GameAgentAccountObservability {
     }
 
     function Get-TraceStatus {
-        $raw = (& aws xray get-trace-segment-destination --region $Region @ProfileArgs --query 'Status' --output text 2>$null)
+        try {
+            $raw = (& aws xray get-trace-segment-destination --region $Region @ProfileArgs --query 'Status' --output text 2>$null)
+        } catch { return '' }
         if ($LASTEXITCODE -ne 0) { return '' }
         return ("$raw").Trim()
     }
 
-    function Test-SpansLogGroup {
-        $raw = (& aws logs describe-log-groups --log-group-name-prefix 'aws/spans' --region $Region @ProfileArgs --output json 2>$null)
-        if ($LASTEXITCODE -ne 0) { return $false }
-        try { $lgCheck = $raw | ConvertFrom-Json } catch { return $false }
-        return (($lgCheck.logGroups | Where-Object { $_.logGroupName -eq 'aws/spans' }).Count -gt 0)
+    # Classify the AWS-reserved 'aws/spans' log group as present | absent |
+    # unreadable, so a denied or throttled describe call is reported as its own
+    # state rather than mistaken for 'absent'. Wrapped so a redirected native
+    # stderr cannot surface as a terminating error under an inherited 'Stop'
+    # preference (PowerShell 7.0/7.1).
+    function Get-SpansLogGroupState {
+        try {
+            $raw = (& aws logs describe-log-groups --log-group-name-prefix 'aws/spans' --region $Region @ProfileArgs --output json 2>$null)
+        } catch { return 'unreadable' }
+        if ($LASTEXITCODE -ne 0) { return 'unreadable' }
+        try { $lgCheck = $raw | ConvertFrom-Json } catch { return 'unreadable' }
+        if ((($lgCheck.logGroups | Where-Object { $_.logGroupName -eq 'aws/spans' }).Count -gt 0)) {
+            return 'present'
+        }
+        return 'absent'
     }
 
     # Current Default indexing sampling percentage, or UNREADABLE.
@@ -98,6 +124,69 @@ function Invoke-GameAgentAccountObservability {
         Write-Host "            '/aws/application-signals/data')"
     }
 
+    # Print the one-time remedy for the Transaction Search state, keyed on BOTH
+    # the current trace destination and the 'aws/spans' state so the advice
+    # never prescribes a toggle that cannot create the group, and never tells
+    # the operator to create a group that already exists. Mirrors
+    # print_spans_remedy in the shell script:
+    #   - either read failed                       : confirm in the console, no
+    #     toggle commands, because the current state is unknown;
+    #   - destination XRay, group PRESENT          : the group already exists;
+    #     only the trace destination needs switching to 'CloudWatchLogs',
+    #     through the console or the opt-in Step 1.7 already offers;
+    #   - destination XRay, group absent, default  : the launch switches the
+    #     destination (which does not create the group by itself); Step 5c then
+    #     prints the one-time toggle from 'CloudWatchLogs';
+    #   - destination XRay, group absent, recheck  : the launch already ran and
+    #     did NOT switch the destination (see the toolkit's 'Transaction Search
+    #     configuration failed' warning); enable Transaction Search once in the
+    #     console, then re-run;
+    #   - destination CloudWatchLogs, group absent : disable/re-enable toggle.
+    function Write-SpansRemedy {
+        param([string]$Destination, [string]$SpansState, [string]$Indent, [string]$Mode = 'default')
+        if ($Destination -eq 'UNREADABLE' -or $SpansState -eq 'unreadable') {
+            Write-Host "${Indent}The current trace destination or the 'aws/spans' log group could not be read"
+            Write-Host "${Indent}(the call was denied, throttled, or otherwise failed), so Transaction Search"
+            Write-Host "${Indent}support is unknown. Confirm Transaction Search in the AWS X-Ray / CloudWatch"
+            Write-Host "${Indent}console, then re-run the deployment."
+            return
+        }
+        if ($Destination -eq 'XRay' -and $SpansState -eq 'present') {
+            Write-Host "${Indent}The AWS-reserved 'aws/spans' log group already exists, but the trace"
+            Write-Host "${Indent}destination is 'XRay', not 'CloudWatchLogs', so spans do not flow yet."
+            Write-Host "${Indent}Switch the destination to 'CloudWatchLogs' by enabling Transaction Search"
+            Write-Host "${Indent}in the AWS X-Ray / CloudWatch console, or re-run with the opt-in:"
+            Write-Host "${Indent}    Deploy-GameAgent -ConfigureAccountObservability"
+            return
+        }
+        if ($Destination -eq 'XRay') {
+            if ($Mode -eq 'recheck') {
+                Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+                Write-Host "${Indent}is not present. The launch has already run and did NOT switch the"
+                Write-Host "${Indent}destination. Look in the launch output for the toolkit warning"
+                Write-Host "${Indent}'Transaction Search configuration failed', then enable Transaction Search"
+                Write-Host "${Indent}once in the AWS X-Ray / CloudWatch console and re-run the deployment."
+                return
+            }
+            Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+            Write-Host "${Indent}is not present. The deployment's own 'agentcore launch' switches the"
+            Write-Host "${Indent}destination to 'CloudWatchLogs', which does NOT create the group by itself;"
+            Write-Host "${Indent}the post-launch recheck (Step 5c) then prints the one-time toggle. You can"
+            Write-Host "${Indent}instead enable Transaction Search once in the AWS X-Ray / CloudWatch console"
+            Write-Host "${Indent}now."
+            return
+        }
+        # destination CloudWatchLogs with the group absent.
+        Write-Host "${Indent}The trace destination is already 'CloudWatchLogs' but the AWS-reserved"
+        Write-Host "${Indent}'aws/spans' log group is not present. Create it once with EITHER:"
+        Write-Host "${Indent}  - the AWS X-Ray / CloudWatch console (enable Transaction Search), OR"
+        Write-Host "${Indent}  - a one-time destination toggle (disable, then re-enable):"
+        Write-Host "${Indent}      aws xray update-trace-segment-destination --destination XRay --region $Region"
+        Write-Host "${Indent}      # wait for Status ACTIVE, then:"
+        Write-Host "${Indent}      aws xray update-trace-segment-destination --destination CloudWatchLogs --region $Region"
+        Write-Host "${Indent}Then re-run the deployment."
+    }
+
     # Runs a single opt-in mutation, checking the CLI exit code and throwing a
     # bounded, public-safe message (no account IDs or ARNs) on failure.
     function Invoke-ObsMutation {
@@ -111,24 +200,57 @@ function Invoke-GameAgentAccountObservability {
         return $output
     }
 
+    if ($ReportOnly) {
+        # Read-only post-launch recheck: agentcore launch performs its own
+        # Transaction Search enable, which a first-time API enable does not
+        # complete on its own. Report whether spans can flow; never mutate.
+        $destination = Get-TraceDestination
+        $spansState = Get-SpansLogGroupState
+        Write-Host "  X-Ray trace segment destination: $destination"
+        if (($destination -eq 'CloudWatchLogs') -and ($spansState -eq 'present')) {
+            Write-Host "  Transaction Search is active (destination CloudWatchLogs, 'aws/spans' present)."
+            return
+        }
+        Write-GameAgentStatus 'Transaction Search does not yet appear active for the runtime.' -Type Warning
+        if (($destination -ne 'CloudWatchLogs') -and ($destination -ne 'UNREADABLE')) {
+            Write-Host "      Trace destination is '$destination', not 'CloudWatchLogs'."
+            Write-Host "      Spans will not flow until destination is 'CloudWatchLogs' and 'aws/spans' exists."
+        }
+        Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      ' -Mode 'recheck'
+        return
+    }
+
     if (-not $ConfigureAccountObservability) {
         $destination = Get-TraceDestination
+        $spansState = Get-SpansLogGroupState
         $destinationDisplay = if ($destination -eq 'UNREADABLE') { 'unknown (read failed)' } else { $destination }
-        $supported = ($destination -eq 'CloudWatchLogs') -and (Test-SpansLogGroup)
+        $supported = ($destination -eq 'CloudWatchLogs') -and ($spansState -eq 'present')
         Write-Host '  Default mode: no account-wide X-Ray or CloudWatch Logs changes will be made.'
         Write-Host "      Current X-Ray trace segment destination: $destinationDisplay"
         if ($supported) {
             Write-Host '  Account already supports Transaction Search (destination CloudWatchLogs, aws/spans present).'
             Write-Host '      Runtime trace delivery will be configured and verified in a later step.'
-        } else {
-            Write-GameAgentStatus 'Account does NOT yet appear to support Transaction Search for the runtime.' -Type Warning
-            Write-Host '      X-Ray Transaction Search spans require destination CloudWatchLogs and the'
-            Write-Host "      AWS-reserved 'aws/spans' log group. The opt-in WOULD change these shared,"
-            Write-Host '      account-wide settings (every X-Ray / Transaction Search consumer):'
+            Write-Host '  Continuing deployment (default account-observability is non-blocking).'
+            return
+        }
+        Write-GameAgentStatus 'Account does NOT yet appear to support Transaction Search for the runtime.' -Type Warning
+        Write-Host '      X-Ray Transaction Search spans require destination CloudWatchLogs and the'
+        Write-Host "      AWS-reserved 'aws/spans' log group. The deployment will NOT change these"
+        Write-Host '      shared settings automatically.'
+        # The opt-in enables Transaction Search additively and never toggles the
+        # shared destination; a first-time API enable does not create 'aws/spans'.
+        # Recommend the opt-in only when 'aws/spans' already exists AND the
+        # destination is readable (so the opt-in can finish the job); otherwise
+        # point to the console or a destination toggle keyed on the current
+        # destination (via Write-SpansRemedy).
+        if (($spansState -eq 'present') -and ($destination -ne 'UNREADABLE')) {
+            Write-Host '      The opt-in WOULD change these shared, account-wide settings'
+            Write-Host '      (every X-Ray / Transaction Search consumer):'
             Write-AccountScope
             Write-Host '      To let the deployment configure them, re-run with the opt-in:'
             Write-Host '          Deploy-GameAgent -ConfigureAccountObservability'
-            Write-Host '      Or enable Transaction Search once in the AWS X-Ray / CloudWatch console.'
+        } else {
+            Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      ' -Mode 'default'
         }
         Write-Host '  Continuing deployment (default account-observability is non-blocking).'
         return
@@ -292,10 +414,30 @@ function Invoke-GameAgentAccountObservability {
         }
     }
 
-    if (Test-SpansLogGroup) {
+    $spansState = Get-SpansLogGroupState
+    if ($spansState -eq 'present') {
         Write-Host '  aws/spans log group present'
+    } elseif ($spansState -eq 'unreadable') {
+        # The describe call failed (denied, throttled, or otherwise), so the
+        # group's state is unknown. Report it accurately rather than claiming the
+        # group is absent.
+        throw ("Transaction Search is enabled (destination CloudWatchLogs) but the AWS-reserved " +
+            "'aws/spans' log group could not be read (the describe call was denied, throttled, or " +
+            "otherwise failed). Confirm the destination and 'aws/spans' in the AWS X-Ray / CloudWatch " +
+            "console, then re-run the deployment.")
     } else {
-        Write-GameAgentStatus 'aws/spans log group not visible yet; AWS creates it shortly after enabling Transaction Search.' -Type Warning
+        # 'aws/spans' is AWS-reserved: a first-time API enable does not create
+        # it (only the console or a destination toggle does). An additive,
+        # no-toggle enable cannot create it when the account started from 'XRay',
+        # so a missing group is a hard failure with the one-time manual step.
+        throw ("Transaction Search is enabled (destination CloudWatchLogs) but the AWS-reserved " +
+            "'aws/spans' log group does not exist. A first-time API enable does not create it; " +
+            "create it once with EITHER the AWS X-Ray / CloudWatch console (enable Transaction " +
+            "Search), OR a one-time destination toggle: " +
+            "'aws xray update-trace-segment-destination --destination XRay --region $Region', wait " +
+            "for Status ACTIVE, then " +
+            "'aws xray update-trace-segment-destination --destination CloudWatchLogs --region $Region'. " +
+            "Then re-run the deployment. Spans cannot flow until 'aws/spans' exists.")
     }
 
     Write-GameAgentStatus 'Account-wide observability configured (opt-in)' -Type Success

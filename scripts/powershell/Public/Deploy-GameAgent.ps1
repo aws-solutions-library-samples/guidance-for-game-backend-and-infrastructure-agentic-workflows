@@ -17,7 +17,13 @@ function Deploy-GameAgent {
     .PARAMETER ConfigureAccountObservability
         Opt in to account-wide X-Ray / CloudWatch Logs changes (trace segment
         destination, default indexing rule, shared Logs resource policy). Omitted
-        by default so the deployment makes no shared, cross-application changes.
+        by default so this repository's scripts make no account-wide Transaction
+        Search settings change. Note that `agentcore launch` performs its own
+        Transaction Search setup on every launch regardless of this switch (it
+        may add a TransactionSearchXRayAccess resource policy whenever no policy
+        already has that exact name, switch the trace segment destination to
+        CloudWatchLogs, and set the Default indexing rule to 1%; each write also
+        happens when its own read fails).
     .PARAMETER StopOnAccountObservabilityChange
         Fail-closed stop switch for operators who require no shared account change.
         When set, the deployment runs a read-only preflight before each
@@ -45,9 +51,11 @@ function Deploy-GameAgent {
     $ErrorActionPreference = 'Stop'
 
     # Honor the shell-equivalent opt-in environment variable when the switch is
-    # not explicitly supplied, so both shells share one opt-in trigger.
+    # not explicitly supplied, so both shells share one opt-in trigger. The
+    # comparison is case-sensitive ('-ceq'), matching bash's exact 'true' check,
+    # so 'TRUE' or 'True' does not opt in on one shell but not the other.
     if (-not $PSBoundParameters.ContainsKey('ConfigureAccountObservability') -and
-        $env:GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -eq 'true') {
+        $env:GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -ceq 'true') {
         $ConfigureAccountObservability = $true
     }
 
@@ -442,6 +450,29 @@ function Deploy-GameAgent {
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
+
+        # ── Step 5c: Post-launch Transaction Search recheck (read-only) ──
+        # agentcore launch performs its own Transaction Search enable on every
+        # launch (Step 2 only on a first deploy, and Step 5b). A first-time API
+        # enable does not complete it ('aws/spans' is created only by the console
+        # or a destination toggle). Running this after the run's final launch
+        # reports whether spans can flow. The recheck runs in a child scope with
+        # a local 'Continue' preference so a redirected native stderr cannot
+        # become a terminating error on PowerShell 7.0/7.1, and the whole call is
+        # wrapped in try/catch so any terminating error (for example a throw or a
+        # parameter-binding error) is downgraded to a non-blocking warning rather
+        # than propagating through the finally and failing the deploy — matching
+        # the shell call site's '|| true'. The surrounding 'Stop' preference is
+        # unaffected for the frontend steps that follow.
+        Write-GameAgentStatus 'Step 5c: Rechecking Transaction Search state...' -Type Info
+        try {
+            & {
+                $ErrorActionPreference = 'Continue'
+                Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ReportOnly
+            }
+        } catch {
+            Write-GameAgentStatus "Post-launch Transaction Search recheck could not complete: $_" -Type Warning
+        }
     } finally { Pop-Location }
     Write-Host ''
 

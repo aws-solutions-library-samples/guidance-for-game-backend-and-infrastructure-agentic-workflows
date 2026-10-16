@@ -46,11 +46,17 @@ log group are **account-wide** settings shared by every X-Ray and Transaction
 Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and the
 `Invoke-GameAgentAccountObservability` PowerShell function) therefore:
 
-- make **no** account-wide change by default. The default path reads the current
-  trace destination, detects whether the account already supports Transaction
-  Search (destination `CloudWatchLogs` and `aws/spans` present), and prints an
-  actionable opt-in warning if it does not — without failing the deploy for that
-  reason alone;
+- make **no** account-wide Transaction Search settings change by default *from
+  this repository's scripts*.
+  The default path reads the current trace destination, detects whether the
+  account already supports Transaction Search (destination `CloudWatchLogs` and
+  `aws/spans` present), and if it does not, prints an actionable warning —
+  recommending the opt-in only when `aws/spans` already exists and the
+  destination was read, and otherwise the
+  one-time console or destination-toggle step — without failing the deploy for
+  that reason alone. (`agentcore launch` runs its
+  own Transaction Search setup independently of this opt-in; see "Ownership and
+  upstream tracking" below.);
 - apply changes only under the purpose-named opt-in
   `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell:
   `Deploy-GameAgent -ConfigureAccountObservability`), after printing exactly which
@@ -68,7 +74,10 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
   All reads and input validation happen before the first write, and both shells
   check the AWS CLI exit status on every shared mutation: a failed write stops
   the opt-in with a bounded, public-safe diagnostic (operation name and error
-  code only) rather than reporting success.
+  code only) rather than reporting success. Because a first-time API enable does
+  not create the AWS-reserved `aws/spans` log group (only the console or a
+  destination toggle does), the opt-in fails with the one-time manual step rather
+  than reporting success when `aws/spans` is still absent after the enable.
 
 ## Runtime trace delivery is verified
 
@@ -97,8 +106,21 @@ exercised successfully outside the cold-start window.
 Track the exporter credential-availability timing with the AWS Distro for
 OpenTelemetry for Python and the Bedrock AgentCore starter toolkit. The related
 trace-delivery setup gap is tracked upstream at
-`aws/bedrock-agentcore-starter-toolkit` issue 457 (a *different*, already
-worked-around failure mode).
+`aws/bedrock-agentcore-starter-toolkit` issue 457 (a *different* failure mode).
+Separately, `agentcore launch` calls the toolkit's own Transaction Search setup
+on every launch — which the deploy script runs in its Step 2 (only on a first
+deploy) and Step 5b launches. On every launch, the toolkit may make up to three
+shared changes independently of this repository's opt-in, each also when its own
+read fails: it adds a
+`TransactionSearchXRayAccess` resource policy whenever no policy already has that
+exact name (even when this opt-in's own policy already grants access), switches
+the account trace segment destination to `CloudWatchLogs` when it is not already
+`CloudWatchLogs`, and sets the `Default`
+X-Ray indexing rule to 1% sampling when no `Default` rule exists. Because a first-time API enable does not
+create the AWS-reserved `aws/spans` log group, that launch-side enable can leave
+Transaction Search incomplete; the read-only Step 5c recheck reports it. This
+residual is tracked in
+[#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
 
 ## Detection (does not suppress)
 
@@ -207,8 +229,12 @@ example, the detection check or the account-observability setup) regresses,
 revert that focused change; AgentCore-managed baseline observability continues to
 operate while the upstream timing behavior is tracked.
 
-Account-wide changes are made only under the
-`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in. The opt-in path prints a
+Account-wide Transaction Search settings changes from *this repository's
+scripts* are made only under the
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in. (`agentcore launch` performs
+its own Transaction Search setup independently; see "Ownership and upstream
+tracking" and [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).)
+The opt-in path prints a
 rollback command for the trace destination when it enables Transaction Search,
 and for the default indexing rule only when `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
 is set to explicitly change it (printing the prior percentage). To remove the

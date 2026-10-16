@@ -10,6 +10,7 @@ are synthetic.
 # Standard library
 import pathlib
 import re
+import shutil
 import subprocess
 
 # Third-party packages
@@ -491,6 +492,15 @@ def _obs_mock(
     fail_code: str = "AccessDeniedException",
 ) -> str:
     spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    # The AWS CLI only renders the quoted log-group name in JSON output. When a
+    # profile's default output is 'text' (or 'table'/'yaml'), an existing group
+    # is rendered WITHOUT the quoted name a JSON parse needs. This mock emulates
+    # that: 'describe-log-groups' returns JSON only when '--output json' is
+    # requested, and a 'text' rendering otherwise. The reader parses the output
+    # as JSON, so a 'text' rendering does not parse and is classified as
+    # 'unreadable' (not 'absent') — dropping '--output json' from the reader
+    # therefore fails the tests.
+    spans_text = "LOGGROUPS\taws/spans\t1700000000000\t/aws/spans" if spans else ""
     # When fail_operation names a mutating "$1 $2" pair (e.g.
     # "logs put-resource-policy"), the mock returns that AWS error on stderr
     # with a non-zero exit, as the real CLI does, so the helper's exit-status
@@ -515,7 +525,12 @@ def _obs_mock(
         "  fi\n"
         '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then '
         f'echo "{indexing_percent}"; return 0; fi\n'
-        f'  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{spans_json}\'; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+        f'      *) printf "%s\\n" "{spans_text}"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
         f'  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{policies_json}\'; return 0; fi\n'
         f"{fail_block}"
         '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"\n'
@@ -535,8 +550,51 @@ def test_account_obs_default_makes_no_mutation_when_supported():
     assert "already supports Transaction Search" in result.stdout
 
 
-def test_account_obs_default_warns_with_scope_and_opt_in_when_unsupported():
+def test_account_obs_default_points_to_console_or_launch_when_xray_and_spans_absent():
+    # Destination XRay, 'aws/spans' absent: the opt-in cannot create the group,
+    # and a first-time enable FROM 'XRay' (XRay -> CloudWatchLogs) does not
+    # create it either. So the default warning must point to the console or the
+    # deploy's own launch + recheck, and must NOT print the XRay -> CloudWatchLogs
+    # toggle pair or recommend the opt-in.
     result = _account_obs_harness("false", _obs_mock(destination="XRay", spans=False))
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "agentcore launch" in result.stdout
+    # No destination-toggle commands when the destination is XRay.
+    assert "update-trace-segment-destination" not in result.stdout
+
+
+def test_account_obs_default_prints_toggle_when_cloudwatchlogs_and_spans_absent():
+    # Destination already CloudWatchLogs but 'aws/spans' absent: a disable/
+    # re-enable toggle (or the console) creates the group, so the toggle pair is
+    # the correct remedy here. The opt-in is still not recommended (it cannot
+    # create the group).
+    result = _account_obs_harness("false", _obs_mock(destination="CloudWatchLogs", spans=False))
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "update-trace-segment-destination --destination XRay" in result.stdout
+    assert "update-trace-segment-destination --destination CloudWatchLogs" in result.stdout
+
+
+def test_account_obs_default_reads_spans_with_json_output():
+    # An existing 'aws/spans' group is only visible in JSON output. The default
+    # path must request JSON so a profile whose default output is 'text' cannot
+    # make a configured account read as 'absent'. The mock renders the group in
+    # 'text' form unless '--output json' is requested; with JSON requested the
+    # account reads as supported and no remedy is printed.
+    result = _account_obs_harness("false", _obs_mock(destination="CloudWatchLogs", spans=True))
+    assert "rc=0" in result.stdout
+    assert "already supports Transaction Search" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+
+
+def test_account_obs_default_offers_opt_in_only_when_spans_present():
+    # Destination XRay but 'aws/spans' already present: the opt-in can finish the
+    # job (switch the destination / add the policy), so the opt-in is offered and
+    # the full scope is listed.
+    result = _account_obs_harness("false", _obs_mock(destination="XRay", spans=True))
     assert "rc=0" in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
     assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" in result.stdout
@@ -544,6 +602,50 @@ def test_account_obs_default_warns_with_scope_and_opt_in_when_unsupported():
     assert "X-Ray trace segment destination" in result.stdout
     assert "X-Ray default indexing rule" in result.stdout
     assert "CloudWatch Logs resource policy" in result.stdout
+
+
+def test_account_obs_default_does_not_offer_opt_in_when_destination_unreadable_and_spans_present():
+    # An unreadable destination with 'aws/spans' present must NOT offer the
+    # opt-in. The opt-in refuses before any write when it cannot read the
+    # destination, so recommending it would send the operator to a path that
+    # fails. Treat it like the unreadable branch: confirm in the console, no
+    # toggle commands.
+    aws_mock = (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        '      *\' --output json \'*) echo \'{"logGroups":[{"logGroupName":"aws/spans"}]}\'; return 0;;\n'
+        '      *) printf "%s\\n" "LOGGROUPS\taws/spans"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _account_obs_harness("false", aws_mock)
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "unknown (read failed)" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+
+
+def test_account_obs_default_reports_unreadable_spans_separately():
+    # A denied/throttled describe is reported as 'unknown', not as 'absent', and
+    # the opt-in is not recommended for an unknown state.
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then echo "CloudWatchLogs"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (ThrottlingException)" >&2; return 254; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _account_obs_harness("false", mock)
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "could not be read" in result.stdout
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
 
 
 def test_account_obs_default_prints_unknown_when_destination_unreadable():
@@ -1564,3 +1666,526 @@ def test_deploy_e2e_stop_switch_halts_at_launch_guard_when_state_changes_later(t
     # launch-site guard halted it.
     assert "Step 2: Launching AgentCore Runtime" in result.stdout
     assert "Stopping before 'agentcore launch'" in result.stderr
+
+
+# ===========================================================================
+# Account-wide observability default/opt-in and post-launch recheck
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Account-wide observability opt-in: a first-time enable cannot create the
+# AWS-reserved 'aws/spans' log group, so the opt-in must fail closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_fails_when_spans_absent_after_enable(shell):
+    """A first-time API enable (destination XRay -> CloudWatchLogs) does not
+    create the AWS-reserved 'aws/spans' log group (starter-toolkit issue 457).
+    The opt-in enables additively and never toggles, so when 'aws/spans' is still
+    absent after the enable it must fail with the one-time manual step, not exit 0
+    with a soft warning that reports success it did not achieve.
+    """
+    result = _account_obs_harness("true", _obs_mock(destination="XRay", spans=False), shell=shell)
+    assert "rc=1" in result.stdout
+    # The destination enable still happens, but the run fails on the missing group.
+    assert "MUTATION: xray update-trace-segment-destination" in result.stdout
+    assert "'aws/spans' log group does not exist" in result.stderr
+    # The one-time remediation names both the console and the toggle path.
+    assert "update-trace-segment-destination --destination XRay" in result.stderr
+    assert "Account-wide observability configured" not in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_fails_with_unreadable_message_when_spans_read_fails(shell):
+    """A denied or throttled 'logs:DescribeLogGroups' must be reported as
+    'unreadable' with an accurate message, not diagnosed as a missing group."""
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        '    case " $* " in\n'
+        '      *" Status "*) echo "ACTIVE"; return 0;;\n'
+        '      *) echo "XRay"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then echo "5"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (AccessDeniedException)" >&2; return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{"resourcePolicies":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _account_obs_harness("true", mock, shell=shell)
+    assert "rc=1" in result.stdout
+    assert "could not be read" in result.stderr
+    assert "does not exist" not in result.stderr
+    assert "Account-wide observability configured" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Post-launch Transaction Search recheck (read-only, non-blocking)
+# ---------------------------------------------------------------------------
+
+
+def _recheck_harness(aws_mock: str, shell: str = "bash") -> "subprocess.CompletedProcess[str]":
+    """Run the script's read-only 'report-transaction-search' mode."""
+    command = "\n".join(
+        (
+            'export AWS_REGION="us-west-2"',
+            'MUTATION_LOG="$(mktemp)"; export MUTATION_LOG',
+            aws_mock,
+            "export -f aws",
+            f'{shell} "{ACCOUNT_OBS_SCRIPT}" report-transaction-search; echo "rc=$?"',
+            'echo "MUTATIONS:"; cat "$MUTATION_LOG"; rm -f "$MUTATION_LOG"',
+        )
+    )
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+def _recheck_mock(*, destination: str = "CloudWatchLogs", spans: bool = True) -> str:
+    spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    spans_text = "LOGGROUPS\taws/spans\t1700000000000\t/aws/spans" if spans else ""
+    return (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        f'    echo "{destination}"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+        f'      *) printf "%s\\n" "{spans_text}"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_reports_active_without_mutation(shell):
+    result = _recheck_harness(_recheck_mock(destination="CloudWatchLogs", spans=True), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "Transaction Search is active" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_warns_when_spans_absent_without_mutation_or_failure(shell):
+    """After launch, a missing 'aws/spans' is surfaced as a non-blocking WARN;
+    the recheck never mutates account state and never fails the deploy. The
+    advice points to the console or the one-time toggle, not to the opt-in."""
+    result = _recheck_harness(_recheck_mock(destination="CloudWatchLogs", spans=False), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "'aws/spans' log group is not present" in result.stdout
+    assert "update-trace-segment-destination --destination XRay" in result.stdout
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_stays_read_only_when_opt_in_is_exported(shell):
+    """Even with GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY exported, the recheck mode
+    takes precedence and makes no shared write: the recheck is always read-only."""
+    command = "\n".join(
+        (
+            'export AWS_REGION="us-west-2"',
+            'export GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY="true"',
+            'MUTATION_LOG="$(mktemp)"; export MUTATION_LOG',
+            _recheck_mock(destination="XRay", spans=False),
+            "export -f aws",
+            f'{shell} "{ACCOUNT_OBS_SCRIPT}" report-transaction-search; echo "rc=$?"',
+            'echo "MUTATIONS:"; cat "$MUTATION_LOG"; rm -f "$MUTATION_LOG"',
+        )
+    )
+    result = subprocess.run([shell, "-c", command], capture_output=True, text=True)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_reports_unreadable_spans_without_mutation_or_failure(shell):
+    """A denied/throttled describe is reported as 'unknown' in the recheck,
+    still read-only and non-failing."""
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        '    echo "CloudWatchLogs"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (AccessDeniedException)" >&2; return 254; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _recheck_harness(mock, shell=shell)
+    assert "rc=0" in result.stdout
+    assert "could not be read" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_confirms_in_console_when_destination_unreadable(shell):
+    """When the recheck cannot read the destination, it must point to the
+    console and must NOT print a destination toggle (the current destination is
+    unknown, so toggling it blindly could disable a working destination)."""
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{"logGroups":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _recheck_harness(mock, shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "could not be" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_warns_when_destination_not_cloudwatchlogs(shell):
+    """After launch, a destination still 'XRay' with 'aws/spans' absent is
+    surfaced as a non-blocking WARN. The launch has already run and did not
+    switch the destination, so the recheck must point to the toolkit's
+    "Transaction Search configuration failed" warning and the one-time console
+    enable, NOT to another launch, NOT to the XRay -> CloudWatchLogs toggle
+    pair, and NOT to the opt-in. Pins the recheck XRay/absent branch."""
+    result = _recheck_harness(_recheck_mock(destination="XRay", spans=False), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "not 'CloudWatchLogs'" in result.stdout
+    assert "Transaction Search configuration failed" in result.stdout
+    assert "enable Transaction Search" in result.stdout
+    # The launch already ran, so the recheck must not send the operator back to
+    # the deploy's own launch, and must not print a destination toggle.
+    assert "agentcore launch" not in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_reports_existing_spans_as_present_when_destination_xray(shell):
+    """Recheck with destination 'XRay' and 'aws/spans' already PRESENT: the
+    group exists, so the remedy must NOT claim it is missing. Only the trace
+    destination needs switching to 'CloudWatchLogs' (console or the opt-in).
+    This is the state a launch leaves behind when its Transaction Search step
+    failed on an account that already had an 'aws/spans' grant."""
+    result = _recheck_harness(_recheck_mock(destination="XRay", spans=True), shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "already exists" in result.stdout
+    # It must NOT say the group is missing/not present.
+    assert "is not present" not in result.stdout
+    assert "does not exist" not in result.stdout
+    # The destination needs switching; the opt-in is one route for this state.
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+# ---------------------------------------------------------------------------
+# Behavior matrix: mode x destination x aws/spans state
+# ---------------------------------------------------------------------------
+
+
+def _spans_reader_harness(describe_output: str, exit_code: int, shell: str = "bash"):
+    """Source the whole script (which only runs main when executed directly) and
+    call spans_log_group_state over a mocked 'aws logs describe-log-groups'."""
+    aws_mock = "aws() {\n" f'  printf "%s" {describe_output}; return {exit_code};\n' "}"
+    command = "\n".join(
+        (
+            'AWS_REGION="us-west-2"',
+            f'source "{ACCOUNT_OBS_SCRIPT}"',
+            aws_mock,
+            "spans_log_group_state",
+        )
+    )
+    return subprocess.run([shell, "-c", command], capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+@pytest.mark.parametrize(
+    "describe_output,exit_code,expected",
+    [
+        ('\'{"logGroups":[{"logGroupName":"aws/spans"}]}\'', 0, "present"),
+        ("'{\"logGroups\":[]}'", 0, "absent"),
+        ('\'{"logGroups":[{"logGroupName":"aws/spans-archive"}]}\'', 0, "absent"),
+        # Parsed JSON that lacks an 'aws/spans' entry maps to 'absent' in BOTH
+        # shells (empty object, empty list, null, logGroups:null).
+        ("'{}'", 0, "absent"),
+        ("'[]'", 0, "absent"),
+        ("'null'", 0, "absent"),
+        ("'{\"logGroups\":null}'", 0, "absent"),
+        # Output that cannot be parsed as JSON at all is 'unreadable', never
+        # 'absent'. A text/table rendering of an existing group lands here.
+        ("'not json at all'", 0, "unreadable"),
+        ('"LOGGROUPS\taws/spans"', 0, "unreadable"),
+        # A non-zero CLI exit (denied / throttled) is 'unreadable'.
+        ("''", 254, "unreadable"),
+    ],
+)
+def test_spans_reader_state_alignment(describe_output, exit_code, expected, shell):
+    """Pin the shell reader's state mapping so it matches the PowerShell reader:
+    only a non-JSON parse (or a non-zero exit) is 'unreadable'; any parsed JSON
+    without an exact 'aws/spans' entry is 'absent'."""
+    result = _spans_reader_harness(describe_output, exit_code, shell=shell)
+    assert result.stdout.strip() == expected, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_script_fails_fast_when_python3_is_missing(shell):
+    """A standalone run of the setup script without python3 on PATH must stop at
+    the start of main with a clear 'python3 not found' message, before any AWS
+    read, rather than letting the describe calls be misread as denied or
+    throttled. The readers parse JSON with python3, so the check guards them."""
+    # Resolve the shell binary with the real PATH, then run it with an empty
+    # PATH so python3 cannot be found. Everything main needs to reach the check
+    # (variable assignments, 'command -v', 'echo') is a shell builtin, so no
+    # PATH entries are required past locating the interpreter itself.
+    shell_bin = shutil.which(shell) or shell
+    result = subprocess.run(
+        [shell_bin, str(ACCOUNT_OBS_SCRIPT)],
+        capture_output=True,
+        text=True,
+        env={"PATH": "", "AWS_REGION": "us-west-2"},
+    )
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "python3 not found" in combined, combined
+    # It must not reach the read path and blame a denied/throttled call.
+    assert "denied, throttled" not in combined, combined
+
+
+# One mock drives every cell of the matrix. 'describe-log-groups' renders JSON
+# only when '--output json' is requested; without the flag it renders a 'text'
+# listing that does not parse as JSON, which the reader classifies as
+# 'unreadable' (not 'absent'), so a reader that drops the flag fails every cell.
+# 'present' is matched on the EXACT name 'aws/spans', never a prefix such as
+# 'aws/spans-archive'. 'unreadable' is a non-zero CLI exit for the relevant read.
+
+
+def _matrix_mock(destination: str, spans: str) -> str:
+    # spans: "present" | "absent" | "unreadable" | "archive_only" | "non_json"
+    if spans == "present":
+        spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}'
+    elif spans == "archive_only":
+        # Only 'aws/spans-archive' — a prefix match would wrongly call this
+        # present; the exact-name check must call it absent.
+        spans_json = '{"logGroups":[{"logGroupName":"aws/spans-archive"}]}'
+    else:
+        spans_json = '{"logGroups":[]}'
+    spans_text = "LOGGROUPS\taws/spans\t1700000000000" if spans in ("present", "archive_only") else ""
+
+    if destination == "UNREADABLE":
+        dest_block = '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+    else:
+        dest_block = (
+            '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+            f'    echo "{destination}"; return 0; fi\n'
+        )
+
+    if spans == "unreadable":
+        spans_block = (
+            '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+            '    echo "An error occurred (AccessDeniedException)" >&2; return 254; fi\n'
+        )
+    elif spans == "non_json":
+        # Exit 0 but not JSON (a profile rendering table/text output). Must be
+        # classified 'unreadable', not 'absent'.
+        spans_block = (
+            '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+            '    printf "%s\\n" "not-json-output aws/spans"; return 0; fi\n'
+        )
+    else:
+        spans_block = (
+            '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+            '    case " $* " in\n'
+            f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+            f'      *) printf "%s\\n" "{spans_text}"; return 0;;\n'
+            "    esac\n"
+            "  fi\n"
+        )
+    return (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        f"{dest_block}"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then echo "5"; return 0; fi\n'
+        f"{spans_block}"
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{"resourcePolicies":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"\n'
+        "  return 0\n"
+        "}"
+    )
+
+
+# Each cell lists substrings that must appear and substrings that must not, so a
+# change to the cell's routing fails the test. Keyed by (mode, destination,
+# spans).
+_MATRIX_CELLS = {
+    # default mode
+    ("default", "CloudWatchLogs", "present"): (["already supports Transaction Search"], []),
+    ("default", "CloudWatchLogs", "absent"): (
+        ["already 'CloudWatchLogs'", "update-trace-segment-destination --destination XRay"],
+        ["GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "CloudWatchLogs", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "CloudWatchLogs", "non_json"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "CloudWatchLogs", "archive_only"): (
+        ["already 'CloudWatchLogs'", "update-trace-segment-destination --destination XRay"],
+        [],
+    ),
+    ("default", "XRay", "present"): (
+        ["GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true", "X-Ray trace segment destination"],
+        [],
+    ),
+    ("default", "XRay", "absent"): (
+        ["agentcore launch", "switches the", "AWS X-Ray / CloudWatch console"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "XRay", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "XRay", "archive_only"): (
+        ["agentcore launch", "switches the"],
+        ["update-trace-segment-destination"],
+    ),
+    ("default", "UNREADABLE", "present"): (
+        ["could not be read"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "UNREADABLE", "absent"): (
+        ["could not be read"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("default", "UNREADABLE", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    # recheck mode
+    ("recheck", "CloudWatchLogs", "present"): (["Transaction Search is active"], []),
+    ("recheck", "CloudWatchLogs", "absent"): (
+        ["already 'CloudWatchLogs'", "update-trace-segment-destination --destination XRay"],
+        ["GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true"],
+    ),
+    ("recheck", "CloudWatchLogs", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "CloudWatchLogs", "non_json"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "CloudWatchLogs", "archive_only"): (
+        ["update-trace-segment-destination --destination XRay"],
+        [],
+    ),
+    ("recheck", "XRay", "present"): (
+        ["already exists", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true", "AWS X-Ray / CloudWatch console"],
+        ["is not present", "does not exist"],
+    ),
+    ("recheck", "XRay", "absent"): (
+        ["Transaction Search configuration failed", "not 'CloudWatchLogs'", "AWS X-Ray / CloudWatch console"],
+        ["update-trace-segment-destination", "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true", "agentcore launch"],
+    ),
+    ("recheck", "XRay", "unreadable"): (
+        ["not 'CloudWatchLogs'", "could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "XRay", "archive_only"): (
+        ["Transaction Search configuration failed"],
+        ["update-trace-segment-destination"],
+    ),
+    ("recheck", "UNREADABLE", "present"): (
+        ["could not be read"],
+        # The not-CloudWatchLogs line must not print for an unreadable
+        # destination.
+        ["not 'CloudWatchLogs'", "update-trace-segment-destination"],
+    ),
+    ("recheck", "UNREADABLE", "absent"): (
+        ["could not be read"],
+        ["not 'CloudWatchLogs'", "update-trace-segment-destination"],
+    ),
+    ("recheck", "UNREADABLE", "unreadable"): (
+        ["could not be read"],
+        ["update-trace-segment-destination"],
+    ),
+}
+
+
+def _run_matrix_cell(mode: str, destination: str, spans: str, shell: str):
+    mock = _matrix_mock(destination, spans)
+    if mode == "recheck":
+        return _recheck_harness(mock, shell=shell)
+    return _account_obs_harness("false", mock, shell=shell)
+
+
+@pytest.mark.parametrize("cell", list(_MATRIX_CELLS.keys()), ids=lambda c: f"{c[0]}-{c[1]}-{c[2]}")
+def test_remedy_behavior_matrix(cell):
+    """Pin every cell of the behavior matrix (mode x destination x aws/spans
+    state) to its distinguishing message route. Both the default Step 1.7 path
+    and the Step 5c recheck stay read-only (no mutation) and return 0."""
+    mode, destination, spans = cell
+    must_contain, must_not_contain = _MATRIX_CELLS[cell]
+    result = _run_matrix_cell(mode, destination, spans, "bash")
+    assert "rc=0" in result.stdout, result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    for needle in must_contain:
+        assert needle in result.stdout, f"{cell}: expected {needle!r}\n{result.stdout}"
+    for needle in must_not_contain:
+        assert needle not in result.stdout, f"{cell}: unexpected {needle!r}\n{result.stdout}"
+
+
+# The whole matrix is byte-identical under the login `bash` and the macOS system
+# `/bin/bash` (3.2). Re-run the cells that exercise the keyed remedy branches
+# under `/bin/bash` so a bash-4+ construct cannot regress 3.2.
+_MATRIX_PARITY_CELLS = [
+    ("default", "XRay", "present"),
+    ("default", "XRay", "absent"),
+    ("recheck", "XRay", "present"),
+    ("recheck", "XRay", "absent"),
+    ("recheck", "XRay", "unreadable"),
+    ("recheck", "UNREADABLE", "present"),
+    ("default", "CloudWatchLogs", "non_json"),
+]
+
+
+@pytest.mark.parametrize("cell", _MATRIX_PARITY_CELLS, ids=lambda c: f"{c[0]}-{c[1]}-{c[2]}")
+def test_remedy_behavior_matrix_under_bash_3_2(cell):
+    mode, destination, spans = cell
+    must_contain, must_not_contain = _MATRIX_CELLS[cell]
+    result = _run_matrix_cell(mode, destination, spans, "/bin/bash")
+    assert "rc=0" in result.stdout, result.stdout
+    for needle in must_contain:
+        assert needle in result.stdout, f"{cell}: expected {needle!r}\n{result.stdout}"
+    for needle in must_not_contain:
+        assert needle not in result.stdout, f"{cell}: unexpected {needle!r}\n{result.stdout}"
+
+
+# ---------------------------------------------------------------------------
+# Post-launch recheck wiring in deploy.sh (static source check)
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_script_runs_recheck_after_the_final_launch_and_non_blocking():
+    """deploy.sh must dispatch the read-only recheck ('report-transaction-search')
+    and must do so AFTER the final (Step 5b) launch, so the recheck reports the
+    post-launch state even on a refresh deploy where only Step 5b launches. The
+    call site must be non-blocking at the shell level ('|| true')."""
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    assert "report-transaction-search" in content
+    # The recheck dispatch is non-blocking regardless of the child's exit status.
+    recheck_line = next(line for line in content.splitlines() if "report-transaction-search" in line)
+    assert recheck_line.rstrip().endswith("|| true")
+    # The recheck follows the final launch (the last 'agentcore launch' in the
+    # file), so it observes the state the run's last launch left behind.
+    last_launch = content.rfind("agentcore launch")
+    recheck = content.find("report-transaction-search")
+    assert last_launch != -1 and recheck != -1
+    assert recheck > last_launch

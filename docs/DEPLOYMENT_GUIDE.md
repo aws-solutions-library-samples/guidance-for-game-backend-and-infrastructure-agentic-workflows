@@ -15,8 +15,9 @@ Before you begin, ensure you have the following installed and configured:
 | **UV** | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **Docker** | Latest | [Install Guide](https://docs.docker.com/get-docker/) |
 | **yq** | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
+| **python3** | 3.8+ | [Download](https://www.python.org/downloads/) |
 
-**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`).
+**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`). UV does not add a `python3` to `PATH`, so a standalone Python 3 is still required: the deployment scripts call `python3` directly to parse AWS CLI responses in the account-observability steps (the Step 1.7 default read, the Step 2b trace-delivery verification, and the Step 5c post-launch recheck).
 
 **Windows users:** Native PowerShell deployment scripts are available in `scripts/powershell/`. See [scripts/powershell/README.md](../scripts/powershell/README.md) for setup and usage. Requires PowerShell 7.0+ and AWS CLI v2 — no WSL2 or Linux environment needed.
 
@@ -150,6 +151,26 @@ You'll be prompted for:
 - Email address
 - Password (min 8 characters, uppercase, lowercase, number, symbol)
 
+Self-signup is disabled and the app has no in-app user management. To add
+another administrator, re-run this script. To grant chat-only access, create
+the user the same way but add it to the `users` group instead of `admin`. The
+sign-in page does not handle a temporary-password challenge, so set a permanent
+password:
+
+```bash
+USER_POOL_ID=<user-pool-id>   # the UserPoolId output of the base stack
+CHAT_USER_EMAIL=<email>
+read -rsp "Password: " CHAT_USER_PASSWORD; echo
+aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --user-attributes Name=email,Value="$CHAT_USER_EMAIL" Name=email_verified,Value=true \
+  --message-action SUPPRESS
+aws cognito-idp admin-set-user-password --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --password "$CHAT_USER_PASSWORD" --permanent
+aws cognito-idp admin-add-user-to-group --user-pool-id "$USER_POOL_ID" --username "$CHAT_USER_EMAIL" \
+  --group-name users
+unset CHAT_USER_PASSWORD
+```
+
 ### Step 6: Access Your Deployment
 
 The deployment script outputs your frontend URL:
@@ -182,12 +203,31 @@ a shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log
 group. Changing these affects every X-Ray and Transaction Search consumer in the
 account.
 
-**Scope.** By default the deployment makes **no** account-wide X-Ray or
-CloudWatch Logs changes. It reads the current trace destination, detects whether
-the account already supports what the runtime needs, and — if it does not —
-prints an actionable warning with the opt-in instruction. A default deployment is
-**not** failed for a missing account configuration; the per-runtime trace
-delivery is still created and verified.
+**Scope.** By default this repository's deployment scripts make **no**
+account-wide Transaction Search settings changes. They read the current trace
+destination, detect whether the account already supports what the runtime needs,
+and — if it does not — print an actionable warning. That warning recommends the
+opt-in only when the AWS-reserved `aws/spans` log group already exists and the
+destination was read (so the opt-in can finish the job); otherwise it points to
+the one-time console enable or a destination toggle keyed on the current
+destination, because the opt-in cannot create that group. A default deployment is **not** failed for a missing account
+configuration; the per-runtime trace delivery is still created and verified.
+
+> **Residual not controlled by this opt-in.** `agentcore launch` — which the
+> deploy script runs in its Step 2 (only on a first deploy) and Step 5b
+> launches — performs its own Transaction Search setup on every launch,
+> regardless of `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. On every launch, the
+> AgentCore starter toolkit may make up to three shared changes, each also when
+> its own read fails: it adds a `TransactionSearchXRayAccess` resource policy
+> whenever no policy already has that exact name (even when this opt-in's own
+> policy already grants access), switches the account trace segment destination
+> to `CloudWatchLogs` when it is not already `CloudWatchLogs`, and sets the
+> `Default` X-Ray indexing rule to 1% sampling when no `Default` rule exists.
+> This is behavior of the toolkit, not of this repository's scripts, and is
+> tracked in
+> [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
+> A read-only post-launch recheck (Step 5c) reports the resulting Transaction
+> Search state without changing it.
 
 **Opt-in.** To let the deployment configure the shared settings, set the
 purpose-named opt-in:
@@ -210,11 +250,21 @@ are read from the process environment only; they are not read from
 `ui/.env.local`. The PowerShell switch `-ConfigureAccountObservability` and the
 environment variable are equivalent opt-in triggers.
 
-**Ownership and preservation.** The deployment reads existing state first and
-preserves it. It enables Transaction Search only additively (it never performs a
-disable/re-enable toggle of the shared destination) and leaves an already-enabled
-`CloudWatchLogs` destination unchanged. If it cannot read the current trace
-destination, the opt-in refuses to change it and fails rather than guessing. The
+**Ownership and preservation.** This repository's opt-in reads existing state
+first and preserves it. It enables Transaction Search only additively (it never
+performs a disable/re-enable toggle of the shared destination) and leaves an
+already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
+enable does not create the AWS-reserved `aws/spans` log group (only the console
+or a destination toggle does), the opt-in **fails** — with the one-time console
+or toggle step — rather than reporting success when `aws/spans` is still absent
+after the enable. On a fresh account whose destination starts at `XRay`, the
+opt-in has by then already written the shared resource policy and switched the
+trace destination to `CloudWatchLogs` (and, if you set
+`GBAW_XRAY_DEFAULT_INDEXING_PERCENT`, changed the `Default` indexing rule); those
+changes stay in place (the destination rollback command was printed earlier in
+the run), and only the console or a destination toggle creates `aws/spans`. If it cannot read the
+current trace destination, the opt-in refuses to change it and fails rather than
+guessing. The
 account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
 modified only when you set `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` to an integer in
 `[0, 100]`, and only then is a rollback command printed with the prior value. The
@@ -243,10 +293,12 @@ deployment with a bounded diagnostic. The deployment then queries the delivery
 `XRAY` binds the intended source — whose resources include the runtime — to the
 intended destination.
 
-**Rollback.** Account-wide changes are only made under the opt-in. The opt-in
-prints a rollback command for the trace destination when it enables Transaction
-Search, and for the default indexing rule only when you explicitly change it
-(with the prior percentage). To remove the project-owned resource policy:
+**Rollback.** The account-wide changes made by *this repository's opt-in* are
+listed above; `agentcore launch` may make the separate, toolkit-owned changes
+noted in the Scope callout. The opt-in prints a rollback command for the trace
+destination when it enables Transaction Search, and for the default indexing rule
+only when you explicitly change it (with the prior percentage). To remove the
+project-owned resource policy:
 
 ```bash
 aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAccess --region <region>
@@ -387,7 +439,8 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 ./scripts/infrastructure/test-kb.sh
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
-# short-lived access token from an approved Cognito test user
+# short-lived access token from a provisioned Cognito test user (in the
+# `admin` or `users` group)
 export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
 ./test-ai-evals.sh
 
@@ -464,6 +517,48 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
 **AI usage (variable)**: $20-630+/month depending on query volume and conversation length
+
+### Optional operations control plane (E1)
+
+The optional E1 operations control plane is **default-disabled** and adds
+**$0.00** incremental cost. It creates no HTTP API route, compute, table,
+bucket, metric, or alarm unless an owner explicitly enables operations. When
+enabled, it deploys the accepted synchronous, read-only GameLift observation
+design ([ADR 0005](adr/0005-persist-operations-and-recover-workflows.md)) with
+**no queue, worker, dead-letter queue, or Step Functions** in the observation
+path and no provider-write permission.
+
+Incremental monthly cost in `us-west-2` (pricing as of **2026-09-21**;
+free-tier allowances excluded):
+
+| Scenario | Fixed | Variable | Total [USD] |
+| --- | --- | --- | --- |
+| Default-disabled | $0.00 | $0.00 | **$0.00** |
+| Enabled, idle | $1.65 | $0.00 | **$1.65** |
+| Enabled, 100,000 observations/mo | $1.84 | $3.49 | **$5.33** |
+
+Enabled resources and their charge basis:
+
+| Service | Basis | Notes |
+| --- | --- | --- |
+| API Gateway (HTTP API) | $1.00 / million requests | 1 route; 100K req ≈ $0.10 |
+| Compute (Lambda, x86, 512 MB) | $0.20 / M requests + $0.0000166667 / GB-s | 1.0 s billed/req modelled; scales to zero when idle |
+| DynamoDB (on-demand) | WRU $0.625/M, RRU $0.125/M | 16 WRU + 4 RRU per observation (transactional) |
+| DynamoDB storage + PITR | $0.25 + $0.20 / GB-mo | small standing footprint |
+| S3 (content-addressed) | $0.023 / GB-mo + $0.005/1K PUT + $0.0004/1K GET | 1 PUT + 1 GET per observation, ~8 KB objects |
+| CloudWatch metrics + alarms | $0.30 / metric-mo + $0.10 / alarm-mo | 4 metrics + 4 alarms (always-on fixed cost) |
+| CloudWatch logs | $0.50 / GB ingest + $0.03 / GB-mo | ~8 KB per request |
+| X-Ray | $5.00 / million traces | 1 trace per observation |
+
+All rates, source URLs, and assumptions live in
+[`docs/operations-cost-model.json`](operations-cost-model.json) and are
+recomputed by `backend/tests/unit/test_operations_cost_model_unit.py` so these
+tables cannot drift. **Denial-of-wallet controls:** create an AWS Budget on the
+optional stack's cost-allocation tag; set DynamoDB on-demand per-table maximum
+read/write request units; enable HTTP API stage throttling; and alarm on
+request count and error/timeout rate. Disable by setting operations mode to
+`disabled` and removing the optional stack. E1 rollout (#413) is blocked on this
+reviewed cost evidence.
 
 ### Cost Optimization Tips
 
