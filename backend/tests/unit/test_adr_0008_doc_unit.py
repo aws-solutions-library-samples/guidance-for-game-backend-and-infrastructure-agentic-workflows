@@ -23,7 +23,7 @@ Phrase checks strip blockquote markers, fold en and em dashes to a
 hyphen-minus, drop ``*`` and ``_`` emphasis, and collapse whitespace first, so
 a re-wrapped paragraph, a quoted banner, a dash style, or a bold/italic marker
 cannot silently disable a guard. The gate check keys on the stable phrase
-"write-adjacent or control route" so a meaning-preserving reword of the
+"write-adjacent or control" so a meaning-preserving reword of the
 enumerated routes (for example "approve or reject") does not trip it, while
 deleting the gate from any one framing sentence does.
 """
@@ -100,9 +100,9 @@ def _slice(text: str, start_marker: str, *end_markers: str) -> str:
 # the locations that frame the gate as one, so weakening "precondition" to
 # "consideration" (or similar) across the threat model fails here too.
 _GATE_LOCATIONS = (
-    ("ADR context", "adr", "Decision 1 therefore makes token-audience", ("## Decision",), 2, False),
+    ("ADR context", "adr", "Decision 1 therefore makes token-audience", ("## Decision",), 2, True),
     ("ADR decision 1", "adr", "### 1. The operations API must accept only", ("Chosen mechanism",), 1, True),
-    ("ADR child 1", "adr", "Operations token-audience separation", ("2. **Proposal proxy.",), 2, False),
+    ("ADR child 1", "adr", "Operations token-audience separation", ("2. **Proposal proxy.",), 2, True),
     ("TM Status banner", "tm", "Status banner.", ("## Phase Model",), 1, True),
     ("TM Phase Model", "tm", "## Phase Model", ("## Operations Trust Boundaries",), 1, False),
     (
@@ -239,10 +239,13 @@ def test_unmerged_surfaces_are_not_asserted_as_shipped(adr_norm: str, tm_norm: s
         # separation of the approver from the requester.
         "a distinct `admin` must approve",
         "a distinct admin must approve",
+        "a distinct approver",
     ]
     # Scoped to the ADR only: a threat model legitimately describes an executor
-    # or automation identity as "distinct from the requester" (O4, OP-ID1), so
-    # this approver-rule phrasing is forbidden in the ADR's decision text alone.
+    # or automation identity as distinct from the requester and approver (O4
+    # says "distinct from requester/approver"; OP-ID1 says "distinct from human
+    # requester/approver"), so this approver-rule phrasing is forbidden
+    # anywhere in the ADR, which is scanned in full.
     forbidden_adr_only = [
         "distinct from the requester",
     ]
@@ -286,7 +289,7 @@ def test_token_audience_gate_in_every_location(adr_text: str, tm_text: str) -> N
         section = _slice(docs[doc_key], start_marker, *end_markers)
         count = section.count(_GATE_PHRASE)
         assert count >= min_sentences, (
-            f"{name}: token-audience gate ('{_GATE_PHRASE} route') must appear in "
+            f"{name}: token-audience gate ('{_GATE_PHRASE}') must appear in "
             f"{min_sentences} framing sentence(s), found {count}"
         )
         if require_precondition:
