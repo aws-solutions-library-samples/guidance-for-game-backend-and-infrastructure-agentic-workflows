@@ -12,13 +12,25 @@ this record merges as **Proposed**, and a later small pull request flips it to
 **Accepted**. That follow-up changes the `Status:` line to `Accepted`, adds an
 `Accepted:` date line (matching ADR 0005's format), rewrites this paragraph to
 record the acceptance rationale, and updates the status cell in the ADR index
-(`docs/adr/README.md`). The decisions rest on a throwaway spike whose
-measurements are summarized under Evidence; the spike itself is not committed,
-so the acceptance review is a review of those summarized measurements, not of
-committed spike code. The fourth acceptance condition of #546 — child issues
-updated to match these decisions — is applied by a maintainer and is not
-complete at authoring time, so the status stays Proposed until both the child
-issues and the status-flip pull request land.
+(`docs/adr/README.md`).
+
+The decisions rest on a throwaway spike whose measurements are summarized under
+Evidence; the spike itself is not committed. As in ADR 0005 — whose status moved
+to Accepted only once a latency measurement was reproduced through a committed
+measurement path and independently reviewed and accepted — the flip to
+**Accepted** here is gated on reproducing the spike's measurements through a
+committed, repeatable path, not on the summarized numbers in the Evidence
+section. Concretely, the acceptance precondition is that the Evidence E1–E11
+results are reproduced by the committed measurement artifacts the child issues
+own (the bundle-size and content-isolation script and the per-shell browser
+checks under #547, and the chat-parity and highlighter measurements under
+#549), and that reproduction is reviewed and accepted. Until that evidence
+exists and is accepted, this record stays **Proposed** and commits nothing.
+
+The fourth acceptance condition of #546 — child issues updated to match these
+decisions — is applied by a maintainer and is not complete at authoring time,
+so the status stays Proposed until the reproduced evidence is accepted, the
+child issues are updated, and the status-flip pull request lands.
 
 ## Context
 
@@ -129,6 +141,31 @@ stayed statically prerendered (`○`), so writing the attribute at build time do
 not make `/` dynamic. The Pages Router hydrates into `#__next`, not `<html>`, so
 a server-written `<html>` attribute causes no hydration mismatch.
 
+#### Authentication boundary (new, invariant across both shells)
+
+Both shells share `ui/src/pages/api/copilot/chat.ts` as the authentication
+boundary. On `main`, `chat.ts` verifies the access-token cookie with
+`CognitoJwtVerifier` and builds the request principal only from verified claims
+(`verifyAccessToken`, `buildTrustedPrincipal`); the new shell does not change
+that route or its contract (decision 4). Introducing the second shell therefore
+adds no browser-owned identity or authorization: shell choice, the per-request
+preview signal, and the resolved theme preference are presentation only and
+never feed identity, groups, tenant, scopes, or authorization. The preview
+signal in particular is not role-aware — it selects which design system renders
+and grants nothing; approver access comes from the #437 operator gate and the
+backend, never from previewing or selecting a shell (decisions 2 and 9).
+
+The routing that selects a shell is likewise confined to presentation routes.
+The proxy matcher that rewrites `/` to the Cloudscape page is scoped to the
+public shell routes only — `/` and the internal shell route (for example
+`/shell-cloudscape`) — and never matches `/api/copilot/chat` or `/api/auth/*`,
+so it cannot read, write, or weaken the authentication boundary or any identity
+cookie. It performs an internal rewrite with no redirect and selects the shell
+from the server-only selector of decision 2; it sets no identity and alters no
+response header or Content Security Policy. These statements hold whether the
+shell foundation (#547) lands before or after this record, because the chat and
+auth routes and their verification code are unchanged by the shell work.
+
 ### 2. Shell selection — same URL, request-time rewrite, server-only default
 
 The server resolves the shell for `/` at request time from a deployment default
@@ -162,9 +199,12 @@ bundles at build time.
   per-request mechanism. The rewrite leaves the internal Cloudscape route (for
   example `/shell-cloudscape`) directly addressable, and the rewrite response
   carries an `x-middleware-rewrite` header naming it. This grants nothing: the
-  preview is a presentation choice open to anyone, selecting only which design
+  preview is a presentation choice that is not role-aware and is open to any
+  caller, selecting only which design
   system renders. It never enables an operator or approval surface (decision 9),
-  which stays behind the #437 gate regardless of shell. If #547 prefers to hide
+  which stays behind the #437 gate regardless of shell; approver access comes
+  from that gate and the backend, never from previewing or selecting a shell
+  (see the authentication boundary under decision 1). If #547 prefers to hide
   the internal route, the proxy can return 404 for direct requests to it; either
   way the preview confers no authority.
 
@@ -312,12 +352,15 @@ theme, not from the raw stored value.
 
 The production policy already carries `style-src 'self' 'unsafe-inline'`,
 `font-src 'self' data:`, and `img-src 'self' data: blob:`. Cloudscape's CSP
-page attributes `style-src 'self'` to "our components" and states it holds for
-client-rendered output; the spike shows that for **server-rendered** Cloudscape
+page attributes `style-src 'self'` to "our components". That page does not
+qualify the attribution to client-rendered output; the client-rendered-versus-
+server-rendered distinction below is this record's own spike measurement, not a
+Cloudscape statement. The spike shows that for **server-rendered** Cloudscape
 output the attribute source (below) still needs `'unsafe-inline'` under
-`style-src-attr`. Under the current policy, both shells load with zero CSP
-violations and the global-styles package injects no inline `<style>` elements
-(Evidence E3).
+`style-src-attr`, while client-rendered Cloudscape output applies the same
+values through the CSSOM and avoids the attribute case (Evidence E5). Under the
+current policy, both shells load with zero CSP violations and the global-styles
+package injects no inline `<style>` elements (Evidence E3).
 
 Decision: do **not** change the CSP to adopt Cloudscape, and do **not** assume
 `'unsafe-inline'` can be dropped from `style-src` at cutover. Tightening is
