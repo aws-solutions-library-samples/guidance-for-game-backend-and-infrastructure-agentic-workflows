@@ -8,16 +8,21 @@ drift from invariants a reader of the default-deployment source depends on:
    ADR and the O9/OP-H section use must resolve, so the record cannot cite a
    path or heading that does not exist in this checkout.
 2. Grounding: the record describes work delivered by the optional operations
-   phase branches, not by the default deployment. Surfaces that those branches
-   add (the proposal proxy, the capacity prepare contract, the discovery
-   contract, token-audience separation) must be written as a dependency on the
-   owning phase, never asserted as an already-shipped, present-tense contract.
-3. Semantics: the token-audience gate is a precondition for *any* write-adjacent
-   or control route, and the chat-renderer requirement is stated as planned, not
-   as current behavior.
+   phase branches, not by the default deployment. Surfaces the record depends on
+   (the capacity prepare contract and the discovery contract) must be written as
+   a dependency on the owning phase, never asserted as an already-shipped,
+   present-tense contract.
+3. Semantics: the token-audience gate is a precondition for *any*
+   write-adjacent or control route, carried in every location that frames it
+   (the ADR context, decision 1, and Implementation child 1; the threat model
+   Status banner, Phase Model, OP-H7, and the P1 list), and the chat-renderer
+   requirement is stated as planned, not as current behavior.
 
 Phrase checks normalize whitespace and drop Markdown emphasis first, so a
 re-wrapped paragraph or a bold/italic marker cannot silently disable a guard.
+The gate check keys on the stable phrase "write-adjacent or control route" so a
+meaning-preserving reword of the enumerated routes (for example "approve or
+reject") does not trip it, while deleting the gate from any one location does.
 """
 
 from __future__ import annotations
@@ -53,6 +58,43 @@ def _slugify(heading: str) -> str:
     return re.sub(r"[^a-z0-9\-_]", "", slug)
 
 
+def _slice(text: str, start_marker: str, *end_markers: str) -> str:
+    """Return the normalized text from ``start_marker`` up to the next end marker.
+
+    ``start_marker`` and the ``end_markers`` are matched against the normalized
+    document, so a re-wrapped heading or sentence still delimits the slice. The
+    slice lets a semantic assertion target one specific location (one ADR
+    section, one threat-model row) rather than the whole document, so deleting
+    the gate from that location fails the guard instead of being masked by the
+    same words elsewhere.
+    """
+    norm = _normalize(text)
+    start = norm.find(_normalize(start_marker))
+    assert start != -1, f"start marker not found: {start_marker!r}"
+    end = len(norm)
+    for marker in end_markers:
+        found = norm.find(_normalize(marker), start + 1)
+        if found != -1:
+            end = min(end, found)
+    return norm[start:end]
+
+
+# The seven locations that must each carry the token-audience gate. Each entry
+# is (human name, document key, start marker, end marker). Removing the gate
+# from any one of these fails ``test_token_audience_gate_in_every_location``.
+_GATE_LOCATIONS = (
+    ("ADR context", "adr", "Decision 1 therefore makes token-audience", "## Decision"),
+    ("ADR decision 1", "adr", "### 1. The operations API must accept only", "Chosen mechanism"),
+    ("ADR child 1", "adr", "Operations token-audience separation", "2. **Proposal proxy."),
+    ("TM Status banner", "tm", "Status banner.", "## Phase Model"),
+    ("TM Phase Model", "tm", "## Phase Model", "## Operations Trust Boundaries"),
+    ("TM OP-H7", "tm", "| OP-H7 |", "Deployed today:"),
+    ("TM P1 list", "tm", "Before enabling any operations write", "## Review Schedule"),
+)
+
+_GATE_PHRASE = "write-adjacent or control"
+
+
 @pytest.fixture(scope="module")
 def adr_text() -> str:
     return _ADR.read_text(encoding="utf-8")
@@ -84,14 +126,22 @@ def test_adr_exists(adr_text: str) -> None:
 def test_status_line_is_well_formed(adr_text: str) -> None:
     """The record carries an explicit, recognized status label.
 
-    This does not pin ``Proposed``: the ADR anticipates its own acceptance, so
-    the guard only requires that a valid status label is present and the record
-    is not left label-less.
+    This does not pin ``Proposed``: the ADR anticipates its own acceptance and a
+    later record may supersede it, so the guard only requires that the status
+    *begins* with a recognized label. ``Superseded by ADR 0010`` and
+    ``Accepted (2026-11-01)`` are therefore both accepted.
     """
-    match = re.search(r"\*\*Status:\*\*\s*([A-Za-z ]+)", adr_text)
+    match = re.search(r"\*\*Status:\*\*\s*(.+)", adr_text)
     assert match, "ADR 0008 must declare a status"
     status = match.group(1).strip().lower()
-    assert status in {"proposed", "accepted", "superseded", "deprecated"}, f"Unexpected ADR 0008 status: {status!r}"
+    first_word = re.match(r"[a-z]+", status)
+    assert first_word, f"Unexpected ADR 0008 status: {status!r}"
+    assert first_word.group(0) in {
+        "proposed",
+        "accepted",
+        "superseded",
+        "deprecated",
+    }, f"Unexpected ADR 0008 status: {status!r}"
 
 
 @pytest.mark.unit
@@ -130,25 +180,38 @@ def test_relative_links_and_anchors_resolve(adr_text: str, tm_text: str) -> None
 @pytest.mark.unit
 @pytest.mark.fast
 def test_unmerged_surfaces_are_not_asserted_as_shipped(adr_norm: str, tm_norm: str) -> None:
-    """Phase-branch surfaces must not be stated as already-shipped contracts.
+    """Phase-branch surfaces must not be stated as already-shipped contracts,
+    and the early-enablement gap must not be reintroduced as "accepted".
 
     Each phrase here asserts an operations surface the default deployment does
-    not provide as though it already exists. Whitespace is normalized first, so
-    a re-wrapped sentence cannot slip a forbidden phrase past the guard.
+    not provide as though it already exists, or softens the gate into an
+    accepted gap, or restores the overstated approver rule. Whitespace and
+    emphasis are normalized first, so a re-wrapped or bolded sentence cannot slip
+    a forbidden phrase past the guard.
     """
     forbidden = [
         "as built on the e1/e2 branches",
         "as built on the operations branches",
+        "as built on the e1-e4 branches",
         "the existing `operations-capability-discovery`",
         "the existing operations-capability-discovery",
         "the existing cancel proxy",
+        "the shipped cancel proxy",
         "the real capacity prepare contract",
         "the existing capacity prepare contract",
+        # The gate is a precondition, never a silently or explicitly accepted gap.
+        "explicitly accepted gap",
+        "silently accepted gap",
+        # The approver rule defers to policy; it is not an unconditional
+        # separation of the approver from the requester.
+        "a distinct `admin` must approve",
+        "a distinct admin must approve",
+        "distinct from the requester",
     ]
     for phrase in forbidden:
         needle = _normalize(phrase)
-        assert needle not in adr_norm, f"ADR 0008 asserts an unmerged surface as shipped: {phrase!r}"
-        assert needle not in tm_norm, f"THREAT_MODEL O9 asserts an unmerged surface as shipped: {phrase!r}"
+        assert needle not in adr_norm, f"ADR 0008 asserts a forbidden phrase: {phrase!r}"
+        assert needle not in tm_norm, f"THREAT_MODEL O9 asserts a forbidden phrase: {phrase!r}"
 
 
 @pytest.mark.unit
@@ -164,18 +227,23 @@ def test_dependency_grounding_is_visible(adr_norm: str) -> None:
 
 @pytest.mark.unit
 @pytest.mark.fast
-def test_token_audience_gate_is_a_precondition_for_every_write_route(adr_norm: str, tm_norm: str) -> None:
-    """The gate must cover any write-adjacent or control route, not only prepare.
+def test_token_audience_gate_in_every_location(adr_text: str, tm_text: str) -> None:
+    """The gate must appear in each location that frames it.
 
-    Both documents are checked here so a threat-model-only drift (for example
-    an OP-H row left describing a surface as existing) cannot pass unnoticed.
+    Keying on the stable phrase ``write-adjacent or control route`` means a
+    meaning-preserving reword of the enumerated routes (``approve or reject``,
+    ``approval, rejection, dispatch``) still passes, while deleting the gate
+    from the context, decision 1, child 1, the Status banner, the Phase Model,
+    OP-H7, or the P1 list fails here rather than being masked by the same words
+    elsewhere in the document.
     """
-    for norm, name in ((adr_norm, "ADR 0008"), (tm_norm, "THREAT_MODEL O9/OP-H")):
-        assert "precondition" in norm, f"{name}: token-audience separation must be stated as a precondition"
-        # The gate names reject explicitly, alongside approve and dispatch.
-        assert re.search(
-            r"approve,?\s+(and\s+)?reject,?\s+dispatch", norm
-        ), f"{name}: the gate must enumerate approve, reject, and dispatch"
+    docs = {"adr": adr_text, "tm": tm_text}
+    for name, doc_key, start_marker, end_marker in _GATE_LOCATIONS:
+        section = _slice(docs[doc_key], start_marker, end_marker)
+        assert _GATE_PHRASE in section, f"{name}: token-audience gate ('{_GATE_PHRASE} route') is missing"
+    # And the ADR frames it explicitly as a precondition in the decision.
+    decision = _slice(adr_text, "### 1. The operations API must accept only", "Chosen mechanism")
+    assert "precondition" in decision, "ADR decision 1 must frame the gate as a precondition"
 
 
 @pytest.mark.unit
@@ -195,7 +263,14 @@ def test_renderer_requirement_is_planned_not_current(adr_norm: str) -> None:
 @pytest.mark.unit
 @pytest.mark.fast
 def test_op_h_rows_present(tm_text: str) -> None:
-    """The O9 boundary and its OP-H threat rows must stay present and tagged."""
+    """The O9 boundary and every OP-H threat row must stay present as table rows.
+
+    Matching the row start ``| OP-Hn |`` rather than any mention of the ID means
+    deleting a row fails here even though the version-history prose still names
+    the range ``OP-H1 through OP-H7``.
+    """
     assert "O9" in tm_text and "Chat proposal handoff" in tm_text
-    for threat_id in ("OP-H1", "OP-H2", "OP-H4", "OP-H5", "OP-H6", "OP-H7"):
-        assert threat_id in tm_text, f"Threat {threat_id} must be covered in the threat model"
+    for threat_id in ("OP-H1", "OP-H2", "OP-H3", "OP-H4", "OP-H5", "OP-H6", "OP-H7"):
+        assert re.search(
+            rf"^\|\s*{re.escape(threat_id)}\s*\|", tm_text, flags=re.MULTILINE
+        ), f"Threat row {threat_id} must be present as a table row in the threat model"
