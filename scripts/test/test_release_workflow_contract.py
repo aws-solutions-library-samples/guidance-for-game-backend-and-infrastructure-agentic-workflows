@@ -335,16 +335,19 @@ class DispatchRefGuardContractTests(unittest.TestCase):
         # failure be ignored and the run still show green off main).
         guard = self.jobs.get("guard-ref", "")
         self.assertTrue(guard, "guard-ref job must exist")
-        # No job-level if: (4-space key) and no step-level if: (anywhere).
+        # No job-level if: (4-space key) and no step-level if: (anywhere),
+        # including a step whose FIRST key is `- if:` (the `- ` list marker
+        # precedes the key, so the pattern allows an optional `-\s+`).
         self.assertNotRegex(
             guard,
-            r"(?m)^\s*if:",
+            r"(?m)^\s*(?:-\s+)?if:",
             msg="guard-ref must carry no if: at the job or step level",
         )
-        # No continue-on-error at the job or step level.
+        # No continue-on-error at the job or step level, including as a step's
+        # first key (`- continue-on-error:`).
         self.assertNotRegex(
             guard,
-            r"(?m)^\s*continue-on-error:",
+            r"(?m)^\s*(?:-\s+)?continue-on-error:",
             msg="guard-ref must not set continue-on-error (its failure must stop the run)",
         )
 

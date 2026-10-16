@@ -297,6 +297,36 @@ def validate_environment_protected(client: GitHubClient, *, environment: str = R
     )
 
 
+def _branch_policies_are_main_only(policies) -> bool:
+    """Return True iff ``policies`` is exactly one branch-typed ``main`` entry.
+
+    A deployment branch policy entry carries a ``name`` and, when GitHub reports
+    it, a ``type`` (``branch`` or ``tag``). A ``tag``-typed ``main`` entry admits
+    the TAG ``main``, not the branch, so it must not satisfy the main-only branch
+    requirement. The ``type`` is required to be ``branch`` or absent; a ``tag``
+    (or any other) type fails.
+    """
+
+    if len(policies) != 1:
+        return False
+    policy = policies[0]
+    if str(policy.get("name", "")) != MAIN_BRANCH:
+        return False
+    policy_type = policy.get("type")
+    return policy_type in (None, "branch")
+
+
+def _describe_branch_policies(policies) -> list[str]:
+    """Render branch policies as ``name[:type]`` for an error message."""
+
+    out: list[str] = []
+    for policy in policies:
+        name = str(policy.get("name", ""))
+        policy_type = policy.get("type")
+        out.append(f"{name}:{policy_type}" if policy_type is not None else name)
+    return sorted(out)
+
+
 def validate_environment_policy(client: GitHubClient, *, environment: str = RELEASE_ENVIRONMENT) -> None:
     """Fail closed unless the environment's policy is fully machine-confirmable.
 
@@ -336,10 +366,10 @@ def validate_environment_policy(client: GitHubClient, *, environment: str = RELE
         f"release environment '{environment}' must restrict deployments to a custom branch policy limited to main",
     )
     policies = client.list_deployment_branch_policies(environment)
-    names = sorted(str(p.get("name", "")) for p in policies)
     _require(
-        names == [MAIN_BRANCH],
-        f"release environment '{environment}' deployment branch policy must be exactly ['{MAIN_BRANCH}'], got {names}",
+        _branch_policies_are_main_only(policies),
+        f"release environment '{environment}' deployment branch policy must be exactly a branch policy named "
+        f"'{MAIN_BRANCH}', got {_describe_branch_policies(policies)}",
     )
 
 
@@ -351,6 +381,20 @@ def validate_environment_policy(client: GitHubClient, *, environment: str = RELE
 # without write access, so this is machine-checked, not hand-checked.
 _TAG_RESTRICTING_RULE_TYPES = frozenset({"creation", "update", "deletion"})
 
+# The two restricting rule types that gate the WORKFLOW'S OWN tag writes.
+# GitHub lets only bypass actors create a ref matching a ``creation`` rule or
+# delete one matching a ``deletion`` rule (see GitHub's "Available rules for
+# rulesets"); the workflow creates ``refs/tags/<tag>`` itself and deletes it
+# during cleanup. ``update`` restricts only pushing/moving an existing tag,
+# which the workflow never does, so ``update`` leaves both writes alone.
+_TAG_WRITE_BLOCKING_RULE_TYPES = frozenset({"creation", "deletion"})
+
+# ``current_user_can_bypass`` values on the single-ruleset GET that mean the
+# calling token IS a bypass actor for the ruleset. Any other value (notably
+# ``never``) or an absent field means it is not, so a ``creation``/``deletion``
+# rule would refuse the workflow's own tag write.
+_CAN_BYPASS_VALUES = frozenset({"always", "pull_requests_only"})
+
 
 def _fnm_pathname_regex(pattern: str) -> str:
     """Translate a ruleset ref pattern to a regex with ``File.fnmatch`` +
@@ -360,12 +404,16 @@ def _fnm_pathname_regex(pattern: str) -> str:
     a concrete ref with Ruby's ``File.fnmatch(pattern, ref, File::FNM_PATHNAME)``
     (see GitHub's "Creating rulesets" article). Under ``FNM_PATHNAME`` the
     wildcards ``*``, ``?``, and ``[...]`` never cross a ``/``, so ``refs/*`` does
-    NOT match ``refs/tags/v1.0.0``. GitHub additionally treats a ``**`` path
-    segment (``**/``) as zero or more directories, so ``refs/tags/**/*`` DOES
-    match ``refs/tags/v1.0.0``. ``~ALL`` is the caller's special case and never
-    reaches here. ``FNM_EXTGLOB`` and ``[^...]`` complement are unsupported by
-    GitHub and are not emulated; a ``[!...]`` negation is honored as fnmatch
-    documents it.
+    NOT match ``refs/tags/v1.0.0``. A ``**`` is treated as "zero or more
+    directories" only when it is a whole path segment, i.e. ``**/`` at the start
+    of the pattern or immediately after a ``/`` (so ``refs/tags/**/*`` DOES match
+    ``refs/tags/v1.0.0``); a ``**`` that does not start a segment (for example
+    ``v**``) collapses to a single-segment ``*`` that never crosses ``/``. A
+    backslash escapes the next character, as ``fnmatch`` documents when
+    ``FNM_NOESCAPE`` is not set, so ``\\v`` is a literal ``v``. ``~ALL`` is the
+    caller's special case and never reaches here. ``FNM_EXTGLOB`` is unsupported
+    by GitHub and is not emulated; a ``[!...]`` or ``[^...]`` negation is honored
+    as fnmatch documents it, and a bracket set never matches ``/``.
     """
 
     i = 0
@@ -373,13 +421,23 @@ def _fnm_pathname_regex(pattern: str) -> str:
     out = ["\\A"]
     while i < n:
         char = pattern[i]
-        if char == "*":
-            if pattern[i : i + 3] == "**/":
-                out.append("(?:[^/]*/)*")  # zero or more directories
+        if char == "\\":
+            # Escape the next character to a literal (fnmatch default). A
+            # trailing backslash is a literal backslash.
+            if i + 1 < n:
+                out.append(re.escape(pattern[i + 1]))
+                i += 2
+            else:
+                out.append(re.escape("\\"))
+                i += 1
+        elif char == "*":
+            at_segment_start = i == 0 or pattern[i - 1] == "/"
+            if at_segment_start and pattern[i : i + 3] == "**/":
+                out.append("(?:[^/]*/)*")  # a whole ** segment: zero or more directories
                 i += 3
                 continue
             if pattern[i : i + 2] == "**":
-                out.append("[^/]*")  # trailing ** behaves as a single-segment *
+                out.append("[^/]*")  # a ** that is not a whole segment behaves as a single-segment *
                 i += 2
                 continue
             out.append("[^/]*")
@@ -403,7 +461,10 @@ def _fnm_pathname_regex(pattern: str) -> str:
                 if stuff.startswith("!"):
                     stuff = "^" + stuff[1:]
                 stuff = stuff.replace("\\", "\\\\")
-                out.append("[" + stuff + "]")
+                # A bracket set never matches ``/`` under FNM_PATHNAME. Guard the
+                # class with a negative lookahead so ``[/]`` (or any set that
+                # lists ``/``) cannot join two path segments.
+                out.append("(?:(?![/])[" + stuff + "])")
                 i = j + 1
         else:
             out.append(re.escape(char))
@@ -438,20 +499,19 @@ def _dispatched_tag_ref(tag: str, *, tag_prefix: str) -> str:
     return f"refs/tags/{tag}" if tag else f"refs/tags/{tag_prefix}"
 
 
-def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> bool:
-    """Return True if an active tag ruleset actually covers ``refs/tags/<tag>``
-    and restricts who may create, update, or delete it.
+def _covering_tag_ruleset_detail(client: GitHubClient, *, ref: str) -> dict | None:
+    """Return the detail of the active tag ruleset that covers ``ref`` and
+    restricts who may create, update, or delete it, or ``None``.
 
     Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
     ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
-    only when it is ``active``; an include pattern matches ``refs/tags/<tag>``
-    (``~ALL`` or an ``FNM_PATHNAME`` pattern) with no exclude pattern that
-    removes it; and it carries at least one restricting rule type
-    (``creation`` / ``update`` / ``deletion``), so matching alone — without any
-    rule that gates the write — does not pass the gate.
+    only when it is ``active``; an include pattern matches ``ref`` (``~ALL`` or
+    an ``FNM_PATHNAME`` pattern) with no exclude pattern that removes it; and it
+    carries at least one restricting rule type (``creation`` / ``update`` /
+    ``deletion``). The first such ruleset's detail is returned so the caller can
+    inspect its rule types and ``current_user_can_bypass``.
     """
 
-    ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
     for summary in client.list_rulesets(target="tag"):
         if str(summary.get("enforcement", "")) != "active":
             continue
@@ -471,25 +531,82 @@ def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag: str, tag_prefix: str
             continue
         rule_types = {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
         if rule_types & _TAG_RESTRICTING_RULE_TYPES:
-            return True
-    return False
+            return detail
+    return None
+
+
+def tag_ruleset_covers_v_tags(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> bool:
+    """Return True if an active tag ruleset actually covers ``refs/tags/<tag>``
+    and restricts who may create, update, or delete it.
+
+    Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
+    ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
+    only when it is ``active``; an include pattern matches ``refs/tags/<tag>``
+    (``~ALL`` or an ``FNM_PATHNAME`` pattern) with no exclude pattern that
+    removes it; and it carries at least one restricting rule type
+    (``creation`` / ``update`` / ``deletion``), so matching alone — without any
+    rule that gates the write — does not pass the gate.
+    """
+
+    ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
+    return _covering_tag_ruleset_detail(client, ref=ref) is not None
+
+
+def _ruleset_token_can_bypass(detail: dict) -> bool:
+    """Return True if ``current_user_can_bypass`` marks the calling token a
+    bypass actor for the ruleset.
+
+    The single-ruleset GET returns ``current_user_can_bypass`` for the calling
+    token's own identity. Any value other than ``always`` / ``pull_requests_only``
+    (including ``never`` or an absent field) means the token is not a bypass
+    actor, so a ``creation`` or ``deletion`` rule would refuse its tag write.
+    """
+
+    return str(detail.get("current_user_can_bypass", "")) in _CAN_BYPASS_VALUES
 
 
 def validate_tag_ruleset_present(client: GitHubClient, *, tag: str, tag_prefix: str = "v") -> None:
-    """Fail closed unless an active tag ruleset covers ``refs/tags/<tag>``.
+    """Fail closed unless an active tag ruleset covers ``refs/tags/<tag>`` with a
+    rule set the workflow's own identity can satisfy.
 
     A non-dry run must not publish a tag the repository does not protect with a
     tag ruleset that both matches the dispatched ref and restricts who may
     create, update, or delete it. The ruleset's ref conditions and rule list are
     readable with ``Metadata: read``, so this is a machine check, not advice.
+
+    Beyond requiring a covering, restricting ruleset, this also refuses before
+    the draft when that ruleset would block the workflow's OWN tag writes:
+    GitHub lets only bypass actors create a ref matching a ``creation`` rule or
+    delete one matching a ``deletion`` rule, and the workflow creates
+    ``refs/tags/<tag>`` and deletes it during cleanup. So when the covering
+    ruleset carries ``creation`` or ``deletion`` and the single-ruleset GET
+    reports ``current_user_can_bypass`` as ``never`` or absent for this token,
+    the gate fails closed with a remedy rather than letting the run fail at the
+    tag write (``creation``) or leave an orphaned tag at cleanup (``deletion``).
+    An ``update``-only ruleset restricts moving an existing tag, which the
+    workflow never does, so it passes.
     """
 
+    ref = _dispatched_tag_ref(tag, tag_prefix=tag_prefix)
+    detail = _covering_tag_ruleset_detail(client, ref=ref)
     _require(
-        tag_ruleset_covers_v_tags(client, tag=tag, tag_prefix=tag_prefix),
-        f"no active tag ruleset covers refs/tags/{tag_prefix}* with a creation/update/deletion rule; "
+        detail is not None,
+        f"no active tag ruleset covers {ref} with a creation/update/deletion rule; "
         f"add a tag ruleset whose ref-name condition includes the {tag_prefix}* tags and restricts "
         "who may create, update, or delete them before releasing",
     )
+    assert detail is not None  # for type-checkers; _require already enforced it
+    rule_types = {str(rule.get("type", "")) for rule in (detail.get("rules") or []) if isinstance(rule, dict)}
+    blocking = sorted(rule_types & _TAG_WRITE_BLOCKING_RULE_TYPES)
+    if blocking and not _ruleset_token_can_bypass(detail):
+        raise ValidationError(
+            f"the tag ruleset covering {ref} carries a {'/'.join(blocking)} rule that only bypass actors can "
+            "satisfy, and this workflow's token is not a bypass actor (current_user_can_bypass is never or "
+            "absent), so it could not create the tag ref (creation) or delete it during cleanup (deletion). "
+            "Use an 'update' rule to restrict who moves release tags (which leaves this workflow's create and "
+            "cleanup writes alone), or add this workflow's identity to the ruleset's bypass list. "
+            "See docs/RELEASING.md 'Recommended maintainer settings'."
+        )
 
 
 def report_release_settings(client: GitHubClient, *, tag: str = "", tag_prefix: str = "v") -> dict[str, str]:
@@ -555,12 +672,12 @@ def report_environment_policy(client: GitHubClient, *, environment: str = RELEAS
             else "missing"
         )
         branch_policy = payload.get("deployment_branch_policy")
-        names = sorted(str(p.get("name", "")) for p in client.list_deployment_branch_policies(environment))
+        policies = client.list_deployment_branch_policies(environment)
         report["branch_policy"] = (
             "ok"
             if isinstance(branch_policy, dict)
             and branch_policy.get("custom_branch_policies") is True
-            and names == [MAIN_BRANCH]
+            and _branch_policies_are_main_only(policies)
             else "missing"
         )
     except Exception:  # noqa: BLE001 - advisory read only; never block on it

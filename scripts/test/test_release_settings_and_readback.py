@@ -174,7 +174,55 @@ class PostPublishReadBackTests(unittest.TestCase):
         self.assertIn("immutable", message)
         self.assertIn("does not equal the published", message)
 
-    def test_missing_asset_fails_read_back(self):
+    def test_two_bad_assets_are_both_reported(self):
+        # The asset check collects every per-asset mismatch, not just the first,
+        # so an operator sees all the bad assets at once. Two corrupted assets
+        # must both appear in the single raised error.
+        inputs = _artifact_inputs()
+        client = _ready_client()
+        client.releases.append({"id": 610, "tag_name": "v0.1.0", "draft": False})
+        _record_assets(client, 610, inputs)
+        client.existing_refs["tags/v0.1.0"] = "t" * 40
+        # Corrupt the sizes of two different assets.
+        client.release_assets[610][0]["size"] = client.release_assets[610][0]["size"] + 1
+        client.release_assets[610][1]["size"] = client.release_assets[610][1]["size"] + 2
+        bad_names = [client.release_assets[610][0]["name"], client.release_assets[610][1]["name"]]
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=610, inputs=inputs, created_tag_sha="t" * 40)
+        message = str(ctx.exception)
+        for name in bad_names:
+            self.assertIn(name, message, f"{name} should be named among the failures")
+
+    def test_persistent_asset_read_error_becomes_a_failure_entry(self):
+        # If the asset-list read keeps failing (for example a persistent 502),
+        # the read error must become a failure ENTRY rather than escaping and
+        # discarding the failures already found. The not-immutable failure and
+        # the tag check must still be reported, so the operator sees the full
+        # picture, not a bare transport error.
+        # Local modules
+        from release.github_client import GitHubError
+
+        inputs = _artifact_inputs()
+        client = _ready_client(published_immutable=False)
+        client.releases.append({"id": 620, "tag_name": "v0.1.0", "draft": False})
+        # The tag ref resolves correctly, so only the asset read and the
+        # immutability are wrong.
+        client.existing_refs["tags/v0.1.0"] = "t" * 40
+        client.tag_objects["t" * 40] = {"sha": "t" * 40, "object": {"sha": COMMIT, "type": "tag"}}
+
+        def boom(release_id):
+            raise GitHubError(502, "list-release-assets")
+
+        client.list_release_assets = boom  # type: ignore[assignment]
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=620, inputs=inputs, created_tag_sha="t" * 40)
+        message = str(ctx.exception).lower()
+        # The not-immutable failure survived (was not discarded by the raise).
+        self.assertIn("immutable", message)
+        # The asset read error is reported as a failure entry.
+        self.assertIn("502", message)
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "release-artifacts"
             _write_artifact_set(out)
@@ -427,6 +475,86 @@ class TagRulesetGateTests(unittest.TestCase):
         with self.assertRaises(validate_mod.ValidationError):
             validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
 
+    def test_update_only_ruleset_passes_without_bypass(self):
+        # An `update`-only ruleset restricts moving an existing tag, which the
+        # workflow never does, so it passes the gate even when the token is not
+        # a bypass actor.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "update"}])
+        client.ruleset_details[42]["current_user_can_bypass"] = "never"
+        validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")  # does not raise
+
+    def test_creation_rule_without_bypass_fails_closed(self):
+        # A `creation` rule only bypass actors can satisfy would refuse the
+        # workflow's own tag-ref write. With current_user_can_bypass=never the
+        # gate must fail closed before the draft, naming the create/cleanup
+        # blockage and the update/bypass remedies.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "creation"}])
+        client.ruleset_details[42]["current_user_can_bypass"] = "never"
+        with self.assertRaises(validate_mod.ValidationError) as ctx:
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+        message = str(ctx.exception).lower()
+        self.assertIn("creation", message)
+        self.assertIn("bypass", message)
+
+    def test_deletion_rule_without_bypass_fails_closed(self):
+        # `deletion` is GitHub's default; it would refuse cleanup's tag-ref
+        # delete and leave an orphaned tag. With no bypass the gate fails closed.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "deletion"}])
+        client.ruleset_details[42]["current_user_can_bypass"] = "never"
+        with self.assertRaises(validate_mod.ValidationError) as ctx:
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+        self.assertIn("deletion", str(ctx.exception).lower())
+
+    def test_creation_rule_absent_bypass_field_fails_closed(self):
+        # An absent current_user_can_bypass field is treated as "not a bypass
+        # actor" (fail closed), since the field is only present when readable.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "creation"}])
+        client.ruleset_details[42].pop("current_user_can_bypass", None)
+        with self.assertRaises(validate_mod.ValidationError):
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+
+    def test_creation_rule_with_bypass_passes(self):
+        # When the token IS a bypass actor (current_user_can_bypass=always), a
+        # creation/deletion rule no longer blocks the workflow's writes, so the
+        # gate passes.
+        client = self._ruleset(["refs/tags/v*"], rules=[{"type": "creation"}, {"type": "deletion"}])
+        client.ruleset_details[42]["current_user_can_bypass"] = "always"
+        validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")  # does not raise
+
+    def test_fakes_model_github_creation_enforcement(self):
+        # The fakes must model GitHub's documented enforcement: a create_ref
+        # for a ref covered by a bypass-less `creation` rule is refused, the way
+        # GitHub refuses it, so the compliant happy-path fixture (an `update`
+        # rule) is one GitHub would actually accept rather than one that only
+        # passes because the fake ignores rules.
+        client = RecordingClient()
+        summary = {"id": 9, "name": "c", "target": "tag", "enforcement": "active"}
+        detail = {
+            "id": 9,
+            "target": "tag",
+            "enforcement": "active",
+            "current_user_can_bypass": "never",
+            "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+            "rules": [{"type": "creation"}, {"type": "deletion"}],
+        }
+        client.rulesets = [summary]
+        client.ruleset_details = {9: detail}
+        with self.assertRaises(RuntimeError):
+            client.create_ref(ref="refs/tags/v0.1.0", sha="t" * 40)
+        # And deletion is refused too (GitHub's default rule).
+        client.existing_refs["tags/v0.1.0"] = "t" * 40
+        with self.assertRaises(RuntimeError):
+            client.delete_ref("tags/v0.1.0")
+
+    def test_fakes_allow_update_rule_ref_writes(self):
+        # The compliant fixture (update-only, bypass never) must let the
+        # workflow's create and delete succeed, since `update` restricts only
+        # moving an existing tag.
+        client = RecordingClient()
+        apply_release_settings(client)
+        client.create_ref(ref="refs/tags/v0.1.0", sha="t" * 40)  # no raise
+        client.delete_ref("tags/v0.1.0")  # no raise
+
     def test_matcher_table_matches_github_fnm_pathname(self):
         # Pin every row of the matcher table against GitHub's
         # documented File.fnmatch + FNM_PATHNAME semantics (* does not cross /,
@@ -460,6 +588,20 @@ class TagRulesetGateTests(unittest.TestCase):
             (["refs/tags/**/*"], [], "v0.1.0", True),
             # ~ALL minus refs/*: refs/* does not match the tag ref, so ~ALL still covers.
             (["~ALL"], ["refs/*"], "v0.1.0", True),
+            # A `**/` that does NOT start a path segment is a single-segment `*`
+            # (not "zero or more directories"), so a trailing `/**/*` or `/*`
+            # then needs a `/` the tag ref does not have. These cover no tag.
+            (["refs/tags/v**/**/*"], [], "v0.1.0", False),
+            (["refs/tags/v**/*"], [], "v0.1.0", False),
+            # `ref**` is a single-segment match, so `ref**/v*` needs `refs/v...`,
+            # which the two-segment tag ref is not.
+            (["ref**/v*"], [], "v0.1.0", False),
+            # A bracket set never matches `/` under FNM_PATHNAME, so `[/]` cannot
+            # join the two segments; the pattern covers no tag.
+            (["refs/tags[/]v*"], [], "v0.1.0", False),
+            # A backslash escapes the next character (fnmatch default), so `\\v`
+            # is a literal `v` and the pattern DOES cover the tag ref.
+            (["refs/tags/\\v*"], [], "v0.1.0", True),
         ]
         for include, exclude, tag, expected in cases:
             with self.subTest(include=include, exclude=exclude, tag=tag):
@@ -505,6 +647,22 @@ class EnvironmentPolicyGateTests(unittest.TestCase):
         }
         with self.assertRaises(validate_mod.ValidationError):
             validate_mod.validate_environment_policy(client)
+
+    def test_tag_typed_main_policy_fails(self):
+        # A deployment branch policy entry named "main" but typed "tag" admits
+        # the TAG main, not the branch, so it must not satisfy the main-only
+        # branch requirement; the gate must fail closed.
+        client = self._client()
+        client.deployment_branch_policies["release"] = [{"id": 1, "name": "main", "type": "tag"}]
+        with self.assertRaises(validate_mod.ValidationError) as ctx:
+            validate_mod.validate_environment_policy(client)
+        self.assertIn("branch policy", str(ctx.exception).lower())
+
+    def test_branch_typed_main_policy_passes(self):
+        # An explicit type "branch" is accepted (as is an absent type).
+        client = self._client()
+        client.deployment_branch_policies["release"] = [{"id": 1, "name": "main", "type": "branch"}]
+        validate_mod.validate_environment_policy(client)  # does not raise
 
 
 class ReadBackRetryTests(unittest.TestCase):
@@ -957,6 +1115,91 @@ class CliVerifyEnvironmentReportTests(unittest.TestCase):
         ):
             cli.cmd_verify_environment(mock.MagicMock())
         self.assertIn("v* tag ruleset=absent", buf.getvalue())
+
+    def test_report_uses_the_dispatched_tag_from_the_environment(self):
+        # The settings report must be built with the dispatched GBAW_RELEASE_TAG,
+        # not an empty placeholder. A ruleset covers only v1.* (an update rule),
+        # so the dispatched tag v1.0.0 is reported present; dropping the tag at
+        # the call site (an empty tag -> refs/tags/v, which v1.* does not cover)
+        # would report absent, so this fails if the tag is not threaded through.
+        # Standard library
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        # Local modules
+        from release import cli
+
+        client = _ready_client()
+        client.rulesets = [{"id": 88, "name": "v1", "target": "tag", "enforcement": "active"}]
+        client.ruleset_details = {
+            88: {
+                "id": 88,
+                "target": "tag",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["refs/tags/v1.*"], "exclude": []}},
+                "rules": [{"type": "update"}],
+            }
+        }
+        buf = io.StringIO()
+        with (
+            mock.patch.object(cli, "_client", return_value=(client, "o", "r")),
+            mock.patch.dict("os.environ", {"GBAW_RELEASE_TAG": "v1.0.0"}, clear=False),
+            redirect_stdout(buf),
+        ):
+            cli.cmd_verify_environment(mock.MagicMock())
+        self.assertIn("v* tag ruleset=present", buf.getvalue())
+
+    def test_environment_policy_report_is_printed(self):
+        # cmd_verify_environment must print the environment-policy report
+        # (prevent-self-review and the main-only branch policy). A compliant
+        # environment reports ok; a non-compliant one reports missing and emits
+        # the note. This pins report_environment_policy's result and its
+        # branch-policy check, which a hardcoded "ok" or a dropped branch check
+        # would otherwise leave untested.
+        # Standard library
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        # Local modules
+        from release import cli
+
+        client = _ready_client()
+        buf = io.StringIO()
+        with (
+            mock.patch.object(cli, "_client", return_value=(client, "o", "r")),
+            redirect_stdout(buf),
+        ):
+            cli.cmd_verify_environment(mock.MagicMock())
+        out = buf.getvalue()
+        self.assertIn("prevent-self-review=ok", out)
+        self.assertIn("main-only branch policy=ok", out)
+
+    def test_environment_policy_report_flags_a_non_compliant_environment(self):
+        # Standard library
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        # Local modules
+        from release import cli
+
+        client = _ready_client()
+        # Self-review is allowed and the branch policy is not main-only.
+        client.environments["release"]["protection_rules"][0]["prevent_self_review"] = False
+        client.deployment_branch_policies["release"] = [{"id": 1, "name": "main"}, {"id": 2, "name": "release/*"}]
+        buf = io.StringIO()
+        with (
+            mock.patch.object(cli, "_client", return_value=(client, "o", "r")),
+            redirect_stdout(buf),
+        ):
+            cli.cmd_verify_environment(mock.MagicMock())
+        out = buf.getvalue()
+        self.assertIn("prevent-self-review=missing", out)
+        self.assertIn("main-only branch policy=missing", out)
+        self.assertIn("fails closed unless the release environment prevents self-review", out)
 
 
 if __name__ == "__main__":

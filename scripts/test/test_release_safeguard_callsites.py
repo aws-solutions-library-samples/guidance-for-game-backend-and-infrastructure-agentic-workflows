@@ -571,6 +571,42 @@ class PublishGateCallSiteTests(unittest.TestCase):
             self.assertIn("self-review", str(ctx.exception).lower())
             self.assertNotIn("create_release", client.calls)
 
+    def test_publish_gate_uses_the_dispatched_tag_not_a_placeholder(self):
+        # The gate must receive the dispatched tag (metadata.tag), not "" or a
+        # placeholder. A ruleset covers v* but EXCLUDES v*-rc.*, and the tag is
+        # an rc tag. Only the real rc tag is uncovered: an empty tag resolves to
+        # refs/tags/v (covered) and v0.0.0 resolves to refs/tags/v0.0.0
+        # (covered), so passing either placeholder at the call site would let
+        # the run through. The real rc tag must be refused before any write.
+        # Standard library
+        import tempfile
+
+        # Local modules
+        from release import validate as validate_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            out = self._valid_input_dir(Path(d), tag="v1.0.0-rc.1")
+            client = RecordingClient()
+            client.main_head = COMMIT
+            apply_release_settings(client)
+            # Cover v* but exclude the rc tags, with an update rule the token
+            # can satisfy, so only the rc tag's exclusion causes the refusal.
+            client.rulesets = [{"id": 77, "name": "v", "target": "tag", "enforcement": "active"}]
+            client.ruleset_details = {
+                77: {
+                    "id": 77,
+                    "target": "tag",
+                    "enforcement": "active",
+                    "current_user_can_bypass": "never",
+                    "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": ["refs/tags/v*-rc.*"]}},
+                    "rules": [{"type": "update"}],
+                }
+            }
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.publish_release_from_dir(client, out, self._metadata(tag="v1.0.0-rc.1"))
+            self.assertIn("tag ruleset", str(ctx.exception).lower())
+            self.assertNotIn("create_release", client.calls)
+
 
 if __name__ == "__main__":
     unittest.main()

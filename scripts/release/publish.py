@@ -12,17 +12,24 @@ ref is ``main``, and validation succeeded):
    ``SHA256SUMS`` (tamper check) and the exclusion guard (public-safety);
 2. verify the manifest's tag, commit, and attached-file list equal the trusted
    dispatch inputs -- the downloaded bytes are never trusted to assert their
-   own identity;
-3. re-run the pre-write validations against the live API: commit is still
-   ``main`` HEAD, tag ref still absent and strictly greater, required checks
-   green, evidence bound; and the ``release`` environment exists with a
-   required-reviewers protection rule (fail closed);
-4. install the SIGTERM-to-exception handler, then create a **draft** release
+   own identity -- and, when a rebuilt manifest is supplied, require the
+   downloaded manifest to be byte-identical to it;
+3. fail closed unless the ``release`` environment's policy is fully
+   machine-confirmable (required reviewers, prevent-self-review, a main-only
+   deployment branch policy) and an active tag ruleset covers the dispatched
+   ``refs/tags/<tag>`` with a rule set this workflow's own identity can satisfy;
+4. re-run the pre-write validations against the live API: commit is still
+   ``main`` HEAD, tag ref still absent and strictly greater;
+5. install the SIGTERM-to-exception handler, then create a **draft** release
    with notes and upload the verified assets (draft creation is inside the
    guarded block, so an ambiguous or interrupted creation is cleaned up);
-5. create the annotated tag *object* then the ``refs/tags/<tag>`` ref at the
-   exact commit;
-6. publish the draft (``prerelease`` for ``-rc.N``).
+6. verify the draft's attached assets before the tag write;
+7. re-check ``main`` HEAD and tag-ref absence, then create the annotated tag
+   *object* and the ``refs/tags/<tag>`` ref at the exact commit;
+8. publish the draft (``prerelease`` for ``-rc.N``);
+9. read the published release back and fail the run unless it is published and
+   immutable, carries exactly the four allowlisted assets, and resolves the tag
+   ref through this run's annotated tag object to the released commit.
 
 Failure handling:
 
@@ -201,32 +208,34 @@ def _check_asset_set(assets, *, inputs: PublishInputs, context: str) -> None:
 
     ``context`` names the phase in the error message ("draft" / "post-publish
     read-back") so an operator knows whether the mismatch is still repairable.
+    Every attached asset is checked, and all mismatches are collected into one
+    raised :class:`ValidationError` so an operator sees every bad asset at once
+    rather than only the first.
     """
 
     local_by_name = {a.name: a.data for a in inputs.artifacts}
     sums_entries = {e.name: e.digest for e in checksums.parse_sha256sums(inputs.sha256sums)}
 
+    failures: list[str] = []
     names = sorted(str(a.get("name", "")) for a in assets)
-    _require(
-        set(names) == set(ALLOWED_ARTIFACT_NAMES),
-        f"{context}: attached assets {names} do not equal the four release artifacts",
-    )
+    if set(names) != set(ALLOWED_ARTIFACT_NAMES):
+        failures.append(f"{context}: attached assets {names} do not equal the four release artifacts")
     for asset in assets:
         name = str(asset.get("name", ""))
         local = local_by_name.get(name)
-        _require(local is not None, f"{context}: unexpected attached asset {name}")
+        if local is None:
+            failures.append(f"{context}: unexpected attached asset {name}")
+            continue
         size = asset.get("size")
-        _require(
-            isinstance(size, int) and size == len(local),
-            f"{context}: asset {name} size {size} does not equal the published {len(local)} bytes",
-        )
+        if not (isinstance(size, int) and size == len(local)):
+            failures.append(f"{context}: asset {name} size {size} does not equal the published {len(local)} bytes")
         reported = _asset_sha256_from_digest(str(asset.get("digest", "")))
         if reported is not None:
             expected = sums_entries.get(name) or checksums.sha256_hex(local)
-            _require(
-                reported == expected,
-                f"{context}: asset {name} digest does not equal its published checksum",
-            )
+            if reported != expected:
+                failures.append(f"{context}: asset {name} digest does not equal its published checksum")
+    if failures:
+        raise ValidationError("; ".join(failures))
 
 
 def _verify_draft_assets(client: GitHubClient, *, release_id: int, inputs: PublishInputs) -> None:
@@ -327,12 +336,24 @@ def verify_published_release(
 
 
 def _collect(check) -> list[str]:
-    """Run a check that raises :class:`ValidationError`; return [] or [message]."""
+    """Run a check that raises :class:`ValidationError`; return [] or [message].
+
+    A :class:`ValidationError` from the check is the expected "this failed"
+    signal and becomes a single failure entry. A read error (any other
+    exception, for example a persistent ``GitHubError`` from a GET that keeps
+    returning 5xx after its retries) is ALSO turned into a failure entry rather
+    than being allowed to escape: letting it propagate would discard the
+    failures the read-back already collected (such as "not immutable") and skip
+    the remaining checks. The entry names the read error so an operator can act
+    on it with the Manual recovery hand checks.
+    """
 
     try:
         check()
     except ValidationError as error:
         return [str(error)]
+    except Exception as error:  # noqa: BLE001 - a read error must become a failure entry, not escape
+        return [f"post-publish read-back: a read failed and could not be confirmed: {error}"]
     return []
 
 
@@ -434,11 +455,11 @@ def publish_release(client: GitHubClient, inputs: PublishInputs) -> PublishResul
             )
 
         # Verify the DRAFT's attached assets (names, sizes, and digests where
-        # GitHub reports them) BEFORE creating the tag. A draft asset changed by
-        # another writer between upload and the tag write is caught here, while
-        # the draft can still be cleaned up and the tag name is not yet burned,
-        # instead of at the post-publish read-back once the release is immutable
-        # and its assets are locked.
+        # GitHub reports them) BEFORE creating the tag. A draft whose attached
+        # assets do not match the published set at this point is caught here,
+        # while the draft can still be cleaned up and the tag name is not yet
+        # burned, instead of at the post-publish read-back once the release is
+        # immutable and its assets are locked.
         _verify_draft_assets(client, release_id=result.release_id, inputs=inputs)
 
         # 4. Re-check main HEAD and tag absence IMMEDIATELY before the tag

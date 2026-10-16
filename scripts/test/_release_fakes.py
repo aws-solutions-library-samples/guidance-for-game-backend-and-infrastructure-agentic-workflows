@@ -119,6 +119,47 @@ class RecordingClient(GitHubClient):
                 return dict(summary)
         raise KeyError(ruleset_id)
 
+    def _ruleset_enforcement_for_ref(self, ref: str) -> "tuple[set[str], str]":
+        """Return (restricting rule types, current_user_can_bypass) for the
+        active tag ruleset that covers ``ref``, modeling GitHub's enforcement of
+        ``creation``/``update``/``deletion`` against a bypass-less identity.
+
+        ``create_ref`` / ``delete_ref`` consult this so the fakes refuse a ref
+        write GitHub would refuse: a ``creation`` rule blocks creating the ref
+        and a ``deletion`` rule blocks deleting it unless the calling identity
+        can bypass (``current_user_can_bypass`` is a bypass value). This keeps
+        the compliant happy-path fixture one GitHub would actually accept.
+        """
+
+        # Local modules
+        from release.validate import _ruleset_pattern_matches_ref
+
+        for summary in getattr(self, "rulesets", []):
+            if str(summary.get("enforcement", "")) != "active" or str(summary.get("target", "")) != "tag":
+                continue
+            detail = getattr(self, "ruleset_details", {}).get(summary.get("id"), summary)
+            if str(detail.get("enforcement", "")) != "active":
+                continue
+            conditions = (detail.get("conditions") or {}).get("ref_name") or {}
+            include = [p for p in (conditions.get("include") or []) if isinstance(p, str)]
+            exclude = [p for p in (conditions.get("exclude") or []) if isinstance(p, str)]
+            if not any(_ruleset_pattern_matches_ref(p, ref) for p in include):
+                continue
+            if any(_ruleset_pattern_matches_ref(p, ref) for p in exclude):
+                continue
+            rule_types = {str(r.get("type", "")) for r in (detail.get("rules") or []) if isinstance(r, dict)}
+            bypass = str(detail.get("current_user_can_bypass", "never"))
+            return rule_types, bypass
+        return set(), "never"
+
+    def _assert_ref_write_allowed(self, ref: str, rule_type: str) -> None:
+        rule_types, bypass = self._ruleset_enforcement_for_ref(ref)
+        can_bypass = bypass in ("always", "pull_requests_only")
+        if rule_type in rule_types and not can_bypass:
+            raise RuntimeError(
+                f"ref write refused by ruleset {rule_type} rule: only bypass actors may {rule_type} {ref}"
+            )
+
     def list_deployment_branch_policies(self, name: str):
         self.calls.append(f"list_deployment_branch_policies:{name}")
         return [dict(p) for p in getattr(self, "deployment_branch_policies", {}).get(name, [])]
@@ -208,13 +249,17 @@ class RecordingClient(GitHubClient):
 
     def create_ref(self, *, ref, sha):
         self._maybe_fail("create_ref")
+        self._assert_ref_write_allowed(ref, "creation")
         key = ref.replace("refs/", "", 1)
         self.existing_refs[key] = sha
         return {"ref": ref, "object": {"sha": sha}}
 
     def delete_ref(self, ref):
         self._maybe_fail("delete_ref")
-        self.existing_refs.pop(ref, None)
+        full = ref if ref.startswith("refs/") else f"refs/{ref}"
+        self._assert_ref_write_allowed(full, "deletion")
+        key = ref.replace("refs/", "", 1)
+        self.existing_refs.pop(key, None)
 
 
 def completed_check(name: str, commit: str, conclusion="success", app_id=15368, completed_at="2024-01-01T00:00:00Z"):
@@ -252,7 +297,15 @@ def protected_environment(name: str = "release") -> dict:
 
 
 def covering_tag_ruleset(ruleset_id: int = 42) -> tuple[dict, dict]:
-    """Return (summary, detail) for an active tag ruleset that covers v* tags."""
+    """Return (summary, detail) for an active tag ruleset that covers v* tags.
+
+    The detail carries an ``update`` rule, which restricts who may *move* a tag
+    but leaves the workflow's own tag creation and cleanup deletion alone, so
+    this is a setup GitHub would accept for a bypass-less workflow identity.
+    ``current_user_can_bypass`` is ``never`` to match a token that is not a
+    bypass actor; because only ``update`` is present, the gate still passes and
+    the ref writes still succeed.
+    """
 
     summary = {"id": ruleset_id, "name": "protect v*", "target": "tag", "enforcement": "active"}
     detail = {
@@ -260,8 +313,9 @@ def covering_tag_ruleset(ruleset_id: int = 42) -> tuple[dict, dict]:
         "name": "protect v*",
         "target": "tag",
         "enforcement": "active",
+        "current_user_can_bypass": "never",
         "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
-        "rules": [{"type": "creation"}, {"type": "update"}, {"type": "deletion"}],
+        "rules": [{"type": "update"}],
     }
     return summary, detail
 
