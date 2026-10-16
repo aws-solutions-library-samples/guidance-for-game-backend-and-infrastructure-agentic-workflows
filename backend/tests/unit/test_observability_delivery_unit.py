@@ -452,6 +452,14 @@ def _obs_mock(
     fail_code: str = "AccessDeniedException",
 ) -> str:
     spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    # The AWS CLI only renders the quoted log-group name in JSON output. When a
+    # profile's default output is 'text' (or 'table'/'yaml'), an existing group
+    # is rendered WITHOUT the quoted name a text match would look for. This mock
+    # emulates that: 'describe-log-groups' returns JSON only when '--output json'
+    # is requested, and a 'text' rendering otherwise. A reader that does not
+    # request JSON therefore reads an existing group as 'absent', which the test
+    # asserts against — so dropping '--output json' from the reader fails.
+    spans_text = "LOGGROUPS\taws/spans\t1700000000000\t/aws/spans" if spans else ""
     # When fail_operation names a mutating "$1 $2" pair (e.g.
     # "logs put-resource-policy"), the mock returns that AWS error on stderr
     # with a non-zero exit, as the real CLI does, so the helper's exit-status
@@ -476,7 +484,12 @@ def _obs_mock(
         "  fi\n"
         '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then '
         f'echo "{indexing_percent}"; return 0; fi\n'
-        f'  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{spans_json}\'; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+        f'      *) printf "%s\\n" "{spans_text}"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
         f'  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{policies_json}\'; return 0; fi\n'
         f"{fail_block}"
         '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"\n'
@@ -496,16 +509,44 @@ def test_account_obs_default_makes_no_mutation_when_supported():
     assert "already supports Transaction Search" in result.stdout
 
 
-def test_account_obs_default_points_to_console_or_toggle_when_spans_absent():
+def test_account_obs_default_points_to_console_or_launch_when_xray_and_spans_absent():
     # Destination XRay, 'aws/spans' absent: the opt-in cannot create the group,
-    # so the default warning must point to the console or the one-time toggle
-    # and must NOT recommend the opt-in as the remedy.
+    # and a first-time enable FROM 'XRay' (XRay -> CloudWatchLogs) does not
+    # create it either. So the default warning must point to the console or the
+    # deploy's own launch + recheck, and must NOT print the XRay -> CloudWatchLogs
+    # toggle pair or recommend the opt-in.
     result = _account_obs_harness("false", _obs_mock(destination="XRay", spans=False))
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "agentcore launch" in result.stdout
+    # No destination-toggle commands when the destination is XRay.
+    assert "update-trace-segment-destination" not in result.stdout
+
+
+def test_account_obs_default_prints_toggle_when_cloudwatchlogs_and_spans_absent():
+    # Destination already CloudWatchLogs but 'aws/spans' absent: a disable/
+    # re-enable toggle (or the console) creates the group, so the toggle pair is
+    # the correct remedy here. The opt-in is still not recommended (it cannot
+    # create the group).
+    result = _account_obs_harness("false", _obs_mock(destination="CloudWatchLogs", spans=False))
     assert "rc=0" in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
     assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
     assert "update-trace-segment-destination --destination XRay" in result.stdout
     assert "update-trace-segment-destination --destination CloudWatchLogs" in result.stdout
+
+
+def test_account_obs_default_reads_spans_with_json_output():
+    # An existing 'aws/spans' group is only visible in JSON output. The default
+    # path must request JSON so a profile whose default output is 'text' cannot
+    # make a configured account read as 'absent'. The mock renders the group in
+    # 'text' form unless '--output json' is requested; with JSON requested the
+    # account reads as supported and no remedy is printed.
+    result = _account_obs_harness("false", _obs_mock(destination="CloudWatchLogs", spans=True))
+    assert "rc=0" in result.stdout
+    assert "already supports Transaction Search" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
 
 
 def test_account_obs_default_offers_opt_in_only_when_spans_present():
@@ -522,12 +563,42 @@ def test_account_obs_default_offers_opt_in_only_when_spans_present():
     assert "CloudWatch Logs resource policy" in result.stdout
 
 
+def test_account_obs_default_does_not_offer_opt_in_when_destination_unreadable_and_spans_present():
+    # Issue: an unreadable destination with 'aws/spans' present must NOT offer the
+    # opt-in. The opt-in refuses before any write when it cannot read the
+    # destination, so recommending it would send the operator to a path that
+    # fails. Treat it like the unreadable branch: confirm in the console, no
+    # toggle commands.
+    aws_mock = (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        '      *\' --output json \'*) echo \'{"logGroups":[{"logGroupName":"aws/spans"}]}\'; return 0;;\n'
+        '      *) printf "%s\\n" "LOGGROUPS\taws/spans"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _account_obs_harness("false", aws_mock)
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
+    assert "unknown (read failed)" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+
+
 def test_account_obs_default_reports_unreadable_spans_separately():
     # A denied/throttled describe is reported as 'unknown', not as 'absent', and
     # the opt-in is not recommended for an unknown state.
-    mock = _obs_mock(destination="CloudWatchLogs", spans=True).replace(
-        'if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{"logGroups":[{"logGroupName":"aws/spans"}]}\'; return 0; fi',
-        'if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (ThrottlingException)" >&2; return 254; fi',
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then echo "CloudWatchLogs"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (ThrottlingException)" >&2; return 254; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
     )
     result = _account_obs_harness("false", mock)
     assert "rc=0" in result.stdout
@@ -807,9 +878,20 @@ def test_account_obs_optin_fails_when_spans_absent_after_enable(shell):
 def test_account_obs_optin_fails_with_unreadable_message_when_spans_read_fails(shell):
     """A denied or throttled 'logs:DescribeLogGroups' must be reported as
     'unreadable' with an accurate message, not diagnosed as a missing group."""
-    mock = _obs_mock(destination="XRay", spans=True).replace(
-        'if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{"logGroups":[{"logGroupName":"aws/spans"}]}\'; return 0; fi',
-        'if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (AccessDeniedException)" >&2; return 254; fi',
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "sts" ]; then echo "123456789012"; return 0; fi\n'
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        '    case " $* " in\n'
+        '      *" Status "*) echo "ACTIVE"; return 0;;\n'
+        '      *) echo "XRay"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-indexing-rules" ]; then echo "5"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo "An error occurred (AccessDeniedException)" >&2; return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-resource-policies" ]; then echo \'{"resourcePolicies":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2 ${3:-}" >> "$MUTATION_LOG"; return 0\n'
+        "}"
     )
     result = _account_obs_harness("true", mock, shell=shell)
     assert "rc=1" in result.stdout
@@ -840,11 +922,17 @@ def _recheck_harness(aws_mock: str, shell: str = "bash") -> "subprocess.Complete
 
 def _recheck_mock(*, destination: str = "CloudWatchLogs", spans: bool = True) -> str:
     spans_json = '{"logGroups":[{"logGroupName":"aws/spans"}]}' if spans else '{"logGroups":[]}'
+    spans_text = "LOGGROUPS\taws/spans\t1700000000000\t/aws/spans" if spans else ""
     return (
         "aws() {\n"
         '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
         f'    echo "{destination}"; return 0; fi\n'
-        f'  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{spans_json}\'; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then\n'
+        '    case " $* " in\n'
+        f"      *' --output json '*) echo '{spans_json}'; return 0;;\n"
+        f'      *) printf "%s\\n" "{spans_text}"; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
         '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
         "}"
     )
@@ -912,11 +1000,40 @@ def test_recheck_reports_unreadable_spans_without_mutation_or_failure(shell):
 
 
 @pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_recheck_confirms_in_console_when_destination_unreadable(shell):
+    """When the recheck cannot read the destination, it must point to the
+    console and must NOT print a destination toggle (the current destination is
+    unknown, so toggling it blindly could disable a working destination)."""
+    mock = (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-log-groups" ]; then echo \'{"logGroups":[]}\'; return 0; fi\n'
+        '  echo "MUTATION: $1 $2" >> "$MUTATION_LOG"; return 0\n'
+        "}"
+    )
+    result = _recheck_harness(mock, shell=shell)
+    assert "rc=0" in result.stdout
+    assert "does not yet appear active" in result.stdout
+    assert "could not be" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
 def test_recheck_warns_when_destination_not_cloudwatchlogs(shell):
+    """After launch, a destination still 'XRay' is surfaced as a non-blocking
+    WARN. Because a first-time enable FROM 'XRay' does not create 'aws/spans',
+    the recheck must NOT print the XRay -> CloudWatchLogs toggle pair and must
+    NOT recommend the opt-in; it points to the console or the deploy's own
+    launch + recheck. Pins mutation M7 (the recheck XRay branch recommending the
+    opt-in or the toggle)."""
     result = _recheck_harness(_recheck_mock(destination="XRay", spans=False), shell=shell)
     assert "rc=0" in result.stdout
     assert "does not yet appear active" in result.stdout
     assert "not 'CloudWatchLogs'" in result.stdout
+    assert "agentcore launch" in result.stdout
+    assert "update-trace-segment-destination" not in result.stdout
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
 
 

@@ -7,6 +7,22 @@ BeforeAll {
         $script:StatusMessages.Add("$Type`: $Message")
     }
 
+    # Capture Write-Host output so a spec can assert the printed remedy text, not
+    # only the Write-GameAgentStatus warnings. The guidance body (the toggle
+    # commands, the console/launch advice, the opt-in instruction) is written
+    # with Write-Host, so without this capture no spec can fail on that text.
+    $script:HostMessages = [System.Collections.Generic.List[string]]::new()
+    function Write-Host {
+        param(
+            [Parameter(ValueFromRemainingArguments = $true, Position = 0)]$Object,
+            [switch]$NoNewline,
+            $ForegroundColor,
+            $BackgroundColor,
+            $Separator
+        )
+        $script:HostMessages.Add(($Object -join ' '))
+    }
+
     # Builds an `aws` mock that returns canned, synthetic responses and records
     # every mutating call name (so a mutation hidden behind an output capture is
     # still observable to the test).
@@ -82,6 +98,7 @@ BeforeAll {
 Describe 'Invoke-GameAgentAccountObservability' {
     BeforeEach {
         $script:StatusMessages = [System.Collections.Generic.List[string]]::new()
+        $script:HostMessages = [System.Collections.Generic.List[string]]::new()
         $global:LASTEXITCODE = 0
     }
     AfterEach {
@@ -289,31 +306,99 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $mutations.Count | Should -Be 0
     }
 
-    It 'ReportOnly warns without mutating or throwing when aws/spans is absent' {
+    It 'ReportOnly prints the destination toggle when the destination is CloudWatchLogs and aws/spans is absent' {
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $false -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
         $mutations.Count | Should -Be 0
         ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+        $host_ = $script:HostMessages -join "`n"
+        # The disable/re-enable toggle is the correct remedy from CloudWatchLogs.
+        $host_ | Should -Match 'update-trace-segment-destination --destination XRay'
+        $host_ | Should -Match 'update-trace-segment-destination --destination CloudWatchLogs'
     }
 
-    It 'ReportOnly warns and points to the console or toggle when the destination is XRay' {
+    It 'ReportOnly warns and points to the console or launch when the destination is XRay' {
         # agentcore launch may leave the destination at XRay. The recheck must
-        # surface it, stay read-only, and point to the console or the one-time
-        # toggle rather than recommend the opt-in (which cannot create the group).
+        # surface it, stay read-only, and point to the console or the deploy's
+        # own launch rather than print the XRay -> CloudWatchLogs toggle pair (a
+        # first-time enable from XRay does not create the group) or recommend the
+        # opt-in (which cannot create it either).
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
         $mutations.Count | Should -Be 0
         ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'agentcore launch'
+        $host_ | Should -Not -Match 'update-trace-segment-destination'
+        $host_ | Should -Not -Match 'GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY'
     }
 
-    It 'ReportOnly reports unreadable aws/spans without mutating or throwing' {
+    It 'ReportOnly reports unreadable aws/spans and prints no toggle commands' {
         $mutations = [System.Collections.Generic.List[string]]::new()
         Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $true -SpansUnreadable $true -Mutations $mutations
         Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
         $mutations.Count | Should -Be 0
         ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+        $host_ = $script:HostMessages -join "`n"
+        # Unreadable spans: confirm in the console, no toggle commands.
+        $host_ | Should -Match 'could not be read'
+        $host_ | Should -Not -Match 'update-trace-segment-destination'
+    }
+
+    It 'ReportOnly confirms in the console and prints no toggle when the destination is unreadable' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -DestinationUnreadable $true -SpansExists $false -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ReportOnly
+        $mutations.Count | Should -Be 0
+        ($script:StatusMessages -join ' ') | Should -Match 'does not yet appear active'
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'could not be read'
+        $host_ | Should -Not -Match 'update-trace-segment-destination'
+    }
+
+    It 'Default mode offers the opt-in only when aws/spans already exists' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'Default mode points to the console or launch (no opt-in) when the destination is XRay and aws/spans is absent' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'agentcore launch'
+        $host_ | Should -Not -Match 'update-trace-segment-destination'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'Default mode prints the toggle (no opt-in) when the destination is CloudWatchLogs and aws/spans is absent' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $false -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'update-trace-segment-destination --destination XRay'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'Default mode does not offer the opt-in when the destination is unreadable even if aws/spans is present' {
+        # The opt-in refuses before any write when it cannot read the
+        # destination, so an unreadable destination must not be sent to the
+        # opt-in; it is treated like the unreadable branch.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -DestinationUnreadable $true -SpansExists $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+        $host_ | Should -Not -Match 'update-trace-segment-destination'
     }
 }
 
@@ -334,10 +419,22 @@ Describe 'Deploy-GameAgent recheck wiring' {
         $recheck | Should -BeGreaterThan $lastLaunch
     }
 
-    It 'runs the recheck non-blocking under a Continue preference' {
+    It 'runs the recheck non-blocking under a Continue preference inside a child scope' {
         # The recheck is read-only and must not fail the deploy, even if a
-        # redirected native stderr would otherwise terminate under 'Stop'.
-        $script:DeployContent | Should -Match "ErrorActionPreference\s*=\s*'Continue'"
+        # redirected native stderr would otherwise terminate under 'Stop'. The
+        # 'Continue' preference must live inside the recheck child scriptblock
+        # (& { ... }); a function-scope assignment would wrongly relax the
+        # surrounding 'Stop' for the frontend steps. Pin the whole shape:
+        # & { $ErrorActionPreference = 'Continue'; Invoke-...-ReportOnly }.
+        $script:DeployContent | Should -Match "&\s*\{\s*\r?\n\s*\`$ErrorActionPreference\s*=\s*'Continue'\s*\r?\n\s*Invoke-GameAgentAccountObservability[^\r\n]*-ReportOnly"
+    }
+
+    It 'wraps the recheck in try/catch so a terminating error cannot fail the deploy' {
+        # Matches the shell call site's '|| true': any terminating error from the
+        # recheck is downgraded to a non-blocking warning rather than propagating
+        # through the finally and failing the deploy.
+        $script:DeployContent | Should -Match "try\s*\{\s*\r?\n\s*&\s*\{"
+        $script:DeployContent | Should -Match "catch\s*\{\s*\r?\n\s*Write-GameAgentStatus[^\r\n]*-Type Warning"
     }
 
     It 'honors the opt-in environment variable with a case-sensitive comparison' {

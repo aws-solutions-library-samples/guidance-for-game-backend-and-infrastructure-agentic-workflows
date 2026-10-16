@@ -13,9 +13,13 @@ set -euo pipefail
 # Changing these affects other workloads in the account, so this script does NOT
 # mutate them unless the operator explicitly opts in with
 # GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true. The default path is read-only: it
-# reports current state, detects whether the account already supports what the
-# runtime needs, and prints the opt-in instruction if it does not — WITHOUT
-# failing the deployment for that reason alone.
+# reports current state and detects whether the account already supports what
+# the runtime needs — WITHOUT failing the deployment for that reason alone. When
+# it does not, the default path recommends the opt-in only when the AWS-reserved
+# 'aws/spans' log group already exists (so the opt-in can finish the job by
+# switching the destination or adding the policy); otherwise it points to the
+# one-time console enable or a destination toggle keyed on the current
+# destination, because the opt-in cannot create 'aws/spans'.
 #
 # BACKGROUND: X-Ray Transaction Search writes spans to the AWS-reserved
 # 'aws/spans' log group. A first-time API enable of Transaction Search
@@ -79,34 +83,38 @@ get_trace_destination() {
 # Classify the AWS-reserved 'aws/spans' log group as present | absent |
 # unreadable. The read is captured BEFORE the match so a denied or throttled
 # 'logs:DescribeLogGroups' (or any non-zero CLI exit) is reported as
-# 'unreadable' rather than mistaken for 'absent'. The match runs on the captured
-# string, so there is no 'grep -q' SIGPIPE on the live CLI under 'pipefail'.
+# 'unreadable' rather than mistaken for 'absent'. '--output json' is requested
+# explicitly so a CLI profile whose default output is 'text', 'table', or 'yaml'
+# cannot render an existing group in a form that omits the quoted name and so
+# reads as 'absent'. Output that cannot be parsed as the expected JSON object is
+# reported as 'unreadable' rather than 'absent', matching the PowerShell reader.
 spans_log_group_state() {
   local output code=0
   output="$(aws logs describe-log-groups \
     --log-group-name-prefix "aws/spans" \
-    --region "$AWS_REGION" 2>/dev/null)" || code=$?
+    --region "$AWS_REGION" \
+    --output json 2>/dev/null)" || code=$?
   if [ "$code" -ne 0 ]; then
     printf 'unreadable\n'
     return 0
   fi
-  if printf '%s' "$output" | grep -q '"aws/spans"'; then
-    printf 'present\n'
-  else
-    printf 'absent\n'
-  fi
-}
+  OBS_SPANS_JSON="$output" python3 -c '
+import json
+import os
+import sys
 
-# Classify whether the account already supports what the runtime needs.
-# Accepts the already-read destination as $1 so the destination is read once.
-# Prints: supported | unsupported.
-detect_account_observability_support() {
-  local destination="$1"
-  if [ "$destination" = "CloudWatchLogs" ] && [ "$(spans_log_group_state)" = "present" ]; then
-    printf 'supported\n'
-  else
-    printf 'unsupported\n'
-  fi
+try:
+    payload = json.loads(os.environ["OBS_SPANS_JSON"])
+except (ValueError, KeyError):
+    sys.exit(3)
+if not isinstance(payload, dict) or "logGroups" not in payload:
+    sys.exit(3)
+groups = payload.get("logGroups") or []
+present = any(
+    isinstance(g, dict) and g.get("logGroupName") == "aws/spans" for g in groups
+)
+print("present" if present else "absent")
+' 2>/dev/null || { printf 'unreadable\n'; return 0; }
 }
 
 # Print exactly which shared settings MAY change on opt-in. Shared by the
@@ -118,6 +126,53 @@ print_account_scope() {
   echo "        3. CloudWatch Logs resource policy   -> ${OBS_RESOURCE_POLICY_NAME}"
   echo "           (grants xray.amazonaws.com logs:PutLogEvents on 'aws/spans' and"
   echo "            '/aws/application-signals/data')"
+}
+
+# Print the one-time remedy for a missing-or-unknown 'aws/spans' group, keyed on
+# the current trace destination so the advice never prescribes a toggle that
+# cannot create the group:
+#   $1 destination  : XRay | CloudWatchLogs | UNREADABLE
+#   $2 spans_state  : present | absent | unreadable
+#   $3 indent       : leading whitespace for the printed lines
+# A first-time API enable (destination -> CloudWatchLogs) does NOT create the
+# AWS-reserved 'aws/spans' group; only the console or a disable/re-enable toggle
+# of an already-CloudWatchLogs destination does (file header, starter-toolkit
+# issue 457). So:
+#   - destination CloudWatchLogs, group absent : disable/re-enable toggle;
+#   - destination XRay                         : the console once, or let the
+#     deploy's own 'agentcore launch' perform the first enable and read the
+#     post-launch recheck (no XRay->CloudWatchLogs pair, which is the first-time
+#     enable that does not create the group);
+#   - destination unreadable (or group read failed): confirm in the console, no
+#     toggle commands, because the current destination is unknown.
+print_spans_remedy() {
+  local destination="$1" spans_state="$2" indent="$3"
+  if [ "$destination" = "UNREADABLE" ] || [ "$spans_state" = "unreadable" ]; then
+    echo "${indent}The current trace destination or the 'aws/spans' log group could not be read"
+    echo "${indent}(the call was denied, throttled, or otherwise failed), so Transaction Search"
+    echo "${indent}support is unknown. Confirm Transaction Search in the AWS X-Ray / CloudWatch"
+    echo "${indent}console, then re-run the deployment."
+    return 0
+  fi
+  if [ "$destination" = "XRay" ]; then
+    echo "${indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+    echo "${indent}is not present. A first-time API enable (destination -> CloudWatchLogs) does"
+    echo "${indent}NOT create it. Create it once by enabling Transaction Search in the AWS"
+    echo "${indent}X-Ray / CloudWatch console; otherwise the deployment's own 'agentcore launch'"
+    echo "${indent}performs the first enable, and the post-launch recheck reports whether the"
+    echo "${indent}group was created. Then re-run the deployment if it was not."
+    return 0
+  fi
+  # destination CloudWatchLogs with the group absent: a disable/re-enable toggle
+  # of the shared destination (or the console) creates the group.
+  echo "${indent}The trace destination is already 'CloudWatchLogs' but the AWS-reserved"
+  echo "${indent}'aws/spans' log group is not present. Create it once with EITHER:"
+  echo "${indent}  - the AWS X-Ray / CloudWatch console (enable Transaction Search), OR"
+  echo "${indent}  - a one-time destination toggle (disable, then re-enable):"
+  echo "${indent}      aws xray update-trace-segment-destination --destination XRay --region ${AWS_REGION}"
+  echo "${indent}      # wait for Status ACTIVE, then:"
+  echo "${indent}      aws xray update-trace-segment-destination --destination CloudWatchLogs --region ${AWS_REGION}"
+  echo "${indent}Then re-run the deployment."
 }
 
 # --- Read-only default path (no opt-in) ---
@@ -151,31 +206,19 @@ report_without_mutation() {
 
   # The opt-in enables Transaction Search ADDITIVELY and never toggles the shared
   # destination. A first-time API enable does not create 'aws/spans', so the
-  # opt-in can finish the job only when the destination/policy need changing but
-  # 'aws/spans' already exists. When 'aws/spans' is absent, only the console or a
-  # one-time destination toggle creates it, so recommend that instead of an
-  # opt-in that would fail.
-  if [ "$spans_state" = "present" ]; then
+  # opt-in can finish the job (switch the destination / add the policy) only when
+  # 'aws/spans' already exists AND the destination is readable. When 'aws/spans'
+  # is absent or the destination is unknown, only the console or a destination
+  # toggle keyed on the current destination creates the group, so recommend that
+  # (via print_spans_remedy) instead of an opt-in that would fail.
+  if [ "$spans_state" = "present" ] && [ "$destination" != "UNREADABLE" ]; then
     echo "      The opt-in WOULD change these shared, account-wide settings"
     echo "      (every X-Ray / Transaction Search consumer):"
     print_account_scope
     echo "      To let the deployment configure them, re-run with the opt-in:"
     echo "          GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh"
-  elif [ "$spans_state" = "unreadable" ]; then
-    echo "      The 'aws/spans' log group could not be read (the describe call was denied,"
-    echo "      throttled, or otherwise failed), so Transaction Search support is unknown."
-    echo "      Re-run once the read succeeds, or confirm Transaction Search in the AWS"
-    echo "      X-Ray / CloudWatch console."
   else
-    echo "      The AWS-reserved 'aws/spans' log group is not present. A first-time API"
-    echo "      enable does NOT create it, so the opt-in cannot create it either; create"
-    echo "      it once with EITHER:"
-    echo "        - the AWS X-Ray / CloudWatch console (enable Transaction Search), OR"
-    echo "        - a one-time destination toggle:"
-    echo "            aws xray update-trace-segment-destination --destination XRay --region ${AWS_REGION}"
-    echo "            # wait for Status ACTIVE, then:"
-    echo "            aws xray update-trace-segment-destination --destination CloudWatchLogs --region ${AWS_REGION}"
-    echo "      Then re-run the deployment."
+    print_spans_remedy "$destination" "$spans_state" "      "
   fi
   echo "  ℹ️  Continuing deployment (default account-observability is non-blocking)."
 }
@@ -558,29 +601,11 @@ report_transaction_search_state() {
     return 0
   fi
   echo "  ⚠️  Transaction Search does not yet appear active for the runtime."
-  if [ "$destination" != "CloudWatchLogs" ]; then
+  if [ "$destination" != "CloudWatchLogs" ] && [ "$destination" != "UNREADABLE" ]; then
     echo "      Trace destination is '${destination}', not 'CloudWatchLogs'."
     echo "      Spans will not flow until destination is 'CloudWatchLogs' and 'aws/spans' exists."
-    echo "      Enable Transaction Search once in the AWS X-Ray / CloudWatch console, or run the"
-    echo "      one-time destination toggle:"
-    echo "          aws xray update-trace-segment-destination --destination XRay --region ${AWS_REGION}"
-    echo "          # wait for Status ACTIVE, then:"
-    echo "          aws xray update-trace-segment-destination --destination CloudWatchLogs --region ${AWS_REGION}"
-    echo "      Then re-run the deployment."
-  elif [ "$spans_state" = "unreadable" ]; then
-    echo "      The AWS-reserved 'aws/spans' log group could not be read (the describe call"
-    echo "      was denied, throttled, or otherwise failed), so its state is unknown."
-    echo "      Confirm Transaction Search in the AWS X-Ray / CloudWatch console."
-  else
-    echo "      The AWS-reserved 'aws/spans' log group is not present. A first-time API"
-    echo "      enable does not create it, so create it once with EITHER the AWS X-Ray /"
-    echo "      CloudWatch console (enable Transaction Search), OR a one-time destination"
-    echo "      toggle:"
-    echo "          aws xray update-trace-segment-destination --destination XRay --region ${AWS_REGION}"
-    echo "          # wait for Status ACTIVE, then:"
-    echo "          aws xray update-trace-segment-destination --destination CloudWatchLogs --region ${AWS_REGION}"
-    echo "      Then re-run the deployment. Spans will not flow until 'aws/spans' exists."
   fi
+  print_spans_remedy "$destination" "$spans_state" "      "
   return 0
 }
 

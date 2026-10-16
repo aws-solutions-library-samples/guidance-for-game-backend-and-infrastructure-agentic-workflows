@@ -171,8 +171,11 @@ echo ""
 # indexing rule, shared Logs resource policy) are shared, cross-application
 # settings. They run ONLY when GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true. By
 # default the deployment is read-only here: it detects whether the account
-# already supports Transaction Search and prints an actionable opt-in warning
-# without failing. See docs/OBSERVABILITY_ADOT_EXPORTER.md.
+# already supports Transaction Search and, if not, prints an actionable warning
+# without failing. That warning recommends the opt-in only when the AWS-reserved
+# 'aws/spans' log group already exists; otherwise it points to the one-time
+# console enable or a destination toggle, because the opt-in cannot create that
+# group. See docs/OBSERVABILITY_ADOT_EXPORTER.md.
 echo "📡 Step 1.7: Account-wide observability..."
 GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY="${GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY:-false}" \
   AWS_REGION="$AWS_REGION" \
@@ -893,6 +896,7 @@ fi
 echo "✅ Runtime traces delivery configured"
 echo ""
 
+# Step 3: Deploy observability stack
 echo "📊 Step 3: Deploying observability stack..."
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/03-agentcore-observability.yaml" \
@@ -949,13 +953,13 @@ echo ""
 
 # Step 5c: Post-launch Transaction Search recheck (read-only, non-blocking)
 # `agentcore launch` performs its own Transaction Search enable on every launch
-# (Step 2 and Step 5b). A first-time API enable does not complete it: the
-# AWS-reserved 'aws/spans' log group is created only by the console or a
-# destination toggle. Running this recheck after the run's final launch reports
-# whether spans can actually flow so a deploy does not finish silently with no
-# Transaction Search. The `|| true` keeps the recheck non-blocking at the call
-# site regardless of the child's exit status; the recheck never mutates account
-# state.
+# (Step 2, only on a first deploy, and Step 5b). A first-time API enable does
+# not complete it: the AWS-reserved 'aws/spans' log group is created only by the
+# console or a destination toggle. Running this recheck after the run's final
+# launch reports whether spans can actually flow so a deploy does not finish
+# silently with no Transaction Search. The `|| true` keeps the recheck
+# non-blocking at the call site regardless of the child's exit status; the
+# recheck never mutates account state.
 # See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
 echo "📡 Step 5c: Rechecking Transaction Search state..."
 AWS_REGION="$AWS_REGION" \
