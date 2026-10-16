@@ -250,12 +250,12 @@ The actor ID the runtime now uses and the raw subject differ by shape, which is 
 
 In hosted mode the subject is constrained to `[A-Za-z0-9][A-Za-z0-9._:-]{2,127}`, so a raw actor ID never looks like a 64-hex digest. Any actor ID that is not 64 hex characters is a pre-upgrade raw-subject actor.
 
-Set your resource and region first. The memory ID is the one the runtime uses (`BEDROCK_AGENTCORE_MEMORY_ID`); it ends in a 10-character suffix, for example `gameagent-memory-0123456789`.
+Set your resource and region first. The memory ID is the one the runtime uses (`BEDROCK_AGENTCORE_MEMORY_ID`); the AgentCore CLI names it after the runtime with a short random suffix, for example `gameagentruntime_mem-0a1b2c3d4e`.
 
 ```bash
 export AWS_REGION=us-west-2
-export MEMORY_ID='gameagent-memory-0123456789'   # synthetic; use your resource ID
-export AWS_PROFILE='<operator-profile>'          # an operator/administrator profile
+export MEMORY_ID='gameagentruntime_mem-0a1b2c3d4e'   # synthetic; use your resource ID
+export AWS_PROFILE='<operator-profile>'              # an operator/administrator profile
 ```
 
 **Step 1 — Dry run: list the actors and classify them.** This only lists; it deletes nothing. Inspect the output before going further.
