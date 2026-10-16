@@ -202,12 +202,22 @@ a shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log
 group. Changing these affects every X-Ray and Transaction Search consumer in the
 account.
 
-**Scope.** By default the deployment makes **no** account-wide X-Ray or
-CloudWatch Logs changes. It reads the current trace destination, detects whether
-the account already supports what the runtime needs, and — if it does not —
-prints an actionable warning with the opt-in instruction. A default deployment is
-**not** failed for a missing account configuration; the per-runtime trace
-delivery is still created and verified.
+**Scope.** By default this repository's deployment scripts make **no**
+account-wide X-Ray or CloudWatch Logs changes. They read the current trace
+destination, detect whether the account already supports what the runtime needs,
+and — if it does not — print an actionable warning with the opt-in instruction. A
+default deployment is **not** failed for a missing account configuration; the
+per-runtime trace delivery is still created and verified.
+
+> **Residual not controlled by this opt-in.** `agentcore launch` (run during
+> Step 2) performs its own Transaction Search setup. On an account that does not
+> yet have Transaction Search, it may switch the account trace destination to
+> `CloudWatchLogs` and create a `TransactionSearchXRayAccess` resource policy,
+> regardless of `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. This is behavior of the
+> AgentCore starter toolkit, not of this repository's scripts, and is tracked in
+> [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
+> A read-only post-launch recheck (Step 2c) reports the resulting Transaction
+> Search state without changing it.
 
 **Opt-in.** To let the deployment configure the shared settings, set the
 purpose-named opt-in:
@@ -230,10 +240,14 @@ are read from the process environment only; they are not read from
 `ui/.env.local`. The PowerShell switch `-ConfigureAccountObservability` and the
 environment variable are equivalent opt-in triggers.
 
-**Ownership and preservation.** The deployment reads existing state first and
-preserves it. It enables Transaction Search only additively (it never performs a
-disable/re-enable toggle of the shared destination) and leaves an already-enabled
-`CloudWatchLogs` destination unchanged. If it cannot read the current trace
+**Ownership and preservation.** This repository's opt-in reads existing state
+first and preserves it. It enables Transaction Search only additively (it never
+performs a disable/re-enable toggle of the shared destination) and leaves an
+already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
+enable does not create the AWS-reserved `aws/spans` log group (only the console
+or a destination toggle does), the opt-in **fails** — with the one-time console
+or toggle step — rather than reporting success when `aws/spans` is still absent
+after the enable. If it cannot read the current trace
 destination, the opt-in refuses to change it and fails rather than guessing. The
 account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
 modified only when you set `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` to an integer in
@@ -263,10 +277,12 @@ deployment with a bounded diagnostic. The deployment then queries the delivery
 `XRAY` binds the intended source — whose resources include the runtime — to the
 intended destination.
 
-**Rollback.** Account-wide changes are only made under the opt-in. The opt-in
-prints a rollback command for the trace destination when it enables Transaction
-Search, and for the default indexing rule only when you explicitly change it
-(with the prior percentage). To remove the project-owned resource policy:
+**Rollback.** The account-wide changes made by *this repository's opt-in* are
+listed above; `agentcore launch` may make the separate, toolkit-owned changes
+noted in the Scope callout. The opt-in prints a rollback command for the trace
+destination when it enables Transaction Search, and for the default indexing rule
+only when you explicitly change it (with the prior percentage). To remove the
+project-owned resource policy:
 
 ```bash
 aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAccess --region <region>

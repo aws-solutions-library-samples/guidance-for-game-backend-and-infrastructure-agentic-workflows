@@ -262,7 +262,7 @@ The deployment script provisions the following resources:
 
 See [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) for detailed step-by-step deployment instructions and environment variable reference.
 
-By default the deployment makes no account-wide X-Ray or CloudWatch Logs changes; it detects whether the account already supports Transaction Search and prints the opt-in instruction if not. Set `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell: `Deploy-GameAgent -ConfigureAccountObservability`) to let it configure those shared settings. See [Account-wide Observability](docs/DEPLOYMENT_GUIDE.md#account-wide-observability-scoped-and-opt-in).
+By default this repository's deployment scripts make no account-wide X-Ray or CloudWatch Logs changes; they detect whether the account already supports Transaction Search and print the opt-in instruction if not. Set `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell: `Deploy-GameAgent -ConfigureAccountObservability`) to let them configure those shared settings. Note that `agentcore launch` (run during Step 2) performs its own Transaction Search setup and may switch the account trace destination and create a resource policy independently of this opt-in; that residual is tracked in [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568). See [Account-wide Observability](docs/DEPLOYMENT_GUIDE.md#account-wide-observability-scoped-and-opt-in).
 
 ## Local Development
 
