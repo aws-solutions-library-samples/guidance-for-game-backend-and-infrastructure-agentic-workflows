@@ -235,6 +235,100 @@ aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
 
 For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 4.5 for the orchestrator and Sonnet 4.6 for specialists. Response text alone is not sufficient evidence of model or tool selection.
 
+### Clean Up Memory Records Left Under Raw-Subject Actor IDs
+
+Run this once, as the operator who deploys the upgrade to the pseudonymous memory actor ID, from an operator or administrator session that has AgentCore Memory data-plane permissions. Do not run it from the chat runtime: the runtime role has no record-delete permission by design (`infrastructure/cloudformation/01-base-infrastructure.yaml` grants memory record read and write but no delete), and that boundary stays in place.
+
+**Why this is needed.** The runtime derives each user's AgentCore Memory actor ID as a 64-character lowercase SHA-256 digest of the verified Cognito subject (`backend/src/utils/memory_identity.py`). A runtime that uses the raw subject writes under a different actor ID — the raw Cognito subject, a 36-character UUID such as `a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6`. Once the digest-based runtime is deployed, those raw-subject records are never read again, but long-term records carry no time-to-live, so they persist until an operator removes them. Short-term events expire on the memory resource's event expiry (30 days by default), so they usually need no manual cleanup; a step to remove them early is included below if you need it.
+
+The actor ID the runtime now uses and the raw subject differ by shape, which is how you tell old from new:
+
+| | Format | Example (synthetic) |
+|---|---|---|
+| New actor ID (keep) | 64 lowercase hex characters | `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` |
+| Old actor ID (clean up) | raw Cognito subject, a 36-character UUID | `a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6` |
+
+In hosted mode the subject is constrained to `[A-Za-z0-9][A-Za-z0-9._:-]{2,127}`, so a raw actor ID never looks like a 64-hex digest. Any actor ID that is not 64 hex characters is a pre-upgrade raw-subject actor.
+
+Set your resource and region first. The memory ID is the one the runtime uses (`BEDROCK_AGENTCORE_MEMORY_ID`); it ends in a 10-character suffix, for example `gameagent-memory-0123456789`.
+
+```bash
+export AWS_REGION=us-west-2
+export MEMORY_ID='gameagent-memory-0123456789'   # synthetic; use your resource ID
+export AWS_PROFILE='<operator-profile>'          # an operator/administrator profile
+```
+
+**Step 1 — Dry run: list the actors and classify them.** This only lists; it deletes nothing. Inspect the output before going further.
+
+```bash
+# All actors in the memory resource
+aws bedrock-agentcore list-actors \
+  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+  --query 'actorSummaries[].actorId' --output text
+
+# Only the pre-upgrade raw-subject actors (actor IDs that are not 64 hex chars)
+aws bedrock-agentcore list-actors \
+  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+  --query 'actorSummaries[].actorId' --output text \
+  | tr '\t' '\n' \
+  | grep -vE '^[0-9a-f]{64}$'
+```
+
+**Step 2 — Dry run: list the long-term records under one raw-subject actor.** The actor ID is the long-term-memory namespace, so list records by namespace. Repeat per raw-subject actor from Step 1. This only lists.
+
+```bash
+export OLD_ACTOR='a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # a raw-subject actor from Step 1
+
+aws bedrock-agentcore list-memory-records \
+  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+  --namespace "$OLD_ACTOR" \
+  --query 'memoryRecordSummaries[].memoryRecordId' --output text
+```
+
+Confirm these are records you intend to remove. Each `memoryRecordId` is a `mem-` identifier (40–50 characters).
+
+**Step 3 — Delete (explicit, opt-in).** Nothing is deleted until you run this step. `batch-delete-memory-records` takes up to 100 records per call. For one raw-subject actor:
+
+```bash
+# Collect the record IDs for the chosen OLD_ACTOR
+RECORD_IDS=$(aws bedrock-agentcore list-memory-records \
+  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+  --namespace "$OLD_ACTOR" \
+  --query 'memoryRecordSummaries[].memoryRecordId' --output text)
+
+# Delete them in one batch (shorthand: repeat memoryRecordId= per record, max 100)
+RECORDS_ARG=$(for id in $RECORD_IDS; do printf 'memoryRecordId=%s ' "$id"; done)
+aws bedrock-agentcore batch-delete-memory-records \
+  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+  --records $RECORDS_ARG
+```
+
+To remove a single record instead, use `aws bedrock-agentcore delete-memory-record --memory-id "$MEMORY_ID" --memory-record-id "<mem-...>" --region "$AWS_REGION"`. If an actor has more than 100 records, repeat the batch until Step 2 lists none.
+
+**Step 4 (optional) — Short-term events.** Short-term events expire on the resource's event expiry, so this is only needed if you want them gone sooner. List sessions and events for a raw-subject actor, then delete per event. This path requires the session and event identifiers:
+
+```bash
+# Sessions for the raw-subject actor
+aws bedrock-agentcore list-sessions \
+  --memory-id "$MEMORY_ID" --actor-id "$OLD_ACTOR" --region "$AWS_REGION" \
+  --query 'sessionSummaries[].sessionId' --output text
+
+# Events in one session (dry run)
+export OLD_SESSION='<session-id-from-above>'
+aws bedrock-agentcore list-events \
+  --memory-id "$MEMORY_ID" --session-id "$OLD_SESSION" --actor-id "$OLD_ACTOR" \
+  --region "$AWS_REGION" --query 'events[].eventId' --output text
+
+# Delete one event (repeat per event ID)
+aws bedrock-agentcore delete-event \
+  --memory-id "$MEMORY_ID" --session-id "$OLD_SESSION" --actor-id "$OLD_ACTOR" \
+  --event-id '<event-id>' --region "$AWS_REGION"
+```
+
+**Verify.** Re-run Step 1's second command and Step 2 for each former raw-subject actor; both should return nothing. New 64-hex actors and their records are left untouched.
+
+**Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are AWS CLI v2 commands with no PowerShell wrapper, and the module exposes no memory-cleanup command. Run the same `aws bedrock-agentcore ...` commands in PowerShell 7+ with AWS CLI v2; set the variables with `$env:AWS_REGION = 'us-west-2'` (and so on) and expand the record list with a PowerShell loop in Step 3 (`$recordsArg = $recordIds | ForEach-Object { "memoryRecordId=$_" }`). The CLI operations and parameters are identical.
+
 ## Teardown
 
 To remove all deployed resources:
