@@ -272,15 +272,16 @@ export AWS_PROFILE='<operator-profile>'              # an operator/administrator
 RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-records.XXXXXX")"
 
 # List every record under each single-character namespace prefix (the CLI follows
-# pagination), one "<namespace>\t<recordId>" row per record. A failed listing
-# aborts before any delete so discovery is never silently incomplete.
-for p in {0..9} {a..z} {A..Z}; do
+# pagination), one "<namespace>\t<recordId>" row per record. The loop runs in a
+# subshell so a failed listing stops discovery with a non-zero status without
+# closing the operator's shell, and the classifier runs only on success (&&).
+( for p in {0..9} {a..z} {A..Z}; do
   aws bedrock-agentcore list-memory-records \
     --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
     --namespace "$p" \
     --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text \
     || { echo "listing failed for prefix $p; discovery is incomplete" >&2; exit 1; }
-done > "$RECORDS_FILE"
+done ) > "$RECORDS_FILE" &&
 
 # The old namespaces: first column is not a 64-hex digest. Cognito subjects contain
 # "-"; digests never do. This keeps raw subjects, "anonymous", and test actors.
@@ -329,7 +330,7 @@ for ((i = 0; i < ${#RECORD_IDS[@]}; i += 100)); do
 done
 ```
 
-To remove a single record instead, use `aws bedrock-agentcore delete-memory-record --memory-id "$MEMORY_ID" --memory-record-id "<mem-...>" --region "$AWS_REGION"`. The loop above already handles an actor with more than 100 records by sending one request per 100-record chunk.
+To remove a single record instead, use `aws bedrock-agentcore delete-memory-record --memory-id "$MEMORY_ID" --memory-record-id "<mem-...>" --region "$AWS_REGION"`. The loop above already handles an actor with more than 100 records by sending one request per 100-record chunk. If Step 3 prints an error, only part of the namespace may have been deleted; fix the session and run Steps 2 and 3 again.
 
 **Step 4 (optional) — Short-term events.** Short-term events expire on the resource's event expiry, so this is only needed if you want them gone sooner. `list-sessions` and `list-events` are keyed by actor ID, so this path uses the old actor directly. List sessions and events for a raw-subject actor, then delete per event:
 
@@ -353,35 +354,46 @@ aws bedrock-agentcore delete-event \
 
 **Verify.** Re-run Step 1; its last command should print nothing. For each namespace you deleted, Step 2 should print no rows. Both read records only, so neither depends on `list-actors`, whose results drop out as events expire. New 64-hex actors and their records are left untouched.
 
-**Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but the ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are plain bash with no PowerShell wrapper, and the module exposes no memory-cleanup command. The same AWS CLI v2 operations and parameters work from PowerShell 7+; the following is the discover-and-delete flow for one old namespace, matching the bash Steps 1–3. PowerShell uses backtick line continuations and `$env:` for process variables, and splits the tab-separated text output explicitly. Matching and sorting use `-cnotmatch`, `-CaseSensitive`, and `@(...)` so a single record is not unrolled to a scalar:
+**Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but the ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are plain bash with no PowerShell wrapper, and the module exposes no memory-cleanup command. The same AWS CLI v2 operations and parameters work from PowerShell 7+; the following is the discover-and-delete flow for one old namespace, matching the bash Steps 1–3 as three separate blocks so nothing is deleted until you run the last one. PowerShell uses backtick line continuations and `$env:` for process variables, and splits the tab-separated text output explicitly. Matching and sorting use `-cnotmatch` and `-CaseSensitive` because PowerShell ignores case by default, and `@(...)` keeps a single record ID as a one-element array.
+
+Set your resource and region first:
 
 ```powershell
 $env:AWS_REGION = 'us-west-2'
 $env:AWS_PROFILE = '<operator-profile>'              # an operator/administrator profile
 $MemoryId = 'gameagentruntime_mem-0a1b2c3d4e'   # synthetic; use your resource ID
+```
 
-# Discovery: list every one-character namespace prefix, keep namespaces that are
-# not a 64-hex digest (raw subjects, "anonymous", test actors).
+PowerShell Step 1 — Discovery: list every one-character namespace prefix and keep the namespaces that are not a 64-hex digest (raw subjects, `anonymous`, test actors). A failed listing throws so discovery is never silently incomplete. This only lists:
+
+```powershell
 $rows = foreach ($p in [char[]]'0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') {
   aws bedrock-agentcore list-memory-records `
     --memory-id $MemoryId --region $env:AWS_REGION `
     --namespace "$p" `
     --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text
+  if ($LASTEXITCODE -ne 0) { throw "listing failed for prefix $p; discovery is incomplete" }
 }
 $rows | ForEach-Object { ($_ -split "`t")[0] } |
   Sort-Object -Unique -CaseSensitive |
   Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }
+```
 
+PowerShell Step 2 — Dry run: pick one old namespace from discovery and list its records by exact namespace match. This only lists:
+
+```powershell
 $OldActor = 'a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # one old namespace from discovery
 
-# Dry run: records under the exact old namespace
 aws bedrock-agentcore list-memory-records `
   --memory-id $MemoryId --region $env:AWS_REGION `
   --namespace $OldActor `
   --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].[namespaces[0],memoryRecordId,createdAt]" `
   --output text
+```
 
-# Collect the IDs for the exact namespace, then delete in batches of at most 100.
+PowerShell Step 3 — Delete (explicit, opt-in). Nothing is deleted until you run this step. Collect the IDs for the exact namespace, then delete in batches of at most 100:
+
+```powershell
 # @(...) keeps a single ID as a one-element array rather than a scalar string.
 $recordIds = @((aws bedrock-agentcore list-memory-records `
   --memory-id $MemoryId --region $env:AWS_REGION `
