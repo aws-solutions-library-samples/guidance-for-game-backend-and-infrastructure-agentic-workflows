@@ -17,6 +17,7 @@ BeforeAll {
             [bool]$ToolkitPolicyPresent = $false,
             [bool]$DefaultIndexingPresent = $true,
             [bool]$ProjectGrantPresent = $false,
+            [string]$OtherWorkloadGrant = '',
             [bool]$DestinationReadFails = $false,
             [bool]$PoliciesReadFails = $false,
             [bool]$IndexingReadFails = $false,
@@ -27,6 +28,7 @@ BeforeAll {
         $toolkitLocal = $ToolkitPolicyPresent
         $indexingPresentLocal = $DefaultIndexingPresent
         $grantLocal = $ProjectGrantPresent
+        $otherGrantLocal = $OtherWorkloadGrant
         $destFailLocal = $DestinationReadFails
         $policiesFailLocal = $PoliciesReadFails
         $indexingFailLocal = $IndexingReadFails
@@ -43,6 +45,9 @@ BeforeAll {
         }
         if ($grantLocal) {
             $policyEntries.Add('{"policyName":"GameAgentTransactionSearchXRayAccess","policyDocument":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"xray.amazonaws.com\"},\"Action\":\"logs:PutLogEvents\",\"Resource\":[\"arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*\"]}]}"}')
+        }
+        if ($otherGrantLocal) {
+            $policyEntries.Add('{"policyName":"' + $otherGrantLocal + '","policyDocument":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"xray.amazonaws.com\"},\"Action\":\"logs:PutLogEvents\",\"Resource\":[\"arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*\"]}]}"}')
         }
         $policiesJson = '{"resourcePolicies":[' + ($policyEntries -join ',') + ']}'
         $indexingJson = if ($indexingPresentLocal) {
@@ -194,6 +199,36 @@ Describe 'Invoke-GameAgentTransactionSearchPreflight' {
         $text | Should -Match 'AWS X-Ray / CloudWatch console'
         $text | Should -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess'
         $text | Should -Match 'no other'
+        # With no other grant, the differently-named-grant exit path must not appear.
+        $text | Should -Not -Match 'a different name'
+    }
+
+    It 'Stop-switch remedy names the exit path when another workload grant is present' {
+        # 'aws/spans' present, but another policy (a different name) already
+        # grants the access. The opt-in would keep that grant and loop, so the
+        # remedy must NOT offer it; it names the blocking grant and the way out.
+        Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true -SpansExists $true -OtherWorkloadGrant 'OtherWorkloadSpansAccess'
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Not -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME'
+        $text | Should -Match 'OtherWorkloadSpansAccess'
+        $text | Should -Match 'a different name'
+        $text | Should -Match 'without the stop switch'
+    }
+
+    It 'Stop-switch remedy names the exit path when only the project-owned grant is present' {
+        # The state this repository's own default opt-in leaves: 'aws/spans'
+        # present and only the project-owned policy grants the access. The opt-in
+        # keeps it and loops, so the remedy names it as the blocking grant.
+        Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true -SpansExists $true -ProjectGrantPresent $true
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Not -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME'
+        $text | Should -Match 'GameAgentTransactionSearchXRayAccess'
+        $text | Should -Match 'a different name'
+        $text | Should -Match 'without the stop switch'
     }
 
     It 'Stop-switch remedy does not offer the opt-in when aws/spans is absent' {
@@ -228,6 +263,9 @@ Describe 'Invoke-GameAgentTransactionSearchPreflight' {
         $text = ($script:StatusMessages -join ' ')
         $text | Should -Match 'could not be read'
         ($text -match 'credentials' -or $text -match 'permission') | Should -BeTrue
+        # The UNKNOWN halt must not fall through to the definite-change guidance.
+        $text | Should -Not -Match 'AWS X-Ray / CloudWatch console'
+        $text | Should -Not -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME'
     }
 
     It 'Notes the project grant (via Write-Host) but says the toolkit still adds its own policy' {

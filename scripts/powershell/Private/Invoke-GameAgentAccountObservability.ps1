@@ -141,9 +141,11 @@ function Invoke-GameAgentAccountObservability {
     #   - destination XRay, group PRESENT          : the group already exists;
     #     only the trace destination needs switching to 'CloudWatchLogs',
     #     through the console or the opt-in Step 1.7 already offers;
-    #   - destination XRay, group absent, default  : the launch switches the
-    #     destination (which does not create the group by itself); Step 5c then
-    #     prints the one-time toggle from 'CloudWatchLogs';
+    #   - destination XRay, group absent, default  : with the stop switch off,
+    #     the launch switches the destination (which does not create the group by
+    #     itself) and Step 5c then prints the one-time toggle from
+    #     'CloudWatchLogs'; with the stop switch set, the deploy halts before
+    #     'agentcore launch', so the advice is the one-time console enable instead;
     #   - destination XRay, group absent, recheck  : the launch already ran and
     #     did NOT switch the destination (see the toolkit's 'Transaction Search
     #     configuration failed' warning); enable Transaction Search once in the
@@ -269,12 +271,17 @@ function Invoke-GameAgentAccountObservability {
                 # launch', so the account must reach a toolkit-passing state
                 # before the opt-in clears the halt. The default policy name
                 # does not satisfy the toolkit's name-only check, so offer the
-                # matching-name command, and only on an account with no other
-                # 'aws/spans' grant (the opt-in keeps an existing grant and skips
-                # its own write); otherwise use the console enable.
-                Write-Host '      With the stop switch set, re-run the opt-in with the matching policy name,'
-                Write-Host "      on an account with no other 'aws/spans' grant (with one in place, the opt-in"
-                Write-Host '      keeps it and skips its own write; use the console enable instead):'
+                # matching-name command (which writes 'TransactionSearchXRayAccess'
+                # instead of the default name shown in the scope list above), on
+                # an account with no other 'aws/spans' grant (the opt-in keeps an
+                # existing grant and skips its own write). Step 1.7 does not read
+                # policies, so the up-front preflight check that runs next names
+                # the console step for an account whose grant has another name.
+                Write-Host "      With the stop switch set, re-run the opt-in with the matching policy name"
+                Write-Host "      'TransactionSearchXRayAccess' (not the default name '$ResourcePolicyName'"
+                Write-Host "      shown above), on an account with no other 'aws/spans' grant (with one in"
+                Write-Host '      place, the opt-in keeps it and skips its own write; the up-front preflight'
+                Write-Host '      check that runs next names the console step for that account):'
                 Write-Host '          Deploy-GameAgent -ConfigureAccountObservability (with'
                 Write-Host '          GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess set)'
             } else {

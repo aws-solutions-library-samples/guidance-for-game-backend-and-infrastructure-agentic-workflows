@@ -677,6 +677,27 @@ def test_account_obs_default_stop_switch_opt_in_offer_names_matching_policy(shel
             assert "GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess" in line
 
 
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_default_stop_switch_off_for_true_offers_bare_opt_in(shell):
+    # Destination XRay, 'aws/spans' present, stop switch set to 'TRUE' (not the
+    # exact 'true'). The Step 1.7 stop check is case-sensitive, so the stop
+    # switch is OFF: the offer must be the bare default-named opt-in, NOT the
+    # matching-name/no-other-grant text the stop-switch branch prints. A
+    # case-insensitive check would wrongly take the stop branch here.
+    result = _account_obs_harness(
+        "false",
+        _obs_mock(destination="XRay", spans=True),
+        extra_env="export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=TRUE",
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh" in result.stdout
+    # The stop-switch-only wording must be absent when the switch is off.
+    assert "no other" not in result.stdout
+    assert "GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess" not in result.stdout
+
+
 def test_account_obs_default_does_not_offer_opt_in_when_destination_unreadable_and_spans_present():
     # An unreadable destination with 'aws/spans' present must NOT offer the
     # opt-in. The opt-in refuses before any write when it cannot read the
@@ -1001,6 +1022,7 @@ def _preflight_mock(
     toolkit_policy_present: bool = False,
     default_indexing_present: bool = True,
     project_grant_present: bool = False,
+    other_grant_name: str = "",
     destination_read_fails: bool = False,
     policies_read_fails: bool = False,
     indexing_read_fails: bool = False,
@@ -1018,6 +1040,13 @@ def _preflight_mock(
     if project_grant_present:
         policy_entries.append(
             '{"policyName":"GameAgentTransactionSearchXRayAccess",'
+            '"policyDocument":"{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":\\"Allow\\",'
+            '\\"Principal\\":{\\"Service\\":\\"xray.amazonaws.com\\"},\\"Action\\":\\"logs:PutLogEvents\\",'
+            '\\"Resource\\":[\\"arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*\\"]}]}"}'
+        )
+    if other_grant_name:
+        policy_entries.append(
+            '{"policyName":"' + other_grant_name + '",'
             '"policyDocument":"{\\"Version\\":\\"2012-10-17\\",\\"Statement\\":[{\\"Effect\\":\\"Allow\\",'
             '\\"Principal\\":{\\"Service\\":\\"xray.amazonaws.com\\"},\\"Action\\":\\"logs:PutLogEvents\\",'
             '\\"Resource\\":[\\"arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*\\"]}]}"}'
@@ -1191,6 +1220,63 @@ def test_preflight_stop_switch_remedy_offers_opt_in_only_when_spans_present(shel
     # The route works only on an account with no other 'aws/spans' grant, so the
     # remedy must state that condition rather than offer the opt-in unqualified.
     assert "no other" in result.stderr
+    # With no other grant, the exit path for a differently-named grant must not
+    # appear (that would contradict offering the opt-in).
+    assert "a different name" not in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_remedy_names_exit_path_when_another_workloads_grant_present(shell):
+    """When 'aws/spans' exists but another workload's policy (a different name)
+    already grants the access, the opt-in would loop: it keeps that grant and
+    never writes 'TransactionSearchXRayAccess'. The remedy must NOT offer the
+    opt-in; it must name the blocking grant and give the way out (add the
+    matching policy name, or run one deploy without the stop switch)."""
+    result = _preflight_harness(
+        _preflight_mock(
+            destination="XRay",
+            toolkit_policy_present=False,
+            default_indexing_present=True,
+            spans=True,
+            other_grant_name="OtherWorkloadSpansAccess",
+        ),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+    # The opt-in route must not be offered when another grant already exists.
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stderr
+    # The remedy must name the grant that blocks the route and give the way out.
+    assert "OtherWorkloadSpansAccess" in result.stderr
+    assert "a different name" in result.stderr
+    assert "without the stop switch" in result.stderr
+
+
+@pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
+def test_preflight_stop_switch_remedy_names_exit_path_when_project_grant_present(shell):
+    """The state this repository's own default opt-in leaves: 'aws/spans' exists
+    and only the project-owned policy ('GameAgentTransactionSearchXRayAccess')
+    grants the access. The opt-in keeps that grant and loops, so the remedy must
+    name it as the blocking grant and give the way out instead of offering the
+    opt-in again."""
+    result = _preflight_harness(
+        _preflight_mock(
+            destination="XRay",
+            toolkit_policy_present=False,
+            default_indexing_present=True,
+            spans=True,
+            project_grant_present=True,
+        ),
+        extra_env='export GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="true"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "Stopping before 'agentcore launch'" in result.stderr
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stderr
+    assert "GameAgentTransactionSearchXRayAccess" in result.stderr
+    assert "a different name" in result.stderr
+    assert "without the stop switch" in result.stderr
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)
@@ -1264,6 +1350,11 @@ def test_preflight_stop_switch_unknown_read_remedy_leads_with_restoring_the_read
     # Lead with the read fix: credentials/permissions, not a console enable.
     assert "could not be read" in result.stderr
     assert "credentials" in result.stderr or "permission" in result.stderr
+    # The UNKNOWN halt must not fall through to the definite-change guidance:
+    # no console-enable sentence (N7) and no opt-in route (N7/N8).
+    assert "Enable Transaction Search" not in result.stderr
+    assert "AWS X-Ray / CloudWatch console" not in result.stderr
+    assert "GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true" not in result.stderr
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)

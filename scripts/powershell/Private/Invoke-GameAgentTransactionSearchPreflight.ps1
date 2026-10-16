@@ -86,7 +86,16 @@ function Invoke-GameAgentTransactionSearchPreflight {
     # name. Used only to annotate the warning. Reuses the single cached read.
     function Test-ProjectSpansGrant {
         param($Policies)
-        if ($null -eq $Policies) { return $false }
+        return [bool](Get-SpansGrantName -Policies $Policies)
+    }
+
+    # Returns the name of the resource policy that already grants
+    # xray.amazonaws.com logs:PutLogEvents on an 'aws/spans' log group (Effect
+    # Allow), or $null when none does or the list could not be read. Reuses the
+    # single cached read. Used to name the grant that blocks the opt-in route.
+    function Get-SpansGrantName {
+        param($Policies)
+        if ($null -eq $Policies) { return $null }
         foreach ($policy in @($Policies.resourcePolicies)) {
             try { $doc = $policy.policyDocument | ConvertFrom-Json } catch { continue }
             foreach ($statement in @($doc.Statement)) {
@@ -97,11 +106,11 @@ function Invoke-GameAgentTransactionSearchPreflight {
                 if (($services -contains 'xray.amazonaws.com') -and
                     ($actions -contains 'logs:PutLogEvents') -and
                     ($resources | Where-Object { "$_" -like '*aws/spans*' })) {
-                    return $true
+                    return $policy.policyName
                 }
             }
         }
-        return $false
+        return $null
     }
 
     # Returns 'present', 'absent', or 'unreadable' for a Default indexing rule
@@ -210,10 +219,13 @@ function Invoke-GameAgentTransactionSearchPreflight {
         Write-Host ''
         Write-GameAgentStatus "WARNING: 'agentcore launch' WILL change SHARED, account-wide settings via the AgentCore starter toolkit (NOT this repository's opt-in). These affect every X-Ray / Transaction Search consumer in the account:" -Type Warning
         foreach ($change in $changes) { Write-Host "        - $change" }
-        if ($policyWouldAdd -and (Test-ProjectSpansGrant -Policies $resourcePolicies)) {
-            Write-Host "      Note: this repository's project-owned policy ('$ResourcePolicyName')"
-            Write-Host '      already grants the needed access, but the toolkit checks only for a policy'
-            Write-Host "      named '$toolkitPolicyName', so it adds its own duplicate policy."
+        if ($policyWouldAdd) {
+            $existingGrantName = Get-SpansGrantName -Policies $resourcePolicies
+            if ($existingGrantName) {
+                Write-Host "      Note: a resource policy ('$existingGrantName') already grants the needed"
+                Write-Host '      access, but the toolkit checks only for a policy'
+                Write-Host "      named '$toolkitPolicyName', so it adds its own duplicate policy."
+            }
         }
         Write-Host '      Cleanup / rollback after launch (run only once no other workload relies on them):'
         if ($policyWouldAdd) {
@@ -241,19 +253,26 @@ function Invoke-GameAgentTransactionSearchPreflight {
         # The opt-in cannot create the AWS-reserved 'aws/spans' log group, and it
         # skips its own policy write when another policy already grants the
         # access. When the halt is a definite change, lead with the one-time
-        # console enable and offer the opt-in route only when 'aws/spans' already
-        # exists AND no other grant is present. When the halt is caused only by an
-        # unreadable state ($wouldChange -eq 2 with no definite change), lead with
-        # restoring the read instead.
+        # console enable. Offer the opt-in route only when 'aws/spans' already
+        # exists AND no other policy grants that access (the cached policy read
+        # decides the second part); with another grant in place, name it and
+        # point to adding the toolkit-named policy directly. When the halt is
+        # caused only by an unreadable state ($wouldChange -eq 2, whether or not
+        # another item is a definite change), lead with restoring the read
+        # instead, because the toolkit's full effect cannot be known until the
+        # read succeeds.
         if ($wouldChange -eq 2) {
-            $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit might change account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. One or more account settings could not be read, so the toolkit's effect is unknown. First restore the read - most often expired credentials or a missing permission on the describe calls - then re-run; this preflight names any condition that still fails."
+            $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit might change account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. One or more account settings could not be read, so the toolkit's full effect is unknown. First restore the read (most often expired credentials or a missing read permission for the item marked UNKNOWN above), then re-run; this preflight names any condition that still fails."
             Write-GameAgentStatus $message -Type Error
             return $false
         }
         $spansState = Get-SpansLogGroupState
+        $grantName = Get-SpansGrantName -Policies $resourcePolicies
         $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. To reach a passing run without any shared change, the account must already satisfy the toolkit's three conditions: a CloudWatch Logs resource policy named exactly 'TransactionSearchXRayAccess', the X-Ray trace segment destination 'CloudWatchLogs', and an X-Ray 'Default' indexing rule. Enable Transaction Search once in the AWS X-Ray / CloudWatch console, then re-run; this preflight names any condition that still fails."
-        if ($spansState -eq 'present') {
-            $message += " Because the AWS-reserved 'aws/spans' log group already exists, this repository's opt-in with the matching policy name can also reach that state, on an account with no other 'aws/spans' grant (with one in place, the opt-in keeps it and skips its own write): GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true with GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess (PowerShell: -ConfigureAccountObservability with that policy name set)."
+        if ($spansState -eq 'present' -and -not $grantName) {
+            $message += " Because the AWS-reserved 'aws/spans' log group already exists and no other policy grants that access, this repository's opt-in with the matching policy name can also reach that state (it switches an 'XRay' destination, adds the toolkit-named policy, and leaves the shared 'Default' indexing rule for the console enable): GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true with GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess (PowerShell: -ConfigureAccountObservability with that policy name set)."
+        } elseif ($spansState -eq 'present' -and $grantName) {
+            $message += " Another policy ('$grantName') already grants 'aws/spans' access under a different name, so neither the console nor the opt-in adds a policy named 'TransactionSearchXRayAccess'. Add a policy with exactly that name, or run one deploy without the stop switch so the toolkit adds it."
         }
         Write-GameAgentStatus $message -Type Error
         return $false

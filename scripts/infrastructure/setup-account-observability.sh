@@ -440,12 +440,16 @@ preflight_transaction_search_toolkit() {
   for change in "${changes[@]}"; do
     echo "        - ${change}"
   done
-  # If the project-owned policy already grants the access, the toolkit STILL
-  # adds its own name-checked policy; call that out explicitly.
-  if [ "$policy_would_add" -eq 1 ] && resource_policy_grant_present; then
-    echo "      Note: this repository's project-owned policy ('${OBS_RESOURCE_POLICY_NAME}')"
-    echo "      already grants the needed access, but the toolkit checks only for a policy"
-    echo "      named '${TOOLKIT_RESOURCE_POLICY_NAME}', so it adds its own duplicate policy."
+  # If another policy already grants the access (under any name), the toolkit
+  # STILL adds its own name-checked policy; call that out and name the grant.
+  if [ "$policy_would_add" -eq 1 ]; then
+    local existing_grant_name
+    existing_grant_name="$(resource_policy_grant_name)"
+    if [ -n "$existing_grant_name" ]; then
+      echo "      Note: a resource policy ('${existing_grant_name}') already grants the needed"
+      echo "      access, but the toolkit checks only for a policy named"
+      echo "      '${TOOLKIT_RESOURCE_POLICY_NAME}', so it adds its own duplicate policy."
+    fi
   fi
   echo "      Cleanup / rollback after launch (run only once no other workload relies on them):"
   if [ "$policy_would_add" -eq 1 ]; then
@@ -542,6 +546,18 @@ resource_policy_grant_present() {
   return 1
 }
 
+# Print the name of the CloudWatch Logs resource policy that already grants
+# xray.amazonaws.com logs:PutLogEvents on 'aws/spans' (Effect Allow), or nothing
+# when no policy does or the list could not be read. Reuses the single cached
+# describe-resource-policies read. Used to name the grant that blocks the opt-in
+# route in the stop-switch remedy.
+resource_policy_grant_name() {
+  local scan
+  if scan="$(scan_cached_spans_policy)"; then
+    printf '%s\n' "$scan" | sed -n 's/^MATCH=//p'
+  fi
+}
+
 # Entry point used by scripts/deploy.sh before each `agentcore launch`. Runs the
 # read-only preflight, then enforces the fail-closed stop switch. Returns:
 #   0  safe to launch (no change, or operator accepted the warning);
@@ -570,22 +586,25 @@ run_transaction_search_preflight() {
     && [ "${TOOLKIT_WOULD_CHANGE:-0}" -ne 0 ]; then
     # The opt-in cannot create the AWS-reserved 'aws/spans' log group, and it
     # skips its own policy write when another policy already grants the access.
-    # When the halt is a definite change, lead with the one-time console enable
-    # and offer the opt-in route only when 'aws/spans' already exists AND no
-    # other grant is present. When the halt is caused only by an unreadable
-    # state (TOOLKIT_WOULD_CHANGE=2 with no definite change), lead with
-    # restoring the read instead, because the stop is about missing information,
-    # not a known change.
-    local remedy_spans_state
+    # When the halt is a definite change, lead with the one-time console enable.
+    # Offer the opt-in route only when 'aws/spans' already exists AND no other
+    # policy grants that access (the cached policy read decides the second part):
+    # with another grant in place the opt-in keeps it, writes nothing the toolkit
+    # looks for, and the account needs the matching policy name added directly.
+    # When the halt is caused only by an unreadable state (TOOLKIT_WOULD_CHANGE=2,
+    # whether or not another item is a definite change), lead with restoring the
+    # read instead, because the toolkit's full effect cannot be known until the
+    # read succeeds.
+    local remedy_spans_state remedy_grant_name
     remedy_spans_state="$(spans_log_group_state)"
     echo "❌ GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true and the AgentCore starter toolkit" >&2
     echo "   would change (or might change) account-wide X-Ray / CloudWatch Logs settings." >&2
     echo "   Stopping before 'agentcore launch' so no shared setting is modified." >&2
     if [ "${TOOLKIT_WOULD_CHANGE:-0}" -eq 2 ]; then
-      echo "   One or more account settings could not be read, so the toolkit's effect is" >&2
-      echo "   unknown. First restore the read — most often expired credentials or a missing" >&2
-      echo "   permission on the describe calls — then re-run; this preflight names any" >&2
-      echo "   condition that still fails." >&2
+      echo "   One or more account settings could not be read, so the toolkit's full effect" >&2
+      echo "   is unknown. First restore the read (most often expired credentials or a missing" >&2
+      echo "   read permission for the item marked UNKNOWN above), then re-run; this" >&2
+      echo "   preflight names any condition that still fails." >&2
       return 1
     fi
     echo "   To reach a passing run without any shared change, the account must already" >&2
@@ -594,13 +613,19 @@ run_transaction_search_preflight() {
     echo "   'CloudWatchLogs', and an X-Ray 'Default' indexing rule. Enable Transaction Search" >&2
     echo "   once in the AWS X-Ray / CloudWatch console, then re-run; this preflight names any" >&2
     echo "   condition that still fails." >&2
-    if [ "$remedy_spans_state" = "present" ]; then
-      echo "   Because the AWS-reserved 'aws/spans' log group already exists, this repository's" >&2
-      echo "   opt-in with the matching policy name can also reach that state, on an account" >&2
-      echo "   with no other 'aws/spans' grant (with one in place, the opt-in keeps it and" >&2
-      echo "   skips its own write):" >&2
+    remedy_grant_name="$(resource_policy_grant_name)"
+    if [ "$remedy_spans_state" = "present" ] && [ -z "$remedy_grant_name" ]; then
+      echo "   Because the AWS-reserved 'aws/spans' log group already exists and no other policy" >&2
+      echo "   grants that access, this repository's opt-in with the matching policy name can" >&2
+      echo "   also reach that state (it switches an 'XRay' destination, adds the toolkit-named" >&2
+      echo "   policy, and leaves the shared 'Default' indexing rule for the console enable):" >&2
       echo "     GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \\" >&2
       echo "       GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh" >&2
+    elif [ "$remedy_spans_state" = "present" ] && [ -n "$remedy_grant_name" ]; then
+      echo "   Another policy ('${remedy_grant_name}') already grants 'aws/spans' access under" >&2
+      echo "   a different name, so neither the console nor the opt-in adds a policy named" >&2
+      echo "   'TransactionSearchXRayAccess'. Add a policy with exactly that name, or run one" >&2
+      echo "   deploy without the stop switch so the toolkit adds it." >&2
     fi
     return 1
   fi
@@ -652,12 +677,17 @@ report_without_mutation() {
       # account must reach a toolkit-passing state before the opt-in clears the
       # halt. The default policy name does not satisfy the toolkit's name-only
       # check, so a bare opt-in would halt on the policy name every run. Offer
-      # the matching-name command, and only on an account with no other
-      # 'aws/spans' grant (the opt-in keeps an existing grant and skips its own
-      # write). Otherwise point to the stop-switch remedy's console enable.
-      echo "      With the stop switch set, re-run the opt-in with the matching policy name,"
-      echo "      on an account with no other 'aws/spans' grant (with one in place, the opt-in"
-      echo "      keeps it and skips its own write; use the console enable instead):"
+      # the matching-name command (which writes 'TransactionSearchXRayAccess'
+      # instead of the default name shown in the scope list above), on an account
+      # with no other 'aws/spans' grant (the opt-in keeps an existing grant and
+      # skips its own write). Step 1.7 does not read policies, so the up-front
+      # preflight check that runs next names the console step for an account
+      # whose grant has another name.
+      echo "      With the stop switch set, re-run the opt-in with the matching policy name"
+      echo "      'TransactionSearchXRayAccess' (not the default name '${OBS_RESOURCE_POLICY_NAME}'"
+      echo "      shown above), on an account with no other 'aws/spans' grant (with one in place,"
+      echo "      the opt-in keeps it and skips its own write; the up-front preflight check that"
+      echo "      runs next names the console step for that account):"
       echo "          GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \\"
       echo "            GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh"
     else
@@ -1085,12 +1115,13 @@ main() {
 }
 
 # Only act when executed directly, so tests can source the functions without
-# running anything. scripts/deploy.sh invokes this script as a subprocess —
-# both for the default Step 1.7 account-observability path and, with
-# --toolkit-preflight, for the read-only toolkit Transaction Search preflight
-# before each `agentcore launch`. Running it as a subprocess (rather than
-# sourcing it) keeps this script's own `set -euo pipefail` from leaking into
-# deploy.sh's shell options.
+# running anything. scripts/deploy.sh invokes this script as a subprocess in
+# all three run modes: the default Step 1.7 account-observability path (no
+# argument), the read-only toolkit Transaction Search preflight before each
+# `agentcore launch` (--toolkit-preflight), and the Step 5c post-launch recheck
+# (report-transaction-search). Running it as a subprocess (rather than sourcing
+# it) keeps this script's own `set -euo pipefail` from leaking into deploy.sh's
+# shell options.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   # Three run modes, selected by the first argument:
   #   (no argument)             the Step 1.7 default/opt-in account-observability
