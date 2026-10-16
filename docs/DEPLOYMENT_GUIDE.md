@@ -239,11 +239,11 @@ For the deployment smoke test, send one off-topic request expected to activate t
 
 Run this once, as the operator who deploys the upgrade to the pseudonymous memory actor ID, after the update has fully rolled out, from an operator or administrator session that has AgentCore Memory data-plane permissions. Do not run it from the chat runtime: the runtime role has no record-delete permission by design (`infrastructure/cloudformation/01-base-infrastructure.yaml` grants memory record read and write but no delete), and that boundary stays in place. The shell blocks below are bash; see the Windows note for the PowerShell form.
 
-**Operator permissions.** The session needs `bedrock-agentcore:ListMemoryRecords`, `bedrock-agentcore:BatchDeleteMemoryRecords`, and `bedrock-agentcore:DeleteMemoryRecord` for the record cleanup (Steps 1–3), and additionally `bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`, and `bedrock-agentcore:DeleteEvent` for the optional short-term-event cleanup (Step 4), on the memory resource.
+**Operator permissions.** Discovery (Step 1) needs `bedrock-agentcore:ListActors` and `bedrock-agentcore:ListMemoryRecords` on the memory resource, and `cognito-idp:ListUsers` on the user pool. The delete (Steps 2–3) needs `bedrock-agentcore:ListMemoryRecords`, `bedrock-agentcore:BatchDeleteMemoryRecords`, and `bedrock-agentcore:DeleteMemoryRecord` on the memory resource. The optional short-term-event cleanup (Step 4) additionally needs `bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`, and `bedrock-agentcore:DeleteEvent` on the memory resource.
 
 **Run after the rollout completes.** Old runtime sessions keep writing raw-subject events and records until they end, so a cleanup run while the previous version is still serving will leave fresh orphans behind. Wait until the digest-based runtime has fully replaced the old one before starting.
 
-**Namespace assumption.** This deploy path configures the memory resource as short-term only (`agentcore configure` without a long-term strategy), and the runtime writes records with `namespaces=[actorId]` — the actor ID is the namespace. The discovery and delete below assume that single-segment layout. A memory configured with the toolkit's long-term strategies instead stores extracted records under paths such as `/users/{actorId}/facts/`, which these steps do not list; adjust the namespace filters if your resource uses those strategies.
+**Namespace assumption.** This deploy path configures the memory resource as short-term only (`agentcore configure` without a long-term strategy), and the runtime writes records with `namespaces=[actorId]` — the actor ID is the whole, single-segment namespace. The AWS CLI's `--namespace` option documents as a prefix filter, but on this layout it matches a whole namespace path segment, not an arbitrary character of a segment: on a live memory resource, `--namespace <full actor ID>` returned that actor's records while `--namespace <first few characters>` and `--namespace <single character>` returned nothing. Discovery below therefore lists each candidate actor ID in full rather than enumerating character prefixes. A memory configured with the toolkit's long-term strategies instead stores extracted records under paths such as `/users/{actorId}/facts/`, which these steps do not list; adjust the namespace filters if your resource uses those strategies.
 
 **Why this is needed.** The runtime derives each user's AgentCore Memory actor ID as a 64-character lowercase SHA-256 digest of the verified Cognito subject (`backend/src/utils/memory_identity.py`). A runtime that uses the raw subject writes under a different actor ID — the raw Cognito subject, a 36-character UUID such as `a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6`. Once the digest-based runtime is deployed, those raw-subject records are never read again, but long-term records carry no time-to-live, so they persist until an operator removes them. Short-term events expire on the memory resource's event expiry (30 days by default), so they usually need no manual cleanup; a step to remove them early is included below if you need it.
 
@@ -261,39 +261,66 @@ Set your resource and region first. The memory ID is the one the runtime uses (`
 ```bash
 export AWS_REGION=us-west-2
 export MEMORY_ID='gameagentruntime_mem-0a1b2c3d4e'   # synthetic; use your resource ID
+export USER_POOL_ID='us-west-2_EXAMPLE01'            # the UserPoolId output of the base stack
 export AWS_PROFILE='<operator-profile>'              # an operator/administrator profile
 ```
 
-**Step 1 — Dry run: discover the old namespaces from the records themselves.** This only lists; it deletes nothing. `list-actors` reports only actors that still have unexpired events, so it misses users whose events have aged out while their long-term records remain. Instead, enumerate records directly. `--namespace` is a prefix filter, so list every one-character prefix (`0`-`9`, `a`-`z`, `A`-`Z`), print each record's namespace and ID, and keep the namespaces that are not a 64-hex digest.
+**Step 1 — Dry run: discover the old namespaces from candidate actor IDs.** This only lists; it deletes nothing. `--namespace` matches a whole namespace path segment, so you cannot sweep records by character prefix; instead, build the set of actor IDs that could hold leftovers and list each one in full. Two sources together cover the leftovers: `list-actors` reports actors that still have unexpired events, and the Cognito user pool's subjects are the actor IDs the old runtime wrote under. Combine both, drop any 64-hex digest (the current actor-ID shape, which you keep), de-duplicate, and list each remaining candidate by exact namespace, reporting the ones that hold records with their counts.
+
+A user who was deleted from the user pool **and** whose events have expired is in neither source, so this discovery cannot find their leftover records; deleting the memory resource is the only way to remove those.
 
 ```bash
-# Write the working file outside the checkout so raw subjects do not land next to
-# tracked content; delete it when you are done. Reusing an already-set
-# RECORDS_FILE means re-running Step 1 after a failed listing overwrites the same
-# file (the ">" below truncates it) instead of leaving the failed run's file behind.
-RECORDS_FILE="${RECORDS_FILE:-$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-records.XXXXXX")}"
+# Write the working files outside the checkout so raw subjects do not land next
+# to tracked content; delete them when you are done. Reusing an already-set
+# CANDIDATES_FILE means re-running Step 1 after a failed listing overwrites the
+# same file instead of leaving the failed run's file behind.
+CANDIDATES_FILE="${CANDIDATES_FILE:-$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-candidates.XXXXXX")}"
+LEFTOVERS_FILE="${LEFTOVERS_FILE:-$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-leftovers.XXXXXX")}"
 
-# List every record under each single-character namespace prefix (the CLI follows
-# pagination), one "<namespace>\t<recordId>" row per record. The loop runs in a
-# subshell so a failed listing stops discovery with a non-zero status without
-# closing the operator's shell, and the classifier runs only on success (&&).
-( for p in {0..9} {a..z} {A..Z}; do
-  aws bedrock-agentcore list-memory-records \
+# Collect candidate actor IDs from the live actor list and the user pool's
+# subjects. Each listing runs in a subshell so a failed call stops discovery
+# with a non-zero status without closing the operator's shell, and the next
+# stage runs only on success (&&). The CLI follows pagination itself.
+RAW_CANDIDATES_FILE="${RAW_CANDIDATES_FILE:-$(mktemp "${TMPDIR:-/tmp}/gbaw-memory-raw.XXXXXX")}"
+( aws bedrock-agentcore list-actors \
     --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
-    --namespace "$p" \
-    --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text \
-    || { echo "listing failed for prefix $p; discovery is incomplete" >&2; exit 1; }
-done ) > "$RECORDS_FILE" &&
+    --query 'actorSummaries[].actorId' --output text \
+    || { echo "list-actors failed; discovery is incomplete" >&2; exit 1; }
+  aws cognito-idp list-users \
+    --user-pool-id "$USER_POOL_ID" --region "$AWS_REGION" \
+    --query 'Users[].Attributes[?Name==`sub`].Value' --output text \
+    || { echo "list-users failed; discovery is incomplete" >&2; exit 1; }
+) > "$RAW_CANDIDATES_FILE" &&
 
-# The old namespaces: first column is not a 64-hex digest. Cognito subjects contain
-# "-"; digests never do. This keeps raw subjects, "anonymous", and test actors.
-cut -f1 "$RECORDS_FILE" | sort -u | grep -vE '^[0-9a-f]{64}$'
+# Drop 64-hex digests (the current shape, which you keep) and de-duplicate. A
+# store with no non-digest candidates leaves CANDIDATES_FILE empty, which is a
+# clean result, not a failure (grep's "no match" status is tolerated).
+{ tr '\t' '\n' < "$RAW_CANDIDATES_FILE" | sort -u | grep -vE '^[0-9a-f]{64}$' || true; } > "$CANDIDATES_FILE" &&
 
-# When finished with discovery, remove the working file:
-#   rm -f "$RECORDS_FILE"
+# List each candidate by exact namespace; a candidate that holds records is an
+# old namespace to clean up. Print "<count>\t<namespace>" per leftover.
+( : > "$LEFTOVERS_FILE"
+  while IFS= read -r actor; do
+    [ -n "$actor" ] || continue
+    ids=$(aws bedrock-agentcore list-memory-records \
+      --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+      --namespace "$actor" \
+      --query "memoryRecordSummaries[?namespaces[0]=='$actor'].memoryRecordId" \
+      --output text) \
+      || { echo "listing failed for $actor; discovery is incomplete" >&2; exit 1; }
+    n=$(printf '%s' "$ids" | tr '\t' '\n' | grep -c . || true)
+    if [ "$n" -gt 0 ]; then
+      printf '%s\t%s\n' "$n" "$actor" >> "$LEFTOVERS_FILE"
+    fi
+  done < "$CANDIDATES_FILE"
+) &&
+cat "$LEFTOVERS_FILE"
+
+# When finished with discovery, remove the working files:
+#   rm -f "$RAW_CANDIDATES_FILE" "$CANDIDATES_FILE" "$LEFTOVERS_FILE"
 ```
 
-**Step 2 — Dry run: list the records under one old namespace, with their details.** Pick one old namespace from Step 1. List its records by **exact** namespace match (`--namespace` is a prefix filter, so a bare prefix would also match current digest namespaces that happen to share the prefix). Show `namespaces[0]` and `createdAt` so you can confirm what matched. This only lists.
+**Step 2 — Dry run: list the records under one old namespace, with their details.** Pick one old namespace from Step 1. List its records by **exact** namespace match (the JMESPath `namespaces[0]==` filter; a candidate that is itself a path prefix of a current digest namespace would otherwise also match that namespace). Show `namespaces[0]` and `createdAt` so you can confirm what matched. This only lists.
 
 ```bash
 export OLD_ACTOR='a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # one old namespace from Step 1
@@ -354,7 +381,7 @@ aws bedrock-agentcore delete-event \
   --event-id '<event-id>' --region "$AWS_REGION"
 ```
 
-**Verify.** Re-run Step 1; it should print nothing at all, with no namespace and no `discovery is incomplete` line. For each namespace you deleted, Step 2 should print no rows. Both read records only, so neither depends on `list-actors`, whose results drop out as events expire. New 64-hex actors and their records are left untouched.
+**Verify.** Re-run Step 1; it should print nothing at all, with no leftover row and no `discovery is incomplete` line. For each namespace you deleted, Step 2 should print no rows. Candidates whose users were deleted from the pool and whose events have expired are in neither discovery source and so cannot be verified this way; deleting the memory resource is the only way to remove those. New 64-hex actors and their records are left untouched.
 
 **Windows (PowerShell).** The deployment lifecycle has a PowerShell module (`scripts/powershell/`), but the ad-hoc operator runbooks in this guide — EKS enrollment, health verification, this cleanup — are plain bash with no PowerShell wrapper, and the module exposes no memory-cleanup command. The same AWS CLI v2 operations and parameters work from PowerShell 7+; the following is the discover-and-delete flow for one old namespace, matching the bash Steps 1–3 as three separate blocks so nothing is deleted until you run the last one. PowerShell uses backtick line continuations and `$env:` for process variables, and splits the tab-separated text output explicitly. Matching and sorting use `-cnotmatch` and `-CaseSensitive` because PowerShell ignores case by default, and `@(...)` keeps a single record ID as a one-element array.
 
@@ -364,22 +391,36 @@ Set your resource and region first:
 $env:AWS_REGION = 'us-west-2'
 $env:AWS_PROFILE = '<operator-profile>'              # an operator/administrator profile
 $MemoryId = 'gameagentruntime_mem-0a1b2c3d4e'   # synthetic; use your resource ID
+$UserPoolId = 'us-west-2_EXAMPLE01'             # the UserPoolId output of the base stack
 ```
 
-PowerShell Step 1 — Discovery: list every one-character namespace prefix and keep the namespaces that are not a 64-hex digest (raw subjects, `anonymous`, test actors). The two statements run inside a `& { ... }` script block so a failed listing throws and stops discovery before any namespace is printed, rather than letting a line-by-line paste classify a partial list. This only lists:
+PowerShell Step 1 — Discovery: build candidate actor IDs from the live actor list and the Cognito user pool's subjects, drop 64-hex digests, de-duplicate, and list each candidate by exact namespace, reporting the ones that hold records with their counts. The whole flow runs inside a `& { ... }` script block so a failed listing throws and stops discovery before any leftover is printed, rather than letting a line-by-line paste classify a partial list. A user deleted from the pool whose events have also expired is in neither source and cannot be found this way. This only lists:
 
 ```powershell
 & {
-  $rows = foreach ($p in [char[]]'0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ') {
-    aws bedrock-agentcore list-memory-records `
+  $actors = aws bedrock-agentcore list-actors `
+    --memory-id $MemoryId --region $env:AWS_REGION `
+    --query 'actorSummaries[].actorId' --output text
+  if ($LASTEXITCODE -ne 0) { throw 'list-actors failed; discovery is incomplete' }
+  $subjects = aws cognito-idp list-users `
+    --user-pool-id $UserPoolId --region $env:AWS_REGION `
+    --query 'Users[].Attributes[?Name==`sub`].Value' --output text
+  if ($LASTEXITCODE -ne 0) { throw 'list-users failed; discovery is incomplete' }
+
+  $candidates = @($actors, $subjects) -split '\s+' |
+    Where-Object { $_ -and $_ -cnotmatch '^[0-9a-f]{64}$' } |
+    Sort-Object -Unique -CaseSensitive
+
+  foreach ($actor in $candidates) {
+    $ids = aws bedrock-agentcore list-memory-records `
       --memory-id $MemoryId --region $env:AWS_REGION `
-      --namespace "$p" `
-      --query 'memoryRecordSummaries[].[namespaces[0],memoryRecordId]' --output text
-    if ($LASTEXITCODE -ne 0) { throw "listing failed for prefix $p; discovery is incomplete" }
+      --namespace $actor `
+      --query "memoryRecordSummaries[?namespaces[0]=='$actor'].memoryRecordId" `
+      --output text
+    if ($LASTEXITCODE -ne 0) { throw "listing failed for $actor; discovery is incomplete" }
+    $n = @($ids -split '\s+' | Where-Object { $_ }).Count
+    if ($n -gt 0) { "$n`t$actor" }
   }
-  $rows | ForEach-Object { ($_ -split "`t")[0] } |
-    Sort-Object -Unique -CaseSensitive |
-    Where-Object { $_ -cnotmatch '^[0-9a-f]{64}$' }
 }
 ```
 

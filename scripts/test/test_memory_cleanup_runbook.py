@@ -373,13 +373,44 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         )
         result = self._run(self.blocks[1])  # Step 1 discovery
         self.assertEqual(result.returncode, 0, result.stderr)
-        discovered = {line for line in result.stdout.splitlines() if line}
+        # Each leftover row is "<count>\t<namespace>"; collect the namespaces.
+        discovered = {line.split("\t")[-1] for line in result.stdout.splitlines() if line.strip()}
         self.assertIn(ACTOR_ONLY_NS, discovered, "a leftover known only from list-actors must be found")
         self.assertIn(POOL_ONLY_NS, discovered, "a leftover known only from the user pool must be found")
         self.assertIn(UPPER_NS, discovered)
         self.assertIn(ANON_NS, discovered)
         self.assertNotIn(DIGEST_NS, discovered, "a 64-hex digest actor must be skipped")
         self.assertNotIn(PREFIX_DIGEST_NS, discovered)
+
+    def test_discovery_does_not_abort_on_a_candidate_with_no_records(self) -> None:
+        # Most candidates (current users whose only records are kept digests, or
+        # pool subjects with nothing left behind) hold no old records. Listing a
+        # zero-record candidate must be skipped, not treated as an error that
+        # ends discovery.
+        self._write_state(
+            records={ACTOR_ONLY_NS: ["mem-" + "u" * 40]},
+            actors=[ACTOR_ONLY_NS],
+            # Two extra subjects with no leftover records at all.
+            subjects=[POOL_ONLY_NS, "e2a1b3c4-0000-4000-8000-000000000000"],
+        )
+        result = self._run(self.blocks[1])  # Step 1 discovery
+        self.assertEqual(result.returncode, 0, result.stderr)
+        discovered = {line.split("\t")[-1] for line in result.stdout.splitlines() if line.strip()}
+        self.assertEqual(discovered, {ACTOR_ONLY_NS}, "only the candidate holding records is a leftover")
+
+    def test_discovery_is_clean_when_every_actor_is_a_digest(self) -> None:
+        # A fully upgraded deployment has only 64-hex digest actors and subjects.
+        # Discovery must then succeed with no leftover and no incomplete message,
+        # not fail because the digest filter removed every candidate.
+        self._write_state(
+            records={DIGEST_NS: ["mem-" + "d" * 40]},
+            actors=[DIGEST_NS],
+            subjects=[DIGEST_NS],
+        )
+        result = self._run(self.blocks[1])  # Step 1 discovery
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "", "a fully upgraded store has no leftovers")
+        self.assertNotIn("discovery is incomplete", result.stderr)
 
     def test_one_character_namespace_discovers_nothing(self) -> None:
         # The real service does not match a character prefix of a single-segment
