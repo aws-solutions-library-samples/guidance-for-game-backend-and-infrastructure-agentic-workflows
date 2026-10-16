@@ -43,8 +43,10 @@ reproduction is reviewed and accepted:
   E11).
 - #548 owns the ungated pre-auth render that E3 and E5 depend on and its
   committed measurement: Cloudscape (`awsui_`) markup in the raw server HTML
-  with no hydration warnings (E3), and strict-policy violations that are all
-  `style-src-attr` reports against server-rendered `style` attributes (E5).
+  with no hydration warnings, no server-rendered `<style>` elements, and no
+  violations under the production policy (E3), and strict-policy violations
+  that are all `style-src-attr` reports against server-rendered `style`
+  attributes (E5).
 - #549 owns the chat-parity and highlighter measurements (E4, E9).
 
 After cutover, #553's deployed strict-CSP check under decision 7 confirms E5
@@ -198,9 +200,10 @@ not read or write them, copy them into another header, or send them to another
 origin. It selects the shell only from the server-only selector of decision 2
 (and, if one is added, the presentation-only preview signal of decisions 2 and
 10), performs an internal rewrite with no redirect, sets no identity or cookie,
-and sets, removes, or weakens no security header or Content Security Policy; the
-only headers it causes are Next's rewrite headers, `x-middleware-rewrite` and,
-on Pages Router data requests, `x-nextjs-rewrite` (decision 2). These statements
+and sets, removes, or weakens no security header or Content Security Policy. The
+only response headers that appear because of it are Next's own routing headers,
+for example `x-middleware-rewrite` on a rewrite and, on Pages Router data
+requests, `x-nextjs-rewrite` or `x-nextjs-matched-path` (decision 2). These statements
 hold whether the shell foundation (#547) lands before or after this record,
 because the chat and auth routes and their verification code are unchanged by
 the shell work.
@@ -502,15 +505,17 @@ shell shows no operator or approval UI unless the operator gate is also on.
   Cloudscape tables, status indicators, and confirmation dialogs).
 - **Consequences:** building #437 only in the new shell makes it depend on the
   Cloudscape foundation (#547/#548),
-  which changes #437's current scope note that it uses "the existing Next.js
+  which changes #437's original scope note that it uses "the existing Next.js
   design system" and is "independent of the separate Cloudscape redesign
   request"; through #437 this also sequences #441, #534, and #539. Because the
   operator and approval surfaces exist only in the new shell, a shell rollback
   during the soak would otherwise hide the approval view and remove the only
   non-API approval path while operations may be pending; therefore the preview
-  path (decision 2) stays available to approvers after a rollback so #554 stays
-  reachable. Whether #441 activation waits for cutover (#552) or relies on the
-  preview path is #441's decision to record. These surfaces change no backend
+  path (decision 2) must stay available to approvers after a rollback so #554
+  stays reachable. No child issue yet builds a preview signal that survives a
+  rollback (see Open Risks), so #441 records whether it relies on such a signal
+  once one is built and owned, or waits until #553 removes the current shell;
+  waiting only for cutover (#552) does not close the gap. These surfaces change no backend
   or IAM behavior (ADR 0001; a hidden UI control is never authorization).
 
 ### 10. Cutover and rollback
@@ -539,8 +544,8 @@ no image rebuild. The current UI shell is removed only after a soak period.
 - **Rollback:** reverse the default shell value and redeploy configuration; no
   image rebuild. The saved theme preference, URLs, cookies, sessions, and the
   chat request contract are identical across shells, so rollback restores the
-  current UI with no user-visible migration. The preview path stays available to
-  approvers after a rollback (decision 9).
+  current UI with no user-visible migration. The preview path must stay available
+  to approvers after a rollback (decision 9 and Open Risks).
 - **Consequences:** two shells are maintained for at least 30 days after #552;
   the selector and the preview cookie live until #553; the config-only path in
   both deployment workflows (decision 2) is a prerequisite for #552.
