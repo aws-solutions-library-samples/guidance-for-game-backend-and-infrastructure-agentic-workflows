@@ -14,10 +14,11 @@ same deterministic rules as the manifest. It never alters the package
 inventory (the security-relevant content) -- only the document metadata and
 any absolute ``fileName`` / path-shaped values. It does NOT scrub registry
 hostnames: syft only records public package-registry hosts (pypi, npm, ...),
-and the exclusion guard independently rejects a fixed list of AWS-owned host
-suffixes (the AWS service domain, the retail domain, and the AWS developer-tools
-domain) plus the internal-domain markers it lists, so a release that carries one
-of those fails closed rather than publishing it.
+and the exclusion guard independently fails closed on any host that is not on
+its public-registry allowlist -- an AWS/Amazon-owned suffix is reported
+distinctly, and any other unexpected host (for example a private registry index
+URL) is rejected too -- so a release that carries a non-allowlisted host fails
+rather than publishing it.
 """
 
 from __future__ import annotations

@@ -33,7 +33,7 @@ credentials.
   missing. The validate job's `verify-environment` step also **reports** whether
   GitHub's immutable-releases setting can be confirmed (it cannot be read ahead
   of a run with the workflow token, so it is enforced after publish instead) and
-  whether a `v*` tag ruleset is present. A dry run is otherwise not a full rehearsal of publication: the
+  whether an active `v*` tag ruleset covers the versioned tags. A dry run is otherwise not a full rehearsal of publication: the
   read-only validate/build jobs cannot list draft releases (only a token with
   push access can), so a draft that already holds the tag is detected only at
   publish time. Run a dry run, inspect the artifacts, then dispatch again with
@@ -151,9 +151,12 @@ privilege:
   actions plus the stdlib tooling — no syft and no SBOM regeneration run beside
   the write token. It downloads the verified set and never rebuilds it.
 
-Every job also runs only when the dispatch ref is `main`; the workflow file
-itself comes from the dispatch ref, so the commit-equals-`main` check in the
-scripts is not sufficient on its own.
+A dedicated `guard-ref` job runs on every dispatch with no ref condition, so a
+dispatch from a non-`main` ref fails loudly there instead of skipping every
+gated job and showing green. Every other job also runs only when the dispatch
+ref is `main` and depends on `guard-ref`; the workflow file itself comes from
+the dispatch ref, so the commit-equals-`main` check in the scripts is not
+sufficient on its own.
 
 Validation runs entirely before any write. In the publish job, the ordering is:
 
@@ -254,13 +257,44 @@ To recover whatever remains:
 1. Check whether `refs/tags/<tag>` exists and whether a release uses `<tag>`;
    the announcement line names the exact tag, tag-object SHA, and draft release
    id to look for.
-2. If a **published** release exists for the tag, the release succeeded despite
-   the error; confirm its assets and stop.
+2. If a **published** release exists for the tag, the publish PATCH succeeded.
+   Whether that is a success or a failure depends on the post-publish read-back:
+   - If the run **passed** its read-back (no `post-publish read-back` error),
+     the release is published and confirmed; confirm its assets and stop.
+   - If the run **failed** its read-back (a `post-publish read-back: ...` error
+     with the release left intact), follow **"A read-back failed after
+     publication"** below instead — the release is published but did not meet
+     the guarantee.
 3. If only a **draft** release or an orphaned tag ref remains, delete the tag
    ref first (if it still points at the run's tag object), then delete the
    draft, then re-dispatch. With GitHub immutable releases enabled, a deleted
    release's tag name cannot be reused, so pick the next tag if the name was
    burned.
+
+### A read-back failed after publication
+
+The publish job reads the release back and fails the run if the release is not
+immutable, if an asset or the tag does not match, or if the tag ref does not
+resolve through this run's annotated tag object to the released commit. The
+release is **already published** and cleanup never deletes it, so a re-dispatch
+of the same tag is refused (the tag ref now exists) and GitHub will not make an
+existing release immutable after the fact (the setting applies only to future
+releases). The real choices depend on which check failed:
+
+- **The release is not immutable (nothing is locked yet).** Because the
+  immutable-releases setting was off when it was published, the release and its
+  tag are still mutable. Either:
+  - keep it as a known mutable release (acceptable only if you accept a mutable
+    milestone); or
+  - delete the release and then `refs/tags/<tag>` (both are deletable while the
+    setting is off), enable GitHub's immutable-releases setting, and dispatch the
+    **same** tag again. Because nothing was immutable, the tag name can be
+    reused.
+- **The release is immutable but an asset or tag check failed.** The assets and
+  tag are now locked, so the release **cannot be repaired**. Delete it if you do
+  not want it (deleting an immutable release is allowed; the tag name is then
+  burned and cannot be reused), and cut the **next** tag, which needs a new
+  commit carrying `docs/releases/<next>.md` and fresh evidence.
 
 ## Rollback
 
@@ -298,15 +332,18 @@ them, with the existing `GITHUB_TOKEN`, is:
   when the setting is enabled, so the read-back **fails the run with a remedy**
   if it is not. This is positive, after-the-fact enforcement, not a pre-flight
   gate; a release can be created and will then fail its own read-back if the
-  setting is off, leaving a published-but-flagged release for an operator to
-  review.
-- **`v*` tag ruleset (reported, not enforced).** The `verify-environment` step
-  reads the repository's tag-target rulesets (`GET /repos/{owner}/{repo}/rulesets?targets=tag`,
-  which needs only `Metadata: read`) and reports whether one is **present** or
-  **absent**. It is advisory only: the list endpoint does not expose each
-  ruleset's ref-name conditions without admin, so the step cannot prove a
-  present ruleset actually covers `v*`, and it never fails the run on this
-  signal.
+  setting is off. GitHub does not mark the release in any way — only the run
+  fails — so the published release is left intact for an operator to review and
+  recover (see "A read-back failed after publication" under Manual recovery).
+- **`v*` tag ruleset (reported in a dry run, enforced before a non-dry run).**
+  The `verify-environment` step reads the repository's tag-target rulesets and
+  each one's ref-name conditions (`GET /repos/{owner}/{repo}/rulesets` then
+  `GET /repos/{owner}/{repo}/rulesets/{id}`, both of which need only
+  `Metadata: read`) and reports whether an active ruleset's conditions cover
+  `refs/tags/v*` (an include that matches the `v*` pattern or `~ALL`, without a
+  matching exclude). A dry run only reports present/absent. Before a non-dry
+  publish the same coverage check **fails closed**: a release will not be
+  published unless an active tag ruleset covers the versioned tags.
 
 Options considered for the setting check were: (a) a documentation-only
 dependency; (b) a pre-run read of the setting (not possible with the workflow
@@ -323,18 +360,21 @@ dispatch, dry or not** — several are not machine-enforced by the workflow:
       with at least one reviewer. (Machine-checked: `verify-environment` fails
       closed without it.)
 - [ ] **Prevent self-review** enabled on the `release` environment, so the
-      dispatcher cannot approve their own release. (Not machine-checked — the
-      token cannot read it; confirm by hand.)
+      dispatcher cannot approve their own release. (Machine-checked before a
+      non-dry run: the environment payload's `prevent_self_review` is read with
+      `actions: read` and the publish fails closed if it is off.)
 - [ ] **Administrators cannot bypass** the `release` environment protection
-      rule. (Not machine-checked; confirm by hand.)
+      rule. (Not machine-checked — the environment payload has no documented
+      admin-bypass field; confirm by hand.)
 - [ ] **Deployment branch rule** limits the `release` environment to `main`.
-      (Not machine-checked; confirm by hand.)
+      (Machine-checked before a non-dry run: the deployment branch policies are
+      read with `actions: read` and must be exactly `main`.)
 - [ ] **GitHub immutable-releases setting enabled** for the repository.
       (Enforced after publish by the read-back, which fails the run unless the
       published release is `immutable`.)
 - [ ] **`v*` tag ruleset** configured to restrict who can create or update
-      release tags. (Reported as present/absent by `verify-environment`; not
-      failed on.)
+      release tags. (Machine-checked before a non-dry run: an active tag ruleset
+      must cover `refs/tags/v*`; reported present/absent in a dry run.)
 
 ## Build provenance and attestation
 
@@ -365,7 +405,8 @@ environments; several guarantees in this document depend on these being set:
   **before any run, dry or not** — the validate job's `verify-environment` step
   (also run again in the publish job before any write) fails closed if the
   environment is missing or has no required-reviewers rule, so a first dispatch
-  can never publish into an auto-created, unprotected environment. The
-  `verify-environment` check confirms a required-reviewers rule exists but does
-  **not** enforce `prevent_self_review`; enable prevent-self-review and
-  no-admin-bypass yourself so a reviewer cannot self-approve their own release.
+  can never publish into an auto-created, unprotected environment. Before a
+  non-dry publish, the publish job additionally fails closed unless the
+  environment prevents self-review and its deployment branch policy is limited
+  to `main` (both read with `actions: read`). Only admin-bypass has no
+  documented field to read, so enable "administrators cannot bypass" by hand.

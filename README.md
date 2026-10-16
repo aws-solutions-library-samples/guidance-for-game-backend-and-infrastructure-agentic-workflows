@@ -531,12 +531,15 @@ Milestone releases are annotated tags published by the manually dispatched
 [`.github/workflows/release.yml`](.github/workflows/release.yml) workflow. A
 release records an exact accepted `main` source state and never deploys to AWS.
 
-The "immutable milestone" guarantee — a published tag and its assets cannot be
-changed or deleted after the fact — holds only once two repository settings are
+The "immutable milestone" guarantee — once published, a release's assets and
+its Git tag cannot be moved, altered, or reused (the title and notes stay
+editable, and the tag can be deleted only by deleting the release, after which
+its name still cannot be reused) — holds only once two repository settings are
 enabled: GitHub's **immutable-releases** setting and a **`v*` tag ruleset**. The
 workflow cannot read the immutable-releases setting ahead of time with its
-`GITHUB_TOKEN`, so it enforces the guarantee after publication: it reads the
-release back and fails the run unless GitHub reports the release as `immutable`.
+`GITHUB_TOKEN`, so it detects whether the setting was in force after
+publication: it reads the release back and fails the run unless GitHub reports
+the release as `immutable`.
 See [docs/RELEASING.md](docs/RELEASING.md) for the release policy,
 evidence-comment format, attached artifacts, the before-first-run checklist, and
 rollback guidance.
