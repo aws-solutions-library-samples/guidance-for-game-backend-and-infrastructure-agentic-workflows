@@ -595,7 +595,7 @@ not Closes.
   managed login and introduces a second (operations) Cognito app client, so on
   acceptance [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md) must
   be updated: its "current Cognito sign-in flow is unchanged" statement and its
-  `client_id` must-equal-`COGNITO_CLIENT_ID` row no longer hold once the
+  `client_id` must-equal-`COGNITO_CLIENT_ID` row stop holding once the
   operations client and managed-login flow land. This ADR does not edit that
   document while it is Proposed; the update is part of the token-audience
   separation child (Implementation child 1).
