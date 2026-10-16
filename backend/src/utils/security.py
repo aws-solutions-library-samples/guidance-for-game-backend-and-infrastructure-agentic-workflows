@@ -149,9 +149,9 @@ def validate_prompt(prompt: str, strict_mode: bool = False) -> str:
     # Hangul fillers U+115F, U+1160, U+3164, U+FFA0 (category Lo), the Braille
     # blank U+2800 (category So), and variation selectors, the combining
     # grapheme joiner, the Khmer inherent vowels U+17B4 and U+17B5, and the
-    # Mongolian free variation selectors U+180B through U+180D (category Mn).
-    # Widening rejection to these characters is a deliberate change pinned by
-    # test.
+    # Mongolian free variation selectors U+180B through U+180D and U+180F
+    # (category Mn). Widening rejection to these characters is a deliberate
+    # change pinned by test.
     if all(char.isspace() or unicodedata.category(char) in _EMPTY_CATEGORIES for char in prompt):
         raise InputValidationError("Prompt cannot be empty")
 

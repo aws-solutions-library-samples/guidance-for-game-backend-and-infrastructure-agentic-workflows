@@ -171,12 +171,12 @@ class TestInvokeAgent:
         ids=["ascii-spaces", "tab-newline", "unicode-whitespace", "zero-width", "interleaved", "format-chars"],
     )
     def test_invoke_agent_whitespace_only_skips_memory_retrieval(self, mock_orchestrator, prompt):
-        """Whitespace-only prompts are rejected before Memory retrieval (#525).
+        """Whitespace-, control-, and format-only prompts are rejected before Memory retrieval (#525).
 
         run_orchestrator is where the AgentCore Memory session manager is built
         and the retrieval hook (which calls retrieve_memories) runs, so proving
-        it is never reached proves no empty-query Memory search is issued. The
-        user receives the existing bounded validation response.
+        it is never reached proves no Memory search is issued for these
+        prompts. The user receives the existing bounded validation response.
         """
         # Local modules
         from agentcore_main import invoke_agent

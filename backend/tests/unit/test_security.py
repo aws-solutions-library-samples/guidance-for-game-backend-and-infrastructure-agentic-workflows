@@ -98,6 +98,10 @@ class TestInputValidation:
                 "\u0643\u064a\u0641 \u062d\u0627\u0644 \u0623\u0633\u0637\u0648\u0644\u064a\u061f",
             ),
             (
+                "\u0643\u0645 \u062a\u0643\u0644\u0641\u0629 GameLift\u200e\u061f",
+                "\u0643\u0645 \u062a\u0643\u0644\u0641\u0629 GameLift\u200e\u061f",
+            ),
+            (
                 "\u3053\u3093\u306b\u3061\u306f\u3001\u8266\u968a\u306e\u72b6\u614b\u306f\uff1f",
                 "\u3053\u3093\u306b\u3061\u306f\u3001\u8266\u968a\u306e\u72b6\u614b\u306f\uff1f",
             ),
@@ -110,12 +114,13 @@ class TestInputValidation:
             "leading-zero-width",
             "emoji-zwj",
             "rtl-sentence",
+            "rtl-with-directional-mark",
             "non-latin-sentence",
             "embedded-soft-hyphen",
         ],
     )
     def test_validate_prompt_keeps_real_content_unchanged(self, prompt, expected):
-        """Prompts with real content are returned trimmed but otherwise unchanged."""
+        """These prompts with real content are returned trimmed but otherwise unchanged."""
         # Local modules
         from utils.security import validate_prompt
 
@@ -133,7 +138,11 @@ class TestInputValidation:
             "\ufe0f",  # Variation Selector-16 (category Mn)
             "\U000e0100",  # Variation Selector-17 (category Mn)
             "\u17b4",  # Khmer Vowel Inherent Aq (category Mn)
+            "\u17b5",  # Khmer Vowel Inherent Aa (category Mn)
             "\u180b",  # Mongolian Free Variation Selector One (category Mn)
+            "\u180c",  # Mongolian Free Variation Selector Two (category Mn)
+            "\u180d",  # Mongolian Free Variation Selector Three (category Mn)
+            "\u180f",  # Mongolian Free Variation Selector Four (category Mn)
             "\U000e0000",  # unassigned code point (category Cn)
         ],
         ids=[
@@ -146,7 +155,11 @@ class TestInputValidation:
             "variation-selector-16",
             "variation-selector-17",
             "khmer-vowel-inherent-aq",
+            "khmer-vowel-inherent-aa",
             "mongolian-free-variation-selector-one",
+            "mongolian-free-variation-selector-two",
+            "mongolian-free-variation-selector-three",
+            "mongolian-free-variation-selector-four",
             "unassigned-code-point",
         ],
     )
