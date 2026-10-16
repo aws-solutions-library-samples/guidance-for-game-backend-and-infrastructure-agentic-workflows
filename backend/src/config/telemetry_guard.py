@@ -99,6 +99,28 @@ from typing import Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
+# Fixed, bounded, content-free message logged at WARNING when a redaction guard
+# path is skipped (a missing or renamed internal, or attribute drift). A skipped
+# path leaves a content export open, so it is surfaced at WARNING at deploy time
+# rather than hidden at DEBUG. The log carries only this message and the skipped
+# path name; it never includes the exception message or stack trace, which can
+# carry content, so the signature-pin unit tests remain the detail-level guard
+# against drift in CI.
+GUARD_PATH_SKIPPED_MESSAGE = (
+    "Telemetry redaction guard path skipped; a trace-content export may be open. Path: %s. Exception type: %s."
+)
+
+
+def _warn_guard_path_skipped(path: str, exc: BaseException) -> None:
+    """Log at WARNING that a redaction guard path was skipped, content-free.
+
+    Records the guard path name and the exception *type* only. The exception
+    message and stack trace are deliberately omitted because they can carry
+    prompt, response, or tool content.
+    """
+    logger.warning(GUARD_PATH_SKIPPED_MESSAGE, path, type(exc).__name__)
+
+
 # The Strands redaction token name and the botocore content-capture switch.
 SEMCONV_OPT_IN_VAR = "OTEL_SEMCONV_STABILITY_OPT_IN"
 GENAI_CAPTURE_CONTENT_VAR = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
@@ -259,12 +281,20 @@ class _McpExceptionInfoFilter(logging.Filter):
 
 
 def _install_mcp_logging_filter() -> None:
-    """Attach the exception-stripping filter to the MCP client logger once."""
-    for name in MCP_EXCEPTION_LOGGER_NAMES:
-        target = logging.getLogger(name)
-        if any(getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker for flt in target.filters):
-            continue
-        target.addFilter(_McpExceptionInfoFilter())
+    """Attach the exception-stripping filter to the MCP client logger once.
+
+    A failure here leaves the MCP client's exception message and stack trace
+    exportable, so it is logged at WARNING (content-free) rather than silently
+    skipped; it never fails startup.
+    """
+    try:
+        for name in MCP_EXCEPTION_LOGGER_NAMES:
+            target = logging.getLogger(name)
+            if any(getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker for flt in target.filters):
+                continue
+            target.addFilter(_McpExceptionInfoFilter())
+    except Exception as exc:  # pragma: no cover - defensive, never fail startup
+        _warn_guard_path_skipped("MCP client logging filter", exc)
 
 
 def _install_strands_span_wrappers() -> None:
@@ -285,57 +315,62 @@ def _install_strands_span_wrappers() -> None:
     ``__wrapped__`` chain resolve to the real Strands method; the signature is
     asserted by the unit tests so a Strands change fails loudly rather than
     silently leaking.
+
+    A missing Strands tracer, or attribute drift on the wrapped ``Tracer``
+    methods, leaves these two content paths open. The whole install -- the
+    import and the ``Tracer`` attribute access -- is guarded so drift cannot
+    crash startup, and any skip is logged at WARNING (content-free) so the open
+    path is visible at deploy time rather than silent.
     """
     try:
         # Third-party packages
         from strands.telemetry.tracer import Tracer
-    except Exception as exc:  # pragma: no cover - defensive import guard
-        logger.debug("Strands tracer not available; skipping span content wrappers: %s", exc)
-        return
 
-    marker = "_gbaw_trace_content_guard"
+        marker = "_gbaw_trace_content_guard"
 
-    original_start_agent_span = Tracer.start_agent_span
-    if not getattr(original_start_agent_span, marker, False):
+        original_start_agent_span = Tracer.start_agent_span
+        if not getattr(original_start_agent_span, marker, False):
 
-        @functools.wraps(original_start_agent_span)
-        def start_agent_span(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            # Drop the system prompt so it is never set as a raw span attribute.
-            kwargs.pop(STRANDS_SYSTEM_PROMPT_KWARG, None)
-            return original_start_agent_span(self, *args, **kwargs)
+            @functools.wraps(original_start_agent_span)
+            def start_agent_span(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                # Drop the system prompt so it is never set as a raw span attribute.
+                kwargs.pop(STRANDS_SYSTEM_PROMPT_KWARG, None)
+                return original_start_agent_span(self, *args, **kwargs)
 
-        setattr(start_agent_span, marker, True)
-        Tracer.start_agent_span = start_agent_span  # type: ignore[method-assign]
+            setattr(start_agent_span, marker, True)
+            Tracer.start_agent_span = start_agent_span  # type: ignore[method-assign]
 
-    original_end_span = Tracer._end_span
-    if not getattr(original_end_span, marker, False):
+        original_end_span = Tracer._end_span
+        if not getattr(original_end_span, marker, False):
 
-        @functools.wraps(original_end_span)
-        def _end_span(self, span, attributes=None, error=None, error_message=None):  # type: ignore[no-untyped-def]
-            # Keep the error status, but strip any content-bearing text. An
-            # exception becomes its type only (no record_exception, no stack
-            # trace); an error-status tool result (error is None, error_message
-            # set) becomes a fixed non-content string.
-            if error is not None:
-                return original_end_span(
-                    self,
-                    span,
-                    attributes,
-                    error=None,
-                    error_message=type(error).__name__,
-                )
-            if error_message is not None:
-                return original_end_span(
-                    self,
-                    span,
-                    attributes,
-                    error=None,
-                    error_message=REDACTED_TOOL_ERROR_STATUS,
-                )
-            return original_end_span(self, span, attributes, error=None, error_message=None)
+            @functools.wraps(original_end_span)
+            def _end_span(self, span, attributes=None, error=None, error_message=None):  # type: ignore[no-untyped-def]
+                # Keep the error status, but strip any content-bearing text. An
+                # exception becomes its type only (no record_exception, no stack
+                # trace); an error-status tool result (error is None, error_message
+                # set) becomes a fixed non-content string.
+                if error is not None:
+                    return original_end_span(
+                        self,
+                        span,
+                        attributes,
+                        error=None,
+                        error_message=type(error).__name__,
+                    )
+                if error_message is not None:
+                    return original_end_span(
+                        self,
+                        span,
+                        attributes,
+                        error=None,
+                        error_message=REDACTED_TOOL_ERROR_STATUS,
+                    )
+                return original_end_span(self, span, attributes, error=None, error_message=None)
 
-        setattr(_end_span, marker, True)
-        Tracer._end_span = _end_span  # type: ignore[method-assign]
+            setattr(_end_span, marker, True)
+            Tracer._end_span = _end_span  # type: ignore[method-assign]
+    except Exception as exc:
+        _warn_guard_path_skipped("strands span wrappers", exc)
 
 
 def _mcp_client_wrapper_layer_remains() -> bool:
@@ -375,13 +410,15 @@ def _uninstrument_mcp() -> None:
     carries ``gen_ai.tool.call.arguments`` or ``gen_ai.tool.call.result`` in this
     process. ``uninstrument`` is called only when the instrumentor reports it is
     instrumented, so an uninstrumented startup logs no warning. A missing or
-    changed ADOT package is a debug-logged no-op, never a startup failure.
+    changed ADOT package, or any failure while uninstrumenting, is a no-op for
+    startup but is logged at WARNING (content-free), because it leaves MCP tool
+    arguments and results exportable; it never fails startup.
     """
     try:
         # Third-party packages
         from amazon.opentelemetry.distro.instrumentation.mcp import McpInstrumentor
     except Exception as exc:  # pragma: no cover - defensive import guard
-        logger.debug("ADOT MCP instrumentor not available; skipping uninstrument: %s", exc)
+        _warn_guard_path_skipped("MCP instrumentor import", exc)
         return
     try:
         instrumentor = McpInstrumentor()
@@ -395,7 +432,7 @@ def _uninstrument_mcp() -> None:
                 "created before telemetry redaction was applied."
             )
     except Exception as exc:  # pragma: no cover - defensive, never fail startup
-        logger.debug("MCP instrumentor uninstrument skipped: %s", exc)
+        _warn_guard_path_skipped("MCP instrumentor uninstrument", exc)
 
 
 def _hosted_runtime(env: Mapping[str, str]) -> bool:
@@ -443,11 +480,19 @@ class _MemoryClientInfoFilter(logging.Filter):
 
 
 def _install_memory_client_filter() -> None:
-    """Attach the below-WARNING filter to the memory SDK client logger once."""
-    target = logging.getLogger(MEMORY_CLIENT_LOGGER_NAME)
-    if any(getattr(flt, "marker", None) == _MemoryClientInfoFilter.marker for flt in target.filters):
-        return
-    target.addFilter(_MemoryClientInfoFilter())
+    """Attach the below-WARNING filter to the memory SDK client logger once.
+
+    A failure here leaves the memory namespace line (which embeds the actor ID)
+    exportable in a hosted runtime, so it is logged at WARNING (content-free)
+    rather than silently skipped; it never fails startup.
+    """
+    try:
+        target = logging.getLogger(MEMORY_CLIENT_LOGGER_NAME)
+        if any(getattr(flt, "marker", None) == _MemoryClientInfoFilter.marker for flt in target.filters):
+            return
+        target.addFilter(_MemoryClientInfoFilter())
+    except Exception as exc:  # pragma: no cover - defensive, never fail startup
+        _warn_guard_path_skipped("memory client logging filter", exc)
 
 
 def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = None) -> TraceContentDecision:

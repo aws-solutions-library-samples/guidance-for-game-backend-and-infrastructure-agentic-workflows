@@ -800,3 +800,145 @@ def test_leftover_memory_client_filter_setup_installs_it_without_cleanup():
 
 def test_leftover_memory_client_filter_is_removed_before_the_next_test():
     assert memory_client_filter_count() == 0
+
+
+# --- Fail-visible logging when a redaction guard path is skipped ----------------
+#
+# Each guard path (the Strands span wrappers, the MCP uninstrument, the MCP and
+# memory logging filters) catches a broad exception so a missing or renamed
+# internal, or attribute drift on a wrapped method, cannot crash startup. A
+# skipped path leaves a content export open, so it must be logged at WARNING, and
+# the log must carry no exception message or stack trace, which can carry content.
+
+_GUARD_SKIP_EXC_MARKER = "UNIQUE-GUARD-SKIP-EXC-MARKER-9f31"
+
+
+def _warning_records(caplog):
+    return [r for r in caplog.records if r.levelno == logging.WARNING and r.name == "config.telemetry_guard"]
+
+
+def test_strands_wrapper_import_failure_logs_warning_without_exception_text(monkeypatch, caplog):
+    # Force the Strands tracer import inside the install path to fail with a
+    # message carrying a unique marker.
+    # Standard library
+    import types
+
+    # Local modules
+    from config.telemetry_guard import _install_strands_span_wrappers
+
+    broken = types.ModuleType("strands.telemetry.tracer")
+
+    def _raise_on_access(name):  # module-level __getattr__: any attribute access fails
+        raise ImportError(_GUARD_SKIP_EXC_MARKER)
+
+    broken.__getattr__ = _raise_on_access  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", broken)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        _install_strands_span_wrappers()
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a skipped guard path must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    # The open path is named and the exception type is kept, but no exception
+    # message or stack trace (which can carry content) is in the record.
+    assert "strands span wrappers" in text
+    assert "ImportError" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+    assert all(r.exc_info is None for r in warnings)
+    assert all(r.exc_text is None for r in warnings)
+
+
+def test_strands_wrapper_attribute_drift_logs_warning_without_exception_text(monkeypatch, caplog):
+    # Attribute drift on the wrapped Tracer method must be caught in the same
+    # path and surfaced at WARNING, not crash startup or pass silently.
+    # Standard library
+    import types
+
+    # Third-party packages
+    from strands.telemetry.tracer import Tracer
+
+    # Local modules
+    from config.telemetry_guard import _install_strands_span_wrappers
+
+    fake_module = types.ModuleType("strands.telemetry.tracer")
+
+    class _DriftedTracer:
+        # The real method name is gone; accessing it raises AttributeError whose
+        # message carries the marker.
+        def __getattr__(self, name):
+            raise AttributeError(f"{_GUARD_SKIP_EXC_MARKER}:{name}")
+
+    fake_module.Tracer = _DriftedTracer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", fake_module)
+
+    original_start = Tracer.start_agent_span
+    original_end = Tracer._end_span
+    try:
+        with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+            _install_strands_span_wrappers()
+    finally:
+        Tracer.start_agent_span = original_start
+        Tracer._end_span = original_end
+
+    warnings = _warning_records(caplog)
+    assert warnings, "attribute drift must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "strands span wrappers" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+
+
+def test_uninstrument_mcp_import_failure_logs_warning_without_exception_text(monkeypatch, caplog):
+    # Standard library
+    import types
+
+    # Local modules
+    from config.telemetry_guard import _uninstrument_mcp
+
+    broken = types.ModuleType("amazon.opentelemetry.distro.instrumentation.mcp")
+
+    def _raise_on_access(name):
+        raise ImportError(_GUARD_SKIP_EXC_MARKER)
+
+    broken.__getattr__ = _raise_on_access  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "amazon.opentelemetry.distro.instrumentation.mcp", broken)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        _uninstrument_mcp()
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a skipped uninstrument path must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "MCP instrumentor" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
+
+
+def test_memory_client_filter_failure_logs_warning_without_exception_text(monkeypatch, caplog):
+    # Make addFilter on the memory client logger raise with a marker message, and
+    # confirm the skip is a content-free WARNING rather than a crash.
+    # Local modules
+    import config.telemetry_guard as guard
+
+    real_get_logger = logging.getLogger
+
+    def _fake_get_logger(name=None):
+        lg = real_get_logger(name)
+        if name == guard.MEMORY_CLIENT_LOGGER_NAME:
+
+            def _raise(_flt):
+                raise RuntimeError(_GUARD_SKIP_EXC_MARKER)
+
+            monkeypatch.setattr(lg, "addFilter", _raise, raising=False)
+            monkeypatch.setattr(lg, "filters", [], raising=False)
+        return lg
+
+    monkeypatch.setattr(guard.logging, "getLogger", _fake_get_logger)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        guard._install_memory_client_filter()
+
+    warnings = _warning_records(caplog)
+    assert warnings, "a skipped memory-filter path must log at WARNING"
+    text = "\n".join(r.getMessage() for r in warnings)
+    assert "memory client logging filter" in text
+    assert _GUARD_SKIP_EXC_MARKER not in text
