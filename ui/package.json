@@ -26,6 +26,11 @@
   "dependencies": {
     "@aws-sdk/client-cognito-identity-provider": "^3.1095.0",
     "@aws-sdk/client-sts": "^3.1127.0",
+    "@cloudscape-design/chat-components": "1.0.178",
+    "@cloudscape-design/component-toolkit": "1.0.0-beta.189",
+    "@cloudscape-design/components": "3.0.1396",
+    "@cloudscape-design/design-tokens": "3.0.114",
+    "@cloudscape-design/global-styles": "1.0.71",
     "@copilotkit/react-core": "1.10.6",
     "@copilotkit/react-ui": "1.10.6",
     "@copilotkit/shared": "1.10.6",
@@ -52,6 +57,7 @@
     "react-syntax-highlighter": "^16.1.1"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
     "@playwright/test": "^1.63.0",
     "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^16.3.2",
@@ -102,6 +108,9 @@
       "<rootDir>/node_modules/",
       "<rootDir>/tests/"
     ],
+    "modulePathIgnorePatterns": [
+      "<rootDir>/.next/"
+    ],
     "collectCoverageFrom": [
       "src/**/*.{js,jsx,ts,tsx}",
       "!src/**/*.d.ts"
@@ -124,7 +133,7 @@
       ]
     },
     "transformIgnorePatterns": [
-      "/node_modules/(?!(@copilotkit|cookie|@aws-sdk|@smithy|refractor|hastscript|hast-util-parse-selector|property-information|space-separated-tokens|comma-separated-tokens|parse-entities|character-entities-legacy|character-reference-invalid|decode-named-character-reference|is-alphabetical|is-alphanumerical|is-decimal|is-hexadecimal)/)"
+      "/node_modules/(?!(@cloudscape-design|@copilotkit|cookie|@aws-sdk|@smithy|refractor|hastscript|hast-util-parse-selector|property-information|space-separated-tokens|comma-separated-tokens|parse-entities|character-entities-legacy|character-reference-invalid|decode-named-character-reference|is-alphabetical|is-alphanumerical|is-decimal|is-hexadecimal)/)"
     ]
   }
 }
