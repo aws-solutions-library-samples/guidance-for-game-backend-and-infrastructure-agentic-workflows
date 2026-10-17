@@ -35,8 +35,64 @@ Characteristics of this **transient** behavior:
 - Only the affected in-flight batch may be dropped.
 
 This is distinct from the missing-`aws/spans`-log-group failure
-(`400 ResourceNotFoundException`), which the deployment already works around in
+(`400 ResourceNotFoundException`), which the deployment addresses in
 `scripts/infrastructure/setup-account-observability.sh` and `scripts/deploy.sh`.
+
+## Account-wide setup is scoped and opt-in
+
+The X-Ray trace segment destination, the default X-Ray indexing (sampling) rule,
+and the shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans`
+log group are **account-wide** settings shared by every X-Ray and Transaction
+Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and the
+`Invoke-GameAgentAccountObservability` PowerShell function) therefore:
+
+- make **no** account-wide Transaction Search settings change by default *from
+  this repository's scripts*.
+  The default path reads the current trace destination, detects whether the
+  account already supports Transaction Search (destination `CloudWatchLogs` and
+  `aws/spans` present), and if it does not, prints an actionable warning —
+  recommending the opt-in only when `aws/spans` already exists and the
+  destination was read, and otherwise the
+  one-time console or destination-toggle step — without failing the deploy for
+  that reason alone. (`agentcore launch` runs its
+  own Transaction Search setup independently of this opt-in; see "Ownership and
+  upstream tracking" below.);
+- apply changes only under the purpose-named opt-in
+  `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell:
+  `Deploy-GameAgent -ConfigureAccountObservability`), after printing exactly which
+  shared settings may change;
+- read existing state first and preserve it: Transaction Search is enabled
+  additively (never a disable/re-enable toggle), an already-enabled
+  `CloudWatchLogs` destination is left unchanged, and an unreadable destination
+  makes the opt-in refuse to change it and fail rather than guess. The
+  account-wide default indexing (sampling) rule is left unchanged unless
+  `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` is set, in which case the prior value is
+  printed as a rollback. The shared Logs resource policy uses the project-owned
+  name `GameAgentTransactionSearchXRayAccess`; existing policies are listed first,
+  so an existing grant (including a legacy `TransactionSearchXRayAccess`) is
+  reused instead of duplicated, and the account's 10-policy limit is respected.
+  All reads and input validation happen before the first write, and both shells
+  check the AWS CLI exit status on every shared mutation: a failed write stops
+  the opt-in with a bounded, public-safe diagnostic (operation name and error
+  code only) rather than reporting success. Because a first-time API enable does
+  not create the AWS-reserved `aws/spans` log group (only the console or a
+  destination toggle does), the opt-in fails with the one-time manual step rather
+  than reporting success when `aws/spans` is still absent after the enable.
+
+## Runtime trace delivery is verified
+
+The per-runtime trace delivery in `scripts/deploy.sh` Step 2b (and
+`Invoke-GameAgentTraceDelivery`) creates the delivery source, destination, and
+delivery. Each mutation distinguishes a genuine already-exists conflict
+(idempotent success) from authorization, validation, throttling, and service
+errors. Retryable errors are retried with a small bounded backoff; a real error
+fails the deployment with a bounded, public-safe diagnostic that names only the
+operation. The deployment then queries the delivery with
+`aws logs describe-deliveries` (retrying a transient read) and fails unless a
+delivery with destination type `XRAY` binds the intended source — whose resources
+include the runtime ARN — to the intended destination. The destination ARN is
+resolved from the API rather than fabricated.
+
 
 ## Ownership and upstream tracking
 
@@ -50,8 +106,21 @@ exercised successfully outside the cold-start window.
 Track the exporter credential-availability timing with the AWS Distro for
 OpenTelemetry for Python and the Bedrock AgentCore starter toolkit. The related
 trace-delivery setup gap is tracked upstream at
-`aws/bedrock-agentcore-starter-toolkit` issue 457 (a *different*, already
-worked-around failure mode).
+`aws/bedrock-agentcore-starter-toolkit` issue 457 (a *different* failure mode).
+Separately, `agentcore launch` calls the toolkit's own Transaction Search setup
+on every launch — which the deploy script runs in its Step 2 (only on a first
+deploy) and Step 5b launches. On every launch, the toolkit may make up to three
+shared changes independently of this repository's opt-in, each also when its own
+read fails: it adds a
+`TransactionSearchXRayAccess` resource policy whenever no policy already has that
+exact name (even when this opt-in's own policy already grants access), switches
+the account trace segment destination to `CloudWatchLogs` when it is not already
+`CloudWatchLogs`, and sets the `Default`
+X-Ray indexing rule to 1% sampling when no `Default` rule exists. Because a first-time API enable does not
+create the AWS-reserved `aws/spans` log group, that launch-side enable can leave
+Transaction Search incomplete; the read-only Step 5c recheck reports it. This
+residual is tracked in
+[#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
 
 ## Detection (does not suppress)
 
@@ -159,3 +228,25 @@ is platform-managed. If a future repository change to observability wiring (for
 example, the detection check or the account-observability setup) regresses,
 revert that focused change; AgentCore-managed baseline observability continues to
 operate while the upstream timing behavior is tracked.
+
+Account-wide Transaction Search settings changes from *this repository's
+scripts* are made only under the
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in. (`agentcore launch` performs
+its own Transaction Search setup independently; see "Ownership and upstream
+tracking" and [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).)
+The opt-in path prints a
+rollback command for the trace destination when it enables Transaction Search,
+and for the default indexing rule only when `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
+is set to explicitly change it (printing the prior percentage). To remove the
+project-owned resource policy:
+
+```bash
+aws logs delete-resource-policy \
+  --policy-name GameAgentTransactionSearchXRayAccess --region <region>
+```
+
+A legacy `TransactionSearchXRayAccess` resource policy from earlier deploys is
+left in place. Delete it only once no other workload relies on it.
+
+Teardown intentionally preserves account-wide observability resources because
+they may be shared with other applications.
