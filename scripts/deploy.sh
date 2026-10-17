@@ -82,6 +82,41 @@ fi
 echo "✅ All required prerequisites met"
 echo ""
 
+# Preflight: install backend dependencies locally, then guard against an
+# unbootable long-path runtime BEFORE any AWS-mutating command runs (#517).
+#
+# `agentcore launch` (Step 2) does not ship this venv's console scripts: the
+# AgentCore starter toolkit rebuilds a dependency bundle with its own
+# `uv pip install --target` inside the uv-selected project environment and zips
+# that into dependencies.zip. uv embeds the environment interpreter's absolute
+# local path into each console script's launcher line; the embedded basename is
+# the longer of the names uv may embed (`<env>/bin/python3` or `<env>/bin/python`
+# depending on the uv version), so this guard measures `<env>/bin/python3`. When
+# that interpreter path is over the uv shebang byte limit or contains a space,
+# uv emits a /bin/sh trampoline instead of a portable shebang, producing a
+# runtime that dies at exec — silently, because deploy still exits 0 and the
+# control plane reaches READY. Running the check here, right after local
+# `uv sync` and before Step 0.5 (the first `aws cloudformation deploy`), means a
+# doomed deploy fails fast with a clear remediation and leaves zero AWS side
+# effects behind. The guard runs from inside the physical backend directory
+# (the same working directory `agentcore launch` resolves the project from) so
+# it measures the interpreter path that actually ships.
+echo "📦 Preflight: Installing backend dependencies..."
+if ! _uv_sync_out=$(cd "$PROJECT_ROOT/backend" && uv sync 2>&1); then
+    echo "❌ Preflight: 'uv sync' failed:" >&2
+    echo "$_uv_sync_out" >&2
+    exit 1
+fi
+echo "🔎 Preflight: Verifying the runtime interpreter path is bootable..."
+(
+  cd "$PROJECT_ROOT/backend"
+  _backend_physical="$(pwd -P)"
+  uv run python \
+    "$SCRIPT_DIR/infrastructure/check_runtime_path.py" --backend-dir "$_backend_physical"
+)
+echo "✅ Runtime interpreter path is portable"
+echo ""
+
 # Step 0: Download KB documentation
 echo "📥 Step 0: Downloading KB documentation..."
 bash "$SCRIPT_DIR/infrastructure/download-kb-docs.sh"
@@ -180,9 +215,15 @@ echo ""
 echo "🤖 Step 2: Launching AgentCore Runtime..."
 cd "$PROJECT_ROOT/backend"
 
-# Ensure backend dependencies (including agentcore CLI) are installed
+# Ensure backend dependencies (including agentcore CLI) are installed.
+# The preflight already synced and ran the runtime path guard (#517); this
+# re-sync is idempotent and keeps Step 2 self-contained.
 echo "📦 Installing backend dependencies..."
-uv sync > /dev/null 2>&1
+if ! _uv_sync_out=$(uv sync 2>&1); then
+    echo "❌ 'uv sync' failed:" >&2
+    echo "$_uv_sync_out" >&2
+    exit 1
+fi
 
 # Resolve model roles through the same canonical Python configuration used by
 # local runtime. Process variables override ui/.env.local; canonical role names
