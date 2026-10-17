@@ -255,6 +255,33 @@ SEMANTIC_MEMORY_STRATEGY = "BEDROCK_AGENTCORE"
 - [Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-memory.html)
 - [Bedrock Data Protection](https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html)
 
+### Retrieved Memory and the Input Guardrail
+
+The Guardrail's input-side policies do not evaluate retrieved long-term memory.
+Models are attached with `guardrail_latest_message`, so Strands wraps the text
+and image blocks of the latest user message in `guardContent`, and Bedrock then
+evaluates only `guardContent` blocks as input. The AgentCore session manager
+adds retrieved memory to that message as an extra text block, and the backend
+sends that block as plain text, so only the user's own words are input-checked.
+A block is sent unwrapped only when it carries the private marker that the
+session manager sets on the context it injects; a user who types the context tag
+is still input-checked.
+
+Retrieved memory consists of the short facts that
+`backend/src/utils/semantic_memory.py` extracts with fixed patterns from the
+user's own messages (a name of up to two words, a game type from a fixed list,
+fleet or cluster IDs, player counts, and similar) and stores in that user's
+namespace. Extraction runs after every turn, including a turn the Guardrail
+blocked, so a stored fact has not necessarily passed the input-side policies.
+Because the prompt-attack filter is input-only, it never evaluates retrieved memory.
+Each sensitive-information entity and regex in
+`infrastructure/cloudformation/04-bedrock-guardrails.yaml` has one action for
+both directions: an `ANONYMIZE` entity such as `USERNAME` in retrieved memory
+reaches the model unmasked, and a `BLOCK` entity such as `PASSWORD` does not
+block the request. The output-side Guardrail policies still evaluate every
+reply, so anything the model repeats from retrieved memory gets the same output
+checks as the rest of the reply.
+
 ---
 
 ## Vulnerability Management
@@ -474,7 +501,7 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 
 The two scope topics (General Programming Help, Entertainment and Casual Chat) block on user input and are detect-only on model output (#530). Valid infrastructure answers (kubectl commands, GameLift Server SDK steps, CloudFormation templates) were being blocked on output as off-topic. Accepted residual risk:
 
-- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
+- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, retrieved long-term memory, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
 - **Language coverage.** The Guardrail uses the default CLASSIC topic tier, which supports English, French, and Spanish. An off-topic request in another language can pass the input check, and the output check will not catch it.
 - **No user-visible fallback for scope detections on output.** The answer is returned unchanged. Personal Advice, content-filter, PII, and regex blocks still replace the entire response with the blocked-output message.
 - **Detections are not recorded.** A scope-topic match on output appears only in the per-request Guardrail trace. The application does not log or store it.
