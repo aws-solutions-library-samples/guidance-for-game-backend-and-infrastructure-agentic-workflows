@@ -45,14 +45,25 @@ def test_agentcore_cost_explorer_access_is_not_region_scoped():
     assert "aws:RequestedRegion" not in statement
 
 
-def test_agentcore_pricing_access_supports_service_discovery():
+def test_agentcore_has_no_pricing_access():
+    """Least privilege (#482): the Pricing API (``pricing:DescribeServices`` /
+    ``GetAttributeValues`` / ``GetProducts``) was enabled by #360 for service
+    discovery, but it is OUTSIDE the reviewed Billing MCP surface, which allows
+    only forecast and recommendation operations (the reviewed Billing MCP
+    forecast and recommendation surface; see SECURITY.md). The Pricing
+    tool has no reviewed caller on the deployed Cost path, so the whole
+    ``MiscReadAccess`` statement (pricing + free-tier + S3 Storage Lens) was
+    removed from ``AgentCoreExecutionRole``."""
     template = BASE_INFRASTRUCTURE_TEMPLATE.read_text(encoding="utf-8")
     execution_role = _cloudformation_resource(template, "AgentCoreExecutionRole")
-    statement = _iam_statement(execution_role, "MiscReadAccess")
 
-    assert "pricing:DescribeServices" in statement
-    assert "pricing:GetAttributeValues" in statement
-    assert "pricing:GetProducts" in statement
+    assert "pricing:DescribeServices" not in execution_role
+    assert "pricing:GetAttributeValues" not in execution_role
+    assert "pricing:GetProducts" not in execution_role
+    assert "MiscReadAccess" not in execution_role
+    # The removed statement also carried free-tier and S3 Storage Lens reads.
+    assert "freetier:GetFreeTierUsage" not in execution_role
+    assert "s3:GetStorageLensConfiguration" not in execution_role
 
 
 def test_ecs_task_role_has_no_cost_explorer_access():
