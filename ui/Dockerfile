@@ -1,5 +1,7 @@
 # Multi-stage build for Next.js frontend
-FROM node:24-alpine AS base
+# NODE_IMAGE lets CodeBuild pull the same image from ECR Public instead of Docker Hub.
+ARG NODE_IMAGE=node:24-alpine
+FROM ${NODE_IMAGE} AS base
 
 # Install dependencies only when needed
 FROM base AS deps

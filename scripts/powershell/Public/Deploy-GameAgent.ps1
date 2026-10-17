@@ -5,7 +5,8 @@ function Deploy-GameAgent {
     .DESCRIPTION
         Full deployment matching deploy.sh: base infra, guardrails, prompts,
         account observability, AgentCore Runtime, CW delivery, observability stack,
-        Knowledge Bases, seed KBs, wire KBs, frontend (Docker), security.
+        Knowledge Bases, seed KBs, wire KBs, frontend (Docker, or CodeBuild when
+        Docker is unavailable), security.
     .PARAMETER ProjectName
         Project name for resource naming. Default: "game-agent".
     .PARAMETER Region
@@ -13,7 +14,8 @@ function Deploy-GameAgent {
     .PARAMETER Profile
         AWS CLI profile. Default: reads from ui/.env.local or uses "default".
     .PARAMETER SkipFrontend
-        Skip frontend steps (6-8) even if Docker is available.
+        Skip frontend steps (6-8). Without this switch the frontend image is built
+        with local Docker when available, otherwise in the base stack's CodeBuild project.
     .EXAMPLE
         Deploy-GameAgent
     .EXAMPLE
@@ -110,8 +112,13 @@ function Deploy-GameAgent {
     if ((Get-Command docker -ErrorAction SilentlyContinue) -and (-not $SkipFrontend)) {
         try { docker info 2>$null | Out-Null; if ($LASTEXITCODE -eq 0) { $dockerAvailable = $true } } catch {}
     }
-    if (-not $dockerAvailable) {
-        Write-GameAgentStatus 'Docker not available — frontend steps (6-8) will be skipped.' -Type Warning
+    # Frontend image build mode, matching deploy.sh: local Docker when available,
+    # otherwise the base stack's amd64 CodeBuild project.
+    $frontendBuild = if ($SkipFrontend) { 'skip' } elseif ($dockerAvailable) { 'docker' } else { 'codebuild' }
+    if ($frontendBuild -eq 'codebuild') {
+        Write-GameAgentStatus 'Docker not available — the frontend image will be built in AWS CodeBuild (Step 6).' -Type Info
+    } elseif ($frontendBuild -eq 'skip') {
+        Write-GameAgentStatus '-SkipFrontend set — frontend steps (6-8) will be skipped.' -Type Warning
     }
 
     # Verify credentials
@@ -406,24 +413,31 @@ function Deploy-GameAgent {
     } finally { Pop-Location }
     Write-Host ''
 
-    # ── Steps 6-8: Frontend (requires Docker) ──
+    # ── Steps 6-8: Frontend ──
     $frontendUrl = ''
-    if ($dockerAvailable) {
+    if ($frontendBuild -ne 'skip') {
         # Step 6: Build and push frontend container
-        Write-GameAgentStatus 'Step 6: Building and pushing frontend container...' -Type Info
+        Write-GameAgentStatus "Step 6: Building and pushing frontend container ($frontendBuild)..." -Type Info
         Push-Location $uiPath
         try {
             $frontendEcrRepo = Get-StackOutput "$ProjectName-infrastructure" 'FrontendRepositoryUri'
             Write-Host "Frontend ECR: $frontendEcrRepo"
 
-            $ecrPassword = Invoke-Aws ecr get-login-password --region $Region
-            $ecrPassword | docker login --username AWS --password-stdin $frontendEcrRepo
-            docker build --platform linux/amd64 -t "${frontendEcrRepo}:latest" .
-            docker push "${frontendEcrRepo}:latest"
+            if ($frontendBuild -eq 'docker') {
+                $ecrPassword = Invoke-Aws ecr get-login-password --region $Region
+                $ecrPassword | docker login --username AWS --password-stdin $frontendEcrRepo
+                docker build --platform linux/amd64 -t "${frontendEcrRepo}:latest" .
+                docker push "${frontendEcrRepo}:latest"
+            } else {
+                $frontendImageTag = "deploy-$((git -C $repoRoot rev-parse --short HEAD 2>$null) ?? 'manual')-$(Get-Date -Format 'yyyyMMddHHmmss')"
+                Invoke-GameAgentFrontendCodeBuild -Region $Region -ProfileArgs $profileArgs -ProjectName $ProjectName -ImageTag $frontendImageTag
+            }
             Write-GameAgentStatus 'Frontend container pushed' -Type Success
 
-            # Step 6b: SBOM generation
-            if (Get-Command syft -ErrorAction SilentlyContinue) {
+            # Step 6b: SBOM generation (needs the image in the local Docker daemon)
+            if ($frontendBuild -ne 'docker') {
+                Write-GameAgentStatus 'Skipping SBOM generation (image was built in CodeBuild)' -Type Info
+            } elseif (Get-Command syft -ErrorAction SilentlyContinue) {
                 Write-GameAgentStatus 'Step 6b: Generating SBOMs...' -Type Info
                 $sbomScript = Join-Path $repoRoot 'scripts/generate-sbom.sh'
                 bash $sbomScript "${frontendEcrRepo}:latest"
@@ -490,13 +504,13 @@ function Deploy-GameAgent {
         Write-GameAgentStatus 'Security infrastructure deployed' -Type Success
         Write-Host ''
     } else {
-        Write-GameAgentStatus 'Steps 6-8: Skipped (Docker not available)' -Type Warning
+        Write-GameAgentStatus 'Steps 6-8: Skipped (-SkipFrontend)' -Type Warning
         Write-Host ''
     }
 
     # ── Summary ──
     Write-Host ('=' * 60) -ForegroundColor Green
-    if ($dockerAvailable) {
+    if ($frontendBuild -ne 'skip') {
         Write-GameAgentStatus 'Deployment Complete!' -Type Success
     } else {
         Write-GameAgentStatus 'Deployment Partially Complete (backend only)' -Type Warning
@@ -514,12 +528,12 @@ function Deploy-GameAgent {
     Write-Host "   Cost KB:      $costKbId"
     Write-Host ''
 
-    if ($dockerAvailable) {
+    if ($frontendBuild -ne 'skip') {
         Write-Host 'Next Steps:' -ForegroundColor Cyan
         Write-Host "   1. Create admin user: Add-GameAgentAdmin -Profile $($Profile ?? 'default')"
         Write-Host "   2. Access frontend: https://$frontendUrl"
     } else {
-        Write-Host 'Frontend was not deployed — Docker is required for Steps 6-8.' -ForegroundColor Yellow
+        Write-Host 'Frontend was not deployed (-SkipFrontend).' -ForegroundColor Yellow
     }
     Write-Host ''
 }

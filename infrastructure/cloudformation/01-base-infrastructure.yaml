@@ -636,6 +636,186 @@ Resources:
         - Key: ManagedBy
           Value: cloudformation
 
+  # Frontend image build in CodeBuild
+  # deploy.sh builds the frontend image locally with Docker when it is
+  # available, and otherwise uploads the ui/ source here and builds it in this
+  # amd64 CodeBuild project. The ECS Express service runs linux/amd64, so this
+  # also avoids cross-architecture emulation on arm64 deploy hosts.
+  FrontendBuildSourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-frontend-build-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # Source archives are only needed for the build that consumes them.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireBuildSources
+            Status: Enabled
+            ExpirationInDays: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: frontend-build/
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: frontend-build-source
+        - Key: ManagedBy
+          Value: cloudformation
+
+  FrontendBuildSourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBuildSourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt FrontendBuildSourceBucket.Arn
+              - !Sub '${FrontendBuildSourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  FrontendBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}-frontend-build'
+      RetentionInDays: 30
+
+  # Security: scoped to reading build sources, writing this project's build
+  # logs, and pushing to the frontend repository only.
+  FrontendBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-frontend-build-role'
+      Path: !If [HasCustomRolePath, !Ref RolePath, !Ref AWS::NoValue]
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: FrontendBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadBuildSource
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - !Sub '${FrontendBuildSourceBucket.Arn}/frontend/*'
+              - Sid: ReadBuildSourceBucket
+                Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt FrontendBuildSourceBucket.Arn
+              - Sid: WriteBuildLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub '${FrontendBuildLogGroup.Arn}'
+                  - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-frontend-build:log-stream:*'
+              - Sid: EcrAuthorization
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushFrontendImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource:
+                  - !GetAtt FrontendRepository.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  FrontendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-frontend-build'
+      Description: Builds and pushes the linux/amd64 frontend image when the deploy host has no Docker
+      ServiceRole: !GetAtt FrontendBuildRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        # Required to run the Docker daemon inside the build container.
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !GetAtt FrontendRepository.RepositoryUri
+      Source:
+        Type: S3
+        # deploy.sh overrides the location with a per-deploy archive.
+        Location: !Sub '${FrontendBuildSourceBucket}/frontend/source.zip'
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - test -n "$IMAGE_TAG"
+                - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${REPOSITORY_URI%%/*}"
+            build:
+              commands:
+                # Pull the Node base image from ECR Public to avoid Docker Hub
+                # anonymous pull limits on shared CodeBuild hosts.
+                - docker build --platform linux/amd64 --build-arg NODE_IMAGE=public.ecr.aws/docker/library/node:24-alpine -t "$REPOSITORY_URI:latest" -t "$REPOSITORY_URI:$IMAGE_TAG" .
+                - docker push "$REPOSITORY_URI:latest"
+                - docker push "$REPOSITORY_URI:$IMAGE_TAG"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref FrontendBuildLogGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
   # Security: S3 Access Logging Bucket (BSC43)
   # Stores access logs for all project S3 buckets
   AccessLogsBucket:
@@ -764,6 +944,18 @@ Outputs:
     Value: !GetAtt AgentCoreCodeBuildRole.Arn
     Export:
       Name: !Sub '${ProjectName}-AgentCoreCodeBuildRoleArn'
+
+  FrontendBuildProjectName:
+    Description: CodeBuild project that builds the frontend image when Docker is unavailable
+    Value: !Ref FrontendBuildProject
+    Export:
+      Name: !Sub '${ProjectName}-FrontendBuildProjectName'
+
+  FrontendBuildSourceBucketName:
+    Description: S3 bucket for frontend CodeBuild source archives
+    Value: !Ref FrontendBuildSourceBucket
+    Export:
+      Name: !Sub '${ProjectName}-FrontendBuildSourceBucketName'
 
   ECSTaskExecutionRoleArn:
     Description: ECS Task Execution Role ARN

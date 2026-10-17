@@ -76,7 +76,7 @@ if ! command -v jq &> /dev/null; then
     echo "   ✅ jq installed"
 fi
 
-# Docker is optional — backend deploys without it, but frontend (Steps 6-8) will be skipped
+# Docker is optional — without it the frontend image is built in CodeBuild (Step 6)
 DOCKER_AVAILABLE=true
 if ! command -v docker &> /dev/null; then
     DOCKER_AVAILABLE=false
@@ -91,10 +91,42 @@ if ! aws sts get-caller-identity &> /dev/null; then
     exit 1
 fi
 
-if [ "$DOCKER_AVAILABLE" = false ]; then
-    echo "⚠️  ${PREREQ_WARNINGS[0]}. Frontend (Steps 6-8) will be skipped."
-    echo "   Install/start Docker to deploy the UI: https://docs.docker.com/get-docker/"
-    echo "   You can re-run this script after starting Docker to deploy the frontend."
+# Frontend image build: local Docker when available, otherwise the amd64
+# CodeBuild project from the base stack. GBAW_FRONTEND_BUILD=docker|codebuild|skip
+# forces a mode; the default (auto) prefers Docker.
+FRONTEND_BUILD="${GBAW_FRONTEND_BUILD:-auto}"
+case "$FRONTEND_BUILD" in
+    auto)
+        if [ "$DOCKER_AVAILABLE" = true ]; then FRONTEND_BUILD=docker; else FRONTEND_BUILD=codebuild; fi
+        ;;
+    docker)
+        if [ "$DOCKER_AVAILABLE" = false ]; then
+            echo "❌ GBAW_FRONTEND_BUILD=docker but ${PREREQ_WARNINGS[0]}."
+            exit 1
+        fi
+        ;;
+    codebuild|skip) ;;
+    *)
+        echo "❌ GBAW_FRONTEND_BUILD must be auto, docker, codebuild, or skip (got: $FRONTEND_BUILD)"
+        exit 1
+        ;;
+esac
+if [ "$FRONTEND_BUILD" = codebuild ]; then
+    for _tool in zip unzip; do
+        if ! command -v "$_tool" &> /dev/null; then
+            echo "❌ $_tool is required to build the frontend in CodeBuild. Install it, or set GBAW_FRONTEND_BUILD=skip."
+            exit 1
+        fi
+    done
+fi
+FRONTEND_ENABLED=true
+[ "$FRONTEND_BUILD" = skip ] && FRONTEND_ENABLED=false
+
+if [ "$FRONTEND_BUILD" = codebuild ]; then
+    echo "ℹ️  ${PREREQ_WARNINGS[0]:-Docker not used}. The frontend image will be built in AWS CodeBuild (Step 6)."
+    echo ""
+elif [ "$FRONTEND_BUILD" = skip ]; then
+    echo "⚠️  GBAW_FRONTEND_BUILD=skip. Frontend (Steps 6-8) will be skipped."
     echo ""
 fi
 
@@ -662,11 +694,11 @@ echo "✅ AgentCore Runtime updated with role models and available service confi
 cd "$PROJECT_ROOT"
 echo ""
 
-# Steps 6-8: Frontend build, deploy, and security (require Docker)
-if [ "$DOCKER_AVAILABLE" = true ]; then
+# Steps 6-8: Frontend build, deploy, and security
+if [ "$FRONTEND_ENABLED" = true ]; then
 
 # Step 6: Build and push frontend container
-echo "🐳 Step 6: Building and pushing frontend container..."
+echo "🐳 Step 6: Building and pushing frontend container ($FRONTEND_BUILD)..."
 cd "$PROJECT_ROOT/ui"
 
 # Get ECR repository URI
@@ -678,25 +710,32 @@ FRONTEND_ECR_REPO=$(aws cloudformation describe-stacks \
 
 echo "Frontend ECR Repository: $FRONTEND_ECR_REPO"
 
-# Login to ECR
-aws ecr get-login-password --region $AWS_REGION | \
-  docker login --username AWS --password-stdin $FRONTEND_ECR_REPO
-
 # Build and push under BOTH :latest and a unique per-deploy tag. The unique tag
 # is passed to the frontend stack as ImageTag: with a constant tag the stack
 # parameters never change, CloudFormation no-ops, and ECS Express keeps running
 # the task it resolved at first deploy — new images land in ECR but are never
 # served (frontend fixes silently don't ship).
 FRONTEND_IMAGE_TAG="deploy-$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo manual)-$(date +%Y%m%d%H%M%S)"
-docker build --platform linux/amd64 -t $FRONTEND_ECR_REPO:latest -t $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG .
-docker push $FRONTEND_ECR_REPO:latest
-docker push $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG
+if [ "$FRONTEND_BUILD" = docker ]; then
+  # Login to ECR
+  aws ecr get-login-password --region $AWS_REGION | \
+    docker login --username AWS --password-stdin $FRONTEND_ECR_REPO
+  docker build --platform linux/amd64 -t $FRONTEND_ECR_REPO:latest -t $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG .
+  docker push $FRONTEND_ECR_REPO:latest
+  docker push $FRONTEND_ECR_REPO:$FRONTEND_IMAGE_TAG
+else
+  AWS_REGION="$AWS_REGION" PROJECT_NAME="$PROJECT_NAME" \
+    bash "$SCRIPT_DIR/infrastructure/build-frontend-codebuild.sh" build "$FRONTEND_IMAGE_TAG"
+fi
 echo "   Frontend image tag: $FRONTEND_IMAGE_TAG"
 
 echo "✅ Frontend container pushed"
 
-# Generate SBOMs (if Syft is installed)
-if command -v syft &> /dev/null; then
+# Generate SBOMs (if Syft is installed). Syft reads the image from the local
+# Docker daemon, so this runs only for local builds.
+if [ "$FRONTEND_BUILD" != docker ]; then
+  echo "ℹ️  Skipping SBOM generation (image was built in CodeBuild)"
+elif command -v syft &> /dev/null; then
   echo ""
   echo "📦 Step 6b: Generating SBOMs..."
   bash "$SCRIPT_DIR/generate-sbom.sh" "$FRONTEND_ECR_REPO:latest"
@@ -825,14 +864,14 @@ echo "✅ Security infrastructure deployed"
 echo ""
 
 else
-  # Docker not available — skip Steps 6-8
-  echo "⏭️  Steps 6-8: Skipped (Docker not available)"
+  # GBAW_FRONTEND_BUILD=skip — skip Steps 6-8
+  echo "⏭️  Steps 6-8: Skipped (GBAW_FRONTEND_BUILD=skip)"
   echo ""
 fi
 
 # Final summary
 echo "=================================================="
-if [ "$DOCKER_AVAILABLE" = true ]; then
+if [ "$FRONTEND_ENABLED" = true ]; then
   echo "✅ Deployment Complete!"
 else
   echo "⚠️  Deployment Partially Complete (backend only)"
@@ -840,7 +879,7 @@ fi
 echo "=================================================="
 echo ""
 
-if [ "$DOCKER_AVAILABLE" = true ]; then
+if [ "$FRONTEND_ENABLED" = true ]; then
 echo "📍 Access URL:"
 echo "   Frontend: https://$FRONTEND_URL"
 echo ""
@@ -860,7 +899,7 @@ if [ -n "$WAF_ACL_ARN" ] && [ "$WAF_ACL_ARN" != "None" ]; then
 fi
 echo ""
 
-if [ "$DOCKER_AVAILABLE" = true ]; then
+if [ "$FRONTEND_ENABLED" = true ]; then
 echo "🔒 Security Features:"
 echo "   ✅ WAF attached to ECS Express ALB"
 echo "   ✅ Rate limiting: 2000 req/5min/IP"
@@ -874,8 +913,7 @@ echo "   2. Access frontend: https://$FRONTEND_URL"
 echo "   3. Subscribe to security alerts:"
 echo "      aws sns subscribe --topic-arn \$(aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-security --region $AWS_REGION --query 'Stacks[0].Outputs[?OutputKey==\`SecurityAlertsTopicArn\`].OutputValue' --output text) --protocol email --notification-endpoint YOUR_EMAIL"
 else
-echo "⚠️  Frontend was not deployed — Docker is required for Steps 6-8."
-echo "   Install/start Docker and re-run this script to deploy the UI."
-echo "   https://docs.docker.com/get-docker/"
+echo "⚠️  Frontend was not deployed (GBAW_FRONTEND_BUILD=skip)."
+echo "   Re-run without GBAW_FRONTEND_BUILD=skip to deploy the UI with Docker or CodeBuild."
 fi
 echo ""

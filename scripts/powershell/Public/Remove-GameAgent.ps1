@@ -228,6 +228,15 @@ function Remove-GameAgent {
         catch { Write-GameAgentStatus 'Could not delete access logs bucket' -Type Warning }
     }
 
+    # Empty the frontend CodeBuild source bucket so CloudFormation can delete it
+    $frontendBuildBucket = "$ProjectName-frontend-build-$accountId-$Region"
+    & aws s3api head-bucket --bucket $frontendBuildBucket @profileArgs 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-GameAgentStatus "Emptying frontend build source bucket: $frontendBuildBucket" -Type Info
+        try { Invoke-Aws s3 rm "s3://$frontendBuildBucket" --recursive --region $Region | Out-Null }
+        catch { Write-GameAgentStatus 'Could not empty the frontend build source bucket' -Type Warning }
+    }
+
     Remove-Stack "$ProjectName-infrastructure"
     Write-Host ''
 

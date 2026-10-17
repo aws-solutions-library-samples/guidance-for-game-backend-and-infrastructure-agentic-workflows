@@ -266,6 +266,14 @@ else
     echo "ℹ️  Access logs bucket not found"
 fi
 
+# Step 5a2: Empty the frontend CodeBuild source bucket so CloudFormation can delete it
+FRONTEND_BUILD_BUCKET="${PROJECT_NAME}-frontend-build-${AWS_ACCOUNT_ID}-${AWS_REGION}"
+if aws s3api head-bucket --bucket "$FRONTEND_BUILD_BUCKET" 2>/dev/null; then
+    echo "🗑️  Emptying frontend build source bucket: $FRONTEND_BUILD_BUCKET"
+    aws s3 rm "s3://${FRONTEND_BUILD_BUCKET}" --recursive --region $AWS_REGION >/dev/null 2>&1 || \
+        echo "⚠️  Could not empty the frontend build source bucket"
+fi
+
 # Step 5b: Delete CloudFormation stack
 if aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-infrastructure --region $AWS_REGION &>/dev/null; then
   aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-infrastructure --region $AWS_REGION

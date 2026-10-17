@@ -34,6 +34,7 @@ Describe 'GameAgent Module' {
         $privateFunctions = @(
             'Resolve-GameAgentProfile'
             'Get-GameAgentIamRoleParameters'
+            'Invoke-GameAgentFrontendCodeBuild'
             'Test-GameAgentPort'
             'Write-GameAgentStatus'
             'Invoke-GameAgentAppObservability'
