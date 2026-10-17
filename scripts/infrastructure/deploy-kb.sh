@@ -14,7 +14,7 @@ PROJECT_NAME="game-agent"
 # permissions boundary.
 for _iam_setting in GBAW_IAM_ROLE_PATH GBAW_IAM_PERMISSIONS_BOUNDARY_ARN; do
   if [ -z "${!_iam_setting:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
-    _value=$(grep "^${_iam_setting}=" "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+    _value=$(grep "^${_iam_setting}=" "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]' || true)
     [ -n "$_value" ] && printf -v "$_iam_setting" '%s' "$_value"
   fi
 done

@@ -24,7 +24,8 @@ fi
 # path and no boundary, which leaves existing deployments unchanged.
 for _iam_setting in GBAW_IAM_ROLE_PATH GBAW_IAM_PERMISSIONS_BOUNDARY_ARN; do
     if [ -z "${!_iam_setting:-}" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
-        _value=$(grep "^${_iam_setting}=" "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+        # || true: grep exits 1 when the key is absent, which set -e/pipefail would treat as fatal.
+        _value=$(grep "^${_iam_setting}=" "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]' || true)
         [ -n "$_value" ] && printf -v "$_iam_setting" '%s' "$_value"
     fi
 done
@@ -761,7 +762,7 @@ COST_KB_ID=$(grep "^GBAW_COST_KB_ID=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/
 # VPC created for the frontend (06-frontend-network.yaml).
 FRONTEND_SUBNET_IDS="${GBAW_FRONTEND_SUBNET_IDS:-}"
 if [ -z "$FRONTEND_SUBNET_IDS" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
-  FRONTEND_SUBNET_IDS=$(grep '^GBAW_FRONTEND_SUBNET_IDS=' "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+  FRONTEND_SUBNET_IDS=$(grep '^GBAW_FRONTEND_SUBNET_IDS=' "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]' || true)
 fi
 if [ -n "$FRONTEND_SUBNET_IDS" ]; then
   echo "   Using frontend subnets from GBAW_FRONTEND_SUBNET_IDS"
