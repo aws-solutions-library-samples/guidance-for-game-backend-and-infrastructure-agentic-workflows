@@ -12,7 +12,8 @@ Recognized phrases (case-insensitive), relative to today's UTC date:
 
 - ``yesterday``
 - ``last month`` / ``previous month``, ``last quarter`` / ``previous quarter``,
-  ``last year`` / ``previous year``, when not followed by "of"
+  ``last year`` / ``previous year``, when not followed by "of" and, for
+  ``last``, not preceded by "the"
 - ``month to date`` / ``MTD``, ``quarter to date`` / ``QTD``,
   ``year to date`` / ``YTD``
 - a full month name with a four-digit year (``July 2026``), when that month has
@@ -22,10 +23,10 @@ Recognized phrases (case-insensitive), relative to today's UTC date:
 
 Phrases that can name the forecast target (``this month``, ``today``, the
 current month with its year, a month name without a year, such as "in July",
-or "the last quarter of the year") and phrases with no single calendar meaning
-(``last week``, ``the last 30 days``) name no period. A to-date period accepts
-a report that ends on today's date or the day before, because the current day's
-cost data is incomplete.
+"the last quarter of the year", or "the last month in 2026") and phrases with
+no single calendar meaning (``last week``, ``the last 30 days``) name no
+period. A to-date period accepts a report that ends on today's date or the day
+before, because the current day's cost data is incomplete.
 """
 
 # Standard library
@@ -49,9 +50,10 @@ _MONTHS = (
 )
 
 _RELATIVE = re.compile(
-    # "The last quarter of the year" names the final quarter, which can be the
-    # forecast target, so a following "of" names no period.
-    r"\b(?:last|previous)\s+(?P<unit>month|quarter|year)\b(?!\s+of\b)"
+    # "The last quarter of the year" and "the last month in 2026" name a final
+    # period, which can be the forecast target, so "the last <unit>" and a
+    # following "of" name no period. "The previous month" is unambiguous.
+    r"\b(?P<article>the\s+)?(?P<relative>last|previous)\s+(?P<unit>month|quarter|year)\b(?!\s+of\b)"
     r"|\b(?P<to_date>month|quarter|year)[\s-]+to[\s-]+date\b"
     r"|\b(?P<abbrev>mtd|qtd|ytd)\b"
     r"|\b(?P<yesterday>yesterday)\b",
@@ -144,6 +146,8 @@ def requested_historical_periods(query: str, today: date) -> list[RequestedPerio
             day = today - timedelta(days=1)
             found.append((match.start(), _complete(day, day)))
         elif match.group("unit"):
+            if match.group("article") and match.group("relative").lower() == "last":
+                continue
             found.append((match.start(), _previous(match.group("unit").lower(), today)))
         else:
             unit = (match.group("to_date") or _TO_DATE_UNITS[match.group("abbrev").lower()]).lower()

@@ -125,14 +125,18 @@ _FORECAST_REQUEST_PATTERN = re.compile(
     r"|\boutlook\b"
     r"|\bnext\s+(?:\d+|few|several|two|three|four|five|six|nine|twelve)\s+(?:days?|weeks?|months?|quarters?|years?)\b"
     r"|\b(?:rest|remainder)\s+of\s+(?:the|this)\s+(?:week|month|quarter|year)\b"
-    r"|\b(?:what|how\s+much)\s+will\b[^\n]{0,60}\b(?:bills?|costs?|spend|spending|charges?|pay)\b"
-    r"|\bwill\s+(?:i|we|my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?|pay|be\s+(?:billed|charged))\b"
+    r"|\b(?:what|how\s+much)\s+will\b[^\n]{0,60}\b(?:bills?|costs?|spend|spending|charges?|pay|owe)\b"
+    r"|\bwill\s+(?:i|we|my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?|pay|owe|be\s+(?:billed|charged))\b"
     r"|\bgoing\s+to\s+(?:cost|spend|pay|be\s+(?:billed|charged))\b"
-    r"|\bexpect(?:s|ed|ing)?\s+to\s+(?:pay|spend|be\s+(?:billed|charged))\b"
-    # "Expected" and "estimated" count only before a bill or spend word, so a
-    # pricing question ("the estimated cost of an instance") is not a forecast.
-    r"|\b(?:expected|estimated)\s+(?:aws\s+)?(?:bills?|spend|spending|charges?)\b"
-    r"|\bestimate\s+(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
+    r"|\bexpect(?:s|ing)?\s+to\s+(?:pay|spend|owe|be\s+(?:billed|charged))\b"
+    r"|\bexpect\s+(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
+    # "Expected" counts only before a bill, spend, or charges word, so a pricing
+    # question ("the expected cost of an instance") is not a forecast.
+    # "Estimated" counts only before "bill", because Cost Explorer calls an open
+    # period's actual charges estimated.
+    r"|\bexpected\s+(?:aws\s+)?(?:bills?|spend|spending|charges?)\b"
+    r"|\bestimated\s+(?:aws\s+)?bills?\b"
+    r"|\bestimate\s+(?:(?:of|for)\s+)?(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
     r"|\bproject\s+(?:my|our|the)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending)\b",
     re.IGNORECASE,
 )
@@ -486,10 +490,11 @@ def run_orchestrator(query: str, context: dict = None):
                 # Advisory/forecast request: discard model-authored financial
                 # prose and return deterministic nonnumeric guidance, composed
                 # with any safe non-cost specialist context.
-                logger.warning(
-                    "Cost advisory or forecast request raised before a validated cost report; "
-                    "returning the cost guidance"
-                )
+                if not cost_report_capture.renderings:
+                    logger.warning(
+                        "Cost advisory or forecast request raised before a validated cost report; "
+                        "returning the cost guidance"
+                    )
                 response = _compose_advisory_response(specialist_outputs)
             else:
                 # Pure operational failure with no cost involvement: preserve the
