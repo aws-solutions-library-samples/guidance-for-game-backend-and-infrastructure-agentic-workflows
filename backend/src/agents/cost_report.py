@@ -190,7 +190,8 @@ class CapturedCostRendering:
     """One deterministic rendering captured during a request.
 
     ``start`` and ``end_inclusive`` are the report period for a rendered report
-    or selection and ``None`` for a typed error rendering.
+    or selection, the requested dates for a typed report-creation error, and
+    ``None`` for a typed report-reuse error.
     """
 
     rendering: str
@@ -238,14 +239,10 @@ def finish_cost_report_capture(capture: CostReportCapture) -> str | None:
     return entries[-1].rendering if entries else None
 
 
-def _capture_authoritative_response(response: str, period: CostReportPeriod | None = None) -> None:
+def _capture_authoritative_response(response: str, start: str | None = None, end_inclusive: str | None = None) -> None:
     capture_id = _active_capture_id.get()
     if capture_id:
-        entry = CapturedCostRendering(
-            rendering=response,
-            start=period.start if period else None,
-            end_inclusive=period.end_inclusive if period else None,
-        )
+        entry = CapturedCostRendering(rendering=response, start=start, end_inclusive=end_inclusive)
         with _capture_lock:
             _captured_responses.setdefault(capture_id, []).append(entry)
 
@@ -846,9 +843,9 @@ def create_cost_report_tool_bundle(
     report_service = service or _cost_report_service
     authoritative_response: list[str] = []
 
-    def record(response: str, period: CostReportPeriod | None = None) -> None:
+    def record(response: str, start: str | None = None, end_inclusive: str | None = None) -> None:
         authoritative_response[:] = [response]
-        _capture_authoritative_response(response, period)
+        _capture_authoritative_response(response, start, end_inclusive)
 
     @tool
     def get_cost_report(
@@ -864,14 +861,14 @@ def create_cost_report_tool_bundle(
         try:
             snapshot = report_service.create_report(start_date, end_date_inclusive, metric)
             rendered = render_cost_report(snapshot.report)
-            record(rendered, snapshot.report.period)
+            record(rendered, snapshot.report.period.start, snapshot.report.period.end_inclusive)
             return {
                 "report": snapshot.report.model_dump(by_alias=True, mode="json"),
                 "validatedFinancialSection": rendered,
             }
         except CostReportError as error:
             rendered = _render_error(error)
-            record(rendered)
+            record(rendered, start_date, end_date_inclusive)
             return error.as_payload()
 
     @tool
@@ -889,7 +886,7 @@ def create_cost_report_tool_bundle(
             else:
                 rendered = render_cost_report_selection(result)
                 payload_key = "selection"
-            record(rendered, result.period)
+            record(rendered, result.period.start, result.period.end_inclusive)
             return {
                 payload_key: result.model_dump(by_alias=True, mode="json"),
                 "validatedFinancialSection": rendered,

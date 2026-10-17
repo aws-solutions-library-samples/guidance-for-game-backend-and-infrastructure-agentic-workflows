@@ -1,30 +1,30 @@
-"""Resolve the historical periods a cost question names explicitly.
+"""Resolve the historical periods a forecast question names explicitly.
 
 A forecast turn can produce validated historical reports the user never asked
 for (for example, baseline months the Cost specialist fetched while working on
 the forecast). The orchestrator keeps such a report only when its period equals
-a period the question names. This module recognizes only unambiguous calendar
-phrases and explicit ISO dates. Anything it does not recognize names no period,
-so the report is dropped rather than guessed at.
+a period the question names. This resolver runs only for forecast questions, so
+it recognizes only phrases that cannot name the forecast target itself. Anything
+it does not recognize names no period, and the report is dropped rather than
+guessed at.
 
 Recognized phrases (case-insensitive), relative to today's UTC date:
 
-- ``today``, ``yesterday``
-- ``this month`` / ``current month`` / ``month to date`` / ``MTD``
-- ``last month`` / ``previous month``
-- ``this quarter`` / ``current quarter`` / ``quarter to date`` / ``QTD``
-- ``last quarter`` / ``previous quarter``
-- ``this year`` / ``current year`` / ``year to date`` / ``YTD``
-- ``last year`` / ``previous year``
-- a full month name after a preposition (``in July``), before a year
-  (``July 2026``), or in the possessive (``July's``). Without a year, a month
-  later than the current one names no period, because it can be the coming
-  month as easily as last year's.
-- ``YYYY-MM-DD`` dates and ``YYYY-MM-DD to YYYY-MM-DD`` ranges
+- ``yesterday``
+- ``last month`` / ``previous month``, ``last quarter`` / ``previous quarter``,
+  ``last year`` / ``previous year``
+- ``month to date`` / ``MTD``, ``quarter to date`` / ``QTD``,
+  ``year to date`` / ``YTD``
+- a full month name with a four-digit year (``July 2026``), when that month has
+  started
+- ``YYYY-MM-DD`` dates and ``YYYY-MM-DD to YYYY-MM-DD`` ranges that are not in
+  the future
 
-Phrases with no single calendar meaning (``last week``, ``the last 30 days``)
-name no period. A to-date period accepts a report that ends on today's date or
-the day before, because the current day's cost data is incomplete.
+Phrases that can name the forecast target (``this month``, ``today``, or a month
+name without a year, such as "in July") and phrases with no single calendar
+meaning (``last week``, ``the last 30 days``) name no period. A to-date period
+accepts a report that ends on today's date or the day before, because the
+current day's cost data is incomplete.
 """
 
 # Standard library
@@ -46,27 +46,21 @@ _MONTHS = (
     "november",
     "december",
 )
-_MONTH_ALTERNATION = "|".join(_MONTHS)
-_PREPOSITIONS = r"in|for|during|of|from|since|through|thru|until|till|to|between|and|vs\.?|versus|over"
 
 _RELATIVE = re.compile(
-    r"\b(?P<when>this|current|last|previous)\s+(?P<unit>month|quarter|year)\b"
+    r"\b(?:last|previous)\s+(?P<unit>month|quarter|year)\b"
     r"|\b(?P<to_date>month|quarter|year)[\s-]+to[\s-]+date\b"
     r"|\b(?P<abbrev>mtd|qtd|ytd)\b"
-    r"|\b(?P<day>today|yesterday)\b",
+    r"|\b(?P<yesterday>yesterday)\b",
     re.IGNORECASE,
 )
-_MONTH_AFTER_PREPOSITION = re.compile(
-    rf"\b(?:{_PREPOSITIONS})\s+(?:the\s+month\s+of\s+)?(?P<month>{_MONTH_ALTERNATION})\b(?:\s+(?P<year>\d{{4}})\b)?",
-    re.IGNORECASE,
-)
-_MONTH_WITH_YEAR = re.compile(rf"\b(?P<month>{_MONTH_ALTERNATION})\s+(?P<year>\d{{4}})\b", re.IGNORECASE)
-_MONTH_POSSESSIVE = re.compile(rf"\b(?P<month>{_MONTH_ALTERNATION})['\u2019]s\b", re.IGNORECASE)
+_MONTH_WITH_YEAR = re.compile(rf"\b(?P<month>{'|'.join(_MONTHS)})\s+(?P<year>\d{{4}})\b", re.IGNORECASE)
 _ISO_RANGE = re.compile(
     r"\b(?P<start>\d{4}-\d{2}-\d{2})\s*(?:to|through|thru|until|till|-|\u2013|\u2014)\s*(?P<end>\d{4}-\d{2}-\d{2})\b",
     re.IGNORECASE,
 )
 _ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+_TO_DATE_UNITS = {"mtd": "month", "qtd": "quarter", "ytd": "year"}
 
 
 @dataclass(frozen=True)
@@ -82,7 +76,7 @@ class RequestedPeriod:
     end_max: date
 
     def matches(self, start: str | None, end_inclusive: str | None) -> bool:
-        """Return whether a report period, as ISO dates, is this period."""
+        """Return whether a report period, given as ISO dates, is this period."""
         if not start or not end_inclusive:
             return False
         try:
@@ -101,50 +95,34 @@ def _to_date(start: date, today: date) -> RequestedPeriod:
     return RequestedPeriod(start=start, end_min=max(start, today - timedelta(days=1)), end_max=today)
 
 
-def _month_end(year: int, month: int) -> date:
-    first_of_next = date(year + (month == 12), month % 12 + 1, 1)
-    return first_of_next - timedelta(days=1)
-
-
 def _quarter_start(day: date) -> date:
     return date(day.year, 3 * ((day.month - 1) // 3) + 1, 1)
 
 
-def _relative_period(when: str, unit: str, today: date) -> RequestedPeriod:
+def _unit_start(unit: str, today: date) -> date:
     if unit == "month":
-        this_start = today.replace(day=1)
-        if when in ("this", "current"):
-            return _to_date(this_start, today)
-        last_end = this_start - timedelta(days=1)
-        return _complete(last_end.replace(day=1), last_end)
+        return today.replace(day=1)
     if unit == "quarter":
-        this_start = _quarter_start(today)
-        if when in ("this", "current"):
-            return _to_date(this_start, today)
-        last_end = this_start - timedelta(days=1)
-        return _complete(_quarter_start(last_end), last_end)
-    this_start = date(today.year, 1, 1)
-    if when in ("this", "current"):
-        return _to_date(this_start, today)
-    return _complete(date(today.year - 1, 1, 1), date(today.year - 1, 12, 31))
+        return _quarter_start(today)
+    return date(today.year, 1, 1)
 
 
-def _month_period(name: str, year_text: str | None, today: date) -> RequestedPeriod | None:
+def _previous(unit: str, today: date) -> RequestedPeriod:
+    this_start = _unit_start(unit, today)
+    last_end = this_start - timedelta(days=1)
+    return _complete(_unit_start(unit, last_end), last_end)
+
+
+def _month_with_year(name: str, year_text: str, today: date) -> RequestedPeriod | None:
     month = _MONTHS.index(name.lower()) + 1
-    if year_text:
-        year = int(year_text)
-    elif month <= today.month:
-        year = today.year
-    else:
-        # A later month without a year can mean the coming one (a forecast
-        # target) as easily as last year's, so it names no historical period.
-        return None
-    if (year, month) > (today.year, today.month):
+    year = int(year_text)
+    if year < 1 or (year, month) > (today.year, today.month):
         return None
     start = date(year, month, 1)
     if (year, month) == (today.year, today.month):
         return _to_date(start, today)
-    return _complete(start, _month_end(year, month))
+    first_of_next = date(year + (month == 12), month % 12 + 1, 1)
+    return _complete(start, first_of_next - timedelta(days=1))
 
 
 def _parse_iso(text: str) -> date | None:
@@ -159,30 +137,19 @@ def requested_historical_periods(query: str, today: date) -> list[RequestedPerio
     found: list[tuple[int, RequestedPeriod]] = []
 
     for match in _RELATIVE.finditer(query):
-        if match.group("day"):
-            day = today if match.group("day").lower() == "today" else today - timedelta(days=1)
+        if match.group("yesterday"):
+            day = today - timedelta(days=1)
             found.append((match.start(), _complete(day, day)))
-        elif match.group("to_date") or match.group("abbrev"):
-            unit = (
-                match.group("to_date")
-                or {"mtd": "month", "qtd": "quarter", "ytd": "year"}[match.group("abbrev").lower()]
-            ).lower()
-            found.append((match.start(), _relative_period("this", unit, today)))
+        elif match.group("unit"):
+            found.append((match.start(), _previous(match.group("unit").lower(), today)))
         else:
-            found.append(
-                (match.start(), _relative_period(match.group("when").lower(), match.group("unit").lower(), today))
-            )
+            unit = (match.group("to_date") or _TO_DATE_UNITS[match.group("abbrev").lower()]).lower()
+            found.append((match.start(), _to_date(_unit_start(unit, today), today)))
 
-    month_spans: set[tuple[int, int]] = set()
-    for pattern in (_MONTH_AFTER_PREPOSITION, _MONTH_WITH_YEAR, _MONTH_POSSESSIVE):
-        for match in pattern.finditer(query):
-            span = match.span("month")
-            if span in month_spans:
-                continue
-            month_spans.add(span)
-            period = _month_period(match.group("month"), match.groupdict().get("year"), today)
-            if period:
-                found.append((span[0], period))
+    for match in _MONTH_WITH_YEAR.finditer(query):
+        period = _month_with_year(match.group("month"), match.group("year"), today)
+        if period:
+            found.append((match.start(), period))
 
     range_spans: list[tuple[int, int]] = []
     for match in _ISO_RANGE.finditer(query):
@@ -191,7 +158,7 @@ def requested_historical_periods(query: str, today: date) -> list[RequestedPerio
         if start and end and start <= end <= today:
             found.append((match.start(), _complete(start, end)))
     for match in _ISO_DATE.finditer(query):
-        if any(lo <= match.start() < hi for lo, hi in range_spans):
+        if any(low <= match.start() < high for low, high in range_spans):
             continue
         day = _parse_iso(match.group(0))
         if day and day <= today:

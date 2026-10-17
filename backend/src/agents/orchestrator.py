@@ -88,8 +88,8 @@ _COST_REPORT_UNAVAILABLE = (
 _COST_ADVISORY_GUIDANCE = (
     "## Cost Guidance\n\n"
     "Review utilization, right-sizing, idle resources, commitment options, and workload scheduling. "
-    "Use the validated Cost Explorer report path for account totals, shares, historical spending, "
-    "or numeric forecasts. No unverified financial value was shown."
+    "Use the validated Cost Explorer report path for account totals, shares, or historical spending. "
+    "No unverified financial value was shown."
 )
 _COST_TOPIC_PATTERN = re.compile(
     r"\b(?:cost|costs|costing|spend|spending|billing|bills?|budgets?|prices?|pricing|forecast|"
@@ -110,6 +110,24 @@ _OPERATIONAL_IDENTIFIER_PATTERN = re.compile(
 # KB/MCP recommendations or public pricing without claiming actual account totals.
 _FORECAST_COST_PATTERN = re.compile(
     r"\b(?:forecast|forecasting|projection|projected|next\s+(?:week|month|quarter|year)|future)\b",
+    re.IGNORECASE,
+)
+
+# Wider detection of forecast requests, used only to decide which captured
+# historical reports a turn may return (and that a forecast is not a request for
+# a historical report). It adds forecast phrasings the narrow pattern above
+# misses, such as "predict", "over the next three months", or "what will my bill
+# be"; a historical question that matches it keeps only reports for periods it
+# names.
+_FORECAST_REQUEST_PATTERN = re.compile(
+    _FORECAST_COST_PATTERN.pattern + r"|\bpredict(?:s|ed|ing|ion|ions)?\b"
+    r"|\bupcoming\b"
+    r"|\bnext\s+(?:\d+|few|several|two|three|four|five|six|nine|twelve)\s+(?:days?|weeks?|months?|quarters?|years?)\b"
+    r"|\b(?:rest|remainder|end)\s+of\s+(?:the|this)\s+(?:week|month|quarter|year)\b"
+    r"|\b(?:what|how\s+much)\s+will\b[^\n]{0,60}\b(?:bills?|costs?|spend|spending|charges?|pay)\b"
+    r"|\bwill\s+(?:i|we|my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?|pay|be\s+(?:billed|charged))\b"
+    r"|\bgoing\s+to\s+(?:cost|spend|pay|be\s+(?:billed|charged))\b"
+    r"|\bproject\s+(?:my|our|the)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending)\b",
     re.IGNORECASE,
 )
 
@@ -175,7 +193,7 @@ def _has_cost_intent(query: str) -> bool:
 
 def _is_forecast_request(query: str) -> bool:
     """Return whether a query asks about future or projected cost."""
-    return _FORECAST_COST_PATTERN.search(query) is not None
+    return _FORECAST_REQUEST_PATTERN.search(query) is not None
 
 
 def _utc_today() -> date:
@@ -183,18 +201,24 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRendering]) -> str | None:
+def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRendering], today: date) -> str | None:
     """Return the authoritative section for a forecast request, or ``None``.
 
     Forecast figures are never validated, so a forecast turn's only validated
-    content is a historical report. A report is kept only when its period equals
-    a historical period the question names; reports the Cost specialist built
-    for any other period (for example, baseline months) are dropped. The kept
-    renderings, one per named period, are followed by the fixed nonnumeric cost
-    guidance for the forecast part. ``None`` means no captured report matches,
-    and the caller returns the guidance alone.
+    content is a historical report. A rendering is kept only when its period (or,
+    for a typed report-creation error, its requested dates) equals a historical
+    period the question names; renderings for any other period (for example,
+    baseline months) are dropped. For each named period the most recent matching
+    rendering is kept, and the kept renderings are followed by the fixed
+    non-numeric cost guidance for the forecast part. ``None`` means no rendering
+    matches, and the caller returns its advisory composition: markers for any
+    consulted GameLift or EKS specialist plus the guidance.
     """
-    periods = requested_historical_periods(query, _utc_today())
+    try:
+        periods = requested_historical_periods(query, today)
+    except Exception:  # The resolver reads user text; never fail the request on it.
+        logger.warning("Forecast period resolution failed; returning the cost guidance")
+        return None
     kept: list[str] = []
     for period in periods:
         for entry in reversed(renderings):
@@ -244,7 +268,7 @@ def _cost_attempted(query: str, specialist_outputs: list[tuple[str, str]]) -> bo
     an account cost report.
     """
     del specialist_outputs  # Retained in the signature for call-site clarity.
-    return _has_cost_intent(query)
+    return _has_cost_intent(query) and not _is_forecast_request(query)
 
 
 def _safe_non_cost_sections(specialist_outputs: list[tuple[str, str]]) -> list[str]:
@@ -327,6 +351,9 @@ def run_orchestrator(query: str, context: dict = None):
 
         cost_report_followup = _is_cost_report_followup(query)
         forecast_request = _is_forecast_request(query) and not cost_report_followup
+        # Read the date once, before the turn, so a turn that crosses UTC
+        # midnight resolves "last month" against the date the specialist used.
+        request_today = _utc_today()
         agent_tools = [cost_agent] if cost_report_followup else [gamelift_agent, eks_agent, cost_agent]
         if cost_report_followup:
             logger.info("Routing cost report ID follow-up exclusively through the cost specialist")
@@ -421,7 +448,11 @@ def run_orchestrator(query: str, context: dict = None):
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
             if forecast_request and authoritative_cost_response is not None:
-                authoritative_cost_response = _forecast_authoritative_section(query, cost_report_capture.renderings)
+                authoritative_cost_response = _forecast_authoritative_section(
+                    query, cost_report_capture.renderings, request_today
+                )
+                if authoritative_cost_response is None:
+                    logger.warning("Forecast request failed after a validated cost report; returning the cost guidance")
             if authoritative_cost_response is not None:
                 logger.warning(
                     "Orchestrator failed after a validated cost report; returning the deterministic rendering"
@@ -457,7 +488,9 @@ def run_orchestrator(query: str, context: dict = None):
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
             if forecast_request and authoritative_cost_response is not None:
-                authoritative_cost_response = _forecast_authoritative_section(query, cost_report_capture.renderings)
+                authoritative_cost_response = _forecast_authoritative_section(
+                    query, cost_report_capture.renderings, request_today
+                )
             if authoritative_cost_response is not None:
                 # A cost-report tool produced the authoritative financial section.
                 # Compose it deterministically with any captured GameLift/EKS
