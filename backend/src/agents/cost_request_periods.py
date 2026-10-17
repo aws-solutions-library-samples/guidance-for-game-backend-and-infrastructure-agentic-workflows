@@ -4,9 +4,9 @@ A forecast turn can produce validated historical reports the user never asked
 for (for example, baseline months the Cost specialist fetched while working on
 the forecast). The orchestrator keeps such a report only when its period equals
 a period the question names. This resolver runs only for forecast questions, so
-it recognizes only phrases that cannot name the forecast target itself. Anything
-it does not recognize names no period, and the report is dropped rather than
-guessed at.
+it recognizes only phrases that normally name a past period rather than the
+forecast target. Anything it does not recognize names no period, and the report
+is dropped rather than guessed at.
 
 Recognized phrases (case-insensitive), relative to today's UTC date:
 
@@ -65,7 +65,10 @@ _RELATIVE = re.compile(
     re.IGNORECASE,
 )
 # "This year's last quarter" and "the very last month" name a final period too.
-_FINAL_PERIOD_PREFIX = re.compile(r"(?:\b(?:year|quarter|\d{4})['\u2019]s|\bvery)\s+$", re.IGNORECASE)
+_FINAL_PERIOD_PREFIX = re.compile(
+    r"(?:\b(?:year|quarter)['\u2019]?s|\b\d{4}['\u2019]s|\bvery)\s+$",
+    re.IGNORECASE,
+)
 _MONTH_WITH_YEAR = re.compile(rf"\b(?P<month>{'|'.join(_MONTHS)})\s+(?P<year>\d{{4}})\b", re.IGNORECASE)
 _ISO_RANGE = re.compile(
     r"\b(?P<start>\d{4}-\d{2}-\d{2})\s*(?:to|through|thru|until|till|-|\u2013|\u2014)\s*(?P<end>\d{4}-\d{2}-\d{2})\b",

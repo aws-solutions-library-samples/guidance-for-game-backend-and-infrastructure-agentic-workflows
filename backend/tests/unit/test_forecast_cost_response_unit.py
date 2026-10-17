@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recognized forecast questions never return a historical report for a period they do not name.
+"""Recognized forecast questions keep historical reports only for periods the question names.
 
 The Cost specialist may build validated historical reports while it works on a
 forecast (for example, baseline months). Those reports are captured as
@@ -366,6 +366,7 @@ class TestNonForecastBehaviorIsUnchanged:
         "query",
         [
             "I didn't expect my AWS bill to be this high this month. Show my costs by service.",
+            "I didnt expect my AWS bill to be this high this month. Show my costs by service.",
             "We didn't expect our spend to jump this month. What changed?",
             "I didn't expect to pay this much this month. Show my costs by service.",
         ],
@@ -420,9 +421,11 @@ class TestForecastDetection:
             "How much should I expect to pay in November?",
             "How much should I expect to owe in November?",
             "How much are we expecting to spend in November?",
+            "Our team expects to pay more in November.",
             "How much do I expect my bill to be in November?",
             "What should we expect our bill to be in Q4?",
             "I expect my bill to be about the same in November.",
+            "What does the agent expect my bill to be in November?",
             "Estimate my December bill.",
             "Give me an estimate of my November bill.",
             "Give me an estimate for my December bill.",
@@ -453,6 +456,9 @@ class TestForecastDetection:
             "Show my estimated charges for this month.",
             "I didn't expect my AWS bill to be this high this month.",
             "I didn\u2019t expect my AWS bill to be this high this month.",
+            "I didnt expect my AWS bill to be this high this month.",
+            "We dont expect our spend to jump like this.",
+            "Our team doesnt expect to pay this much.",
             "We did not expect our spend to jump this month.",
             "I never expect my costs to drop in summer.",
             "I didn't expect to pay this much this month.",
@@ -474,7 +480,7 @@ OCTOBER_TO_DATE = ("2026-10-01", "2026-10-15", "2026-10-16")
 
 
 class TestRequestedHistoricalPeriods:
-    """The period resolver recognizes only phrases that cannot name the forecast target."""
+    """The period resolver recognizes only phrases that normally name a past period."""
 
     @pytest.mark.parametrize(
         ("query", "expected"),
@@ -493,7 +499,10 @@ class TestRequestedHistoricalPeriods:
             ("month-to-date spend", {OCTOBER_TO_DATE}),
             ("my spend so far this month", {OCTOBER_TO_DATE}),
             ("this month so far", {OCTOBER_TO_DATE}),
+            ("so far this quarter", {OCTOBER_TO_DATE}),
+            ("this quarter so far", {OCTOBER_TO_DATE}),
             ("so far this year", {("2026-01-01", "2026-10-15", "2026-10-16")}),
+            ("this year so far", {("2026-01-01", "2026-10-15", "2026-10-16")}),
             ("MTD", {OCTOBER_TO_DATE}),
             ("quarter to date", {OCTOBER_TO_DATE}),
             ("last quarter", {("2026-07-01", "2026-09-30", "2026-09-30")}),
@@ -546,6 +555,8 @@ class TestRequestedHistoricalPeriods:
             "The  last month",
             "THE LAST QUARTER IN 2026",
             "this year's last quarter",
+            "this years last quarter",
+            "This Year's Last Quarter",
             "this quarter's last month",
             "2026\u2019s last quarter",
             "the year's last month",

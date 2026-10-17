@@ -372,10 +372,11 @@ Forecast detection is pattern-based. A question the orchestrator recognizes as
 a forecast gets the fixed, non-numeric cost guidance, because forecast figures
 are not validated. A historical report captured during that turn is kept only
 when its period equals a period the question names.
-`agents/cost_request_periods.py` recognizes only phrases that cannot name the
-forecast target, such as "last month", "last quarter", "month to date", a month
-with its year once that month has ended ("July 2026"), and ISO dates before
-today; every other captured report is dropped.
+`agents/cost_request_periods.py` recognizes only phrases that normally name a
+past period rather than the forecast target, such as "last month", "last
+quarter", "month to date", a month with its year once that month has ended
+("July 2026"), and ISO dates before today; every other captured report is
+dropped.
 
 Snapshot correctness and billing finality are separate. A validated report is
 internally consistent with Cost Explorer at its `queriedAt` timestamp, while an

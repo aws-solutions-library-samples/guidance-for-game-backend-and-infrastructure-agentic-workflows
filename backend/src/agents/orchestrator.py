@@ -120,8 +120,12 @@ _FORECAST_COST_PATTERN = re.compile(
 # be", "my expected bill", or "outlook"; a historical question that matches it
 # keeps only reports for periods it names.
 # A negated "expect" ("I didn't expect my bill to be this high") describes a
-# bill already incurred, so it does not mark a forecast.
-_NOT_NEGATED = r"(?<!n't\s)(?<!n\u2019t\s)(?<!\bnot\s)(?<!\bnever\s)"
+# bill already incurred, so it does not mark a forecast. The negation must come
+# directly before "expect"; the apostrophe may be missing ("didnt", "dont").
+_NOT_NEGATED = (
+    r"(?<!n't\s)(?<!n\u2019t\s)(?<!\bnot\s)(?<!\bnever\s)"
+    r"(?<!\bdidnt\s)(?<!\bdont\s)(?<!\bdoesnt\s)(?<!\bwasnt\s)(?<!\bwerent\s)"
+)
 _FORECAST_REQUEST_PATTERN = re.compile(
     _FORECAST_COST_PATTERN.pattern + r"|\bpredict(?:s|ed|ing|ion|ions)?\b"
     r"|\bupcoming\b"
