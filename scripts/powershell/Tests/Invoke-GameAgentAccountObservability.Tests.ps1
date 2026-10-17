@@ -1,4 +1,15 @@
 BeforeAll {
+    # Invoke-GameAgentAccountObservability delegates its trace-destination read
+    # to the shared Get-GameAgentTraceDestination helper, so dot-source that
+    # helper first; otherwise every spec that reaches the read fails with
+    # "The term 'Get-GameAgentTraceDestination' is not recognized".
+    . (Join-Path $PSScriptRoot '..' 'Private' 'Get-GameAgentTraceDestination.ps1' | Resolve-Path)
+    # The -StopOnAccountObservabilityChange switch defaults to
+    # (Resolve-GameAgentStopSwitch -Value $env:...), so the helper must be loaded
+    # before the function; otherwise every call that omits the switch fails at
+    # parameter binding with "The term 'Resolve-GameAgentStopSwitch' is not
+    # recognized".
+    . (Join-Path $PSScriptRoot '..' 'Private' 'Resolve-GameAgentStopSwitch.ps1' | Resolve-Path)
     . (Join-Path $PSScriptRoot '..' 'Private' 'Invoke-GameAgentAccountObservability.ps1' | Resolve-Path)
 
     $script:StatusMessages = [System.Collections.Generic.List[string]]::new()
@@ -486,6 +497,67 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
         $host_ | Should -Not -Match 'update-trace-segment-destination'
     }
+
+    It 'Default mode under the stop switch offers the opt-in with the matching policy name' {
+        # Destination XRay, 'aws/spans' present. With the stop switch set, the
+        # bare default-named opt-in would halt on the toolkit's name-only check
+        # and loop. The remedy must offer the matching policy name and the
+        # no-other-grant condition, not the bare default opt-in.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess'
+        $host_ | Should -Match 'no other'
+    }
+
+    It 'Default mode XRay/aws-spans-absent remedy drops the launch promise under the stop switch' {
+        # Write-SpansRemedy's stop-switch branch: the deploy halts before
+        # 'agentcore launch', so the remedy must say the stop switch is set and
+        # point to the console, not promise a launch destination switch or a
+        # Step 5c toggle.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $mutations.Count | Should -Be 0
+        $host_ = $script:HostMessages -join "`n"
+        $host_ | Should -Match 'stop switch is set'
+        $host_ | Should -Match 'AWS X-Ray / CloudWatch console'
+        $host_ | Should -Not -Match 'the post-launch recheck \(Step 5c\)'
+        $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
+    }
+
+    It 'The stop-switch parameter default reads the environment and treats TRUE as off' -ForEach @(
+        @{ EnvValue = 'true'; ExpectStopWording = $true }
+        @{ EnvValue = 'TRUE'; ExpectStopWording = $false }
+        @{ EnvValue = '';     ExpectStopWording = $false }
+    ) {
+        # When the caller omits -StopOnAccountObservabilityChange, the parameter
+        # default resolves it from GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE
+        # through the case-sensitive helper. On the XRay/'aws/spans'-absent path
+        # the stop-switch branch prints 'stop switch is set', so its presence
+        # tells us whether the env value armed the switch.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Mutations $mutations
+        $prior = $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE
+        try {
+            $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE = $EnvValue
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @()
+        } finally {
+            if ($null -eq $prior) {
+                Remove-Item Env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE -ErrorAction SilentlyContinue
+            } else {
+                $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE = $prior
+            }
+        }
+        $host_ = $script:HostMessages -join "`n"
+        if ($ExpectStopWording) {
+            $host_ | Should -Match 'stop switch is set'
+        } else {
+            $host_ | Should -Not -Match 'stop switch is set'
+        }
+    }
 }
 
 
@@ -527,5 +599,12 @@ Describe 'Deploy-GameAgent recheck wiring' {
         # Match bash's exact 'true' check so 'TRUE' does not opt in on one shell
         # but not the other.
         $script:DeployContent | Should -Match 'GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -ceq '
+    }
+
+    It 'passes the stop switch into the Step 1.7 account-observability call' {
+        # Step 1.7 must forward -StopOnAccountObservabilityChange so the default
+        # XRay/'aws/spans'-absent remedy knows the deploy halts before launch and
+        # the matching-name opt-in offer is used.
+        $script:DeployContent | Should -Match 'Invoke-GameAgentAccountObservability[^\r\n]*-StopOnAccountObservabilityChange'
     }
 }
