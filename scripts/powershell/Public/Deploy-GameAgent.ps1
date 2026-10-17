@@ -450,13 +450,40 @@ function Deploy-GameAgent {
 
         # Step 7: Deploy frontend
         Write-GameAgentStatus 'Step 7: Deploying frontend...' -Type Info
+
+        # Frontend subnets, matching deploy.sh: GBAW_FRONTEND_SUBNET_IDS, else the
+        # default VPC, else a small public VPC for the frontend.
+        $frontendSubnetIds = $env:GBAW_FRONTEND_SUBNET_IDS
+        if (-not $frontendSubnetIds) {
+            $envLocal = Join-Path $uiPath '.env.local'
+            if (Test-Path $envLocal) {
+                $m = Select-String -Path $envLocal -Pattern '^GBAW_FRONTEND_SUBNET_IDS=(.*)$' | Select-Object -Last 1
+                if ($m) { $frontendSubnetIds = $m.Matches[0].Groups[1].Value -replace '\s', '' }
+            }
+        }
+        if (-not $frontendSubnetIds) {
+            $defaultVpc = ((Invoke-Aws ec2 describe-vpcs --filters Name=is-default,Values=true --region $Region `
+                --query 'Vpcs[0].VpcId' --output text) | Out-String).Trim()
+            if (-not $defaultVpc -or $defaultVpc -eq 'None') {
+                Write-GameAgentStatus "No default VPC in $Region; deploying a frontend VPC with two public subnets..." -Type Info
+                Deploy-Stack -StackName "$ProjectName-frontend-network" `
+                    -TemplateFile (Join-Path $infraPath '06-frontend-network.yaml') `
+                    -Params @("ProjectName=$ProjectName")
+                $frontendSubnetIds = Get-StackOutput "$ProjectName-frontend-network" 'PublicSubnetIds'
+                if (-not $frontendSubnetIds -or $frontendSubnetIds -eq 'None') {
+                    throw 'Frontend network stack did not export PublicSubnetIds.'
+                }
+            }
+        }
+
         Deploy-Stack -StackName "$ProjectName-frontend" `
             -TemplateFile (Join-Path $infraPath '02-frontend-ecs-express.yaml') `
             -Params @(
                 "ProjectName=$ProjectName",
                 "RuntimeId=$runtimeId",
                 "TenantId=$tenantId",
-                "WorkspaceId=$workspaceId"
+                "WorkspaceId=$workspaceId",
+                "SubnetIds=$frontendSubnetIds"
             )
 
         $frontendUrl = Get-StackOutput "$ProjectName-frontend" 'ServiceUrl'

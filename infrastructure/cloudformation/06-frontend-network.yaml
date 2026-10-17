@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Game Agent - Frontend network for accounts without a default VPC'
+
+# Optional. deploy.sh creates this stack only when the Region has no default VPC
+# (common in AWS Control Tower and other landing-zone accounts) and no subnets
+# are supplied with GBAW_FRONTEND_SUBNET_IDS.
+#
+# ECS Express Mode places the load balancer and tasks in the same subnets. With
+# public subnets it provisions an internet-facing Application Load Balancer and
+# assigns public IPs to tasks for outbound access (ECR pulls, Cognito, AgentCore),
+# so no NAT gateway is needed. Inbound traffic reaches tasks only through the
+# ECS-managed load balancer security group.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: game-agent
+    Description: Project name used for resource naming
+
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-4])$'
+    Description: IPv4 CIDR for the frontend VPC (/16 to /24)
+
+  PublicSubnetACidr:
+    Type: String
+    Default: 10.42.0.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-8])$'
+    Description: IPv4 CIDR for the first public subnet
+
+  PublicSubnetBCidr:
+    Type: String
+    Default: 10.42.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-8])$'
+    Description: IPv4 CIDR for the second public subnet
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: cloudformation
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-igw'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Two Availability Zones: the minimum ECS Express Mode accepts for a load balancer.
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      # Express assigns task public IPs itself; nothing else launches here.
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-public-a'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-public-b'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-public'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+Outputs:
+  VpcId:
+    Description: Frontend VPC ID
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${ProjectName}-FrontendVpcId'
+
+  PublicSubnetIds:
+    Description: Comma-separated public subnet IDs for the frontend service
+    # deploy.sh reads this only after the stack completes, so the internet route
+    # is in place before Express classifies the subnets (public -> internet-facing ALB).
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export:
+      Name: !Sub '${ProjectName}-FrontendPublicSubnetIds'

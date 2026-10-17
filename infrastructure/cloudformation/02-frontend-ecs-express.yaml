@@ -53,6 +53,14 @@ Parameters:
     Default: 4
     Description: Maximum number of tasks
 
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Optional subnets for the service, in at least two Availability Zones.
+      Public subnets give an internet-facing load balancer. Leave empty to use
+      the default VPC.
+
   SessionIdleRefreshSeconds:
     Type: Number
     Default: 900
@@ -79,6 +87,9 @@ Parameters:
       Seconds before the idle timeout that the accessible countdown warning
       opens so a present user can choose to stay signed in.
 
+Conditions:
+  HasSubnetIds: !Not [!Equals [!Join ['', !Ref SubnetIds], '']]
+
 Resources:
   FrontendService:
     Type: AWS::ECS::ExpressGatewayService
@@ -92,6 +103,10 @@ Resources:
         Fn::ImportValue: !Sub '${ProjectName}-ECSTaskRoleArn'
       Cpu: !Ref Cpu
       Memory: !Ref Memory
+      NetworkConfiguration: !If
+        - HasSubnetIds
+        - Subnets: !Ref SubnetIds
+        - !Ref AWS::NoValue
       HealthCheckPath: /api/health
       PrimaryContainer:
         Image: !Sub

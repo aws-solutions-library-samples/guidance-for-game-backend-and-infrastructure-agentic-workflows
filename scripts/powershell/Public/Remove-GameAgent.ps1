@@ -135,6 +135,8 @@ function Remove-GameAgent {
     # ── Step 2: Frontend ──
     Write-GameAgentStatus 'Step 2: Deleting frontend...' -Type Info
     Remove-Stack "$ProjectName-frontend"
+    # Frontend VPC, created only in accounts without a default VPC
+    Remove-Stack "$ProjectName-frontend-network"
     Write-Host ''
 
     # ── Step 3.5: Guardrails ──

@@ -144,6 +144,14 @@ else
   echo "⚠️  Frontend stack not found"
 fi
 
+# Step 2b: Delete the frontend VPC (created only in accounts without a default VPC)
+if aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-frontend-network --region $AWS_REGION &>/dev/null; then
+  echo "🗑️  Deleting frontend network..."
+  aws cloudformation delete-stack --stack-name ${PROJECT_NAME}-frontend-network --region $AWS_REGION
+  aws cloudformation wait stack-delete-complete --stack-name ${PROJECT_NAME}-frontend-network --region $AWS_REGION
+  echo "✅ Frontend network deleted"
+fi
+
 # Step 3: Clean up legacy EKS MCP infrastructure (if any)
 echo ""
 echo "🗑️  Step 3: Cleaning up legacy EKS MCP infrastructure..."

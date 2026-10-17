@@ -755,6 +755,42 @@ GAMELIFT_KB_ID=$(grep "^GBAW_GAMELIFT_KB_ID=" "$PROJECT_ROOT/backend/.env.local"
 EKS_KB_ID=$(grep "^GBAW_EKS_KB_ID=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 COST_KB_ID=$(grep "^GBAW_COST_KB_ID=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 
+# Frontend subnets. ECS Express falls back to the default VPC, which many
+# landing-zone accounts (for example AWS Control Tower) do not have. Order:
+# GBAW_FRONTEND_SUBNET_IDS if set, else the default VPC, else a small public
+# VPC created for the frontend (06-frontend-network.yaml).
+FRONTEND_SUBNET_IDS="${GBAW_FRONTEND_SUBNET_IDS:-}"
+if [ -z "$FRONTEND_SUBNET_IDS" ] && [ -f "$PROJECT_ROOT/ui/.env.local" ]; then
+  FRONTEND_SUBNET_IDS=$(grep '^GBAW_FRONTEND_SUBNET_IDS=' "$PROJECT_ROOT/ui/.env.local" | tail -1 | cut -d= -f2- | tr -d '[:space:]')
+fi
+if [ -n "$FRONTEND_SUBNET_IDS" ]; then
+  echo "   Using frontend subnets from GBAW_FRONTEND_SUBNET_IDS"
+else
+  DEFAULT_VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
+    --region $AWS_REGION --query 'Vpcs[0].VpcId' --output text)
+  if [ -n "$DEFAULT_VPC_ID" ] && [ "$DEFAULT_VPC_ID" != "None" ]; then
+    echo "   Using the default VPC ($DEFAULT_VPC_ID) for the frontend"
+  else
+    echo "   No default VPC in $AWS_REGION; deploying a frontend VPC with two public subnets..."
+    aws cloudformation deploy \
+      --template-file "$PROJECT_ROOT/infrastructure/cloudformation/06-frontend-network.yaml" \
+      --stack-name "${PROJECT_NAME}-frontend-network" \
+      --parameter-overrides ProjectName="$PROJECT_NAME" \
+      --region $AWS_REGION \
+      --no-fail-on-empty-changeset
+    FRONTEND_SUBNET_IDS=$(aws cloudformation describe-stacks \
+      --stack-name "${PROJECT_NAME}-frontend-network" \
+      --region $AWS_REGION \
+      --query 'Stacks[0].Outputs[?OutputKey==`PublicSubnetIds`].OutputValue' \
+      --output text)
+    if [ -z "$FRONTEND_SUBNET_IDS" ] || [ "$FRONTEND_SUBNET_IDS" = "None" ]; then
+      echo "❌ Frontend network stack did not export PublicSubnetIds" >&2
+      exit 1
+    fi
+    echo "   Frontend subnets: $FRONTEND_SUBNET_IDS"
+  fi
+fi
+
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/02-frontend-ecs-express.yaml" \
   --stack-name "${PROJECT_NAME}-frontend" \
@@ -764,6 +800,7 @@ aws cloudformation deploy \
     ImageTag="$FRONTEND_IMAGE_TAG" \
     TenantId="$GBAW_TENANT_ID" \
     WorkspaceId="$GBAW_WORKSPACE_ID" \
+    SubnetIds="$FRONTEND_SUBNET_IDS" \
   --capabilities CAPABILITY_NAMED_IAM \
   --region $AWS_REGION \
   --no-fail-on-empty-changeset
