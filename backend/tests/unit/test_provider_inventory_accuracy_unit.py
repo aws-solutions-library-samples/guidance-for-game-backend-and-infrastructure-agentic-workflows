@@ -7,7 +7,8 @@ describes so the document cannot silently drift from reality:
 
 * the Knowledge Base ``numberOfResults`` is caller/provider-controlled, not a
   code-owned upper bound (``create_kb_retrieve_tool`` forwards it unchanged);
-* both the classic and container GameLift list paths are uncapped to the model;
+* both the classic and container GameLift list paths are item-capped to the
+  model (each bounded by `GAMELIFT_MAX_PROJECTED_ITEMS`);
 * ``reuse_cost_report`` is a registered deterministic cost surface with
   no-new-query semantics.
 """
@@ -48,21 +49,31 @@ class TestKnowledgeBaseCountClaim:
 
 
 class TestGameLiftListBoundsClaim:
-    def test_both_fleet_paths_are_uncapped_in_code(self):
+    def test_both_fleet_paths_are_item_capped_in_code(self):
         # Local modules
         from agents import gamelift_specialist as gls
 
-        # Neither the classic nor the container aggregation applies an item cap.
+        # Both the classic and container aggregation now apply the shared item
+        # cap: the classic path caps the fleet-ID set it describes, and the
+        # container path caps its listing via a PaginationConfig MaxItems bound.
         classic_src = inspect.getsource(gls._list_classic_fleet_attributes)
         container_src = inspect.getsource(gls._list_container_fleet_summaries)
-        assert "GAMELIFT_MAX_PROJECTED_ITEMS" not in classic_src
-        assert "GAMELIFT_MAX_PROJECTED_ITEMS" not in container_src
+        assert "GAMELIFT_MAX_PROJECTED_ITEMS" in classic_src
+        assert "GAMELIFT_MAX_PROJECTED_ITEMS" in container_src
+        # The bounded listing is assembled through the code-owned envelope
+        # builder, which enforces the final-serialized aggregate cap.
+        list_src = inspect.getsource(gls.list_gamelift_fleets)
+        assert "build_fleet_list_result" in list_src
+        # The raw FleetAttributes duplicate is absent from the model-visible envelope.
+        assert '"FleetAttributes"' not in list_src
 
-    def test_inventory_states_both_paths_uncapped(self):
+    def test_inventory_states_both_paths_bounded(self):
         text = _inventory_text().lower()
-        # Both classic AND container listing outputs must be called out as uncapped.
+        # Both classic AND container listing outputs must be called out as bounded.
         assert "classic" in text and "container" in text
-        assert "neither classic nor container fleet output is item-bounded" in text
+        assert "both the classic and container fleet collections are item-bounded" in text
+        # The stale "uncapped" follow-up claim must be gone.
+        assert "neither classic nor container fleet output is item-bounded" not in text
 
 
 class TestReuseCostReportRegistered:
