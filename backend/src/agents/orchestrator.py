@@ -116,17 +116,23 @@ _FORECAST_COST_PATTERN = re.compile(
 # Wider detection of forecast requests, used only to decide which captured
 # historical reports a turn may return (and that a forecast is not a request for
 # a historical report). It adds forecast phrasings the narrow pattern above
-# misses, such as "predict", "over the next three months", or "what will my bill
-# be"; a historical question that matches it keeps only reports for periods it
-# names.
+# misses, such as "predict", "over the next three months", "what will my bill
+# be", "my expected bill", or "outlook"; a historical question that matches it
+# keeps only reports for periods it names.
 _FORECAST_REQUEST_PATTERN = re.compile(
     _FORECAST_COST_PATTERN.pattern + r"|\bpredict(?:s|ed|ing|ion|ions)?\b"
     r"|\bupcoming\b"
+    r"|\boutlook\b"
     r"|\bnext\s+(?:\d+|few|several|two|three|four|five|six|nine|twelve)\s+(?:days?|weeks?|months?|quarters?|years?)\b"
-    r"|\b(?:rest|remainder|end)\s+of\s+(?:the|this)\s+(?:week|month|quarter|year)\b"
+    r"|\b(?:rest|remainder)\s+of\s+(?:the|this)\s+(?:week|month|quarter|year)\b"
     r"|\b(?:what|how\s+much)\s+will\b[^\n]{0,60}\b(?:bills?|costs?|spend|spending|charges?|pay)\b"
     r"|\bwill\s+(?:i|we|my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?|pay|be\s+(?:billed|charged))\b"
     r"|\bgoing\s+to\s+(?:cost|spend|pay|be\s+(?:billed|charged))\b"
+    r"|\bexpect(?:s|ed|ing)?\s+to\s+(?:pay|spend|be\s+(?:billed|charged))\b"
+    # "Expected" and "estimated" count only before a bill or spend word, so a
+    # pricing question ("the estimated cost of an instance") is not a forecast.
+    r"|\b(?:expected|estimated)\s+(?:aws\s+)?(?:bills?|spend|spending|charges?)\b"
+    r"|\bestimate\s+(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
     r"|\bproject\s+(?:my|our|the)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending)\b",
     re.IGNORECASE,
 )
@@ -211,8 +217,9 @@ def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRen
     baseline months) are dropped. For each named period the most recent matching
     rendering is kept, and the kept renderings are followed by the fixed
     non-numeric cost guidance for the forecast part. ``None`` means no rendering
-    matches, and the caller returns its advisory composition: markers for any
-    consulted GameLift or EKS specialist plus the guidance.
+    matches or the named periods could not be resolved; the caller then returns
+    its advisory composition: markers for any consulted GameLift or EKS
+    specialist plus the guidance.
     """
     try:
         periods = requested_historical_periods(query, today)
@@ -352,7 +359,7 @@ def run_orchestrator(query: str, context: dict = None):
         cost_report_followup = _is_cost_report_followup(query)
         forecast_request = _is_forecast_request(query) and not cost_report_followup
         # Read the date once, before the turn, so a turn that crosses UTC
-        # midnight resolves "last month" against the date the specialist used.
+        # midnight still resolves "last month" against the day it started.
         request_today = _utc_today()
         agent_tools = [cost_agent] if cost_report_followup else [gamelift_agent, eks_agent, cost_agent]
         if cost_report_followup:
@@ -479,6 +486,10 @@ def run_orchestrator(query: str, context: dict = None):
                 # Advisory/forecast request: discard model-authored financial
                 # prose and return deterministic nonnumeric guidance, composed
                 # with any safe non-cost specialist context.
+                logger.warning(
+                    "Cost advisory or forecast request raised before a validated cost report; "
+                    "returning the cost guidance"
+                )
                 response = _compose_advisory_response(specialist_outputs)
             else:
                 # Pure operational failure with no cost involvement: preserve the

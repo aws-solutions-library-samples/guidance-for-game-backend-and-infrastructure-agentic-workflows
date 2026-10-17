@@ -170,6 +170,31 @@ class TestForecastWithoutNamedPeriod:
         """These phrases can name the forecast target, so a matching baseline is dropped."""
         assert _run(query, [period]) == GUIDANCE
 
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    @pytest.mark.parametrize(
+        ("query", "periods"),
+        [
+            ("Forecast my AWS cost for the last month of the year.", LIVE_BASELINES),
+            ("What is my AWS cost forecast for the last quarter of the year?", [("2026-07-01", "2026-09-30")]),
+            ("Forecast our AWS spend for the last quarter of 2026.", [("2026-07-01", "2026-09-30")]),
+            ("Forecast my AWS cost for October 2026.", LIVE_BASELINES),
+            ("Forecast my AWS cost for 2026-10-16.", [("2026-10-16", "2026-10-16")]),
+        ],
+    )
+    def test_phrases_that_can_name_the_forecast_target_keep_no_report(self, query, periods, raise_after):
+        assert _run(query, periods, raise_after=raise_after, cost_ran=True) == GUIDANCE
+
+    def test_raised_turn_without_a_report_logs_a_warning(self):
+        def body() -> str:
+            record_specialist_output("Cost", "Next month should cost about USD 999.00.")
+            raise RuntimeError("model call failed before any report")
+
+        with patch.object(orchestrator.logger, "warning") as warning:
+            response = _orchestrate("Predict my AWS costs for the next 30 days.", body)
+
+        assert response == GUIDANCE
+        assert any("request raised before a validated cost report" in str(c) for c in warning.call_args_list)
+
     def test_year_zero_does_not_fail_the_request(self):
         assert _run("Forecast next month and compare it with July 0000.", [("2026-09-01", "2026-09-30")]) == GUIDANCE
 
@@ -185,6 +210,10 @@ class TestForecastWithoutNamedPeriod:
             "Estimate my AWS spend for the rest of the year.",
             "Project my AWS costs through December.",
             "What will my AWS bill be in November?",
+            "What is my expected AWS bill for November?",
+            "Estimate my December bill.",
+            "What's the outlook for my AWS spend?",
+            "How much should I expect to pay in November?",
         ],
     )
     def test_wider_forecast_phrasings_get_guidance(self, query):
@@ -252,6 +281,15 @@ class TestForecastNamingAHistoricalPeriod:
         assert response.startswith("## Cost Report Unavailable")
         assert response.endswith(GUIDANCE)
         assert "999" not in response
+
+    def test_report_matching_two_named_periods_is_shown_once(self):
+        response = _run(
+            "Forecast the rest of the month from my month to date spend (2026-10-01 to 2026-10-15).",
+            [("2026-10-01", "2026-10-15")],
+        )
+
+        assert response.count("**Report ID:** `cost-report-0`") == 1
+        assert response.endswith(GUIDANCE)
 
     def test_no_report_matches_the_named_period(self):
         assert _run(self.QUERY, [("2026-07-01", "2026-07-31")]) == GUIDANCE
@@ -323,6 +361,17 @@ class TestForecastDetection:
             "What will my AWS bill be in November?",
             "What is my upcoming bill?",
             "How much am I going to spend?",
+            # Each phrasing below matches only one of the wider alternatives.
+            "Predict my AWS bill.",
+            "What do the next 3 months look like for my spend?",
+            "Show my spend for the remainder of the quarter.",
+            "How much will the AWS bill be in November?",
+            "Will we be charged more in November?",
+            "What is my expected AWS bill for November?",
+            "How much should I expect to pay in November?",
+            "Estimate my December bill.",
+            "What is my estimated AWS bill for November?",
+            "What's the outlook for my AWS spend?",
         ],
     )
     def test_forecast_phrasings_are_detected(self, query):
@@ -337,6 +386,9 @@ class TestForecastDetection:
             "What are cost optimization strategies for EKS?",
             "Estimate the cost of a c5.large instance.",
             "Will my fleet scale out during peak hours?",
+            "What were my AWS costs at the end of the month?",
+            "My bill was higher than expected last month.",
+            "Is last month's bill estimated or final?",
         ],
     )
     def test_historical_and_advisory_phrasings_are_not_detected(self, query):
@@ -361,6 +413,7 @@ class TestRequestedHistoricalPeriods:
         ("query", "expected"),
         [
             ("my spend last month", {SEPTEMBER}),
+            ("last month's spend", {SEPTEMBER}),
             ("the previous month", {SEPTEMBER}),
             ("month-to-date spend", {OCTOBER_TO_DATE}),
             ("MTD", {OCTOBER_TO_DATE}),
@@ -371,10 +424,12 @@ class TestRequestedHistoricalPeriods:
             ("yesterday", {("2026-10-15", "2026-10-15", "2026-10-15")}),
             ("costs in July 2026", {("2026-07-01", "2026-07-31", "2026-07-31")}),
             ("July 2026's spend", {("2026-07-01", "2026-07-31", "2026-07-31")}),
-            ("October 2026", {OCTOBER_TO_DATE}),
+            ("September 2026", {SEPTEMBER}),
             ("for December 2025", {("2025-12-01", "2025-12-31", "2025-12-31")}),
             ("from 2026-07-01 to 2026-07-31", {("2026-07-01", "2026-07-31", "2026-07-31")}),
+            ("from 2026-10-01 to 2026-10-15", {("2026-10-01", "2026-10-15", "2026-10-15")}),
             ("on 2026-07-04", {("2026-07-04", "2026-07-04", "2026-07-04")}),
+            ("on 2026-10-15", {("2026-10-15", "2026-10-15", "2026-10-15")}),
             ("last month and month to date", {SEPTEMBER, OCTOBER_TO_DATE}),
         ],
     )
@@ -401,9 +456,15 @@ class TestRequestedHistoricalPeriods:
             "I may need a forecast",
             "March forward with savings",
             "July 0000",
+            "October 2026",
             "November 2026",
+            "the last month of the year",
+            "the last quarter of 2026",
+            "the last year of the contract",
             "2026-13-40",
+            "from 2026-10-01 to 2026-10-16",
             "from 2026-10-01 to 2026-11-30",
+            "on 2026-10-16",
             "on 2026-12-25",
         ],
     )

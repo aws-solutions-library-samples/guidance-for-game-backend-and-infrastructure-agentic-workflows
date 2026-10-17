@@ -12,19 +12,20 @@ Recognized phrases (case-insensitive), relative to today's UTC date:
 
 - ``yesterday``
 - ``last month`` / ``previous month``, ``last quarter`` / ``previous quarter``,
-  ``last year`` / ``previous year``
+  ``last year`` / ``previous year``, when not followed by "of"
 - ``month to date`` / ``MTD``, ``quarter to date`` / ``QTD``,
   ``year to date`` / ``YTD``
 - a full month name with a four-digit year (``July 2026``), when that month has
-  started
-- ``YYYY-MM-DD`` dates and ``YYYY-MM-DD to YYYY-MM-DD`` ranges that are not in
-  the future
+  ended
+- ``YYYY-MM-DD`` dates and ``YYYY-MM-DD to YYYY-MM-DD`` ranges that end before
+  today
 
-Phrases that can name the forecast target (``this month``, ``today``, or a month
-name without a year, such as "in July") and phrases with no single calendar
-meaning (``last week``, ``the last 30 days``) name no period. A to-date period
-accepts a report that ends on today's date or the day before, because the
-current day's cost data is incomplete.
+Phrases that can name the forecast target (``this month``, ``today``, the
+current month with its year, a month name without a year, such as "in July",
+or "the last quarter of the year") and phrases with no single calendar meaning
+(``last week``, ``the last 30 days``) name no period. A to-date period accepts
+a report that ends on today's date or the day before, because the current day's
+cost data is incomplete.
 """
 
 # Standard library
@@ -48,7 +49,9 @@ _MONTHS = (
 )
 
 _RELATIVE = re.compile(
-    r"\b(?:last|previous)\s+(?P<unit>month|quarter|year)\b"
+    # "The last quarter of the year" names the final quarter, which can be the
+    # forecast target, so a following "of" names no period.
+    r"\b(?:last|previous)\s+(?P<unit>month|quarter|year)\b(?!\s+of\b)"
     r"|\b(?P<to_date>month|quarter|year)[\s-]+to[\s-]+date\b"
     r"|\b(?P<abbrev>mtd|qtd|ytd)\b"
     r"|\b(?P<yesterday>yesterday)\b",
@@ -116,11 +119,11 @@ def _previous(unit: str, today: date) -> RequestedPeriod:
 def _month_with_year(name: str, year_text: str, today: date) -> RequestedPeriod | None:
     month = _MONTHS.index(name.lower()) + 1
     year = int(year_text)
-    if year < 1 or (year, month) > (today.year, today.month):
+    # The current month, like "this month", can be the forecast target; "month
+    # to date" names its to-date period explicitly.
+    if year < 1 or (year, month) >= (today.year, today.month):
         return None
     start = date(year, month, 1)
-    if (year, month) == (today.year, today.month):
-        return _to_date(start, today)
     first_of_next = date(year + (month == 12), month % 12 + 1, 1)
     return _complete(start, first_of_next - timedelta(days=1))
 
@@ -152,16 +155,18 @@ def requested_historical_periods(query: str, today: date) -> list[RequestedPerio
             found.append((match.start(), period))
 
     range_spans: list[tuple[int, int]] = []
+    # A date or range that includes today, like "today", can name the forecast
+    # target, so only dates before today count.
     for match in _ISO_RANGE.finditer(query):
         range_spans.append(match.span())
         start, end = _parse_iso(match.group("start")), _parse_iso(match.group("end"))
-        if start and end and start <= end <= today:
+        if start and end and start <= end < today:
             found.append((match.start(), _complete(start, end)))
     for match in _ISO_DATE.finditer(query):
         if any(low <= match.start() < high for low, high in range_spans):
             continue
         day = _parse_iso(match.group(0))
-        if day and day <= today:
+        if day and day < today:
             found.append((match.start(), _complete(day, day)))
 
     periods: list[RequestedPeriod] = []
