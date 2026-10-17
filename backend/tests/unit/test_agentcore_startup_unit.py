@@ -10,7 +10,22 @@ import pytest
 from bedrock_agentcore.runtime.context import RequestContext
 from botocore.exceptions import ClientError, NoCredentialsError
 
+# Local modules
+from _guard_state import telemetry_guard_isolation
+
 pytestmark = [pytest.mark.unit]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telemetry_guard_state():
+    """Snapshot and restore the content guard's process-wide state per test.
+
+    Tests in this module import ``agentcore_main``, which runs the telemetry
+    content guard against the real environment and installs process-wide Strands
+    tracer wrappers and an MCP logger filter. This fixture restores those after
+    each test so the guard's installs do not leak into the rest of the session.
+    """
+    yield from telemetry_guard_isolation()
 
 
 def _jwt_context(session_id="ctx-session"):
@@ -462,3 +477,409 @@ class TestRequestScopeLifecycle:
         assert "error" in result.lower()
         # ...and the scope is still reset via the finally block.
         assert current_scope() is UNSCOPED
+
+
+class TestEntrypointTelemetryGuardWiring:
+    """Pin that the entrypoint applies the content guard before any MCP client.
+
+    The guard overrides the distro's content switches and uninstruments the MCP
+    instrumentor; both must happen before ``prewarm_container`` creates the first
+    MCP client, or MCP tool-content spans would already be wired. Importing the
+    entrypoint fresh exercises that ordering. Removing the guard call from the
+    entrypoint fails these assertions.
+    """
+
+    def _fresh_import_with_recording(self):
+        # Standard library
+        import importlib
+        import logging
+        import os
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        # Third-party packages
+        from amazon.opentelemetry.distro.instrumentation.mcp import McpInstrumentor
+        from mcp.shared.session import BaseSession
+        from strands.telemetry.tracer import Tracer
+
+        # Local modules
+        from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES, _McpExceptionInfoFilter
+
+        # Snapshot the Strands Tracer methods and the MCP logger filters so the
+        # guard's process-wide installs during the fresh import are reverted and
+        # do not leak into the rest of the session.
+        saved_start_agent_span = Tracer.start_agent_span
+        saved_end_span = Tracer._end_span
+        saved_filters = {name: list(logging.getLogger(name).filters) for name in MCP_EXCEPTION_LOGGER_NAMES}
+
+        # Start from a known single-instrumented MCP state.
+        instrumentor = McpInstrumentor()
+        for _ in range(5):
+            if not hasattr(BaseSession.send_request, "__wrapped__"):
+                break
+            instrumentor._is_instrumented_by_opentelemetry = True
+            instrumentor.uninstrument()
+        instrumentor._is_instrumented_by_opentelemetry = False
+        instrumentor.instrument()
+
+        recorded = {}
+
+        def _recording_create_mcp_client(server_name, *args, **kwargs):
+            # Capture the MCP wrapping state and the content switch at the moment
+            # the first client would be created during prewarm.
+            if "mcp_wrapped_at_first_client" not in recorded:
+                recorded["mcp_wrapped_at_first_client"] = hasattr(BaseSession.send_request, "__wrapped__")
+                recorded["capture_env_at_first_client"] = os.environ.get(
+                    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+                )
+            return MagicMock()
+
+        # Remove any OTEL switches so a missing guard call is detectable.
+        preserved = {
+            k: os.environ.pop(k, None)
+            for k in (
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+                "OTEL_SEMCONV_STABILITY_OPT_IN",
+                "GBAW_CAPTURE_TRACE_CONTENT",
+            )
+        }
+        sys.modules.pop("agentcore_main", None)
+        try:
+            with (
+                patch("boto3.client") as mock_boto3,
+                patch("utils.mcp_client_factory.create_mcp_client", side_effect=_recording_create_mcp_client),
+                patch("models.cached_bedrock.create_cached_bedrock_model", return_value=MagicMock()),
+                patch("utils.kb_tools.create_kb_retrieve_tool", return_value=MagicMock()),
+            ):
+                mock_sts = MagicMock()
+                mock_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+                mock_boto3.return_value = mock_sts
+                importlib.import_module("agentcore_main")
+            final_capture = os.environ.get("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
+            final_mcp_wrapped = hasattr(BaseSession.send_request, "__wrapped__")
+        finally:
+            # Restore environment and MCP state for the rest of the session.
+            for k, v in preserved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for _ in range(5):
+                if not hasattr(BaseSession.send_request, "__wrapped__"):
+                    break
+                instrumentor._is_instrumented_by_opentelemetry = True
+                instrumentor.uninstrument()
+            instrumentor._is_instrumented_by_opentelemetry = False
+            sys.modules.pop("agentcore_main", None)
+            # Restore the Strands Tracer methods and the MCP logger filters the
+            # guard installed during the import, so they do not leak into the
+            # rest of the session.
+            Tracer.start_agent_span = saved_start_agent_span
+            Tracer._end_span = saved_end_span
+            for name, flts in saved_filters.items():
+                lg = logging.getLogger(name)
+                for flt in list(lg.filters):
+                    if flt not in flts:
+                        lg.removeFilter(flt)
+
+        recorded["final_capture"] = final_capture
+        recorded["final_mcp_wrapped"] = final_mcp_wrapped
+        return recorded
+
+    def test_guard_applied_and_mcp_unwrapped_before_first_client(self):
+        # ``mcp`` and ``aws-opentelemetry-distro`` are direct dependencies, so the
+        # ADOT MCP instrumentor must import. This test imports it directly (no
+        # importorskip): if the ADOT MCP module moves or is renamed upstream, the
+        # import fails and this required check fails rather than skipping, which is
+        # how CI catches ADOT MCP drift before a deploy leaves the MCP tool-content
+        # path open.
+        recorded = self._fresh_import_with_recording()
+
+        # The entrypoint created at least one MCP client during prewarm.
+        assert "mcp_wrapped_at_first_client" in recorded
+        # The content switch was applied before that client was created.
+        assert recorded["capture_env_at_first_client"] == "false"
+        # The MCP instrumentor was uninstrumented before that client was created.
+        assert recorded["mcp_wrapped_at_first_client"] is False
+        # And the module import left the redacting default in place.
+        assert recorded["final_capture"] == "false"
+        assert recorded["final_mcp_wrapped"] is False
+
+    def test_fresh_import_does_not_leak_guard_state_into_session(self):
+        # Importing the entrypoint runs the guard against the real os.environ and
+        # installs process-wide Strands wrappers and MCP logger filters. This test
+        # proves the fresh-import harness snapshots and restores all of them, so
+        # later tests in the session do not inherit the redaction switches, the
+        # tracer wrappers, or the logging filters.
+        #
+        # The test first forces a clean baseline — guard variables removed, the
+        # tracer methods unwrapped through ``__wrapped__``, and the guard's own
+        # logging filters removed — so the assertions compare against a state the
+        # guard definitely did not leave behind. That way the test fails whenever
+        # the harness stops restoring, regardless of collection order (any earlier
+        # test in the session may already have run the guard once).
+        # Standard library
+        import logging
+        import os
+
+        # Third-party packages
+        # ``strands-agents`` is a direct dependency; import the Strands tracer
+        # directly so Strands drift fails this check rather than skipping it.
+        from strands.telemetry.tracer import Tracer
+
+        # Local modules
+        from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES, _McpExceptionInfoFilter
+
+        otel_vars = (
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+            "OTEL_SEMCONV_STABILITY_OPT_IN",
+            "GBAW_CAPTURE_TRACE_CONTENT",
+            "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS",
+        )
+
+        def _guard_filter_count():
+            total = 0
+            for name in MCP_EXCEPTION_LOGGER_NAMES:
+                total += sum(
+                    1
+                    for flt in logging.getLogger(name).filters
+                    if getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker
+                )
+            return total
+
+        def _unwrap(method):
+            # Resolve past any guard wrapper to the underlying Strands method.
+            while hasattr(method, "__wrapped__"):
+                method = method.__wrapped__
+            return method
+
+        # Force a clean baseline the guard cannot already have produced.
+        for var in otel_vars:
+            os.environ.pop(var, None)
+        Tracer.start_agent_span = _unwrap(Tracer.start_agent_span)
+        Tracer._end_span = _unwrap(Tracer._end_span)
+        for name in MCP_EXCEPTION_LOGGER_NAMES:
+            lg = logging.getLogger(name)
+            for flt in list(lg.filters):
+                if getattr(flt, "marker", None) == _McpExceptionInfoFilter.marker:
+                    lg.removeFilter(flt)
+
+        env_before = {k: os.environ.get(k) for k in otel_vars}
+        start_before = Tracer.start_agent_span
+        end_before = Tracer._end_span
+        filters_before = _guard_filter_count()
+        # Baseline really is clean: no guard variables, no guard filters, and the
+        # tracer methods carry no guard wrapper.
+        assert env_before == {k: None for k in otel_vars}
+        assert filters_before == 0
+        assert not hasattr(start_before, "__wrapped__")
+        assert not hasattr(end_before, "__wrapped__")
+
+        self._fresh_import_with_recording()
+
+        # The harness must leave the clean baseline exactly as it found it.
+        assert {k: os.environ.get(k) for k in otel_vars} == env_before
+        assert Tracer.start_agent_span is start_before
+        assert Tracer._end_span is end_before
+        assert _guard_filter_count() == filters_before
+        assert not hasattr(Tracer.start_agent_span, "__wrapped__")
+        assert not hasattr(Tracer._end_span, "__wrapped__")
+
+    def test_entrypoint_posture_warning_names_the_skipped_path_through_logger(self):
+        """Importing the entrypoint under drift logs the posture WARNING for real.
+
+        This exercises the whole wiring: the guard records the skipped path on the
+        decision, the module-level posture call runs at import, and the WARNING is
+        rendered through the application logger (loguru). A posture call that
+        ignores the decision, or a ``%``-style posture message that loguru drops,
+        fails this check because the drifted path name never reaches the captured
+        output.
+        """
+        # Standard library
+        import importlib
+        import logging
+        import os
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        # Third-party packages
+        from mcp.shared.session import BaseSession
+        from strands.telemetry.tracer import Tracer
+
+        # Local modules
+        from config.telemetry_guard import MCP_EXCEPTION_LOGGER_NAMES
+        from utils.logger import logger as app_logger
+
+        def _unwrap(method):
+            while hasattr(method, "__wrapped__"):
+                method = method.__wrapped__
+            return method
+
+        saved_start = _unwrap(Tracer.start_agent_span)
+        saved_end = _unwrap(Tracer._end_span)
+        Tracer.start_agent_span = saved_start
+        Tracer._end_span = saved_end
+        saved_filters = {name: list(logging.getLogger(name).filters) for name in MCP_EXCEPTION_LOGGER_NAMES}
+
+        otel_vars = (
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+            "OTEL_SEMCONV_STABILITY_OPT_IN",
+            "GBAW_CAPTURE_TRACE_CONTENT",
+            "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS",
+        )
+        preserved = {k: os.environ.pop(k, None) for k in otel_vars}
+
+        records: list = []
+        sink_id = app_logger.add(
+            lambda message: records.append(message),
+            level="INFO",
+            format="{level}|{message}",
+        )
+
+        sys.modules.pop("agentcore_main", None)
+        try:
+            # Simulate ``_end_span`` attribute drift: accessing it raises, so the
+            # guard wraps ``start_agent_span`` but reports ``_end_span`` as open.
+            del Tracer._end_span
+            with (
+                patch("boto3.client") as mock_boto3,
+                patch("utils.mcp_client_factory.create_mcp_client", return_value=MagicMock()),
+                patch("models.cached_bedrock.create_cached_bedrock_model", return_value=MagicMock()),
+                patch("utils.kb_tools.create_kb_retrieve_tool", return_value=MagicMock()),
+            ):
+                mock_sts = MagicMock()
+                mock_sts.get_caller_identity.return_value = {"Account": "123456789012"}
+                mock_boto3.return_value = mock_sts
+                importlib.import_module("agentcore_main")
+        finally:
+            app_logger.remove(sink_id)
+            Tracer._end_span = saved_end
+            Tracer.start_agent_span = saved_start
+            for k, v in preserved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            for name, flts in saved_filters.items():
+                lg = logging.getLogger(name)
+                for flt in list(lg.filters):
+                    if flt not in flts:
+                        lg.removeFilter(flt)
+            sys.modules.pop("agentcore_main", None)
+
+        rendered = "".join(str(r) for r in records)
+        # The posture WARNING ran at import and named the drifted path, rendered
+        # through loguru with the count and path substituted (no stray %d/%s).
+        # Pin the level and the posture text on the SAME record, so demoting the
+        # skipped-path branch below WARNING fails here (the unrelated
+        # memory-disabled WARNING also starts with "WARNING|").
+        assert any(str(r).startswith("WARNING|") and "redaction incomplete" in str(r).lower() for r in records)
+        assert "_end_span" in rendered
+        assert "1 guard path(s) were skipped" in rendered
+        assert "%d" not in rendered
+        assert "%s" not in rendered
+
+
+class TestTraceContentPostureLine:
+    """The startup posture line must match the resolved decision.
+
+    A clean redacting run says exported telemetry carries no content; a run with
+    a skipped guard path must not make that claim and must instead report, at
+    WARNING, that redaction is incomplete and name the open path. The posture
+    line is rendered through the application logger (loguru), which formats with
+    ``str.format`` and ignores ``%``-style positional arguments, so these tests
+    render through the real logger rather than a mock.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _capture_loguru():
+        """Capture rendered records from the application logger (loguru)."""
+        # Local modules
+        from utils.logger import logger as app_logger
+
+        records: list = []
+        sink_id = app_logger.add(
+            lambda message: records.append(message),
+            level="INFO",
+            format="{level}|{message}",
+        )
+        try:
+            yield records
+        finally:
+            app_logger.remove(sink_id)
+
+    def test_clean_redaction_logs_no_content_at_info(self):
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import TraceContentDecision
+        from utils.logger import logger as app_logger
+
+        decision = TraceContentDecision(
+            capture_enabled=False,
+            capture_message_content="false",
+            semconv_opt_in="gen_ai_unredacted_attributes=",
+            skipped_paths=(),
+        )
+
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
+
+        rendered = "".join(str(r) for r in records)
+        assert "INFO|" in rendered
+        assert "WARNING|" not in rendered
+        assert "carries no prompt or response content" in rendered
+
+    def test_skipped_path_logs_incomplete_at_warning_and_names_the_path(self):
+        """The posture WARNING must substitute the count and open paths.
+
+        Rendered through the real loguru logger: ``%d``/``%s`` placeholders would
+        print literally and drop the values, so this asserts the substituted
+        values are present and no literal placeholder survives.
+        """
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import TraceContentDecision
+        from utils.logger import logger as app_logger
+
+        decision = TraceContentDecision(
+            capture_enabled=False,
+            capture_message_content="false",
+            semconv_opt_in="gen_ai_unredacted_attributes=",
+            skipped_paths=("strands span wrappers", "memory client logging filter"),
+        )
+
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
+
+        rendered = "".join(str(r) for r in records)
+        assert "WARNING|" in rendered
+        # The count and both open paths are substituted into the message.
+        assert "2 guard path(s) were skipped" in rendered
+        assert "strands span wrappers" in rendered
+        assert "memory client logging filter" in rendered
+        # No literal format placeholders survive.
+        assert "%d" not in rendered
+        assert "%s" not in rendered
+        assert "redaction incomplete" in rendered.lower()
+        assert "carries no prompt or response content" not in rendered
+
+    def test_opt_in_logs_capture_enabled_at_warning(self):
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import TraceContentDecision
+        from utils.logger import logger as app_logger
+
+        decision = TraceContentDecision(
+            capture_enabled=True,
+            capture_message_content="true",
+            semconv_opt_in="",
+            skipped_paths=(),
+        )
+
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
+
+        rendered = "".join(str(r) for r in records)
+        assert "WARNING|" in rendered
+        assert "capture is ENABLED" in rendered

@@ -573,8 +573,8 @@ aws logs tail /ecs/game-agent-frontend --follow
 ### X-Ray Tracing
 
 - **Dashboard**: AWS Console > CloudWatch > Gen AI Observability > AgentCore
-- **Transaction Search**: Query by user ID, session ID, or time range
-- **Trace Details**: Full request flow including MCP calls
+- **Transaction Search**: Query by session or correlation id, or time range
+- **Trace Details**: Request flow and timing across orchestrator, specialists, and MCP calls, with token-count, model id, finish reason, and error attributes. Prompt, response, tool, and system-prompt content is redacted by default; see the Exported Telemetry Content section in `SECURITY.md` for the memory paths it covers and the ones it leaves open.
 
 ---
 
