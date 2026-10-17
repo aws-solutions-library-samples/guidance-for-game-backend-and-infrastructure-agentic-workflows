@@ -549,7 +549,7 @@ export MEMORY_LONG_TERM_ENABLED=true
 - **Load**: Previous conversations loaded from AgentCore Memory on each request
 - **Persist**: Each interaction saved to AgentCore Memory after completion
 - **Cross-Session**: Same user sees conversation history across browser sessions
-- **User-Scoped**: Each user has isolated memory (based on `actor_id`)
+- **User-Scoped**: Each user has isolated memory, keyed by a pseudonymous `actor_id` (a SHA-256 digest of the verified subject; see `utils/memory_identity.py`)
 
 **Memory Settings**:
 - `MEMORY_LONG_TERM_ENABLED`: Enable/disable (default: false)

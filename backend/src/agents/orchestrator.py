@@ -44,6 +44,7 @@ from config.settings import (
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
+from utils.memory_identity import memory_actor_id
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 
 # Optional memory integration imports (may not be available in all environments)
@@ -303,8 +304,16 @@ def run_orchestrator(query: str, context: dict = None):
             display_name = context.get("display_name", "user")
             logger.debug(f"👤 User: {display_name}, Actor: {actor_id}, Session: {session_id}")
 
+        # AgentCore Memory is given a pseudonymous actor ID, never the raw subject:
+        # the memory service puts the actor ID on its own trace spans. A subject
+        # that is not a usable string disables memory for this request.
+        try:
+            memory_actor = memory_actor_id(actor_id)
+        except ValueError:
+            memory_actor = None
+
         # Create agent with or without memory
-        if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id and session_id:
+        if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and memory_actor and session_id:
             # Use native AgentCore Memory integration
             logger.debug(f"🧠 Creating agent with AgentCore Memory: {BEDROCK_AGENTCORE_MEMORY_ID}")
 
@@ -314,7 +323,7 @@ def run_orchestrator(query: str, context: dict = None):
                 config = AgentCoreMemoryConfig(
                     memory_id=BEDROCK_AGENTCORE_MEMORY_ID,
                     session_id=session_id,
-                    actor_id=actor_id,
+                    actor_id=memory_actor,
                     retrieval_config={
                         "{actorId}": RetrievalConfig(
                             top_k=10,  # Retrieve more memories for better context
@@ -453,10 +462,10 @@ def run_orchestrator(query: str, context: dict = None):
                     response = sanitize_advisory_section("Cost", str(response))
 
         # Extract and save semantic memories for LTM (non-blocking)
-        if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:
+        if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and memory_actor:
             if SEMANTIC_MEMORY_AVAILABLE:
                 try:
-                    extract_and_save_user_info(actor_id, query, str(response))
+                    extract_and_save_user_info(memory_actor, query, str(response))
                 except Exception as e:
                     logger.debug(f"⚠️ Semantic memory extraction skipped: {e}")
 
