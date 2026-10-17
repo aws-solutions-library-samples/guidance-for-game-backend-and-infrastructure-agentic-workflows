@@ -13,9 +13,11 @@ Recognized phrases (case-insensitive), relative to today's UTC date:
 - ``yesterday``
 - ``last month`` / ``previous month``, ``last quarter`` / ``previous quarter``,
   ``last year`` / ``previous year``, when not followed by "of" and, for
-  ``last``, not preceded by "the"
+  ``last``, not preceded by "the", "very", or a year or quarter possessive
+  ("this year's last quarter")
 - ``month to date`` / ``MTD``, ``quarter to date`` / ``QTD``,
-  ``year to date`` / ``YTD``
+  ``year to date`` / ``YTD``, and "so far this month" / "this month so far"
+  (or quarter or year)
 - a full month name with a four-digit year (``July 2026``), when that month has
   ended
 - ``YYYY-MM-DD`` dates and ``YYYY-MM-DD to YYYY-MM-DD`` ranges that end before
@@ -23,10 +25,11 @@ Recognized phrases (case-insensitive), relative to today's UTC date:
 
 Phrases that can name the forecast target (``this month``, ``today``, the
 current month with its year, a month name without a year, such as "in July",
-"the last quarter of the year", or "the last month in 2026") and phrases with
-no single calendar meaning (``last week``, ``the last 30 days``) name no
-period. A to-date period accepts a report that ends on today's date or the day
-before, because the current day's cost data is incomplete.
+"the last quarter of the year", "the last month in 2026", or "this year's last
+quarter") and phrases with no single calendar meaning (``last week``, ``the
+last 30 days``) name no period. A to-date period accepts a report that ends on
+today's date or the day before, because the current day's cost data is
+incomplete.
 """
 
 # Standard library
@@ -55,10 +58,14 @@ _RELATIVE = re.compile(
     # following "of" name no period. "The previous month" is unambiguous.
     r"\b(?P<article>the\s+)?(?P<relative>last|previous)\s+(?P<unit>month|quarter|year)\b(?!\s+of\b)"
     r"|\b(?P<to_date>month|quarter|year)[\s-]+to[\s-]+date\b"
+    r"|\bso\s+far\s+this\s+(?P<so_far>month|quarter|year)\b"
+    r"|\bthis\s+(?P<so_far_after>month|quarter|year)\s+so\s+far\b"
     r"|\b(?P<abbrev>mtd|qtd|ytd)\b"
     r"|\b(?P<yesterday>yesterday)\b",
     re.IGNORECASE,
 )
+# "This year's last quarter" and "the very last month" name a final period too.
+_FINAL_PERIOD_PREFIX = re.compile(r"(?:\b(?:year|quarter|\d{4})['\u2019]s|\bvery)\s+$", re.IGNORECASE)
 _MONTH_WITH_YEAR = re.compile(rf"\b(?P<month>{'|'.join(_MONTHS)})\s+(?P<year>\d{{4}})\b", re.IGNORECASE)
 _ISO_RANGE = re.compile(
     r"\b(?P<start>\d{4}-\d{2}-\d{2})\s*(?:to|through|thru|until|till|-|\u2013|\u2014)\s*(?P<end>\d{4}-\d{2}-\d{2})\b",
@@ -146,11 +153,18 @@ def requested_historical_periods(query: str, today: date) -> list[RequestedPerio
             day = today - timedelta(days=1)
             found.append((match.start(), _complete(day, day)))
         elif match.group("unit"):
-            if match.group("article") and match.group("relative").lower() == "last":
+            if match.group("relative").lower() == "last" and (
+                match.group("article") or _FINAL_PERIOD_PREFIX.search(query, 0, match.start("relative"))
+            ):
                 continue
             found.append((match.start(), _previous(match.group("unit").lower(), today)))
         else:
-            unit = (match.group("to_date") or _TO_DATE_UNITS[match.group("abbrev").lower()]).lower()
+            unit = (
+                match.group("to_date")
+                or match.group("so_far")
+                or match.group("so_far_after")
+                or _TO_DATE_UNITS[match.group("abbrev").lower()]
+            ).lower()
             found.append((match.start(), _to_date(_unit_start(unit, today), today)))
 
     for match in _MONTH_WITH_YEAR.finditer(query):

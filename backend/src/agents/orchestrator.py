@@ -119,6 +119,9 @@ _FORECAST_COST_PATTERN = re.compile(
 # misses, such as "predict", "over the next three months", "what will my bill
 # be", "my expected bill", or "outlook"; a historical question that matches it
 # keeps only reports for periods it names.
+# A negated "expect" ("I didn't expect my bill to be this high") describes a
+# bill already incurred, so it does not mark a forecast.
+_NOT_NEGATED = r"(?<!n't\s)(?<!n\u2019t\s)(?<!\bnot\s)(?<!\bnever\s)"
 _FORECAST_REQUEST_PATTERN = re.compile(
     _FORECAST_COST_PATTERN.pattern + r"|\bpredict(?:s|ed|ing|ion|ions)?\b"
     r"|\bupcoming\b"
@@ -128,8 +131,8 @@ _FORECAST_REQUEST_PATTERN = re.compile(
     r"|\b(?:what|how\s+much)\s+will\b[^\n]{0,60}\b(?:bills?|costs?|spend|spending|charges?|pay|owe)\b"
     r"|\bwill\s+(?:i|we|my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?|pay|owe|be\s+(?:billed|charged))\b"
     r"|\bgoing\s+to\s+(?:cost|spend|pay|be\s+(?:billed|charged))\b"
-    r"|\bexpect(?:s|ing)?\s+to\s+(?:pay|spend|owe|be\s+(?:billed|charged))\b"
-    r"|\bexpect\s+(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
+    r"|" + _NOT_NEGATED + r"\bexpect(?:s|ing)?\s+to\s+(?:pay|spend|owe|be\s+(?:billed|charged))\b"
+    r"|" + _NOT_NEGATED + r"\bexpect\s+(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
     # "Expected" counts only before a bill, spend, or charges word, so a pricing
     # question ("the expected cost of an instance") is not a forecast.
     # "Estimated" counts only before "bill", because Cost Explorer calls an open

@@ -180,6 +180,8 @@ class TestForecastWithoutNamedPeriod:
             ("Forecast my AWS cost for the last quarter in 2026.", [("2026-07-01", "2026-09-30")]),
             ("What will my AWS bill be for the last quarter this year?", [("2026-07-01", "2026-09-30")]),
             ("Forecast my AWS cost for the last month in the year.", LIVE_BASELINES),
+            ("Forecast my AWS cost for this year's last quarter.", [("2026-07-01", "2026-09-30")]),
+            ("Forecast my AWS cost for the very last month in 2026.", LIVE_BASELINES),
             ("Forecast my AWS cost for October 2026.", LIVE_BASELINES),
             ("Forecast my AWS cost for 2026-10-16.", [("2026-10-16", "2026-10-16")]),
         ],
@@ -306,6 +308,12 @@ class TestForecastNamingAHistoricalPeriod:
         assert response.count("**Report ID:** `cost-report-0`") == 1
         assert response.endswith(GUIDANCE)
 
+    def test_spend_so_far_this_month_is_kept_with_guidance(self):
+        response = _run("Give me an estimate of my spend so far this month.", [("2026-10-01", "2026-10-15")])
+
+        assert "**Report ID:** `cost-report-0`" in response
+        assert response.endswith(GUIDANCE)
+
     def test_no_report_matches_the_named_period(self):
         assert _run(self.QUERY, [("2026-07-01", "2026-07-31")]) == GUIDANCE
 
@@ -354,6 +362,21 @@ class TestNonForecastBehaviorIsUnchanged:
         assert "**Report ID:** `cost-report-0`" in response
         assert GUIDANCE not in response
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "I didn't expect my AWS bill to be this high this month. Show my costs by service.",
+            "We didn't expect our spend to jump this month. What changed?",
+            "I didn't expect to pay this much this month. Show my costs by service.",
+        ],
+    )
+    def test_unexpected_bill_question_returns_the_report(self, query):
+        """A negated "expect" is about a bill already incurred, not a forecast."""
+        response = _run(query, [("2026-10-01", "2026-10-15")])
+
+        assert "**Report ID:** `cost-report-0`" in response
+        assert GUIDANCE not in response
+
     def test_report_followup_with_forecast_wording_returns_the_report(self):
         service = _service(1, prefix="cost-0123456789abcdef0123456789abcde")
         create_tools, _ = create_cost_report_tool_bundle(service)
@@ -395,10 +418,16 @@ class TestForecastDetection:
             "Will we owe AWS more in November?",
             "What is my expected AWS bill for November?",
             "How much should I expect to pay in November?",
+            "How much should I expect to owe in November?",
+            "How much are we expecting to spend in November?",
             "How much do I expect my bill to be in November?",
+            "What should we expect our bill to be in Q4?",
+            "I expect my bill to be about the same in November.",
             "Estimate my December bill.",
             "Give me an estimate of my November bill.",
+            "Give me an estimate for my December bill.",
             "What is my estimated AWS bill for November?",
+            "What are our estimated AWS bills for December?",
             "What's the outlook for my AWS spend?",
         ],
     )
@@ -422,6 +451,11 @@ class TestForecastDetection:
             "Is last month's bill estimated or final?",
             "What are my estimated AWS charges so far this month?",
             "Show my estimated charges for this month.",
+            "I didn't expect my AWS bill to be this high this month.",
+            "I didn\u2019t expect my AWS bill to be this high this month.",
+            "We did not expect our spend to jump this month.",
+            "I never expect my costs to drop in summer.",
+            "I didn't expect to pay this much this month.",
         ],
     )
     def test_historical_and_advisory_phrasings_are_not_detected(self, query):
@@ -447,9 +481,19 @@ class TestRequestedHistoricalPeriods:
         [
             ("my spend last month", {SEPTEMBER}),
             ("last month's spend", {SEPTEMBER}),
+            ("my last month's bill", {SEPTEMBER}),
+            ("What's last month's spend", {SEPTEMBER}),
+            ("last year's last quarter", {("2025-01-01", "2025-12-31", "2025-12-31")}),
+            (
+                "last year's bill and last month's bill",
+                {("2025-01-01", "2025-12-31", "2025-12-31"), SEPTEMBER},
+            ),
             ("last month in EC2", {SEPTEMBER}),
             ("the previous month", {SEPTEMBER}),
             ("month-to-date spend", {OCTOBER_TO_DATE}),
+            ("my spend so far this month", {OCTOBER_TO_DATE}),
+            ("this month so far", {OCTOBER_TO_DATE}),
+            ("so far this year", {("2026-01-01", "2026-10-15", "2026-10-16")}),
             ("MTD", {OCTOBER_TO_DATE}),
             ("quarter to date", {OCTOBER_TO_DATE}),
             ("last quarter", {("2026-07-01", "2026-09-30", "2026-09-30")}),
@@ -500,6 +544,12 @@ class TestRequestedHistoricalPeriods:
             "the last quarter this year",
             "the last month in the year",
             "The  last month",
+            "THE LAST QUARTER IN 2026",
+            "this year's last quarter",
+            "this quarter's last month",
+            "2026\u2019s last quarter",
+            "the year's last month",
+            "the very last month in 2026",
             "2026-13-40",
             "from 2026-10-01 to 2026-10-16",
             "from 2026-10-01 to 2026-11-30",
