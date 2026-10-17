@@ -144,3 +144,59 @@ class TestAgentEvals:
             response_lower = response.lower()
             has_aws_keyword = any(keyword in response_lower for keyword in aws_keywords)
             assert has_aws_keyword, f"Response lacks AWS/error context: {response[:100]}"
+
+
+class TestNonCostQueriesAreNotWithheld:
+    """Non-cost replies must not be swapped for the financial withheld notice.
+
+    Contract: a non-cost reply whose numbers are purely operational (a session
+    length, a fleet count) is returned to the user unchanged. It is never
+    replaced by the dedicated financial withheld notice, the ``## Cost``
+    advisory heading, or the deterministic cost guidance.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_config(self):
+        self.config = get_test_config()
+        if self.config["mode"] != "deployed":
+            pytest.skip("AI evals require deployed stack - deploy with ./deploy-all.sh")
+        if not check_backend_available(self.config):
+            pytest.skip("Deployed AgentCore Runtime not accessible")
+
+    @pytest.mark.ai_eval
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "My name is Quill. My game is a battle royale and our sessions last about 40 minutes.",
+            "What are the best practices for deploying game servers across AWS Regions for low latency?",
+        ],
+    )
+    def test_operational_query_is_answered_not_withheld(self, query):
+        # Local modules
+        from agents.financial_guard import withheld_financial_reply_notice
+
+        response = make_agent_request(query, self.config)
+
+        assert isinstance(response, str)
+        assert len(response) > 0
+        # The dedicated financial withheld notice must not appear for a
+        # non-cost query that only mentions quantities.
+        assert withheld_financial_reply_notice() not in response
+        assert "did not come from the validated cost report" not in response
+        # The reply must not be swapped for the Cost advisory section or the
+        # deterministic cost guidance.
+        assert not response.lstrip().startswith("## Cost")
+        assert "Unvalidated financial figures were withheld" not in response
+        assert "## Cost Guidance" not in response
+        # The reply stays on topic. The best-practices query is outside the cost
+        # domain (Regions and latency), so a correct answer discusses game
+        # servers, GameLift, EKS, or Regions without needing a cost figure.
+        if query.startswith("My name is"):
+            # A short greeting may acknowledge only the synthetic name, so the
+            # on-topic bar for this case is just that the name is echoed.
+            assert "quill" in response.lower()
+        else:
+            assert any(
+                keyword in response.lower()
+                for keyword in ("gamelift", "game server", "game servers", "eks", "region", "regions")
+            )
