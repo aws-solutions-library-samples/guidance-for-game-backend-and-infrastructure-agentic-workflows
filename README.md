@@ -361,6 +361,10 @@ the stated Cost Explorer snapshot; an `estimated` report can still be revised by
 AWS as open-period billing data is finalized. Historical cost-and-usage
 operations from the general Billing MCP tool are blocked from bypassing the
 validated report path; forecast and optimization operations remain available.
+Forecast figures are not validated, so a forecast question gets fixed,
+non-numeric cost guidance. A historical report built during a forecast turn is
+shown only when the question names that report's period (for example, "last
+month"); reports for any other period are dropped.
 
 ### Enrolling EKS Clusters
 

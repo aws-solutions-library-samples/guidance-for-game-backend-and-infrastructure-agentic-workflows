@@ -20,13 +20,15 @@ Memory is automatically handled when session_manager is provided.
 
 # Standard library
 import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 # Third-party packages
 from strands import Agent
 
 # Local modules
-from agents.cost_report import begin_cost_report_capture, finish_cost_report_capture
+from agents.cost_report import CapturedCostRendering, begin_cost_report_capture, finish_cost_report_capture
+from agents.cost_request_periods import requested_historical_periods
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.financial_guard import contains_unvalidated_financial_content, sanitize_advisory_section
@@ -171,6 +173,44 @@ def _has_cost_intent(query: str) -> bool:
     return _COST_INTENT_PATTERN.search(query) is not None
 
 
+def _is_forecast_request(query: str) -> bool:
+    """Return whether a query asks about future or projected cost."""
+    return _FORECAST_COST_PATTERN.search(query) is not None
+
+
+def _utc_today() -> date:
+    """Return today's UTC date. Patched in tests for a deterministic date."""
+    return datetime.now(timezone.utc).date()
+
+
+def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRendering]) -> str | None:
+    """Return the authoritative section for a forecast request, or ``None``.
+
+    Forecast figures are never validated, so a forecast turn's only validated
+    content is a historical report. A report is kept only when its period equals
+    a historical period the question names; reports the Cost specialist built
+    for any other period (for example, baseline months) are dropped. The kept
+    renderings, one per named period, are followed by the fixed nonnumeric cost
+    guidance for the forecast part. ``None`` means no captured report matches,
+    and the caller returns the guidance alone.
+    """
+    periods = requested_historical_periods(query, _utc_today())
+    kept: list[str] = []
+    for period in periods:
+        for entry in reversed(renderings):
+            if period.matches(entry.start, entry.end_inclusive):
+                if entry.rendering not in kept:
+                    kept.append(entry.rendering)
+                break
+    logger.info(
+        f"Forecast request: kept {len(kept)} of {len(renderings)} captured cost rendering(s) "
+        f"for {len(periods)} named historical period(s)"
+    )
+    if not kept:
+        return None
+    return "\n\n".join([*(section.strip() for section in kept), _COST_ADVISORY_GUIDANCE])
+
+
 def _has_cost_topic(query: str) -> bool:
     """Return whether a query enters the cost/pricing advisory domain."""
     if _is_operational_identifier_query(query):
@@ -286,6 +326,7 @@ def run_orchestrator(query: str, context: dict = None):
         logger.info(f"📋 Prompt versions: {get_prompt_versions()}")
 
         cost_report_followup = _is_cost_report_followup(query)
+        forecast_request = _is_forecast_request(query) and not cost_report_followup
         agent_tools = [cost_agent] if cost_report_followup else [gamelift_agent, eks_agent, cost_agent]
         if cost_report_followup:
             logger.info("Routing cost report ID follow-up exclusively through the cost specialist")
@@ -379,6 +420,8 @@ def run_orchestrator(query: str, context: dict = None):
         except Exception:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
+            if forecast_request and authoritative_cost_response is not None:
+                authoritative_cost_response = _forecast_authoritative_section(query, cost_report_capture.renderings)
             if authoritative_cost_response is not None:
                 logger.warning(
                     "Orchestrator failed after a validated cost report; returning the deterministic rendering"
@@ -413,6 +456,8 @@ def run_orchestrator(query: str, context: dict = None):
         else:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
+            if forecast_request and authoritative_cost_response is not None:
+                authoritative_cost_response = _forecast_authoritative_section(query, cost_report_capture.renderings)
             if authoritative_cost_response is not None:
                 # A cost-report tool produced the authoritative financial section.
                 # Compose it deterministically with any captured GameLift/EKS
