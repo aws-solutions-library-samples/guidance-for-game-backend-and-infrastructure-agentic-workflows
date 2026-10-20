@@ -4,7 +4,7 @@
 The input Guardrail wraps the last user text message in ``guardContent`` so only
 the user's own words are evaluated as input. Retrieved long-term memory is
 injected by the session manager as an extra text block in that same message. It
-consists of short facts pattern-extracted from the user's own earlier messages,
+consists of facts pattern-extracted from the user's own earlier messages,
 and evaluating it as fresh input trips input-side policies on unrelated
 questions, so it is sent to Bedrock unwrapped (plain ``text``) while the user's
 own words stay guarded.

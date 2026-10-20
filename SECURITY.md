@@ -267,12 +267,14 @@ A block is sent unwrapped only when it carries the private marker that the
 session manager sets on the context it injects; a user who types the context tag
 is still input-checked.
 
-Retrieved memory consists of the short facts that
+Retrieved memory consists of the facts that
 `backend/src/utils/semantic_memory.py` extracts with fixed patterns from the
-user's own messages (a name of up to two words, a game type from a fixed list,
-fleet or cluster IDs, player counts, and similar) and stores in that user's
-namespace. Extraction runs after every turn, including a turn the Guardrail
-blocked, so a stored fact has not necessarily passed the input-side policies.
+user's own messages and stores in that user's namespace: a name of up to two
+words, a game type from a fixed list, fleet or cluster IDs, player counts, and
+similar. The patterns fix each fact's shape but not its length; a name word or
+an ID can be as long as the prompt allows. Extraction is skipped for any turn
+the Guardrail stopped, so a stored fact comes from a message the Guardrail let
+through, and it is not input-checked again when it is retrieved on later turns.
 Because the prompt-attack filter is input-only, it never evaluates retrieved memory.
 Each sensitive-information entity and regex in
 `infrastructure/cloudformation/04-bedrock-guardrails.yaml` has one action for
@@ -280,7 +282,10 @@ both directions: an `ANONYMIZE` entity such as `USERNAME` in retrieved memory
 reaches the model unmasked, and a `BLOCK` entity such as `PASSWORD` does not
 block the request. The output-side Guardrail policies still evaluate every
 reply, so anything the model repeats from retrieved memory gets the same output
-checks as the rest of the reply.
+checks as the rest of the reply. Those checks are not a defense against an
+instruction stored in memory, because the prompt-attack filter does not run on
+output. A per-fact length limit and a system-prompt line that marks retrieved
+memory as data are tracked in #624.
 
 ---
 
