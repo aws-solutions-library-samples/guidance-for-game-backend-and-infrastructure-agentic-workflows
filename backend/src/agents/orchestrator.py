@@ -85,11 +85,17 @@ _COST_REPORT_UNAVAILABLE = (
     "explicit start and end date.\n\n"
     "No unverified financial report was produced."
 )
-_COST_ADVISORY_GUIDANCE = (
-    "## Cost Guidance\n\n"
+_COST_GUIDANCE_HEADING = "## Cost Guidance\n\n"
+_COST_GUIDANCE_BODY = (
     "Review utilization, right-sizing, idle resources, commitment options, and workload scheduling. "
     "Use the validated Cost Explorer report path for account totals, shares, or historical spending. "
     "No unverified financial value was shown."
+)
+_COST_ADVISORY_GUIDANCE = _COST_GUIDANCE_HEADING + _COST_GUIDANCE_BODY
+# Forecast turns never show a forecast figure (an owned forecast rendering is
+# tracked in #625), so their guidance says so before the shared advice.
+_FORECAST_COST_GUIDANCE = (
+    _COST_GUIDANCE_HEADING + "This assistant does not show numeric cost forecasts. " + _COST_GUIDANCE_BODY
 )
 _COST_TOPIC_PATTERN = re.compile(
     r"\b(?:cost|costs|costing|spend|spending|billing|bills?|budgets?|prices?|pricing|forecast|"
@@ -227,10 +233,10 @@ def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRen
     period the question names; renderings for any other period (for example,
     baseline months) are dropped. For each named period the most recent matching
     rendering is kept, and the kept renderings are followed by the fixed
-    non-numeric cost guidance for the forecast part. ``None`` means no rendering
-    matches or the named periods could not be resolved; the caller then returns
-    its advisory composition: markers for any consulted GameLift or EKS
-    specialist plus the guidance.
+    non-numeric forecast guidance, which says no numeric forecast is shown.
+    ``None`` means no rendering matches or the named periods could not be
+    resolved; the caller then returns its advisory composition: markers for any
+    consulted GameLift or EKS specialist plus the forecast guidance.
     """
     try:
         periods = requested_historical_periods(query, today)
@@ -250,7 +256,7 @@ def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRen
     )
     if not kept:
         return None
-    return "\n\n".join([*(section.strip() for section in kept), _COST_ADVISORY_GUIDANCE])
+    return "\n\n".join([*(section.strip() for section in kept), _FORECAST_COST_GUIDANCE])
 
 
 def _has_cost_topic(query: str) -> bool:
@@ -314,14 +320,20 @@ def _cost_specialist_ran(specialist_outputs: list[tuple[str, str]]) -> bool:
     return any(name.strip().lower() == _COST_SERVICE_NAME for name, _ in specialist_outputs)
 
 
-def _compose_advisory_response(specialist_outputs: list[tuple[str, str]]) -> str:
+def _compose_advisory_response(specialist_outputs: list[tuple[str, str]], *, forecast_request: bool = False) -> str:
     """Compose safe operational context plus deterministic cost guidance.
 
     Model-authored Cost specialist prose is intentionally never returned unless
     it came through the authoritative report capture. Advisory/forecast requests
-    receive deterministic, nonnumeric guidance instead.
+    receive deterministic, nonnumeric guidance instead; forecast requests get the
+    variant that says no numeric forecast is shown.
     """
-    return "\n\n".join([*_safe_non_cost_sections(specialist_outputs), _COST_ADVISORY_GUIDANCE])
+    return "\n\n".join([*_safe_non_cost_sections(specialist_outputs), _cost_guidance(forecast_request)])
+
+
+def _cost_guidance(forecast_request: bool) -> str:
+    """Return the fixed cost guidance for a forecast or a general cost-advice turn."""
+    return _FORECAST_COST_GUIDANCE if forecast_request else _COST_ADVISORY_GUIDANCE
 
 
 def _compose_final_response(
@@ -502,7 +514,7 @@ def run_orchestrator(query: str, context: dict = None):
                         "Cost advisory or forecast request raised before a validated cost report; "
                         "returning the cost guidance"
                     )
-                response = _compose_advisory_response(specialist_outputs)
+                response = _compose_advisory_response(specialist_outputs, forecast_request=forecast_request)
             else:
                 # Pure operational failure with no cost involvement: preserve the
                 # existing behavior and surface the error.
@@ -541,7 +553,7 @@ def run_orchestrator(query: str, context: dict = None):
             elif _cost_specialist_ran(specialist_outputs):
                 # Cost advisory/forecast path without a historical report. Use
                 # deterministic nonnumeric guidance with safe operational markers.
-                response = _compose_advisory_response(specialist_outputs)
+                response = _compose_advisory_response(specialist_outputs, forecast_request=forecast_request)
             else:
                 # If the routing model answers a cost topic directly, discard
                 # its prose and return deterministic nonnumeric guidance. For a
@@ -549,7 +561,7 @@ def run_orchestrator(query: str, context: dict = None):
                 # defense: volunteered monetary claims must not escape merely
                 # because the query classifier did not predict them.
                 if _has_cost_topic(query):
-                    response = _COST_ADVISORY_GUIDANCE
+                    response = _cost_guidance(forecast_request)
                 elif contains_unvalidated_financial_content(str(response)):
                     response = sanitize_advisory_section("Cost", str(response))
 

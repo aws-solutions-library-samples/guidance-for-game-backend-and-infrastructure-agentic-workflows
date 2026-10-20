@@ -31,7 +31,11 @@ _real_run_orchestrator = orchestrator.run_orchestrator
 
 TODAY = date(2026, 10, 16)
 FORECAST = "Forecast my AWS cost for next month."
-GUIDANCE = orchestrator._COST_ADVISORY_GUIDANCE
+# Forecast turns get the cost guidance with a sentence saying no numeric
+# forecast is shown; other cost-advice turns get the plain guidance.
+FORECAST_SENTENCE = "This assistant does not show numeric cost forecasts."
+GUIDANCE = orchestrator._FORECAST_COST_GUIDANCE
+ADVISORY_GUIDANCE = orchestrator._COST_ADVISORY_GUIDANCE
 LIVE_BASELINES = [
     ("2026-10-01", "2026-10-15"),
     ("2026-04-01", "2026-09-30"),
@@ -190,9 +194,14 @@ class TestForecastWithoutNamedPeriod:
         assert _run(query, periods, raise_after=raise_after, cost_ran=True) == GUIDANCE
 
     @pytest.mark.parametrize(
-        "query", ["Predict my AWS costs for the next 30 days.", "What are cost optimization strategies for EKS?"]
+        ("query", "expected"),
+        [
+            ("Predict my AWS costs for the next 30 days.", GUIDANCE),
+            ("What are cost optimization strategies for EKS?", ADVISORY_GUIDANCE),
+        ],
+        ids=["forecast", "advisory"],
     )
-    def test_raised_turn_without_a_report_logs_a_fixed_warning(self, query):
+    def test_raised_turn_without_a_report_logs_a_fixed_warning(self, query, expected):
         def body() -> str:
             record_specialist_output("Cost", "Next month should cost about USD 999.00.")
             raise RuntimeError("model call failed before any report")
@@ -200,7 +209,7 @@ class TestForecastWithoutNamedPeriod:
         with patch.object(orchestrator, "logger") as log:
             response = _orchestrate(query, body)
 
-        assert response == GUIDANCE
+        assert response == expected
         assert any("request raised before a validated cost report" in str(c) for c in log.warning.call_args_list)
         assert "model call failed before any report" not in str(log.mock_calls)
 
@@ -346,6 +355,36 @@ class TestForecastNamingAHistoricalPeriod:
         assert "**Report ID:** `cost-report-0`" in response
 
 
+class TestForecastGuidanceText:
+    """Forecast replies say that no numeric forecast is shown; other cost advice does not."""
+
+    def test_forecast_guidance_states_that_no_forecast_is_shown(self):
+        assert GUIDANCE.startswith("## Cost Guidance\n\n" + FORECAST_SENTENCE + " ")
+        assert GUIDANCE.endswith("No unverified financial value was shown.")
+        assert FORECAST_SENTENCE not in ADVISORY_GUIDANCE
+
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    def test_forecast_reply_carries_the_sentence(self, raise_after):
+        response = _run(FORECAST, LIVE_BASELINES, raise_after=raise_after)
+
+        assert FORECAST_SENTENCE in response
+
+    def test_forecast_answered_without_a_specialist_carries_the_sentence(self):
+        """A forecast the routing model answers directly gets the forecast guidance."""
+        assert _run("Forecast my GameLift cost for next month.", []) == GUIDANCE
+
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    def test_cost_advice_from_the_specialist_has_no_forecast_sentence(self, raise_after):
+        query = "What are cost optimization strategies for game servers?"
+        response = _run(query, [], raise_after=raise_after, cost_ran=True)
+
+        assert response == ADVISORY_GUIDANCE
+
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    def test_pricing_question_answered_directly_has_no_forecast_sentence(self, raise_after):
+        assert _run("How much does GameLift cost?", [], raise_after=raise_after) == ADVISORY_GUIDANCE
+
+
 class TestNonForecastBehaviorIsUnchanged:
     """Historical questions and report follow-ups still return the captured report."""
 
@@ -353,14 +392,14 @@ class TestNonForecastBehaviorIsUnchanged:
         response = _run("Show my costs for last month", [("2026-08-01", "2026-08-31"), ("2026-09-01", "2026-09-30")])
 
         assert "**Report ID:** `cost-report-1`" in response
-        assert GUIDANCE not in response
+        assert "## Cost Guidance" not in response
 
     def test_estimated_charges_to_date_return_the_report(self):
         """Cost Explorer calls open-period actuals estimated, so this is not a forecast."""
         response = _run("What are my estimated AWS charges so far this month?", [("2026-10-01", "2026-10-15")])
 
         assert "**Report ID:** `cost-report-0`" in response
-        assert GUIDANCE not in response
+        assert "## Cost Guidance" not in response
 
     @pytest.mark.parametrize(
         "query",
@@ -376,7 +415,7 @@ class TestNonForecastBehaviorIsUnchanged:
         response = _run(query, [("2026-10-01", "2026-10-15")])
 
         assert "**Report ID:** `cost-report-0`" in response
-        assert GUIDANCE not in response
+        assert "## Cost Guidance" not in response
 
     def test_report_followup_with_forecast_wording_returns_the_report(self):
         service = _service(1, prefix="cost-0123456789abcdef0123456789abcde")
@@ -391,7 +430,7 @@ class TestNonForecastBehaviorIsUnchanged:
         response = _orchestrate("Use cost-0123456789abcdef0123456789abcde0 to project next month", body)
 
         assert "cost-0123456789abcdef0123456789abcde0" in response
-        assert GUIDANCE not in response
+        assert "## Cost Guidance" not in response
 
 
 class TestForecastDetection:
