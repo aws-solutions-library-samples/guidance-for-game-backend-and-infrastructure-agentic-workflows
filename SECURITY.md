@@ -510,9 +510,14 @@ attaches **no AWS managed read policies** (the former
 `CloudWatchReadOnlyAccess`, `CloudWatchLogsReadOnlyAccess`, and
 `CostOptimizationHubReadOnlyAccess` grants allowed reading any log group, stack
 template/parameter, and metric in the account). Every statement below names a
-concrete caller that worked on the prior role, so the rebuild **adds no net-new
-provider capability** — it only removes, scopes, or makes explicit what the
-managed policies previously supplied implicitly. No runtime path reads log
+concrete reviewed caller. For every action except three, that caller worked on
+the prior role, so the rebuild only removes, scopes, or makes explicit what the
+managed policies previously supplied implicitly. The three exceptions are
+read-only: `compute-optimizer:GetEnrollmentStatus` (the Billing MCP
+compute-optimizer tool's enrollment check) and `eks:ListInsights` /
+`eks:DescribeInsight` (the eks-mcp `get_eks_insights` tool). Their callers were
+already offered to the model and failed only because the prior role denied
+them. The rebuild adds **no write capability**. No runtime path reads log
 **content** or deletes memory **records**; the only provider mutations are the
 scoped memory/event writes (including session-event `DeleteEvent` within this
 project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
@@ -561,7 +566,8 @@ Reference, or that address a global endpoint:*
 - **EC2** `DescribeInstances` — no resource-type support; constrained by an
   `aws:RequestedRegion` condition.
 - **Compute Optimizer** `GetEC2InstanceRecommendations` /
-  `GetAutoScalingGroupRecommendations` and the **Auto Scaling** describes
+  `GetAutoScalingGroupRecommendations` / `GetEnrollmentStatus` and the
+  **Auto Scaling** describes
   (`DescribeAutoScalingGroups`, `DescribeAutoScalingInstances`) — no resource
   types; constrained by an `aws:RequestedRegion` condition.
 
@@ -579,7 +585,9 @@ the deployment region:*
   names are dynamic. Among the `List*` reads, only `ListClusters` has no resource
   type; `ListNodegroups`, `ListFargateProfiles`, and `ListAddons` take a `cluster`
   ARN but use `*` because cluster names are created at runtime, constrained
-  instead by the `aws:RequestedRegion` condition.
+  instead by the `aws:RequestedRegion` condition. The Insights reads
+  (`ListInsights`, `DescribeInsight`) also take a `cluster` ARN and use `*` for
+  the same reason.
 
 > **Region narrowing (behavior change from the prior role).** On the prior role
 > the Compute Optimizer and Auto Scaling grants carried no region condition (the
@@ -591,8 +599,10 @@ the deployment region:*
 **Not granted (pre-existing gaps).** These actions were either never granted on
 the prior role, or had a reviewed caller that never actually worked on it, so
 adding them now would expand provider capability and is out of scope for the
-least-privilege rebuild. Each is tracked as a follow-up, with its runtime
-impact:
+least-privilege rebuild. The three reads named above were granted after their
+denials were observed and reviewed for issue #583; each action below still
+needs its own review before it is granted. Each is tracked as a follow-up, with
+its runtime impact:
 
 - `ce:GetUsageForecast` — the Billing MCP cost-explorer **usage** forecast.
   `AWSBillingReadOnlyAccess` carried no forecast action, so usage forecasts never
