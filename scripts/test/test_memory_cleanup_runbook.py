@@ -248,7 +248,22 @@ if args[:2] == ["bedrock-agentcore", "batch-delete-memory-records"]:
     if len(record_ids) > 100:
         sys.stderr.write("batch exceeds the 100-record cap\n")
         sys.exit(4)
-    print(json.dumps({"successfulRecords": [{"memoryRecordId": r} for r in record_ids], "failedRecords": []}))
+    # A chosen set of record IDs is reported as failed (the real service returns
+    # failedRecords with a zero exit status), so the loop surfaces them.
+    fail_set = set(state.get("fail_delete_records", []))
+    failed = [{"memoryRecordId": r} for r in record_ids if r in fail_set]
+    succeeded = [{"memoryRecordId": r} for r in record_ids if r not in fail_set]
+    query = option("--query") or ""
+    output = option("--output") or ""
+    # Honor --query 'failedRecords[].memoryRecordId' --output text, as the real
+    # CLI does: print one tab-joined line of the failed record IDs (nothing when
+    # none failed), rather than the full JSON response.
+    if query == "failedRecords[].memoryRecordId" and output == "text":
+        failed_ids = [f["memoryRecordId"] for f in failed]
+        if failed_ids:
+            print("\t".join(failed_ids))
+        sys.exit(0)
+    print(json.dumps({"successfulRecords": succeeded, "failedRecords": failed}))
     sys.exit(0)
 
 save()
@@ -302,6 +317,7 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         fail_namespaces: list | None = None,
         fail_list_actors: bool = False,
         fail_list_users: bool = False,
+        fail_delete_records: list | None = None,
     ) -> None:
         self.state_path.write_text(
             json.dumps(
@@ -313,11 +329,12 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
                     "fail_namespaces": fail_namespaces or [],
                     "fail_list_actors": fail_list_actors,
                     "fail_list_users": fail_list_users,
+                    "fail_delete_records": fail_delete_records or [],
                 }
             )
         )
 
-    def _env(self) -> dict:
+    def _env(self, old_actor: str | None = None) -> dict:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin}:{env['PATH']}"
         env["FAKE_STATE"] = str(self.state_path)
@@ -325,15 +342,15 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         env["MEMORY_ID"] = "gameagentruntime_mem-0a1b2c3d4e"
         env["AWS_PROFILE"] = "operator-test"
         env["USER_POOL_ID"] = "us-west-2_EXAMPLE01"
-        env["OLD_ACTOR"] = OLD_NS
+        env["OLD_ACTOR"] = OLD_NS if old_actor is None else old_actor
         # Keep the discovery working files inside the test temp dir.
         env["TMPDIR"] = str(self.tmp)
         return env
 
-    def _run(self, script: str) -> subprocess.CompletedProcess:
+    def _run(self, script: str, old_actor: str | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", script],
-            env=self._env(),
+            env=self._env(old_actor),
             cwd=self.tmp,
             capture_output=True,
             text=True,
@@ -652,6 +669,110 @@ class MemoryCleanupRunbookTests(unittest.TestCase):
         self.assertEqual(sum(len(b) for b in batches), 250)
         self.assertEqual([rid for b in batches for rid in b], many)
 
+    def test_step3_refuses_a_digest_old_actor(self) -> None:
+        # A 64-hex digest is a current, live user's namespace. Step 3 must refuse
+        # it, print the refusal, and reach the fake CLI with no delete call.
+        self._write_state(
+            records={DIGEST_NS: ["mem-" + "d" * 40]},
+            actors=[DIGEST_NS],
+            subjects=[],
+        )
+        result = self._run(self.blocks[3], old_actor=DIGEST_NS)  # Step 3 delete
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Refusing: OLD_ACTOR is empty or a 64-hex digest (a current actor ID)",
+            result.stderr,
+        )
+        state = self._state()
+        self.assertNotIn("delete_batches", state, "a digest OLD_ACTOR must delete nothing")
+        self.assertFalse(
+            any(call[:2] == ["bedrock-agentcore", "batch-delete-memory-records"] for call in state["calls"]),
+            "no delete call may reach the CLI for a digest OLD_ACTOR",
+        )
+
+    def test_step3_refuses_an_empty_old_actor(self) -> None:
+        # An empty OLD_ACTOR must be refused the same way, deleting nothing.
+        self._write_state(
+            records={OLD_NS: ["mem-" + "o" * 40]},
+            actors=[OLD_NS],
+            subjects=[],
+        )
+        result = self._run(self.blocks[3], old_actor="")  # Step 3 delete
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Refusing: OLD_ACTOR is empty or a 64-hex digest (a current actor ID)",
+            result.stderr,
+        )
+        state = self._state()
+        self.assertNotIn("delete_batches", state, "an empty OLD_ACTOR must delete nothing")
+        self.assertFalse(
+            any(call[:2] == ["bedrock-agentcore", "batch-delete-memory-records"] for call in state["calls"]),
+            "no delete call may reach the CLI for an empty OLD_ACTOR",
+        )
+
+    def test_step3_deletes_a_legitimate_raw_subject(self) -> None:
+        # A legitimate raw-subject OLD_ACTOR (a 36-char UUID) still deletes
+        # exactly its matching records, and the collected-count line prints.
+        self._write_state(
+            records={ACTOR_ONLY_NS: ["mem-" + "u" * 40, "mem-" + "v" * 40]},
+            actors=[ACTOR_ONLY_NS],
+            subjects=[],
+        )
+        result = self._run(self.blocks[3], old_actor=ACTOR_ONLY_NS)  # Step 3 delete
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Refusing", result.stderr)
+        batches = self._state()["delete_batches"]
+        deleted = [rid for batch in batches for rid in batch]
+        self.assertEqual(deleted, ["mem-" + "u" * 40, "mem-" + "v" * 40])
+        self.assertIn(f"Collected 2 record ID(s) for namespace {ACTOR_ONLY_NS}", result.stdout)
+
+    def test_step3_prints_collected_count_when_empty(self) -> None:
+        # With no records under the namespace, the count line still prints so an
+        # empty collection (for example after expired credentials) is visible.
+        self._write_state(records={}, actors=[], subjects=[])
+        result = self._run(self.blocks[3], old_actor=ACTOR_ONLY_NS)  # Step 3 delete
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Collected 0 record ID(s) for namespace {ACTOR_ONLY_NS}", result.stdout)
+        self.assertNotIn("delete_batches", self._state(), "an empty collection deletes nothing")
+
+    def test_step3_surfaces_failed_records(self) -> None:
+        # A batch-delete that returns failedRecords (zero exit status) must be
+        # surfaced on stderr so the operator sees records that were not deleted.
+        failing = "mem-" + "u" * 40
+        self._write_state(
+            records={ACTOR_ONLY_NS: [failing, "mem-" + "v" * 40]},
+            actors=[ACTOR_ONLY_NS],
+            subjects=[],
+            fail_delete_records=[failing],
+        )
+        result = self._run(self.blocks[3], old_actor=ACTOR_ONLY_NS)  # Step 3 delete
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Failed to delete: {failing}", result.stderr)
+
+    def test_step2_dry_run_refuses_a_digest_old_actor(self) -> None:
+        # The dry run (Step 2) must never preview a digest as deletable. The
+        # block exports its own placeholder OLD_ACTOR, so swap that literal for a
+        # digest to exercise the guard the same way an operator's typo would.
+        self._write_state(
+            records={DIGEST_NS: ["mem-" + "d" * 40]},
+            actors=[DIGEST_NS],
+            subjects=[],
+        )
+        block = re.sub(
+            r"export OLD_ACTOR=.*",
+            f"export OLD_ACTOR='{DIGEST_NS}'",
+            self.blocks[2],
+            count=1,
+        )
+        result = self._run(block)  # Step 2 dry run
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Refusing: OLD_ACTOR is empty or a 64-hex digest (a current actor ID)",
+            result.stderr,
+        )
+        # The dry run must not even list the digest's records.
+        self.assertNotIn("mem-" + "d" * 40, result.stdout)
+
 
 class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
     """Static guards on the runbook text, scoped to the Step 3 bash block so a
@@ -675,11 +796,16 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
         # Every command fence in the section, bash and PowerShell, for the option
         # allowlist. The two forms must stay aligned, so both are scanned.
         ps_blocks = re.findall(r"```powershell\n(.*?)```", cls.section, flags=re.DOTALL)
+        cls.ps_blocks = ps_blocks
         cls.fences = "\n".join(blocks + ps_blocks)
         # Step 3 is the delete block: the one that calls batch-delete-memory-records.
         delete_blocks = [b for b in blocks if "batch-delete-memory-records" in b]
         assert delete_blocks, "no bash block calls batch-delete-memory-records"
         cls.delete_block = delete_blocks[0]
+        # The PowerShell Step 3 delete block, likewise.
+        ps_delete_blocks = [b for b in ps_blocks if "batch-delete-memory-records" in b]
+        assert ps_delete_blocks, "no PowerShell block calls batch-delete-memory-records"
+        cls.ps_delete_block = ps_delete_blocks[0]
 
     def test_discovery_builds_candidates_from_actors_and_the_pool(self) -> None:
         # Discovery derives candidate actor IDs from the live actor list and the
@@ -689,6 +815,37 @@ class MemoryCleanupRunbookStaticChecks(unittest.TestCase):
 
     def test_delete_uses_exact_namespace_filter(self) -> None:
         self.assertIn("namespaces[0]==", self.delete_block, "the delete must restrict to an exact namespace")
+
+    def test_bash_step3_guards_against_a_digest_or_empty_actor(self) -> None:
+        # The bash Step 3 block must refuse an empty or 64-hex-digest OLD_ACTOR
+        # before any delete, using no exit/return (which would close a paste).
+        self.assertIn("'^[0-9a-f]{64}$'", self.delete_block, "Step 3 must guard against a 64-hex digest")
+        self.assertIn(
+            "Refusing: OLD_ACTOR is empty or a 64-hex digest (a current actor ID)",
+            self.delete_block,
+            "Step 3 must print the refusal message",
+        )
+        # Check the executable lines only: a comment may mention these words.
+        code = "\n".join(line for line in self.delete_block.splitlines() if not line.strip().startswith("#"))
+        self.assertNotIn("exit", code, "Step 3 must not use exit (it is pasted into a shell)")
+        self.assertNotIn("return", code, "Step 3 must not use return (it is pasted into a shell)")
+        guard_pos = self.delete_block.index("Refusing:")
+        delete_pos = self.delete_block.index("batch-delete-memory-records")
+        self.assertLess(guard_pos, delete_pos, "the guard must come before the delete")
+
+    def test_powershell_step3_guards_inside_a_scriptblock_before_delete(self) -> None:
+        # The PowerShell Step 3 block must wrap the step in & { ... } and throw
+        # the refusal before any delete, because a pasted bare throw does not
+        # stop later top-level statements.
+        block = self.ps_delete_block
+        brace_pos = block.index("& {")
+        guard_pos = block.index("-cmatch '^[0-9a-f]{64}$'")
+        throw_pos = block.index("Refusing:")
+        delete_pos = block.index("batch-delete-memory-records")
+        self.assertLess(brace_pos, guard_pos, "the guard must be inside the & { script block")
+        self.assertLess(guard_pos, delete_pos, "the guard must come before the delete")
+        self.assertLess(throw_pos, delete_pos, "the refusal throw must come before the delete")
+        self.assertIn("-not $OldActor", block, "the guard must also refuse an empty $OldActor")
 
     def test_batches_capped_at_100(self) -> None:
         self.assertIn("+= 100", self.delete_block, "the delete must chunk the ID list by 100")

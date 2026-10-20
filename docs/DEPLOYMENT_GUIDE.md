@@ -237,13 +237,13 @@ For the deployment smoke test, send one off-topic request expected to activate t
 
 ### Clean Up Memory Records Left Under Raw-Subject Actor IDs
 
-Run this once, as the operator who deploys the upgrade to the pseudonymous memory actor ID, after the update has fully rolled out, from an operator or administrator session that has AgentCore Memory data-plane permissions. Do not run it from the chat runtime: the runtime role has no record-delete permission by design (`infrastructure/cloudformation/01-base-infrastructure.yaml` grants memory record read and write but no delete), and that boundary stays in place. The shell blocks below are bash; see the Windows note for the PowerShell form.
+Run this once, as the operator who deploys the upgrade to the pseudonymous memory actor ID, after the update has fully rolled out, from an operator or administrator session that has AgentCore Memory data-plane permissions. Do not run it from the chat runtime: the runtime role has no record-delete permission by design (`infrastructure/cloudformation/01-base-infrastructure.yaml` grants memory record read and write but no delete), and that boundary stays in place. The shell blocks below are bash; macOS defaults to zsh, so run `bash` first if your terminal is zsh, otherwise the `#` comment lines fail to parse. See the Windows note for the PowerShell form.
 
 **Operator permissions.** Discovery (Step 1) needs `bedrock-agentcore:ListActors` and `bedrock-agentcore:ListMemoryRecords` on the memory resource, and `cognito-idp:ListUsers` on the user pool. The delete (Steps 2–3) needs `bedrock-agentcore:ListMemoryRecords`, `bedrock-agentcore:BatchDeleteMemoryRecords`, and `bedrock-agentcore:DeleteMemoryRecord` on the memory resource. The optional short-term-event cleanup (Step 4) additionally needs `bedrock-agentcore:ListSessions`, `bedrock-agentcore:ListEvents`, and `bedrock-agentcore:DeleteEvent` on the memory resource.
 
 **Run after the rollout completes.** Old runtime sessions keep writing raw-subject events and records until they end, so a cleanup run while the previous version is still serving will leave fresh orphans behind. Wait until the digest-based runtime has fully replaced the old one before starting.
 
-**Namespace assumption.** This deploy path configures the memory resource as short-term only (`agentcore configure` without a long-term strategy), and the runtime writes records with `namespaces=[actorId]` — the actor ID is the whole, single-segment namespace. The AWS CLI's `--namespace` option is documented as a prefix filter, but on this layout it matches a whole namespace path segment, not an arbitrary character of a segment: on a live memory resource, `--namespace <full actor ID>` returned that actor's records while `--namespace <first few characters>` and `--namespace <single character>` returned nothing. Discovery below therefore lists each candidate actor ID in full rather than enumerating character prefixes. A memory configured with the toolkit's long-term strategies instead stores extracted records under paths such as `/users/{actorId}/facts/`, which these steps do not list; adjust the namespace filters if your resource uses those strategies.
+**Namespace assumption.** This deploy path configures the memory resource as short-term only (`agentcore configure` without a long-term strategy), and the runtime writes records with `namespaces=[actorId]` — the actor ID is the whole, single-segment namespace. This runbook also assumes the memory resource is dedicated to this deployment, so any non-digest namespace is treated as a leftover to clean up. The AWS CLI's `--namespace` option is documented as a prefix filter, but on this layout it matches a whole namespace path segment, not an arbitrary character of a segment: on a live memory resource, `--namespace <full actor ID>` returned that actor's records while `--namespace <first few characters>` and `--namespace <single character>` returned nothing. Discovery below therefore lists each candidate actor ID in full rather than enumerating character prefixes. A memory configured with the toolkit's long-term strategies instead stores extracted records under paths such as `/users/{actorId}/facts/`, which these steps do not list; adjust the namespace filters if your resource uses those strategies.
 
 **Why this is needed.** The runtime derives each user's AgentCore Memory actor ID as a 64-character lowercase SHA-256 digest of the verified Cognito subject (`backend/src/utils/memory_identity.py`). A runtime that uses the raw subject writes under a different actor ID — the raw Cognito subject, a 36-character UUID such as `a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6`. Once the digest-based runtime is deployed, those raw-subject records are never read again, but long-term records carry no time-to-live, so they persist until an operator removes them. Short-term events expire on the memory resource's event expiry (30 days by default), so they usually need no manual cleanup; a step to remove them early is included below if you need it.
 
@@ -328,11 +328,17 @@ cat "$LEFTOVERS_FILE"
 ```bash
 export OLD_ACTOR='a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # one old namespace from Step 1
 
-aws bedrock-agentcore list-memory-records \
-  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
-  --namespace "$OLD_ACTOR" \
-  --query "memoryRecordSummaries[?namespaces[0]=='$OLD_ACTOR'].[namespaces[0],memoryRecordId,createdAt]" \
-  --output text
+# The same guard as Step 3: never preview a 64-hex digest (a current actor ID)
+# or an empty value as deletable. Uses no exit/return so a paste keeps the shell.
+if printf '%s' "$OLD_ACTOR" | grep -Eq '^[0-9a-f]{64}$' || [ -z "$OLD_ACTOR" ]; then
+  echo "Refusing: OLD_ACTOR is empty or a 64-hex digest (a current actor ID)" >&2
+else
+  aws bedrock-agentcore list-memory-records \
+    --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+    --namespace "$OLD_ACTOR" \
+    --query "memoryRecordSummaries[?namespaces[0]=='$OLD_ACTOR'].[namespaces[0],memoryRecordId,createdAt]" \
+    --output text
+fi
 ```
 
 Confirm these are records you intend to remove, and that every `namespaces[0]` equals `$OLD_ACTOR`. Each `memoryRecordId` is a `mem-` identifier (40–50 characters).
@@ -340,26 +346,41 @@ Confirm these are records you intend to remove, and that every `namespaces[0]` e
 **Step 3 — Delete (explicit, opt-in).** Nothing is deleted until you run this step. `batch-delete-memory-records` takes at most 100 records per call. Collect the IDs for the **exact** namespace into a bash array, then delete in chunks of 100:
 
 ```bash
-# Collect the record IDs for the exact OLD_ACTOR namespace into an array
-RECORD_IDS=()
-while IFS= read -r id; do
-  [ -n "$id" ] && RECORD_IDS+=("$id")
-done < <(aws bedrock-agentcore list-memory-records \
-  --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
-  --namespace "$OLD_ACTOR" \
-  --query "memoryRecordSummaries[?namespaces[0]=='$OLD_ACTOR'].memoryRecordId" \
-  --output text | tr '\t' '\n')
-
-# Delete in batches of at most 100 (the API cap)
-for ((i = 0; i < ${#RECORD_IDS[@]}; i += 100)); do
-  RECORDS_ARG=()
-  for id in "${RECORD_IDS[@]:i:100}"; do
-    RECORDS_ARG+=("memoryRecordId=$id")
-  done
-  aws bedrock-agentcore batch-delete-memory-records \
+# Refuse to run if OLD_ACTOR is empty or a 64-hex digest: an empty value would
+# be rejected by the API, but a digest is a current, live user's namespace, and
+# deleting it is irreversible. The guard wraps the whole step with an if/else so
+# a pasted block never stops the operator's interactive shell.
+if printf '%s' "$OLD_ACTOR" | grep -Eq '^[0-9a-f]{64}$' || [ -z "$OLD_ACTOR" ]; then
+  echo "Refusing: OLD_ACTOR is empty or a 64-hex digest (a current actor ID)" >&2
+else
+  # Collect the record IDs for the exact OLD_ACTOR namespace into an array
+  RECORD_IDS=()
+  while IFS= read -r id; do
+    [ -n "$id" ] && RECORD_IDS+=("$id")
+  done < <(aws bedrock-agentcore list-memory-records \
     --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
-    --records "${RECORDS_ARG[@]}"
-done
+    --namespace "$OLD_ACTOR" \
+    --query "memoryRecordSummaries[?namespaces[0]=='$OLD_ACTOR'].memoryRecordId" \
+    --output text | tr '\t' '\n')
+
+  # Print the count so an empty collection (for example after expired
+  # credentials) is visible rather than a silent no-op.
+  echo "Collected ${#RECORD_IDS[@]} record ID(s) for namespace $OLD_ACTOR"
+
+  # Delete in batches of at most 100 (the API cap). After each call, surface any
+  # failedRecords (zero exit status, but the records were not deleted).
+  for ((i = 0; i < ${#RECORD_IDS[@]}; i += 100)); do
+    RECORDS_ARG=()
+    for id in "${RECORD_IDS[@]:i:100}"; do
+      RECORDS_ARG+=("memoryRecordId=$id")
+    done
+    FAILED=$(aws bedrock-agentcore batch-delete-memory-records \
+      --memory-id "$MEMORY_ID" --region "$AWS_REGION" \
+      --records "${RECORDS_ARG[@]}" \
+      --query 'failedRecords[].memoryRecordId' --output text)
+    if [ -n "$FAILED" ]; then echo "Failed to delete: $FAILED" >&2; fi
+  done
+fi
 ```
 
 To remove a single record instead, use `aws bedrock-agentcore delete-memory-record --memory-id "$MEMORY_ID" --memory-record-id "<mem-...>" --region "$AWS_REGION"`. The loop above already handles an actor with more than 100 records by sending one request per 100-record chunk. If Step 3 prints an error, only part of the namespace may have been deleted; fix the session and run Steps 2 and 3 again.
@@ -433,29 +454,50 @@ PowerShell Step 2 — Dry run: pick one old namespace from discovery and list it
 ```powershell
 $OldActor = 'a1b2c3d4-5e6f-7a8b-9c0d-e1f2a3b4c5d6'   # one old namespace from discovery
 
-aws bedrock-agentcore list-memory-records `
-  --memory-id $MemoryId --region $env:AWS_REGION `
-  --namespace $OldActor `
-  --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].[namespaces[0],memoryRecordId,createdAt]" `
-  --output text
+# The same guard as Step 3: never preview a 64-hex digest (a current actor ID)
+# or an empty value as deletable. A pasted bare throw does not stop later
+# top-level statements, so the whole step runs inside a & { ... } script block.
+& {
+  if (-not $OldActor -or $OldActor -cmatch '^[0-9a-f]{64}$') {
+    throw 'Refusing: $OldActor is empty or a 64-hex digest (a current actor ID)'
+  }
+  aws bedrock-agentcore list-memory-records `
+    --memory-id $MemoryId --region $env:AWS_REGION `
+    --namespace $OldActor `
+    --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].[namespaces[0],memoryRecordId,createdAt]" `
+    --output text
+}
 ```
 
 PowerShell Step 3 — Delete (explicit, opt-in). Nothing is deleted until you run this step. Collect the IDs for the exact namespace, then delete in batches of at most 100:
 
 ```powershell
-# @(...) keeps a single ID as a one-element array rather than a scalar string.
-$recordIds = @((aws bedrock-agentcore list-memory-records `
-  --memory-id $MemoryId --region $env:AWS_REGION `
-  --namespace $OldActor `
-  --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].memoryRecordId" `
-  --output text) -split '\s+' | Where-Object { $_ })
-
-for ($i = 0; $i -lt $recordIds.Count; $i += 100) {
-  $chunk = $recordIds[$i..([Math]::Min($i + 99, $recordIds.Count - 1))]
-  $recordsArg = $chunk | ForEach-Object { "memoryRecordId=$_" }
-  aws bedrock-agentcore batch-delete-memory-records `
+# A pasted bare throw does not stop later top-level statements, so the whole
+# step runs inside a & { ... } script block with the guard before any delete.
+& {
+  if (-not $OldActor -or $OldActor -cmatch '^[0-9a-f]{64}$') {
+    throw 'Refusing: $OldActor is empty or a 64-hex digest (a current actor ID)'
+  }
+  # @(...) keeps a single ID as a one-element array rather than a scalar string.
+  $recordIds = @((aws bedrock-agentcore list-memory-records `
     --memory-id $MemoryId --region $env:AWS_REGION `
-    --records $recordsArg
+    --namespace $OldActor `
+    --query "memoryRecordSummaries[?namespaces[0]=='$OldActor'].memoryRecordId" `
+    --output text) -split '\s+' | Where-Object { $_ })
+
+  # Print the count so an empty collection is visible rather than a silent no-op.
+  Write-Host "Collected $($recordIds.Count) record ID(s) for namespace $OldActor"
+
+  for ($i = 0; $i -lt $recordIds.Count; $i += 100) {
+    $chunk = $recordIds[$i..([Math]::Min($i + 99, $recordIds.Count - 1))]
+    $recordsArg = $chunk | ForEach-Object { "memoryRecordId=$_" }
+    # Surface any failedRecords (zero exit status, but not deleted).
+    $failed = aws bedrock-agentcore batch-delete-memory-records `
+      --memory-id $MemoryId --region $env:AWS_REGION `
+      --records $recordsArg `
+      --query 'failedRecords[].memoryRecordId' --output text
+    if ($failed) { Write-Error "Failed to delete: $failed" -ErrorAction Continue }
+  }
 }
 ```
 
