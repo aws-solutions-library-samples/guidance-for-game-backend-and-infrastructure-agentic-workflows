@@ -370,7 +370,9 @@ The cost specialist rejects the Billing MCP server's historical
 optimization operations remain available.
 Forecast detection is pattern-based. A question the orchestrator recognizes as
 a forecast gets the fixed, non-numeric cost guidance, because forecast figures
-are not validated. A historical report captured during that turn is kept only
+are not validated; that guidance says the assistant does not show numeric cost
+forecasts (#625 tracks an owned forecast rendering). A historical report
+captured during that turn is kept only
 when its period equals a period the question names.
 `agents/cost_request_periods.py` recognizes only phrases that normally name a
 past period rather than the forecast target, such as "last month", "last
