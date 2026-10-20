@@ -92,6 +92,21 @@ SHEBANG_FIXED_OVERHEAD = 3  # "#!" + "\n"
 # Over-124-byte interpreter paths trip the trampoline.
 INTERPRETER_BYTE_LIMIT = SHEBANG_LINE_LIMIT - SHEBANG_FIXED_OVERHEAD
 
+# Guard exit codes. 0 and 1 are the fail-fast contract both deploy paths rely
+# on: 0 means the path was measured and is bootable, 1 means it was measured and
+# is unbootable (abort the deploy). 3 is a distinct, documented "skipped" result
+# the callers treat as non-fatal: the guard measured nothing because the host is
+# out of scope. Keeping skip separate from 0 stops a caller from reporting a
+# measured pass for a check that never ran.
+EXIT_OK = 0
+EXIT_UNBOOTABLE = 1
+EXIT_SKIPPED_NATIVE_WINDOWS = 3
+
+# A fixed, machine-readable stdout token the callers key on for the skip, so no
+# caller has to parse free-form prose. It leads the single human-readable skip
+# line the guard prints on a native Windows host.
+SKIPPED_NATIVE_WINDOWS_TOKEN = "RUNTIME_PATH_CHECK_SKIPPED_NATIVE_WINDOWS"
+
 
 def interpreter_path_bytes(interpreter_path: str) -> int:
     """Filesystem byte length of ``interpreter_path``.
@@ -349,6 +364,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # On a native Windows host the POSIX shebang predicate does not apply and
+    # this guard measures nothing (out of scope; follow-up issue #610). Announce
+    # the skip with the fixed machine-readable token the callers key on, print a
+    # single human-readable line, and return the dedicated SKIPPED code so the
+    # deploy continues without a caller reporting a measured pass.
+    if uses_native_windows_launcher():
+        sys.stdout.write(
+            SKIPPED_NATIVE_WINDOWS_TOKEN + " Runtime interpreter path not checked on native Windows (see #610)\n"
+        )
+        return EXIT_SKIPPED_NATIVE_WINDOWS
+
     if args.interpreter:
         interpreter_path = args.interpreter
         # A direct probe carries no backend context, so remediation uses the
@@ -359,10 +385,10 @@ def main(argv: list[str] | None = None) -> int:
         remediation_backend_dir = args.backend_dir
 
     if venv_python_is_bootable(interpreter_path):
-        return 0
+        return EXIT_OK
 
     sys.stderr.write("\u274c " + remediation_message(interpreter_path, backend_dir=remediation_backend_dir) + "\n")
-    return 1
+    return EXIT_UNBOOTABLE
 
 
 if __name__ == "__main__":

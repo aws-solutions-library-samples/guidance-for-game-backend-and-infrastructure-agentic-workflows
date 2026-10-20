@@ -490,6 +490,57 @@ class RuntimePathCli(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("space", (result.stdout + result.stderr).lower())
 
+    def _run_simulated_os(self, *, os_name: str, interpreter: str) -> subprocess.CompletedProcess:
+        """Invoke the CLI with the native-Windows predicate forced to the given
+        ``os_name`` result, so the skip branch can be exercised on a POSIX host
+        without a real Windows machine. We patch ``uses_native_windows_launcher``
+        rather than flipping ``os.name`` globally (which would make the stdlib
+        try to ``import nt``). Passes ``--interpreter`` so no venv is resolved;
+        the skip must take precedence over measuring that path.
+        """
+        force_windows = "True" if os_name == "nt" else "False"
+        bootstrap = (
+            "import importlib.util, sys;"
+            f"spec = importlib.util.spec_from_file_location('check_runtime_path', {str(GUARD_PY)!r});"
+            "mod = importlib.util.module_from_spec(spec);"
+            "spec.loader.exec_module(mod);"
+            f"mod.uses_native_windows_launcher = lambda os_name=None: {force_windows};"
+            f"sys.exit(mod.main(['--interpreter', {interpreter!r}]))"
+        )
+        return subprocess.run(
+            [sys.executable, "-c", bootstrap],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_native_windows_skips_with_distinct_exit_code_and_token(self) -> None:
+        # On a native Windows host the guard measures nothing (out of scope,
+        # tracked in issue #610). It must announce the skip on stdout with a
+        # fixed machine-readable token the callers key on, print exactly one
+        # human skip line, and exit with the dedicated SKIPPED code (not 0, so a
+        # caller never mistakes a skip for a measured pass, and not 1, so the
+        # deploy still continues).
+        long_windows_path = "C:\\" + "a" * 300 + "\\Scripts\\python.exe"
+        result = self._run_simulated_os(os_name="nt", interpreter=long_windows_path)
+        self.assertEqual(result.returncode, guard.EXIT_SKIPPED_NATIVE_WINDOWS, result.stdout + result.stderr)
+        self.assertNotEqual(guard.EXIT_SKIPPED_NATIVE_WINDOWS, 0)
+        self.assertNotEqual(guard.EXIT_SKIPPED_NATIVE_WINDOWS, 1)
+        self.assertIn(guard.SKIPPED_NATIVE_WINDOWS_TOKEN, result.stdout)
+        self.assertIn("610", result.stdout)
+        self.assertIn("native Windows", result.stdout)
+        # Exactly one human-facing skip line, and no "portable"/success claim.
+        self.assertNotIn("portable", result.stdout.lower())
+        skip_lines = [line for line in result.stdout.splitlines() if "native Windows" in line]
+        self.assertEqual(len(skip_lines), 1, result.stdout)
+
+    def test_posix_measured_pass_emits_no_skip_token(self) -> None:
+        # The inverse: a real measured pass on POSIX exits 0 and never emits the
+        # skip token, so callers print the success line only for a measured pass.
+        result = self._run_simulated_os(os_name="posix", interpreter="/srv/app/backend/.venv/bin/python3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn(guard.SKIPPED_NATIVE_WINDOWS_TOKEN, result.stdout)
+
     def _run_default_path(self, *, virtual_env: str, executable_env: str) -> subprocess.CompletedProcess:
         """Invoke the CLI with NO ``--interpreter`` so it exercises the default
         ``resolve_runtime_interpreter`` path, with ``VIRTUAL_ENV`` and a
@@ -949,6 +1000,77 @@ def _strip_powershell_comments(text: str) -> str:
 
 
 _strip_comments = _strip_powershell_comments
+
+
+class ShellPreflightSkipBehavior(unittest.TestCase):
+    """The deploy.sh success echo must be conditional on the guard measuring and
+    passing. A native-Windows skip (the guard's dedicated SKIPPED exit code)
+    must print the skip line, not the "portable" success line, and must NOT
+    abort the deploy under ``set -e``/``pipefail``. A real guard failure must
+    still abort.
+
+    This runs the extracted guard block from deploy.sh with ``uv`` stubbed to a
+    chosen exit code, so it exercises the actual control flow (not a text scan).
+    """
+
+    def _extract_guard_block(self) -> str:
+        text = DEPLOY_SH.read_text(encoding="utf-8")
+        start = text.find('echo "🔎 Preflight: Verifying the runtime interpreter path is bootable..."')
+        self.assertNotEqual(start, -1, "deploy.sh must announce the preflight")
+        # The block ends at the download-KB step marker that follows the guard.
+        end = text.find("# Step 0: Download KB documentation", start)
+        self.assertNotEqual(end, -1, "deploy.sh must have a Step 0 after the guard")
+        return text[start:end]
+
+    def _run_block(self, guard_exit: int, guard_stdout: str) -> subprocess.CompletedProcess:
+        block = self._extract_guard_block()
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = Path(tmp) / "scripts"
+            (script_dir / "infrastructure").mkdir(parents=True)
+            (Path(tmp) / "backend").mkdir()
+            # A guard placeholder so the referenced path exists.
+            (script_dir / "infrastructure" / "check_runtime_path.py").write_text("", encoding="utf-8")
+            harness = (
+                "set -e\n"
+                "set -o pipefail\n"
+                f"PROJECT_ROOT={str(tmp)!r}\n"
+                f"SCRIPT_DIR={str(script_dir)!r}\n"
+                # Stub `uv run python <guard> ...` to emit the chosen stdout and exit code.
+                "uv() {\n"
+                f"  printf '%s' {guard_stdout!r}\n"
+                f"  return {guard_exit}\n"
+                "}\n" + block
+            )
+            return subprocess.run(
+                ["bash", "-c", harness],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+    def test_measured_pass_prints_portable_and_continues(self) -> None:
+        result = self._run_block(guard_exit=0, guard_stdout="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("portable", result.stdout.lower())
+
+    def test_native_windows_skip_prints_skip_not_portable_and_continues(self) -> None:
+        # The guard's SKIPPED exit code must not abort the deploy and must not
+        # print the "portable" success line; the skip is reported instead.
+        result = self._run_block(
+            guard_exit=guard.EXIT_SKIPPED_NATIVE_WINDOWS,
+            guard_stdout=guard.SKIPPED_NATIVE_WINDOWS_TOKEN
+            + " Runtime interpreter path not checked on native Windows (see #610)\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("portable", result.stdout.lower())
+        self.assertIn("native Windows", result.stdout)
+
+    def test_guard_failure_aborts_the_deploy(self) -> None:
+        # A real unbootable-path failure (exit 1) must abort under set -e and
+        # never print the "portable" success line.
+        result = self._run_block(guard_exit=1, guard_stdout="unbootable\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("portable", result.stdout.lower())
 
 
 class PreflightOrdering(unittest.TestCase):

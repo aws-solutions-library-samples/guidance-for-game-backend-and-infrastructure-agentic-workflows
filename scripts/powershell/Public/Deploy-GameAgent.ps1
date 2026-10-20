@@ -150,8 +150,15 @@ function Deploy-GameAgent {
         }
     } finally { Pop-Location }
     Write-GameAgentStatus 'Preflight: Verifying the runtime interpreter path is bootable...' -Type Info
-    Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
-    Write-GameAgentStatus 'Runtime interpreter path is portable' -Type Success
+    $runtimePathResult = Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
+    if ($runtimePathResult.Skipped) {
+        # The guard skipped the check on a native Windows host (out of scope;
+        # see #610). Report the skip rather than claiming a portability result
+        # nobody measured.
+        Write-GameAgentStatus 'Runtime interpreter path not checked on native Windows (see #610)' -Type Info
+    } else {
+        Write-GameAgentStatus 'Runtime interpreter path is portable' -Type Success
+    }
     Write-Host ''
 
     # ── Step 0: Download KB documentation ──

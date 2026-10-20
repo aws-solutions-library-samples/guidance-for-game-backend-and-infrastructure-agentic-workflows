@@ -23,13 +23,33 @@ BeforeAll {
 }
 
 Describe 'Test-GameAgentRuntimePath' {
-    It 'Passes silently when the shared guard reports a bootable path' {
+    It 'Returns a measured-pass result when the shared guard reports a bootable path' {
         $calls = [System.Collections.Generic.List[string]]::new()
         $runner = New-GuardRunner -ExitCode 0 -Output '' -Calls $calls
 
-        { Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner } |
+        $result = $null
+        { $result = Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner } |
             Should -Not -Throw
         $calls.Count | Should -Be 1
+        $result.Skipped | Should -BeFalse
+    }
+
+    It 'Returns a skipped result without throwing when the guard skips on native Windows' {
+        # Exit code 3 is the guard's dedicated "skipped" signal (a native Windows
+        # host, out of scope; see #610). It is non-fatal: the guard measured
+        # nothing, so the function must not throw and must report Skipped so the
+        # caller prints the skip line instead of the Success line.
+        $calls = [System.Collections.Generic.List[string]]::new()
+        $runner = New-GuardRunner -ExitCode 3 `
+            -Output 'RUNTIME_PATH_CHECK_SKIPPED_NATIVE_WINDOWS Runtime interpreter path not checked on native Windows (see #610)' `
+            -Calls $calls
+
+        $result = $null
+        { $result = Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner } |
+            Should -Not -Throw
+        $calls.Count | Should -Be 1
+        $result.Skipped | Should -BeTrue
+        $result.Output | Should -Match '610'
     }
 
     It 'Throws with the guard remediation when the path is unbootable' {

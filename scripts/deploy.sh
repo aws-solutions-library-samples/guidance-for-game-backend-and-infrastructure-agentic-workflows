@@ -108,13 +108,25 @@ if ! _uv_sync_out=$(cd "$PROJECT_ROOT/backend" && uv sync 2>&1); then
     exit 1
 fi
 echo "🔎 Preflight: Verifying the runtime interpreter path is bootable..."
-(
+_runtime_path_status=0
+_runtime_path_out="$(
   cd "$PROJECT_ROOT/backend"
   _backend_physical="$(pwd -P)"
   uv run python \
     "$SCRIPT_DIR/infrastructure/check_runtime_path.py" --backend-dir "$_backend_physical"
-)
-echo "✅ Runtime interpreter path is portable"
+)" || _runtime_path_status=$?
+# Exit code 3 is the guard's dedicated "skipped" signal (a native Windows host,
+# out of scope; see #610): the path was not measured, so report the skip rather
+# than a portability result and let the deploy continue. 0 means it measured and
+# passed. Any other nonzero is a real failure; re-raise it so `set -e` aborts.
+if [ "$_runtime_path_status" -eq 0 ]; then
+  echo "✅ Runtime interpreter path is portable"
+elif [ "$_runtime_path_status" -eq 3 ]; then
+  printf '%s\n' "$_runtime_path_out"
+else
+  printf '%s\n' "$_runtime_path_out" >&2
+  exit "$_runtime_path_status"
+fi
 echo ""
 
 # Step 0: Download KB documentation
