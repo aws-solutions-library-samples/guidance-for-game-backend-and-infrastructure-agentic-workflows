@@ -194,13 +194,16 @@ The routing that selects a shell is likewise confined to presentation routes.
 The proxy matcher that rewrites `/` to the Cloudscape page is scoped to the
 public shell routes only — `/` and the internal shell route (for example
 `/shell-cloudscape`) — and never matches `/api/copilot/chat` or `/api/auth/*`,
-so it never runs in front of the authentication boundary. The identity cookies
-are `Path=/` and do arrive on the requests the proxy handles; the proxy must
-not read or write them, copy them into another header, or send them to another
-origin. It selects the shell only from the server-only selector of decision 2
-(and, if one is added, the presentation-only preview signal of decisions 2 and
-10), performs an internal rewrite with no redirect, sets no identity or cookie,
-and sets, removes, or weakens no security header or Content Security Policy. The
+so it never runs in front of the authentication boundary. #547 owns this
+matcher, and its tests must show the matcher never matches `/api/copilot/chat`
+or `/api/auth/*`. The identity cookies are `Path=/` and do arrive on the
+requests the proxy handles; the proxy must not read or write them, copy them
+into another header, or send them to another origin. It selects the shell only
+from the server-only selector of decision 2 and, if one is introduced, a
+presentation-only preview signal (decisions 2 and 10): the proxy may read such
+a preview signal but never sets identity or any cookie. It performs an internal
+rewrite with no redirect, sets no identity or cookie, and sets, removes, or
+weakens no security header or Content Security Policy. The
 only response headers that appear because of it are Next's own routing headers,
 for example `x-middleware-rewrite` on a rewrite and, on Pages Router data
 requests, `x-nextjs-rewrite` or `x-nextjs-matched-path` (decision 2). These statements
@@ -238,17 +241,19 @@ bundles at build time.
 - **Consequences:** cutover (#552) and rollback are a single configuration
   change to the running container with no image rebuild (see decision 10 and
   the cutover path below); `/` stays static; the preview path uses the same
-  per-request mechanism. The rewrite leaves the internal Cloudscape route (for
-  example `/shell-cloudscape`) directly addressable, and the rewrite response
-  carries an `x-middleware-rewrite` header naming it. This grants nothing: the
-  preview is a presentation choice that is not role-aware and is open to any
-  caller, selecting only which design system renders. It never enables an
-  operator or approval surface (decision 9), which stays behind the #437 gate
-  regardless of shell; approver access comes from that gate and the backend,
-  never from previewing or selecting a shell (see the authentication boundary
-  under decision 1). If #547 prefers to hide the internal route, the proxy can
-  return 404 for direct requests to it; either way the preview confers no
-  authority.
+  per-request mechanism. The rewrite response carries an `x-middleware-rewrite`
+  header naming the internal Cloudscape route (for example `/shell-cloudscape`).
+  Whether that internal route is directly addressable is #547's choice: #547
+  may leave it addressable, or hide it by returning 404 for direct requests.
+  Either way the preview confers no authority: the preview is a presentation
+  choice that is not role-aware and selects only which design system renders.
+  It never enables an operator or approval surface (decision 9), which stays
+  behind the #437 gate regardless of shell; approver access comes from that gate
+  and the backend, never from previewing or selecting a shell (see the
+  authentication boundary under decision 1). If a per-request preview signal is
+  introduced, it is a presentation-only value (for example a preview cookie, see
+  decision 10) that the proxy may read to select the shell but never sets; it
+  establishes no identity.
 
 #### Config-only cutover path (new, required by decisions 2 and 10)
 
@@ -557,6 +562,10 @@ no image rebuild. The current UI shell is removed only after a soak period.
 - [ ] The `/api/copilot/chat` request contract is unchanged — the fields the
       proxy consumes (the last user message and the `threadId`); the frontend
       API tests pass unmodified.
+- [ ] The same-origin gate on the chat POST is unchanged:
+      `ui/src/pages/api/copilot/chat.ts` still rejects cross-origin POSTs with
+      `isSameOrigin` from `ui/src/utils/csrf.ts`, and the Cloudscape shell
+      issues same-origin browser POSTs without stripping `Origin` or `Referer`.
 - [ ] New-chat reset rotates the thread: it calls `reset()` **and** rotates the
       `threadId` through `useCopilotContext().setThreadId`, which is what clears
       the AgentCore session; `reset()` alone does not.
@@ -753,8 +762,8 @@ new-shell ceiling has roughly 177 KiB of headroom over the 323.3 KiB shell
 measured in E2/E3, so parity needs `PrismLight` or lazy loading (see the
 Bundle-size budget section).
 
-**E10 — measurement method.** Baseline numbers reproduce exactly from a clean
-`git archive HEAD ui`, `npm ci`, `next build`: `/_app` 140.0, `/` 822.6,
+**E10 — measurement method.** Baseline numbers reproduce at the spike's base
+commit, `npm ci`, `next build`: `/_app` 140.0, `/` 822.6,
 `/admin/users` 159.0 KiB, as summed gzip-6 sizes of `pages[route] ∪
 pages['/_app']` `.js` files divided by 1,024. The build ID appears only in
 `_buildManifest.js`, `_ssgManifest.js`, and `_clientMiddlewareManifest.js`,
@@ -799,17 +808,21 @@ Commands: `git archive HEAD ui | tar -x`; `npm ci`;
   `/` to render dynamically and is not the preferred path.
 - **Post-rollback approver preview is unowned.** Decisions 9 and 10 require the
   preview path to stay available to approvers after a rollback so #554 stays
-  reachable, but with the foundation as scoped the proxy returns 404 for the
-  internal shell route whenever the Cloudscape shell is not selected, so nothing
-  serves the Cloudscape shell once the default is back to `current`. No child
-  issue builds a per-request preview signal that survives a rollback. This is an
-  open risk, not a resolved one: either a presentation-only preview signal that
-  survives a rollback is added and owned before #441 relies on the
-  Cloudscape-only approval view, or #441 waits until #553 removes the current
-  shell, after which a rollback is no longer a configuration change. Waiting
-  only for cutover (#552) does not close the gap, because a rollback during the
-  soak returns the default to `current`. Proposed owner: #441 records which
-  path it takes.
+  reachable. Whether a post-rollback preview path exists depends on #547's
+  choice for the internal shell route (decision 2): if #547 hides the internal
+  route with a 404 whenever the Cloudscape shell is not selected, a rolled-back
+  deployment has no approver preview path, because nothing serves the Cloudscape
+  shell once the default is back to `current`; if the internal route stays
+  directly addressable, the preview remains reachable at that route even after a
+  rollback. No child issue yet builds a per-request preview signal that survives
+  a rollback (a presentation-only signal the proxy may read but never sets, see
+  decisions 1 and 10). This is an open risk, not a resolved one: either such a
+  preview signal that survives a rollback is added and owned before #441 relies
+  on the Cloudscape-only approval view, or #441 waits until #553 removes the
+  current shell, after which a rollback is no longer a configuration change.
+  Waiting only for cutover (#552) does not close the gap, because a rollback
+  during the soak returns the default to `current`. Proposed owner: #441 records
+  which path it takes.
 - **Harness auth.** The spike ran without a live Cognito backend, so the
   authenticated journeys (sign-in, refresh, idle warning) were not exercised
   end to end; #547 and #548 validate those against both shells.

@@ -18,6 +18,9 @@ existing Game Agent chat path remains the current product behavior.
 | [ADR 0005](0005-persist-operations-and-recover-workflows.md) | Accepted | Persist operations state and recover workflows |
 | [ADR 0007](0007-adopt-cloudscape-with-parallel-shell-cutover.md) | Proposed | Adopt Cloudscape with a parallel-shell cutover |
 
+Number 0006 is reserved for the bounded-autonomy capacity ADR on the operations
+E5 branch (#438), so this index skips it until that work merges.
+
 Later architecture issues define versioned contracts, trusted principal
 context, and incremental cost. Those details must not weaken the boundaries
 accepted here.
