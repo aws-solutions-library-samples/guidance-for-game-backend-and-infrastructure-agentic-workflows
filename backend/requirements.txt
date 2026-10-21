@@ -212,7 +212,7 @@ markdown-it-py==4.2.0
     # via rich
 markdownify==1.2.0
     # via strands-agents-tools
-mcp==1.28.1
+mcp==1.30.0
     # via
     #   awslabs-aws-api-mcp-server
     #   awslabs-billing-cost-management-mcp-server
