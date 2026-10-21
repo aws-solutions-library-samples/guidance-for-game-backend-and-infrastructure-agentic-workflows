@@ -28,7 +28,7 @@ MINIMUM_PATCHED = {
 # below 13.0.0, the first release that fixes these, so the backend depends on
 # neither strands-agents-tools nor strands-agents-builder.
 ABSENT_OR_PATCHED = {
-    "pillow": ((13, 0, 0), "GHSA-8g5g-8vmr-9782 and seven High-severity Pillow advisories"),
+    "pillow": ((13, 0, 0), "GHSA-8g5g-8vmr-9782 and the other Pillow advisories fixed in 13.0.0"),
 }
 
 
