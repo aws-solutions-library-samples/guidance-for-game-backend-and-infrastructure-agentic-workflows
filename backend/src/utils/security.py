@@ -13,6 +13,7 @@ from __future__ import annotations
 # Standard library
 import hashlib
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -36,6 +37,13 @@ def _get_logger() -> Logger:
 
 # Maximum prompt length (characters)
 MAX_PROMPT_LENGTH = 32000
+
+# Unicode categories treated as empty alongside whitespace: control characters
+# (category Cc, including DEL) and format characters (category Cf, such as
+# zero-width spaces and joiners, directional marks, soft hyphens, word joiners,
+# and byte-order marks). A prompt made only of these has no content to answer
+# or search for.
+_EMPTY_CATEGORIES = frozenset({"Cc", "Cf"})
 
 # Maximum conversation history messages
 MAX_HISTORY_MESSAGES = 100
@@ -123,7 +131,31 @@ def validate_prompt(prompt: str, strict_mode: bool = False) -> str:
     prompt = prompt.replace("\x00", "")
     prompt = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f]", "", prompt)
 
-    return prompt.strip()
+    prompt = prompt.strip()
+
+    # Reject a prompt whose every character is whitespace (str.isspace()),
+    # a control character (category Cc), or a format character (category Cf).
+    # A whitespace-only prompt trims to an empty string, which is not a valid
+    # Memory search query. Characters such as zero-width spaces, directional
+    # marks, soft hyphens, and DEL survive str.strip(), so a prompt made only
+    # of them, in any order and mixed with whitespace, has no content but would
+    # still reach the agent and Memory. Both are rejected here, before agent
+    # construction and Memory retrieval, with the same response as an empty
+    # prompt. The trimmed prompt is returned unchanged, so characters inside
+    # real text are kept.
+    #
+    # Rejection is deliberately limited to these categories. Other
+    # invisible-looking characters are accepted as content, for example the
+    # Hangul fillers U+115F, U+1160, U+3164, U+FFA0 (category Lo), the Braille
+    # blank U+2800 (category So), and variation selectors, the combining
+    # grapheme joiner, the Khmer inherent vowels U+17B4 and U+17B5, and the
+    # Mongolian free variation selectors U+180B through U+180D and U+180F
+    # (category Mn). Widening rejection to these characters is a deliberate
+    # change pinned by test.
+    if all(char.isspace() or unicodedata.category(char) in _EMPTY_CATEGORIES for char in prompt):
+        raise InputValidationError("Prompt cannot be empty")
+
+    return prompt
 
 
 def validate_user_context(context: dict | None) -> dict:
