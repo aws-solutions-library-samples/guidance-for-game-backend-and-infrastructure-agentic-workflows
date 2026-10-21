@@ -19,6 +19,7 @@ from utils.kb_tools import create_kb_retrieve_tool
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
 from utils.mcp_client_factory import create_mcp_client
+from utils.mcp_provider_lock import serialize_mcp_client_start
 from utils.security import log_sanitized_exception
 from utils.timing import time_operation
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
@@ -78,9 +79,15 @@ def create_specialist_agent(
                     for server_name in mcp_server_names:
                         mcp_client = create_mcp_client(server_name)
                         if mcp_client:
+                            # Serialize start and last-consumer stop of the shared
+                            # cached client so two specialist calls in one turn do
+                            # not race its start window. Applied to the RAW client
+                            # before the guard transform so the guard wrappers sit
+                            # outside the lock and delegate through it unchanged.
+                            tool_provider: Any = serialize_mcp_client_start(mcp_client)
                             if mcp_client_transform:
-                                mcp_client = mcp_client_transform(server_name, mcp_client)
-                            tools.append(mcp_client)
+                                tool_provider = mcp_client_transform(server_name, tool_provider)
+                            tools.append(tool_provider)
                             mcp_clients_created += 1
 
                     # If no MCP clients created and fallback exists, use it
