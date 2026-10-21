@@ -245,10 +245,9 @@ def _reset_mcp_instrumentor():
 
 def test_apply_uninstruments_mcp_instrumentor_singleton(monkeypatch):
     # Instrument the real ADOT McpInstrumentor, then confirm the guard restores
-    # the wrapped MCP SDK methods (no __wrapped__ attribute remains).
-    pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
-    pytest.importorskip("mcp")
-
+    # the wrapped MCP SDK methods (no __wrapped__ attribute remains). The ADOT MCP
+    # module and mcp are direct dependencies and are imported directly below, so a
+    # missing or renamed module fails this test rather than skipping it.
     # Third-party packages
     from mcp.shared.session import BaseSession
 
@@ -267,9 +266,6 @@ def test_apply_uninstruments_mcp_instrumentor_singleton(monkeypatch):
 
 
 def test_apply_opt_in_does_not_uninstrument_mcp(monkeypatch):
-    pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
-    pytest.importorskip("mcp")
-
     # Third-party packages
     from mcp.shared.session import BaseSession
 
@@ -359,8 +355,6 @@ def _capture_otel_log_attributes(logger_name: str, monkeypatch):
 
 
 def test_guard_filters_mcp_exception_text_from_log_records(monkeypatch, _clean_mcp_log_filters):
-    pytest.importorskip("opentelemetry.sdk._logs")
-
     _set_guard_env(monkeypatch, opt_in=False)
     apply_trace_content_guard()
 
@@ -390,8 +384,6 @@ def test_mcp_exception_logger_name_is_pinned_to_strands_client():
 
 
 def test_opt_in_leaves_mcp_exception_text_in_log_records(monkeypatch, _clean_mcp_log_filters):
-    pytest.importorskip("opentelemetry.sdk._logs")
-
     _set_guard_env(monkeypatch, opt_in=True)
     apply_trace_content_guard()
 
@@ -420,8 +412,9 @@ def test_uninstrument_logs_no_warning_when_not_instrumented(monkeypatch, caplog)
     # Standard library
     import logging
 
-    pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
-    pytest.importorskip("mcp")
+    # Third-party packages
+    from amazon.opentelemetry.distro.instrumentation.mcp import McpInstrumentor  # noqa: F401
+    from mcp.shared.session import BaseSession  # noqa: F401
 
     _reset_mcp_instrumentor()  # leaves the singleton uninstrumented
     _set_guard_env(monkeypatch, opt_in=False)
@@ -436,9 +429,6 @@ def test_uninstrument_logs_no_warning_when_not_instrumented(monkeypatch, caplog)
 def test_uninstrument_warns_when_adot_layer_remains_under_a_client(monkeypatch, caplog):
     # Standard library
     import logging
-
-    pytest.importorskip("amazon.opentelemetry.distro.instrumentation.mcp")
-    pytest.importorskip("mcp")
 
     # Third-party packages
     from mcp.shared.session import BaseSession
@@ -557,8 +547,6 @@ def test_memory_client_logger_name_is_pinned_to_the_sdk_client():
 
 
 def test_hosted_guard_keeps_the_memory_namespace_out_of_exported_logs(_memory_client_logger):
-    pytest.importorskip("opentelemetry.sdk._logs")
-
     # Control: with the guard not applied, the SDK's INFO line carries the
     # namespace into exported records, so the assertion below cannot pass vacuously.
     assert _MEMORY_NAMESPACE in _exported_memory_log_text()
@@ -573,8 +561,6 @@ def test_hosted_guard_passes_memory_client_failure_warnings(_memory_client_logge
     # resource-not-found error the client's WARNING includes the resolved
     # namespace, which SECURITY.md lists as a residual risk. This pins that
     # boundary: if it moves, the documented residual risk has to move with it.
-    pytest.importorskip("opentelemetry.sdk._logs")
-
     apply_trace_content_guard({HOSTED_RUNTIME_VAR: "true"})
 
     exported = _exported_memory_log_text(service_error_code="ResourceNotFoundException")
@@ -586,7 +572,6 @@ def test_hosted_guard_passes_memory_client_event_failure_errors(_memory_client_l
     # When creating or listing events fails, the client logs the service's error
     # text at ERROR, which the filter passes. SECURITY.md lists this with the
     # other failure paths; if the boundary moves, the documentation has to move.
-    pytest.importorskip("opentelemetry.sdk._logs")
     # Third-party packages
     from bedrock_agentcore.memory.client import MemoryClient
     from botocore.exceptions import ClientError

@@ -335,9 +335,8 @@ def _reset_strands_tracer_singleton():
 
 
 def test_real_agent_and_llo_handler_leak_no_content(monkeypatch):
-    pytest.importorskip("amazon.opentelemetry.distro.llo_handler")
-    pytest.importorskip("strands")
-
+    # The ADOT LLO handler and strands are direct dependencies, imported directly
+    # below so a missing or renamed module fails this test rather than skipping it.
     # Third-party packages
     from amazon.opentelemetry.distro.llo_handler import LLOHandler
     from opentelemetry.sdk._logs import LoggerProvider
