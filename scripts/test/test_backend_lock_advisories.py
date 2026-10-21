@@ -23,6 +23,15 @@ MINIMUM_PATCHED = {
 }
 
 
+# package -> (first patched version, advisories). The package may be absent from
+# the lock, but any locked copy must be patched. strands-agents-tools caps Pillow
+# below 13.0.0, the first release that fixes these, so the backend depends on
+# neither strands-agents-tools nor strands-agents-builder.
+ABSENT_OR_PATCHED = {
+    "pillow": ((13, 0, 0), "GHSA-8g5g-8vmr-9782 and seven High-severity Pillow advisories"),
+}
+
+
 def _version_tuple(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
 
@@ -47,6 +56,21 @@ class BackendLockAdvisoryTests(unittest.TestCase):
                     _version_tuple(version),
                     minimum,
                     f"uv.lock resolves {name} to {version}, below the release that fixes {advisories}",
+                )
+
+    def test_capped_packages_are_absent_or_patched(self) -> None:
+        for name, (minimum, advisories) in ABSENT_OR_PATCHED.items():
+            for version in self.locked.get(name, []):
+                self.assertGreaterEqual(
+                    _version_tuple(version),
+                    minimum,
+                    f"uv.lock resolves {name} to {version}, below the release that fixes {advisories}",
+                )
+            if name in self.pins:
+                self.assertGreaterEqual(
+                    _version_tuple(self.pins[name]),
+                    minimum,
+                    f"requirements.txt pins {name}=={self.pins[name]}, below the release that fixes {advisories}",
                 )
 
     def test_runtime_requirements_pin_the_patched_version(self) -> None:
