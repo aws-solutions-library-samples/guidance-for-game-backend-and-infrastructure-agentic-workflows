@@ -6,9 +6,17 @@ read-only migration advice. It runs a real Agones fleet on Amazon EKS (the
 proposes (the "to" side), then compare the two under simulated player load.
 
 **Boundaries**
-- Use a dedicated sandbox account with no other workloads. The operator role's
-  EC2 permissions are the eksctl minimum and apply to every EC2 resource in the
-  Region; everything else it can touch is scoped to this environment.
+- Use a dedicated sandbox account with no other workloads. That account, not
+  the policy, is what contains EC2: the operator role's EC2 permissions are the
+  eksctl minimum and apply to every EC2 resource in the Region. Its
+  CloudFormation, EKS, GameLift, ECR, and IAM role permissions are scoped by
+  name or tag.
+- The workload permissions boundary is the effective ceiling for every role the
+  environment creates. The operator can attach its own `eksctl-<cluster>-*`
+  policy to a bounded role and run code with it on an instance it launches, so
+  plan for that role being able to do anything the boundary allows: EC2, load
+  balancing, and Auto Scaling in this Region, reads of this cluster, image
+  pulls, the node management agent, and GameLift fleet logging.
 - You run every step yourself, with that operator role. Nothing here is part
   of `deploy-all.sh`, `scripts/deploy.sh`, or the product's stacks.
 - The assistant stays read-only. It gets `get`/`list`/`watch` on core and Agones
@@ -22,7 +30,7 @@ proposes (the "to" side), then compare the two under simulated player load.
 
 | Path | Purpose |
 |---|---|
-| `iam/operator-role.yaml` | Operator role and the permissions boundary for every role it creates. Region-bound; IAM, EKS, CloudFormation, GameLift, and ECR access is scoped to this environment, while EC2 access covers the Region (hence the dedicated account) |
+| `iam/operator-role.yaml` | Operator role and the permissions boundary for every role it creates. Both are bound to one Region. CloudFormation, EKS, GameLift, ECR, and IAM role access is scoped by name or tag; EC2 access covers the Region, which is why the account must be dedicated |
 | `eks/cluster.yaml` | eksctl config: EKS 1.35, private nodes, single NAT gateway, API limited to your `/32` |
 | `agones/helm-values.yaml` | Keeps every Agones service cluster-internal (no load balancers) |
 | `agones/fleet.yaml` | `simple-game-server` fleet (UDP 7654), the workload migrated from |
@@ -107,7 +115,14 @@ The stack creates the `<cluster>-operator` role and the
 (the EKS cluster and node roles, and each GameLift fleet role) must carry that
 boundary; the operator role cannot create a role without it, attach any policy
 outside a short allowlist, or change the boundary, the assistant's role, or
-itself.
+itself. The boundary, not the allowlist, is the ceiling: see **Boundaries**
+above.
+
+To run a second environment in the same account, give it its own
+`ClusterName`, `StackPrefix`, and `RepositoryName`, none of which is a prefix
+of the other environment's values (for example `agones-a` and `agones-b`, not
+`agones` and `agones-b`). IAM scopes, stack selection, and `verify-clean` match
+by prefix.
 
 Assume the operator role for every following step, for example through a named
 profile with `role_arn` and `source_profile`. Its sessions last at most one
@@ -201,14 +216,20 @@ environment: `gl-demo-*` stacks tagged `demo=agones-gamelift-migration` and
 `demo-env=<cluster>`, the cluster (after checking the same tags) with its
 `eksctl-<cluster>-*` stacks, and the ECR repository (after checking its tags).
 It waits for in-progress stacks to settle, because a container fleet cannot be
-deleted until it is active. For non-interactive use, set
-`DEMO_CONFIRM=<cluster>`. It never changes deletion, termination, or retention
-settings.
+deleted until it is active; a stack in `REVIEW_IN_PROGRESS` is deleted at once.
+If a failed `cluster-up` left `eksctl-<cluster>-*` stacks without a cluster,
+`down` lists them and removes them with `eksctl delete cluster`. For every
+fleet it deletes, it also removes the default `gamelift-<fleet ID>-<Region>`
+log group that GameLift creates when a template sets no `LogConfiguration`; the
+reference template logs to its own `gamelift-<stack>` group, which goes
+with the stack. A fleet deleted outside `down` leaves its default log group
+behind. For non-interactive use, set `DEMO_CONFIRM=<cluster>`. It never changes
+deletion, termination, or retention settings.
 
 `verify-clean` fails on any AWS error, including an expired session; only a
 service's not-found answer counts as absent. It checks tagged resources, stacks
-in every status except `DELETE_COMPLETE` for both name patterns, the cluster,
-and the repository. Recently deleted resources can stay visible to the tagging
+in every status except `DELETE_COMPLETE` for both name patterns,
+`gamelift-<prefix>-*` log groups, the cluster, and the repository. Recently deleted resources can stay visible to the tagging
 API for a short time, so it retries before reporting them.
 
 ## Tests

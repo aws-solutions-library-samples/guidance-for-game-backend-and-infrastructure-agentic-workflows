@@ -192,13 +192,39 @@ stack_tags() {
     --query 'Stacks[0].Tags' --output json
 }
 
-# GameLift stacks of THIS environment: prefix match AND demo/demo-env tags.
+# A stack in REVIEW_IN_PROGRESS (a change set never executed) has no stack
+# tags yet; its tags are on the change sets. Prints them as one JSON list, or
+# returns 1 if the change sets disagree, so a stack counts as this
+# environment's only when every change set says so.
+review_stack_tags() {
+  local ids id tags first=""
+  ids="$(aws_lookup 'does not exist' cloudformation list-change-sets --region "$REGION" --stack-name "$1" \
+    --query 'Summaries[].ChangeSetId' --output text)" || return "$?"
+  for id in $ids; do
+    [ "$id" != "None" ] || continue
+    tags="$(aws_lookup 'does not exist' cloudformation describe-change-set --region "$REGION" --change-set-name "$id" \
+      --query 'Tags' --output json)" || return "$?"
+    tags="$(jq -c '(. // []) | sort_by(.Key)' <<<"$tags")"
+    if [ -z "$first" ]; then first="$tags"; elif [ "$tags" != "$first" ]; then return 1; fi
+  done
+  printf '%s' "${first:-[]}"
+}
+
+# Stacks of THIS environment: prefix match AND demo/demo-env tags.
+# demo_stacks [PREFIX]  (default: the GameLift stack prefix)
 demo_stacks() {
-  local listing name status tags
-  listing="$(stacks_with_prefix "${STACK_PREFIX}-")" || exit 1
+  local prefix="${1:-${STACK_PREFIX}-}" listing name status tags
+  listing="$(stacks_with_prefix "$prefix")" || exit 1
   while read -r name status; do
     [ -n "$name" ] && [ "$name" != "None" ] || continue
     if tags="$(stack_tags "$name")"; then
+      if [ "$status" = REVIEW_IN_PROGRESS ] && jq -e '(. // []) | length == 0' >/dev/null <<<"$tags"; then
+        if tags="$(review_stack_tags "$name")"; then :; else
+          local rc="$?"
+          [ "$rc" -eq 1 ] && continue  # change sets disagree: not provably ours
+          absent_or_exit "$rc"; continue
+        fi
+      fi
       if tags_belong_to_demo "$tags"; then
         echo "$name $status"
       fi
@@ -403,6 +429,8 @@ cmd_load() {
 
 wait_for_stack_settled() {
   # Waits until a stack is no longer *_IN_PROGRESS (at most WAIT_MINUTES).
+  # REVIEW_IN_PROGRESS (a change set that was never executed) counts as
+  # settled: such a stack can be deleted at once.
   local stack="$1" status deadline=$((SECONDS + ${WAIT_MINUTES:-60} * 60))
   while :; do
     if status="$(aws_lookup 'does not exist' cloudformation describe-stacks --region "$REGION" --stack-name "$stack" \
@@ -410,7 +438,7 @@ wait_for_stack_settled() {
       absent_or_exit "$?"
       return 0
     fi
-    [[ "$status" == *_IN_PROGRESS ]] || return 0
+    [[ "$status" == *_IN_PROGRESS && "$status" != REVIEW_IN_PROGRESS ]] || return 0
     [ "$SECONDS" -lt "$deadline" ] || die "stack $stack is still $status"
     log "Waiting for $stack ($status)"
     sleep "${POLL_SECONDS:-30}"
@@ -429,10 +457,29 @@ confirm_down() {
   [ "$answer" = "$CLUSTER_NAME" ] || die "not confirmed"
 }
 
+# Container fleet IDs a stack created, one per line.
+stack_fleet_ids() {
+  local ids id
+  ids="$(aws_lookup 'NOT_A_MATCH' cloudformation describe-stack-resources --region "$REGION" --stack-name "$1" \
+    --query "StackResources[?ResourceType=='AWS::GameLift::ContainerFleet'].PhysicalResourceId" --output text)" || exit 1
+  for id in $ids; do
+    if [[ "$id" =~ ^containerfleet-[0-9a-f-]{36}$ ]]; then echo "$id"; fi
+  done
+}
+
+# Deletes the default gamelift-<fleet ID>-<Region> log group GameLift creates
+# for a fleet without LogConfiguration; it outlives the fleet and its stack.
+delete_default_fleet_log_group() {
+  local group="gamelift-$1-$REGION"
+  if aws_lookup 'ResourceNotFoundException' logs delete-log-group --region "$REGION" --log-group-name "$group" >/dev/null; then
+    log "Deleted log group $group"
+  fi
+}
+
 cmd_down() {
   validate_settings
   require_tools jq
-  local stacks name status cluster_present=false repo_arn="" tags plan=""
+  local stacks name status cluster_present=false eksctl_leftovers="" repo_arn="" tags plan="" fleets="" fleet
   # Resolve exactly what belongs to this environment before deleting anything.
   stacks="$(demo_stacks)"
   while read -r name status; do
@@ -445,6 +492,14 @@ cmd_down() {
     plan+="  EKS cluster $CLUSTER_NAME, its node group, VPC, and NAT gateway"$'\n'
   else
     absent_or_exit "$?"
+    # A failed cluster-up can leave eksctl stacks behind without a cluster.
+    eksctl_leftovers="$(demo_stacks "eksctl-${CLUSTER_NAME}-")"
+    if [ -n "$eksctl_leftovers" ]; then
+      require_tools eksctl
+      while read -r name status; do
+        plan+="  eksctl stack $name ($status), left by a failed cluster-up"$'\n'
+      done <<<"$eksctl_leftovers"
+    fi
   fi
   if repo_arn="$(repository_arn)"; then
     tags="$(repository_tags "$repo_arn")"
@@ -470,6 +525,7 @@ cmd_down() {
   while read -r name status; do
     [ -n "$name" ] || continue
     wait_for_stack_settled "$name"
+    fleets+="$(stack_fleet_ids "$name")"$'\n'
     log "Deleting GameLift stack $name"
     aws_lookup 'NOT_A_MATCH' cloudformation delete-stack --region "$REGION" --stack-name "$name" >/dev/null
   done <<<"$stacks"
@@ -478,6 +534,9 @@ cmd_down() {
     aws_lookup 'NOT_A_MATCH' cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$name" >/dev/null \
       || die "stack $name did not delete"
   done <<<"$stacks"
+  for fleet in $fleets; do
+    delete_default_fleet_log_group "$fleet"
+  done
   # 2. Kubernetes workloads, in the demo's own cluster only.
   if [ "$cluster_present" = true ]; then
     use_demo_kube
@@ -486,7 +545,10 @@ cmd_down() {
       kubectl delete -f "$DEMO_DIR/agones/fleet.yaml" --ignore-not-found --wait=true || true
       helm uninstall agones --namespace agones-system --wait || true
     fi
-    # 3. The cluster, its node group, VPC, and NAT gateway (eksctl stacks).
+  fi
+  # 3. The cluster, its node group, VPC, and NAT gateway (eksctl stacks), or
+  #    the stacks a failed cluster-up left behind.
+  if [ "$cluster_present" = true ] || [ -n "$eksctl_leftovers" ]; then
     log "Deleting cluster $CLUSTER_NAME"
     eksctl delete cluster --region "$REGION" --name "$CLUSTER_NAME" --disable-nodegroup-eviction --wait
   fi
@@ -564,6 +626,11 @@ cmd_verify_clean() {
   [ -z "$found" ] || { echo "GameLift stacks remain:"; echo "$found"; remaining=1; }
   found="$(stacks_with_prefix "eksctl-${CLUSTER_NAME}-")"
   [ -z "$found" ] || [ "$found" = "None" ] || { echo "eksctl stacks remain:"; echo "$found"; remaining=1; }
+  # Fleet log groups the reference template creates (also caught by tag above
+  # once the tagging API lists them).
+  found="$(aws_lookup 'NOT_A_MATCH' logs describe-log-groups --region "$REGION" \
+    --log-group-name-prefix "gamelift-${STACK_PREFIX}-" --query 'logGroups[].logGroupName' --output text)" || exit 1
+  [ -z "$found" ] || [ "$found" = "None" ] || { echo "Fleet log groups remain:"; echo "$found"; remaining=1; }
   # The cluster and repository count only if they carry this environment's
   # tags, the same scoping `down` applies before deleting them.
   local repo_arn

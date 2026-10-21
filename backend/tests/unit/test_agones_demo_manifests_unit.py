@@ -302,3 +302,127 @@ def test_operator_role_cannot_touch_other_stacks_clusters_or_repositories():
         resources = by_sid[sid]["Resource"]
         resources = [resources] if not isinstance(resources, list) else resources
         assert all(r != "*" for r in resources), sid
+
+
+# ---------------------------------------------------------------------------
+# #608: exact resource scopes, tagging, boundary ceiling, fleet logs
+# ---------------------------------------------------------------------------
+
+_P = "arn:${AWS::Partition}"
+_ACCT = "${AWS::Region}:${AWS::AccountId}"
+_IAM = f"{_P}:iam::${{AWS::AccountId}}"
+_DEMO_ROLES = [f"{_IAM}:role/eksctl-${{ClusterName}}-*", f"{_IAM}:role/${{StackPrefix}}-*"]
+
+# Every Allow statement's exact Resource list. Widening any scope (for example
+# PassRole to role/*, ECR to repository/*, or CloudFormation to stack/*), or
+# adding a statement, must change this pin.
+EXPECTED_ALLOW_RESOURCES = {
+    "Ec2ForEksctl": ["*"],
+    "CloudFormationDemoStacks": [
+        f"{_P}:cloudformation:{_ACCT}:stack/eksctl-${{ClusterName}}-*/*",
+        f"{_P}:cloudformation:{_ACCT}:stack/${{StackPrefix}}-*/*",
+    ],
+    "CloudFormationReadAndValidate": ["*"],
+    "EksDemoCluster": [
+        f"{_P}:eks:{_ACCT}:cluster/${{ClusterName}}",
+        f"{_P}:eks:{_ACCT}:nodegroup/${{ClusterName}}/*/*",
+        f"{_P}:eks:{_ACCT}:addon/${{ClusterName}}/*/*",
+        f"{_P}:eks:{_ACCT}:access-entry/${{ClusterName}}/*",
+        f"{_P}:eks:{_ACCT}:podidentityassociation/${{ClusterName}}/*",
+        f"{_P}:eks::aws:cluster-access-policy/*",
+    ],
+    "EksAccountReads": ["*"],
+    "EksAmiLookup": [f"{_P}:ssm:${{AWS::Region}}::parameter/aws/*"],
+    "EksctlLogRetention": [f"{_P}:logs:{_ACCT}:log-group:/aws/eks/${{ClusterName}}/*"],
+    "FleetLogGroups": [
+        f"{_P}:logs:{_ACCT}:log-group:gamelift-${{StackPrefix}}-*",
+        f"{_P}:logs:{_ACCT}:log-group:gamelift-containerfleet-*",
+    ],
+    "ListLogGroups": ["*"],
+    "IamCreateBoundedRoles": _DEMO_ROLES,
+    "IamAttachAllowlistedPolicies": _DEMO_ROLES,
+    "IamInlinePoliciesOnEksctlRolesOnly": [f"{_IAM}:role/eksctl-${{ClusterName}}-*"],
+    "IamManageDemoRoles": [
+        f"{_IAM}:role/eksctl-${{ClusterName}}-*",
+        f"{_IAM}:instance-profile/eksctl-${{ClusterName}}-*",
+        f"{_IAM}:role/${{StackPrefix}}-*",
+    ],
+    "PassDemoRolesToTheirServices": _DEMO_ROLES,
+    "ReadAgentRole": [f"{_IAM}:role/${{AgentRoleName}}"],
+    "ReadEksServiceLinkedRoles": [
+        f"{_IAM}:role/aws-service-role/eks.amazonaws.com/*",
+        f"{_IAM}:role/aws-service-role/eks-nodegroup.amazonaws.com/*",
+    ],
+    "EksctlManagedPolicies": [f"{_IAM}:policy/eksctl-${{ClusterName}}-*"],
+    "IamReadPolicies": [f"{_P}:iam::aws:policy/*", "WorkloadBoundary"],
+    "ServiceLinkedRoles": ["*"],
+    "GameLiftCreateTagged": ["*"],
+    "GameLiftTagThisEnvironmentOnly": ["*"],
+    "GameLiftChangeNamedOnly": [
+        f"{_P}:gamelift:{_ACCT}:containergroupdefinition/${{StackPrefix}}-*",
+        f"{_P}:gamelift:{_ACCT}:gamesessionqueue/${{StackPrefix}}-*",
+    ],
+    "GameLiftChangeTaggedFleetsOnly": [
+        f"{_P}:gamelift:{_ACCT}:containerfleet/*",
+        f"{_P}:gamelift:{_ACCT}:fleet/*",
+    ],
+    "GameLiftStartTestSessions": ["*"],
+    "GameLiftReads": ["*"],
+    "EcrDemoRepository": [f"{_P}:ecr:{_ACCT}:repository/${{RepositoryName}}"],
+    "EcrLogin": ["*"],
+    "ResourceDiscoveryForCleanupCheck": ["*"],
+}
+
+
+def test_every_allow_statement_has_its_exact_resource_scope():
+    allows = {s["Sid"]: _list(s["Resource"]) for s in _statements() if s["Effect"] == "Allow"}
+    assert allows == EXPECTED_ALLOW_RESOURCES
+
+
+def test_no_policy_version_actions_are_granted():
+    """A new policy version would rewrite an attached eksctl policy in place, outside the boundary checks."""
+    forbidden = {"iam:CreatePolicyVersion", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion"}
+    for statement in _statements():
+        if statement["Effect"] != "Allow":
+            continue
+        actions = set(_actions(statement))
+        assert not actions & forbidden, statement["Sid"]
+        assert not any(a.endswith("*") and a.startswith("iam:") for a in actions), statement["Sid"]
+
+
+def test_tagging_cannot_bring_another_environments_resource_into_scope():
+    tagging = [s for s in _statements() if s["Effect"] == "Allow" and "gamelift:TagResource" in _actions(s)]
+    assert [s["Sid"] for s in tagging] == ["GameLiftTagThisEnvironmentOnly"]
+    (statement,) = tagging
+    assert _actions(statement) == ["gamelift:TagResource"]
+    assert statement["Condition"] == {
+        "StringEquals": {"aws:RequestTag/demo-env": "ClusterName"},
+        "StringEqualsIfExists": {"aws:ResourceTag/demo-env": "ClusterName"},
+    }
+
+
+def test_workload_boundary_is_region_bound_and_reads_only_this_cluster():
+    boundary = _operator_template()["Resources"]["WorkloadBoundary"]["Properties"]["PolicyDocument"]["Statement"]
+    by_sid = {s["Sid"]: s for s in boundary}
+    region = by_sid["DenyOtherRegions"]
+    assert region["Effect"] == "Deny" and region["Resource"] == "*"
+    assert set(region["NotAction"]) == {"iam:*", "sts:*"}
+    assert region["Condition"] == {"StringNotEquals": {"aws:RequestedRegion": "AWS::Region"}}
+    eks = [a for s in boundary if s["Effect"] == "Allow" for a in _actions(s) if a.startswith(("eks:", "eks-auth:"))]
+    assert sorted(eks) == ["eks-auth:AssumeRoleForPodIdentity", "eks:DescribeCluster"]
+    assert by_sid["EksThisClusterOnly"]["Resource"] == f"{_P}:eks:{_ACCT}:cluster/${{ClusterName}}"
+
+
+def test_reference_fleet_logs_to_a_group_the_stack_deletes():
+    template = load_cfn_template((_DEMO / "gamelift" / "container-fleet.reference.yaml").read_text(encoding="utf-8"))
+    resources = template["Resources"]
+    group = resources["FleetLogGroup"]
+    assert group["Type"] == "AWS::Logs::LogGroup"
+    assert group["DeletionPolicy"] == "Delete" and group["UpdateReplacePolicy"] == "Delete"
+    assert group["Properties"]["LogGroupName"] == "gamelift-${AWS::StackName}"
+    assert 1 <= group["Properties"]["RetentionInDays"] <= 30
+    tags = {t["Key"]: t["Value"] for t in group["Properties"]["Tags"]}
+    assert tags == {"demo": "agones-gamelift-migration", "demo-env": "DemoEnv"}
+    logging = resources["ContainerFleet"]["Properties"]["LogConfiguration"]
+    assert logging["LogDestination"] == "CLOUDWATCH"
+    assert logging["LogGroupArn"].endswith(":log-group:${FleetLogGroup}")
