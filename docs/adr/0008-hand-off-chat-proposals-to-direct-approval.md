@@ -110,8 +110,8 @@ permitted only by adopting the "Accept the residual" alternative below and makin
 the document updates it lists.
 
 **Chosen mechanism — a separate, confidential operations Cognito app client
-(audience) whose token the frontend server obtains without the operations
-client's own credentials from within a managed-login session.**
+(audience) whose token the frontend server obtains, and holds server-side, so
+the chat-forwarded token can never carry the operations audience.**
 
 - A second Cognito app client is provisioned for the operations API. **Every**
   operations JWT authorizer (E1/E2 action, E3 dispatch, E4 control plane) lists
@@ -140,44 +140,43 @@ client's own credentials from within a managed-login session.**
   breaks the cancel proxy, which forwards the chat token to the action API; the
   discovery proxy would break when the E4 authorizer moves. To avoid a mixed
   state, **all** operator-console proxies move to the operations token together.
-- **Obtaining the operations token (chosen path (b)): move the application's
-  primary sign-in to Cognito managed login.** Cognito's `/oauth2/authorize`
-  endpoint is an interactive browser redirect, and its managed-login session
-  cookie is set only when the user signs in through the login pages; a refresh
-  token works only with the client that issued it. An SRP sign-in through
-  `amazon-cognito-identity-js` creates no managed-login session, so no token for
-  a second client can be obtained from it silently. The application therefore
-  moves its primary sign-in from in-browser SRP to managed login using the
-  authorization-code grant with PKCE for the **chat** client, completed by the
-  frontend server. Within that one-hour managed-login session the server then
-  runs an authorization-code + PKCE exchange for the separate **operations**
-  client (using `prompt=none` where the managed-login branding version supports
-  it, so no second credential prompt is shown), and keeps the operations access
-  and refresh tokens server-side in `HttpOnly`, `Secure`, `SameSite=Lax` cookies
-  scoped to the operations proxies. The authorize step is a browser redirect, so
-  if the managed-login session has lapsed (for example the one-hour session
-  expired before first operations use) the `prompt=none` exchange returns
-  `login_required`; the server then falls back to the interactive step-up
-  sign-in of path (a) — redirecting the browser to managed login for the
-  operations client — rather than failing the handoff. Neither client's tokens
-  reach browser JavaScript.
-- **Consequences of path (b).** It requires the managed-login branding version
-  (available on the Essentials plan, which the base user pool already defaults
-  to), a managed-login domain, callback and logout routes, and replaces
-  `CognitoAuth.tsx` and the `/api/auth/login` and `/api/auth/refresh` token
-  posting. Logout must call Cognito `/logout`. It must be coordinated with the
-  Cloudscape app-frame work
-  ([#548](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/548)),
-  which rebuilds the sign-in experience. As a side benefit, both clients' tokens
-  stay out of browser JavaScript.
-- **Acceptable interim (path (a)).** If activation (#441) precedes the sign-in
-  change, the operations client may instead use a step-up interactive sign-in at
-  first operations use: the browser is redirected to managed login for the
-  operations client, the user signs in there, and the frontend server keeps the
-  operations client's own refresh token server-side in an `HttpOnly` cookie to
-  mint subsequent operations access tokens. This works with the hosted login on
-  the pool's default plan.
-- **For whichever path runs.** The operations refresh token is bound to the
+- **Obtaining the operations token (chosen path (a)): a step-up interactive
+  sign-in for the operations client at first operations use.** Cognito's
+  `/oauth2/authorize` endpoint is an interactive browser redirect, and a refresh
+  token works only with the client that issued it. At first operations use the
+  browser is redirected to managed login for the separate **operations** client;
+  the user signs in there, and the frontend server keeps the operations client's
+  own refresh token server-side in an `HttpOnly` cookie to mint subsequent
+  operations access tokens. This path works with the hosted login on the pool's
+  default plan and does not change the application's primary sign-in, which stays
+  in-browser SRP through `amazon-cognito-identity-js` until the separate
+  managed-login decision below lands. A step-up sign-in cannot authorize as a
+  different account because the operations proxies require the operations token's
+  `sub` to equal the verified chat session's `sub`.
+- **Planned follow-up (path (b)): move the application's primary sign-in to
+  Cognito managed login.** Moving primary sign-in from in-browser SRP to managed
+  login — the authorization-code grant with PKCE for the **chat** client,
+  completed by the frontend server, with the server then running an
+  authorization-code + PKCE exchange for the operations client within that
+  managed-login session so neither client's tokens reach browser JavaScript — is
+  a **separate decision recorded by a later ADR**, not decided here. It lands
+  **after** the Cloudscape UI cutover
+  ([#552](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/552)),
+  not during it, so the shell cutover and its rollback never change the sign-in
+  flow at the same time, and it is coordinated with the Cloudscape sign-in
+  rebuild
+  ([#548](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/548)).
+  That later ADR would use `prompt=none` where the managed-login branding version
+  supports it, so no second credential prompt is shown; because the authorize
+  step is a browser redirect, a lapsed managed-login session (for example the
+  one-hour session expiring before first operations use) returns
+  `login_required`, and the server then falls back to the path (a) interactive
+  step-up sign-in rather than failing the handoff. Managed login requires the
+  managed-login branding version (available on the Essentials plan, which the
+  base user pool already defaults to), a managed-login domain, callback and
+  logout routes, and would replace `CognitoAuth.tsx` and the `/api/auth/login`
+  and `/api/auth/refresh` token posting, with logout calling Cognito `/logout`.
+- **For the operations token.** The operations refresh token is bound to the
   operations client, stored `HttpOnly`, and revoked on logout. The OAuth `state`
   value and the PKCE verifier are bound to the existing session. The operations
   proxies require the operations token's `sub` to equal the verified chat
@@ -189,12 +188,17 @@ client's own credentials from within a managed-login session.**
   verifier, which would make `requester.client_id` mean "some holder of an
   operations token" rather than "the trusted proposal proxy"; a confidential
   client is what makes `client_id` attribution (decision 9) meaningful.
-- **Trade-offs.** Path (b) adds a managed-login domain, a second confidential
-  app client, callback and logout routes, and replaces the SRP sign-in UI; it
-  removes both clients' tokens from the browser. Path (a) is smaller but leaves
-  the chat tokens in browser storage and shows a second sign-in. Both are
-  reversible: removing the operations client and its proxies returns the
-  deployment to chat-only.
+- **Trade-offs.** This ADR chooses path (a): a step-up interactive sign-in for
+  the confidential operations client, which adds a second confidential app
+  client and the operations proxy cookies but leaves the application's primary
+  sign-in (in-browser SRP) unchanged, so it does not touch the Cloudscape UI
+  cutover (#552) or the sign-in rebuild (#548). Its cost is that the chat tokens
+  remain in browser storage and the user sees a second sign-in at first
+  operations use. Path (b) — moving primary sign-in to managed login, decided by
+  a later ADR after #552 — would additionally remove both clients' tokens from
+  the browser at the cost of a managed-login domain, callback and logout routes,
+  and replacing the SRP sign-in UI. Both are reversible: removing the operations
+  client and its proxies returns the deployment to chat-only.
 
 **Alternatives (recorded, not chosen):**
 
@@ -212,8 +216,10 @@ client's own credentials from within a managed-login session.**
   without a Lambda. Rejected because audience separation is a cleaner invariant.
 - **A second SRP authentication against the operations client in the browser
   (path (c)).** Rejected: the operations tokens would then pass through browser
-  JavaScript and the library's `localStorage` cache, contradicting this record's
-  property that neither client's tokens reach the browser.
+  JavaScript and the library's `localStorage` cache. Keeping the operations
+  tokens server-side (path (a) stores the operations refresh token in an
+  `HttpOnly` cookie) is what makes the operations audience a credential the
+  browser — and any same-origin script — cannot read.
 - **Accept the residual and compensate.** Keep one audience and rely on: the raw
   token never being exposed to tools or the model, no generic authenticated-HTTP
   tool existing in the runtime, and restricted runtime egress. Rejected: these
@@ -454,19 +460,20 @@ Under the canonical idempotency fingerprint in
 (workspace, idempotency token, and the prepared-operation hash), the
 prepared-operation hash binds the requester and client, so a second requester
 reusing a token produces a different fingerprint and gets `IDEMPOTENCY_CONFLICT`,
-not a replay. The E2 capacity-prepare path on the E2 branch instead keys
+not a replay. The E2 capacity-prepare path on the E2 branch currently keys
 idempotency on a narrower intent fingerprint — the trusted workspace, the bound
 observation, the code-selected capability, the idempotency token, and the target
 and requested triple, **without** the requester or the prepared-operation hash —
 so two different requesters submitting a byte-identical proposal under the same
 token in a shared workspace would replay the one stored operation rather than
-create a second. That narrower fingerprint is a deviation from ADR 0005's
-canonical fingerprint; the cross-requester replay it allows under a known token
-is recorded here as a residual and should be reconciled in the E2 capacity
-implementation note that the E2 advise-stack branch (#431) adds to ADR 0005.
-Preparation touches no provider, so a submission produces at most one
-immutable `pending_approval` record awaiting a direct human approval, never a
-provider write.
+get `IDEMPOTENCY_CONFLICT`. That narrower fingerprint does not meet ADR 0005's
+canonical fingerprint and is a required fix in the E2 work: #429 (with the advise
+stack in #431) must key E2 idempotency on ADR 0005's canonical fingerprint —
+workspace, idempotency token, and the prepared-operation hash, which binds the
+requester and client — before E2 merges, so a second requester reusing a token
+gets `IDEMPOTENCY_CONFLICT`, not a replay. Preparation touches no provider, so a
+submission produces at most one immutable `pending_approval` record awaiting a
+direct human approval, never a provider write.
 
 ### 9. Audit
 
@@ -590,18 +597,20 @@ not Closes.
    operator-UI work (#416), including the cancel proxy on the E1/E2 action API
    and the list, detail, discovery, control, and kill-switch proxies on the E4
    control-plane API, moves to the server-side operations token; the
-   AgentCore authorizer keeps only the chat client. Primary sign-in moves to
-   Cognito managed login (authorization-code + PKCE for the chat client), and the
-   frontend server obtains the operations client's token within that session
-   (`prompt=none` where available), keeping both tokens off browser JavaScript;
-   the operations refresh token is client-bound, `HttpOnly`, revoked on logout,
-   and the proxy requires the operations token's `sub` to equal the chat
-   session's `sub`. Blockers: a base-stack confidential operations app client, a
-   managed-login domain, callback and logout routes, the managed-login branding
-   version (Essentials default), and coordination with the Cloudscape sign-in
-   rebuild (#548). This child must land before any write-adjacent or control
-   route (prepare, approve, reject, dispatch, or control) is enabled — including
-   launch activation (#441) — and is not blocked by them.
+   AgentCore authorizer keeps only the chat client. The operations client's
+   token is obtained by path (a): a step-up interactive sign-in for the
+   operations client at first operations use, with its refresh token kept
+   server-side (`HttpOnly`, client-bound, revoked on logout) and the proxy
+   requiring the operations token's `sub` to equal the chat session's `sub`;
+   this leaves the application's primary sign-in unchanged. Moving primary
+   sign-in to managed login (path (b)) is **not** part of this child; it is a
+   separate ADR and issue, after the Cloudscape UI cutover (#552) and
+   coordinated with the Cloudscape sign-in rebuild (#548). Blockers: a
+   base-stack confidential operations app client, and the hosted login on the
+   pool's default plan (Essentials). This child must land before any
+   write-adjacent or control route (prepare, approve, reject, dispatch, or
+   control) is enabled — including launch activation (#441) — and is not blocked
+   by them.
 2. **Proposal proxy.** Server-side submit-to-prepare proxy that observes first,
    forwards the operations token and the CSPRNG idempotency token, enforces
    same-origin and the proposer-group defense-in-depth check; includes the
@@ -639,11 +648,13 @@ not Closes.
 ## Consequences
 
 - Closing the shared-token exposure (decision 1) adds a second confidential
-  Cognito app client, a managed-login domain, callback and logout routes, moves
-  the primary sign-in to managed login (coordinated with #548), moves every
-  operator-console proxy to the operations token, and covers all three
-  operations authorizers (action, dispatch, control). It also closes the
-  equivalent residual on the read-only observation routes.
+  Cognito app client, a step-up interactive sign-in for that client (path (a)),
+  the operations proxy cookies, and moves every operator-console proxy to the
+  operations token, and covers all three operations authorizers (action,
+  dispatch, control). It also closes the equivalent residual on the read-only
+  observation routes. It leaves the application's primary sign-in unchanged;
+  moving primary sign-in to managed login (path (b)) is a separate ADR after the
+  Cloudscape UI cutover (#552), coordinated with the sign-in rebuild (#548).
 - The handoff reuses the trusted frontend proxy tier and the #554 approval view,
   so no new service and no new trust boundary type is introduced; a single new
   trust boundary (chat proposal submission) is added to the threat model.
@@ -658,19 +669,21 @@ not Closes.
   with a trusted UI notice, and the API fails closed regardless of any UI state.
 - The frontend gains a proposal proxy that must be reviewed to the same bar as
   the #554 approve and reject proxies.
-- **Documents to update on acceptance.** Decision 1 moves the primary sign-in to
-  managed login and introduces a second (operations) Cognito app client, so on
-  acceptance [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md) must
-  be updated: its "The current Cognito sign-in flow is unchanged" statement
-  stops holding once the managed-login flow lands, and the sign-in clause of its
-  summary line that this work "does not enable operations or change the customer
-  sign-in experience" stops holding for the same reason (the "does not enable
-  operations" clause stays true). The chat path's `client_id`
-  must-equal-`COGNITO_CLIENT_ID` row keeps holding for the chat
-  token; the Identity doc gains a separate row binding the operations token's
-  `client_id` to the operations app client. This ADR does not edit that
-  document while it is Proposed; the update is part of the token-audience
-  separation child (Implementation child 1).
+- **Documents to update on acceptance.** Decision 1 introduces a second
+  (operations) Cognito app client obtained by a step-up interactive sign-in
+  (path (a)); it does not change the application's primary sign-in, so
+  [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md)'s "The current
+  Cognito sign-in flow is unchanged" statement and the sign-in clause of its
+  summary line continue to hold for primary sign-in. On acceptance the Identity
+  doc gains a separate row binding the operations token's `client_id` to the
+  operations app client, while the chat path's `client_id`
+  must-equal-`COGNITO_CLIENT_ID` row keeps holding for the chat token. Moving
+  primary sign-in to managed login (path (b)) is a separate ADR after #552; the
+  Identity statements that stop holding (the "current Cognito sign-in flow is
+  unchanged" statement, and the sign-in clause of the summary line) are updated
+  by that later record, not this one. This ADR does not edit the Identity
+  document while it is Proposed; the operations-client row is part of the
+  token-audience separation child (Implementation child 1).
 
 ## Rejected Alternatives
 

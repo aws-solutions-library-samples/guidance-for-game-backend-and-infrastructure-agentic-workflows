@@ -240,6 +240,14 @@ def test_unmerged_surfaces_are_not_asserted_as_shipped(adr_norm: str, tm_norm: s
         "a distinct `admin` must approve",
         "a distinct admin must approve",
         "a distinct approver",
+        # Managed login (path (b)) is a planned follow-up for a later ADR, not
+        # the path this ADR chooses; path (a) is the chosen path here.
+        "chosen path (b)",
+        "obtaining the operations token (chosen path (b))",
+        # The E2 narrower idempotency fingerprint is a required fix in #429, not
+        # an accepted residual or a tolerated deviation recorded by this record.
+        "recorded here as a residual",
+        "is a deviation from adr 0005's canonical fingerprint",
     ]
     # Scoped to the ADR only: a threat model legitimately describes an executor
     # or automation identity as distinct from the requester and approver (O4
@@ -267,6 +275,73 @@ def test_dependency_grounding_is_visible(adr_norm: str) -> None:
     assert "gamelift-capacity-proposal-request" in adr_norm
     assert "operations-capability-discovery" in adr_norm
     assert "outside the nine source-control contracts" in adr_norm
+
+
+@pytest.mark.unit
+@pytest.mark.fast
+def test_sign_in_decision_chooses_path_a_and_defers_managed_login(adr_norm: str) -> None:
+    """Path (a) is the chosen operations-token path; managed login (path (b)) is
+    a planned follow-up for a separate, later ADR after the Cloudscape UI cutover.
+
+    This pins decision 1's sequencing so the record cannot drift back to
+    choosing managed login here (the superseded "chosen path (b)") or to folding
+    the managed-login migration into this ADR. It guards the same property the
+    old pins guarded — the precondition gate and no overstatement of what this
+    record changes — now against the decision this ADR makes: the shell cutover
+    (#552) and its rollback never change the sign-in flow at the same time.
+    """
+    # Path (a) is the chosen operations-token path for this ADR.
+    assert "chosen path (a)" in adr_norm, "decision 1 must choose path (a) as the operations-token path"
+    # Managed login is a separate, later ADR, not decided here, and it lands
+    # after the Cloudscape UI cutover (#552), coordinated with the sign-in
+    # rebuild (#548).
+    assert "path (b)" in adr_norm, "managed login must still be named as the planned follow-up path (b)"
+    assert "separate decision recorded by a later adr" in adr_norm, "managed login must be deferred to a later ADR"
+    assert "after the cloudscape ui cutover" in adr_norm, "managed login must land after the Cloudscape UI cutover"
+    assert "#552" in adr_norm, "the Cloudscape UI cutover issue (#552) must be named"
+    assert "#548" in adr_norm, "coordination with the Cloudscape sign-in rebuild (#548) must be named"
+    # Implementation child 1 keeps path (a) and points managed login out to the
+    # follow-up rather than carrying it.
+    child_1 = _slice(
+        adr_norm,
+        "Operations token-audience separation",
+        "2. **Proposal proxy.",
+    )
+    assert "path (a)" in child_1, "Implementation child 1 must keep path (a)"
+    assert (
+        "separate adr and issue, after the cloudscape ui cutover" in child_1
+    ), "Implementation child 1 must point managed login out to a separate ADR and issue after #552"
+
+
+@pytest.mark.unit
+@pytest.mark.fast
+def test_e2_idempotency_must_use_canonical_fingerprint(adr_norm: str, tm_norm: str) -> None:
+    """The E2 capacity-prepare path must adopt ADR 0005's canonical fingerprint
+    in #429 before E2 merges; it is a required fix, not an accepted residual.
+
+    This replaces the old residual framing with a guard that the record now
+    states the fix as required and names the owning issue (#429), so the
+    cross-requester replay cannot be normalized as a tolerated deviation in a
+    Proposed ADR or an approved threat model. The forbidden-phrase guard removes
+    the old "recorded here as a residual" / "deviation from ADR 0005" wording;
+    this pins the replacement.
+    """
+    # The ADR frames the E2 fingerprint as a required fix keyed on ADR 0005's
+    # canonical fingerprint, owned by #429 (advise stack in #431).
+    assert (
+        "does not meet adr 0005's canonical fingerprint" in adr_norm
+    ), "the E2 narrower fingerprint must be stated as not meeting ADR 0005's canonical fingerprint"
+    assert "before e2 merges" in adr_norm, "the canonical fingerprint must be required before E2 merges"
+    assert "#429" in adr_norm, "the E2 idempotency fix must name its owning issue (#429)"
+    # The threat model's OP-H5 no longer carries the cross-requester replay as a
+    # residual; its residual column is now just the mis-tuning risk, and it
+    # points at the required #429 fix.
+    assert (
+        "cross-requester idempotency replay" not in tm_norm
+    ), "OP-H5 must not record cross-requester idempotency replay as a residual risk"
+    assert (
+        "must adopt that fingerprint in #429" in tm_norm
+    ), "OP-H5 must state the E2 path adopts ADR 0005's canonical fingerprint in #429"
 
 
 @pytest.mark.unit
