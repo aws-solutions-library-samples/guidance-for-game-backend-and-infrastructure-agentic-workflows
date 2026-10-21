@@ -78,7 +78,7 @@ dev = [
     # CLI/interactive tools (not needed in production)
     "strands-agents-builder>=0.1.10",
     "bedrock-agentcore-starter-toolkit>=0.3.11",
-    "uv>=0.12.0",
+    "uv>=0.13.4",
 
     # Testing
     "pytest>=9.1.1",
