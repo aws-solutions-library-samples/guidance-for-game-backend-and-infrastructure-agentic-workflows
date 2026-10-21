@@ -27,6 +27,9 @@ BeforeAll {
         )
 
         $destArn = 'arn:aws:logs:us-west-2:123456789012:delivery-destination:rt-1-traces-destination'
+        # GetNewClosure binds the block to its own module scope, where $script:
+        # variables are empty, so capture the runtime ARN as a local.
+        $runtimeArn = $script:RuntimeArn
         $firstStatus = $StatusSequence[0]
         $pollStatuses = if ($StatusSequence.Count -gt 1) { $StatusSequence[1..($StatusSequence.Count - 1)] } else { @($StatusSequence[-1]) }
         $pollQueue = [System.Collections.Generic.Queue[string]]::new()
@@ -50,7 +53,7 @@ BeforeAll {
                 'logs put-delivery-source' { return '{}' }
                 'logs put-delivery-destination' { return "{""deliveryDestination"":{""arn"":""$destArn""}}" }
                 'logs get-delivery-source' {
-                    return "{""deliverySource"":{""name"":""rt-1-traces-source"",""logType"":""TRACES"",""resourceArns"":[""$($script:RuntimeArn)""]}}"
+                    return "{""deliverySource"":{""name"":""rt-1-traces-source"",""logType"":""TRACES"",""resourceArns"":[""$runtimeArn""]}}"
                 }
                 'logs get-delivery-destination' {
                     if ($AwsArgs -contains '--query') { return $destArn }
