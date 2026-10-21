@@ -2,7 +2,7 @@
 Integration tests for Knowledge Base with GameLift specialist.
 
 These tests verify that the KB integration works end-to-end with the agent
-using the native Strands retrieve tool.
+using the backend's own Knowledge Base retrieve tool (``utils.kb_tools``).
 """
 
 # Standard library
@@ -32,10 +32,10 @@ class TestKBIntegration:
         kb_tool = create_kb_retrieve_tool("test-kb-id", "us-west-2")
         assert kb_tool is not None
 
-    def test_native_strands_retrieve_tool(self):
-        """Test native Strands retrieve tool is available."""
-        # Third-party packages
-        from strands_tools.retrieve import retrieve
+    def test_kb_retrieve_tool_is_available(self):
+        """Test the owned Knowledge Base retrieve tool is available."""
+        # Local modules
+        from utils.kb_tools import retrieve
 
         assert retrieve is not None
         assert callable(retrieve)
@@ -73,28 +73,24 @@ class TestKBIntegration:
 
 
 @pytest.mark.integration
-class TestNativeStrandsRetrieve:
-    """Test native Strands retrieve tool behavior."""
+class TestKBRetrieveTool:
+    """Test the owned Knowledge Base retrieve tool against a deployed KB."""
 
     def test_retrieve_tool_with_kb_configured(self):
-        """Test retrieve tool when KB is configured."""
+        """The bound retrieve tool returns a bounded JSON envelope with a state."""
         kb_id = os.getenv("GBAW_GAMELIFT_KB_ID")
         if not kb_id:
             pytest.skip("KB not configured")
 
-        # Third-party packages
-        from strands_tools.retrieve import retrieve
+        # Standard library
+        import json
 
-        # Create mock tool use
-        tool_use = {
-            "toolUseId": "test-123",
-            "input": {"text": "GameLift fleet capacity planning", "knowledgeBaseId": kb_id, "numberOfResults": 3},
-        }
+        # Local modules
+        from utils.kb_tools import create_kb_retrieve_tool
 
-        result = retrieve(tool_use)
+        kb_tool = create_kb_retrieve_tool(kb_id, os.getenv("AWS_REGION", "us-west-2"))
+        result = kb_tool(text="GameLift fleet capacity planning", numberOfResults=3)
 
-        # Should return proper tool result format
-        assert isinstance(result, dict)
-        assert "toolUseId" in result
-        assert "status" in result
-        assert "content" in result
+        assert isinstance(result, str)
+        envelope = json.loads(result)
+        assert "state" in envelope
