@@ -4,9 +4,11 @@ ADOT's MCP instrumentor writes ``gen_ai.tool.call.arguments`` and
 ``gen_ai.tool.call.result`` onto MCP protocol spans with no capture switch to
 turn them off. This test drives the real ADOT ``ClientWrapper`` behind an
 in-memory span exporter, confirms the tool result would otherwise be exported,
-and asserts that with the startup guard applied the MCP instrumentation produces
-no such spans. Token/name/timing data remain available on the Strands
-``execute_tool`` span, which the redaction token already covers for content.
+and asserts that with the startup guard applied the ADOT wrapper is removed from
+the MCP SDK send methods (no ``__wrapped__`` attribute remains), so the
+instrumentation that writes those attributes is no longer active on a real MCP
+call. Token/name/timing data remain available on the Strands ``execute_tool``
+span, which the redaction token already covers for content.
 """
 
 # Standard library

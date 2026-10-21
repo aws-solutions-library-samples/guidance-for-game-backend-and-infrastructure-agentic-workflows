@@ -26,8 +26,13 @@ OpenTelemetry log records:
   records tool/model error text as the span status description and, for
   exceptions, as an ``exception`` span event (message and stack trace). While
   redacting, the guard installs narrow wrappers on these two ``Tracer`` methods
-  that drop the ``system_prompt`` keyword (a no-op where it is not set as a raw
-  attribute) and reduce an error to its type while keeping the error status.
+  that drop the ``system_prompt`` keyword and reduce an error to its type while
+  keeping the error status. On versions that copy the keyword onto the agent span
+  as a raw attribute, dropping it stops the distro's log-record handler from
+  emitting a ``system`` message; on versions that route ``system_prompt`` through
+  the redaction policy, dropping it removes only the agent span's redacted
+  system-prompt event. Either way the system prompt is still reported, redacted,
+  through ``gen_ai.system_instructions`` on model spans.
 * Under agent observability the distro installs an OpenTelemetry logging handler
   on the root logger, so a library ``logger.exception(...)`` becomes a log record
   whose attributes carry the exception type, message, and stack trace. The MCP
@@ -317,13 +322,14 @@ def _install_mcp_logging_filter() -> None:
 def _install_strands_span_wrappers() -> None:
     """Wrap the Strands ``Tracer`` methods that export content the token misses.
 
-    * ``start_agent_span`` -- drop the ``system_prompt`` keyword so it is not set
-      as a plain span attribute on Strands versions that copy raw string keyword
-      arguments onto the agent span (and so the distro's log-record handler cannot
-      turn it into a ``system`` message). The system prompt is still reported,
-      redacted, through ``gen_ai.system_instructions`` on model spans. On Strands
-      versions that route the system prompt through the redaction policy instead
-      of setting a raw attribute, dropping the keyword is simply a no-op.
+    * ``start_agent_span`` -- drop the ``system_prompt`` keyword. On Strands
+      versions that copy raw string keyword arguments onto the agent span,
+      dropping it stops that raw attribute (and so the distro's log-record
+      handler cannot turn it into a ``system`` message). On versions that route
+      ``system_prompt`` through the redaction policy, ``Agent`` passes it by
+      keyword, so dropping it removes the agent span's redacted system-prompt
+      event. Either way the system prompt is still reported, redacted, through
+      ``gen_ai.system_instructions`` on model spans.
     * ``_end_span`` -- replace an error's status description with its exception
       type (or a fixed non-content string for an error-status tool result) and
       drop the exception object so no ``exception`` event with message/stack
