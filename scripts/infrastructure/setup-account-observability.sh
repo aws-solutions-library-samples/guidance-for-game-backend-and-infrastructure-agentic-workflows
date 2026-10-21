@@ -59,6 +59,11 @@ OBS_ACTIVE_RETRY_SECONDS="${GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS:-10}"
 [[ "$OBS_ACTIVE_MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || OBS_ACTIVE_MAX_ATTEMPTS=30
 [[ "$OBS_ACTIVE_RETRY_SECONDS" =~ ^[0-9]+$ ]] || OBS_ACTIVE_RETRY_SECONDS=10
 
+# Set to 1 by wait_for_destination_active when the destination never reached
+# ACTIVE within the wait budget. A later missing-'aws/spans' check reads this to
+# distinguish a still-PENDING destination from a genuine missing group.
+OBS_DESTINATION_WAIT_EXPIRED=0
+
 # --- Read-only state readers (safe in every mode) ---
 
 # Print the current X-Ray trace segment destination, or UNREADABLE if the read
@@ -216,7 +221,7 @@ report_without_mutation() {
     destination_display="$destination"
   fi
 
-  echo "  ℹ️  Default mode: no account-wide X-Ray or CloudWatch Logs changes will be made."
+  echo "  ℹ️  Default mode: this step makes no account-wide X-Ray or CloudWatch Logs changes."
   echo "      Current X-Ray trace segment destination: ${destination_display}"
 
   if [ "$destination" = "CloudWatchLogs" ] && [ "$spans_state" = "present" ]; then
@@ -408,9 +413,12 @@ configure_resource_policy() {
 }
 
 # Bounded poll until the trace destination reports ACTIVE. Warns (non-fatal) if
-# it never reaches ACTIVE within the budget.
+# it never reaches ACTIVE within the budget, and records that expiry in
+# OBS_DESTINATION_WAIT_EXPIRED so a later missing-'aws/spans' check can name the
+# still-PENDING destination as the likely cause instead of a first-time enable.
 wait_for_destination_active() {
   local attempt status
+  OBS_DESTINATION_WAIT_EXPIRED=0
   for ((attempt = 1; attempt <= OBS_ACTIVE_MAX_ATTEMPTS; attempt++)); do
     status="$(aws xray get-trace-segment-destination \
       --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "")"
@@ -422,6 +430,7 @@ wait_for_destination_active() {
       sleep "$OBS_ACTIVE_RETRY_SECONDS"
     fi
   done
+  OBS_DESTINATION_WAIT_EXPIRED=1
   echo "  ⚠️  Trace segment destination did not reach ACTIVE within the wait budget;"
   echo "      it may still converge shortly. Re-check in the AWS X-Ray console if traces"
   echo "      do not appear."
@@ -502,9 +511,14 @@ configure_account_observability() {
     return 1
   fi
 
-  # Validate the requested indexing percentage before any write.
+  # Validate the requested indexing percentage before any write. The value is
+  # interpolated verbatim into the update-indexing-rule JSON, where a JSON
+  # number may not carry a leading zero, so reject a leading zero (e.g. '05')
+  # here rather than letting the CLI's JSON parser reject it after the
+  # resource-policy and destination writes. Accept 0, or 1-3 digits with no
+  # leading zero, and cap at 100.
   if [ -n "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" ]; then
-    if ! [[ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" =~ ^[0-9]+$ ]] \
+    if ! [[ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" =~ ^(0|[1-9][0-9]{0,2})$ ]] \
       || [ "$GBAW_XRAY_DEFAULT_INDEXING_PERCENT" -gt 100 ]; then
       echo "❌ GBAW_XRAY_DEFAULT_INDEXING_PERCENT='${GBAW_XRAY_DEFAULT_INDEXING_PERCENT}' must be an integer in [0, 100]" >&2
       return 1
@@ -595,6 +609,16 @@ configure_account_observability() {
     echo "   and 'aws/spans' in the AWS X-Ray / CloudWatch console, then re-run." >&2
     return 1
   else
+    if [ "$OBS_DESTINATION_WAIT_EXPIRED" = "1" ]; then
+      echo "❌ Transaction Search was enabled (destination set to CloudWatchLogs) but the" >&2
+      echo "   destination is still PENDING after the wait budget, and the AWS-reserved" >&2
+      echo "   'aws/spans' log group does not exist yet. The destination transition can take" >&2
+      echo "   longer than the wait; the group typically appears once it becomes ACTIVE." >&2
+      echo "   Wait a few minutes and re-run the deployment, or check the destination status:" >&2
+      echo "     aws xray get-trace-segment-destination --region ${AWS_REGION}" >&2
+      echo "   Spans cannot flow until the destination is ACTIVE and 'aws/spans' exists." >&2
+      return 1
+    fi
     echo "❌ Transaction Search is enabled (destination CloudWatchLogs) but the" >&2
     echo "   AWS-reserved 'aws/spans' log group does not exist. A first-time API" >&2
     echo "   enable does not create it; create it once with EITHER:" >&2

@@ -507,7 +507,10 @@ def test_account_obs_default_makes_no_mutation_when_supported():
     result = _account_obs_harness("false", _obs_mock(destination="CloudWatchLogs", spans=True))
     assert "rc=0" in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
-    assert "no account-wide" in result.stdout
+    # The default-mode line scopes its "no changes" claim to this step, because a
+    # later launch step may still make account-wide changes.
+    assert "this step makes no account-wide X-Ray or CloudWatch Logs changes" in result.stdout
+    assert "no account-wide X-Ray or CloudWatch Logs changes will be made" not in result.stdout
     assert "already supports Transaction Search" in result.stdout
 
 
@@ -717,6 +720,61 @@ def test_account_obs_optin_refuses_before_any_write_when_percent_is_invalid():
     assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
 
 
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+@pytest.mark.parametrize("percent", ["05", "007"])
+def test_account_obs_optin_rejects_leading_zero_percent_before_any_write(shell, percent):
+    """A leading-zero percentage is rejected before any shared write.
+
+    The value is interpolated verbatim into the ``update-indexing-rule`` JSON,
+    and a JSON number may not carry a leading zero (``05`` is invalid JSON), so
+    the CLI would reject it only after the resource-policy and destination
+    writes. Validation therefore refuses it during the read-and-validate phase
+    with zero mutations, under both the login ``bash`` and macOS ``/bin/bash``.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=True, indexing_percent="5"),
+        extra_env=f'export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="{percent}"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "must be an integer in [0, 100]" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+@pytest.mark.parametrize("percent", ["0", "5", "100"])
+def test_account_obs_optin_accepts_canonical_percent(shell, percent):
+    """Canonical integers (no leading zero) in [0, 100] are accepted and the
+    opt-in reaches the indexing-rule write without a validation refusal."""
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="CloudWatchLogs", spans=True, indexing_percent="7"),
+        extra_env=f'export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="{percent}"',
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "must be an integer in [0, 100]" not in result.stderr
+    # The requested value is accepted and the rule is written (the mock reports a
+    # different current value so a change is always requested).
+    assert "MUTATION: xray update-indexing-rule" in result.stdout
+    assert f"indexing rule set to {percent}%" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_rejects_percent_above_100(shell):
+    """A value above 100 is still rejected before any shared write."""
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=True, indexing_percent="5"),
+        extra_env='export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="101"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "must be an integer in [0, 100]" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
 def test_account_obs_optin_refuses_before_any_write_when_indexing_unreadable_and_change_requested():
     """An unreadable indexing rule with a change requested refuses before any write.
 
@@ -873,6 +931,30 @@ def test_account_obs_optin_fails_when_spans_absent_after_enable(shell):
     assert "'aws/spans' log group does not exist" in result.stderr
     # The one-time remediation names both the console and the toggle path.
     assert "update-trace-segment-destination --destination XRay" in result.stderr
+    assert "Account-wide observability configured" not in result.stdout
+    # The destination reached ACTIVE in this case, so the failure must NOT blame
+    # a still-PENDING destination; it is the genuine missing-group case.
+    assert "still PENDING" not in result.stderr
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_names_pending_destination_when_wait_expires(shell):
+    """When the destination never reaches ACTIVE within the wait budget and
+    'aws/spans' is still absent, the failure must name the still-PENDING
+    destination (wait and re-run, or check its status) rather than blaming a
+    first-time enable that cannot create the group. The trace-destination
+    transition can take longer than the wait budget, so this is the likely
+    cause when the wait expired.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=False, status="PENDING"),
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "MUTATION: xray update-trace-segment-destination" in result.stdout
+    # The message points at the still-PENDING destination, not a missing group.
+    assert "still PENDING" in result.stderr
     assert "Account-wide observability configured" not in result.stdout
 
 
