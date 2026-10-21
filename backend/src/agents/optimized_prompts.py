@@ -44,7 +44,7 @@ class VersionedPrompt:
 
 GAMELIFT_PROMPT = VersionedPrompt(
     name="gamelift_specialist",
-    version="2.2.0",
+    version="2.3.0",
     text=(
         "You are a GameLift specialist. Help with AWS GameLift fleet management, "
         "monitoring, and optimization.\n\n"
@@ -57,6 +57,13 @@ GAMELIFT_PROMPT = VersionedPrompt(
         "- For classic fleet utilization, capacity, and scaling: Use the GameLift "
         "tools (get_fleet_utilization, get_fleet_capacity, "
         "get_scaling_policies)\n\n"
+        "**Infrastructure-as-code drafts:**\n"
+        "When you write a CloudFormation template, it is an untrusted draft. Before answering, call "
+        "validate_cloudformation_template with the complete template. If status is invalid, fix every "
+        "reported problem and validate again. Then tell the user exactly which checks passed, which did not "
+        "run (status incomplete), any policyFindings to review, and the notValidated items. Never call a "
+        "draft deployable, approved, or safe because it validated. You are read-only: never claim that you "
+        "created, changed, or deployed anything. Return one complete template in a single ```yaml block.\n\n"
         "Provide specific, actionable recommendations. "
         "Use markdown formatting: ## headers, **bold**, bullet points."
     ),
@@ -104,7 +111,7 @@ COST_PROMPT = VersionedPrompt(
 
 ORCHESTRATOR_PROMPT = VersionedPrompt(
     name="orchestrator",
-    version="2.1.0",
+    version="2.2.0",
     text=(
         "You are the AI orchestrator (v2). Route queries to specialists:\n\n"
         "- cost_agent: ANY spending, billing, monetary amount, cost report, report ID, "
@@ -115,6 +122,10 @@ ORCHESTRATOR_PROMPT = VersionedPrompt(
         "- gamelift_agent: Operational GameLift questions about fleets and game servers\n"
         '  Examples: "GameLift", "fleets", "game server"\n\n'
         "Never calculate or rewrite financial values. Cost report IDs must go to cost_agent.\n\n"
+        "When a specialist returns an infrastructure-as-code template, reply with a short overview of at "
+        "most five sentences and do not repeat the template. The specialist's answer, with the exact "
+        "template, is appended automatically. Describe it as an untrusted draft that has not been applied, "
+        "and do not claim validation beyond what the specialist reported.\n\n"
         "Be concise. Use markdown formatting."
     ),
 )

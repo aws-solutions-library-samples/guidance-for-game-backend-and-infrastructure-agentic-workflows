@@ -286,6 +286,27 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
+              # Read-only validation of untrusted CloudFormation drafts
+              # (agents/cfn_template_validation.py). ValidateTemplate has no
+              # resource-level permissions, so it is bound to this Region.
+              # DescribeType is limited to the public AWS:: resource-type
+              # registry (no account-scoped or third-party types). Neither
+              # action creates, changes, or reads account resources. See
+              # SECURITY.md, "CloudFormation draft validation".
+              - Sid: CloudFormationDraftValidation
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: CloudFormationPublicTypeSchemas
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeType
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}::type/resource/AWS-*'
               - Sid: GameLiftReadAccess
                 Effect: Allow
                 Action:
