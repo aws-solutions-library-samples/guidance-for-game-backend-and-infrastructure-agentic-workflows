@@ -524,10 +524,12 @@ def _covering_tag_rulesets(client: GitHubClient, *, ref: str) -> list[dict]:
     aggregated and the most restrictive version applies), so the gate must look
     at all covering rulesets, not just the first.
 
-    Reads each tag-target ruleset's ``conditions.ref_name`` and ``rules`` with
+    Reads each ruleset's ``conditions.ref_name`` and ``rules`` with
     ``GET /repos/{o}/{r}/rulesets/{id}`` (``Metadata: read``). A ruleset counts
-    only when it is ``active`` and an include pattern matches ``ref`` (``~ALL``
-    or an ``FNM_PATHNAME`` pattern) with no exclude pattern that removes it. The
+    only when it is ``active``, its detail ``target`` is ``tag`` (re-checked on
+    the detail rather than trusting the server-side ``?targets=tag`` list
+    filter), and an include pattern matches ``ref`` (``~ALL`` or an
+    ``FNM_PATHNAME`` pattern) with no exclude pattern that removes it. The
     returned list preserves the order GitHub lists the rulesets in, so the
     caller can inspect each ruleset's rule types and ``current_user_can_bypass``
     independently (``current_user_can_bypass`` is reported per ruleset).
@@ -542,6 +544,13 @@ def _covering_tag_rulesets(client: GitHubClient, *, ref: str) -> list[dict]:
             continue
         detail = client.get_ruleset(ruleset_id)
         if str(detail.get("enforcement", summary.get("enforcement", ""))) != "active":
+            continue
+        # Re-check the ruleset's own ``target`` on the detail rather than
+        # trusting the server-side ``?targets=tag`` list filter. Fail closed
+        # when it is absent or anything other than ``tag`` so a branch-target
+        # ruleset (which can carry a ~ALL include and an update rule) is never
+        # read as covering a tag ref if that list filter ever stopped applying.
+        if str(detail.get("target", "")) != "tag":
             continue
         conditions = (detail.get("conditions") or {}).get("ref_name") or {}
         include = conditions.get("include") or []

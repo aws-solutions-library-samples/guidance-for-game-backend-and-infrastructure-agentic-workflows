@@ -203,15 +203,18 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _check_asset_set(assets, *, inputs: PublishInputs, context: str) -> None:
+def _check_asset_set(assets, *, inputs: PublishInputs, context: str, require_uploaded: bool = False) -> None:
     """Shared asset check: exactly the four allowlisted names, each matching the
     published size and, when GitHub reports a ``digest``, the ``SHA256SUMS`` sha.
 
     ``context`` names the phase in the error message ("draft" / "post-publish
     read-back") so an operator knows whether the mismatch is still repairable.
-    Every attached asset is checked, and all mismatches are collected into one
-    raised :class:`ValidationError` so an operator sees every bad asset at once
-    rather than only the first.
+    When ``require_uploaded`` is set (the post-publication read-back), each
+    asset must also read back ``state == "uploaded"``; an asset in any other
+    state (an upload that reported success but never finished) is a failure
+    entry. Every attached asset is checked, and all mismatches are collected
+    into one raised :class:`ValidationError` so an operator sees every bad asset
+    at once rather than only the first.
     """
 
     local_by_name = {a.name: a.data for a in inputs.artifacts}
@@ -235,6 +238,10 @@ def _check_asset_set(assets, *, inputs: PublishInputs, context: str) -> None:
             expected = sums_entries.get(name) or checksums.sha256_hex(local)
             if reported != expected:
                 failures.append(f"{context}: asset {name} digest does not equal its published checksum")
+        if require_uploaded:
+            state = str(asset.get("state", ""))
+            if state != "uploaded":
+                failures.append(f"{context}: asset {name} state {state!r} is not 'uploaded'")
     if failures:
         raise ValidationError("; ".join(failures))
 
@@ -388,7 +395,7 @@ def _verify_published_assets(client: GitHubClient, *, release_id: int, inputs: P
         lambda: client.list_release_assets(release_id),
         is_ready=lambda a: {str(x.get("name", "")) for x in a} == set(ALLOWED_ARTIFACT_NAMES),
     )
-    _check_asset_set(assets, inputs=inputs, context="post-publish read-back")
+    _check_asset_set(assets, inputs=inputs, context="post-publish read-back", require_uploaded=True)
 
 
 def _verify_published_tag(client: GitHubClient, *, inputs: PublishInputs, created_tag_sha: str | None) -> None:

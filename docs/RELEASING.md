@@ -130,13 +130,14 @@ from the exact tag:
 | Artifact | Contents |
 | --- | --- |
 | `release-manifest.json` | Schema version, tag/name, commit and commit date, default operations mode (proven `disabled` by a fail-closed scan of **every tracked file**, regardless of suffix: the ADR declares the default and no tracked file references `GBAW_OPERATIONS_MODE` except Markdown files and files under `docs/`, `scripts/release/`, and `scripts/test/`), SHA-256 of dependency locks, managed-prompt sources, and every `*.yaml`/`*.yml` under `infrastructure/` (both CloudFormation templates and the Kubernetes RBAC manifests, under `hashes.infrastructure_templates`), required-check conclusions, the evidence digest, gate summary, and waiver issue references, and the attached file names. Serialized with sorted keys, two-space indent, ASCII, LF, trailing newline. |
-| `backend-sbom.spdx.json` | Backend SPDX SBOM from a pinned syft over `dir:backend` **without installing dependencies**, normalized (creation time set to the commit date in UTC `YYYY-MM-DDThh:mm:ssZ`, a namespace made unique per release from the source name, tag, and commit, and absolute paths removed). syft records only public package-registry hosts, so no hostname scrubbing is performed; the exclusion guard independently rejects any hostname that is not an allowlisted public package-registry host (reporting an AWS/Amazon-owned suffix distinctly), so a release carrying an internal, private, or otherwise unexpected host fails closed rather than publishing it. |
+| `backend-sbom.spdx.json` | Backend SPDX SBOM from a pinned syft over `dir:backend` **without installing dependencies**, normalized (creation time set to the commit date in UTC `YYYY-MM-DDThh:mm:ssZ`, a namespace made unique per release from the source name, tag, and commit, and absolute paths removed). syft records only public package-registry hosts, so no hostname scrubbing is performed; the exclusion guard independently rejects any host in an `http` or `https` URL that is not an allowlisted public package-registry host (reporting an AWS/Amazon-owned suffix distinctly), so a release carrying an internal, private, or otherwise unexpected host fails closed rather than publishing it. |
 | `frontend-sbom.spdx.json` | Frontend SPDX SBOM over `dir:ui`, normalized the same way. |
 | `SHA256SUMS` | `sha256sum`-format checksums, sorted by filename, covering every other attached file. |
 
 An exclusion guard rejects any artifact outside this allowlist and any content
 containing ARNs, account-ID patterns, credentials/tokens, `.env` /
-`.bedrock_agentcore` material, source archives, or any hostname that is not an
+`.bedrock_agentcore` material, source archives, or any host in an `http` or
+`https` URL that is not an
 allowlisted public package-registry host — so an internal or unknown private
 registry host (for example one carried in a lockfile index URL) fails closed
 rather than being published. **GitHub supplies the source `.zip`/`.tar.gz`

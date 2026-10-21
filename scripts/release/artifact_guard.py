@@ -10,9 +10,9 @@ two independent rules before any artifact is uploaded:
 
 2. **Forbidden content.** No ARNs, account-ID patterns, credentials/tokens,
    ``.env`` / ``.bedrock_agentcore`` material, source-archive signatures, or any
-   hostname outside the allowlisted public package registries (an internal,
-   private, or otherwise unknown host fails closed) may appear in any attached
-   bytes.
+   host in an ``http`` or ``https`` URL outside the allowlisted public package
+   registries (an internal, private, or otherwise unknown host fails closed)
+   may appear in any attached bytes.
 
 The guard is intentionally conservative: it fails closed. It reuses the
 repository public-content rules where possible but adds release-specific
@@ -140,6 +140,13 @@ def _looks_like_archive(name: str, data: bytes) -> bool:
 
 
 def _hostnames(text: str) -> set[str]:
+    """Return the lowercased hosts of every ``http`` and ``https`` URL in ``text``.
+
+    The scan covers hosts carried in ``http(s)`` URLs (how SBOMs reference
+    package registries and license pages). Other schemes (``ssh``,
+    ``git+ssh``) and scheme-less host strings are out of scope for this check.
+    """
+
     hosts: set[str] = set()
     for match in re.finditer(r"https?://([A-Za-z0-9.\-]+)", text):
         hosts.add(match.group(1).lower())

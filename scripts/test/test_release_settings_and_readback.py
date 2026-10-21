@@ -113,7 +113,12 @@ def _record_assets(client, release_id, inputs):
     import hashlib
 
     client.release_assets[release_id] = [
-        {"name": a.name, "size": len(a.data), "digest": f"sha256:{hashlib.sha256(a.data).hexdigest()}"}
+        {
+            "name": a.name,
+            "size": len(a.data),
+            "digest": f"sha256:{hashlib.sha256(a.data).hexdigest()}",
+            "state": "uploaded",
+        }
         for a in inputs.artifacts
     ]
 
@@ -323,6 +328,43 @@ class PostPublishReadBackTests(unittest.TestCase):
             client.upload_release_asset = wrong_digest  # type: ignore[assignment]
             with self.assertRaises(validate_mod.ValidationError):
                 publish.publish_release_from_dir(client, out, _metadata())
+
+    def test_asset_not_uploaded_state_fails_post_publish_read_back(self):
+        # The post-publish read-back must confirm each asset's state is
+        # "uploaded"; an asset that read back in any other state (for example
+        # "starter" or "new", an upload that never completed) is a failure
+        # entry, aggregated with the other read-back checks. Direct
+        # verify_published_release call so the state is observed on the
+        # PUBLISHED release, not the pre-tag draft.
+        inputs = _artifact_inputs()
+        client = _ready_client()
+        client.releases.append({"id": 510, "tag_name": "v0.1.0", "draft": False})
+        client.published_immutable = True
+        _record_assets(client, 510, inputs)
+        # Mark one asset as not-yet-uploaded.
+        client.release_assets[510][0]["state"] = "starter"
+        # A valid tag ref so the tag checks pass and only the asset state fails.
+        client.existing_refs["tags/v0.1.0"] = "t" * 40
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.verify_published_release(client, release_id=510, inputs=inputs, created_tag_sha="t" * 40)
+        message = str(ctx.exception).lower()
+        self.assertIn("state", message)
+        self.assertIn("post-publish read-back", message)
+
+    def test_uploaded_state_passes_post_publish_read_back(self):
+        # The happy path (every asset state "uploaded") passes the read-back, so
+        # the new state check does not reject a correctly published release.
+        inputs = _artifact_inputs()
+        client = _ready_client()
+        client.releases.append({"id": 511, "tag_name": "v0.1.0", "draft": False})
+        client.published_immutable = True
+        _record_assets(client, 511, inputs)
+        client.existing_refs["tags/v0.1.0"] = "t" * 40
+        with mock.patch.object(publish, "_sleep", lambda _s: None):
+            publish.verify_published_release(
+                client, release_id=511, inputs=inputs, created_tag_sha="t" * 40
+            )  # does not raise
 
     def test_tag_object_pointing_at_wrong_commit_fails_read_back(self):
         with tempfile.TemporaryDirectory() as d:
@@ -945,6 +987,114 @@ class TagRulesetGateTests(unittest.TestCase):
                     expected,
                     f"include={include} exclude={exclude} tag={tag}",
                 )
+
+    def test_branch_target_ruleset_does_not_cover_a_tag_even_if_the_list_filter_lapses(self):
+        # The gate must re-check each ruleset's own ``target`` on the detail and
+        # not trust the server-side ``?targets=tag`` list filter. A branch-target
+        # ruleset with a ~ALL include and an ``update`` rule would otherwise be
+        # read as covering refs/tags/v0.1.0 if that filter ever stopped applying.
+        # With the filter disabled, the gate must still refuse (the ruleset's
+        # target is ``branch``, not ``tag``), so no tag is protected.
+        client = RecordingClient()
+        client.list_rulesets_ignore_target_filter = True
+        client.rulesets = [{"id": 55, "name": "branch all", "target": "branch", "enforcement": "active"}]
+        client.ruleset_details = {
+            55: {
+                "id": 55,
+                "name": "branch all",
+                "target": "branch",
+                "enforcement": "active",
+                "current_user_can_bypass": "never",
+                "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+                "rules": [{"type": "update"}],
+            }
+        }
+        # The branch-target ruleset is NOT a covering tag ruleset.
+        covering = validate_mod._covering_tag_rulesets(client, ref="refs/tags/v0.1.0")
+        self.assertEqual(covering, [])
+        with self.assertRaises(validate_mod.ValidationError):
+            validate_mod.validate_tag_ruleset_present(client, tag="v0.1.0")
+
+    def test_branch_target_ruleset_in_publish_path_refuses_before_any_write(self):
+        # End to end: a repository whose only ruleset is branch-target (even if
+        # the tag list filter lapsed and returned it) does not protect the tag,
+        # so publish_release_from_dir must refuse before any create_release.
+        # Standard library
+        import tempfile
+
+        # Local modules
+        from release import artifacts as artifacts_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "release-artifacts"
+            _write_artifact_set(out)
+            client = RecordingClient()
+            client.main_head = COMMIT
+            apply_release_settings(client)
+            client.list_rulesets_ignore_target_filter = True
+            client.rulesets = [{"id": 55, "name": "branch all", "target": "branch", "enforcement": "active"}]
+            client.ruleset_details = {
+                55: {
+                    "id": 55,
+                    "name": "branch all",
+                    "target": "branch",
+                    "enforcement": "active",
+                    "current_user_can_bypass": "never",
+                    "conditions": {"ref_name": {"include": ["~ALL"], "exclude": []}},
+                    "rules": [{"type": "update"}],
+                }
+            }
+            with self.assertRaises(validate_mod.ValidationError) as ctx:
+                publish.publish_release_from_dir(client, out, _metadata())
+            self.assertIn("tag ruleset", str(ctx.exception).lower())
+            self.assertNotIn("create_release", client.calls)
+
+
+class GateReadErrorFailClosedTests(unittest.TestCase):
+    """Each authoritative gate read must fail closed: when a read raises the
+    client's error type, publish_release_from_dir raises and makes no write.
+
+    These pin the fail-closed behavior so a future ``try/except ... continue``
+    around a gate read would turn a test red rather than silently letting a
+    release through on a transient or forbidden read."""
+
+    def _ready_publish_client(self):
+        client = RecordingClient()
+        client.main_head = COMMIT
+        apply_release_settings(client)
+        return client
+
+    def _assert_fails_closed_on_read_error(self, method_name):
+        # Standard library
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "release-artifacts"
+            _write_artifact_set(out)
+            client = self._ready_publish_client()
+            client.read_fail_on = {method_name}
+            with self.assertRaises(GitHubError) as ctx:
+                publish.publish_release_from_dir(client, out, _metadata())
+            self.assertEqual(ctx.exception.status, 403)
+            # No write of any kind: the gate ran before create_release and the
+            # read error was not swallowed.
+            for write in ("create_release", "create_tag_object", "create_ref", "upload_release_asset"):
+                self.assertFalse(
+                    any(call.startswith(write) for call in client.calls),
+                    msg=f"{write} must not run when {method_name} fails; calls={client.calls}",
+                )
+
+    def test_list_rulesets_read_error_fails_closed(self):
+        self._assert_fails_closed_on_read_error("list_rulesets")
+
+    def test_get_ruleset_read_error_fails_closed(self):
+        self._assert_fails_closed_on_read_error("get_ruleset")
+
+    def test_get_environment_read_error_fails_closed(self):
+        self._assert_fails_closed_on_read_error("get_environment")
+
+    def test_list_deployment_branch_policies_read_error_fails_closed(self):
+        self._assert_fails_closed_on_read_error("list_deployment_branch_policies")
 
 
 class EnvironmentPolicyGateTests(unittest.TestCase):

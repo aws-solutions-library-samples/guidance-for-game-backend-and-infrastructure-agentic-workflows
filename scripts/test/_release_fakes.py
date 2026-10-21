@@ -15,7 +15,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 # Local modules
-from release.github_client import GitHubClient, Request, Response  # noqa: E402
+from release.github_client import GitHubClient, GitHubError, Request, Response  # noqa: E402
 
 
 class RecordingClient(GitHubClient):
@@ -50,6 +50,15 @@ class RecordingClient(GitHubClient):
         self.release_assets: dict[int, list[dict]] = {}
         self.published_immutable = True
         self.tag_objects: dict[str, dict] = {}  # tag-object sha -> {"object": {...}}
+        # Read-error injection. A read method named here raises the client's own
+        # error type (``GitHubError``) so tests can pin that the authoritative
+        # gates fail closed on a read error rather than swallowing it.
+        self.read_fail_on: set[str] = set()
+        # When true, ``list_rulesets`` returns every ruleset regardless of the
+        # requested ``target``, modeling a server-side ``?targets=`` filter that
+        # stopped applying. Tests use it to prove the gate re-checks each
+        # ruleset's own ``target`` rather than trusting the list filter.
+        self.list_rulesets_ignore_target_filter = False
         # Write behavior
         self.fail_on: str | None = None  # method name to raise in
         self._next_release_id = 100
@@ -62,6 +71,14 @@ class RecordingClient(GitHubClient):
         self.calls.append(name)
         if self.fail_on == name:
             raise RuntimeError(f"injected failure in {name}")
+
+    def _maybe_read_fail(self, name: str) -> None:
+        """Raise the client's own error type for a read method named in
+        ``read_fail_on`` (a sanitized 403), so a gate that failed to fail closed
+        on a read error would let the write through instead of raising."""
+
+        if name in self.read_fail_on:
+            raise GitHubError(403, name, "forbidden")
 
     # -- reads --
     def get_branch_head_sha(self, branch: str) -> str:
@@ -93,6 +110,7 @@ class RecordingClient(GitHubClient):
 
     def get_environment(self, name: str):
         self.calls.append(f"get_environment:{name}")
+        self._maybe_read_fail("get_environment")
         environments = getattr(self, "environments", None) or {}
         payload = environments.get(name)
         return dict(payload) if payload is not None else None
@@ -103,13 +121,15 @@ class RecordingClient(GitHubClient):
 
     def list_rulesets(self, *, target=None):
         self.calls.append(f"list_rulesets:{target}")
+        self._maybe_read_fail("list_rulesets")
         rulesets = [dict(r) for r in getattr(self, "rulesets", [])]
-        if target is None:
+        if target is None or getattr(self, "list_rulesets_ignore_target_filter", False):
             return rulesets
         return [r for r in rulesets if str(r.get("target", "")) == target]
 
     def get_ruleset(self, ruleset_id: int):
         self.calls.append(f"get_ruleset:{ruleset_id}")
+        self._maybe_read_fail("get_ruleset")
         detail = getattr(self, "ruleset_details", {}).get(ruleset_id)
         if detail is not None:
             return dict(detail)
@@ -166,6 +186,7 @@ class RecordingClient(GitHubClient):
 
     def list_deployment_branch_policies(self, name: str):
         self.calls.append(f"list_deployment_branch_policies:{name}")
+        self._maybe_read_fail("list_deployment_branch_policies")
         return [dict(p) for p in getattr(self, "deployment_branch_policies", {}).get(name, [])]
 
     def get_release(self, release_id: int):
