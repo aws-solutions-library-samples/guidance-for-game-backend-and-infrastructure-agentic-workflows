@@ -283,11 +283,8 @@ def test_sign_in_decision_chooses_path_a_and_defers_managed_login(adr_norm: str)
     """Path (a) is the chosen operations-token path; managed login (path (b)) is
     a planned follow-up for a separate, later ADR after the Cloudscape UI cutover.
 
-    This pins decision 1's sequencing so the record cannot drift back to
-    choosing managed login here (the superseded "chosen path (b)") or to folding
-    the managed-login migration into this ADR. It guards the same property the
-    old pins guarded — the precondition gate and no overstatement of what this
-    record changes — now against the decision this ADR makes: the shell cutover
+    This pins decision 1's sequencing: the record must not choose managed login
+    here or fold the managed-login migration into this ADR, so the shell cutover
     (#552) and its rollback never change the sign-in flow at the same time.
     """
     # Path (a) is the chosen operations-token path for this ADR.
@@ -319,12 +316,10 @@ def test_e2_idempotency_must_use_canonical_fingerprint(adr_norm: str, tm_norm: s
     """The E2 capacity-prepare path must adopt ADR 0005's canonical fingerprint
     in #429 before E2 merges; it is a required fix, not an accepted residual.
 
-    This replaces the old residual framing with a guard that the record now
-    states the fix as required and names the owning issue (#429), so the
-    cross-requester replay cannot be normalized as a tolerated deviation in a
-    Proposed ADR or an approved threat model. The forbidden-phrase guard removes
-    the old "recorded here as a residual" / "deviation from ADR 0005" wording;
-    this pins the replacement.
+    The record states the fix as required and names the owning issue (#429), so
+    the cross-requester replay cannot be normalized as a tolerated deviation in a
+    Proposed ADR or an approved threat model. The forbidden-phrase guard rejects
+    residual or deviation framing; this test pins the required-fix wording.
     """
     # The ADR frames the E2 fingerprint as a required fix keyed on ADR 0005's
     # canonical fingerprint, owned by #429 (advise stack in #431).
@@ -333,9 +328,9 @@ def test_e2_idempotency_must_use_canonical_fingerprint(adr_norm: str, tm_norm: s
     ), "the E2 narrower fingerprint must be stated as not meeting ADR 0005's canonical fingerprint"
     assert "before e2 merges" in adr_norm, "the canonical fingerprint must be required before E2 merges"
     assert "#429" in adr_norm, "the E2 idempotency fix must name its owning issue (#429)"
-    # The threat model's OP-H5 no longer carries the cross-requester replay as a
-    # residual; its residual column is now just the mis-tuning risk, and it
-    # points at the required #429 fix.
+    # The threat model's OP-H5 does not record the cross-requester replay as a
+    # residual; its residual column is the mis-tuning risk, and it points at the
+    # required #429 fix.
     assert (
         "cross-requester idempotency replay" not in tm_norm
     ), "OP-H5 must not record cross-requester idempotency replay as a residual risk"
