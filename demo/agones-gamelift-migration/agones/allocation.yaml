@@ -1,0 +1,10 @@
+# Allocate one game server out of the fleet — the Agones equivalent of
+# "a match started / players joined". Re-apply to allocate another.
+apiVersion: allocation.agones.dev/v1
+kind: GameServerAllocation
+metadata:
+  name: simple-game-server-allocation
+spec:
+  selectors:
+    - matchLabels:
+        agones.dev/fleet: simple-game-server
