@@ -500,8 +500,8 @@ manifest are the stated supply-chain boundary. When the immutable-releases
 setting is enabled, creating an immutable release makes GitHub generate a
 release attestation (a cryptographically verifiable record of the tag, commit
 SHA, and assets), so enabling that setting is also what provides attestation
-today. A dedicated, workflow-signed provenance attestation is tracked as a
-follow-up.
+today. A dedicated, workflow-signed provenance attestation is tracked in
+[#613](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/613).
 
 ## Recommended maintainer settings
 

@@ -548,7 +548,9 @@ Build-provenance attestation is deferred, consistent with the no-AWS-credentials
 design: the workflow holds no `id-token` or `attestations` permission, and the
 attached SBOMs plus the `SHA256SUMS` manifest are the stated supply-chain
 boundary. When the immutable-releases setting is enabled, creating an immutable
-release makes GitHub generate a release attestation automatically.
+release makes GitHub generate a release attestation automatically. A dedicated,
+workflow-signed provenance attestation is tracked in
+[#613](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/613).
 
 ## License
 
