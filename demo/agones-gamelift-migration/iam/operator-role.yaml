@@ -284,10 +284,8 @@ Resources:
                 Effect: Allow
                 Action: logs:PutRetentionPolicy
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/*"
-              # Fleet log groups: the reference template's own group, and the
-              # default gamelift-<fleet ID>-<Region> group that `down` removes
-              # for each fleet it deletes. Fleet IDs are generated, so the
-              # default group is scoped by its name pattern only.
+              # Fleet log groups the reference template creates and deletes
+              # (AWS::Logs::LogGroup handler actions), scoped to this prefix.
               - Sid: FleetLogGroups
                 Effect: Allow
                 Action:
@@ -306,7 +304,13 @@ Resources:
                   - logs:DescribeIndexPolicies
                 Resource:
                   - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:gamelift-${StackPrefix}-*"
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:gamelift-containerfleet-*"
+              # The default gamelift-<fleet ID>-<Region> group that `down`
+              # removes for each fleet it deletes. Fleet IDs are generated, so
+              # this is scoped by the name pattern only, and only for deletion.
+              - Sid: DeleteDefaultFleetLogGroups
+                Effect: Allow
+                Action: logs:DeleteLogGroup
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:gamelift-containerfleet-*"
               - Sid: ListLogGroups
                 Effect: Allow
                 Action:

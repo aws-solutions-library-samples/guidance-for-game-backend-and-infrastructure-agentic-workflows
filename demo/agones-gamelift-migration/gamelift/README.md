@@ -62,8 +62,10 @@ What to look for (the reference template shows each one):
   parameters if the template lacks them.
 - `demo` and `demo-env` tags on the stack (see step 3), so that the operator
   role allows the GameLift resources and `down` finds the stack.
-- `LogConfiguration` pointing at a log group the stack creates, as the
-  reference template does. Without it, GameLift writes to a default
+- `LogConfiguration` pointing at a log group the stack creates, named
+  `gamelift-${AWS::StackName}` as in the reference template: GameLift requires
+  the `gamelift-` prefix, and the operator role can create only
+  `gamelift-<prefix>-*` groups. Without it, GameLift writes to a default
   `gamelift-<fleet ID>-<Region>` group that outlives the stack; `down` deletes
   it for every fleet it deletes.
 - Only the resources you expect, small capacity, and one location.

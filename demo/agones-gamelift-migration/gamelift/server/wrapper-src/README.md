@@ -10,8 +10,9 @@ directory, copied from the upstream repository.
 Changes from upstream: `server.go` is unmodified. `go.mod` and `go.sum` raise
 `github.com/gorilla/websocket` from v1.5.1 to v1.5.3
 ([GHSA-w67g-5rqw-f597](https://github.com/advisories/GHSA-w67g-5rqw-f597)) and
-are re-tidied against Server SDK 5.2.0, which drops the `golang/mock` and
-`golang.org/x/net` requirements that only websocket v1.5.1 needed. Dependabot
+are re-tidied against Server SDK 5.2.0. Tidying drops the `golang.org/x/net`
+requirement, which only websocket v1.5.1 needed, and the indirect `golang/mock`
+entry, which the Server SDK's own `go.mod` already carries. Dependabot
 cannot raise it here, because the `replace` directive points at the SDK
 directory that `../build.sh` downloads at build time.
 

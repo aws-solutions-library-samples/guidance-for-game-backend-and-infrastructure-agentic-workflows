@@ -7,6 +7,7 @@ Agones services, and a region-bound, resource-scoped operator role.
 """
 
 # Standard library
+import fnmatch
 import re
 from pathlib import Path
 from typing import Any
@@ -334,10 +335,8 @@ EXPECTED_ALLOW_RESOURCES = {
     "EksAccountReads": ["*"],
     "EksAmiLookup": [f"{_P}:ssm:${{AWS::Region}}::parameter/aws/*"],
     "EksctlLogRetention": [f"{_P}:logs:{_ACCT}:log-group:/aws/eks/${{ClusterName}}/*"],
-    "FleetLogGroups": [
-        f"{_P}:logs:{_ACCT}:log-group:gamelift-${{StackPrefix}}-*",
-        f"{_P}:logs:{_ACCT}:log-group:gamelift-containerfleet-*",
-    ],
+    "FleetLogGroups": [f"{_P}:logs:{_ACCT}:log-group:gamelift-${{StackPrefix}}-*"],
+    "DeleteDefaultFleetLogGroups": [f"{_P}:logs:{_ACCT}:log-group:gamelift-containerfleet-*"],
     "ListLogGroups": ["*"],
     "IamCreateBoundedRoles": _DEMO_ROLES,
     "IamAttachAllowlistedPolicies": _DEMO_ROLES,
@@ -385,9 +384,11 @@ def test_no_policy_version_actions_are_granted():
     for statement in _statements():
         if statement["Effect"] != "Allow":
             continue
-        actions = set(_actions(statement))
-        assert not actions & forbidden, statement["Sid"]
-        assert not any(a.endswith("*") and a.startswith("iam:") for a in actions), statement["Sid"]
+        for pattern in _actions(statement):
+            # IAM action names are case-insensitive and may use * and ? anywhere.
+            matched = [name for name in forbidden if fnmatch.fnmatchcase(name.lower(), pattern.lower())]
+            assert not matched, (statement["Sid"], pattern, matched)
+            assert not (pattern.startswith("iam:") and "*" in pattern), (statement["Sid"], pattern)
 
 
 def test_tagging_cannot_bring_another_environments_resource_into_scope():
@@ -426,3 +427,12 @@ def test_reference_fleet_logs_to_a_group_the_stack_deletes():
     logging = resources["ContainerFleet"]["Properties"]["LogConfiguration"]
     assert logging["LogDestination"] == "CLOUDWATCH"
     assert logging["LogGroupArn"].endswith(":log-group:${FleetLogGroup}")
+
+
+def test_default_fleet_log_groups_are_delete_only():
+    statement = _by_sid()["DeleteDefaultFleetLogGroups"]
+    assert _actions(statement) == ["logs:DeleteLogGroup"]
+    for other in _statements():
+        resources = _list(other.get("Resource", []))
+        if other["Effect"] == "Allow" and other["Sid"] != "DeleteDefaultFleetLogGroups":
+            assert not any("gamelift-containerfleet-" in r for r in resources), other["Sid"]

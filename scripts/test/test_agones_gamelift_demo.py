@@ -540,6 +540,37 @@ class DemoScriptBehavior(unittest.TestCase):
         deleted = [c for c in self.calls() if c.startswith("aws cloudformation delete-stack")]
         self.assertEqual([re.search(r"--stack-name (\S+)", c).group(1) for c in deleted], ["gl-demo-review"])
 
+    def test_change_set_lookup_errors_fail_closed(self) -> None:
+        for prefix in ("aws cloudformation list-change-sets", "aws cloudformation describe-change-set"):
+            for command in ("verify-clean", "down"):
+                self.clean_state(
+                    stacks={"gl-demo-review": {"status": "REVIEW_IN_PROGRESS", "tags": {}, "change_sets": [DEMO_TAGS]}},
+                    errors={prefix: "(AccessDeniedException) when calling the operation"},
+                )
+                result = self.run_script(command, DEMO_CONFIRM=ENV)
+                self.assertNotEqual(result.returncode, 0, (prefix, command))
+                self.assertNotIn("No resources", result.stdout, (prefix, command))
+
+    def test_change_sets_that_differ_only_in_unrelated_tags_still_match(self) -> None:
+        self.clean_state(stacks={"gl-demo-review": {"status": "REVIEW_IN_PROGRESS", "tags": {},
+                                                    "change_sets": [{**DEMO_TAGS, "owner": "a"},
+                                                                    {**DEMO_TAGS, "owner": "b"}]}})
+        result = self.run_script("verify-clean")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gl-demo-review REVIEW_IN_PROGRESS", result.stdout)
+
+    def test_down_deletes_fleet_log_groups_after_the_cluster_and_repository(self) -> None:
+        fleet = "containerfleet-00000000-0000-0000-0000-000000000000"
+        state = self.read_state()
+        state["stacks"]["gl-demo-migration"]["fleets"] = [fleet]
+        self.write_state(stacks=state["stacks"], log_groups=[f"gamelift-{fleet}-us-east-1"])
+        result = self.run_script("down", DEMO_CONFIRM=ENV)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        logs = next(i for i, c in enumerate(calls) if c.startswith("aws logs delete-log-group"))
+        self.assertLess(next(i for i, c in enumerate(calls) if c.startswith("eksctl delete cluster")), logs)
+        self.assertLess(next(i for i, c in enumerate(calls) if c.startswith("aws ecr delete-repository")), logs)
+
     def test_down_removes_eksctl_stacks_left_by_a_failed_cluster_up(self) -> None:
         self.write_state(cluster=None, repo=None, tagged=[], stacks={
             f"eksctl-{ENV}-cluster": {"status": "ROLLBACK_COMPLETE", "tags": DEMO_TAGS},

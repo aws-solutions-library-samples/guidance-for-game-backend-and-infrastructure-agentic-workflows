@@ -53,6 +53,9 @@ AGENT_ROLE_NAME="${AGENT_ROLE_NAME:-game-agent-agentcore-execution-role}"
 # Status aws_lookup returns when the service reports the resource does not
 # exist. Any other failure exits the script, even inside $(...).
 NOT_FOUND=10
+# Status review_stack_tags returns when change sets disagree on this
+# environment's tags (distinct from 1, which aws_lookup uses for AWS errors).
+CHANGE_SETS_DISAGREE=11
 
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
@@ -194,8 +197,9 @@ stack_tags() {
 
 # A stack in REVIEW_IN_PROGRESS (a change set never executed) has no stack
 # tags yet; its tags are on the change sets. Prints them as one JSON list, or
-# returns 1 if the change sets disagree, so a stack counts as this
-# environment's only when every change set says so.
+# returns $CHANGE_SETS_DISAGREE if the change sets disagree on the demo and
+# demo-env tags, so a stack counts as this environment's only when every change
+# set says so. Any AWS error exits as usual, so callers fail closed.
 review_stack_tags() {
   local ids id tags first=""
   ids="$(aws_lookup 'does not exist' cloudformation list-change-sets --region "$REGION" --stack-name "$1" \
@@ -204,8 +208,9 @@ review_stack_tags() {
     [ "$id" != "None" ] || continue
     tags="$(aws_lookup 'does not exist' cloudformation describe-change-set --region "$REGION" --change-set-name "$id" \
       --query 'Tags' --output json)" || return "$?"
-    tags="$(jq -c '(. // []) | sort_by(.Key)' <<<"$tags")"
-    if [ -z "$first" ]; then first="$tags"; elif [ "$tags" != "$first" ]; then return 1; fi
+    # Compare only the tags that decide ownership; other keys may differ.
+    tags="$(jq -c '[(. // [])[] | select(.Key == "demo" or .Key == "demo-env")] | sort_by(.Key)' <<<"$tags")"
+    if [ -z "$first" ]; then first="$tags"; elif [ "$tags" != "$first" ]; then return "$CHANGE_SETS_DISAGREE"; fi
   done
   printf '%s' "${first:-[]}"
 }
@@ -221,7 +226,7 @@ demo_stacks() {
       if [ "$status" = REVIEW_IN_PROGRESS ] && jq -e '(. // []) | length == 0' >/dev/null <<<"$tags"; then
         if tags="$(review_stack_tags "$name")"; then :; else
           local rc="$?"
-          [ "$rc" -eq 1 ] && continue  # change sets disagree: not provably ours
+          [ "$rc" -eq "$CHANGE_SETS_DISAGREE" ] && continue  # not provably ours
           absent_or_exit "$rc"; continue
         fi
       fi
@@ -534,9 +539,6 @@ cmd_down() {
     aws_lookup 'NOT_A_MATCH' cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$name" >/dev/null \
       || die "stack $name did not delete"
   done <<<"$stacks"
-  for fleet in $fleets; do
-    delete_default_fleet_log_group "$fleet"
-  done
   # 2. Kubernetes workloads, in the demo's own cluster only.
   if [ "$cluster_present" = true ]; then
     use_demo_kube
@@ -557,6 +559,12 @@ cmd_down() {
     log "Deleting ECR repository $REPOSITORY_NAME"
     aws_lookup 'NOT_A_MATCH' ecr delete-repository --region "$REGION" --repository-name "$REPOSITORY_NAME" --force >/dev/null
   fi
+  # 5. Default fleet log groups last: they cost almost nothing, so a denied
+  #    delete (for example under an operator role deployed before this step
+  #    existed) never leaves the cluster or NAT gateway running.
+  for fleet in $fleets; do
+    delete_default_fleet_log_group "$fleet"
+  done
   rm -f "$DEMO_KUBECONFIG"
   cmd_verify_clean
 }

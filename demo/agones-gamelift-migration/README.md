@@ -16,7 +16,11 @@ proposes (the "to" side), then compare the two under simulated player load.
   policy to a bounded role and run code with it on an instance it launches, so
   plan for that role being able to do anything the boundary allows: EC2, load
   balancing, and Auto Scaling in this Region, reads of this cluster, image
-  pulls, the node management agent, and GameLift fleet logging.
+  pulls, the node management agent, and the GameLift fleet runtime
+  (`GetComputeAuthToken`, CloudWatch Logs including log-group creation, metrics,
+  and `s3:PutObject`, all on `*`).
+- After changing `iam/operator-role.yaml`, update the operator-role stack before
+  running `down`, so `down` has the permissions its current steps use.
 - You run every step yourself, with that operator role. Nothing here is part
   of `deploy-all.sh`, `scripts/deploy.sh`, or the product's stacks.
 - The assistant stays read-only. It gets `get`/`list`/`watch` on core and Agones
