@@ -852,6 +852,103 @@ ensure_runtime_trace_delivery() {
   return 0
 }
 
+# Read the account X-Ray trace segment destination in one place. Prints two
+# space-separated tokens, "<destination> <status>", using the same enum the API
+# models (destination XRay | CloudWatchLogs; status PENDING | ACTIVE). A failed
+# or unparseable read prints "UNREADABLE UNREADABLE" so the caller can treat a
+# read failure the same as a not-yet-active destination. Read-only.
+read_trace_segment_destination() {
+  local output
+  if ! output=$(aws xray get-trace-segment-destination \
+    --region "$AWS_REGION" --output json 2>/dev/null); then
+    printf 'UNREADABLE UNREADABLE\n'
+    return 0
+  fi
+  TRACE_DEST_JSON="$output" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.loads(os.environ["TRACE_DEST_JSON"])
+except (ValueError, KeyError):
+    print("UNREADABLE UNREADABLE")
+    sys.exit(0)
+if not isinstance(payload, dict):
+    print("UNREADABLE UNREADABLE")
+    sys.exit(0)
+destination = payload.get("Destination") or "UNREADABLE"
+status = payload.get("Status") or "UNREADABLE"
+print(f"{destination} {status}")
+' 2>/dev/null || printf 'UNREADABLE UNREADABLE\n'
+}
+
+# Bounded poll until the trace segment destination reports ACTIVE. Returns 0 as
+# soon as it is ACTIVE, or non-zero when the budget is exhausted. The budget is
+# overridable for tests and operators via GBAW_TRACE_DESTINATION_ACTIVE_* (the
+# defaults mirror the account-observability wait: 30 attempts, 10s apart).
+wait_for_trace_destination_active() {
+  local attempts="${GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS:-30}"
+  local delay="${GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=30
+  [[ "$delay" =~ ^[0-9]+$ ]] || delay=10
+  local attempt status
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    status="$(aws xray get-trace-segment-destination \
+      --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "")"
+    if [ "$status" = "ACTIVE" ]; then
+      return 0
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
+# Step 2b gate. Transaction Search must be active for the per-runtime trace
+# delivery to bind: the delivery destination type is XRAY and the account trace
+# segment destination has to be CloudWatchLogs and ACTIVE. On a fresh account the
+# destination can stay PENDING for several minutes after agentcore launch
+# switches it, so this gate decides whether to create the delivery now, wait for
+# it, or defer it without failing the deploy:
+#   - CloudWatchLogs + ACTIVE: create and verify the delivery; every failure is
+#     fatal (issue #471 requires a failed delivery to fail the deploy).
+#   - CloudWatchLogs + not yet ACTIVE: wait for a bounded, configurable budget;
+#     if it becomes ACTIVE, create and verify as above.
+#   - Not CloudWatchLogs, still not ACTIVE after the wait, or an unreadable read:
+#     print one WARNING naming the state and skip the delivery. The deploy
+#     continues and the read-only Step 5c recheck still reports.
+#   $1 runtime id, $2 runtime arn
+ensure_runtime_trace_delivery_gated() {
+  local runtime_id="$1"
+  local runtime_arn="$2"
+  local destination status
+
+  read -r destination status <<< "$(read_trace_segment_destination)"
+
+  if [ "$destination" = "CloudWatchLogs" ] && [ "$status" = "ACTIVE" ]; then
+    ensure_runtime_trace_delivery "$runtime_id" "$runtime_arn"
+    return $?
+  fi
+
+  if [ "$destination" = "CloudWatchLogs" ]; then
+    echo "  ⏳ Trace segment destination is CloudWatchLogs but not yet ACTIVE (status: ${status}); waiting..."
+    if wait_for_trace_destination_active; then
+      ensure_runtime_trace_delivery "$runtime_id" "$runtime_arn"
+      return $?
+    fi
+  fi
+
+  echo "⚠️  WARNING: Skipping runtime trace delivery setup."
+  echo "   X-Ray trace segment destination is '${destination}' (status: ${status}), not an"
+  echo "   active 'CloudWatchLogs' destination. Traces will not reach CloudWatch Logs until"
+  echo "   X-Ray Transaction Search is active for this account. Check it with:"
+  echo "     aws xray get-trace-segment-destination --region ${AWS_REGION}"
+  echo "   and re-run the deployment after it reports CloudWatchLogs and ACTIVE."
+  return 0
+}
+
 build_agentcore_env_args
 
 # Get execution role from CloudFormation
@@ -935,7 +1032,7 @@ echo ""
 # Also skipped when --auto-update-on-conflict updates an existing runtime.
 # See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
 echo "📡 Step 2b: Ensuring CloudWatch delivery for runtime traces..."
-if ! ensure_runtime_trace_delivery "$RUNTIME_ID" "$RUNTIME_ARN"; then
+if ! ensure_runtime_trace_delivery_gated "$RUNTIME_ID" "$RUNTIME_ARN"; then
   echo "❌ Runtime traces delivery could not be configured and verified" >&2
   exit 1
 fi

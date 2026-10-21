@@ -444,6 +444,179 @@ def test_ensure_runtime_trace_delivery_fails_on_conflicting_source():
 
 
 # ---------------------------------------------------------------------------
+# ensure_runtime_trace_delivery_gated (Step 2b gate: wait for an ACTIVE
+# CloudWatchLogs destination; warn and skip instead of aborting otherwise)
+# ---------------------------------------------------------------------------
+
+# The gate reuses every delivery helper plus the destination reader and the
+# bounded active-wait. A short wait budget keeps these tests fast.
+_GATE_FUNCTION_NAMES = DELIVERY_FUNCTION_NAMES + (
+    "read_trace_segment_destination",
+    "wait_for_trace_destination_active",
+    "ensure_runtime_trace_delivery_gated",
+)
+
+_GATE_ARGS = f'ensure_runtime_trace_delivery_gated rt-1 {_RUNTIME_ARN}; echo "rc=$?"'
+
+
+def _gate_harness(aws_mock: str, invocation: str, extra_env: str = "") -> "subprocess.CompletedProcess[str]":
+    """Run a bash harness that sources the Step 2b gate over a mocked ``aws``.
+
+    The destination active-wait budget is pinned small (two attempts, no delay)
+    so a PENDING-through-the-whole-budget case returns promptly.
+    """
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    functions = "\n".join(_function_source(content, name) for name in _GATE_FUNCTION_NAMES)
+    command = "\n".join(
+        (
+            "set -o pipefail",
+            'AWS_REGION="us-west-2"',
+            "GBAW_DELIVERY_RETRY_SECONDS=0",
+            "GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS=2",
+            "GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS=0",
+            extra_env,
+            functions,
+            "sleep() { :; }",
+            aws_mock,
+            invocation,
+        )
+    )
+    return subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+
+def _gate_aws_mock(
+    *,
+    destination: str,
+    status_sequence: tuple[str, ...],
+    create_error: str | None = None,
+) -> str:
+    """Build an ``aws`` mock for the gate.
+
+    ``get-trace-segment-destination`` with ``--output json`` (the gate's single
+    read of both fields) returns ``{"Destination":...,"Status":...}`` using the
+    first value of ``status_sequence``; the ``--query Status`` reads the
+    bounded wait makes consume the remaining values (the last value repeats once
+    the sequence is exhausted), so a PENDING-then-ACTIVE transition can be
+    modeled. The delivery calls return a verified-active binding unless
+    ``create_error`` is given.
+    """
+    first_status = status_sequence[0]
+    wait_statuses = status_sequence[1:] or (status_sequence[-1],)
+    status_lines = "".join(f'      echo "{value}" >> "$STATUS_SEQ"\n' for value in wait_statuses)
+    create_block = f'    echo "{create_error}" >&2; return 254' if create_error else '    echo "{}"; return 0'
+    return (
+        f'STATUS_SEQ="$(mktemp)"\n'
+        f"{status_lines}"
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then\n'
+        '    case " $* " in\n'
+        f'      *" Status "*)\n'
+        '        status="$(head -n 1 "$STATUS_SEQ")"\n'
+        '        if [ "$(wc -l < "$STATUS_SEQ")" -gt 1 ]; then tail -n +2 "$STATUS_SEQ" > "$STATUS_SEQ.t"; mv "$STATUS_SEQ.t" "$STATUS_SEQ"; fi\n'
+        '        echo "$status"; return 0;;\n'
+        f'      *) printf \'{{"Destination":"{destination}","Status":"{first_status}"}}\\n\'; return 0;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  if [ "$1" = "logs" ] && [ "$2" = "put-delivery-source" ]; then echo "{}"; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "put-delivery-destination" ]; then\n'
+        f'    echo \'{{"deliveryDestination":{{"arn":"{_DEST_ARN}"}}}}\'; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "create-delivery" ]; then\n'
+        f"{create_block}\n"
+        "  fi\n"
+        '  if [ "$1" = "logs" ] && [ "$2" = "get-delivery-source" ]; then\n'
+        f'    echo \'{{"deliverySource":{{"name":"rt-1-traces-source","logType":"TRACES",'
+        f'"resourceArns":["{_RUNTIME_ARN}"]}}}}\'; return 0; fi\n'
+        '  if [ "$1" = "logs" ] && [ "$2" = "describe-deliveries" ]; then\n'
+        f'    echo \'{{"deliveries":[{{"deliverySourceName":"rt-1-traces-source",'
+        f'"deliveryDestinationArn":"{_DEST_ARN}","deliveryDestinationType":"XRAY"}}]}}\'; return 0; fi\n'
+        '  echo "unexpected: $*" >&2; return 1\n'
+        "}"
+    )
+
+
+def test_gate_creates_delivery_when_destination_active():
+    """CloudWatchLogs + ACTIVE: the delivery is created and verified as today."""
+    result = _gate_harness(
+        _gate_aws_mock(destination="CloudWatchLogs", status_sequence=("ACTIVE",)),
+        _GATE_ARGS,
+    )
+    assert result.returncode == 0
+    assert "rc=0" in result.stdout
+    assert "Delivery verified active" in result.stdout
+
+
+def test_gate_fatal_create_error_still_aborts_when_active():
+    """CloudWatchLogs + ACTIVE keeps every delivery failure fatal (issue 471)."""
+    result = _gate_harness(
+        _gate_aws_mock(
+            destination="CloudWatchLogs",
+            status_sequence=("ACTIVE",),
+            create_error="An error occurred (AccessDeniedException): not authorized",
+        ),
+        _GATE_ARGS,
+    )
+    assert "rc=1" in result.stdout
+
+
+def test_gate_waits_for_pending_then_creates_delivery():
+    """CloudWatchLogs + PENDING that becomes ACTIVE within the budget: created."""
+    result = _gate_harness(
+        _gate_aws_mock(destination="CloudWatchLogs", status_sequence=("PENDING", "ACTIVE")),
+        _GATE_ARGS,
+    )
+    assert result.returncode == 0
+    assert "rc=0" in result.stdout
+    assert "Delivery verified active" in result.stdout
+
+
+def test_gate_warns_and_skips_when_pending_through_whole_budget():
+    """CloudWatchLogs + PENDING for the whole budget: no delivery mutation, a
+    single WARNING naming the state, and the step returns success."""
+    result = _gate_harness(
+        _gate_aws_mock(destination="CloudWatchLogs", status_sequence=("PENDING",)),
+        _GATE_ARGS,
+    )
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    # One WARNING, on stdout like the script's other warnings.
+    assert result.stdout.count("WARNING") == 1
+    assert "WARNING" not in result.stderr
+    assert "CloudWatchLogs" in result.stdout
+    assert "PENDING" in result.stdout
+    assert "re-run" in result.stdout
+    # No delivery resource was created or verified.
+    assert "put-delivery-source" not in result.stdout
+    assert "Delivery verified active" not in result.stdout
+
+
+def test_gate_warns_and_skips_when_destination_is_xray():
+    """Transaction Search not on (destination XRay): no mutation, WARNING, success."""
+    result = _gate_harness(
+        _gate_aws_mock(destination="XRay", status_sequence=("ACTIVE",)),
+        _GATE_ARGS,
+    )
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    assert "XRay" in result.stdout
+    assert "Transaction Search" in result.stdout
+    assert "Delivery verified active" not in result.stdout
+
+
+def test_gate_warns_and_skips_when_destination_read_fails():
+    """A failed destination read: no mutation, WARNING, success (non-fatal)."""
+    aws_mock = (
+        "aws() {\n"
+        '  if [ "$1" = "xray" ] && [ "$2" = "get-trace-segment-destination" ]; then return 254; fi\n'
+        '  echo "unexpected: $*" >&2; return 1\n'
+        "}"
+    )
+    result = _gate_harness(aws_mock, _GATE_ARGS)
+    assert "rc=0" in result.stdout
+    assert "WARNING" in result.stdout
+    assert "Delivery verified active" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
 # Account-wide observability: scoped, opt-in, state-preserving
 # ---------------------------------------------------------------------------
 
@@ -546,7 +719,10 @@ def test_account_obs_default_makes_no_mutation_when_supported():
     result = _account_obs_harness("false", _obs_mock(destination="CloudWatchLogs", spans=True))
     assert "rc=0" in result.stdout
     assert "MUTATION" not in result.stdout.split("MUTATIONS:", 1)[1]
-    assert "no account-wide" in result.stdout
+    # The default-mode line scopes its "no changes" claim to this step, because a
+    # later launch step may still make account-wide changes.
+    assert "this step makes no account-wide X-Ray or CloudWatch Logs changes" in result.stdout
+    assert "no account-wide X-Ray or CloudWatch Logs changes will be made" not in result.stdout
     assert "already supports Transaction Search" in result.stdout
 
 
@@ -844,6 +1020,61 @@ def test_account_obs_optin_refuses_before_any_write_when_percent_is_invalid():
         "true",
         _obs_mock(destination="XRay", spans=True, indexing_percent="5"),
         extra_env='export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="abc"',
+    )
+    assert "rc=1" in result.stdout
+    assert "must be an integer in [0, 100]" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+@pytest.mark.parametrize("percent", ["05", "007"])
+def test_account_obs_optin_rejects_leading_zero_percent_before_any_write(shell, percent):
+    """A leading-zero percentage is rejected before any shared write.
+
+    The value is interpolated verbatim into the ``update-indexing-rule`` JSON,
+    and a JSON number may not carry a leading zero (``05`` is invalid JSON), so
+    the CLI would reject it only after the resource-policy and destination
+    writes. Validation therefore refuses it during the read-and-validate phase
+    with zero mutations, under both the login ``bash`` and macOS ``/bin/bash``.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=True, indexing_percent="5"),
+        extra_env=f'export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="{percent}"',
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "must be an integer in [0, 100]" in result.stderr
+    assert "MUTATION:" not in result.stdout.split("MUTATIONS:", 1)[1]
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+@pytest.mark.parametrize("percent", ["0", "5", "100"])
+def test_account_obs_optin_accepts_canonical_percent(shell, percent):
+    """Canonical integers (no leading zero) in [0, 100] are accepted and the
+    opt-in reaches the indexing-rule write without a validation refusal."""
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="CloudWatchLogs", spans=True, indexing_percent="7"),
+        extra_env=f'export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="{percent}"',
+        shell=shell,
+    )
+    assert "rc=0" in result.stdout
+    assert "must be an integer in [0, 100]" not in result.stderr
+    # The requested value is accepted and the rule is written (the mock reports a
+    # different current value so a change is always requested).
+    assert "MUTATION: xray update-indexing-rule" in result.stdout
+    assert f"indexing rule set to {percent}%" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_rejects_percent_above_100(shell):
+    """A value above 100 is still rejected before any shared write."""
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=True, indexing_percent="5"),
+        extra_env='export GBAW_XRAY_DEFAULT_INDEXING_PERCENT="101"',
+        shell=shell,
     )
     assert "rc=1" in result.stdout
     assert "must be an integer in [0, 100]" in result.stderr
@@ -1969,6 +2200,30 @@ def test_account_obs_optin_fails_when_spans_absent_after_enable(shell):
     assert "'aws/spans' log group does not exist" in result.stderr
     # The one-time remediation names both the console and the toggle path.
     assert "update-trace-segment-destination --destination XRay" in result.stderr
+    assert "Account-wide observability configured" not in result.stdout
+    # The destination reached ACTIVE in this case, so the failure must NOT blame
+    # a still-PENDING destination; it is the genuine missing-group case.
+    assert "still PENDING" not in result.stderr
+
+
+@pytest.mark.parametrize("shell", _OBS_SHELLS)
+def test_account_obs_optin_names_pending_destination_when_wait_expires(shell):
+    """When the destination never reaches ACTIVE within the wait budget and
+    'aws/spans' is still absent, the failure must name the still-PENDING
+    destination (wait and re-run, or check its status) rather than blaming a
+    first-time enable that cannot create the group. The trace-destination
+    transition can take longer than the wait budget, so this is the likely
+    cause when the wait expired.
+    """
+    result = _account_obs_harness(
+        "true",
+        _obs_mock(destination="XRay", spans=False, status="PENDING"),
+        shell=shell,
+    )
+    assert "rc=1" in result.stdout
+    assert "MUTATION: xray update-trace-segment-destination" in result.stdout
+    # The message points at the still-PENDING destination, not a missing group.
+    assert "still PENDING" in result.stderr
     assert "Account-wide observability configured" not in result.stdout
 
 

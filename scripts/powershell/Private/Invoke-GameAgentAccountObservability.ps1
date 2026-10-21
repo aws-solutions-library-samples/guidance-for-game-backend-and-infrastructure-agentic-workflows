@@ -244,7 +244,7 @@ function Invoke-GameAgentAccountObservability {
         $spansState = Get-SpansLogGroupState
         $destinationDisplay = if ($destination -eq 'UNREADABLE') { 'unknown (read failed)' } else { $destination }
         $supported = ($destination -eq 'CloudWatchLogs') -and ($spansState -eq 'present')
-        Write-Host '  Default mode: no account-wide X-Ray or CloudWatch Logs changes will be made.'
+        Write-Host '  Default mode: this step makes no account-wide X-Ray or CloudWatch Logs changes.'
         Write-Host "      Current X-Ray trace segment destination: $destinationDisplay"
         if ($supported) {
             Write-Host '  Account already supports Transaction Search (destination CloudWatchLogs, aws/spans present).'
@@ -326,11 +326,16 @@ function Invoke-GameAgentAccountObservability {
         throw 'Cannot read the current trace destination; not changing it'
     }
 
-    # Validate the requested indexing percentage before any write.
+    # Validate the requested indexing percentage before any write. Keep the
+    # accepted inputs identical to the shell path: reject a leading zero (e.g.
+    # '05') so both paths accept the same values, even though the int parse here
+    # would otherwise tolerate it.
     $requestedPercent = $null
     if (-not [string]::IsNullOrWhiteSpace($DefaultIndexingPercent)) {
         $parsedPercent = 0
-        if (-not [int]::TryParse($DefaultIndexingPercent, [ref]$parsedPercent) -or $parsedPercent -lt 0 -or $parsedPercent -gt 100) {
+        if ($DefaultIndexingPercent -notmatch '^(0|[1-9][0-9]{0,2})$' -or
+            -not [int]::TryParse($DefaultIndexingPercent, [ref]$parsedPercent) -or
+            $parsedPercent -lt 0 -or $parsedPercent -gt 100) {
             throw "GBAW_XRAY_DEFAULT_INDEXING_PERCENT='$DefaultIndexingPercent' must be an integer in [0, 100]"
         }
         $requestedPercent = $parsedPercent
@@ -411,6 +416,7 @@ function Invoke-GameAgentAccountObservability {
     }
 
     # ── Trace destination: additive enable only; never a disable/re-enable toggle ──
+    $destinationWaitExpired = $false
     if ($destination -eq 'CloudWatchLogs') {
         Write-Host '  X-Ray trace destination already CloudWatchLogs - left unchanged'
     } elseif ($destination -eq 'XRay') {
@@ -418,7 +424,9 @@ function Invoke-GameAgentAccountObservability {
         Write-Host "     Rollback: aws xray update-trace-segment-destination --destination $destination --region $Region"
         Invoke-ObsMutation 'trace destination' @('xray', 'update-trace-segment-destination', '--destination', 'CloudWatchLogs', '--region', $Region) | Out-Null
         Write-Host '  X-Ray trace destination set to CloudWatchLogs'
-        # Bounded poll until the destination reports ACTIVE.
+        # Bounded poll until the destination reports ACTIVE. Record an expiry so
+        # a later missing-'aws/spans' check can name the still-PENDING
+        # destination as the likely cause instead of a first-time enable.
         $active = $false
         for ($attempt = 1; $attempt -le $ActiveMaxAttempts; $attempt++) {
             if ((Get-TraceStatus) -eq 'ACTIVE') { $active = $true; break }
@@ -427,6 +435,7 @@ function Invoke-GameAgentAccountObservability {
         if ($active) {
             Write-Host '  Trace segment destination is ACTIVE'
         } else {
+            $destinationWaitExpired = $true
             Write-GameAgentStatus 'Trace segment destination did not reach ACTIVE within the wait budget; it may still converge shortly.' -Type Warning
         }
     } else {
@@ -465,6 +474,18 @@ function Invoke-GameAgentAccountObservability {
             "otherwise failed). Confirm the destination and 'aws/spans' in the AWS X-Ray / CloudWatch " +
             "console, then re-run the deployment.")
     } else {
+        if ($destinationWaitExpired) {
+            # The destination transition can take longer than the wait budget.
+            # When the wait expired and 'aws/spans' is still absent, the likely
+            # cause is a still-PENDING destination, not a first-time enable.
+            throw ("Transaction Search was enabled (destination set to CloudWatchLogs) but the " +
+                "destination is still PENDING after the wait budget, and the AWS-reserved 'aws/spans' " +
+                "log group does not exist yet. The destination transition can take longer than the " +
+                "wait; the group typically appears once it becomes ACTIVE. Wait a few minutes and " +
+                "re-run the deployment, or check the destination status: " +
+                "'aws xray get-trace-segment-destination --region $Region'. Spans cannot flow until " +
+                "the destination is ACTIVE and 'aws/spans' exists.")
+        }
         # 'aws/spans' is AWS-reserved: a first-time API enable does not create
         # it (only the console or a destination toggle does). An additive,
         # no-toggle enable cannot create it when the account started from 'XRay',

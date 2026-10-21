@@ -211,7 +211,15 @@ opt-in only when the AWS-reserved `aws/spans` log group already exists and the
 destination was read (so the opt-in can finish the job); otherwise it points to
 the one-time console enable or a destination toggle keyed on the current
 destination, because the opt-in cannot create that group. A default deployment is **not** failed for a missing account
-configuration; the per-runtime trace delivery is still created and verified.
+configuration. The per-runtime trace delivery (Step 2b) binds only when X-Ray
+Transaction Search is active, so the deploy first reads the account trace segment
+destination: when it is `CloudWatchLogs` and `ACTIVE` the delivery is created and
+verified (and any delivery failure then fails the deploy); when it is
+`CloudWatchLogs` but not yet `ACTIVE` the deploy waits a bounded budget for it;
+and when the destination is not `CloudWatchLogs`, never becomes `ACTIVE` within
+the budget, or cannot be read, the deploy prints one WARNING naming the state and
+skips the delivery rather than aborting. The read-only Step 5c recheck still runs
+and reports.
 
 > **Residual not controlled by this opt-in.** `agentcore launch` — which the
 > deploy script runs in its Step 2 (only on a first deploy) and Step 5b
@@ -291,14 +299,21 @@ continues to work and the opt-in skips its own write. Delete the legacy
 `TransactionSearchXRayAccess` policy only once you have confirmed no other
 workload relies on it.
 
-**Validation.** The per-runtime trace delivery step (delivery source →
-destination → delivery) distinguishes a genuine already-exists conflict from
-authorization, validation, throttling, and service errors by the AWS error code.
-Retryable errors are retried with a small bounded backoff; a real error fails the
-deployment with a bounded diagnostic. The deployment then queries the delivery
-(retrying a transient read) and fails unless a delivery with destination type
-`XRAY` binds the intended source — whose resources include the runtime — to the
-intended destination.
+**Validation.** The per-runtime trace delivery step first reads the account
+trace segment destination: it creates and verifies the delivery only when the
+destination is `CloudWatchLogs` and `ACTIVE`, waits a bounded, configurable
+budget when the destination is `CloudWatchLogs` but still converging, and
+otherwise prints one WARNING and skips the delivery (the deploy continues). The
+wait budget is overridable with `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS`
+(default 30) and `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` (default 10). When
+the delivery does run, each mutation (delivery source → destination → delivery)
+distinguishes a genuine already-exists conflict from authorization, validation,
+throttling, and service errors by the AWS error code. Retryable errors are
+retried with a small bounded backoff; a real error fails the deployment with a
+bounded diagnostic. The deployment then queries the delivery (retrying a
+transient read) and fails unless a delivery with destination type `XRAY` binds
+the intended source — whose resources include the runtime — to the intended
+destination.
 
 **Rollback.** The account-wide changes made by *this repository's opt-in* are
 listed above; `agentcore launch` may make the separate, toolkit-owned changes
@@ -613,6 +628,8 @@ reviewed cost evidence.
 | `GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS` | No | 10 | Opt-in only: delay between ACTIVE polls, in seconds |
 | `GBAW_DELIVERY_MAX_ATTEMPTS` | No | 4 (capped at 20) | Runtime trace-delivery retry attempts |
 | `GBAW_DELIVERY_RETRY_SECONDS` | No | 5 (capped at 60) | Delay between trace-delivery retries, in seconds |
+| `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS` | No | 30 | Step 2b: polls for the X-Ray trace destination to reach `ACTIVE` before creating the trace delivery |
+| `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` | No | 10 | Step 2b: delay between trace-destination `ACTIVE` polls, in seconds |
 | `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE` | No | false | Fail-closed: stop before `agentcore launch` if the AgentCore starter toolkit would change account-wide X-Ray / CloudWatch Logs settings. Only the exact value `true` enables it. See [AgentCore Starter Toolkit Transaction Search](#agentcore-starter-toolkit-transaction-search-launch-time-exception) |
 
 ## Security Notes

@@ -139,6 +139,10 @@ Describe 'Invoke-GameAgentAccountObservability' {
         $mutations | Should -Not -Contain 'xray update-trace-segment-destination'
         $mutations | Should -Not -Contain 'xray update-indexing-rule'
         $mutations | Should -Not -Contain 'logs put-resource-policy'
+        # The default-mode line scopes its "no changes" claim to this step, since
+        # a later launch step may still make account-wide changes.
+        ($script:HostMessages -join ' ') | Should -Match 'this step makes no account-wide X-Ray or CloudWatch Logs changes'
+        ($script:HostMessages -join ' ') | Should -Not -Match 'no account-wide X-Ray or CloudWatch Logs changes will be made'
     }
 
     It 'Default mode prints unknown when the destination read fails' {
@@ -183,6 +187,43 @@ Describe 'Invoke-GameAgentAccountObservability' {
         Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
         {
             Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability -DefaultIndexingPercent 'abc'
+        } | Should -Throw '*must be an integer in `[0, 100`]*'
+        $mutations.Count | Should -Be 0
+    }
+
+    It 'Opt-in refuses before any shared write when the requested percent has a leading zero' -ForEach @(
+        @{ Percent = '05' }
+        @{ Percent = '007' }
+    ) {
+        # A leading-zero value is rejected before any write so the shell and
+        # PowerShell paths accept exactly the same inputs; '05' is not a valid
+        # JSON number, which the shell path would otherwise send verbatim.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
+        {
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability -DefaultIndexingPercent $Percent
+        } | Should -Throw '*must be an integer in `[0, 100`]*'
+        $mutations.Count | Should -Be 0
+    }
+
+    It 'Opt-in accepts a canonical percent with no leading zero and writes the rule' -ForEach @(
+        @{ Percent = '0' }
+        @{ Percent = '5' }
+        @{ Percent = '100' }
+    ) {
+        # Canonical integers in [0, 100] are accepted; the mock reports a
+        # different current value so a change is always requested and written.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'CloudWatchLogs' -SpansExists $true -IndexingPercent '7' -Mutations $mutations
+        Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability -DefaultIndexingPercent $Percent
+        $mutations | Should -Contain 'xray update-indexing-rule'
+    }
+
+    It 'Opt-in refuses before any shared write when the requested percent is above 100' {
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $true -Mutations $mutations
+        {
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability -DefaultIndexingPercent '101'
         } | Should -Throw '*must be an integer in `[0, 100`]*'
         $mutations.Count | Should -Be 0
     }
@@ -304,6 +345,19 @@ Describe 'Invoke-GameAgentAccountObservability' {
         {
             Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability
         } | Should -Throw "*'aws/spans' log group does not exist*"
+        $mutations | Should -Contain 'xray update-trace-segment-destination'
+    }
+
+    It 'Opt-in names the still-PENDING destination when the wait budget expires and aws/spans is absent' {
+        # The destination transition can take longer than the wait budget. When
+        # the wait expires (Status never ACTIVE) and 'aws/spans' is still
+        # absent, the failure must name the still-PENDING destination (wait and
+        # re-run, or check its status) rather than blaming a first-time enable.
+        $mutations = [System.Collections.Generic.List[string]]::new()
+        Set-ObsAwsMock -Destination 'XRay' -SpansExists $false -Status 'PENDING' -Mutations $mutations
+        {
+            Invoke-GameAgentAccountObservability -Region 'us-west-2' -ProfileArgs @() -ConfigureAccountObservability -ActiveMaxAttempts 2 -ActiveRetrySeconds 0
+        } | Should -Throw '*still PENDING*'
         $mutations | Should -Contain 'xray update-trace-segment-destination'
     }
 
