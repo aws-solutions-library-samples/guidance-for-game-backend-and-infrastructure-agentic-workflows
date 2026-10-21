@@ -27,11 +27,13 @@ Describe 'Test-GameAgentRuntimePath' {
         $calls = [System.Collections.Generic.List[string]]::new()
         $runner = New-GuardRunner -ExitCode 0 -Output '' -Calls $calls
 
-        $result = $null
-        { $result = Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner } |
-            Should -Not -Throw
+        # Call directly so the result is visible here (an assignment inside a
+        # `{ } | Should -Not -Throw` block runs in a child scope); a throw still
+        # fails the test.
+        $result = Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner
         $calls.Count | Should -Be 1
-        $result.Skipped | Should -BeFalse
+        $result.ContainsKey('Skipped') | Should -BeTrue
+        $result.Skipped | Should -Be $false
     }
 
     It 'Returns a skipped result without throwing when the guard skips on native Windows' {
@@ -44,11 +46,9 @@ Describe 'Test-GameAgentRuntimePath' {
             -Output 'RUNTIME_PATH_CHECK_SKIPPED_NATIVE_WINDOWS Runtime interpreter path not checked on native Windows (see #610)' `
             -Calls $calls
 
-        $result = $null
-        { $result = Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner } |
-            Should -Not -Throw
+        $result = Test-GameAgentRuntimePath -BackendPath $BackendPath -RepoRoot $RepoRoot -GuardRunner $runner
         $calls.Count | Should -Be 1
-        $result.Skipped | Should -BeTrue
+        $result.Skipped | Should -Be $true
         $result.Output | Should -Match '610'
     }
 
