@@ -564,7 +564,7 @@ packaging==26.2
     #   opentelemetry-instrumentation-sqlalchemy
 pathable==0.4.4
     # via jsonschema-path
-pillow==12.3.0
+pillow==13.0.0
     # via strands-agents-tools
 platformdirs==4.5.1
     # via fastmcp-slim
