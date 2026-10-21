@@ -505,3 +505,48 @@ def test_scraper_exit_status_stops_both_deploy_paths_before_seeding():
     assert "if ($LASTEXITCODE -ne 0) { throw 'KB docs download failed' }" in ps_download
     ps_deploy = (_REPO_ROOT / "scripts" / "powershell" / "Public" / "Deploy-GameAgent.ps1").read_text(encoding="utf-8")
     assert ps_deploy.index("Invoke-GameAgentKBDocDownload") < ps_deploy.index("Invoke-GameAgentKBSeed")
+
+
+# ---------------------------------------------------------------------------
+# Short chunks: every paragraph, list item, and table carries the qualifier
+# ---------------------------------------------------------------------------
+
+
+def _paragraphs_outside_code(text: str) -> list[str]:
+    body = text.split("\n\n", 2)[2]  # after the title and the header block, which carries Status:
+    blocks = [b for b in re.split(r"\n\s*\n", body) if b.strip()]
+    return [b for b in blocks if not all(line.startswith("    ") or not line.strip() for line in b.splitlines())]
+
+
+@pytest.mark.parametrize("lifecycle, label", [("historical", "Historical source"), ("sample", "Sample walkthrough")])
+def test_every_paragraph_of_a_non_current_document_carries_its_qualifier(scraper_module, tmp_path, lifecycle, label):
+    """Bedrock starts a chunk at a paragraph boundary, so a short chunk can be one short paragraph."""
+    html = (
+        "<html><head><meta property='article:published_time' content='2023-09-21T09:00:00Z'></head><body><article>"
+        "<section class='blog-post-content'>"
+        "<p>But either way, you are well under the threshold.</p>"
+        "<p>Short second paragraph.</p>"
+        "<ul><li>First item</li><li>Second item</li></ul>"
+        "<table><tr><th>Instance</th><th>Spot</th></tr><tr><td>c4.large</td><td>0.04</td></tr></table>"
+        f"<p>{'A long paragraph of prose about Spot capacity. ' * 30}</p>"
+        "</section></article></body></html>"
+    )
+    text = _render(scraper_module, tmp_path, html, {**_DOC, "lifecycle": lifecycle})
+    qualifier = f"({label}, published 2023-09-21.)"
+    for paragraph in _paragraphs_outside_code(text):
+        assert qualifier in paragraph, paragraph
+    assert f"{qualifier} But either way" in text
+    assert re.search(rf"^\s*[*+-] {re.escape(qualifier)} First item", text, re.M), "qualifier after the list marker"
+    lines = text.splitlines()
+    header = next(i for i, line in enumerate(lines) if "Instance" in line and "|" in line)
+    assert lines[header - 1] == qualifier, "qualifier directly above the table"
+    assert "c4.large" in lines[header + 2] and qualifier not in lines[header + 2], "table rows unchanged"
+
+
+def test_paragraph_qualifiers_never_enter_code(scraper_module, tmp_path):
+    html = _walkthrough_with_code()
+    plain = _render(scraper_module, tmp_path / "plain", html)
+    qualified = _render(scraper_module, tmp_path / "qualified", html, {**_DOC, "lifecycle": "sample"})
+    for line in plain.splitlines():
+        if line.startswith("    ") and line.strip():
+            assert line in qualified.splitlines(), line

@@ -12,11 +12,18 @@ function Invoke-GameAgentKBSeed {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
     $stackName = "$ProjectName-kb-$KBName"
 
-    # Check if stack exists
-    & aws cloudformation describe-stacks --stack-name $stackName --region $Region @ProfileArgs 2>$null | Out-Null
+    # Check if stack exists. Only "does not exist" means skip; any other failure
+    # (expired credentials, access denied, throttling) stops the deploy instead of
+    # reporting a Knowledge Base that was never seeded as done.
+    $stackCheck = (& aws cloudformation describe-stacks --stack-name $stackName --region $Region @ProfileArgs 2>&1) | Out-String
     if ($LASTEXITCODE -ne 0) {
-        Write-GameAgentStatus "Stack $stackName not found, skipping seeding" -Type Warning
-        return
+        if ($stackCheck -match 'does not exist') {
+            Write-GameAgentStatus "Stack $stackName not found, skipping seeding" -Type Warning
+            return
+        }
+        $detail = $stackCheck.Trim()
+        if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) }
+        throw "Could not read stack ${stackName}: $detail"
     }
 
     # Get stack outputs
@@ -76,6 +83,17 @@ function Invoke-GameAgentKBSeed {
             & aws bedrock-agent get-ingestion-job --knowledge-base-id $kbId --data-source-id $dsId `
                 --ingestion-job-id $jobId --region $Region @ProfileArgs `
                 --query 'ingestionJob.statistics' --output table 2>$null
+            # A COMPLETE job can still have skipped documents; any failed
+            # document means part of this Knowledge Base is missing.
+            $failedDocs = ((& aws bedrock-agent get-ingestion-job --knowledge-base-id $kbId --data-source-id $dsId `
+                --ingestion-job-id $jobId --region $Region @ProfileArgs `
+                --query 'ingestionJob.statistics.numberOfDocumentsFailed' --output text 2>$null) | Out-String).Trim()
+            if ($failedDocs -ne '0') {
+                $reasons = (& aws bedrock-agent get-ingestion-job --knowledge-base-id $kbId --data-source-id $dsId `
+                    --ingestion-job-id $jobId --region $Region @ProfileArgs `
+                    --query 'ingestionJob.failureReasons' --output text 2>$null) | Out-String
+                throw "$KBName KB ingestion completed with failed documents: $failedDocs. $($reasons.Trim())"
+            }
             return
         } elseif ($status -eq 'FAILED') {
             throw "$KBName KB ingestion failed!"
