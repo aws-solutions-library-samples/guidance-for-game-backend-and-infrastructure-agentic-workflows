@@ -50,7 +50,11 @@ Authorization bearer; the runtime reads the raw header from its request
 context). The operations control plane this record builds on is delivered by
 the E1-E4 work tracked in #413, #414, #415, and #416 (launch activation #441)
 and the children in the Implementation section; it is not provisioned by the
-default deployment. On those phase branches each operations HTTP API authorizer
+default deployment. Throughout this record the E-letters (E1 observe, E2 advise,
+E3 remediate, E4 operate) follow the operations issue titles (#413, #414, #415,
+#416); `docs/THREAT_MODEL.md`'s Phase Model table assigns the phase letters
+differently, so its owners cite the issue that owns each control rather than a
+phase letter. On those phase branches each operations HTTP API authorizer
 accepts the **same** Cognito app-client audience the chat path forwards. The AgentCore chat role holds no IAM permission for the
 operations stack, but a forwarded bearer token is itself a usable credential:
 runtime code that can make an authenticated HTTP call could replay that token
@@ -150,8 +154,13 @@ client's own credentials from within a managed-login session.**
   client (using `prompt=none` where the managed-login branding version supports
   it, so no second credential prompt is shown), and keeps the operations access
   and refresh tokens server-side in `HttpOnly`, `Secure`, `SameSite=Lax` cookies
-  scoped to the operations proxies. Neither client's tokens reach browser
-  JavaScript.
+  scoped to the operations proxies. The authorize step is a browser redirect, so
+  if the managed-login session has lapsed (for example the one-hour session
+  expired before first operations use) the `prompt=none` exchange returns
+  `login_required`; the server then falls back to the interactive step-up
+  sign-in of path (a) — redirecting the browser to managed login for the
+  operations client — rather than failing the handoff. Neither client's tokens
+  reach browser JavaScript.
 - **Consequences of path (b).** It requires the managed-login branding version
   (available on the Essentials plan, which the base user pool already defaults
   to), a managed-login domain, callback and logout routes, and replaces
@@ -328,7 +337,8 @@ child issue:
 - **Separate prepare throttle.** `POST /operations/prepare` gets its own
   route-level throttle, distinct from the shared approval-route throttle, so a
   prepare flood cannot starve approve, reject, and cancel. WAF does not apply to
-  HTTP APIs and the frontend per-task limiter is per ECS task, so neither is the
+  HTTP APIs and the frontend per-task limiter — part of the planned proxy tier,
+  not present on `main` today — is per ECS task, so neither is the
   authoritative limit.
 
 ### 5. The user reaches approval through the direct operator approval view
@@ -574,7 +584,9 @@ not Closes.
    `deploy-operations-execution.sh` (E3), and `deploy-operations-control.sh` (E4)
    bash deploy wrappers that take `CognitoClientId` are given the operations
    client ID (no PowerShell operations wrapper exists; one would need the same
-   binding if introduced); every operator-console proxy delivered by the E4
+   binding if introduced), and each wrapper rejects at deploy time an operations
+   client ID equal to the chat client ID so the two audiences cannot be
+   collapsed into one; every operator-console proxy delivered by the E4
    operator-UI work (#416), including the cancel proxy on the E1/E2 action API
    and the list, detail, discovery, control, and kill-switch proxies on the E4
    control-plane API, moves to the server-side operations token; the
@@ -619,7 +631,8 @@ not Closes.
    shell change without changing the trust boundary.
 8. **Chat-reachability guard (#429/#430).** Keep preparation unreachable from
    the chat runtime; regression that the chat role has no operations token after
-   child 1.
+   child 1, including a check that the deploy wrappers reject an operations
+   client ID equal to the chat client ID.
 9. **Autonomy and remote boundaries (#416/#437).** No change to this record;
    listed so later phases do not reintroduce a chat-reachable prepare path.
 
