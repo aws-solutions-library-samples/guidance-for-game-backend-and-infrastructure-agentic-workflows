@@ -345,7 +345,7 @@ function Deploy-GameAgent {
         # ── Step 2b: CloudWatch delivery for runtime traces ──
         Write-GameAgentStatus 'Step 2b: Ensuring CloudWatch delivery for runtime traces...' -Type Info
         $deliveryInvoker = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS delivery command'
-        Invoke-GameAgentTraceDelivery `
+        Invoke-GameAgentTraceDeliveryGated `
             -RuntimeId $runtimeId `
             -RuntimeArn $runtimeArn `
             -Region $Region `

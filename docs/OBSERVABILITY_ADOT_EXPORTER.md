@@ -82,12 +82,25 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
 ## Runtime trace delivery is verified
 
 The per-runtime trace delivery in `scripts/deploy.sh` Step 2b (and
-`Invoke-GameAgentTraceDelivery`) creates the delivery source, destination, and
-delivery. Each mutation distinguishes a genuine already-exists conflict
-(idempotent success) from authorization, validation, throttling, and service
-errors. Retryable errors are retried with a small bounded backoff; a real error
-fails the deployment with a bounded, public-safe diagnostic that names only the
-operation. The deployment then queries the delivery with
+`Invoke-GameAgentTraceDeliveryGated`) binds only when X-Ray Transaction Search is
+active, because the delivery destination type is `XRAY` and the account trace
+segment destination must be `CloudWatchLogs` and `ACTIVE`. Step 2b first reads
+the destination and routes accordingly: when it is `CloudWatchLogs` and `ACTIVE`
+it creates the delivery source, destination, and delivery; when it is
+`CloudWatchLogs` but not yet `ACTIVE` it waits a bounded, configurable budget
+(`GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS` / `_RETRY_SECONDS`) and then
+creates it; and when the destination is not `CloudWatchLogs`, never reaches
+`ACTIVE` within the budget, or cannot be read, it prints one WARNING naming the
+state and skips the delivery without failing the deploy. On a fresh account
+`agentcore launch` switches the destination to `CloudWatchLogs`, but the switch
+can stay PENDING for several minutes, so a default deploy is not aborted while it
+converges; the read-only Step 5c recheck reports the resulting state, and
+re-running the deployment once the destination is `ACTIVE` creates the delivery.
+When the delivery does run, each mutation distinguishes a genuine already-exists
+conflict (idempotent success) from authorization, validation, throttling, and
+service errors. Retryable errors are retried with a small bounded backoff; a real
+error fails the deployment with a bounded, public-safe diagnostic that names only
+the operation. The deployment then queries the delivery with
 `aws logs describe-deliveries` (retrying a transient read) and fails unless a
 delivery with destination type `XRAY` binds the intended source — whose resources
 include the runtime ARN — to the intended destination. The destination ARN is
