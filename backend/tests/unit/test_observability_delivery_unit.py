@@ -540,6 +540,9 @@ def test_gate_warns_and_skips_when_pending_through_whole_budget():
     )
     assert "rc=0" in result.stdout
     assert "WARNING" in result.stdout
+    # One WARNING, on stdout like the script's other warnings.
+    assert result.stdout.count("WARNING") == 1
+    assert "WARNING" not in result.stderr
     assert "CloudWatchLogs" in result.stdout
     assert "PENDING" in result.stdout
     assert "re-run" in result.stdout

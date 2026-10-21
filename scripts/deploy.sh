@@ -913,17 +913,12 @@ ensure_runtime_trace_delivery_gated() {
     fi
   fi
 
-  echo "⚠️  WARNING: Skipping runtime trace delivery setup." >&2
-  echo "   X-Ray trace segment destination is '${destination}' (status: ${status}), not an" >&2
-  echo "   active 'CloudWatchLogs' destination. Traces will not reach CloudWatch Logs until" >&2
-  echo "   X-Ray Transaction Search is active for this account." >&2
-  echo "   Re-run the deployment after it becomes ACTIVE. Check it with:" >&2
-  echo "     aws xray get-trace-segment-destination --region ${AWS_REGION}" >&2
-  # Also surface the WARNING on stdout so an operator watching the console sees
-  # it even when stderr is redirected separately.
-  echo "⚠️  WARNING: Runtime trace delivery skipped — destination '${destination}' status '${status}'."
-  echo "   Traces will not reach CloudWatch Logs until Transaction Search is active; re-run the"
-  echo "   deployment after 'aws xray get-trace-segment-destination --region ${AWS_REGION}' reports ACTIVE."
+  echo "⚠️  WARNING: Skipping runtime trace delivery setup."
+  echo "   X-Ray trace segment destination is '${destination}' (status: ${status}), not an"
+  echo "   active 'CloudWatchLogs' destination. Traces will not reach CloudWatch Logs until"
+  echo "   X-Ray Transaction Search is active for this account. Check it with:"
+  echo "     aws xray get-trace-segment-destination --region ${AWS_REGION}"
+  echo "   and re-run the deployment after it reports CloudWatchLogs and ACTIVE."
   return 0
 }
 

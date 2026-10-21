@@ -117,5 +117,5 @@ function Invoke-GameAgentTraceDeliveryGated {
         }
     }
 
-    Write-GameAgentStatus "WARNING: Skipping runtime trace delivery setup. X-Ray trace segment destination is '$destination' (status: $status), not an active 'CloudWatchLogs' destination. Traces will not reach CloudWatch Logs until X-Ray Transaction Search is active for this account. Re-run the deployment after it becomes ACTIVE. Check it with: aws xray get-trace-segment-destination --region $Region" -Type Warning
+    Write-GameAgentStatus "WARNING: Skipping runtime trace delivery setup. X-Ray trace segment destination is '$destination' (status: $status), not an active 'CloudWatchLogs' destination. Traces will not reach CloudWatch Logs until X-Ray Transaction Search is active for this account. Check it with: aws xray get-trace-segment-destination --region $Region and re-run the deployment after it reports CloudWatchLogs and ACTIVE." -Type Warning
 }
