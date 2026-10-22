@@ -77,6 +77,7 @@ REVIEWED_ACTIONS: dict[str, str] = {
     # Billing MCP compute-optimizer tool (reviewed EC2 + Auto Scaling rightsizing)
     "compute-optimizer:GetEC2InstanceRecommendations": "Billing MCP compute-optimizer (EC2)",
     "compute-optimizer:GetAutoScalingGroupRecommendations": "Billing MCP compute-optimizer (Auto Scaling)",
+    "compute-optimizer:GetEnrollmentStatus": "Billing MCP compute-optimizer enrollment probe",
     # Compute Optimizer dependent reads (SAR table + Compute Optimizer IAM guide)
     "ec2:DescribeInstances": "Compute Optimizer EC2 recommendation dependent read",
     "autoscaling:DescribeAutoScalingGroups": "Compute Optimizer Auto Scaling recommendation dependent read",
@@ -101,6 +102,8 @@ REVIEWED_ACTIONS: dict[str, str] = {
     "eks:DescribeFargateProfile": "aws-api-mcp call_aws eks describe-fargate-profile",
     "eks:ListAddons": "aws-api-mcp call_aws eks list-addons",
     "eks:DescribeAddon": "aws-api-mcp call_aws eks describe-addon",
+    "eks:ListInsights": "eks-mcp get_eks_insights (list)",
+    "eks:DescribeInsight": "eks-mcp get_eks_insights (describe)",
     # eks-mcp get_eks_vpc_config is wholly non-functional (ec2:DescribeRouteTables
     # was never granted and shares its error path), so its DescribeVpcs/
     # DescribeSubnets reads are a pre-existing gap and are NOT granted.
@@ -183,6 +186,7 @@ SAR_REQUIRED_ACTIONS: dict[str, set[str]] = {
         "autoscaling:DescribeAutoScalingGroups",
         "autoscaling:DescribeAutoScalingInstances",
     },
+    "compute-optimizer:GetEnrollmentStatus": {"compute-optimizer:GetEnrollmentStatus"},
     "gamelift:ListFleets": {"gamelift:ListFleets"},
     "gamelift:DescribeFleetAttributes": {"gamelift:DescribeFleetAttributes"},
     "gamelift:ListContainerFleets": {"gamelift:ListContainerFleets"},
@@ -201,6 +205,8 @@ SAR_REQUIRED_ACTIONS: dict[str, set[str]] = {
     "eks:DescribeFargateProfile": {"eks:DescribeFargateProfile"},
     "eks:ListAddons": {"eks:ListAddons"},
     "eks:DescribeAddon": {"eks:DescribeAddon"},
+    "eks:ListInsights": {"eks:ListInsights"},
+    "eks:DescribeInsight": {"eks:DescribeInsight"},
     "cloudwatch:GetMetricData": {"cloudwatch:GetMetricData"},
     # BatchGetImage also lists BatchImportUpstreamImage, CreateRepository, and
     # TagResource; GetDownloadUrlForLayer also lists BatchImportUpstreamImage —
@@ -240,6 +246,7 @@ WILDCARD_RESOURCE_ALLOWLIST = frozenset(
         "cost-optimization-hub:GetRecommendation",
         "compute-optimizer:GetEC2InstanceRecommendations",
         "compute-optimizer:GetAutoScalingGroupRecommendations",
+        "compute-optimizer:GetEnrollmentStatus",
         "ec2:DescribeInstances",
         "autoscaling:DescribeAutoScalingGroups",
         "autoscaling:DescribeAutoScalingInstances",
@@ -261,6 +268,8 @@ WILDCARD_RESOURCE_ALLOWLIST = frozenset(
         "eks:DescribeFargateProfile",
         "eks:ListAddons",
         "eks:DescribeAddon",
+        "eks:ListInsights",
+        "eks:DescribeInsight",
         "cloudwatch:GetMetricData",
         "ecr:GetAuthorizationToken",
         "xray:PutTraceSegments",
@@ -444,6 +453,7 @@ EXPECTED_STATEMENTS: dict[str, dict] = {
         "actions": {
             "compute-optimizer:GetEC2InstanceRecommendations",
             "compute-optimizer:GetAutoScalingGroupRecommendations",
+            "compute-optimizer:GetEnrollmentStatus",
         },
         "resources": _WILDCARD,
         "condition": EXPECTED_REGION_CONDITION,
@@ -479,6 +489,8 @@ EXPECTED_STATEMENTS: dict[str, dict] = {
             "eks:DescribeFargateProfile",
             "eks:ListAddons",
             "eks:DescribeAddon",
+            "eks:ListInsights",
+            "eks:DescribeInsight",
         },
         "resources": _WILDCARD,
         "condition": EXPECTED_REGION_CONDITION,

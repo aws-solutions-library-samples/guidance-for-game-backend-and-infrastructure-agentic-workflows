@@ -510,9 +510,14 @@ attaches **no AWS managed read policies** (the former
 `CloudWatchReadOnlyAccess`, `CloudWatchLogsReadOnlyAccess`, and
 `CostOptimizationHubReadOnlyAccess` grants allowed reading any log group, stack
 template/parameter, and metric in the account). Every statement below names a
-concrete caller that worked on the prior role, so the rebuild **adds no net-new
-provider capability** — it only removes, scopes, or makes explicit what the
-managed policies previously supplied implicitly. No runtime path reads log
+concrete reviewed caller. For every action except three, that caller worked on
+the prior role, so the rebuild only removes, scopes, or makes explicit what the
+managed policies previously supplied implicitly. The three exceptions are
+read-only: `compute-optimizer:GetEnrollmentStatus` (the Billing MCP
+compute-optimizer tool's enrollment check) and `eks:ListInsights` /
+`eks:DescribeInsight` (the eks-mcp `get_eks_insights` tool). Their callers were
+already offered to the model and failed only because the prior role denied
+them. The rebuild adds **no write capability**. No runtime path reads log
 **content** or deletes memory **records**; the only provider mutations are the
 scoped memory/event writes (including session-event `DeleteEvent` within this
 project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
@@ -527,10 +532,10 @@ project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
 | AgentCoreMemoryAccess | `bedrock-agentcore:CreateEvent`, `GetEvent`, `ListEvents`, `DeleteEvent`, `RetrieveMemoryRecords`, `BatchCreateMemoryRecords` | Strands session manager (STM events) + `semantic_memory.py` (LTM write/retrieve) | `memory/gameagent*` |
 | CostExplorerReadAccess | `ce:GetCostAndUsage`, `GetCostForecast`, `aws-portal:ViewBilling` | Owned deterministic report + Billing MCP cost forecast | `*` (global endpoint) |
 | CostOptimizationHubReadAccess | `cost-optimization-hub:ListRecommendationSummaries`, `ListRecommendations`, `GetRecommendation` | Billing MCP cost-optimization | `*` (global; no resource type) |
-| ComputeOptimizerReadAccess | `compute-optimizer:GetEC2InstanceRecommendations`, `GetAutoScalingGroupRecommendations` | Billing MCP compute-optimizer (EC2 + Auto Scaling rightsizing) | `*` + `aws:RequestedRegion` (regional service, no resource type) |
+| ComputeOptimizerReadAccess | `compute-optimizer:GetEC2InstanceRecommendations`, `GetAutoScalingGroupRecommendations`, `GetEnrollmentStatus` | Billing MCP compute-optimizer (EC2 + Auto Scaling rightsizing, and its enrollment probe) | `*` + `aws:RequestedRegion` (regional service, no resource type) |
 | AutoScalingReadAccess | `autoscaling:DescribeAutoScalingGroups`, `DescribeAutoScalingInstances` | Compute Optimizer Auto Scaling dependent reads | `*` + `aws:RequestedRegion` (no resource type) |
 | GameLiftReadAccess | 10 reviewed `gamelift:List*/Describe*` ops | GameLift specialist | `*` + `aws:RequestedRegion` (no fleet-ARN scoping for collection/capacity reads) |
-| EKSReadAccess | `eks:ListClusters`, `DescribeCluster`, `List/DescribeNodegroup(s)`, `List/DescribeFargateProfile(s)`, `List/DescribeAddon(s)` | aws-api-mcp `call_aws` + eks-mcp | `*` + `aws:RequestedRegion` (dynamic cluster names) |
+| EKSReadAccess | `eks:ListClusters`, `DescribeCluster`, `List/DescribeNodegroup(s)`, `List/DescribeFargateProfile(s)`, `List/DescribeAddon(s)`, `ListInsights`, `DescribeInsight` | aws-api-mcp `call_aws` + eks-mcp (including `get_eks_insights`) | `*` + `aws:RequestedRegion` (dynamic cluster names) |
 | EC2ReadAccess | `ec2:DescribeInstances` | Compute Optimizer EC2 dependent read | `*` + `aws:RequestedRegion` (EC2 describes have no resource type) |
 | ECRImageAccess | `ecr:BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability` | container-mode image pull | `repository/bedrock-agentcore-gameagentruntime` |
 | ECRTokenAccess | `ecr:GetAuthorizationToken` | container-mode registry auth | `*` + `aws:RequestedRegion` (no resource type) |
@@ -561,7 +566,8 @@ Reference, or that address a global endpoint:*
 - **EC2** `DescribeInstances` — no resource-type support; constrained by an
   `aws:RequestedRegion` condition.
 - **Compute Optimizer** `GetEC2InstanceRecommendations` /
-  `GetAutoScalingGroupRecommendations` and the **Auto Scaling** describes
+  `GetAutoScalingGroupRecommendations` / `GetEnrollmentStatus` and the
+  **Auto Scaling** describes
   (`DescribeAutoScalingGroups`, `DescribeAutoScalingInstances`) — no resource
   types; constrained by an `aws:RequestedRegion` condition.
 
@@ -579,7 +585,9 @@ the deployment region:*
   names are dynamic. Among the `List*` reads, only `ListClusters` has no resource
   type; `ListNodegroups`, `ListFargateProfiles`, and `ListAddons` take a `cluster`
   ARN but use `*` because cluster names are created at runtime, constrained
-  instead by the `aws:RequestedRegion` condition.
+  instead by the `aws:RequestedRegion` condition. The Insights reads
+  (`ListInsights`, `DescribeInsight`) also take a `cluster` ARN and use `*` for
+  the same reason.
 
 > **Region narrowing (behavior change from the prior role).** On the prior role
 > the Compute Optimizer and Auto Scaling grants carried no region condition (the
@@ -591,8 +599,10 @@ the deployment region:*
 **Not granted (pre-existing gaps).** These actions were either never granted on
 the prior role, or had a reviewed caller that never actually worked on it, so
 adding them now would expand provider capability and is out of scope for the
-least-privilege rebuild. Each is tracked as a follow-up, with its runtime
-impact:
+least-privilege rebuild. The three reads named above were granted after their
+denials were observed and reviewed for issue #583; each action below still
+needs its own review before it is granted. Each is tracked as a follow-up, with
+its runtime impact:
 
 - `ce:GetUsageForecast` — the Billing MCP cost-explorer **usage** forecast.
   `AWSBillingReadOnlyAccess` carried no forecast action, so usage forecasts never
@@ -605,8 +615,6 @@ impact:
   `lambda:ListProvisionedConcurrencyConfigs`) never worked. Impact: these two
   rightsizing categories are off the reviewed surface and are removed from the
   model-visible catalog by the Billing MCP guard.
-- `eks:ListInsights` / `eks:DescribeInsight` (the EKS insights tool). Impact: an
-  insights request fails with access denied.
 - `eks-mcpserver:QueryKnowledgeBase` (the EKS troubleshooting-guide search tool).
   Impact: the troubleshooting-guide search returns nothing / fails.
 - `get_eks_vpc_config` (the eks-mcp VPC tool) is **wholly non-functional**: it
@@ -620,10 +628,6 @@ impact:
   documentation but granted by neither the prior nor the reviewed role. Impact:
   if the platform ever emits these, they would be denied; no reviewed caller
   needs them today.
-- `compute-optimizer:GetEnrollmentStatus` — the Billing MCP compute-optimizer
-  tool probes it before each operation; neither the prior nor the reviewed role
-  grants it. Impact: the probe is denied and the tool logs the denial and
-  continues (a tolerated, non-fatal denial).
 
 **Container-fallback ECR grant.** The deployed runtime uses AgentCore
 `direct_code_deploy` and pulls no image, but the toolkit prints a warning and
