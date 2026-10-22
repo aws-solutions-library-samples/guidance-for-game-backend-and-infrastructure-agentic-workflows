@@ -72,7 +72,7 @@ dependencies = [
     "requests>=2.34.2",
     "beautifulsoup4>=4.15.0",
     "html2text>=2024.2.26",
-    "pypdf>=6.19.0",
+    "pypdf>=6.20.1",
 ]
 
 [dependency-groups]
