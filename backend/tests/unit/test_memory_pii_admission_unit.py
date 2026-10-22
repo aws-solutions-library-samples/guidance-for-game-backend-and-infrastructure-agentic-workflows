@@ -40,12 +40,12 @@ def test_sensitive_fact_is_rejected_before_any_memory_client_call(value):
 def test_sensitive_input_is_not_truncated_into_an_apparently_safe_fact(value):
     # The extraction patterns can stop before dots or punctuation. Check the
     # original message before extraction so an address is not saved as "192".
-    with patch.object(semantic_memory, "save_semantic_memory") as save:
+    with patch.object(semantic_memory, "save_semantic_memory", return_value=True) as save:
         semantic_memory.extract_and_save_user_info(
             "actor-synthetic", f"My name is Zephyr. Our game uses cluster-{value}.", "Noted."
         )
 
-    save.assert_not_called()
+    save.assert_called_once_with("actor-synthetic", "User's name is Zephyr")
 
 
 def test_ordinary_profile_and_game_facts_still_save():

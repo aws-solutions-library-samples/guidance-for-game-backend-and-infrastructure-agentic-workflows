@@ -273,22 +273,31 @@ user's own messages and stores in that user's namespace: a name of up to two
 words, a game type from a fixed list, fleet or cluster IDs, player counts, and
 similar. The patterns fix each fact's shape but not its length; a name word or
 an ID can be as long as the prompt allows. Extraction is skipped for any turn
-the Guardrail stopped. A local admission check also skips extraction for messages
-containing recognizable account IDs, email addresses, phone numbers, IPv4/IPv6
-addresses, or `.internal` hostnames. It checks the original message before any
+the Guardrail stopped. A local admission check also refuses facts containing
+recognizable account IDs, email addresses, phone numbers, IPv4/IPv6 addresses,
+or `.internal` hostnames. It checks the original spans before any extraction
 pattern can truncate a sensitive value, and checks content again before a memory
-write. Ordinary names and game facts remain eligible. This intentionally skips
-all facts from such a message, including otherwise harmless facts.
+write. Ordinary names and game facts in the same message remain eligible.
 Stored facts are not input-checked again when retrieved on later turns.
 Because the prompt-attack filter is input-only, it never evaluates retrieved memory.
 Each sensitive-information entity and regex in
 `infrastructure/cloudformation/04-bedrock-guardrails.yaml` has one action for
-both directions. The local admission check is not a complete PII classifier:
-arbitrary usernames and disguised sensitive values may remain, and existing
-records are not rewritten. An `ANONYMIZE` entity in those retrieved records
-reaches the model unmasked, and a `BLOCK` entity does not block the request.
-The output-side Guardrail policies still evaluate every
-reply, so anything the model repeats from retrieved memory gets the same output
+both directions, and none of them runs on retrieved memory. A `BLOCK` entity
+such as `PASSWORD` stops its turn, so extraction is skipped and it is never
+stored. For `ANONYMIZE` values, the write path refuses any candidate fact that
+carries a value shaped like one: it matches the template's AWS account ID
+(`\b\d{12}\b`) and internal hostname (`\b[a-z0-9-]+\.internal\b`) regexes plus
+local approximations of the `EMAIL`, `IP_ADDRESS` (IPv4 addresses, CIDR
+blocks, and IPv6 addresses) and `PHONE` entities, and rejects the fact if a captured value overlaps
+a match anywhere in the message. Retrieved memory therefore carries none of the
+values those patterns recognize. The refusal logs only a count. The residual is
+what the patterns do not recognize: the `USERNAME` entity is model-detected and
+has no local equivalent, so the name capture (`\w+`, up to two words) can store
+a handle such as `player_one42` as a name, and an email, IP or phone value in a
+format the approximations miss can still be stored. Existing records are not
+rewritten. Such a value reaches the model unmasked on later turns.
+The output-side Guardrail policies still evaluate every reply, so anything the
+model repeats from retrieved memory gets the same output
 checks as the rest of the reply. Those checks are not a defense against an
 instruction stored in memory, because the prompt-attack filter does not run on
 output. A per-fact length limit and a system-prompt line that marks retrieved
