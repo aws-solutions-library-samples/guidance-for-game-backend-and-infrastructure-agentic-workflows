@@ -278,10 +278,21 @@ through, and it is not input-checked again when it is retrieved on later turns.
 Because the prompt-attack filter is input-only, it never evaluates retrieved memory.
 Each sensitive-information entity and regex in
 `infrastructure/cloudformation/04-bedrock-guardrails.yaml` has one action for
-both directions: an `ANONYMIZE` entity such as `USERNAME` in retrieved memory
-reaches the model unmasked, and a `BLOCK` entity such as `PASSWORD` does not
-block the request. The output-side Guardrail policies still evaluate every
-reply, so anything the model repeats from retrieved memory gets the same output
+both directions, and none of them runs on retrieved memory. A `BLOCK` entity
+such as `PASSWORD` stops its turn, so extraction is skipped and it is never
+stored. For `ANONYMIZE` values, the write path refuses any candidate fact that
+carries a value shaped like one: it matches the template's AWS account ID
+(`\b\d{12}\b`) and internal hostname (`\b[a-z0-9-]+\.internal\b`) regexes plus
+local approximations of the `EMAIL`, `IP_ADDRESS` (IPv4 addresses and CIDR
+blocks) and `PHONE` entities, and rejects the fact if a captured value overlaps
+a match anywhere in the message. Retrieved memory therefore carries none of the
+values those patterns recognize. The refusal logs only a count. The residual is
+what the patterns do not recognize: the `USERNAME` entity is model-detected and
+has no local equivalent, so the name capture (`\w+`, up to two words) can store
+a handle such as `player_one42` as a name, and an email, IP or phone value in a
+format the approximations miss (an IPv6 address, for example) can still be
+stored. Such a value reaches the model unmasked on later turns.
+The output-side Guardrail policies still evaluate every reply, so anything the model repeats from retrieved memory gets the same output
 checks as the rest of the reply. Those checks are not a defense against an
 instruction stored in memory, because the prompt-attack filter does not run on
 output. A per-fact length limit and a system-prompt line that marks retrieved
