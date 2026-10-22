@@ -20,6 +20,8 @@ MINIMUM_PATCHED = {
     "aiohttp": ((3, 14, 4), "GHSA-2g87-pp6c-29x5, GHSA-5wr8-gcqf-gqf3", True),
     "certifi": ((2026, 10, 19), "GHSA-6q48-6c7w-9gw2", True),
     "uv": ((0, 13, 4), "GHSA-hq85-5cpj-mr62", False),
+    "virtualenv": ((21, 14, 7), "GHSA-vxj4-q4g9-crj7", False),
+    "pypdf": ((6, 20, 1), "GHSA-39mj-jf6j-2qj3, GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, GHSA-qfv9-64jg-mh7p", True),
 }
 
 
