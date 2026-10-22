@@ -98,6 +98,11 @@ _OPERATIONAL_CLEAN = [
     "Set desired capacity to 25% off-hours and 100% during peak.",
     "Run at 40% off-season.",
     "The fleet is 15% off its target utilization.",
+    # Sizes without a billing period, or a period without a financial word, are
+    # operational.
+    "Each node has 2 GB of memory.",
+    "Use 30 GB volumes; watch cost.",
+    "Logs grow by 2 GB a day.",
     "Player counts are 40% off their weekend highs.",
     # An uppercase code later in a numbered step is not an amount marker.
     "1. Pre-scale for CNY and watch the error rate.",
@@ -195,6 +200,14 @@ _FINANCIAL_WITHHELD = [
     "Savings Plan rate 0.0624 vCPU",
     "The storage rate is 0.023 GB.",
     "Data transfer costs 0.09 GB",
+    # A size followed by any spelling of a billing period is a rate, not a
+    # quantity, and stays withheld next to a financial word.
+    "Storage costs 2 GB a month",
+    "Storage costs 2 GB monthly",
+    "Storage costs 2 GB each month",
+    "Storage costs 1.5 TB an hour",
+    "costs 2 GB a month",
+    "Storage costs 2 GB every hour",
     # A line-start value that ends a sentence is not a list marker and must stay.
     "999. That is the estimated monthly cost.",
     "450. That assumes on-demand rates.",

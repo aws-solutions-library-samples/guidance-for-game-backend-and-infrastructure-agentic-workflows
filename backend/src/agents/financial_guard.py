@@ -220,6 +220,16 @@ _QUANTITY_RATE_LOOKAHEAD = (
     rf"(?![-/\u2010-\u2015]\w|\s+(?:{_QUANTITY_TIME_UNIT})\b|\s+to[\s-]date\b"
     rf"|\s+(?:over|on|to)\s+(?:{_QUANTITY_TIME_UNIT})\b)"
 )
+# A size followed by a billing period is a storage or transfer rate, not a
+# quantity, however the period is spelled: "2 GB per month", "2 GB a month",
+# "1.5 TB an hour", "2 GB each month", "2 GB every hour", "2 GB monthly". The
+# size branch refuses to neutralize such a number so it stays visible to the
+# value-language detector. Each alternative is a fixed word sequence anchored
+# at the end of the size match, so the guard adds no backtracking.
+_SIZE_RATE_LOOKAHEAD = (
+    rf"(?!\s+(?:per|a|an|each|every)\s+(?:{_QUANTITY_TIME_UNIT})\b"
+    r"|\s+(?:hourly|daily|weekly|monthly|yearly|annually)\b)"
+)
 # The unit may follow the number directly, after whitespace, or after a single
 # hyphen ("40-minute"). The ``_QUANTITY_RATE_LOOKAHEAD`` keeps a compound pricing
 # unit ("GB-month") and a period-over-period or "to date" running total ("950
@@ -227,9 +237,9 @@ _QUANTITY_RATE_LOOKAHEAD = (
 # surviving number stays visible to the currency and value-language detectors.
 # A spaced decimal rate such as "0.04048 vCPU per hour" stays visible because
 # the count branch accepts an integer only, so the decimal never enters the
-# quantity match. The size branch adds a "per <time>" guard so "0.04048 GB per
-# hour" is preserved. A trailing word boundary keeps "4 GiB" from matching a
-# longer token. A currency symbol immediately before the number blocks the match
+# quantity match. The size branch adds ``_SIZE_RATE_LOOKAHEAD`` so "0.04048 GB
+# per hour" and "2 GB a month" are preserved. A trailing word boundary keeps
+# "4 GiB" from matching a longer token. A currency symbol immediately before the number blocks the match
 # here, and a preceding code or word is handled in ``_neutralize_quantities``.
 #
 # An integer count followed by "per <time>" ("2 instances per minute", "5 vCPU
@@ -246,7 +256,7 @@ _QUANTITY_RE = re.compile(
     rf"{_QUANTITY_RATE_LOOKAHEAD}"
     rf"|(?<![{_CURRENCY_SYMBOLS}\d.,])\b(?!0[\d.,])(?:[1-9]\d{{0,2}}(?:,\d{{3}})+|\d+)(?:\.\d+)?"
     rf"[\s-]?(?:{_QUANTITY_SIZE_UNIT})\b"
-    rf"{_QUANTITY_RATE_LOOKAHEAD}(?!\s+per\s+(?:{_QUANTITY_TIME_UNIT})\b)"
+    rf"{_QUANTITY_RATE_LOOKAHEAD}{_SIZE_RATE_LOOKAHEAD}"
     rf"|(?<![{_CURRENCY_SYMBOLS}\d.,])\b\d+[\s-]?(?:{_QUANTITY_TIME_UNIT})\b{_QUANTITY_RATE_LOOKAHEAD}",
     re.IGNORECASE,
 )
