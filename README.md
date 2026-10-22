@@ -535,6 +535,33 @@ The teardown script is idempotent and removes resources in reverse deployment or
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on reporting bugs, suggesting features, and submitting pull requests.
 
+## Releases
+
+Milestone releases are annotated tags published by the manually dispatched
+[`.github/workflows/release.yml`](.github/workflows/release.yml) workflow. A
+release records an exact accepted `main` source state and never deploys to AWS.
+
+The "immutable milestone" guarantee — once published, a release's assets and
+its Git tag cannot be moved, altered, or reused (the title and notes stay
+editable; while the release exists its tag cannot be deleted, and deleting the
+release makes the tag deletable but its name still cannot be reused) — holds
+only once two repository settings are enabled: GitHub's **immutable-releases**
+setting and a **`v*` tag ruleset**. The workflow cannot read the
+immutable-releases setting ahead of time with its `GITHUB_TOKEN`, so it is
+enforced after publish: the run reads the release back and fails unless GitHub
+reports the release as `immutable`.
+See [docs/RELEASING.md](docs/RELEASING.md) for the release policy,
+evidence-comment format, attached artifacts, the before-first-run checklist, and
+rollback guidance.
+
+Build-provenance attestation is deferred, consistent with the no-AWS-credentials
+design: the workflow holds no `id-token` or `attestations` permission, and the
+attached SBOMs plus the `SHA256SUMS` manifest are the stated supply-chain
+boundary. When the immutable-releases setting is enabled, creating an immutable
+release makes GitHub generate a release attestation automatically. A dedicated,
+workflow-signed provenance attestation is tracked in
+[#613](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/613).
+
 ## License
 
 This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
