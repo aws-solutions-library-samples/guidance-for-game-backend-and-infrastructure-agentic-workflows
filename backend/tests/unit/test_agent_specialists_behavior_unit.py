@@ -40,7 +40,7 @@ class TestGameLiftSpecialistBehavior:
         assert callable(get_scaling_policies)
 
     def test_gamelift_boto3_tools_return_dict(self):
-        """Test GameLift boto3 tools return dict structures."""
+        """Test GameLift boto3 tools return the bounded, code-owned envelope."""
         # Local modules
         from agents.gamelift_specialist import list_gamelift_fleets
 
@@ -55,22 +55,28 @@ class TestGameLiftSpecialistBehavior:
             result = list_gamelift_fleets()
 
             assert isinstance(result, dict)
-            assert result["FleetAttributes"] == []
+            # The raw FleetAttributes duplicate is gone; the model-facing
+            # contract is ClassicFleets + ContainerFleets + FleetCounts.
+            assert "FleetAttributes" not in result
             assert result["ClassicFleets"] == []
             assert result["ContainerFleets"] == []
             assert result["FleetCounts"] == {"Classic": 0, "Container": 0, "Total": 0}
+            # A valid empty inventory with no failures is the distinct `empty`.
+            assert result["status"] == "empty"
             # No fleets -> must not call describe_fleet_attributes
             mock_gamelift.describe_fleet_attributes.assert_not_called()
 
     def test_list_fleets_paginates_and_chunks(self):
-        """list_gamelift_fleets pages all fleets and chunks describe calls at 100.
+        """list_gamelift_fleets pages fleets and chunks describe calls at 100.
 
         Regression for #124: a single list_fleets() call truncated large
-        accounts. With 150 fleets across 2 pages, all 150 must be described via
-        two describe_fleet_attributes calls (100 + 50).
+        accounts. With 150 fleets across 2 pages, the projection item cap bounds
+        the view to GAMELIFT_MAX_PROJECTED_ITEMS and marks it truncated, while
+        the 100-ID chunking for describe_fleet_attributes is preserved on the
+        capped ID set.
         """
         # Local modules
-        from agents.gamelift_specialist import list_gamelift_fleets
+        from agents.gamelift_specialist import GAMELIFT_MAX_PROJECTED_ITEMS, list_gamelift_fleets
 
         page1 = [f"fleet-{i}" for i in range(100)]
         page2 = [f"fleet-{i}" for i in range(100, 150)]
@@ -87,20 +93,22 @@ class TestGameLiftSpecialistBehavior:
 
             mock_gamelift.get_paginator.side_effect = get_paginator
             mock_gamelift.describe_fleet_attributes.side_effect = lambda FleetIds: {
-                "FleetAttributes": [{"FleetId": fid} for fid in FleetIds]
+                "FleetAttributes": [{"FleetId": fid, "Status": "ACTIVE"} for fid in FleetIds]
             }
             mock_client.return_value = mock_gamelift
 
             result = list_gamelift_fleets()
 
-            # All 150 fleets described, none dropped
-            assert len(result["FleetAttributes"]) == 150
-            # describe called twice with <=100 IDs each (100, then 50)
+            # View is item-capped and flagged truncated; counts never overclaim.
+            assert len(result["ClassicFleets"]) == GAMELIFT_MAX_PROJECTED_ITEMS
+            assert result["truncated"] is True
+            assert result["FleetCounts"]["Classic"] == GAMELIFT_MAX_PROJECTED_ITEMS
+            # describe called with <=100 IDs per call on the capped ID set.
             calls = mock_gamelift.describe_fleet_attributes.call_args_list
-            assert [len(c.kwargs["FleetIds"]) for c in calls] == [100, 50]
+            assert all(len(c.kwargs["FleetIds"]) <= 100 for c in calls)
 
     def test_list_fleets_classic_only(self):
-        """Classic fleets are preserved when no container fleets exist."""
+        """Classic fleets are projected when no container fleets exist."""
         # Local modules
         from agents.gamelift_specialist import list_gamelift_fleets
 
@@ -109,26 +117,29 @@ class TestGameLiftSpecialistBehavior:
 
             def get_paginator(operation):
                 if operation == "list_fleets":
-                    return self._paginator([{"FleetIds": ["classic-fleet"]}])
+                    return self._paginator([{"FleetIds": ["fleet-classic"]}])
                 if operation == "list_container_fleets":
                     return self._paginator([{"ContainerFleets": []}])
                 raise AssertionError(f"Unexpected paginator: {operation}")
 
             mock_gamelift.get_paginator.side_effect = get_paginator
             mock_gamelift.describe_fleet_attributes.return_value = {
-                "FleetAttributes": [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
+                "FleetAttributes": [{"FleetId": "fleet-classic", "Status": "ACTIVE", "InstanceType": "c5.large"}]
             }
             mock_client.return_value = mock_gamelift
 
             result = list_gamelift_fleets()
 
-            assert result["FleetAttributes"] == [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
-            assert result["ClassicFleets"] == [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
+            assert "FleetAttributes" not in result
+            assert result["ClassicFleets"] == [
+                {"FleetId": "fleet-classic", "Status": "ACTIVE", "InstanceType": "c5.large"}
+            ]
             assert result["ContainerFleets"] == []
             assert result["FleetCounts"] == {"Classic": 1, "Container": 0, "Total": 1}
+            assert result["status"] == "ok"
 
     def test_list_fleets_container_only(self):
-        """Container fleets are returned when classic list_fleets is empty."""
+        """Container fleets are projected when classic list_fleets is empty."""
         # Local modules
         from agents.gamelift_specialist import list_gamelift_fleets
 
@@ -139,7 +150,7 @@ class TestGameLiftSpecialistBehavior:
                 if operation == "list_fleets":
                     return self._paginator([{"FleetIds": []}])
                 if operation == "list_container_fleets":
-                    return self._paginator([{"ContainerFleets": [{"FleetId": "container-fleet"}]}])
+                    return self._paginator([{"ContainerFleets": [{"FleetId": "containerfleet-1"}]}])
                 if operation == "list_container_group_definitions":
                     return self._paginator(
                         [
@@ -162,7 +173,7 @@ class TestGameLiftSpecialistBehavior:
                                 "FleetDeployments": [
                                     {
                                         "DeploymentId": "deployment-one",
-                                        "DeploymentStatus": "COMPLETED",
+                                        "DeploymentStatus": "COMPLETE",
                                     }
                                 ]
                             }
@@ -173,8 +184,8 @@ class TestGameLiftSpecialistBehavior:
             mock_gamelift.get_paginator.side_effect = get_paginator
             mock_gamelift.describe_container_fleet.return_value = {
                 "ContainerFleet": {
-                    "FleetId": "container-fleet",
-                    "FleetArn": "redacted-resource-reference",
+                    "FleetId": "containerfleet-1",
+                    "FleetArn": "arn:aws:gamelift:us-west-2:123456789012:containerfleet/cf-1",
                     "GameServerContainerGroupDefinitionName": "game-server-group",
                     "GameServerContainerGroupDefinitionArn": "container-group-definition/game-server-group:7",
                     "InstanceType": "c6i.large",
@@ -182,7 +193,7 @@ class TestGameLiftSpecialistBehavior:
                     "Status": "ACTIVE",
                     "DeploymentDetails": {"LatestDeploymentId": "deployment-one"},
                     "LogConfiguration": {"LogDestination": "CLOUDWATCH", "LogGroupArn": "log-group-arn"},
-                    "LocationAttributes": [{"Location": "example-region", "Status": "ACTIVE"}],
+                    "LocationAttributes": [{"Location": "us-west-2", "Status": "ACTIVE"}],
                 }
             }
             mock_gamelift.describe_container_group_definition.return_value = {
@@ -200,8 +211,9 @@ class TestGameLiftSpecialistBehavior:
 
             result = list_gamelift_fleets()
 
-            assert result["FleetAttributes"] == []
+            assert "FleetAttributes" not in result
             assert result["FleetCounts"] == {"Classic": 0, "Container": 1, "Total": 1}
+            assert result["status"] == "ok"
             assert result["ContainerFleets"] == [
                 {
                     "FleetType": "container",
@@ -210,7 +222,7 @@ class TestGameLiftSpecialistBehavior:
                     "BillingType": "ON_DEMAND",
                     "GameServerContainerGroupDefinitionName": "game-server-group",
                     "GameServerContainerGroupDefinitionVersion": 7,
-                    "DeploymentStatus": "COMPLETED",
+                    "DeploymentStatus": "COMPLETE",
                     "LogDestinationType": "CLOUDWATCH",
                     "LocationCount": 1,
                     "ContainerGroupDefinition": {
@@ -224,9 +236,10 @@ class TestGameLiftSpecialistBehavior:
                     },
                 }
             ]
-            assert "FleetId" not in result["ContainerFleets"][0]
-            assert "FleetArn" not in result["ContainerFleets"][0]
-            assert "LogGroupArn" not in result["ContainerFleets"][0]
+            row = result["ContainerFleets"][0]
+            assert "FleetId" not in row
+            assert "FleetArn" not in row
+            assert "LogGroupArn" not in row
 
     def test_list_fleets_mixed_classic_and_container(self):
         """Container IDs returned by list_fleets are not described as classic fleets."""
@@ -238,9 +251,9 @@ class TestGameLiftSpecialistBehavior:
 
             def get_paginator(operation):
                 if operation == "list_fleets":
-                    return self._paginator([{"FleetIds": ["classic-fleet", "container-fleet"]}])
+                    return self._paginator([{"FleetIds": ["fleet-classic", "containerfleet-1"]}])
                 if operation == "list_container_fleets":
-                    return self._paginator([{"ContainerFleets": [{"FleetId": "container-fleet"}]}])
+                    return self._paginator([{"ContainerFleets": [{"FleetId": "containerfleet-1"}]}])
                 if operation == "list_container_group_definitions":
                     return self._paginator([{"ContainerGroupDefinitions": []}])
                 if operation == "list_fleet_deployments":
@@ -250,13 +263,13 @@ class TestGameLiftSpecialistBehavior:
             mock_gamelift.get_paginator.side_effect = get_paginator
 
             def describe_fleet_attributes(FleetIds):
-                assert FleetIds == ["classic-fleet"]
-                return {"FleetAttributes": [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]}
+                assert FleetIds == ["fleet-classic"]
+                return {"FleetAttributes": [{"FleetId": "fleet-classic", "Status": "ACTIVE"}]}
 
             mock_gamelift.describe_fleet_attributes.side_effect = describe_fleet_attributes
             mock_gamelift.describe_container_fleet.return_value = {
                 "ContainerFleet": {
-                    "FleetId": "container-fleet",
+                    "FleetId": "containerfleet-1",
                     "GameServerContainerGroupDefinitionName": "game-server-group",
                     "GameServerContainerGroupDefinitionArn": "container-group-definition/game-server-group:3",
                     "InstanceType": "c6i.large",
@@ -275,14 +288,20 @@ class TestGameLiftSpecialistBehavior:
 
             result = list_gamelift_fleets()
 
-            assert result["ClassicFleets"] == [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
+            assert result["ClassicFleets"] == [{"FleetId": "fleet-classic", "Status": "ACTIVE"}]
             assert result["ContainerFleets"][0]["FleetType"] == "container"
             assert result["ContainerFleets"][0]["GameServerContainerGroupDefinitionVersion"] == 3
             assert result["FleetCounts"] == {"Classic": 1, "Container": 1, "Total": 2}
+            assert result["status"] == "ok"
             mock_gamelift.describe_fleet_attributes.assert_called_once()
 
     def test_list_fleets_container_api_failure_preserves_classic_results(self):
-        """Classic fleet results still return when container APIs fail."""
+        """Classic fleet results still return when container APIs fail.
+
+        The failed container listing becomes a code-owned {Source, Code} warning
+        with no provider text, and the envelope is reported as a partial
+        ``incomplete`` view that still carries the valid classic rows.
+        """
         # Local modules
         from agents.gamelift_specialist import list_gamelift_fleets
 
@@ -291,24 +310,27 @@ class TestGameLiftSpecialistBehavior:
 
             def get_paginator(operation):
                 if operation == "list_fleets":
-                    return self._paginator([{"FleetIds": ["classic-fleet"]}])
+                    return self._paginator([{"FleetIds": ["fleet-classic"]}])
                 if operation == "list_container_fleets":
                     return self._paginator(error=Exception("container read denied"))
                 raise AssertionError(f"Unexpected paginator: {operation}")
 
             mock_gamelift.get_paginator.side_effect = get_paginator
             mock_gamelift.describe_fleet_attributes.return_value = {
-                "FleetAttributes": [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
+                "FleetAttributes": [{"FleetId": "fleet-classic", "Status": "ACTIVE"}]
             }
             mock_client.return_value = mock_gamelift
 
             result = list_gamelift_fleets()
 
-            assert result["ClassicFleets"] == [{"FleetId": "classic-fleet", "Status": "ACTIVE"}]
+            assert result["ClassicFleets"] == [{"FleetId": "fleet-classic", "Status": "ACTIVE"}]
             assert result["ContainerFleets"] == []
             assert result["FleetCounts"] == {"Classic": 1, "Container": 0, "Total": 1}
-            assert result["Warnings"] == [{"Source": "container_fleets", "Message": "container read denied"}]
-            assert "error" not in result
+            # Code-owned, deduplicated {Source, Code, Count} warning only -- no provider text.
+            assert result["Warnings"] == [{"Source": "container_fleets", "Code": "provider_error", "Count": 1}]
+            assert "container read denied" not in __import__("json").dumps(result)
+            assert result["status"] == "incomplete"
+            assert result["partial"] is True
 
 
 class TestEKSSpecialistBehavior:

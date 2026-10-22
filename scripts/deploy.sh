@@ -57,6 +57,20 @@ if ! command -v jq &> /dev/null; then
     echo "   ✅ jq installed"
 fi
 
+# python3 is required to parse AWS CLI JSON in the account-observability steps
+# (Step 1.7 default read, Step 2b trace-delivery verification, and the Step 5c
+# recheck). uv installs Python 3.13 for the backend but does not put it on PATH,
+# so a standalone python3 is a hard prerequisite. Unlike jq it is not
+# auto-installed: fail with a clear message rather than guess an interpreter.
+if ! command -v python3 &> /dev/null; then
+    echo "❌ python3 not found. It is required to parse AWS responses in the"
+    echo "   account-observability steps (Step 1.7 default read, Step 2b"
+    echo "   trace-delivery verification, and the Step 5c recheck). Install"
+    echo "   Python 3 from https://www.python.org/downloads/ (or your OS package"
+    echo "   manager) and re-run."
+    exit 1
+fi
+
 # Docker is optional — backend deploys without it, but frontend (Steps 6-8) will be skipped
 DOCKER_AVAILABLE=true
 if ! command -v docker &> /dev/null; then
@@ -80,6 +94,53 @@ if [ "$DOCKER_AVAILABLE" = false ]; then
 fi
 
 echo "✅ All required prerequisites met"
+echo ""
+
+# Preflight: install backend dependencies locally, then guard against an
+# unbootable long-path runtime BEFORE any AWS-mutating command runs (#517).
+#
+# `agentcore launch` (Step 2) does not ship this venv's console scripts: the
+# AgentCore starter toolkit rebuilds a dependency bundle with its own
+# `uv pip install --target` inside the uv-selected project environment and zips
+# that into dependencies.zip. uv embeds the environment interpreter's absolute
+# local path into each console script's launcher line; the embedded basename is
+# the longer of the names uv may embed (`<env>/bin/python3` or `<env>/bin/python`
+# depending on the uv version), so this guard measures `<env>/bin/python3`. When
+# that interpreter path is over the uv shebang byte limit or contains a space,
+# uv emits a /bin/sh trampoline instead of a portable shebang, producing a
+# runtime that dies at exec — silently, because deploy still exits 0 and the
+# control plane reaches READY. Running the check here, right after local
+# `uv sync` and before Step 0.5 (the first `aws cloudformation deploy`), means a
+# doomed deploy fails fast with a clear remediation and leaves zero AWS side
+# effects behind. The guard runs from inside the physical backend directory
+# (the same working directory `agentcore launch` resolves the project from) so
+# it measures the interpreter path that actually ships.
+echo "📦 Preflight: Installing backend dependencies..."
+if ! _uv_sync_out=$(cd "$PROJECT_ROOT/backend" && uv sync 2>&1); then
+    echo "❌ Preflight: 'uv sync' failed:" >&2
+    echo "$_uv_sync_out" >&2
+    exit 1
+fi
+echo "🔎 Preflight: Verifying the runtime interpreter path is bootable..."
+_runtime_path_status=0
+_runtime_path_out="$(
+  cd "$PROJECT_ROOT/backend"
+  _backend_physical="$(pwd -P)"
+  uv run python \
+    "$SCRIPT_DIR/infrastructure/check_runtime_path.py" --backend-dir "$_backend_physical"
+)" || _runtime_path_status=$?
+# Exit code 3 is the guard's dedicated "skipped" signal (a native Windows host,
+# out of scope; see #610): the path was not measured, so report the skip rather
+# than a portability result and let the deploy continue. 0 means it measured and
+# passed. Any other nonzero is a real failure; re-raise it so `set -e` aborts.
+if [ "$_runtime_path_status" -eq 0 ]; then
+  echo "✅ Runtime interpreter path is portable"
+elif [ "$_runtime_path_status" -eq 3 ]; then
+  printf '%s\n' "$_runtime_path_out"
+else
+  printf '%s\n' "$_runtime_path_out" >&2
+  exit "$_runtime_path_status"
+fi
 echo ""
 
 # Step 0: Download KB documentation
@@ -166,23 +227,37 @@ GBAW_COST_PROMPT_ARN=$(grep "^GBAW_COST_PROMPT_ARN=" "$PROJECT_ROOT/backend/.env
 echo "✅ Managed Prompts deployed"
 echo ""
 
-# Step 1.7: Account-wide observability setup (idempotent)
-# Ensures 'aws/spans' log group exists (AWS-reserved namespace) and configures
-# Transaction Search. Toggles Transaction Search if log group is missing.
-# Workaround for: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
-echo "📡 Step 1.7: Setting up account-wide observability..."
-bash "$SCRIPT_DIR/infrastructure/setup-account-observability.sh"
+# Step 1.7: Account-wide observability setup
+# Account-wide X-Ray / CloudWatch Logs changes (trace segment destination,
+# indexing rule, shared Logs resource policy) are shared, cross-application
+# settings. They run ONLY when GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true. By
+# default the deployment is read-only here: it detects whether the account
+# already supports Transaction Search and, if not, prints an actionable warning
+# without failing. That warning recommends the opt-in only when the AWS-reserved
+# 'aws/spans' log group already exists and the destination was read; otherwise
+# it points to the one-time console enable or a destination toggle, because the
+# opt-in cannot create that group. See docs/OBSERVABILITY_ADOT_EXPORTER.md.
+echo "📡 Step 1.7: Account-wide observability..."
+GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY="${GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY:-false}" \
+  AWS_REGION="$AWS_REGION" \
+  bash "$SCRIPT_DIR/infrastructure/setup-account-observability.sh"
 
-echo "✅ Account-wide observability configured"
+echo "✅ Account-wide observability step complete"
 echo ""
 
 # Step 2: Launch AgentCore Runtime (direct code deployment via CodeBuild)
 echo "🤖 Step 2: Launching AgentCore Runtime..."
 cd "$PROJECT_ROOT/backend"
 
-# Ensure backend dependencies (including agentcore CLI) are installed
+# Ensure backend dependencies (including agentcore CLI) are installed.
+# The preflight already synced and ran the runtime path guard (#517); this
+# re-sync is idempotent and keeps Step 2 self-contained.
 echo "📦 Installing backend dependencies..."
-uv sync > /dev/null 2>&1
+if ! _uv_sync_out=$(uv sync 2>&1); then
+    echo "❌ 'uv sync' failed:" >&2
+    echo "$_uv_sync_out" >&2
+    exit 1
+fi
 
 # Resolve model roles through the same canonical Python configuration used by
 # local runtime. Process variables override ui/.env.local; canonical role names
@@ -451,6 +526,455 @@ reconcile_waf_association() {
   return 1
 }
 
+# --- Runtime trace-delivery classification and verification (#471) ---
+#
+# AWS CloudWatch Logs delivery setup for the AgentCore runtime must distinguish a
+# genuine "already exists" conflict (idempotent success) from authorization,
+# validation, throttling, and service errors. A failure that is misread as an
+# idempotent conflict can report a broken delivery as success.
+
+# Classify a CloudWatch Logs delivery CLI error from its combined output.
+# Prints one of: conflict | retryable | fatal. The output text is consumed
+# locally and never re-emitted, so account IDs and ARNs are not printed.
+#
+# Classification keys off the modeled AWS error CODE extracted from the standard
+# "An error occurred (<Code>) when calling ..." form, so free text such as an
+# account ID that happens to contain "500" or a validation message that mentions
+# "already exists" cannot be misread. CLI transport failures (which carry no
+# error code) are matched on their fixed phrasing and treated as retryable.
+classify_delivery_error() {
+  local error_text="$1"
+  local code=""
+  if [[ "$error_text" =~ \(([A-Za-z0-9]+)\) ]]; then
+    code="${BASH_REMATCH[1]}"
+  fi
+
+  case "$code" in
+    ConflictException | ResourceAlreadyExistsException)
+      printf 'conflict\n'
+      return 0
+      ;;
+    ThrottlingException | ServiceUnavailableException | InternalFailure \
+      | 500 | 502 | 503 | 504)
+      printf 'retryable\n'
+      return 0
+      ;;
+  esac
+
+  # Transport-level CLI failures have no modeled error code.
+  if [[ "$error_text" == *"Could not connect to the endpoint URL"* \
+    || "$error_text" == *"Read timeout"* ]]; then
+    printf 'retryable\n'
+    return 0
+  fi
+
+  printf 'fatal\n'
+  return 0
+}
+
+# Run a single CloudWatch Logs delivery mutation with bounded retry on
+# retryable errors. A fatal error (authorization, validation, service) fails
+# with a bounded, public-safe diagnostic naming only the operation. A conflict
+# is NOT auto-resolved here: it returns 2 so the caller can decide whether the
+# operation is a safe idempotent rerun (create-delivery) or needs a follow-up
+# check (the put upserts).
+#   $1 label (public-safe operation name, e.g. "delivery source")
+#   $2.. the aws CLI arguments
+# Honors GBAW_DELIVERY_MAX_ATTEMPTS (default 4, capped at 20) and
+# GBAW_DELIVERY_RETRY_SECONDS (default 5, capped at 60). On success the captured
+# combined output (stdout and stderr) is available in DELIVERY_LAST_STDOUT; the
+# caller parses it as JSON only with a safe fallback, so stderr noise cannot
+# produce a bad ARN.
+# Returns: 0 success | 1 fatal/exhausted | 2 conflict.
+run_delivery_mutation() {
+  local label="$1"
+  shift
+  local max_attempts="${GBAW_DELIVERY_MAX_ATTEMPTS:-4}"
+  local retry_seconds="${GBAW_DELIVERY_RETRY_SECONDS:-5}"
+  local attempt
+  local command_output
+  local classification
+
+  DELIVERY_LAST_STDOUT=""
+  if ! [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || ! [[ "$retry_seconds" =~ ^[0-9]+$ ]]; then
+    echo "❌ Delivery retry settings must use positive attempts and non-negative seconds" >&2
+    return 1
+  fi
+  # Cap at the same bounds the PowerShell path enforces (attempts 1-20, delay 0-60).
+  [ "$max_attempts" -gt 20 ] && max_attempts=20
+  [ "$retry_seconds" -gt 60 ] && retry_seconds=60
+
+  for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    if command_output=$(aws "$@" 2>&1); then
+      DELIVERY_LAST_STDOUT="$command_output"
+      return 0
+    fi
+    classification=$(classify_delivery_error "$command_output")
+    case "$classification" in
+      conflict)
+        return 2
+        ;;
+      retryable)
+        if [ "$attempt" -lt "$max_attempts" ]; then
+          echo "  ⏳ ${label}: retryable AWS error, retrying (${attempt}/${max_attempts})..."
+          sleep "$retry_seconds"
+          continue
+        fi
+        echo "❌ ${label} did not succeed after ${max_attempts} attempts (retryable AWS error)" >&2
+        return 1
+        ;;
+      *)
+        echo "❌ ${label} failed with a non-retryable AWS error" >&2
+        return 1
+        ;;
+    esac
+  done
+  echo "❌ ${label} did not succeed within the retry budget" >&2
+  return 1
+}
+
+# Verify that a delivery binding matches the intended runtime. Reads only
+# stdout. Checks, from `describe-deliveries` JSON ($1): a delivery whose
+# deliverySourceName is $2, deliveryDestinationArn is $3, and
+# deliveryDestinationType is XRAY; and, from `get-delivery-source` JSON ($5),
+# that the source's resourceArns contains the runtime ARN $4.
+delivery_is_active() {
+  local deliveries_json="$1"
+  local expected_source="$2"
+  local expected_dest_arn="$3"
+  local runtime_arn="$4"
+  local source_json="$5"
+
+  if ! is_resolved_deployment_value "$expected_source" \
+    || ! is_resolved_deployment_value "$expected_dest_arn" \
+    || ! is_resolved_deployment_value "$runtime_arn"; then
+    return 1
+  fi
+
+  SOURCE="$expected_source" DEST="$expected_dest_arn" RUNTIME="$runtime_arn" \
+    SOURCE_JSON="$source_json" python3 -c '
+import json
+import os
+import sys
+
+
+def _load(text):
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return None
+
+
+deliveries_payload = _load(sys.stdin.read())
+if isinstance(deliveries_payload, dict):
+    deliveries = deliveries_payload.get("deliveries", [])
+else:
+    deliveries = deliveries_payload
+if not isinstance(deliveries, list):
+    sys.exit(1)
+
+expected_source = os.environ["SOURCE"]
+expected_dest = os.environ["DEST"]
+runtime_arn = os.environ["RUNTIME"]
+
+matched = False
+for delivery in deliveries:
+    if not isinstance(delivery, dict):
+        continue
+    if delivery.get("deliverySourceName") != expected_source:
+        continue
+    if delivery.get("deliveryDestinationArn") != expected_dest:
+        continue
+    if delivery.get("deliveryDestinationType") != "XRAY":
+        continue
+    matched = True
+    break
+if not matched:
+    sys.exit(1)
+
+# The delivery source must actually be bound to the runtime ARN.
+source_payload = _load(os.environ.get("SOURCE_JSON", ""))
+source = source_payload.get("deliverySource") if isinstance(source_payload, dict) else None
+if not isinstance(source, dict):
+    sys.exit(1)
+resource_arns = source.get("resourceArns", [])
+if not isinstance(resource_arns, list) or runtime_arn not in resource_arns:
+    sys.exit(1)
+sys.exit(0)
+' <<< "$deliveries_json"
+}
+
+# Read account state to confirm an already-existing delivery resource matches
+# the intended runtime after a conflict. Returns 0 only when the resource is
+# ours. Output is consumed locally.
+#   $1 "source"|"destination", $2 resource name, $3 runtime arn
+delivery_resource_matches_runtime() {
+  local kind="$1"
+  local name="$2"
+  local runtime_arn="$3"
+  local json
+
+  if [ "$kind" = "source" ]; then
+    if ! json=$(aws logs get-delivery-source --name "$name" --region "$AWS_REGION" --output json 2>/dev/null); then
+      return 1
+    fi
+    RESOURCE_JSON="$json" RUNTIME="$runtime_arn" python3 -c '
+import json, os, sys
+try:
+    source = json.loads(os.environ["RESOURCE_JSON"]).get("deliverySource", {})
+except (ValueError, KeyError):
+    sys.exit(1)
+if source.get("logType") not in (None, "TRACES"):
+    sys.exit(1)
+arns = source.get("resourceArns", [])
+sys.exit(0 if isinstance(arns, list) and os.environ["RUNTIME"] in arns else 1)
+'
+    return $?
+  fi
+
+  if ! json=$(aws logs get-delivery-destination --name "$name" --region "$AWS_REGION" --output json 2>/dev/null); then
+    return 1
+  fi
+  RESOURCE_JSON="$json" python3 -c '
+import json, os, sys
+try:
+    dest = json.loads(os.environ["RESOURCE_JSON"]).get("deliveryDestination", {})
+except (ValueError, KeyError):
+    sys.exit(1)
+sys.exit(0 if dest.get("deliveryDestinationType") == "XRAY" else 1)
+'
+}
+
+# Resolve a project-owned delivery destination ARN from the AWS API rather than
+# fabricating it. Prints the ARN on success; returns non-zero if it cannot be
+# resolved.
+resolve_delivery_destination_arn() {
+  local name="$1"
+  local arn
+  arn=$(aws logs get-delivery-destination \
+    --name "$name" \
+    --region "$AWS_REGION" \
+    --query 'deliveryDestination.arn' \
+    --output text 2>/dev/null || echo "")
+  if [ -z "$arn" ] || [ "$arn" = "None" ]; then
+    return 1
+  fi
+  printf '%s\n' "$arn"
+}
+
+# Full Step 2b workflow: create source, destination, and delivery with
+# classification + bounded retry, then verify the delivery is active. Fails
+# (returns non-zero) on any real error or on verification failure.
+#   $1 runtime id, $2 runtime arn
+ensure_runtime_trace_delivery() {
+  local runtime_id="$1"
+  local runtime_arn="$2"
+  local delivery_source_name="${runtime_id}-traces-source"
+  local delivery_dest_name="${runtime_id}-traces-destination"
+  local delivery_dest_arn=""
+  local deliveries_json=""
+  local source_json=""
+  local rc
+
+  # Delivery source (upsert). A conflict here means a differing source already
+  # covers this runtime, which is only safe if it is actually bound to us.
+  run_delivery_mutation "Delivery source" \
+    logs put-delivery-source \
+    --name "$delivery_source_name" \
+    --log-type "TRACES" \
+    --resource-arn "$runtime_arn" \
+    --region "$AWS_REGION"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    if ! delivery_resource_matches_runtime "source" "$delivery_source_name" "$runtime_arn"; then
+      echo "❌ A conflicting delivery source exists for this runtime" >&2
+      return 1
+    fi
+    echo "  ✅ Delivery source already present for this runtime"
+  elif [ "$rc" -ne 0 ]; then
+    return 1
+  else
+    echo "  ✅ Delivery source ready"
+  fi
+
+  # Delivery destination (upsert). Same conflict rule applies.
+  run_delivery_mutation "Delivery destination" \
+    logs put-delivery-destination \
+    --name "$delivery_dest_name" \
+    --delivery-destination-type "XRAY" \
+    --region "$AWS_REGION"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    if ! delivery_resource_matches_runtime "destination" "$delivery_dest_name" "$runtime_arn"; then
+      echo "❌ A conflicting delivery destination exists for this runtime" >&2
+      return 1
+    fi
+    echo "  ✅ Delivery destination already present"
+  elif [ "$rc" -ne 0 ]; then
+    return 1
+  else
+    echo "  ✅ Delivery destination ready"
+  fi
+
+  # Resolve the destination ARN from the put response when it parses as JSON;
+  # the capture may include stderr, so a failed parse falls back to the API read
+  # below rather than yielding a bad ARN. Never fabricate it.
+  if [ -n "$DELIVERY_LAST_STDOUT" ]; then
+    delivery_dest_arn=$(printf '%s' "$DELIVERY_LAST_STDOUT" \
+      | python3 -c "import json,sys; print(json.load(sys.stdin)['deliveryDestination']['arn'])" 2>/dev/null || echo "")
+  fi
+  if [ -z "$delivery_dest_arn" ]; then
+    if ! delivery_dest_arn=$(resolve_delivery_destination_arn "$delivery_dest_name"); then
+      echo "❌ Unable to resolve the delivery destination ARN" >&2
+      return 1
+    fi
+  fi
+
+  # Delivery binding (create). A conflict here is a safe idempotent rerun of the
+  # same source/destination pair.
+  run_delivery_mutation "Delivery" \
+    logs create-delivery \
+    --delivery-source-name "$delivery_source_name" \
+    --delivery-destination-arn "$delivery_dest_arn" \
+    --region "$AWS_REGION"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "  ✅ Delivery already exists"
+  elif [ "$rc" -ne 0 ]; then
+    return 1
+  else
+    echo "  ✅ Delivery ready"
+  fi
+
+  # Verification (bounded retry; stdout only): the deployment must not succeed
+  # unless the intended source and destination are actually bound to the runtime.
+  local verify_attempts="${GBAW_DELIVERY_MAX_ATTEMPTS:-4}"
+  local verify_delay="${GBAW_DELIVERY_RETRY_SECONDS:-5}"
+  [[ "$verify_attempts" =~ ^[1-9][0-9]*$ ]] || verify_attempts=4
+  [[ "$verify_delay" =~ ^[0-9]+$ ]] || verify_delay=5
+  [ "$verify_attempts" -gt 20 ] && verify_attempts=20
+  [ "$verify_delay" -gt 60 ] && verify_delay=60
+
+  local attempt verified=false
+  for ((attempt = 1; attempt <= verify_attempts; attempt++)); do
+    if deliveries_json=$(aws logs describe-deliveries \
+      --region "$AWS_REGION" --output json 2>/dev/null) \
+      && source_json=$(aws logs get-delivery-source \
+        --name "$delivery_source_name" --region "$AWS_REGION" --output json 2>/dev/null) \
+      && delivery_is_active "$deliveries_json" "$delivery_source_name" \
+        "$delivery_dest_arn" "$runtime_arn" "$source_json"; then
+      verified=true
+      break
+    fi
+    if [ "$attempt" -lt "$verify_attempts" ]; then
+      sleep "$verify_delay"
+    fi
+  done
+  if [ "$verified" != true ]; then
+    echo "❌ Runtime trace delivery is not active for the intended source and destination" >&2
+    return 1
+  fi
+  echo "  ✅ Delivery verified active"
+  return 0
+}
+
+# Read the account X-Ray trace segment destination in one place. Prints two
+# space-separated tokens, "<destination> <status>", using the same enum the API
+# models (destination XRay | CloudWatchLogs; status PENDING | ACTIVE). A failed
+# or unparseable read prints "UNREADABLE UNREADABLE" so the caller can treat a
+# read failure the same as a not-yet-active destination. Read-only.
+read_trace_segment_destination() {
+  local output
+  if ! output=$(aws xray get-trace-segment-destination \
+    --region "$AWS_REGION" --output json 2>/dev/null); then
+    printf 'UNREADABLE UNREADABLE\n'
+    return 0
+  fi
+  TRACE_DEST_JSON="$output" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.loads(os.environ["TRACE_DEST_JSON"])
+except (ValueError, KeyError):
+    print("UNREADABLE UNREADABLE")
+    sys.exit(0)
+if not isinstance(payload, dict):
+    print("UNREADABLE UNREADABLE")
+    sys.exit(0)
+destination = payload.get("Destination") or "UNREADABLE"
+status = payload.get("Status") or "UNREADABLE"
+print(f"{destination} {status}")
+' 2>/dev/null || printf 'UNREADABLE UNREADABLE\n'
+}
+
+# Bounded poll until the trace segment destination reports ACTIVE. Returns 0 as
+# soon as it is ACTIVE, or non-zero when the budget is exhausted. The budget is
+# overridable for tests and operators via GBAW_TRACE_DESTINATION_ACTIVE_* (the
+# defaults mirror the account-observability wait: 30 attempts, 10s apart).
+wait_for_trace_destination_active() {
+  local attempts="${GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS:-30}"
+  local delay="${GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS:-10}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=30
+  [[ "$delay" =~ ^[0-9]+$ ]] || delay=10
+  local attempt status
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    status="$(aws xray get-trace-segment-destination \
+      --region "$AWS_REGION" --query 'Status' --output text 2>/dev/null || echo "")"
+    if [ "$status" = "ACTIVE" ]; then
+      return 0
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
+# Step 2b gate. Transaction Search must be active for the per-runtime trace
+# delivery to bind: the delivery destination type is XRAY and the account trace
+# segment destination has to be CloudWatchLogs and ACTIVE. On a fresh account the
+# destination can stay PENDING for several minutes after agentcore launch
+# switches it, so this gate decides whether to create the delivery now, wait for
+# it, or defer it without failing the deploy:
+#   - CloudWatchLogs + ACTIVE: create and verify the delivery; every failure is
+#     fatal (issue #471 requires a failed delivery to fail the deploy).
+#   - CloudWatchLogs + not yet ACTIVE: wait for a bounded, configurable budget;
+#     if it becomes ACTIVE, create and verify as above.
+#   - Not CloudWatchLogs, still not ACTIVE after the wait, or an unreadable read:
+#     print one WARNING naming the state and skip the delivery. The deploy
+#     continues and the read-only Step 5c recheck still reports.
+#   $1 runtime id, $2 runtime arn
+ensure_runtime_trace_delivery_gated() {
+  local runtime_id="$1"
+  local runtime_arn="$2"
+  local destination status
+
+  read -r destination status <<< "$(read_trace_segment_destination)"
+
+  if [ "$destination" = "CloudWatchLogs" ] && [ "$status" = "ACTIVE" ]; then
+    ensure_runtime_trace_delivery "$runtime_id" "$runtime_arn"
+    return $?
+  fi
+
+  if [ "$destination" = "CloudWatchLogs" ]; then
+    echo "  ⏳ Trace segment destination is CloudWatchLogs but not yet ACTIVE (status: ${status}); waiting..."
+    if wait_for_trace_destination_active; then
+      ensure_runtime_trace_delivery "$runtime_id" "$runtime_arn"
+      return $?
+    fi
+  fi
+
+  echo "⚠️  WARNING: Skipping runtime trace delivery setup."
+  echo "   X-Ray trace segment destination is '${destination}' (status: ${status}), not an"
+  echo "   active 'CloudWatchLogs' destination. Traces will not reach CloudWatch Logs until"
+  echo "   X-Ray Transaction Search is active for this account. Check it with:"
+  echo "     aws xray get-trace-segment-destination --region ${AWS_REGION}"
+  echo "   and re-run the deployment after it reports CloudWatchLogs and ACTIVE."
+  return 0
+}
+
 build_agentcore_env_args
 
 # Get execution role from CloudFormation
@@ -528,44 +1052,9 @@ echo ""
 # Also skipped when --auto-update-on-conflict updates an existing runtime.
 # See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
 echo "📡 Step 2b: Ensuring CloudWatch delivery for runtime traces..."
-DELIVERY_SOURCE_NAME="${RUNTIME_ID}-traces-source"
-DELIVERY_DEST_NAME="${RUNTIME_ID}-traces-destination"
-
-# Create delivery source (idempotent)
-if aws logs put-delivery-source \
-    --name "$DELIVERY_SOURCE_NAME" \
-    --log-type "TRACES" \
-    --resource-arn "$RUNTIME_ARN" \
-    --region $AWS_REGION > /dev/null 2>&1; then
-  echo "  ✅ Delivery source created"
-else
-  echo "  ✅ Delivery source already exists"
-fi
-
-# Create delivery destination (idempotent)
-DELIVERY_DEST_ARN=""
-if DEST_RESULT=$(aws logs put-delivery-destination \
-    --name "$DELIVERY_DEST_NAME" \
-    --delivery-destination-type "XRAY" \
-    --region $AWS_REGION 2>&1); then
-  DELIVERY_DEST_ARN=$(echo "$DEST_RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['deliveryDestination']['arn'])" 2>/dev/null || echo "")
-  echo "  ✅ Delivery destination created"
-else
-  # Already exists — construct the ARN
-  DELIVERY_DEST_ARN="arn:aws:logs:${AWS_REGION}:$(aws sts get-caller-identity --query Account --output text):delivery-destination:${DELIVERY_DEST_NAME}"
-  echo "  ✅ Delivery destination already exists"
-fi
-
-# Create delivery (idempotent)
-if [ -n "$DELIVERY_DEST_ARN" ]; then
-  if aws logs create-delivery \
-      --delivery-source-name "$DELIVERY_SOURCE_NAME" \
-      --delivery-destination-arn "$DELIVERY_DEST_ARN" \
-      --region $AWS_REGION > /dev/null 2>&1; then
-    echo "  ✅ Delivery created"
-  else
-    echo "  ✅ Delivery already exists"
-  fi
+if ! ensure_runtime_trace_delivery_gated "$RUNTIME_ID" "$RUNTIME_ARN"; then
+  echo "❌ Runtime traces delivery could not be configured and verified" >&2
+  exit 1
 fi
 
 echo "✅ Runtime traces delivery configured"
@@ -624,6 +1113,21 @@ uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 echo "✅ AgentCore Runtime updated with role models and available service configuration"
 
 cd "$PROJECT_ROOT"
+echo ""
+
+# Step 5c: Post-launch Transaction Search recheck (read-only, non-blocking)
+# `agentcore launch` performs its own Transaction Search enable on every launch
+# (Step 2, only on a first deploy, and Step 5b). A first-time API enable does
+# not complete it: the AWS-reserved 'aws/spans' log group is created only by the
+# console or a destination toggle. Running this recheck after the run's final
+# launch reports whether spans can actually flow so a deploy does not finish
+# silently with no Transaction Search. The `|| true` keeps the recheck
+# non-blocking at the call site regardless of the child's exit status; the
+# recheck never mutates account state.
+# See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
+echo "📡 Step 5c: Rechecking Transaction Search state..."
+AWS_REGION="$AWS_REGION" \
+  bash "$SCRIPT_DIR/infrastructure/setup-account-observability.sh" report-transaction-search || true
 echo ""
 
 # Steps 6-8: Frontend build, deploy, and security (require Docker)
