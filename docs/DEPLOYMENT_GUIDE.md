@@ -15,8 +15,9 @@ Before you begin, ensure you have the following installed and configured:
 | **UV** | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **Docker** | Latest | [Install Guide](https://docs.docker.com/get-docker/) |
 | **yq** | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
+| **python3** | 3.8+ | [Download](https://www.python.org/downloads/) |
 
-**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`).
+**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`). UV does not add a `python3` to `PATH`, so a standalone Python 3 is still required: the deployment scripts call `python3` directly to parse AWS CLI responses in the account-observability steps (the Step 1.7 default read, the Step 2b trace-delivery verification, and the Step 5c post-launch recheck).
 
 **Windows users:** Native PowerShell deployment scripts are available in `scripts/powershell/`. See [scripts/powershell/README.md](../scripts/powershell/README.md) for setup and usage. Requires PowerShell 7.0+ and AWS CLI v2 — no WSL2 or Linux environment needed.
 
@@ -194,6 +195,134 @@ Log in with the admin credentials you created.
 
 ADOT runtime telemetry is auto-configured by AgentCore. For a known cold-start exporter credential limitation (transient `403` on telemetry export) and the read-only detection check, see [`OBSERVABILITY_ADOT_EXPORTER.md`](OBSERVABILITY_ADOT_EXPORTER.md).
 
+### Account-wide Observability (Scoped and Opt-in)
+
+X-Ray Transaction Search relies on account-wide, cross-application settings: the
+X-Ray trace segment destination, the default X-Ray indexing (sampling) rule, and
+a shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log
+group. Changing these affects every X-Ray and Transaction Search consumer in the
+account.
+
+**Scope.** By default this repository's deployment scripts make **no**
+account-wide Transaction Search settings changes. They read the current trace
+destination, detect whether the account already supports what the runtime needs,
+and — if it does not — print an actionable warning. That warning recommends the
+opt-in only when the AWS-reserved `aws/spans` log group already exists and the
+destination was read (so the opt-in can finish the job); otherwise it points to
+the one-time console enable or a destination toggle keyed on the current
+destination, because the opt-in cannot create that group. A default deployment is **not** failed for a missing account
+configuration. The per-runtime trace delivery (Step 2b) binds only when X-Ray
+Transaction Search is active, so the deploy first reads the account trace segment
+destination: when it is `CloudWatchLogs` and `ACTIVE` the delivery is created and
+verified (and any delivery failure then fails the deploy); when it is
+`CloudWatchLogs` but not yet `ACTIVE` the deploy waits a bounded budget for it;
+and when the destination is not `CloudWatchLogs`, never becomes `ACTIVE` within
+the budget, or cannot be read, the deploy prints one WARNING naming the state and
+skips the delivery rather than aborting. The read-only Step 5c recheck still runs
+and reports.
+
+> **Residual not controlled by this opt-in.** `agentcore launch` — which the
+> deploy script runs in its Step 2 (only on a first deploy) and Step 5b
+> launches — performs its own Transaction Search setup on every launch,
+> regardless of `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. On every launch, the
+> AgentCore starter toolkit may make up to three shared changes, each also when
+> its own read fails: it adds a `TransactionSearchXRayAccess` resource policy
+> whenever no policy already has that exact name (even when this opt-in's own
+> policy already grants access), switches the account trace segment destination
+> to `CloudWatchLogs` when it is not already `CloudWatchLogs`, and sets the
+> `Default` X-Ray indexing rule to 1% sampling when no `Default` rule exists.
+> This is behavior of the toolkit, not of this repository's scripts, and is
+> tracked in
+> [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
+> A read-only post-launch recheck (Step 5c) reports the resulting Transaction
+> Search state without changing it.
+
+**Opt-in.** To let the deployment configure the shared settings, set the
+purpose-named opt-in:
+
+```bash
+GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh
+```
+
+PowerShell uses the matching switch:
+
+```powershell
+Deploy-GameAgent -ConfigureAccountObservability
+```
+
+Before applying anything, the opt-in path prints exactly which shared settings
+may change.
+
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` and `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
+are read from the process environment only; they are not read from
+`ui/.env.local`. The PowerShell switch `-ConfigureAccountObservability` and the
+environment variable are equivalent opt-in triggers.
+
+**Ownership and preservation.** This repository's opt-in reads existing state
+first and preserves it. It enables Transaction Search only additively (it never
+performs a disable/re-enable toggle of the shared destination) and leaves an
+already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
+enable does not create the AWS-reserved `aws/spans` log group (only the console
+or a destination toggle does), the opt-in **fails** — with the one-time console
+or toggle step — rather than reporting success when `aws/spans` is still absent
+after the enable. On a fresh account whose destination starts at `XRay`, the
+opt-in has by then already written the shared resource policy and switched the
+trace destination to `CloudWatchLogs` (and, if you set
+`GBAW_XRAY_DEFAULT_INDEXING_PERCENT`, changed the `Default` indexing rule); those
+changes stay in place (the destination rollback command was printed earlier in
+the run), and only the console or a destination toggle creates `aws/spans`. If it cannot read the
+current trace destination, the opt-in refuses to change it and fails rather than
+guessing. The
+account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
+modified only when you set `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` to an integer in
+`[0, 100]`, and only then is a rollback command printed with the prior value. The
+shared Logs resource policy uses a project-owned name
+(`GameAgentTransactionSearchXRayAccess`). Before writing it, the deployment lists
+existing resource policies: if another policy (including a legacy
+`TransactionSearchXRayAccess` written by earlier deploys) already grants
+`xray.amazonaws.com` `logs:PutLogEvents` on `aws/spans`, it is left in place and
+the write is skipped; if the account is already at the 10-policy limit, the
+deployment fails with a bounded message instead of adding a duplicate.
+
+**Legacy policy migration.** Some earlier versions of this project wrote a shared
+policy named `TransactionSearchXRayAccess`. The current opt-in writes its own
+project-owned policy name and leaves any `TransactionSearchXRayAccess` policy
+untouched. If such a policy exists and already grants the needed access, it
+continues to work and the opt-in skips its own write. Delete the legacy
+`TransactionSearchXRayAccess` policy only once you have confirmed no other
+workload relies on it.
+
+**Validation.** The per-runtime trace delivery step first reads the account
+trace segment destination: it creates and verifies the delivery only when the
+destination is `CloudWatchLogs` and `ACTIVE`, waits a bounded, configurable
+budget when the destination is `CloudWatchLogs` but still converging, and
+otherwise prints one WARNING and skips the delivery (the deploy continues). The
+wait budget is overridable with `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS`
+(default 30) and `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` (default 10). When
+the delivery does run, each mutation (delivery source → destination → delivery)
+distinguishes a genuine already-exists conflict from authorization, validation,
+throttling, and service errors by the AWS error code. Retryable errors are
+retried with a small bounded backoff; a real error fails the deployment with a
+bounded diagnostic. The deployment then queries the delivery (retrying a
+transient read) and fails unless a delivery with destination type `XRAY` binds
+the intended source — whose resources include the runtime — to the intended
+destination.
+
+**Rollback.** The account-wide changes made by *this repository's opt-in* are
+listed above; `agentcore launch` may make the separate, toolkit-owned changes
+noted in the Scope callout. The opt-in prints a rollback command for the trace
+destination when it enables Transaction Search, and for the default indexing rule
+only when you explicitly change it (with the prior percentage). To remove the
+project-owned resource policy:
+
+```bash
+aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAccess --region <region>
+```
+
+Teardown intentionally preserves account-wide observability resources because
+they may be shared with other applications.
+
+
 ## Post-Deployment Configuration
 
 ### Enroll EKS Clusters (Optional)
@@ -366,6 +495,15 @@ reviewed cost evidence.
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
+| `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` | No | false | Opt in to account-wide X-Ray / CloudWatch Logs changes (trace destination, indexing rule, shared Logs resource policy). See [Account-wide Observability](#account-wide-observability-scoped-and-opt-in) |
+| `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` | No | unset | Opt-in only: X-Ray default indexing (sampling) percent, integer [0, 100]. Left unchanged when unset |
+| `GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME` | No | `GameAgentTransactionSearchXRayAccess` | Opt-in only: project-owned CloudWatch Logs resource policy name |
+| `GBAW_OBSERVABILITY_ACTIVE_MAX_ATTEMPTS` | No | 30 | Opt-in only: max polls for the trace destination to reach ACTIVE |
+| `GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS` | No | 10 | Opt-in only: delay between ACTIVE polls, in seconds |
+| `GBAW_DELIVERY_MAX_ATTEMPTS` | No | 4 (capped at 20) | Runtime trace-delivery retry attempts |
+| `GBAW_DELIVERY_RETRY_SECONDS` | No | 5 (capped at 60) | Delay between trace-delivery retries, in seconds |
+| `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS` | No | 30 | Step 2b: polls for the X-Ray trace destination to reach `ACTIVE` before creating the trace delivery |
+| `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` | No | 10 | Step 2b: delay between trace-destination `ACTIVE` polls, in seconds |
 
 ## Security Notes
 

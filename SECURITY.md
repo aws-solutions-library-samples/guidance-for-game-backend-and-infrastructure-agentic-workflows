@@ -491,7 +491,7 @@ Every other protection is unchanged. `backend/tests/unit/test_guardrail_template
 | Frontend (ECS Express) | JWT claims, validated prompt | **Authenticated** | HttpOnly cookies, Cognito verification |
 | Backend (AgentCore) | Sanitized prompt, user context | **Validated** | Input validation, rate limiting, guardrails |
 | AWS service responses | Fleet/cluster info, costs | **Internal** | IAM-scoped read-only access |
-| Logs (CloudWatch) | Sanitized excerpts | **Redacted** | PII/credentials stripped by `sanitize_log_data()`, encrypted at rest |
+| Logs (CloudWatch) | Request IDs, bounded metrics, outcomes | **Redacted** | No prompt text or raw identifiers; sensitive patterns and control characters stripped by `sanitize_log_data()`/`normalize_log_value()`, correlation via `redact_identifier()`, encrypted at rest |
 | Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation (`actor_id`), encrypted at rest, TTL-enforced |
 
 ### Service-to-Service Credentials
@@ -824,6 +824,66 @@ reference to `resolve_runtime_host`.
 - CloudWatch logs all application activity
 - Logs retained per compliance requirements
 
+### Application Log Minimization
+
+Application logs are limited to request/correlation IDs, bounded metrics, and
+operation outcomes. They do not contain prompt text, extracted names,
+semantic-memory content, email addresses, display names, raw Cognito subjects,
+or raw session/thread identifiers.
+
+- Agents run without the default Strands stdout printer
+  (`callback_handler=None`), so streamed model text and tool names are not
+  written to stdout, which the hosted runtime ships to its log group. A static
+  test checks every `Agent(...)` construction.
+- Correlation uses a per-request ID. The backend binds the AgentCore runtime
+  request ID into every log record for the duration of an invocation, so lines
+  from one request can be correlated without any raw identifier. A value that
+  must stay tied to a principal or session across lines is emitted as a
+  bounded, non-reversible token: `redact_identifier()`
+  (`backend/src/utils/security.py`, a keyed HMAC-SHA-256 prefix over a random
+  per-process key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
+  the frontend. The HMAC key is random per process and is never read from the
+  environment, so a token is stable only within a single process and does not
+  correlate across processes, restarts, or tiers. The frontend additionally
+  records AgentCore's service request ID from the `x-amzn-RequestId` response
+  header, which identifies the invocation to the service (for example in a
+  support case). It comes from a different header than the request ID the
+  runtime container logs, so the two are not known to match and it is treated
+  as a service-call identifier rather than a cross-tier correlation key. It is
+  not derived from caller identity or content and is logged normalized rather
+  than redacted.
+- Externally influenced fields are normalized before emission so carriage
+  returns, line feeds, other C0/C1/DEL control characters, the Unicode line and
+  paragraph separators, and bidirectional-formatting controls cannot inject
+  additional log records or reorder a rendered line. The backend normalizes
+  every record at the logging sink (`normalize_log_value()` applied by the
+  logger patcher in `backend/src/utils/logger.py`); the frontend logger strips
+  the same classes in `logInfo`, `logWarning`, `logError`, `logDebug`, and
+  `redact`.
+- The AgentCore SDK installs its own log handler whose formatter would emit the
+  raw runtime session ID on every invocation. `agentcore_main` wraps that
+  formatter so the serialized `sessionId` is replaced with a bounded token while
+  `requestId` is preserved.
+- Semantic-memory logging records only outcomes and counts.
+- The request-handling error paths that can see prompt or identity values — the
+  AgentCore entrypoint, the orchestrator (including the model-loop failure over
+  the user prompt), the specialists, agent timing, and semantic memory — record
+  the exception class name, a typed, sanitized error code, the request ID, and a
+  bounded list of `module:function:lineno` raise-site frames (no message,
+  locals, arguments, source text, or file paths) through
+  `log_sanitized_exception()`, never the exception message, which can embed a
+  provider validation payload or caller value. The raise-site frames restore
+  bug triage without reintroducing caller- or provider-authored content, and the
+  frame count and each component are bounded so a deep stack cannot produce an
+  unbounded line. The full rendered traceback is emitted only when debug logging
+  is explicitly enabled (a non-production switch). Separately governed diagnostic
+  paths that cannot carry prompt or identity values do retain the exception
+  message to classify the failure: startup credential and container pre-warm
+  checks and the memory-ID config read in `agentcore_main`, the GameLift
+  specialist's AWS SDK describe/list calls, the Cost Explorer diagnostic path,
+  the cost-report snapshot store's DynamoDB failure paths, and the Bedrock Prompt
+  Management load fallback.
+
 ### Secrets Management
 
 - No hardcoded credentials in code
@@ -844,7 +904,12 @@ reference to `resolve_runtime_host`.
 
 - User data isolated per actor_id
 - Memory can be cleared via API (`/api/memory/clear`)
-- No PII stored in logs (filtered by guardrails)
+- No PII in application log messages (prompt text and identifiers excluded; see
+  Application Log Minimization). Distributed-trace span content is governed
+  separately: the tracing SDK can attach prompt and response content to GenAI
+  spans, controlled by `OTEL_SEMCONV_STABILITY_OPT_IN`
+  (`gen_ai_unredacted_attributes`). Narrowing trace-span content is tracked as a
+  follow-up.
 
 ### SOC 2 / ISO 27001
 
