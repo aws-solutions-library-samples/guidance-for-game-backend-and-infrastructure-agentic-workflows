@@ -42,8 +42,8 @@ def _stub_environment(tmp_path: pathlib.Path, uv_exit_code: int = 0, aws_mode: s
     else:
         uv_content = """#!/bin/sh
 printf "%s\\n" \
-  "export GBAW_ORCHESTRATOR_MODEL_ID='global.anthropic.claude-haiku-4-5-20251001-v1:0'" \
-  "export GBAW_SPECIALIST_MODEL_ID='global.anthropic.claude-sonnet-4-6'"
+  "export GBAW_ORCHESTRATOR_MODEL_ID='global.anthropic.claude-haiku-5-5'" \
+  "export GBAW_SPECIALIST_MODEL_ID='global.anthropic.claude-sonnet-5-5'"
 """
     _write_executable(bin_dir / "uv", uv_content)
 
@@ -84,7 +84,19 @@ def test_inference_profile_script_uses_uv_model_loader(script):
     assert "GBAW_SPECIALIST_MODEL_ID" in content
 
 
-def test_get_profile_ids_prefers_role_application_profiles(tmp_path):
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_inference_profile_names_follow_role_models(script):
+    """Application profile names track the current role model generation."""
+    content = script.read_text(encoding="utf-8")
+    assert "GameAgent-Orchestrator-Claude-Haiku-5-5" in content
+    assert "GameAgent-Specialist-Claude-Sonnet-5-5" in content
+    # The previous-generation profile names must not linger in lookups or creation.
+    assert "Claude-Haiku-4-5" not in content
+    assert "Claude-Sonnet-4-6" not in content
+
+
+def test_get_profile_ids_exports_resolved_models_even_when_application_profiles_exist(tmp_path):
+    """Application profiles over the 5.5 models are not runtime IDs until #421."""
     result = subprocess.run(
         ["bash", str(GET_SCRIPT), "us-west-2"],
         env=_stub_environment(tmp_path, aws_mode="profiles"),
@@ -93,11 +105,13 @@ def test_get_profile_ids_prefers_role_application_profiles(tmp_path):
         check=True,
     )
 
-    assert "GBAW_ORCHESTRATOR_MODEL_ID='orchestrator-profile-id'" in result.stdout
-    assert "GBAW_SPECIALIST_MODEL_ID='specialist-profile-id'" in result.stdout
+    assert "GBAW_ORCHESTRATOR_MODEL_ID='global.anthropic.claude-haiku-5-5'" in result.stdout
+    assert "GBAW_SPECIALIST_MODEL_ID='global.anthropic.claude-sonnet-5-5'" in result.stdout
+    assert "profile-id" not in result.stdout
+    assert "not supported as runtime model IDs until #421" in result.stderr
 
 
-def test_agentcore_role_can_invoke_preferred_application_profiles():
+def test_agentcore_role_can_invoke_application_profiles():
     template = BASE_INFRASTRUCTURE_TEMPLATE.read_text(encoding="utf-8")
     execution_role = _cloudformation_resource(template, "AgentCoreExecutionRole")
 
@@ -114,8 +128,8 @@ def test_get_profile_ids_falls_back_to_canonical_system_profiles(tmp_path):
         check=True,
     )
 
-    assert "GBAW_ORCHESTRATOR_MODEL_ID='global.anthropic.claude-haiku-4-5-20251001-v1:0'" in result.stdout
-    assert "GBAW_SPECIALIST_MODEL_ID='global.anthropic.claude-sonnet-4-6'" in result.stdout
+    assert "GBAW_ORCHESTRATOR_MODEL_ID='global.anthropic.claude-haiku-5-5'" in result.stdout
+    assert "GBAW_SPECIALIST_MODEL_ID='global.anthropic.claude-sonnet-5-5'" in result.stdout
 
 
 def test_manage_profile_check_uses_role_application_profiles(tmp_path):
