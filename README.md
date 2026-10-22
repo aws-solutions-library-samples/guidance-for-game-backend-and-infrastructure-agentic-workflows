@@ -167,9 +167,10 @@ Price List us-west-2 rates; free-tier allowances intentionally excluded):
 | uv | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | yq | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
 | jq | 1.6+ | [Install Guide](https://jqlang.github.io/jq/download/) |
+| python3 | 3.8+ | [Download](https://www.python.org/downloads/) |
 | Docker | Latest (optional) | [Install Guide](https://docs.docker.com/get-docker/) |
 
-Python 3.13 and the AgentCore CLI are automatically installed by `uv` during setup. Docker is only required for building and deploying the frontend container image; frontend deployment steps are skipped if Docker is not available.
+Python 3.13 and the AgentCore CLI are automatically installed by `uv` during setup, but `uv` does not place a `python3` on `PATH`; the deployment scripts call `python3` directly to parse AWS CLI responses, so a standalone Python 3 is required. Docker is only required for building and deploying the frontend container image; frontend deployment steps are skipped if Docker is not available.
 
 ### AWS Account Requirements
 
@@ -254,13 +255,15 @@ The deployment script provisions the following resources:
 1. Base infrastructure (Cognito user pool, IAM roles, ECR repositories)
 2. Bedrock Guardrails (content filtering, PII protection)
 3. Managed prompts (Bedrock Prompt Management)
-4. Account-level observability configuration
+4. Account-level observability configuration (scoped; account-wide X-Ray / CloudWatch Logs changes are opt-in via `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true`)
 5. AgentCore Runtime (backend container via CodeBuild)
 6. Bedrock Knowledge Bases (GameLift, EKS, Cost documentation)
 7. Frontend infrastructure (ECS Express + ALB)
 8. Security infrastructure (WAF, CloudTrail, Inspector)
 
 See [docs/DEPLOYMENT_GUIDE.md](docs/DEPLOYMENT_GUIDE.md) for detailed step-by-step deployment instructions and environment variable reference.
+
+By default this repository's deployment scripts make no account-wide Transaction Search settings changes; they detect whether the account already supports Transaction Search and, if not, print the opt-in instruction when the AWS-reserved `aws/spans` log group already exists and the destination was read, or the one-time console or destination-toggle step when it does not (the opt-in cannot create that group). Set `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` (PowerShell: `Deploy-GameAgent -ConfigureAccountObservability`) to let them configure those shared settings. Note that `agentcore launch` (which the deploy script runs in its Step 2, only on a first deploy, and Step 5b launches) performs its own Transaction Search setup independently of this opt-in: on every launch, the toolkit may make up to three shared changes, each also when its own read fails — it may add a `TransactionSearchXRayAccess` resource policy (whenever no policy already has that exact name, even when this opt-in's own policy already grants access), switch the account trace segment destination to `CloudWatchLogs`, and set the `Default` X-Ray indexing rule to 1% sampling. That residual is tracked in [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568). See [Account-wide Observability](docs/DEPLOYMENT_GUIDE.md#account-wide-observability-scoped-and-opt-in).
 
 ## Local Development
 
