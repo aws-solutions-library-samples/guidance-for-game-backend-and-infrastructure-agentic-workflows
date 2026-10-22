@@ -598,7 +598,7 @@ pyjwt==2.15.1
     # via
     #   game-agent-backend
     #   mcp
-pypdf==6.20.1
+pypdf==6.21.1
     # via game-agent-backend
 pyperclip==1.11.0
     # via fastmcp-slim
