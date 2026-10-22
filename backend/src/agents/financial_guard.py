@@ -221,14 +221,25 @@ _QUANTITY_RATE_LOOKAHEAD = (
     rf"|\s+(?:over|on|to)\s+(?:{_QUANTITY_TIME_UNIT})\b)"
 )
 # A size followed by a billing period is a storage or transfer rate, not a
-# quantity, however the period is spelled: "2 GB per month", "2 GB a month",
-# "1.5 TB an hour", "2 GB each month", "2 GB every hour", "2 GB monthly". The
-# size branch refuses to neutralize such a number so it stays visible to the
-# value-language detector. Each alternative is a fixed word sequence anchored
-# at the end of the size match, so the guard adds no backtracking.
+# quantity. The look-ahead recognizes these period spellings:
+#   - "per" with a space or hyphen, an optional count, and an optional
+#     "calendar"/"billing" qualifier: "2 GB per month", "2 GB per-month",
+#     "2 GB per mo", "2 GB per calendar month", "2 GB per 30 days",
+#     "2 GB per qtr";
+#   - an optional "in", then "a"/"an"/"each"/"every" and an optional qualifier:
+#     "2 GB a month", "2 GB a mo", "1.5 TB an hour", "2 GB every hour",
+#     "2 GB in a month";
+#   - a period adverb: "2 GB monthly", "2 GB nightly", "2 GB bi-weekly",
+#     "2 GB quarterly", "2 GB semi-annually".
+# The size branch refuses to neutralize such a number so it stays visible to the
+# value-language detector. Spellings outside this list are still neutralized.
+# Each alternative is a fixed word sequence anchored at the end of the size
+# match, so the guard adds no super-linear backtracking.
 _SIZE_RATE_LOOKAHEAD = (
-    rf"(?!\s+(?:per|a|an|each|every)\s+(?:{_QUANTITY_TIME_UNIT})\b"
-    r"|\s+(?:hourly|daily|weekly|monthly|yearly|annually)\b)"
+    rf"(?!\s+per[\s-]+(?:\d+\s+)?(?:calendar\s+|billing\s+)?(?:{_QUANTITY_TIME_UNIT}|mo|yr|qtr|quarter)\b"
+    rf"|\s+(?:in\s+)?(?:a|an|each|every)\s+(?:calendar\s+|billing\s+)?(?:{_QUANTITY_TIME_UNIT}|mo|yr|quarter)\b"
+    r"|\s+(?:hourly|daily|nightly|weekly|bi-?weekly|fortnightly|monthly|bi-?monthly|quarterly|yearly|annually"
+    r"|semi-?annually)\b)"
 )
 # The unit may follow the number directly, after whitespace, or after a single
 # hyphen ("40-minute"). The ``_QUANTITY_RATE_LOOKAHEAD`` keeps a compound pricing

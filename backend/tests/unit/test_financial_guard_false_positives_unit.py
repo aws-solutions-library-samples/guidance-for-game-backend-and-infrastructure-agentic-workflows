@@ -102,6 +102,7 @@ _OPERATIONAL_CLEAN = [
     # operational.
     "Each node has 2 GB of memory.",
     "Use 30 GB volumes; watch cost.",
+    "Budget 2 GB per node",
     "Logs grow by 2 GB a day.",
     "Player counts are 40% off their weekend highs.",
     # An uppercase code later in a numbered step is not an amount marker.
@@ -208,6 +209,15 @@ _FINANCIAL_WITHHELD = [
     "Storage costs 1.5 TB an hour",
     "costs 2 GB a month",
     "Storage costs 2 GB every hour",
+    "Storage costs 2 GB per-month",
+    "Storage costs 2 GB per mo",
+    "Storage costs 2 GB a mo",
+    "Storage costs 2 GB per calendar month",
+    "Storage costs 2 GB per 30 days",
+    "Storage costs 2 GB quarterly",
+    "Storage costs 2 GB nightly",
+    "Storage costs 2 GB bi-weekly",
+    "Storage costs 2 GB in a month",
     # A line-start value that ends a sentence is not a list marker and must stay.
     "999. That is the estimated monthly cost.",
     "450. That assumes on-demand rates.",
