@@ -13,7 +13,7 @@ pytestmark = pytest.mark.unit
 
 _SENSITIVE_VALUES = [
     "000000000000",
-    "player@example.invalid",
+    "player@example.com",
     "192.0.2.17",
     "2001:db8::17",
     "game-server.internal",
