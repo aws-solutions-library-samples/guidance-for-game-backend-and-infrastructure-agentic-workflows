@@ -386,6 +386,50 @@ def test_renderer_requirement_is_planned_not_current(adr_norm: str) -> None:
 
 @pytest.mark.unit
 @pytest.mark.fast
+def test_confirmation_card_is_blocked_by_renderer_neutralization(adr_text: str) -> None:
+    """Renderer neutralization must land before the in-transcript submit control.
+
+    Child 3 ships the confirmation card and its submit path inside the chat
+    transcript. If neutralizing model-authored links, URLs, and raw HTML were
+    left to a later child, prompt-injected model HTML could render beside a real
+    submit control, spoof the card, or post a same-origin form. Child 3 must
+    therefore name renderer neutralization as a blocker, and child 5 must not be
+    the only child that carries it.
+    """
+    child_3 = _slice(adr_text, "3. **Proposal fence and confirmation card.", "4. **Server-owned proposer policy")
+    assert "blocked by renderer neutralization" in child_3, "child 3 must be blocked by renderer neutralization"
+    assert "raw html" in child_3, "child 3's blocker must cover raw HTML from model output"
+    assert "links and urls" in child_3, "child 3's blocker must cover model-authored links and URLs"
+    blockers = child_3[child_3.find("blockers:") :]
+    assert blockers.startswith("blockers: renderer neutralization"), "child 3's Blockers list must name it"
+    child_5 = _slice(adr_text, "5. **Navigation-only in-chat entry.", "6. **Direct approval surface")
+    assert "blockers: child 3" in child_5, "child 5 must stay blocked on child 3"
+    assert "renderer neutralization that already blocks child 3" in child_5
+
+
+@pytest.mark.unit
+@pytest.mark.fast
+def test_proposal_proxy_accepts_only_json_bodies(adr_text: str) -> None:
+    """Decision 2 must restrict the proposal proxy to ``application/json`` bodies.
+
+    ``SameSite=Lax`` and the same-origin check do not stop a same-origin HTML
+    form, which can only send form or ``text/plain`` encodings, so a JSON-only
+    proxy is what refuses such a form.
+    """
+    decision_2 = _slice(adr_text, "### 2. The trusted frontend server proxy", "### 3. Model output becomes")
+    assert "accepts only `application/json` request bodies" in decision_2
+
+
+@pytest.mark.unit
+@pytest.mark.fast
+def test_chat_unreachability_does_not_expire_at_activation(adr_norm: str) -> None:
+    """#429's chat-unreachability holds after #441 activation, not only before it."""
+    assert "until #441 activation" not in adr_norm, "chat-unreachability must not read as expiring at #441"
+    assert adr_norm.count("child 1 is a precondition of that activation") >= 2
+
+
+@pytest.mark.unit
+@pytest.mark.fast
 def test_op_h_rows_present(tm_text: str) -> None:
     """The O9 boundary and every OP-H threat row must stay present as table rows.
 

@@ -253,16 +253,21 @@ no operations permission and no provider-write permission. The handoff crosses
 from the browser to the frontend server, and from the frontend server to the
 operations API; it never flows through the AgentCore runtime, a chat tool, or a
 model tool call. #429's property — preparation is unreachable from the chatbot —
-continues to hold for the chat runtime until #441 activation.
+holds for the chat runtime before and after launch activation (#441), because
+Implementation child 1 is a precondition of that activation.
 
 The proxy derives the requester identity from the verified operations access
 token and reads `cognito:groups` from that **access** token (not an ID token),
 consistent with [Identity and Authorization](../IDENTITY_AND_AUTHORIZATION.md#approval-identity).
 It requires the server-owned proposer group `operations-proposer` (decision 4),
 enforces same-origin writes, rejects redirects, bounds response bytes, and
-rate-limits per subject. The proxy group check is UI defense in depth; the
-authoritative proposer decision is server-owned in the application service
-(decision 4).
+rate-limits per subject. The proxy accepts only `application/json` request
+bodies and rejects any other `Content-Type` with 415 before reading the body, so
+an HTML form — which can send only `application/x-www-form-urlencoded`,
+`multipart/form-data`, or `text/plain` — cannot submit a proposal, even from the
+same origin where `SameSite=Lax` cookies and the same-origin check would pass.
+The proxy group check is UI defense in depth; the authoritative proposer
+decision is server-owned in the application service (decision 4).
 
 ### 3. Model output becomes a typed, untrusted proposal through a fenced contract
 
@@ -296,7 +301,11 @@ versioned, fail-closed fenced contract, mirroring
 - **One explicit user gesture, no auto-submit.** Trusted UI code renders a
   confirmation card from the fence values **and** the trusted current state from
   the observe call. Fields are editable. The proposal is submitted only on one
-  explicit user gesture; nothing submits on render.
+  explicit user gesture; nothing submits on render. The card and its submit path
+  ship only in a chat renderer that already neutralizes model-authored links and
+  URLs and renders no raw HTML from model output (decision 5; Implementation
+  child 3 is blocked by that neutralization), so model output cannot spoof the
+  card or place a form or control beside it.
 - **Rendering the outcome.** On a successful preparation the proxy returns the
   `operation_id` and reads the preview from `GET /operations/{operationId}`
   (decision 5). A deterministically `denied` outcome (HTTP 200,
@@ -371,11 +380,15 @@ pattern, is **navigation-only**: selecting it navigates the user to the #554
 approval view. It takes `operation_id` only from the proxy's prepare response,
 never from a model-authored link or chat text. The chat renderer today uses
 CopilotKit's default Markdown rendering, which turns a model-authored link into
-a clickable anchor and renders raw HTML in model output; a child-5 requirement
-is therefore to neutralize model-authored markdown links and URLs so that no
-model-authored link or URL pointing at the approval route is ever rendered as an
-actionable control. There is **no** approve or reject
-control inside the chat transcript. The approve or reject decision never travels
+a clickable anchor and renders raw HTML in model output. Renderer neutralization
+is therefore a prerequisite of the first chat UI that carries a submit control:
+the chat renderer must neutralize model-authored markdown links and URLs and
+render no raw HTML from model output, so that no model-authored link, URL, or
+HTML is ever rendered as an actionable control, spoofs the confirmation card, or
+posts a same-origin form. It lands before the proposal confirmation card and
+submit path (Implementation child 3 is blocked by it) and so is already in
+place for this navigation-only entry (child 5). There is **no** approve or
+reject control inside the chat transcript. The approve or reject decision never travels
 inside a chat message, a model response, a model tool call, or any request body:
 approve carries only the path `operation_id`, and reject (like cancel) carries at
 most an optional `expected_prepared_hash`. The in-chat affordance
@@ -528,9 +541,11 @@ routes a chat adapter to the application services. This record creates **no**
 chat adapter for prepare: the path is Operations UI → trusted Next.js proxy →
 operations HTTP API, and the chat runtime is off it. #429's property that
 preparation "remains unreachable from the chatbot" is preserved for the chat
-runtime, and remains so until #441 activation. ADR 0002's single-authorization
-rule is honored because the authoritative proposer policy and limits live in the
-E2 application service (decision 4), not in the proxy adapter.
+runtime, and continues to hold after launch activation (#441), because
+Implementation child 1 is a precondition of that activation. ADR 0002's
+single-authorization rule is honored because the authoritative proposer policy
+and limits live in the E2 application service (decision 4), not in the proxy
+adapter.
 
 ## Contract Impact
 
@@ -622,19 +637,25 @@ not Closes.
 3. **Proposal fence and confirmation card.** The versioned `proposal` fence,
    its shared frontend validator (fail closed), the confirmation card showing
    server-observed current state, one-gesture submit, and `denied` rendering.
-   Blockers: child 2; the prompt directive, deployed when a full deployment or
-   runtime update passes the new prompt version to AgentCore
-   (`deploy-prompts.sh` alone publishes the version but does not update a running
-   runtime).
+   Blocked by renderer neutralization: before the confirmation card or submit
+   path ships, the chat renderer neutralizes model-authored markdown links and
+   URLs and renders no raw HTML from model output, with renderer tests, so model
+   output can neither spoof the card nor place a link, form, or control beside
+   its submit path. That renderer change is filed as its own issue and must merge
+   first. Blockers: renderer neutralization; child 2; the prompt directive,
+   deployed when a full deployment or runtime update passes the new prompt
+   version to AgentCore (`deploy-prompts.sh` alone publishes the version but does
+   not update a running runtime).
 4. **Server-owned proposer policy and limits.** `operations-proposer` policy in
    the E2 application service, per-requester concurrent `pending_approval` cap,
    and a dedicated `POST /operations/prepare` route throttle (E2 behavior change
    with tests). Blockers: #414.
 5. **Navigation-only in-chat entry.** Presentational affordance gated on
-   discovery `phases.prepare`, navigating to the #554 approval view; the chat
-   renderer neutralizes model-authored markdown links and URLs and renders no
-   raw HTML from model output, so model output cannot become an actionable
-   control. Blockers: child 3; #554.
+   discovery `phases.prepare`, navigating to the #554 approval view. It relies on
+   the renderer neutralization that already blocks child 3, so model output
+   cannot become an actionable control beside it, and adds a test that a
+   model-authored link to the approval route renders inert. Blockers: child 3
+   (and therefore renderer neutralization); #554.
 6. **Direct approval surface (#554).** Open; blocked by #430, #437, and #546.
 7. **UI shell integration (#546).** The in-chat entry survives the Cloudscape
    shell change without changing the trust boundary.
