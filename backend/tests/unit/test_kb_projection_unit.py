@@ -9,12 +9,10 @@ They assert that a raw/unbounded provider response, sensitive
 metadata/location, a misleading completion state, and provider-authored
 exception text MUST NOT reach that boundary.
 
-The provider boundary is mocked with synthetic, public-safe fixtures only. To
-stay valid across the pre-fix implementation (which delegates to
-``strands_tools.retrieve``) and the post-fix implementation (which calls the
-Bedrock Agent Runtime client directly), the fixtures install a stub at the
-real AWS boundary — ``boto3.client("bedrock-agent-runtime")`` — so whichever
-code path runs sees the same synthetic raw response.
+The provider boundary is mocked with synthetic, public-safe fixtures only. The
+fixtures install a stub at the real AWS boundary,
+``boto3.client("bedrock-agent-runtime")``, and at the module's client builder,
+so the tool sees the same synthetic raw response either way.
 """
 
 # Standard library
@@ -81,8 +79,8 @@ class _AgentRuntimeStub:
 def _provider(stub: _AgentRuntimeStub):
     """Install ``stub`` as the bedrock-agent-runtime client for any code path.
 
-    Patches both ``boto3.client`` (used by strands_tools.retrieve) and, if
-    present, the post-fix client builder in ``utils.kb_tools``.
+    Patches ``boto3.client`` and, if present, the client builder in
+    ``utils.kb_tools``.
     """
     # Local modules
     import utils.kb_tools as kb_tools
@@ -97,14 +95,6 @@ def _provider(stub: _AgentRuntimeStub):
     patches = [patch("boto3.client", side_effect=fake_client)]
     if hasattr(kb_tools, "_build_agent_runtime_client"):
         patches.append(patch("utils.kb_tools._build_agent_runtime_client", return_value=stub))
-    # strands_tools.retrieve imports boto3 as a module attribute
-    try:
-        # Third-party packages
-        import strands_tools.retrieve as st_retrieve  # noqa: F401
-
-        patches.append(patch("strands_tools.retrieve.boto3.client", side_effect=fake_client))
-    except Exception:
-        pass
 
     started = [p.start() for p in patches]
     try:

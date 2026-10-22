@@ -15,8 +15,6 @@ This document provides a comprehensive overview of major dependencies, their ver
 | Package | Version | Purpose | License | Security Notes |
 |---------|---------|---------|---------|----------------|
 | strands-agents | >=1.19.0 | AI agent framework with OTEL support | Apache-2.0 | AWS managed |
-| strands-agents-tools | >=0.2.17 | Agent tools library | Apache-2.0 | AWS managed |
-| strands-agents-builder | >=0.1.10 | Agent builder utilities | Apache-2.0 | AWS managed |
 | bedrock-agentcore | >=1.0.6 | AWS Bedrock AgentCore SDK | Apache-2.0 | AWS managed |
 | bedrock-agentcore-starter-toolkit | >=0.1.33 | AgentCore starter utilities | Apache-2.0 | AWS managed |
 
