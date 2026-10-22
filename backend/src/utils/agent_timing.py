@@ -8,6 +8,7 @@ from typing import Any
 
 # Local modules
 from utils.logger import logger
+from utils.security import log_sanitized_exception
 from utils.timing import time_operation
 
 
@@ -42,7 +43,7 @@ class TimedAgent:
             except Exception as e:
                 if self.execution_start:
                     failed_time = time.time() - self.execution_start
-                    logger.error(f"❌ Agent execution failed after {failed_time:.3f}s: {e}")
+                    log_sanitized_exception(logger, f"❌ Agent execution failed after {failed_time:.3f}s", e)
                 else:
-                    logger.error(f"❌ Agent execution failed immediately: {e}")
+                    log_sanitized_exception(logger, "❌ Agent execution failed immediately", e)
                 raise
