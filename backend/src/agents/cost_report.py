@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Callable, cast
@@ -186,15 +186,34 @@ class _LegacyCacheSnapshotStore:
 
 
 @dataclass(frozen=True)
+class CapturedCostRendering:
+    """One deterministic rendering captured during a request.
+
+    ``start`` and ``end_inclusive`` are the report period for a rendered report
+    or selection, the requested dates for a typed report-creation error, and
+    ``None`` for a typed report-reuse error.
+    """
+
+    rendering: str
+    start: str | None = None
+    end_inclusive: str | None = None
+
+
+@dataclass(frozen=True)
 class CostReportCapture:
-    """Request-scoped capture handle used to bypass model-generated financial prose."""
+    """Request-scoped capture handle used to bypass model-generated financial prose.
+
+    After :func:`finish_cost_report_capture`, ``renderings`` holds every
+    rendering captured during the request, oldest first.
+    """
 
     capture_id: str
     token: Token[str | None]
+    renderings: list[CapturedCostRendering] = field(default_factory=list, compare=False, hash=False)
 
 
 _active_capture_id: ContextVar[str | None] = ContextVar("cost_report_capture_id", default=None)
-_captured_responses: dict[str, str] = {}
+_captured_responses: dict[str, list[CapturedCostRendering]] = {}
 _capture_lock = threading.RLock()
 
 
@@ -208,17 +227,24 @@ def begin_cost_report_capture() -> CostReportCapture:
 
 
 def finish_cost_report_capture(capture: CostReportCapture) -> str | None:
-    """Finish a capture and return the last deterministic rendering, if any."""
+    """Finish a capture and return the last deterministic rendering, if any.
+
+    Every captured rendering, with its report period, is also left on
+    ``capture.renderings`` so a caller can choose one by period.
+    """
     _active_capture_id.reset(capture.token)
     with _capture_lock:
-        return _captured_responses.pop(capture.capture_id, None)
+        entries = _captured_responses.pop(capture.capture_id, [])
+    capture.renderings[:] = entries
+    return entries[-1].rendering if entries else None
 
 
-def _capture_authoritative_response(response: str) -> None:
+def _capture_authoritative_response(response: str, start: str | None = None, end_inclusive: str | None = None) -> None:
     capture_id = _active_capture_id.get()
     if capture_id:
+        entry = CapturedCostRendering(rendering=response, start=start, end_inclusive=end_inclusive)
         with _capture_lock:
-            _captured_responses[capture_id] = response
+            _captured_responses.setdefault(capture_id, []).append(entry)
 
 
 def _parse_period(start_date: str, end_date_inclusive: str) -> tuple[date, date, date]:
@@ -817,9 +843,9 @@ def create_cost_report_tool_bundle(
     report_service = service or _cost_report_service
     authoritative_response: list[str] = []
 
-    def record(response: str) -> None:
+    def record(response: str, start: str | None = None, end_inclusive: str | None = None) -> None:
         authoritative_response[:] = [response]
-        _capture_authoritative_response(response)
+        _capture_authoritative_response(response, start, end_inclusive)
 
     @tool
     def get_cost_report(
@@ -835,14 +861,14 @@ def create_cost_report_tool_bundle(
         try:
             snapshot = report_service.create_report(start_date, end_date_inclusive, metric)
             rendered = render_cost_report(snapshot.report)
-            record(rendered)
+            record(rendered, snapshot.report.period.start, snapshot.report.period.end_inclusive)
             return {
                 "report": snapshot.report.model_dump(by_alias=True, mode="json"),
                 "validatedFinancialSection": rendered,
             }
         except CostReportError as error:
             rendered = _render_error(error)
-            record(rendered)
+            record(rendered, start_date, end_date_inclusive)
             return error.as_payload()
 
     @tool
@@ -860,7 +886,7 @@ def create_cost_report_tool_bundle(
             else:
                 rendered = render_cost_report_selection(result)
                 payload_key = "selection"
-            record(rendered)
+            record(rendered, result.period.start, result.period.end_inclusive)
             return {
                 payload_key: result.model_dump(by_alias=True, mode="json"),
                 "validatedFinancialSection": rendered,

@@ -64,16 +64,28 @@ _SYMBOL_AMOUNT_RE = re.compile(rf"[{_CURRENCY_SYMBOLS}]\s*\d|\d\s*[{_CURRENCY_SY
 # No word boundary is required *between* the code and the digits, because a
 # glued form like "USD999" has no boundary there. A boundary is still required
 # on the outer side so a code embedded in another word does not match.
+# The number-then-code branch starts only at the beginning of a run of digits,
+# commas, and periods (leading separators included), so a long run is scanned
+# once instead of once per digit. It matches exactly the same text.
 _CODE_AMOUNT_RE = re.compile(
     rf"\b(?:{_ISO_ALTERNATION})[\s:]*\$?\d"  # code then number ("USD 5", "USD999")
-    rf"|\d[\d,.]*\s*(?:{_ISO_ALTERNATION})\b",  # number then code ("999 USD", "999USD")
+    rf"|(?<![\d,.])[.,]*\d[\d,.]*\s*(?:{_ISO_ALTERNATION})\b",  # number then code ("999 USD", "999USD")
     re.IGNORECASE,
 )
 
 # Explicit currency words require an adjacent value; a bare discussion of
 # "dollars" or "yen" is not itself a financial figure.
 _CURRENCY_WORD = r"dollars?|cents?|euros?|yen"
-_MONEY_NUMBER = r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)" r"(?![A-Za-z0-9]|,\d|\.\d|\s*%)"
+# A money number starts where no ASCII letter or digit precedes it. It does not
+# start right after a digit and a comma ("1,|200"), because the same number
+# already matches from the start of that run, so a long comma-separated run is
+# scanned once instead of once per group. When the run is glued to a letter
+# ("Rs1,200"), the second branch starts at the first group instead. Every text
+# that matched before still matches; a glued run can now start a match one
+# group earlier, which only adds matches near the edge of a word window.
+_MONEY_NUMBER = (
+    r"(?:(?<![A-Za-z0-9])(?<!\d,)|(?<=[A-Za-z])\d+,)" r"(?:\d[\d,]*(?:\.\d+)?|\.\d+)" r"(?![A-Za-z0-9]|,\d|\.\d|\s*%)"
+)
 _CURRENCY_WORD_AMOUNT_RE = re.compile(
     rf"(?:\b(?:{_CURRENCY_WORD})\b[^\n]{{0,20}}{_MONEY_NUMBER})"
     rf"|(?:{_MONEY_NUMBER}[^\n]{{0,20}}\b(?:{_CURRENCY_WORD})\b)",
@@ -138,7 +150,9 @@ _PERCENT_NOUN = (
     r"cost|costs|spend|spending|sav(?:e|es|ed|ing|ings)|discounts?|share|bills?|billed|billing|drop"
     r"|cheaper|cheapest|expensive|price|prices|pricing"
 )
-_PERCENT_VALUE = r"\d+(?:\.\d+)?\s*(?:%|percent\b)"
+# A percentage starts only at the beginning of a digit run, so a long run is
+# scanned once instead of once per digit. It matches exactly the same text.
+_PERCENT_VALUE = r"(?<!\d)\d+(?:\.\d+)?\s*(?:%|percent\b)"
 # "N% off" is a discount unless it describes an operating period or a distance
 # from a target ("20% off-hours", "15% off its target utilization").
 _OFF_NOT_DISCOUNT = (

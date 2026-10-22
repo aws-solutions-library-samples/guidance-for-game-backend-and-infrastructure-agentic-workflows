@@ -20,13 +20,15 @@ Memory is automatically handled when session_manager is provided.
 
 # Standard library
 import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 # Third-party packages
 from strands import Agent
 
 # Local modules
-from agents.cost_report import begin_cost_report_capture, finish_cost_report_capture
+from agents.cost_report import CapturedCostRendering, begin_cost_report_capture, finish_cost_report_capture
+from agents.cost_request_periods import requested_historical_periods
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
 from agents.financial_guard import contains_unvalidated_financial_content, withheld_financial_reply_notice
@@ -44,6 +46,7 @@ from config.settings import (
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
+from utils.security import log_sanitized_exception, redact_identifier
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 
 # Optional memory integration imports (may not be available in all environments)
@@ -83,11 +86,17 @@ _COST_REPORT_UNAVAILABLE = (
     "explicit start and end date.\n\n"
     "No unverified financial report was produced."
 )
-_COST_ADVISORY_GUIDANCE = (
-    "## Cost Guidance\n\n"
+_COST_GUIDANCE_HEADING = "## Cost Guidance\n\n"
+_COST_GUIDANCE_BODY = (
     "Review utilization, right-sizing, idle resources, commitment options, and workload scheduling. "
-    "Use the validated Cost Explorer report path for account totals, shares, historical spending, "
-    "or numeric forecasts. No unverified financial value was shown."
+    "Use the validated Cost Explorer report path for account totals, shares, or historical spending. "
+    "No unverified financial value was shown."
+)
+_COST_ADVISORY_GUIDANCE = _COST_GUIDANCE_HEADING + _COST_GUIDANCE_BODY
+# Forecast turns never show a forecast figure (an owned forecast rendering is
+# tracked in #625), so their guidance says so before the shared advice.
+_FORECAST_COST_GUIDANCE = (
+    _COST_GUIDANCE_HEADING + "This assistant does not show numeric cost forecasts. " + _COST_GUIDANCE_BODY
 )
 _COST_TOPIC_PATTERN = re.compile(
     r"\b(?:cost|costs|costing|spend|spending|billing|bills?|budgets?|prices?|pricing|forecast|"
@@ -108,6 +117,41 @@ _OPERATIONAL_IDENTIFIER_PATTERN = re.compile(
 # KB/MCP recommendations or public pricing without claiming actual account totals.
 _FORECAST_COST_PATTERN = re.compile(
     r"\b(?:forecast|forecasting|projection|projected|next\s+(?:week|month|quarter|year)|future)\b",
+    re.IGNORECASE,
+)
+
+# Wider detection of forecast requests, used only to decide which captured
+# historical reports a turn may return (and that a forecast is not a request for
+# a historical report). It adds forecast phrasings the narrow pattern above
+# misses, such as "predict", "over the next three months", "what will my bill
+# be", "my expected bill", or "outlook"; a historical question that matches it
+# keeps only reports for periods it names.
+# A negated "expect" ("I didn't expect my bill to be this high") describes a
+# bill already incurred, so it does not mark a forecast. The negation must come
+# directly before "expect"; the apostrophe may be missing ("didnt", "dont").
+_NOT_NEGATED = (
+    r"(?<!n't\s)(?<!n\u2019t\s)(?<!\bnot\s)(?<!\bnever\s)"
+    r"(?<!\bdidnt\s)(?<!\bdont\s)(?<!\bdoesnt\s)(?<!\bwasnt\s)(?<!\bwerent\s)"
+)
+_FORECAST_REQUEST_PATTERN = re.compile(
+    _FORECAST_COST_PATTERN.pattern + r"|\bpredict(?:s|ed|ing|ion|ions)?\b"
+    r"|\bupcoming\b"
+    r"|\boutlook\b"
+    r"|\bnext\s+(?:\d+|few|several|two|three|four|five|six|nine|twelve)\s+(?:days?|weeks?|months?|quarters?|years?)\b"
+    r"|\b(?:rest|remainder)\s+of\s+(?:the|this)\s+(?:week|month|quarter|year)\b"
+    r"|\b(?:what|how\s+much)\s+will\b[^\n]{0,60}\b(?:bills?|costs?|spend|spending|charges?|pay|owe)\b"
+    r"|\bwill\s+(?:i|we|my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?|pay|owe|be\s+(?:billed|charged))\b"
+    r"|\bgoing\s+to\s+(?:cost|spend|pay|be\s+(?:billed|charged))\b"
+    r"|" + _NOT_NEGATED + r"\bexpect(?:s|ing)?\s+to\s+(?:pay|spend|owe|be\s+(?:billed|charged))\b"
+    r"|" + _NOT_NEGATED + r"\bexpect\s+(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
+    # "Expected" counts only before a bill, spend, or charges word, so a pricing
+    # question ("the expected cost of an instance") is not a forecast.
+    # "Estimated" counts only before "bill", because Cost Explorer calls an open
+    # period's actual charges estimated.
+    r"|\bexpected\s+(?:aws\s+)?(?:bills?|spend|spending|charges?)\b"
+    r"|\bestimated\s+(?:aws\s+)?bills?\b"
+    r"|\bestimate\s+(?:(?:of|for)\s+)?(?:my|our)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending|charges?)\b"
+    r"|\bproject\s+(?:my|our|the)\b[^\n]{0,40}\b(?:bills?|costs?|spend|spending)\b",
     re.IGNORECASE,
 )
 
@@ -171,6 +215,51 @@ def _has_cost_intent(query: str) -> bool:
     return _COST_INTENT_PATTERN.search(query) is not None
 
 
+def _is_forecast_request(query: str) -> bool:
+    """Return whether a query asks about future or projected cost."""
+    return _FORECAST_REQUEST_PATTERN.search(query) is not None
+
+
+def _utc_today() -> date:
+    """Return today's UTC date. Patched in tests for a deterministic date."""
+    return datetime.now(timezone.utc).date()
+
+
+def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRendering], today: date) -> str | None:
+    """Return the authoritative section for a forecast request, or ``None``.
+
+    Forecast figures are never validated, so a forecast turn's only validated
+    content is a historical report. A rendering is kept only when its period (or,
+    for a typed report-creation error, its requested dates) equals a historical
+    period the question names; renderings for any other period (for example,
+    baseline months) are dropped. For each named period the most recent matching
+    rendering is kept, and the kept renderings are followed by the fixed
+    non-numeric forecast guidance, which says no numeric forecast is shown.
+    ``None`` means no rendering matches or the named periods could not be
+    resolved; the caller then returns its advisory composition: markers for any
+    consulted GameLift or EKS specialist plus the forecast guidance.
+    """
+    try:
+        periods = requested_historical_periods(query, today)
+    except Exception:  # The resolver reads user text; never fail the request on it.
+        logger.warning("Forecast period resolution failed; returning the cost guidance")
+        return None
+    kept: list[str] = []
+    for period in periods:
+        for entry in reversed(renderings):
+            if period.matches(entry.start, entry.end_inclusive):
+                if entry.rendering not in kept:
+                    kept.append(entry.rendering)
+                break
+    logger.info(
+        f"Forecast request: kept {len(kept)} of {len(renderings)} captured cost rendering(s) "
+        f"for {len(periods)} named historical period(s)"
+    )
+    if not kept:
+        return None
+    return "\n\n".join([*(section.strip() for section in kept), _FORECAST_COST_GUIDANCE])
+
+
 def _has_cost_topic(query: str) -> bool:
     """Return whether a query enters the cost/pricing advisory domain."""
     if _is_operational_identifier_query(query):
@@ -204,7 +293,7 @@ def _cost_attempted(query: str, specialist_outputs: list[tuple[str, str]]) -> bo
     an account cost report.
     """
     del specialist_outputs  # Retained in the signature for call-site clarity.
-    return _has_cost_intent(query)
+    return _has_cost_intent(query) and not _is_forecast_request(query)
 
 
 def _safe_non_cost_sections(specialist_outputs: list[tuple[str, str]]) -> list[str]:
@@ -232,14 +321,20 @@ def _cost_specialist_ran(specialist_outputs: list[tuple[str, str]]) -> bool:
     return any(name.strip().lower() == _COST_SERVICE_NAME for name, _ in specialist_outputs)
 
 
-def _compose_advisory_response(specialist_outputs: list[tuple[str, str]]) -> str:
+def _compose_advisory_response(specialist_outputs: list[tuple[str, str]], *, forecast_request: bool = False) -> str:
     """Compose safe operational context plus deterministic cost guidance.
 
     Model-authored Cost specialist prose is intentionally never returned unless
     it came through the authoritative report capture. Advisory/forecast requests
-    receive deterministic, nonnumeric guidance instead.
+    receive deterministic, nonnumeric guidance instead; forecast requests get the
+    variant that says no numeric forecast is shown.
     """
-    return "\n\n".join([*_safe_non_cost_sections(specialist_outputs), _COST_ADVISORY_GUIDANCE])
+    return "\n\n".join([*_safe_non_cost_sections(specialist_outputs), _cost_guidance(forecast_request)])
+
+
+def _cost_guidance(forecast_request: bool) -> str:
+    """Return the fixed cost guidance for a forecast or a general cost-advice turn."""
+    return _FORECAST_COST_GUIDANCE if forecast_request else _COST_ADVISORY_GUIDANCE
 
 
 def _compose_final_response(
@@ -286,6 +381,10 @@ def run_orchestrator(query: str, context: dict = None):
         logger.info(f"📋 Prompt versions: {get_prompt_versions()}")
 
         cost_report_followup = _is_cost_report_followup(query)
+        forecast_request = _is_forecast_request(query) and not cost_report_followup
+        # Read the date once, before the turn, so a turn that crosses UTC
+        # midnight still resolves "last month" against the day it started.
+        request_today = _utc_today()
         agent_tools = [cost_agent] if cost_report_followup else [gamelift_agent, eks_agent, cost_agent]
         if cost_report_followup:
             logger.info("Routing cost report ID follow-up exclusively through the cost specialist")
@@ -300,13 +399,15 @@ def run_orchestrator(query: str, context: dict = None):
         if context and isinstance(context, dict):
             actor_id = context.get("user_id") or context.get("actor_id")
             session_id = context.get("session_id")
-            display_name = context.get("display_name", "user")
-            logger.debug(f"👤 User: {display_name}, Actor: {actor_id}, Session: {session_id}")
+            logger.debug(
+                f"👤 Memory context resolved (actor={redact_identifier(actor_id)}, "
+                f"session={redact_identifier(session_id)})"
+            )
 
         # Create agent with or without memory
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id and session_id:
             # Use native AgentCore Memory integration
-            logger.debug(f"🧠 Creating agent with AgentCore Memory: {BEDROCK_AGENTCORE_MEMORY_ID}")
+            logger.debug("🧠 Creating agent with AgentCore Memory")
 
             try:
                 # Create memory config with retrieval config for LTM
@@ -334,7 +435,7 @@ def run_orchestrator(query: str, context: dict = None):
                     filter_restored_tool_context=True,
                 )
                 logger.debug(f"✅ Config created with LTM retrieval enabled")
-                logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {actor_id})")
+                logger.debug(f"   Namespace pattern: {{actorId}} (resolves to: {redact_identifier(actor_id)})")
                 logger.debug(f"   Retrieval: top_k=10, relevance_score=0.25, strategy=user_facts")
 
                 # Create session manager and agent with memory
@@ -344,6 +445,9 @@ def run_orchestrator(query: str, context: dict = None):
                     tools=agent_tools,
                     model=orch_model,
                     session_manager=session_manager,
+                    # The default Strands handler prints streamed model text and tool
+                    # names to stdout, which the hosted runtime ships to its logs.
+                    callback_handler=None,
                     hooks=[
                         MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),
                         WallClockTimeoutHook(AGENT_TIMEOUT_ORCHESTRATOR_SECONDS),
@@ -352,7 +456,7 @@ def run_orchestrator(query: str, context: dict = None):
                 logger.debug("✅ Agent created with memory")
 
             except Exception as e:
-                logger.warning(f"⚠️ Memory setup failed, using fallback: {e}")
+                log_sanitized_exception(logger, "⚠️ Memory setup failed, using fallback", e)
                 agent = None
         else:
             logger.debug("ℹ️  Memory not configured, using agent without memory")
@@ -364,6 +468,7 @@ def run_orchestrator(query: str, context: dict = None):
                 system_prompt=get_optimized_orchestrator_prompt(),
                 tools=agent_tools,
                 model=orch_model,
+                callback_handler=None,
                 hooks=[
                     MaxTurnsHook(AGENT_MAX_TURNS_ORCHESTRATOR),
                     WallClockTimeoutHook(AGENT_TIMEOUT_ORCHESTRATOR_SECONDS),
@@ -376,9 +481,15 @@ def run_orchestrator(query: str, context: dict = None):
         specialist_capture = begin_specialist_capture()
         try:
             response: Any = agent(query)
-        except Exception:
+        except Exception as exc:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
+            if forecast_request and authoritative_cost_response is not None:
+                authoritative_cost_response = _forecast_authoritative_section(
+                    query, cost_report_capture.renderings, request_today
+                )
+                if authoritative_cost_response is None:
+                    logger.warning("Forecast request failed after a validated cost report; returning the cost guidance")
             if authoritative_cost_response is not None:
                 logger.warning(
                     "Orchestrator failed after a validated cost report; returning the deterministic rendering"
@@ -389,13 +500,22 @@ def run_orchestrator(query: str, context: dict = None):
                     cost_only=cost_report_followup,
                 )
             elif cost_report_followup:
-                logger.exception("Cost report ID follow-up failed before producing a deterministic rendering")
+                # The failing call is the orchestrator model loop over the user
+                # prompt; its exception message can quote the prompt or a
+                # provider validation payload, so record the sanitized
+                # class/code/request-id and bounded raise-site frames rather than
+                # the raw message or rendered traceback.
+                log_sanitized_exception(
+                    logger, "Cost report ID follow-up failed before producing a deterministic rendering", exc
+                )
                 response = _COST_REPORT_FOLLOWUP_FAILURE
             elif _cost_attempted(query, specialist_outputs):
                 # A fresh account-report request raised before producing an
                 # authoritative rendering. Fail closed and preserve only safe
                 # non-cost specialist sections.
-                logger.exception("Cost-bearing request raised before a validated cost report; failing closed")
+                log_sanitized_exception(
+                    logger, "Cost-bearing request raised before a validated cost report; failing closed", exc
+                )
                 response = _compose_final_response(
                     _COST_REPORT_UNAVAILABLE,
                     specialist_outputs,
@@ -405,7 +525,12 @@ def run_orchestrator(query: str, context: dict = None):
                 # Advisory/forecast request: discard model-authored financial
                 # prose and return deterministic nonnumeric guidance, composed
                 # with any safe non-cost specialist context.
-                response = _compose_advisory_response(specialist_outputs)
+                if not cost_report_capture.renderings:
+                    logger.warning(
+                        "Cost advisory or forecast request raised before a validated cost report; "
+                        "returning the cost guidance"
+                    )
+                response = _compose_advisory_response(specialist_outputs, forecast_request=forecast_request)
             else:
                 # Pure operational failure with no cost involvement: preserve the
                 # existing behavior and surface the error.
@@ -413,6 +538,10 @@ def run_orchestrator(query: str, context: dict = None):
         else:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
+            if forecast_request and authoritative_cost_response is not None:
+                authoritative_cost_response = _forecast_authoritative_section(
+                    query, cost_report_capture.renderings, request_today
+                )
             if authoritative_cost_response is not None:
                 # A cost-report tool produced the authoritative financial section.
                 # Compose it deterministically with any captured GameLift/EKS
@@ -440,7 +569,7 @@ def run_orchestrator(query: str, context: dict = None):
             elif _cost_specialist_ran(specialist_outputs):
                 # Cost advisory/forecast path without a historical report. Use
                 # deterministic nonnumeric guidance with safe operational markers.
-                response = _compose_advisory_response(specialist_outputs)
+                response = _compose_advisory_response(specialist_outputs, forecast_request=forecast_request)
             else:
                 # If the routing model answers a cost topic directly, discard
                 # its prose and return deterministic nonnumeric guidance. For a
@@ -449,7 +578,7 @@ def run_orchestrator(query: str, context: dict = None):
                 # dedicated, number-free notice so a non-cost question is not
                 # answered with cost guidance.
                 if _has_cost_topic(query):
-                    response = _COST_ADVISORY_GUIDANCE
+                    response = _cost_guidance(forecast_request)
                 elif contains_unvalidated_financial_content(str(response)):
                     response = withheld_financial_reply_notice()
 
@@ -459,11 +588,11 @@ def run_orchestrator(query: str, context: dict = None):
                 try:
                     extract_and_save_user_info(actor_id, query, str(response))
                 except Exception as e:
-                    logger.debug(f"⚠️ Semantic memory extraction skipped: {e}")
+                    log_sanitized_exception(logger, "⚠️ Semantic memory extraction skipped", e)
 
         logger.info(f"✅ Orchestrator complete ({len(str(response))} chars)")
         return response
 
     except Exception as e:
-        logger.error(f"❌ Orchestrator error: {e}")
+        log_sanitized_exception(logger, "❌ Orchestrator error", e)
         raise
