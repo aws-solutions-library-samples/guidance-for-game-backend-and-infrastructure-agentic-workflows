@@ -107,7 +107,8 @@ def test_matches_raw_json_blob_credential_load():
 
 
 def test_ignores_missing_log_group_400_resourcenotfound():
-    # This is upstream #457, a DIFFERENT (already-worked-around) failure mode.
+    # This is starter-toolkit issue 457, a DIFFERENT failure mode (missing
+    # 'aws/spans' log group), not an exporter auth failure.
     e = _evt(
         1, "Failed to export batch code: 400, reason: The specified log group does not exist. ResourceNotFoundException"
     )
