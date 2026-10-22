@@ -22,7 +22,11 @@ BeforeAll {
             [bool]$PoliciesReadFails = $false,
             [bool]$IndexingReadFails = $false,
             [bool]$SpansExists = $false,
-            [bool]$SpansReadFails = $false
+            [bool]$SpansReadFails = $false,
+            # Names the mock returns for the toolkit policy and the indexing
+            # rule, so a test can supply a case variant (synthetic values).
+            [string]$ToolkitPolicyName = 'TransactionSearchXRayAccess',
+            [string]$DefaultIndexingRuleName = 'Default'
         )
         $destLocal = $Destination
         $toolkitLocal = $ToolkitPolicyPresent
@@ -41,7 +45,7 @@ BeforeAll {
 
         $policyEntries = [System.Collections.Generic.List[string]]::new()
         if ($toolkitLocal) {
-            $policyEntries.Add('{"policyName":"TransactionSearchXRayAccess","policyDocument":"{\"Version\":\"2012-10-17\",\"Statement\":[]}"}')
+            $policyEntries.Add('{"policyName":"' + $ToolkitPolicyName + '","policyDocument":"{\"Version\":\"2012-10-17\",\"Statement\":[]}"}')
         }
         if ($grantLocal) {
             $policyEntries.Add('{"policyName":"GameAgentTransactionSearchXRayAccess","policyDocument":"{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"xray.amazonaws.com\"},\"Action\":\"logs:PutLogEvents\",\"Resource\":[\"arn:aws:logs:us-west-2:123456789012:log-group:aws/spans:*\"]}]}"}')
@@ -51,7 +55,7 @@ BeforeAll {
         }
         $policiesJson = '{"resourcePolicies":[' + ($policyEntries -join ',') + ']}'
         $indexingJson = if ($indexingPresentLocal) {
-            '{"IndexingRules":[{"Name":"Default","Rule":{"Probabilistic":{"DesiredSamplingPercentage":1}}}]}'
+            '{"IndexingRules":[{"Name":"' + $DefaultIndexingRuleName + '","Rule":{"Probabilistic":{"DesiredSamplingPercentage":1}}}]}'
         } else {
             '{"IndexingRules":[]}'
         }
@@ -266,6 +270,65 @@ Describe 'Invoke-GameAgentTransactionSearchPreflight' {
         # The UNKNOWN halt must not fall through to the definite-change guidance.
         $text | Should -Not -Match 'AWS X-Ray / CloudWatch console'
         $text | Should -Not -Match 'GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME'
+    }
+
+    # The toolkit and the shell readers match the policy name, the rule name and
+    # the trace destination case-sensitively. A case variant must NOT be taken
+    # for the toolkit's own setting: the preflight must predict the change (and
+    # the stop switch must halt), or PowerShell fails open where the shell stops.
+    It 'Treats a case-variant toolkit policy name as absent (predicts the add)' {
+        Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -ToolkitPolicyName 'transactionsearchxrayaccess' -DefaultIndexingPresent $true
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -MatchExactly 'WARNING'
+        $text | Should -MatchExactly "WOULD ADD 'TransactionSearchXRayAccess'"
+        $text | Should -Not -Match 'would make NO account-wide'
+    }
+
+    It 'Stop switch halts when only a case-variant toolkit policy name exists' {
+        Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -ToolkitPolicyName 'transactionsearchxrayaccess' -DefaultIndexingPresent $true
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        ($script:StatusMessages -join ' ') | Should -Match "Stopping before 'agentcore launch'"
+    }
+
+    It 'Treats a case-variant indexing rule name as absent (predicts the update)' {
+        Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true -DefaultIndexingRuleName 'default'
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $out[-1] | Should -BeTrue
+        $text | Should -MatchExactly 'WARNING'
+        $text | Should -MatchExactly "WOULD SET 'Default' to 1% \(UpdateIndexingRule\)"
+        $text | Should -Not -Match 'would make NO account-wide'
+    }
+
+    It 'Stop switch halts when only a case-variant indexing rule name exists' {
+        Set-PreflightAwsMock -Destination 'CloudWatchLogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true -DefaultIndexingRuleName 'default'
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+        ($script:StatusMessages -join ' ') | Should -Match "Stopping before 'agentcore launch'"
+    }
+
+    It 'Treats a case-variant trace destination as UNKNOWN, not CloudWatchLogs' {
+        Set-PreflightAwsMock -Destination 'cloudwatchlogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true
+        $out = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() 6>&1
+        $text = ($script:StatusMessages -join ' ') + ' ' + (($out | ForEach-Object { "$_" }) -join ' ')
+        $text | Should -MatchExactly 'X-Ray trace segment destination: UNKNOWN'
+        $text | Should -Not -Match 'would make NO account-wide'
+        Set-PreflightAwsMock -Destination 'cloudwatchlogs' -ToolkitPolicyPresent $true -DefaultIndexingPresent $true
+        $result = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $result | Should -BeFalse
+    }
+
+    It 'Stop message scopes its guarantee to agentcore launch' {
+        # With the opt-in, Step 1.7 may already have written shared settings, so
+        # the halt only guarantees that 'agentcore launch' changes nothing.
+        Set-PreflightAwsMock -Destination 'XRay' -ToolkitPolicyPresent $false -DefaultIndexingPresent $true
+        $null = Invoke-GameAgentTransactionSearchPreflight -Region 'us-west-2' -ProfileArgs @() -StopOnAccountObservabilityChange
+        $text = ($script:StatusMessages -join ' ')
+        $text | Should -Match "so 'agentcore launch' modifies no shared setting"
+        $text | Should -Not -Match 'so no shared setting is modified'
     }
 
     It 'Notes the project grant (via Write-Host) but says the toolkit still adds its own policy' {

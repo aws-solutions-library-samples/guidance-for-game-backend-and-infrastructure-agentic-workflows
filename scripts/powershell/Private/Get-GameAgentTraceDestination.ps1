@@ -24,6 +24,8 @@ function Get-GameAgentTraceDestination {
     }
     if ($LASTEXITCODE -ne 0) { return 'UNREADABLE' }
     $dest = ("$raw").Trim()
-    if ($dest -eq 'XRay' -or $dest -eq 'CloudWatchLogs') { return $dest }
+    # Case-sensitive, matching the shell reader's `case` match: any other casing
+    # is not a value the API returns, so it is UNREADABLE, not a known state.
+    if ($dest -ceq 'XRay' -or $dest -ceq 'CloudWatchLogs') { return $dest }
     return 'UNREADABLE'
 }

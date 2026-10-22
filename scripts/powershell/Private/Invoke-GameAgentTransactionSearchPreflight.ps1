@@ -71,12 +71,16 @@ function Invoke-GameAgentTransactionSearchPreflight {
 
     # Returns 'present', 'absent', or 'unreadable' for a resource policy named
     # literally 'TransactionSearchXRayAccess' (the toolkit's name-only check),
-    # from the single cached describe-resource-policies read.
+    # from the single cached describe-resource-policies read. Every comparison
+    # against an AWS identifier in this preflight is case-sensitive (-ceq,
+    # -cne, -ccontains, -clike), matching the toolkit and the shell readers: a
+    # case variant such as 'transactionsearchxrayaccess' does not satisfy the
+    # toolkit, so it must not satisfy this prediction either.
     function Get-ToolkitResourcePolicyPresence {
         param($Policies)
         if ($null -eq $Policies) { return 'unreadable' }
         foreach ($policy in @($Policies.resourcePolicies)) {
-            if ($policy.policyName -eq $toolkitPolicyName) { return 'present' }
+            if ($policy.policyName -ceq $toolkitPolicyName) { return 'present' }
         }
         return 'absent'
     }
@@ -99,13 +103,13 @@ function Invoke-GameAgentTransactionSearchPreflight {
         foreach ($policy in @($Policies.resourcePolicies)) {
             try { $doc = $policy.policyDocument | ConvertFrom-Json } catch { continue }
             foreach ($statement in @($doc.Statement)) {
-                if ($statement.Effect -ne 'Allow') { continue }
+                if ($statement.Effect -cne 'Allow') { continue }
                 $services = @($statement.Principal.Service)
                 $actions = @($statement.Action)
                 $resources = @($statement.Resource)
-                if (($services -contains 'xray.amazonaws.com') -and
-                    ($actions -contains 'logs:PutLogEvents') -and
-                    ($resources | Where-Object { "$_" -like '*aws/spans*' })) {
+                if (($services -ccontains 'xray.amazonaws.com') -and
+                    ($actions -ccontains 'logs:PutLogEvents') -and
+                    ($resources | Where-Object { "$_" -clike '*aws/spans*' })) {
                     return $policy.policyName
                 }
             }
@@ -122,7 +126,7 @@ function Invoke-GameAgentTransactionSearchPreflight {
         if ($LASTEXITCODE -ne 0) { return 'unreadable' }
         try { $parsed = $raw | ConvertFrom-Json } catch { return 'unreadable' }
         foreach ($rule in @($parsed.IndexingRules)) {
-            if ($rule.Name -eq 'Default') { return 'present' }
+            if ($rule.Name -ceq 'Default') { return 'present' }
         }
         return 'absent'
     }
@@ -137,7 +141,7 @@ function Invoke-GameAgentTransactionSearchPreflight {
         if ($LASTEXITCODE -ne 0) { return 'unreadable' }
         try { $parsed = $raw | ConvertFrom-Json } catch { return 'unreadable' }
         foreach ($group in @($parsed.logGroups)) {
-            if ($group.logGroupName -eq 'aws/spans') { return 'present' }
+            if ($group.logGroupName -ceq 'aws/spans') { return 'present' }
         }
         return 'absent'
     }
@@ -171,9 +175,9 @@ function Invoke-GameAgentTransactionSearchPreflight {
 
     # 2. Trace segment destination (shared reader, used by the opt-in path too).
     $destination = Get-GameAgentTraceDestination -Region $Region -ProfileArgs $ProfileArgs
-    if ($destination -eq 'CloudWatchLogs') {
+    if ($destination -ceq 'CloudWatchLogs') {
         # no change — no detail line
-    } elseif ($destination -eq 'UNREADABLE') {
+    } elseif ($destination -ceq 'UNREADABLE') {
         $unknown = $true
         $detail.Add('      - X-Ray trace segment destination: UNKNOWN (could not read destination)')
     } else {
@@ -262,13 +266,13 @@ function Invoke-GameAgentTransactionSearchPreflight {
         # instead, because the toolkit's full effect cannot be known until the
         # read succeeds.
         if ($wouldChange -eq 2) {
-            $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit might change account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. One or more account settings could not be read, so the toolkit's full effect is unknown. First restore the read (most often expired credentials or a missing read permission for the item marked UNKNOWN above), then re-run; this preflight names any condition that still fails."
+            $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit might change account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so 'agentcore launch' modifies no shared setting. One or more account settings could not be read, so the toolkit's full effect is unknown. First restore the read (most often expired credentials or a missing read permission for the item marked UNKNOWN above), then re-run; this preflight names any condition that still fails."
             Write-GameAgentStatus $message -Type Error
             return $false
         }
         $spansState = Get-SpansLogGroupState
         $grantName = Get-SpansGrantName -Policies $resourcePolicies
-        $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so no shared setting is modified. To reach a passing run without any shared change, the account must already satisfy the toolkit's three conditions: a CloudWatch Logs resource policy named exactly 'TransactionSearchXRayAccess', the X-Ray trace segment destination 'CloudWatchLogs', and an X-Ray 'Default' indexing rule. Enable Transaction Search once in the AWS X-Ray / CloudWatch console, then re-run; this preflight names any condition that still fails."
+        $message = "StopOnAccountObservabilityChange is set and the AgentCore starter toolkit would change (or might change) account-wide X-Ray / CloudWatch Logs settings. Stopping before 'agentcore launch' so 'agentcore launch' modifies no shared setting. To reach a passing run without any shared change, the account must already satisfy the toolkit's three conditions: a CloudWatch Logs resource policy named exactly 'TransactionSearchXRayAccess', the X-Ray trace segment destination 'CloudWatchLogs', and an X-Ray 'Default' indexing rule. Enable Transaction Search once in the AWS X-Ray / CloudWatch console, then re-run; this preflight names any condition that still fails."
         if ($spansState -eq 'present' -and -not $grantName) {
             $message += " Because the AWS-reserved 'aws/spans' log group already exists and no other policy grants that access, this repository's opt-in with the matching policy name can also reach that state (it switches an 'XRay' destination, adds the toolkit-named policy, and leaves the shared 'Default' indexing rule for the console enable): GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true with GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess (PowerShell: -ConfigureAccountObservability with that policy name set)."
         } elseif ($spansState -eq 'present' -and $grantName) {

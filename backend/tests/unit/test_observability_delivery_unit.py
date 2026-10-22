@@ -1411,6 +1411,10 @@ def test_preflight_stop_switch_halts_when_toolkit_would_change(shell):
     )
     assert "rc=1" in result.stdout
     assert "Stopping before 'agentcore launch'" in result.stderr
+    # The halt guarantees only that 'agentcore launch' changes nothing: with the
+    # opt-in, Step 1.7 may already have written shared settings.
+    assert "so 'agentcore launch' modifies no shared setting" in result.stderr
+    assert "so no shared setting is modified" not in result.stderr
 
 
 @pytest.mark.parametrize("shell", _PREFLIGHT_SHELLS)

@@ -604,7 +604,7 @@ run_transaction_search_preflight() {
     remedy_spans_state="$(spans_log_group_state)"
     echo "❌ GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true and the AgentCore starter toolkit" >&2
     echo "   would change (or might change) account-wide X-Ray / CloudWatch Logs settings." >&2
-    echo "   Stopping before 'agentcore launch' so no shared setting is modified." >&2
+    echo "   Stopping before 'agentcore launch' so 'agentcore launch' modifies no shared setting." >&2
     if [ "${TOOLKIT_WOULD_CHANGE:-0}" -eq 2 ]; then
       echo "   One or more account settings could not be read, so the toolkit's full effect" >&2
       echo "   is unknown. First restore the read (most often expired credentials or a missing" >&2
