@@ -69,3 +69,52 @@ def test_resolve_identity_settings_prefers_nonempty_environment(monkeypatch):
         "GBAW_TENANT_ID": "tenant-a",
         "GBAW_WORKSPACE_ID": "workspace-a",
     }
+
+
+def _run_loader(args, extra_env=None):
+    """Run the loader CLI as a subprocess with the role variables unset.
+
+    ``--default-models-only`` ignores ``ui/.env.local`` overrides, so the
+    output is deterministic in any checkout: it is the repository default pair.
+    """
+    # Standard library
+    import json as _json
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    for key in (
+        "GBAW_ORCHESTRATOR_MODEL_ID",
+        "GBAW_SPECIALIST_MODEL_ID",
+        "GBAW_BEDROCK_MODEL_ID",
+        "GBAW_BEDROCK_MODEL_ID_SECONDARY",
+    ):
+        env.pop(key, None)
+    if extra_env:
+        env.update(extra_env)
+
+    result = subprocess.run(
+        [sys.executable, str(MODULE_PATH), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    return result, _json
+
+
+def test_default_models_only_shell_emits_both_5_5_ids():
+    result, _ = _run_loader(["--default-models-only"])
+    # shlex.quote leaves these dotted IDs unquoted because they contain no
+    # shell-special characters.
+    assert "export GBAW_ORCHESTRATOR_MODEL_ID=global.anthropic.claude-haiku-5-5" in result.stdout
+    assert "export GBAW_SPECIALIST_MODEL_ID=global.anthropic.claude-sonnet-5-5" in result.stdout
+
+
+def test_default_models_only_json_emits_both_5_5_ids():
+    result, json_mod = _run_loader(["--default-models-only", "--format", "json"])
+    payload = json_mod.loads(result.stdout)
+    assert payload == {
+        "GBAW_ORCHESTRATOR_MODEL_ID": "global.anthropic.claude-haiku-5-5",
+        "GBAW_SPECIALIST_MODEL_ID": "global.anthropic.claude-sonnet-5-5",
+    }
