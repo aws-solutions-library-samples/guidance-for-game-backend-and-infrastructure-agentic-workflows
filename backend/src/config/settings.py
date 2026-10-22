@@ -346,7 +346,7 @@ logger.info("- Cost Explorer MCP: stdio transport via console scripts (pre-insta
 
 # Log Memory configuration
 logger.info(f"Bedrock Sessions Enabled: {USE_BEDROCK_SESSIONS}")
-logger.info(f"Memory ID: {BEDROCK_AGENTCORE_MEMORY_ID or 'Not set (will be auto-configured)'}")
+logger.info(f"Memory configured: {bool(BEDROCK_AGENTCORE_MEMORY_ID)}")
 logger.info(f"Memory Config: Session TTL={MEMORY_SESSION_TTL_HOURS}h, User TTL={MEMORY_USER_TTL_DAYS}d")
 logger.info(f"Long-term Memory Enabled: {MEMORY_LONG_TERM_ENABLED}")
 logger.info(f"Memory Required (Hard Fail): {MEMORY_REQUIRED}")
