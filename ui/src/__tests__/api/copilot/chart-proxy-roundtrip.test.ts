@@ -19,6 +19,7 @@ jest.mock('@/utils/logger', () => ({
   logError: jest.fn(),
   logDebug: jest.fn(),
   redact: jest.fn((v?: string | null) => (v ? '<redacted>' : '<none>')),
+  normalizeLogValue: jest.fn((v: unknown) => String(v)),
 }));
 
 jest.mock('@/utils/fetchWithTimeout', () => ({
