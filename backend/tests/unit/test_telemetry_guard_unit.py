@@ -17,12 +17,15 @@ from _guard_state import (
     snapshot_guard_state,
 )
 from config.telemetry_guard import (
+    ADOT_MCP_INSTRUMENTOR_MODULE,
     CAPTURE_OPT_IN_VALUE,
     CAPTURE_TRACE_CONTENT_VAR,
     DISABLED_INSTRUMENTATIONS_VAR,
     GENAI_CAPTURE_CONTENT_VAR,
     HOSTED_RUNTIME_VAR,
+    INSTRUMENTOR_ENTRY_POINT_GROUP,
     MCP_INSTRUMENTOR_ENTRY_POINT,
+    MCP_SUBPROCESS_EXCLUSION_PATH,
     MEMORY_CLIENT_LOGGER_NAME,
     SEMCONV_OPT_IN_VAR,
     apply_trace_content_guard,
@@ -161,10 +164,25 @@ def test_default_appends_aws_mcp_to_existing_disabled_list():
     assert tokens.count(MCP_INSTRUMENTOR_ENTRY_POINT) == 1
 
 
-def test_default_leaves_disabled_list_unset_when_unset():
-    # Unset only happens when the distro is not running with agent observability,
-    # so children are not auto-instrumented with the default exclusion list either.
+def test_hosted_default_sets_disabled_list_when_unset():
+    # A hosted runtime with no exclusion list must not leave the MCP subprocess
+    # path open: the guard sets the list to the MCP entry point instead.
     decision = resolve_trace_content_env({"GBAW_HOSTED_RUNTIME": "true"})
+    assert decision.disabled_instrumentations == MCP_INSTRUMENTOR_ENTRY_POINT
+
+
+@pytest.mark.parametrize("env", [{}, {"GBAW_HOSTED_RUNTIME": "false"}])
+def test_non_hosted_default_leaves_disabled_list_unset_when_unset(env):
+    # A local run's MCP subprocesses are not auto-instrumented by the repository
+    # scripts, so the guard does not invent an exclusion list there.
+    decision = resolve_trace_content_env(env)
+    assert decision.disabled_instrumentations is None
+
+
+def test_opt_in_leaves_disabled_list_unset_when_unset_even_if_hosted():
+    decision = resolve_trace_content_env(
+        {"GBAW_HOSTED_RUNTIME": "true", CAPTURE_TRACE_CONTENT_VAR: CAPTURE_OPT_IN_VALUE}
+    )
     assert decision.disabled_instrumentations is None
 
 
@@ -211,6 +229,7 @@ def test_apply_leaves_disabled_list_unset_when_unset(monkeypatch):
     monkeypatch.delenv(GENAI_CAPTURE_CONTENT_VAR, raising=False)
     monkeypatch.delenv(CAPTURE_TRACE_CONTENT_VAR, raising=False)
     monkeypatch.delenv(DISABLED_INSTRUMENTATIONS_VAR, raising=False)
+    monkeypatch.delenv(HOSTED_RUNTIME_VAR, raising=False)
 
     apply_trace_content_guard()
 
@@ -218,6 +237,151 @@ def test_apply_leaves_disabled_list_unset_when_unset(monkeypatch):
     import os as _os
 
     assert DISABLED_INSTRUMENTATIONS_VAR not in _os.environ
+
+
+def test_hosted_apply_sets_disabled_list_when_unset(monkeypatch):
+    _set_guard_env(monkeypatch, opt_in=False)
+    # Register the variable so monkeypatch removes what the guard writes.
+    monkeypatch.setenv(DISABLED_INSTRUMENTATIONS_VAR, "")
+    monkeypatch.delenv(DISABLED_INSTRUMENTATIONS_VAR)
+    monkeypatch.setenv(HOSTED_RUNTIME_VAR, "true")
+
+    decision = apply_trace_content_guard()
+
+    # Standard library
+    import os as _os
+
+    assert _os.environ[DISABLED_INSTRUMENTATIONS_VAR] == MCP_INSTRUMENTOR_ENTRY_POINT
+    # The exclusion is in place, so it is not reported as a skipped path.
+    assert MCP_SUBPROCESS_EXCLUSION_PATH not in decision.skipped_paths
+
+
+# --- The aws_mcp entry point is what the exclusion list actually names ----------
+#
+# OTEL_PYTHON_DISABLED_INSTRUMENTATIONS matches entry-point names. If the distro
+# renamed `aws_mcp`, the token would exclude nothing; the guard must then report
+# the subprocess exclusion as a skipped path instead of "redaction active".
+
+
+def test_installed_distro_registers_aws_mcp_for_its_mcp_instrumentor():
+    # Pins today's reality: an ADOT upgrade that renames or moves the MCP
+    # instrumentor entry point fails here, before it can fail open in a deploy.
+    # Standard library
+    from importlib.metadata import entry_points
+
+    eps = [ep for ep in entry_points(group=INSTRUMENTOR_ENTRY_POINT_GROUP) if ep.name == MCP_INSTRUMENTOR_ENTRY_POINT]
+    assert len(eps) == 1
+    module, _, attr = eps[0].value.partition(":")
+    assert module == ADOT_MCP_INSTRUMENTOR_MODULE
+    assert attr.strip() == "McpInstrumentor"
+    # No other entry point loads the MCP instrumentor under a different name.
+    aliases = [
+        ep.name
+        for ep in entry_points(group=INSTRUMENTOR_ENTRY_POINT_GROUP)
+        if ep.value.partition(":")[0].startswith(ADOT_MCP_INSTRUMENTOR_MODULE)
+        and ep.name != MCP_INSTRUMENTOR_ENTRY_POINT
+    ]
+    assert aliases == []
+
+
+def test_guard_records_no_entry_point_skip_with_the_installed_distro(monkeypatch):
+    _set_guard_env(monkeypatch, opt_in=False)
+
+    decision = apply_trace_content_guard()
+
+    assert MCP_SUBPROCESS_EXCLUSION_PATH not in decision.skipped_paths
+
+
+class _FakeEntryPoint:
+    def __init__(self, name: str, value: str) -> None:
+        self.name = name
+        self.value = value
+
+
+@pytest.mark.parametrize(
+    "fake_entry_points",
+    [
+        [],
+        [_FakeEntryPoint("aws_mcp_v2", f"{ADOT_MCP_INSTRUMENTOR_MODULE}:McpInstrumentor")],
+        [_FakeEntryPoint(MCP_INSTRUMENTOR_ENTRY_POINT, "some.other.module:McpInstrumentor")],
+    ],
+    ids=["no-entry-points", "renamed", "different-module"],
+)
+def test_unresolved_mcp_entry_point_is_a_skipped_path(monkeypatch, caplog, fake_entry_points):
+    # Local modules
+    from config import telemetry_guard as guard
+
+    _set_guard_env(monkeypatch, opt_in=False)
+    monkeypatch.setattr(guard.importlib.metadata, "entry_points", lambda **_: fake_entry_points)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        decision = guard.apply_trace_content_guard()
+
+    assert MCP_SUBPROCESS_EXCLUSION_PATH in decision.skipped_paths
+    messages = [r.getMessage() for r in caplog.records if MCP_SUBPROCESS_EXCLUSION_PATH in r.getMessage()]
+    assert len(messages) == 1
+    # Content-free: the fixed reason only, never the entry-point value seen.
+    assert "some.other.module" not in messages[0]
+    assert "aws_mcp_v2" not in messages[0]
+
+
+def test_aliased_mcp_entry_point_is_a_skipped_path(monkeypatch):
+    # Local modules
+    from config import telemetry_guard as guard
+
+    _set_guard_env(monkeypatch, opt_in=False)
+    fakes = [
+        _FakeEntryPoint(MCP_INSTRUMENTOR_ENTRY_POINT, f"{ADOT_MCP_INSTRUMENTOR_MODULE}:McpInstrumentor"),
+        _FakeEntryPoint("aws_mcp_client", f"{ADOT_MCP_INSTRUMENTOR_MODULE}.client:McpClientInstrumentor"),
+    ]
+    monkeypatch.setattr(guard.importlib.metadata, "entry_points", lambda **_: fakes)
+
+    decision = guard.apply_trace_content_guard()
+
+    assert MCP_SUBPROCESS_EXCLUSION_PATH in decision.skipped_paths
+
+
+def test_entry_point_class_move_inside_the_module_still_resolves(monkeypatch):
+    # Local modules
+    from config import telemetry_guard as guard
+
+    _set_guard_env(monkeypatch, opt_in=False)
+    fakes = [_FakeEntryPoint(MCP_INSTRUMENTOR_ENTRY_POINT, f"{ADOT_MCP_INSTRUMENTOR_MODULE}.instrumentation:Renamed")]
+    monkeypatch.setattr(guard.importlib.metadata, "entry_points", lambda **_: fakes)
+
+    decision = guard.apply_trace_content_guard()
+
+    assert MCP_SUBPROCESS_EXCLUSION_PATH not in decision.skipped_paths
+
+
+def test_entry_point_lookup_error_is_a_skipped_path_and_never_raises(monkeypatch, caplog):
+    # Local modules
+    from config import telemetry_guard as guard
+
+    _set_guard_env(monkeypatch, opt_in=False)
+
+    def _boom(**_):
+        raise RuntimeError("synthetic secret-bearing failure text")
+
+    monkeypatch.setattr(guard.importlib.metadata, "entry_points", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="config.telemetry_guard"):
+        decision = guard.apply_trace_content_guard()
+
+    assert MCP_SUBPROCESS_EXCLUSION_PATH in decision.skipped_paths
+    assert "synthetic secret-bearing failure text" not in caplog.text
+
+
+def test_opt_in_does_not_check_the_mcp_entry_point(monkeypatch):
+    # Local modules
+    from config import telemetry_guard as guard
+
+    _set_guard_env(monkeypatch, opt_in=True)
+    monkeypatch.setattr(guard.importlib.metadata, "entry_points", lambda **_: [])
+
+    decision = guard.apply_trace_content_guard()
+
+    assert decision.skipped_paths == ()
 
 
 def _reset_mcp_instrumentor():
@@ -1220,3 +1384,38 @@ def test_opt_in_decision_has_no_skipped_paths(monkeypatch):
 
     assert decision.capture_enabled is True
     assert decision.skipped_paths == ()
+
+
+def test_end_span_wrapper_passes_through_a_new_strands_keyword(monkeypatch):
+    # A Strands release that adds a parameter to _end_span must not make every
+    # span end raise TypeError: unknown arguments pass through unchanged while
+    # the error text is still redacted.
+    # Standard library
+    import types
+
+    # Local modules
+    from config.telemetry_guard import _install_strands_span_wrappers
+
+    calls: list = []
+
+    class _FutureTracer:
+        def start_agent_span(self, *args, **kwargs):  # pragma: no cover - not exercised
+            return None
+
+        def _end_span(self, span, attributes=None, error=None, error_message=None, *, new_flag=False):
+            calls.append((span, attributes, error, error_message, new_flag))
+
+    fake_module = types.ModuleType("strands.telemetry.tracer")
+    fake_module.Tracer = _FutureTracer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "strands.telemetry.tracer", fake_module)
+
+    _install_strands_span_wrappers()
+
+    tracer = _FutureTracer()
+    tracer._end_span("span", {"k": "v"}, ValueError("secret tool text"), new_flag=True)
+    tracer._end_span("span", None, error_message="secret tool output", new_flag=True)
+    tracer._end_span("span")
+
+    assert calls[0] == ("span", {"k": "v"}, None, "ValueError", True)
+    assert calls[1] == ("span", None, None, "tool returned error status", True)
+    assert calls[2] == ("span", None, None, None, False)

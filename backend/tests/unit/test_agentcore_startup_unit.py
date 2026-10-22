@@ -905,3 +905,28 @@ class TestTraceContentPostureLine:
         rendered = "".join(str(r) for r in records)
         assert "WARNING|" in rendered
         assert "capture is ENABLED" in rendered
+
+    def test_unresolved_mcp_entry_point_is_not_reported_as_active(self, monkeypatch):
+        # If the distro no longer registers `aws_mcp` for its MCP instrumentor,
+        # the subprocess exclusion names nothing; the posture line must report
+        # redaction as incomplete rather than active.
+        # Standard library
+        import importlib.metadata
+
+        # Local modules
+        from agentcore_main import _log_trace_content_posture
+        from config.telemetry_guard import MCP_SUBPROCESS_EXCLUSION_PATH, apply_trace_content_guard
+        from utils.logger import logger as app_logger
+
+        monkeypatch.setattr(importlib.metadata, "entry_points", lambda **_: [])
+        env = {"GBAW_HOSTED_RUNTIME": "true"}
+        decision = apply_trace_content_guard(env)
+
+        with self._capture_loguru() as records:
+            _log_trace_content_posture(decision, app_logger)
+
+        rendered = "".join(str(r) for r in records)
+        assert "WARNING|" in rendered
+        assert "redaction incomplete" in rendered.lower()
+        assert MCP_SUBPROCESS_EXCLUSION_PATH in rendered
+        assert "carries no prompt or response content" not in rendered

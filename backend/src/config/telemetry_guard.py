@@ -58,13 +58,20 @@ OpenTelemetry log records:
   botocore spans from the MCP subprocesses start their own traces instead of
   nesting under the tool call, and MCP JSON-RPC error codes are not recorded as
   span attributes; the tool name, call id, status, and timing remain
-  on the Strands tool span. The hosted runtime is safe because agent
-  observability sets this exclusion list, so the guard appends ``aws_mcp`` to it
-  and the MCP server subprocesses inherit the exclusion. When the list is unset
-  (a non-observability ``opentelemetry-instrument`` run) the guard leaves it
-  unset; an auto-instrumented child would then load ``aws_mcp`` and could emit
-  MCP tool-content spans, which is why the exclusion is relied on only under
-  agent observability.
+  on the Strands tool span. Under agent observability the distro sets this
+  exclusion list, so the guard appends ``aws_mcp`` to it and the MCP server
+  subprocesses inherit the exclusion. In a hosted runtime where the list is unset
+  (for example observability configured without the distro default), the guard
+  sets it to ``aws_mcp`` rather than leaving the subprocess path open. A
+  non-hosted run with the list unset leaves it unset: a local run is not started
+  under ``opentelemetry-instrument`` by the repository scripts, so its MCP
+  subprocesses are not auto-instrumented and export nothing. Because the
+  exclusion only works if ``aws_mcp`` is the name the distro registers, the guard
+  also checks the installed ``opentelemetry_instrumentor`` entry points: if no
+  ``aws_mcp`` entry point resolves to the distro's MCP instrumentor module, or a
+  differently named entry point also loads that module, the subprocess exclusion
+  is recorded as a skipped path so the startup posture reports redaction as
+  incomplete instead of active.
 * The AgentCore Memory SDK client logger (``bedrock_agentcore.memory.client``)
   writes the long-term-memory namespace, which embeds the memory actor ID, at
   INFO on every successful lookup, and the distro exports root-logger records
@@ -99,6 +106,7 @@ disabled-instrumentations list untouched.
 
 # Standard library
 import functools
+import importlib.metadata
 import logging
 import os
 from dataclasses import dataclass, field, replace
@@ -134,8 +142,26 @@ def _warn_guard_path_skipped(path: str, exc: BaseException) -> None:
     path name is also recorded so the startup posture line can name it.
     """
     logger.warning(GUARD_PATH_SKIPPED_MESSAGE, path, type(exc).__name__)
+    _record_skipped_path(path)
+
+
+# Fixed, content-free message for a guard path skipped by a check rather than by
+# an exception. ``reason`` is always one of the module's fixed reason constants.
+GUARD_PATH_CHECK_FAILED_MESSAGE = (
+    "Telemetry redaction guard path skipped; a trace-content export may be open. Path: %s. Reason: %s."
+)
+
+
+def _record_skipped_path(path: str) -> None:
+    """Add ``path`` to the active guard run's skipped paths, once."""
     if _SKIPPED_PATHS is not None and path not in _SKIPPED_PATHS:
         _SKIPPED_PATHS.append(path)
+
+
+def _warn_guard_check_failed(path: str, reason: str) -> None:
+    """Log at WARNING that a guard check failed, with a fixed reason, and record the path."""
+    logger.warning(GUARD_PATH_CHECK_FAILED_MESSAGE, path, reason)
+    _record_skipped_path(path)
 
 
 # The Strands redaction token name and the botocore content-capture switch.
@@ -154,6 +180,20 @@ REDACT_ALL_TOKEN = UNREDACTED_ATTRIBUTES_PREFIX  # equals "gen_ai_unredacted_att
 # subprocesses, which inherit a copy of this process's environment.
 DISABLED_INSTRUMENTATIONS_VAR = "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS"
 MCP_INSTRUMENTOR_ENTRY_POINT = "aws_mcp"
+
+# The exclusion list names entry points, so ``aws_mcp`` only excludes MCP
+# instrumentation while the distro registers its MCP instrumentor under that
+# name. The guard checks the installed entry points at startup. The value is
+# matched on the module path, not the exact ``module:Class`` string, so a class
+# rename inside the module still passes while a rename of the entry point, or a
+# move to another module, is reported as a skipped path.
+INSTRUMENTOR_ENTRY_POINT_GROUP = "opentelemetry_instrumentor"
+ADOT_MCP_INSTRUMENTOR_MODULE = "amazon.opentelemetry.distro.instrumentation.mcp"
+MCP_SUBPROCESS_EXCLUSION_PATH = "MCP subprocess instrumentation exclusion"
+# Fixed reasons for that path; they never carry entry-point values or exception text.
+MCP_ENTRY_POINT_MISSING_REASON = "aws_mcp entry point not found or not the ADOT MCP instrumentor"
+MCP_ENTRY_POINT_ALIASED_REASON = "another entry point also loads the ADOT MCP instrumentor"
+MCP_ENTRY_POINT_CHECK_ERROR_REASON = "entry point lookup failed"
 
 # Operator opt-in. Content capture is enabled only when the opt-in variable
 # holds exactly this value; any other value (including "true", "1", or empty)
@@ -227,8 +267,7 @@ def _append_disabled_instrumentation(existing: str) -> str:
     """Append the MCP instrumentor entry point to the disabled list, once.
 
     Preserves the existing entries and their order and never duplicates
-    ``aws_mcp``. The caller only invokes this when the variable is already set,
-    so an unset variable stays unset.
+    ``aws_mcp``. An empty ``existing`` yields just ``aws_mcp``.
     """
     tokens = [token.strip() for token in existing.split(",") if token.strip()]
     if MCP_INSTRUMENTOR_ENTRY_POINT not in tokens:
@@ -240,12 +279,17 @@ def resolve_trace_content_env(env: Mapping[str, str]) -> TraceContentDecision:
     """Decide the exported-telemetry content switches from the environment.
 
     The default (no exact opt-in) redacts all sensitive span attributes, disables
-    GenAI message-content capture, and -- when the auto-instrumentation disabled
-    list is already set -- appends the MCP instrumentor so MCP tool arguments and
-    results stay out of exported spans in subprocesses. The opt-in is honored only
-    for the exact token value, so a hosted runtime without the opt-in never
-    captures content regardless of other values, and the opt-in leaves the
-    disabled list untouched.
+    GenAI message-content capture, and adds the MCP instrumentor to the
+    auto-instrumentation disabled list so MCP tool arguments and results stay out
+    of exported spans in subprocesses. The list is appended to when it is already
+    set. When it is unset, a hosted runtime sets it to ``aws_mcp`` so the
+    exclusion still reaches the subprocesses, while a non-hosted run leaves it
+    unset (its subprocesses are not auto-instrumented by the repository's local
+    scripts, and setting the list there would change a developer's own
+    ``opentelemetry-instrument`` defaults). The opt-in is honored only for the
+    exact token value, so a hosted runtime without the opt-in never captures
+    content regardless of other values, and the opt-in leaves the disabled list
+    untouched.
     """
     capture_enabled = env.get(CAPTURE_TRACE_CONTENT_VAR, "") == CAPTURE_OPT_IN_VALUE
     existing_opt_in = env.get(SEMCONV_OPT_IN_VAR, "")
@@ -257,7 +301,18 @@ def resolve_trace_content_env(env: Mapping[str, str]) -> TraceContentDecision:
             semconv_opt_in=_merge_semconv_opt_in(existing_opt_in, redact=False),
             disabled_instrumentations=existing_disabled,
         )
-    disabled = None if existing_disabled is None else _append_disabled_instrumentation(existing_disabled)
+    if existing_disabled is not None:
+        disabled: Optional[str] = _append_disabled_instrumentation(existing_disabled)
+    elif _hosted_runtime(env):
+        # Hosted with no list: set one so the subprocess exclusion is effective
+        # instead of silently absent. Under agent observability the distro would
+        # already have set its default list (with setdefault, before this guard
+        # runs), so an unset list means that default is not in play for this
+        # process or for the children that inherit its environment; setting
+        # ``aws_mcp`` alone cannot displace it.
+        disabled = _append_disabled_instrumentation("")
+    else:
+        disabled = None
     return TraceContentDecision(
         capture_enabled=False,
         capture_message_content="false",
@@ -383,28 +438,24 @@ def _install_strands_span_wrappers() -> None:
         if not getattr(original_end_span, marker, False):
 
             @functools.wraps(original_end_span)
-            def _end_span(self, span, attributes=None, error=None, error_message=None):  # type: ignore[no-untyped-def]
+            def _end_span(  # type: ignore[no-untyped-def]
+                self, span, attributes=None, error=None, error_message=None, *args, **kwargs
+            ):
                 # Keep the error status, but strip any content-bearing text. An
                 # exception becomes its type only (no record_exception, no stack
                 # trace); an error-status tool result (error is None, error_message
-                # set) becomes a fixed non-content string.
+                # set) becomes a fixed non-content string. Any parameter a newer
+                # Strands adds is passed through unchanged, so a new keyword cannot
+                # raise TypeError on every span end; the signature-pin tests flag
+                # such a change for review. The known slots are passed
+                # positionally so extra positional arguments keep their places.
                 if error is not None:
-                    return original_end_span(
-                        self,
-                        span,
-                        attributes,
-                        error=None,
-                        error_message=type(error).__name__,
-                    )
-                if error_message is not None:
-                    return original_end_span(
-                        self,
-                        span,
-                        attributes,
-                        error=None,
-                        error_message=REDACTED_TOOL_ERROR_STATUS,
-                    )
-                return original_end_span(self, span, attributes, error=None, error_message=None)
+                    redacted_message = type(error).__name__
+                elif error_message is not None:
+                    redacted_message = REDACTED_TOOL_ERROR_STATUS
+                else:
+                    redacted_message = None
+                return original_end_span(self, span, attributes, None, redacted_message, *args, **kwargs)
 
             setattr(_end_span, marker, True)
             Tracer._end_span = _end_span  # type: ignore[method-assign]
@@ -445,7 +496,7 @@ def _mcp_client_wrapper_layer_remains() -> bool:
         from mcp.shared.session import BaseSession
     except Exception:  # pragma: no cover - MCP SDK not installed
         return False
-    adot_mcp_module = "amazon.opentelemetry.distro.instrumentation.mcp"
+    adot_mcp_module = ADOT_MCP_INSTRUMENTOR_MODULE
     for method_name in ("send_request", "send_notification"):
         func = getattr(BaseSession, method_name, None)
         seen = 0
@@ -497,6 +548,35 @@ def _uninstrument_mcp() -> None:
                 _SKIPPED_PATHS.append(path)
     except Exception as exc:  # pragma: no cover - defensive, never fail startup
         _warn_guard_path_skipped("MCP instrumentor uninstrument", exc)
+
+
+def _is_adot_mcp_module(value: str) -> bool:
+    """Return True when an entry-point value loads from the ADOT MCP instrumentor module."""
+    module = value.split(":", 1)[0].strip()
+    return module == ADOT_MCP_INSTRUMENTOR_MODULE or module.startswith(ADOT_MCP_INSTRUMENTOR_MODULE + ".")
+
+
+def _verify_mcp_entry_point() -> None:
+    """Check that ``aws_mcp`` is the entry point the distro uses for MCP instrumentation.
+
+    The subprocess exclusion appends ``aws_mcp`` to the disabled-instrumentations
+    list, which OpenTelemetry matches against entry-point *names*. If the distro
+    renamed the entry point, or registered the MCP instrumentor under a second
+    name, the token would exclude nothing and auto-instrumented MCP subprocesses
+    would export tool arguments and results. Either case is recorded as a skipped
+    path with a fixed reason, so the startup posture reports redaction as
+    incomplete. Only entry-point names and module paths are inspected; nothing is
+    loaded. Any lookup error is recorded the same way and never fails startup.
+    """
+    try:
+        entry_points = importlib.metadata.entry_points(group=INSTRUMENTOR_ENTRY_POINT_GROUP)
+        mcp_names = {ep.name for ep in entry_points if _is_adot_mcp_module(str(ep.value))}
+        if MCP_INSTRUMENTOR_ENTRY_POINT not in mcp_names:
+            _warn_guard_check_failed(MCP_SUBPROCESS_EXCLUSION_PATH, MCP_ENTRY_POINT_MISSING_REASON)
+        elif mcp_names != {MCP_INSTRUMENTOR_ENTRY_POINT}:
+            _warn_guard_check_failed(MCP_SUBPROCESS_EXCLUSION_PATH, MCP_ENTRY_POINT_ALIASED_REASON)
+    except Exception:
+        _warn_guard_check_failed(MCP_SUBPROCESS_EXCLUSION_PATH, MCP_ENTRY_POINT_CHECK_ERROR_REASON)
 
 
 def _hosted_runtime(env: Mapping[str, str]) -> bool:
@@ -568,8 +648,10 @@ def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = 
     and the OpenTelemetry log records derived from them. When redacting, the
     guard also installs the Strands agent-span and error-path wrappers, attaches
     the MCP client logging filter, uninstruments the MCP instrumentor singleton
-    in this process, and appends ``aws_mcp`` to an already-set
-    disabled-instrumentations list so subprocesses inherit the exclusion. In a
+    in this process, adds ``aws_mcp`` to the disabled-instrumentations list (an
+    already-set list, or an unset list in a hosted runtime) so subprocesses
+    inherit the exclusion, and checks that ``aws_mcp`` is still the distro's MCP
+    instrumentor entry point, recording a skipped path if it is not. In a
     hosted runtime it also filters the AgentCore Memory SDK client logger to
     WARNING and above; a non-hosted run and the opt-in leave it alone. Returns the
     decision for logging and tests.
@@ -588,6 +670,7 @@ def apply_trace_content_guard(env: "os._Environ[str] | dict[str, str] | None" = 
             _install_strands_span_wrappers()
             _install_mcp_logging_filter()
             _uninstrument_mcp()
+            _verify_mcp_entry_point()
             if _hosted_runtime(target):
                 _install_memory_client_filter()
         finally:
