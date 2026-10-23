@@ -31,7 +31,7 @@ from agents.cost_report import CapturedCostRendering, begin_cost_report_capture,
 from agents.cost_request_periods import requested_historical_periods
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
-from agents.financial_guard import contains_unvalidated_financial_content, sanitize_advisory_section
+from agents.financial_guard import contains_unvalidated_financial_content, withheld_financial_reply_notice
 from agents.gamelift_specialist import gamelift_agent
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
 from agents.specialist_capture import begin_specialist_capture, finish_specialist_capture
@@ -574,12 +574,13 @@ def run_orchestrator(query: str, context: dict = None):
                 # If the routing model answers a cost topic directly, discard
                 # its prose and return deterministic nonnumeric guidance. For a
                 # non-cost query, inspect the actual model output as the final
-                # defense: volunteered monetary claims must not escape merely
-                # because the query classifier did not predict them.
+                # defense: a volunteered monetary claim is replaced with a
+                # dedicated, number-free notice so a non-cost question is not
+                # answered with cost guidance.
                 if _has_cost_topic(query):
                     response = _cost_guidance(forecast_request)
                 elif contains_unvalidated_financial_content(str(response)):
-                    response = sanitize_advisory_section("Cost", str(response))
+                    response = withheld_financial_reply_notice()
 
         # Extract and save semantic memories for LTM (non-blocking)
         if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and actor_id:
