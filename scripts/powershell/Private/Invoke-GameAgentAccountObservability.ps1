@@ -28,6 +28,13 @@ function Invoke-GameAgentAccountObservability {
         # present) without mutating anything. Mirrors the shell script's
         # 'report-transaction-search' mode.
         [switch]$ReportOnly,
+        # Fail-closed stop switch state, mirrored from the shell
+        # GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE opt-in. When set, the deploy
+        # halts before 'agentcore launch', so the default XRay/'aws/spans'-absent
+        # remedy must not promise a launch destination switch or a Step 5c toggle.
+        # Resolved from the environment when the caller does not pass it, with the
+        # same case-sensitive 'true'-only rule the shell path uses.
+        [switch]$StopOnAccountObservabilityChange = (Resolve-GameAgentStopSwitch -Value $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE),
         # Project-owned name for the shared Logs resource policy. The default is
         # read from the GBAW-prefixed environment variable so it cannot collide
         # with an unrelated environment value.
@@ -72,16 +79,10 @@ function Invoke-GameAgentAccountObservability {
     }
 
     # Returns XRay | CloudWatchLogs, or UNREADABLE if the read did not succeed.
-    # Wrapped so a redirected native stderr cannot surface as a terminating error
-    # under an inherited 'Stop' preference (PowerShell 7.0/7.1).
+    # Delegates to the shared Get-GameAgentTraceDestination so the opt-in path
+    # and the Transaction Search preflight use one implementation.
     function Get-TraceDestination {
-        try {
-            $raw = (& aws xray get-trace-segment-destination --region $Region @ProfileArgs --query 'Destination' --output text 2>$null)
-        } catch { return 'UNREADABLE' }
-        if ($LASTEXITCODE -ne 0) { return 'UNREADABLE' }
-        $dest = ("$raw").Trim()
-        if ($dest -eq 'XRay' -or $dest -eq 'CloudWatchLogs') { return $dest }
-        return 'UNREADABLE'
+        return Get-GameAgentTraceDestination -Region $Region -ProfileArgs $ProfileArgs
     }
 
     function Get-TraceStatus {
@@ -140,9 +141,11 @@ function Invoke-GameAgentAccountObservability {
     #   - destination XRay, group PRESENT          : the group already exists;
     #     only the trace destination needs switching to 'CloudWatchLogs',
     #     through the console or the opt-in Step 1.7 already offers;
-    #   - destination XRay, group absent, default  : the launch switches the
-    #     destination (which does not create the group by itself); Step 5c then
-    #     prints the one-time toggle from 'CloudWatchLogs';
+    #   - destination XRay, group absent, default  : with the stop switch off,
+    #     the launch switches the destination (which does not create the group by
+    #     itself) and Step 5c then prints the one-time toggle from
+    #     'CloudWatchLogs'; with the stop switch set, the deploy halts before
+    #     'agentcore launch', so the advice is the one-time console enable instead;
     #   - destination XRay, group absent, recheck  : the launch already ran and
     #     did NOT switch the destination (see the toolkit's 'Transaction Search
     #     configuration failed' warning); enable Transaction Search once in the
@@ -172,6 +175,16 @@ function Invoke-GameAgentAccountObservability {
                 Write-Host "${Indent}destination. Look in the launch output for the toolkit warning"
                 Write-Host "${Indent}'Transaction Search configuration failed', then enable Transaction Search"
                 Write-Host "${Indent}once in the AWS X-Ray / CloudWatch console and re-run the deployment."
+                return
+            }
+            if ($StopOnAccountObservabilityChange) {
+                # The stop-switch preflight halts the deploy before 'agentcore
+                # launch', so the launch never switches the destination and no
+                # Step 5c recheck runs.
+                Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
+                Write-Host "${Indent}is not present. The stop switch is set, so the deployment stops before"
+                Write-Host "${Indent}'agentcore launch' and nothing will switch the destination. Enable"
+                Write-Host "${Indent}Transaction Search once in the AWS X-Ray / CloudWatch console, then re-run."
                 return
             }
             Write-Host "${Indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
@@ -253,8 +266,28 @@ function Invoke-GameAgentAccountObservability {
             Write-Host '      The opt-in WOULD change these shared, account-wide settings'
             Write-Host '      (every X-Ray / Transaction Search consumer):'
             Write-AccountScope
-            Write-Host '      To let the deployment configure them, re-run with the opt-in:'
-            Write-Host '          Deploy-GameAgent -ConfigureAccountObservability'
+            if ($StopOnAccountObservabilityChange) {
+                # Under the stop switch the deploy halts before 'agentcore
+                # launch', so the account must reach a toolkit-passing state
+                # before the opt-in clears the halt. The default policy name
+                # does not satisfy the toolkit's name-only check, so offer the
+                # matching-name command (which writes 'TransactionSearchXRayAccess'
+                # instead of the default name shown in the scope list above), on
+                # an account with no other 'aws/spans' grant (the opt-in keeps an
+                # existing grant and skips its own write). Step 1.7 does not read
+                # policies, so the up-front preflight check that runs next names
+                # the console step for an account whose grant has another name.
+                Write-Host "      With the stop switch set, re-run the opt-in with the matching policy name"
+                Write-Host "      'TransactionSearchXRayAccess' (not the default name '$ResourcePolicyName'"
+                Write-Host "      shown above), on an account with no other 'aws/spans' grant (with one in"
+                Write-Host '      place, the opt-in keeps it and skips its own write; the up-front preflight'
+                Write-Host '      check that runs next names the console step for that account):'
+                Write-Host '          Deploy-GameAgent -ConfigureAccountObservability (with'
+                Write-Host '          GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess set)'
+            } else {
+                Write-Host '      To let the deployment configure them, re-run with the opt-in:'
+                Write-Host '          Deploy-GameAgent -ConfigureAccountObservability'
+            }
         } else {
             Write-SpansRemedy -Destination $destination -SpansState $spansState -Indent '      ' -Mode 'default'
         }
