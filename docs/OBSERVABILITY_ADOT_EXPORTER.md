@@ -131,9 +131,15 @@ the account trace segment destination to `CloudWatchLogs` when it is not already
 `CloudWatchLogs`, and sets the `Default`
 X-Ray indexing rule to 1% sampling when no `Default` rule exists. Because a first-time API enable does not
 create the AWS-reserved `aws/spans` log group, that launch-side enable can leave
-Transaction Search incomplete; the read-only Step 5c recheck reports it. This
-residual is tracked in
-[#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).
+Transaction Search incomplete; the read-only Step 5c recheck reports it. The
+deployment predicts these launch-side changes before every launch and warns
+about them, and a fail-closed stop switch
+(`GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true`, PowerShell
+`-StopOnAccountObservabilityChange`) can halt the deploy before `agentcore
+launch` makes any of these changes. The residual
+is that, without the stop switch, the
+toolkit still performs this setup during `agentcore launch`; it exposes no flag
+to skip only that step.
 
 ## Detection (does not suppress)
 
@@ -245,8 +251,10 @@ operate while the upstream timing behavior is tracked.
 Account-wide Transaction Search settings changes from *this repository's
 scripts* are made only under the
 `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true` opt-in. (`agentcore launch` performs
-its own Transaction Search setup independently; see "Ownership and upstream
-tracking" and [#568](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/568).)
+its own Transaction Search setup independently; the deployment predicts and warns
+about those launch-side changes before every launch, and the fail-closed
+`GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` stop switch can halt the deploy
+before any launch. See "Ownership and upstream tracking".)
 The opt-in path prints a
 rollback command for the trace destination when it enables Transaction Search,
 and for the default indexing rule only when `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
