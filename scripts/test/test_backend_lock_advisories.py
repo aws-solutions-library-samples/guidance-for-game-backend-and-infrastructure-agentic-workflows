@@ -22,6 +22,7 @@ MINIMUM_PATCHED = {
     "uv": ((0, 13, 4), "GHSA-hq85-5cpj-mr62", False),
     "virtualenv": ((21, 14, 7), "GHSA-vxj4-q4g9-crj7", False),
     "pypdf": ((6, 20, 1), "GHSA-39mj-jf6j-2qj3, GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, GHSA-qfv9-64jg-mh7p", True),
+    "black": ((26, 10, 1), "GHSA-cg8m-r9f2-5wm2", False),
 }
 
 
