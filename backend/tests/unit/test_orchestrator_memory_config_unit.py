@@ -15,6 +15,7 @@ import pytest
 
 # Local modules
 import agents.orchestrator as orch
+from utils.memory_identity import memory_actor_id
 
 # Capture the REAL run_orchestrator at import time. conftest's autouse
 # `mock_all_mcp_and_agents` fixture patches `agents.orchestrator.run_orchestrator`
@@ -51,6 +52,7 @@ def test_memory_config_enables_filter_restored_tool_context():
         "orchestrator must set filter_restored_tool_context=True so an orphaned "
         "toolUse in replayed history can't brick the session (#155)"
     )
-    # Sanity: it still wires the core identity fields.
+    # Sanity: it still wires the core identity fields. The memory actor ID is the
+    # pseudonymous digest of the subject, never the subject itself.
     assert captured.get("session_id") == "s-1"
-    assert captured.get("actor_id") == "u-1"
+    assert captured.get("actor_id") == memory_actor_id("u-1")
