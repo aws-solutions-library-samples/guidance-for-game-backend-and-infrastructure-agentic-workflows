@@ -17,6 +17,7 @@ existing Game Agent chat path remains the current product behavior.
 | [ADR 0004](0004-expose-governed-public-mcp-facade.md) | Proposed | Expose a governed public MCP facade |
 | [ADR 0005](0005-persist-operations-and-recover-workflows.md) | Accepted | Persist operations state and recover workflows |
 | [ADR 0007](0007-adopt-cloudscape-with-parallel-shell-cutover.md) | Proposed | Adopt Cloudscape with a parallel-shell cutover |
+| [ADR 0008](0008-hand-off-chat-proposals-to-direct-approval.md) | Proposed | Hand off chat proposals to direct approval |
 
 Number 0006 is reserved for the bounded-autonomy capacity ADR on the operations
 E5 branch (#438), so this index skips it until that work merges.
