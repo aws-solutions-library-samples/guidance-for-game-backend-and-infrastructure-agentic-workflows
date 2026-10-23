@@ -124,6 +124,13 @@ jobs:
       env:
         REQUIRE_NEXT_BUILD_MANIFEST: 'true'
 
+    # The bundle budget needs a build to measure, so it runs here (not in the
+    # build-free unit jobs): it fails the build if a current-UI page gains
+    # Cloudscape code/CSS or grows past its per-page ceiling.
+    - name: Check bundle budget
+      working-directory: ./ui
+      run: node scripts/measure-bundles.mjs
+
     - name: Run E2E smoke tests
       working-directory: ./ui
       run: npx playwright test tests/e2e-smoke.spec.ts

@@ -54,6 +54,11 @@ Node.js Production Dependencies
 
 @aws-sdk/client-cognito-identity-provider (^3.911.0)   Apache-2.0
 @aws-sdk/client-sts (^3.911.0)                         Apache-2.0
+@cloudscape-design/chat-components (1.0.178)           Apache-2.0
+@cloudscape-design/component-toolkit (1.0.0-beta.189)  Apache-2.0
+@cloudscape-design/components (3.0.1396)               Apache-2.0
+@cloudscape-design/design-tokens (3.0.114)             Apache-2.0
+@cloudscape-design/global-styles (1.0.71)              Apache-2.0
 @copilotkit/react-core (^1.10.6)                       MIT
 @copilotkit/react-ui (^1.10.6)                         MIT
 @copilotkit/shared (^1.10.4)                           MIT
@@ -83,6 +88,7 @@ Node.js Development Dependencies
 --------------------------------------------------------------------------------
 
 @eslint/eslintrc (^3.3.1)                   MIT
+@axe-core/playwright (4.13.0)               MPL-2.0
 @playwright/test (^1.56.1)                  Apache-2.0
 @testing-library/jest-dom (^6.8.0)          MIT
 @testing-library/react (^16.3.0)            MIT
