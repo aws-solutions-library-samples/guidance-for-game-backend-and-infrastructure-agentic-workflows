@@ -5,36 +5,35 @@ description = "AI-powered game server management backend"
 requires-python = ">=3.13.9,<3.14"
 dependencies = [
     # Strands packages with OTEL support
-    "strands-agents[otel]>=1.50.2",
+    "strands-agents[otel]>=1.57.2",
 
     # MCP client. Previously pinned <1.19.0 due to an eks-mcp-server
     # incompatibility (awslabs/mcp#1577: mcp 1.19 added stricter type
     # validation that broke eks-mcp-server's Union[CallToolResult] pattern).
     # Fixed upstream: eks-mcp-server>=0.1.32 now requires mcp[cli]>=1.23.0,
     # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
-    "mcp>=1.28.1",
+    "mcp>=1.30.0",
 
-    # AWS SDK. Floors at 1.43.32 (not .33) so the resolver can satisfy the
-    # awscli==1.45.32 bundled by awslabs.aws-api-mcp-server, which pins
-    # botocore==1.43.32 exactly.
-    "boto3>=1.43.32",
-    "botocore>=1.43.32",
+    # AWS SDK. The floor tracks the locked boto3/botocore versions so a fresh
+    # resolution cannot select older ones.
+    "boto3>=1.43.108",
+    "botocore>=1.43.108",
 
     # Environment variables
-    "python-dotenv>=1.2.2",
+    "python-dotenv>=1.2.4",
 
     # JWT authentication (floor raised to the patched version, vulnerability fix)
     "PyJWT[crypto]>=2.15.0",
 
     # AgentCore SDK with Strands integration
-    "bedrock-agentcore[strands-agents]>=1.19.0",
+    "bedrock-agentcore[strands-agents]>=1.24.0",
 
     # HTTP client with AWS SigV4 signing
     "httpx>=0.28.1",
     "httpx-auth-awssigv4>=0.1.4",
 
     # Utilities
-    "pydantic>=2.13.4",
+    "pydantic>=2.13.5",
     "loguru>=0.7.3",
     "PyYAML>=6.0.1",
     "cachetools>=6.2.4",  # bounded TTL caches (rate-limit, KB, memory dedup)
@@ -44,7 +43,7 @@ dependencies = [
     "rfc8785>=0.1.4",
 
     # OpenTelemetry / ADOT for AgentCore observability
-    "aws-opentelemetry-distro>=0.19.0",
+    "aws-opentelemetry-distro>=0.21.0",
     "opentelemetry-instrumentation>=0.65b0",
 
     # Process monitoring
@@ -57,13 +56,17 @@ dependencies = [
     # AWS CLI bridge (call_aws) used by the EKS specialist for cluster discovery
     # (`aws eks list-clusters`). Its log/workdir are redirected to /tmp via env in
     # mcp_client_factory.create_mcp_client (it writes under $HOME otherwise).
-    # Floor at 1.3.47: 1.3.46 is affected by GHSA-29w2-fq35-v728 (High).
-    "awslabs.aws-api-mcp-server>=1.4.1",
+    # The floor tracks the locked version; it must stay above 1.3.46, which is
+    # affected by GHSA-29w2-fq35-v728 (High).
+    "awslabs.aws-api-mcp-server>=1.5.6",
     # Replaces the YANKED awslabs.cost-explorer-mcp-server (#105). Its SQLite
     # session DB path is hardcoded in the package dir (read-only on container);
     # mcp_client_factory relocates it to /tmp via a startup patch.
-    "awslabs.billing-cost-management-mcp-server>=0.0.29",
-    "awslabs.eks-mcp-server>=0.1.35",
+    # Keep the reviewed tool catalog pinned until #465 adds bounded,
+    # operation-specific projections for Billing MCP forecast and optimization
+    # responses. Later releases add model-visible tools that are not yet guarded.
+    "awslabs.billing-cost-management-mcp-server==0.0.29",
+    "awslabs.eks-mcp-server>=0.1.37",
 
     # Documentation scraper dependencies
     "requests>=2.34.2",
@@ -75,7 +78,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     # CLI/interactive tools (not needed in production)
-    "bedrock-agentcore-starter-toolkit>=0.3.11",
+    "bedrock-agentcore-starter-toolkit>=0.3.13",
     "uv>=0.13.4",
 
     # Testing
@@ -85,10 +88,10 @@ dev = [
     "pytest-timeout>=2.3.1",
 
     # Code quality tools
-    "pre-commit>=4.6.1",
+    "pre-commit>=4.6.2",
     "black>=26.10.1",
-    "isort>=8.0.1",
-    "mypy>=2.3.0",
+    "isort>=9.0.2",
+    "mypy>=2.4.0",
 ]
 
 [tool.black]
