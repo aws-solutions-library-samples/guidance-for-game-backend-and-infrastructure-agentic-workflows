@@ -15,15 +15,16 @@ Before you begin, ensure you have the following installed and configured:
 | **UV** | 0.9+ | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **Docker** | Latest | [Install Guide](https://docs.docker.com/get-docker/) |
 | **yq** | v4+ | [Install Guide](https://github.com/mikefarah/yq#install) |
+| **python3** | 3.8+ | [Download](https://www.python.org/downloads/) |
 
-**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`).
+**Note:** Python 3.13 and the AgentCore CLI (`bedrock-agentcore-starter-toolkit`) are automatically installed by UV during setup (`uv sync`). UV does not add a `python3` to `PATH`, so a standalone Python 3 is still required: the deployment scripts call `python3` directly to parse AWS CLI responses in the account-observability steps (the Step 1.7 default read, the Step 2b trace-delivery verification, and the Step 5c post-launch recheck).
 
 **Windows users:** Native PowerShell deployment scripts are available in `scripts/powershell/`. See [scripts/powershell/README.md](../scripts/powershell/README.md) for setup and usage. Requires PowerShell 7.0+ and AWS CLI v2 — no WSL2 or Linux environment needed.
 
 ### AWS Account Requirements
 
 Your AWS account needs the following:
-- **Bedrock Model Access**: Claude Sonnet 4.6 and Claude Haiku 4.5 enabled in your region
+- **Bedrock Model Access**: Claude Sonnet 5.5 and Claude Haiku 5.5 enabled in your region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 
@@ -33,8 +34,8 @@ Your AWS account needs the following:
 2. Navigate to **Model access** in the left sidebar
 3. Click **Manage model access**
 4. Enable:
-   - Anthropic Claude Sonnet 4.6
-   - Anthropic Claude 4.5 Haiku
+   - Anthropic Claude Sonnet 5.5
+   - Anthropic Claude Haiku 5.5
 5. Click **Save changes**
 
 ## Quick Start
@@ -107,12 +108,14 @@ cp ui/.env.local.example ui/.env.local
 
 Edit `ui/.env.local` if you need to customize:
 - `AWS_REGION`: Your deployment region
-- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (default: Claude Haiku 4.5)
-- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (default: Claude Sonnet 4.6)
+- `GBAW_ORCHESTRATOR_MODEL_ID`: Orchestrator model or inference profile (commented out; default from `model_settings.py`: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID`: GameLift, EKS, and Cost model or inference profile (commented out; default from `model_settings.py`: Claude Sonnet 5.5)
 - `GBAW_TENANT_ID`: Trusted tenant binding for this deployment (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID`: Trusted workspace binding for this deployment (default: `default-workspace`)
 
 Process environment values take precedence over `ui/.env.local`. The canonical role variables above take precedence over the compatibility aliases `GBAW_BEDROCK_MODEL_ID` and `GBAW_BEDROCK_MODEL_ID_SECONDARY`; empty values are treated as unset. The deployment passes the resolved role IDs to AgentCore on both initial launch and updates.
+
+> **Upgrading an existing deployment:** The two model-ID lines ship commented out so the defaults come from `backend/src/config/model_settings.py`. If your existing `ui/.env.local` was created from an earlier example, it may still pin `GBAW_ORCHESTRATOR_MODEL_ID` and `GBAW_SPECIALIST_MODEL_ID` to the previous model generation. Those pinned values take precedence over the defaults, so a redeploy keeps those models until you update or delete those two lines. After redeploying, confirm the resolved model IDs in the startup log and `scripts/deploy.sh` output name the models you expect.
 
 Tenant and workspace are server-side identity bindings. The deployment passes
 them to the frontend container without a `NEXT_PUBLIC_` prefix; browser request
@@ -187,12 +190,266 @@ Log in with the admin credentials you created.
 | Frontend | ECS Express (Fargate + ALB) | Web UI with chat interface |
 | Backend | Bedrock AgentCore | AI agents and orchestration |
 | Auth | Cognito | User authentication |
-| AI Models | Bedrock | Claude Haiku 4.5 orchestrator and Claude Sonnet 4.6 specialists |
+| AI Models | Bedrock | Claude Haiku 5.5 orchestrator and Claude Sonnet 5.5 specialists |
 | Knowledge Bases | Bedrock | RAG for GameLift, EKS, Cost |
 | Guardrails | Bedrock | AI safety controls |
 | Observability | CloudWatch | Logging and monitoring |
 
 ADOT runtime telemetry is auto-configured by AgentCore. For a known cold-start exporter credential limitation (transient `403` on telemetry export) and the read-only detection check, see [`OBSERVABILITY_ADOT_EXPORTER.md`](OBSERVABILITY_ADOT_EXPORTER.md).
+
+### Account-wide Observability (Scoped and Opt-in)
+
+X-Ray Transaction Search relies on account-wide, cross-application settings: the
+X-Ray trace segment destination, the default X-Ray indexing (sampling) rule, and
+a shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log
+group. Changing these affects every X-Ray and Transaction Search consumer in the
+account.
+
+**Scope.** By default this repository's deployment scripts make **no**
+account-wide Transaction Search settings changes. They read the current trace
+destination, detect whether the account already supports what the runtime needs,
+and — if it does not — print an actionable warning. That warning recommends the
+opt-in only when the AWS-reserved `aws/spans` log group already exists and the
+destination was read (so the opt-in can finish the job); otherwise it points to
+the one-time console enable or a destination toggle keyed on the current
+destination, because the opt-in cannot create that group. A default deployment is **not** failed for a missing account
+configuration. The per-runtime trace delivery (Step 2b) binds only when X-Ray
+Transaction Search is active, so the deploy first reads the account trace segment
+destination: when it is `CloudWatchLogs` and `ACTIVE` the delivery is created and
+verified (and any delivery failure then fails the deploy); when it is
+`CloudWatchLogs` but not yet `ACTIVE` the deploy waits a bounded budget for it;
+and when the destination is not `CloudWatchLogs`, never becomes `ACTIVE` within
+the budget, or cannot be read, the deploy prints one WARNING naming the state and
+skips the delivery rather than aborting. The read-only Step 5c recheck still runs
+and reports.
+
+> **Residual not controlled by this opt-in.** `agentcore launch` — which the
+> deploy script runs in its Step 2 (only on a first deploy) and Step 5b
+> launches — performs its own Transaction Search setup on every launch,
+> regardless of `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY`. On every launch, the
+> AgentCore starter toolkit may make up to three shared changes, each also when
+> its own read fails: it adds a `TransactionSearchXRayAccess` resource policy
+> whenever no policy already has that exact name (even when this opt-in's own
+> policy already grants access), switches the account trace segment destination
+> to `CloudWatchLogs` when it is not already `CloudWatchLogs`, and sets the
+> `Default` X-Ray indexing rule to 1% sampling when no `Default` rule exists.
+> This is behavior of the toolkit, not of this repository's scripts. The
+> deployment predicts these changes before every launch and warns about them,
+> and a fail-closed stop switch
+> (`GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true`, PowerShell
+> `-StopOnAccountObservabilityChange`) can halt the deploy before `agentcore
+> launch` makes any of these changes. The residual is that, without the stop switch,
+> the toolkit still performs its own setup during `agentcore launch`; the
+> toolkit exposes no flag to skip only that step.
+> A read-only post-launch recheck (Step 5c) reports the resulting Transaction
+> Search state without changing it. For the full launch-time behavior and the
+> stop switch, see
+> [AgentCore Starter Toolkit Transaction Search (Launch-Time Exception)](#agentcore-starter-toolkit-transaction-search-launch-time-exception).
+
+**Opt-in.** To let the deployment configure the shared settings, set the
+purpose-named opt-in:
+
+```bash
+GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true ./deploy-all.sh
+```
+
+PowerShell uses the matching switch:
+
+```powershell
+Deploy-GameAgent -ConfigureAccountObservability
+```
+
+Before applying anything, the opt-in path prints exactly which shared settings
+may change.
+
+`GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` and `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`
+are read from the process environment only; they are not read from
+`ui/.env.local`. The PowerShell switch `-ConfigureAccountObservability` and the
+environment variable are equivalent opt-in triggers.
+
+**Ownership and preservation.** This repository's opt-in reads existing state
+first and preserves it. It enables Transaction Search only additively (it never
+performs a disable/re-enable toggle of the shared destination) and leaves an
+already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
+enable does not create the AWS-reserved `aws/spans` log group (only the console
+or a destination toggle does), the opt-in **fails** — with the one-time console
+or toggle step — rather than reporting success when `aws/spans` is still absent
+after the enable. On a fresh account whose destination starts at `XRay`, the
+opt-in has by then already written the shared resource policy and switched the
+trace destination to `CloudWatchLogs` (and, if you set
+`GBAW_XRAY_DEFAULT_INDEXING_PERCENT`, changed the `Default` indexing rule); those
+changes stay in place (the destination rollback command was printed earlier in
+the run), and only the console or a destination toggle creates `aws/spans`. If it cannot read the
+current trace destination, the opt-in refuses to change it and fails rather than
+guessing. The
+account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
+modified only when you set `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` to an integer in
+`[0, 100]`, and only then is a rollback command printed with the prior value. The
+shared Logs resource policy uses a project-owned name
+(`GameAgentTransactionSearchXRayAccess`). Before writing it, the deployment lists
+existing resource policies: if another policy (including a legacy
+`TransactionSearchXRayAccess` written by earlier deploys) already grants
+`xray.amazonaws.com` `logs:PutLogEvents` on `aws/spans`, it is left in place and
+the write is skipped; if the account is already at the 10-policy limit, the
+deployment fails with a bounded message instead of adding a duplicate.
+
+**Legacy policy migration.** Some earlier versions of this project wrote a shared
+policy named `TransactionSearchXRayAccess`. The current opt-in writes its own
+project-owned policy name and leaves any `TransactionSearchXRayAccess` policy
+untouched. If such a policy exists and already grants the needed access, it
+continues to work and the opt-in skips its own write. Delete the legacy
+`TransactionSearchXRayAccess` policy only once you have confirmed no other
+workload relies on it.
+
+**Validation.** The per-runtime trace delivery step first reads the account
+trace segment destination: it creates and verifies the delivery only when the
+destination is `CloudWatchLogs` and `ACTIVE`, waits a bounded, configurable
+budget when the destination is `CloudWatchLogs` but still converging, and
+otherwise prints one WARNING and skips the delivery (the deploy continues). The
+wait budget is overridable with `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS`
+(default 30) and `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` (default 10). When
+the delivery does run, each mutation (delivery source → destination → delivery)
+distinguishes a genuine already-exists conflict from authorization, validation,
+throttling, and service errors by the AWS error code. Retryable errors are
+retried with a small bounded backoff; a real error fails the deployment with a
+bounded diagnostic. The deployment then queries the delivery (retrying a
+transient read) and fails unless a delivery with destination type `XRAY` binds
+the intended source — whose resources include the runtime — to the intended
+destination.
+
+**Rollback.** The account-wide changes made by *this repository's opt-in* are
+listed above; `agentcore launch` may make the separate, toolkit-owned changes
+noted in the Scope callout. The opt-in prints a rollback command for the trace
+destination when it enables Transaction Search, and for the default indexing rule
+only when you explicitly change it (with the prior percentage). To remove the
+project-owned resource policy:
+
+```bash
+aws logs delete-resource-policy --policy-name GameAgentTransactionSearchXRayAccess --region <region>
+```
+
+Teardown intentionally preserves account-wide observability resources because
+they may be shared with other applications.
+
+### AgentCore Starter Toolkit Transaction Search (Launch-Time Exception)
+
+The account-wide setup above is this repository's own, opt-in behavior. Separately,
+`agentcore launch` itself can change account-wide X-Ray / CloudWatch Logs settings.
+When runtime observability is enabled — the same setting that selects the
+`opentelemetry-instrument` entrypoint used for tracing — the AgentCore starter
+toolkit (version 0.3.11) runs its `enable_transaction_search_if_needed` step after
+the runtime is created or updated. In 0.3.11 there is no flag to keep that OTEL
+entrypoint while skipping only this account step, so this deployment keeps the
+entrypoint and instead makes the behavior explicit.
+
+**What the toolkit may change (its own conditions):**
+
+- **CloudWatch Logs resource policy** — the toolkit creates a policy named
+  literally `TransactionSearchXRayAccess` whenever no policy with that exact name
+  exists. It checks the *name* only, so this repository's project-owned
+  `GameAgentTransactionSearchXRayAccess` policy does **not** satisfy it: the
+  toolkit adds its own `TransactionSearchXRayAccess` policy even when the opt-in
+  already granted the access.
+- **X-Ray trace segment destination** — set to `CloudWatchLogs` when it is not
+  already `CloudWatchLogs` (account-wide, shared by every X-Ray caller).
+- **X-Ray default indexing rule** — the toolkit calls `UpdateIndexingRule` to set
+  the shared `Default` rule to 1% when no rule named `Default` exists. There is no
+  separate create operation; this is an upsert of the account-wide `Default` rule.
+- **Write-on-doubt.** When the toolkit cannot read one of these settings, it
+  performs the write anyway. A read that it cannot interpret therefore still
+  results in the account-wide change.
+
+**Read-only preflight and warning.** Before every `agentcore launch`, the
+deployment runs a read-only preflight that predicts exactly which of these the
+toolkit would change, using the toolkit's own conditions. If it would change
+nothing, the deployment prints a single no-change line (no per-item detail). If
+it would change something, it prints the per-item detail followed by a prominent
+warning that names each change and the affected shared settings, explains that
+the change comes from the AgentCore starter toolkit (not this repository's
+opt-in), and prints only the cleanup/rollback commands relevant to the predicted
+changes. If a read fails, the preflight reports the toolkit's effect as
+**unknown** (a possible change), never as "no change", and states that for each
+unknown item the toolkit will perform the write.
+
+**Default is non-blocking.** A fresh-account `./deploy-all.sh` still completes; the
+preflight warns but does not stop.
+
+**Fail-closed stop switch.** Operators who require no shared account change can set
+a stop switch that halts the deploy *before* `agentcore launch` whenever the
+toolkit would (or might) change account-wide settings:
+
+```bash
+GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true ./deploy-all.sh
+```
+
+PowerShell uses the matching switch (or the same environment variable):
+
+```powershell
+Deploy-GameAgent -StopOnAccountObservabilityChange
+```
+
+Only the exact value `true` enables it; any other value (including `TRUE` and `1`)
+is treated as off. When the stop switch is set, the preflight runs once up front —
+before the Knowledge Base and observability steps — so a predicted or unknown
+change halts the deploy before any of those steps run. Because the stop is
+fail-closed, it also halts when the preflight cannot read the current state
+(unknown).
+
+**Reaching a passing run with the stop switch.** The stop switch keeps halting
+until the account already satisfies all three toolkit conditions, so that the
+toolkit's launch-time step would be a no-op:
+
+- a CloudWatch Logs resource policy named *literally* `TransactionSearchXRayAccess`,
+- the X-Ray trace segment destination set to `CloudWatchLogs`, and
+- an X-Ray indexing rule named `Default`.
+
+Enable Transaction Search once in the AWS X-Ray / CloudWatch console. That
+creates the AWS-reserved `aws/spans` log group, switches the trace destination,
+and sets the `Default` indexing rule. Then re-run with the stop switch still set.
+If the preflight still reports the resource policy, the account has no policy
+with the toolkit's exact name yet. If another policy already grants `aws/spans`
+access under a different name, such as this repository's
+`GameAgentTransactionSearchXRayAccess`, neither the console nor the opt-in adds
+the name `TransactionSearchXRayAccess`. Add a policy named exactly
+`TransactionSearchXRayAccess`, or run one deploy without the stop switch so the
+toolkit adds it.
+
+This repository's opt-in uses the project-owned name
+`GameAgentTransactionSearchXRayAccess` by default, which does **not** satisfy the
+toolkit's name-only check. The opt-in cannot create `aws/spans`, and it skips its
+own policy write when another policy already grants `xray.amazonaws.com` access
+to `aws/spans`. So it reaches a passing state only when `aws/spans` already
+exists and no other policy grants that access. On such an account, run the opt-in
+with the matching policy name to switch the destination and add the policy the
+toolkit looks for (the opt-in leaves the shared `Default` indexing rule in place,
+so the console enable above still creates it when it is missing):
+
+```bash
+GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
+  GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME=TransactionSearchXRayAccess ./deploy-all.sh
+```
+
+On an account **without** `aws/spans`, do not use the opt-in to clear the stop
+switch: it would write the shared policy (and switch an `XRay` destination) but
+still stop at Step 1.7, because it cannot create the group. Use the console
+enable above instead.
+
+**Cleanup.** The warning prints only the rollback commands for the changes it
+predicted. If the toolkit added its own policy, remove it after launch (only once
+no other workload relies on it):
+
+```bash
+aws logs delete-resource-policy --policy-name TransactionSearchXRayAccess --region <region>
+```
+
+Note that `TransactionSearchXRayAccess` is also this repository's legacy policy
+name, so confirm the launch (not an earlier deploy) created it before deleting.
+If the launch changed the trace destination, restore the prior value with
+`aws xray update-trace-segment-destination --destination <prior> --region <region>`.
+If the launch set the shared `Default` indexing rule to 1%, restore a prior
+percentage with
+`aws xray update-indexing-rule --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":<prior>}}' --region <region>`.
+
 
 ## Post-Deployment Configuration
 
@@ -233,7 +490,7 @@ aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
   --filter-pattern '"Orchestrator model" || "Specialist model"'
 ```
 
-For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 4.5 for the orchestrator and Sonnet 4.6 for specialists. Response text alone is not sufficient evidence of model or tool selection.
+For the deployment smoke test, send one off-topic request expected to activate the Guardrail and one in-domain request such as "List my EKS clusters" expected to route to a specialist and invoke a client-side tool. Confirm the Guardrail result and tool-use span in AgentCore traces, and confirm the startup log identifies Haiku 5.5 for the orchestrator and Sonnet 5.5 for specialists. Response text alone is not sufficient evidence of model or tool selection.
 
 ## Teardown
 
@@ -285,7 +542,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 
 | Service | Estimated Cost | Notes |
 |---------|---------------|-------|
-| Bedrock (Claude Sonnet 4.6 + Haiku 4.5) | $20-630+ | Dominant cost; uses `global.*` cross-region model IDs (~$3/M input, ~$15/M output for Sonnet 4.6; ~$1/M input, ~$5/M output for Haiku 4.5) |
+| Bedrock (Claude Sonnet 5.5 + Haiku 5.5) | ~$480 (excluding `between_tools` thinking) at ~10,000 queries/month | Uses `global.*` cross-region model IDs; Sonnet 5.5 $2.00/M input + $10.00/M output, Haiku 5.5 $0.10/M input + $0.50/M output (AWS Price List API, us-west-2, retrieved 2026-10-09). Token volumes scaled up ~30% from the equivalent Claude 4.x workload for the newer tokenizer; Haiku 5.5 thinking is disabled, Sonnet 5.5 uses `between_tools` whose thinking blocks bill as output. Scales with query volume |
 | ECS Fargate | $36-47 | 1 vCPU, 2 GB task; $36.04 at MinTasks: 1 (730 hrs), ~$47 at avg ~1.3 tasks under moderate load (~950 task-hrs/mo) |
 | Bedrock Guardrails | $3-32 | 4 guarded calls/query × (input + output) TU per safeguard: content filters ($0.15/1K TU) + denied topics ($0.15/1K TU) + PII ($0.10/1K TU) |
 | Bedrock AgentCore Runtime | $1-10 | CPU billed on active consumption only (I/O wait free); memory billed for full session duration |
@@ -299,7 +556,7 @@ Approximate monthly costs at minimal usage (development/demo) in `us-west-2`:
 | Cognito | Free | Up to 50,000 MAUs |
 
 **Base infrastructure**: ~$80-140/month (Fargate, ALB, WAF, Guardrails, CloudWatch, KMS, CloudTrail)
-**AI usage (variable)**: $20-630+/month depending on query volume and conversation length
+**AI usage (variable)**: ~$480/month (excluding `between_tools` thinking) at ~10,000 queries/month (Claude Sonnet 5.5 + Haiku 5.5; Haiku thinking disabled, Sonnet `between_tools`); scales with query volume and conversation length
 
 ### Optional operations control plane (E1)
 
@@ -345,11 +602,19 @@ reviewed cost evidence.
 
 ### Cost Optimization Tips
 
-- Prompt caching is enabled by default. Cache-read share must exceed ~22% of cached tokens to break even (writes cost 1.25×, reads cost 0.1×). Min checkpoint: 1,024 tokens (Sonnet 4.6), 4,096 tokens (Haiku 4.5). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
+- Prompt caching is enabled by default and uses the default 5-minute TTL. Cache-read share must exceed ~22% of cached tokens for Haiku 5.5 and ~21% for Sonnet 5.5 to break even (writes cost 1.25× input; reads cost 0.1× input for Haiku 5.5 and 0.05× for Sonnet 5.5). Min checkpoint: 512 tokens for both Claude Haiku 5.5 and Claude Sonnet 5.5 (see the Bedrock [prompt caching](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html) guide). Monitor `CacheReadInputTokenCount` vs `CacheWriteInputTokenCount` in CloudWatch
 - Knowledge Bases use S3 Vectors (not OpenSearch) for cost-effective vector storage — near-zero cost at small scale
 - ECS Fargate scales between 1-4 tasks based on load (configurable via MinTasks/MaxTasks)
 - AgentCore Runtime only charges for active CPU time; memory is billed for full session duration regardless of I/O wait
 - Monitor CloudWatch dashboards to track AI token consumption
+
+### Optional: application inference profiles for cost attribution
+
+The optional helper scripts `scripts/infrastructure/manage-inference-profile.sh` and `scripts/infrastructure/get-inference-profile-ids.sh` create and check Game Agent application inference profiles for per-role Cost Explorer attribution. They are not called by `scripts/deploy.sh`. An application inference profile records only the requests sent through it, so the profiles attribute no runtime spend until the runtime can use them (see the note below).
+
+> **Not supported as runtime model IDs yet.** Do not set `GBAW_ORCHESTRATOR_MODEL_ID` or `GBAW_SPECIALIST_MODEL_ID` to an application inference profile that wraps Claude Haiku 5.5 or Claude Sonnet 5.5 until the capability-aware model factory ([#421](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/421)). An application inference profile ID is opaque, so the runtime cannot tell which model it wraps and sends the earlier-generation request shape, which includes `temperature`. The 5.5 models reject `temperature`, so every request through such a profile fails. You can create the profiles ahead of #421, but keep the role variables on the `global.` system inference profile IDs. `get-inference-profile-ids.sh` always exports those resolved IDs and prints a stderr notice when it finds the application profiles.
+
+The profile names track the current model generation (`GameAgent-Orchestrator-Claude-Haiku-5-5` and `GameAgent-Specialist-Claude-Sonnet-5-5`). If you created profiles under earlier names, run `manage-inference-profile.sh create <region>` to create the current ones and delete the previous-generation profiles manually; they are not removed automatically. `get-inference-profile-ids.sh` looks up only the current names.
 
 ## Environment Variables Reference
 
@@ -357,8 +622,8 @@ reviewed cost evidence.
 |----------|----------|---------|-------------|
 | `AWS_REGION` | No | us-west-2 | AWS deployment region |
 | `AWS_PROFILE` | No | default | AWS credentials profile |
-| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-4-5-20251001-v1:0` | Orchestrator model/profile |
-| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-4-6` | All specialist models/profiles |
+| `GBAW_ORCHESTRATOR_MODEL_ID` | No | `global.anthropic.claude-haiku-5-5` | Orchestrator model/profile |
+| `GBAW_SPECIALIST_MODEL_ID` | No | `global.anthropic.claude-sonnet-5-5` | All specialist models/profiles |
 | `GBAW_BEDROCK_MODEL_ID` | No | unset | Legacy orchestrator alias |
 | `GBAW_BEDROCK_MODEL_ID_SECONDARY` | No | unset | Legacy specialist alias |
 | `GBAW_TENANT_ID` | No | `default-tenant` | Server-side trusted tenant binding |
@@ -366,6 +631,16 @@ reviewed cost evidence.
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
+| `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` | No | false | Opt in to account-wide X-Ray / CloudWatch Logs changes (trace destination, indexing rule, shared Logs resource policy). See [Account-wide Observability](#account-wide-observability-scoped-and-opt-in) |
+| `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` | No | unset | Opt-in only: X-Ray default indexing (sampling) percent, integer [0, 100]. Left unchanged when unset |
+| `GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME` | No | `GameAgentTransactionSearchXRayAccess` | Opt-in only: project-owned CloudWatch Logs resource policy name |
+| `GBAW_OBSERVABILITY_ACTIVE_MAX_ATTEMPTS` | No | 30 | Opt-in only: max polls for the trace destination to reach ACTIVE |
+| `GBAW_OBSERVABILITY_ACTIVE_RETRY_SECONDS` | No | 10 | Opt-in only: delay between ACTIVE polls, in seconds |
+| `GBAW_DELIVERY_MAX_ATTEMPTS` | No | 4 (capped at 20) | Runtime trace-delivery retry attempts |
+| `GBAW_DELIVERY_RETRY_SECONDS` | No | 5 (capped at 60) | Delay between trace-delivery retries, in seconds |
+| `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS` | No | 30 | Step 2b: polls for the X-Ray trace destination to reach `ACTIVE` before creating the trace delivery |
+| `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` | No | 10 | Step 2b: delay between trace-destination `ACTIVE` polls, in seconds |
+| `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE` | No | false | Fail-closed: stop before `agentcore launch` if the AgentCore starter toolkit would change account-wide X-Ray / CloudWatch Logs settings. Only the exact value `true` enables it. See [AgentCore Starter Toolkit Transaction Search](#agentcore-starter-toolkit-transaction-search-launch-time-exception) |
 
 ## Security Notes
 

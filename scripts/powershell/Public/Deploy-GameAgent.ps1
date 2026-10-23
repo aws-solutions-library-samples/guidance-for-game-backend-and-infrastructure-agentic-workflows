@@ -14,20 +14,76 @@ function Deploy-GameAgent {
         AWS CLI profile. Default: reads from ui/.env.local or uses "default".
     .PARAMETER SkipFrontend
         Skip frontend steps (6-8) even if Docker is available.
+    .PARAMETER ConfigureAccountObservability
+        Opt in to account-wide X-Ray / CloudWatch Logs changes (trace segment
+        destination, default indexing rule, shared Logs resource policy). Omitted
+        by default so this repository's scripts make no account-wide Transaction
+        Search settings change. Note that `agentcore launch` performs its own
+        Transaction Search setup on every launch regardless of this switch (it
+        may add a TransactionSearchXRayAccess resource policy whenever no policy
+        already has that exact name, switch the trace segment destination to
+        CloudWatchLogs, and set the Default indexing rule to 1%; each write also
+        happens when its own read fails).
+    .PARAMETER StopOnAccountObservabilityChange
+        Fail-closed stop switch for operators who require no shared account change.
+        When set, the deployment runs a read-only preflight before each
+        `agentcore launch` and STOPS if the AgentCore starter toolkit would (or
+        might) change account-wide X-Ray / CloudWatch Logs settings. Mirrors the
+        shell GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true opt-in.
     .EXAMPLE
         Deploy-GameAgent
     .EXAMPLE
         Deploy-GameAgent -Profile demo -Region us-east-1
+    .EXAMPLE
+        Deploy-GameAgent -ConfigureAccountObservability
+        Opts in to the account-wide X-Ray / CloudWatch Logs changes.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [string]$ProjectName = 'game-agent',
         [string]$Region = 'us-west-2',
         [string]$Profile,
-        [switch]$SkipFrontend
+        [switch]$SkipFrontend,
+        [switch]$ConfigureAccountObservability,
+        [switch]$StopOnAccountObservabilityChange
     )
 
     $ErrorActionPreference = 'Stop'
+
+    # Honor the shell-equivalent opt-in environment variable when the switch is
+    # not explicitly supplied, so both shells share one opt-in trigger. The
+    # comparison is case-sensitive ('-ceq'), matching bash's exact 'true' check,
+    # so 'TRUE' or 'True' does not opt in on one shell but not the other.
+    if (-not $PSBoundParameters.ContainsKey('ConfigureAccountObservability') -and
+        $env:GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY -ceq 'true') {
+        $ConfigureAccountObservability = $true
+    }
+
+    # Likewise honor the shell-equivalent fail-closed stop switch. Only the exact
+    # value 'true' (case-sensitive) enables it, matching the shell path, which
+    # treats 'TRUE', '1', and '' as off. The mapping lives in a shared helper so
+    # it is testable in isolation.
+    if (-not $PSBoundParameters.ContainsKey('StopOnAccountObservabilityChange') -and
+        (Resolve-GameAgentStopSwitch -Value $env:GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE)) {
+        $StopOnAccountObservabilityChange = $true
+    }
+
+    # Resolve the delivery retry knobs from the environment with the same bounds
+    # the shell path enforces (attempts 1-20, delay 0-60). An out-of-range value
+    # is clamped to the cap, matching the shell; a non-numeric or missing value
+    # falls back to the function default.
+    $deliveryRetryArgs = @{}
+    $parsedAttempts = 0
+    if ([int]::TryParse($env:GBAW_DELIVERY_MAX_ATTEMPTS, [ref]$parsedAttempts) -and $parsedAttempts -ge 1) {
+        if ($parsedAttempts -gt 20) { $parsedAttempts = 20 }
+        $deliveryRetryArgs['MaxAttempts'] = $parsedAttempts
+    }
+    $parsedDelay = 0
+    if ([int]::TryParse($env:GBAW_DELIVERY_RETRY_SECONDS, [ref]$parsedDelay) -and $parsedDelay -ge 0) {
+        if ($parsedDelay -gt 60) { $parsedDelay = 60 }
+        $deliveryRetryArgs['RetrySeconds'] = $parsedDelay
+    }
+
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
     $infraPath = Join-Path $repoRoot 'infrastructure/cloudformation'
     $backendPath = Join-Path $repoRoot 'backend'
@@ -119,6 +175,48 @@ function Deploy-GameAgent {
         return
     }
 
+    # ── Preflight: local dependency setup + runtime path guard (#517) ──
+    # Install backend dependencies locally and verify the venv interpreter path
+    # is bootable BEFORE any AWS-mutating command. agentcore launch (Step 2)
+    # does not ship this venv's console scripts: the AgentCore starter toolkit
+    # rebuilds a dependency bundle with its own `uv pip install --target` inside
+    # the uv-selected project environment and zips that into dependencies.zip.
+    # uv embeds the environment interpreter's absolute local path into each
+    # console script's launcher line; the embedded basename is the longer of the
+    # names uv may embed (`<env>/bin/python3` or `<env>/bin/python` depending on
+    # the uv version), so the shared guard measures `<env>/bin/python3`. An
+    # over-limit or space-bearing POSIX interpreter path makes uv emit a /bin/sh
+    # trampoline that dies at exec in the container — silently, since deploy
+    # still exits 0 and the control plane reaches READY. Running the guard here,
+    # after local `uv sync` and before Step 1 (the first stack deploy), fails a
+    # doomed deploy fast with zero AWS side effects. The shared guard does not
+    # check native Windows hosts (tracked as a follow-up issue), so on a Windows
+    # host it is a no-op.
+    Write-GameAgentStatus 'Preflight: Installing backend dependencies...' -Type Info
+    Push-Location $backendPath
+    try {
+        $uvSyncOutput = uv sync 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # uv prints blank lines between its diagnostic sections; render the
+            # captured output as one block so Write-GameAgentStatus's mandatory
+            # Message parameter is not bound to an empty string.
+            $uvSyncText = ($uvSyncOutput | Out-String).TrimEnd()
+            if ($uvSyncText) { Write-GameAgentStatus $uvSyncText -Type Error }
+            throw "uv sync failed (exit code $LASTEXITCODE)"
+        }
+    } finally { Pop-Location }
+    Write-GameAgentStatus 'Preflight: Verifying the runtime interpreter path is bootable...' -Type Info
+    $runtimePathResult = Test-GameAgentRuntimePath -BackendPath $backendPath -RepoRoot $repoRoot
+    if ($runtimePathResult.Skipped) {
+        # The guard skipped the check on a native Windows host (out of scope;
+        # see #610). Report the skip rather than claiming a portability result
+        # nobody measured.
+        Write-GameAgentStatus 'Runtime interpreter path not checked on native Windows (see #610)' -Type Info
+    } else {
+        Write-GameAgentStatus 'Runtime interpreter path is portable' -Type Success
+    }
+    Write-Host ''
+
     # ── Step 0: Download KB documentation ──
     Write-GameAgentStatus 'Step 0: Downloading KB documentation...' -Type Info
     Invoke-GameAgentKBDocDownload -Region $Region -ProfileArgs $profileArgs
@@ -192,18 +290,39 @@ function Deploy-GameAgent {
     Write-GameAgentStatus 'Managed Prompts deployed' -Type Success
     Write-Host ''
 
-    # ── Step 1.7: Account-wide observability ──
-    Write-GameAgentStatus 'Step 1.7: Setting up account-wide observability...' -Type Info
-    Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs
+    # ── Step 1.7: Account-wide observability (scoped, opt-in) ──
+    Write-GameAgentStatus 'Step 1.7: Account-wide observability...' -Type Info
+    Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ConfigureAccountObservability:$ConfigureAccountObservability -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
     Write-Host ''
+
+    # When the fail-closed stop switch is set, run the preflight ONCE up front so
+    # a predicted (or unknown) account-wide change halts the deploy before the
+    # AgentCore, Knowledge Base, and observability steps — not partway through.
+    # The per-launch guards below still run; they re-check immediately before
+    # each launch and can still halt if a later read fails. Mirrors the early
+    # stop-switch preflight in scripts/deploy.sh.
+    if ($StopOnAccountObservabilityChange) {
+        Write-GameAgentStatus 'Stop switch set: running the toolkit Transaction Search preflight before Step 2...' -Type Info
+        Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
+        Write-Host ''
+    }
 
     # ── Step 2: AgentCore Runtime ──
     Write-GameAgentStatus 'Step 2: Launching AgentCore Runtime...' -Type Info
     Push-Location $backendPath
     try {
         Write-GameAgentStatus 'Installing backend dependencies...' -Type Info
-        uv sync 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "uv sync failed (exit code $LASTEXITCODE)" }
+        # This re-sync is idempotent and keeps Step 2 self-contained; the
+        # runtime path guard runs in the earlier preflight block.
+        $uvSyncOutput = uv sync 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            # uv prints blank lines between its diagnostic sections; render the
+            # captured output as one block so Write-GameAgentStatus's mandatory
+            # Message parameter is not bound to an empty string.
+            $uvSyncText = ($uvSyncOutput | Out-String).TrimEnd()
+            if ($uvSyncText) { Write-GameAgentStatus $uvSyncText -Type Error }
+            throw "uv sync failed (exit code $LASTEXITCODE)"
+        }
 
         # Resolve both model roles through the canonical Python configuration.
         $settingsLoader = Join-Path $repoRoot 'config/load_deployment_settings.py'
@@ -290,6 +409,10 @@ function Deploy-GameAgent {
         # Launch or skip
         if (-not $existingRuntime) {
             Write-GameAgentStatus 'Launching new AgentCore Runtime (CodeBuild)...' -Type Info
+            # Preflight: predict (read-only) which account-wide X-Ray / CloudWatch
+            # Logs settings the AgentCore starter toolkit would change during this
+            # launch, and honor the fail-closed stop switch before launching.
+            Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
             uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
             if ($LASTEXITCODE -ne 0) { throw "agentcore launch failed (exit code $LASTEXITCODE)" }
             Start-Sleep -Seconds 10
@@ -304,28 +427,13 @@ function Deploy-GameAgent {
 
         # ── Step 2b: CloudWatch delivery for runtime traces ──
         Write-GameAgentStatus 'Step 2b: Ensuring CloudWatch delivery for runtime traces...' -Type Info
-        $deliverySourceName = "$runtimeId-traces-source"
-        $deliveryDestName = "$runtimeId-traces-destination"
-
-        try { Invoke-Aws logs put-delivery-source --name $deliverySourceName --log-type TRACES --resource-arn $runtimeArn --region $Region | Out-Null }
-        catch { <# already exists #> }
-        Write-Host '  Delivery source OK'
-
-        $deliveryDestArn = ''
-        try {
-            $destResult = (Invoke-Aws logs put-delivery-destination --name $deliveryDestName --delivery-destination-type XRAY --region $Region) | ConvertFrom-Json
-            $deliveryDestArn = $destResult.deliveryDestination.arn
-        } catch {
-            $accountId = $identity.Account
-            $deliveryDestArn = "arn:aws:logs:${Region}:${accountId}:delivery-destination:${deliveryDestName}"
-        }
-        Write-Host '  Delivery destination OK'
-
-        if ($deliveryDestArn) {
-            try { Invoke-Aws logs create-delivery --delivery-source-name $deliverySourceName --delivery-destination-arn $deliveryDestArn --region $Region | Out-Null }
-            catch { <# already exists #> }
-            Write-Host '  Delivery OK'
-        }
+        $deliveryInvoker = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS delivery command'
+        Invoke-GameAgentTraceDeliveryGated `
+            -RuntimeId $runtimeId `
+            -RuntimeArn $runtimeArn `
+            -Region $Region `
+            -InvokeAws $deliveryInvoker `
+            @deliveryRetryArgs
         Write-GameAgentStatus 'Runtime traces delivery configured' -Type Success
         Write-Host ''
     } finally { Pop-Location }
@@ -386,9 +494,36 @@ function Deploy-GameAgent {
             '-env', "GBAW_COGNITO_ISSUER=$cognitoIssuer",
             '-env', "GBAW_COGNITO_CLIENT_ID=$cognitoClientId"
         )
+        # Preflight again: --auto-update-on-conflict updates the existing runtime,
+        # and the toolkit re-runs its account-wide Transaction Search step on
+        # every launch.
+        Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
+
+        # ── Step 5c: Post-launch Transaction Search recheck (read-only) ──
+        # agentcore launch performs its own Transaction Search enable on every
+        # launch (Step 2 only on a first deploy, and Step 5b). A first-time API
+        # enable does not complete it ('aws/spans' is created only by the console
+        # or a destination toggle). Running this after the run's final launch
+        # reports whether spans can flow. The recheck runs in a child scope with
+        # a local 'Continue' preference so a redirected native stderr cannot
+        # become a terminating error on PowerShell 7.0/7.1, and the whole call is
+        # wrapped in try/catch so any terminating error (for example a throw or a
+        # parameter-binding error) is downgraded to a non-blocking warning rather
+        # than propagating through the finally and failing the deploy — matching
+        # the shell call site's '|| true'. The surrounding 'Stop' preference is
+        # unaffected for the frontend steps that follow.
+        Write-GameAgentStatus 'Step 5c: Rechecking Transaction Search state...' -Type Info
+        try {
+            & {
+                $ErrorActionPreference = 'Continue'
+                Invoke-GameAgentAccountObservability -Region $Region -ProfileArgs $profileArgs -ReportOnly
+            }
+        } catch {
+            Write-GameAgentStatus "Post-launch Transaction Search recheck could not complete: $_" -Type Warning
+        }
     } finally { Pop-Location }
     Write-Host ''
 
@@ -459,14 +594,7 @@ function Deploy-GameAgent {
         # bounded WAF propagation delays, and verify its required rules.
         Write-GameAgentStatus 'Step 8c: Reconciling WAF association...' -Type Info
         $wafAclArn = Get-StackOutput "$ProjectName-security" 'WebACLArn'
-        $profileArgsForWaf = @($profileArgs)
-        $invokeAwsForWaf = {
-            param([string[]]$AwsArgs)
-            $allArgs = $AwsArgs + $profileArgsForWaf
-            $result = & aws @allArgs 2>&1
-            if ($LASTEXITCODE -ne 0) { throw "AWS WAF command failed: $result" }
-            return $result
-        }.GetNewClosure()
+        $invokeAwsForWaf = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS WAF command'
         Invoke-GameAgentWafReconciliation `
             -ExpectedWebAclArn $wafAclArn `
             -ResourceArn $frontendAlbArn `

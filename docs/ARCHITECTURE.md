@@ -326,8 +326,8 @@ ignores the bypass whenever hosted mode is on.
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
-- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 4.5)
-- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 4.6)
+- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 5.5)
 - `GBAW_BEDROCK_MODEL_ID` / `GBAW_BEDROCK_MODEL_ID_SECONDARY` - Legacy compatibility aliases
 - `GBAW_TENANT_ID` - Server-side tenant binding (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID` - Server-side workspace binding (default: `default-workspace`)
@@ -368,6 +368,17 @@ same data without silently mixing Cost Explorer query times.
 The cost specialist rejects the Billing MCP server's historical
 `getCostAndUsage` operations so they cannot bypass this path; forecast and
 optimization operations remain available.
+Forecast detection is pattern-based. A question the orchestrator recognizes as
+a forecast gets the fixed, non-numeric cost guidance, because forecast figures
+are not validated; that guidance says the assistant does not show numeric cost
+forecasts (#625 tracks an owned forecast rendering). A historical report
+captured during that turn is kept only
+when its period equals a period the question names.
+`agents/cost_request_periods.py` recognizes only phrases that normally name a
+past period rather than the forecast target, such as "last month", "last
+quarter", "month to date", a month with its year once that month has ended
+("July 2026"), and ISO dates before today; every other captured report is
+dropped.
 
 Snapshot correctness and billing finality are separate. A validated report is
 internally consistent with Cost Explorer at its `queriedAt` timestamp, while an

@@ -33,6 +33,9 @@ Describe 'GameAgent Module' {
     It 'Does not export private functions' {
         $privateFunctions = @(
             'Resolve-GameAgentProfile'
+            'Resolve-GameAgentStopSwitch'
+            'Assert-GameAgentTransactionSearchPreflight'
+            'Get-GameAgentTraceDestination'
             'Test-GameAgentPort'
             'Write-GameAgentStatus'
             'Invoke-GameAgentAppObservability'
@@ -44,6 +47,9 @@ Describe 'GameAgent Module' {
             'Invoke-GameAgentPromptDeploy'
             'Invoke-GameAgentPromptTeardown'
             'Invoke-GameAgentWafReconciliation'
+            'Invoke-GameAgentTraceDelivery'
+            'Invoke-GameAgentTransactionSearchPreflight'
+            'New-GameAgentAwsInvoker'
             'New-GameAgentAgentCoreEnvArgs'
         )
         $exported = (Get-Module -Name GameAgent).ExportedCommands.Keys
