@@ -245,6 +245,33 @@ GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY="${GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY:-fa
 echo "✅ Account-wide observability step complete"
 echo ""
 
+# Read-only preflight for the AgentCore starter toolkit's account-wide
+# Transaction Search step, run before each `agentcore launch`. The script is run
+# as a SUBPROCESS (not sourced) so its own `set -euo pipefail` cannot leak into
+# this deploy's shell options; deploy.sh keeps its own options and variables.
+# Returns non-zero when the fail-closed stop switch is set and the toolkit would
+# (or might) change account-wide settings, or when python3 is not on PATH (the
+# preflight parses AWS CLI JSON with python3). deploy.sh checks python3 as a
+# prerequisite above, so a full deploy reaches this only for the stop-switch case.
+run_toolkit_preflight() {
+  AWS_REGION="$AWS_REGION" \
+    GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE="${GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE:-false}" \
+    GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME="${GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME:-}" \
+    bash "$SCRIPT_DIR/infrastructure/setup-account-observability.sh" --toolkit-preflight
+}
+
+# When the operator has set the fail-closed stop switch, run the preflight ONCE
+# up front so a predicted (or unknown) account-wide change halts the deploy
+# before the Knowledge Base and observability steps — not partway through. The
+# per-launch preflights below still run; they re-check immediately before each
+# launch and can still halt if a later read fails or the account state changes.
+if [ "${GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE:-false}" = "true" ]; then
+  echo "🔎 Stop switch set: running the toolkit Transaction Search preflight before Step 2..."
+  if ! run_toolkit_preflight; then
+    exit 1
+  fi
+fi
+
 # Step 2: Launch AgentCore Runtime (direct code deployment via CodeBuild)
 echo "🤖 Step 2: Launching AgentCore Runtime..."
 cd "$PROJECT_ROOT/backend"
@@ -1032,6 +1059,12 @@ if [ -n "$EXISTING_RUNTIME" ] && [ "$EXISTING_RUNTIME" != "null" ]; then
   RUNTIME_ARN="$EXISTING_RUNTIME"
 else
   echo "🚀 Launching new AgentCore Runtime (CodeBuild)..."
+  # Preflight: predict (read-only) which account-wide X-Ray / CloudWatch Logs
+  # settings the AgentCore starter toolkit would change during this launch, and
+  # honor the fail-closed stop switch before any launch is attempted.
+  if ! run_toolkit_preflight; then
+    exit 1
+  fi
   uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 
   # Wait for runtime to be ready
@@ -1109,6 +1142,11 @@ if [ -n "$COST_KB_ID" ]; then echo "   Cost KB:     $COST_KB_ID"; fi
 # available and avoids dropping prompt or Guardrail settings on replacement.
 build_agentcore_env_args
 echo "🚀 Updating AgentCore Runtime environment..."
+# Preflight again: --auto-update-on-conflict updates the existing runtime, and
+# the toolkit re-runs its account-wide Transaction Search step on every launch.
+if ! run_toolkit_preflight; then
+  exit 1
+fi
 uv run agentcore launch --auto-update-on-conflict "${AGENTCORE_ENV_ARGS[@]}"
 echo "✅ AgentCore Runtime updated with role models and available service configuration"
 
