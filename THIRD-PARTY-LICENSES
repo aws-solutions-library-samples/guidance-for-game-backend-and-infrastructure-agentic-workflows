@@ -113,5 +113,9 @@ Vendored Source (demo/agones-gamelift-migration only)
 
 aws/amazon-gamelift-toolkit SdkGoWrapper     Apache-2.0
   Files: demo/agones-gamelift-migration/gamelift/server/wrapper-src/
-         (server.go, go.mod, go.sum; LICENSE and NOTICE alongside)
+         (server.go, go.mod, go.sum; LICENSE and NOTICE alongside;
+         go.mod and go.sum modified, see its README.md)
+         demo/agones-gamelift-migration/gamelift/server/wrapper.sh
+         (adapted from the starter kit's wrapper.sh)
   Source: https://github.com/aws/amazon-gamelift-toolkit/tree/main/containers-starter-kit/SdkGoWrapper
+          https://github.com/aws/amazon-gamelift-toolkit/blob/main/containers-starter-kit/wrapper.sh
