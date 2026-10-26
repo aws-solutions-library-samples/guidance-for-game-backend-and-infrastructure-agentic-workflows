@@ -20,9 +20,18 @@ MINIMUM_PATCHED = {
     "aiohttp": ((3, 14, 4), "GHSA-2g87-pp6c-29x5, GHSA-5wr8-gcqf-gqf3", True),
     "certifi": ((2026, 10, 19), "GHSA-6q48-6c7w-9gw2", True),
     "uv": ((0, 13, 4), "GHSA-hq85-5cpj-mr62", False),
-    "virtualenv": ((21, 14, 7), "GHSA-vxj4-q4g9-crj7", False),
-    "pypdf": ((6, 20, 1), "GHSA-39mj-jf6j-2qj3, GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, GHSA-qfv9-64jg-mh7p", True),
+    "virtualenv": ((21, 14, 13), "GHSA-vxj4-q4g9-crj7, GHSA-c978-59m8-c77v, GHSA-cx6f-vjhg-g3cc", False),
+    "pypdf": (
+        (6, 21, 2),
+        "GHSA-39mj-jf6j-2qj3, GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, GHSA-qfv9-64jg-mh7p, "
+        "GHSA-6c7f-9265-g8fw, GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4",
+        True,
+    ),
     "black": ((26, 10, 1), "GHSA-cg8m-r9f2-5wm2", False),
+    "filelock": ((4, 2, 1), "GHSA-v4x8-3wr5-3wq8", False),
+    "fastmcp": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
+    "fastmcp-slim": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
+    "setuptools": ((84, 1, 0), "GHSA-xmj3-9gf7-h52w", True),
 }
 
 
