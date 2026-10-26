@@ -592,7 +592,7 @@ pyjwt==2.15.1
     # via
     #   game-agent-backend
     #   mcp
-pypdf==6.21.1
+pypdf==6.21.2
     # via game-agent-backend
 pyperclip==1.11.0
     # via fastmcp-slim
@@ -670,7 +670,7 @@ s3transfer==0.19.2
     # via boto3
 secretstorage==3.5.0 ; sys_platform == 'linux'
     # via keyring
-setuptools==84.0.0
+setuptools==84.1.0
     # via awslabs-aws-api-mcp-server
 shellingham==1.5.4
     # via typer
