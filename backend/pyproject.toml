@@ -6,14 +6,14 @@ requires-python = ">=3.13.9,<3.14"
 dependencies = [
     # Strands packages with OTEL support
     "strands-agents[otel]>=1.50.2",
-    "strands-agents-tools>=0.8.5",
 
     # MCP client. Previously pinned <1.19.0 due to an eks-mcp-server
     # incompatibility (awslabs/mcp#1577: mcp 1.19 added stricter type
     # validation that broke eks-mcp-server's Union[CallToolResult] pattern).
     # Fixed upstream: eks-mcp-server>=0.1.32 now requires mcp[cli]>=1.23.0,
-    # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
-    "mcp>=1.28.1",
+    # which also resolves GHSA-9h52-p55h-vw2f. The current floor additionally
+    # requires the patched release for GHSA-84m7-p3x7-pcfv.
+    "mcp>=1.30.0",
 
     # AWS SDK. Floors at 1.43.32 (not .33) so the resolver can satisfy the
     # awscli==1.45.32 bundled by awslabs.aws-api-mcp-server, which pins
@@ -70,13 +70,12 @@ dependencies = [
     "requests>=2.34.2",
     "beautifulsoup4>=4.15.0",
     "html2text>=2024.2.26",
-    "pypdf>=6.19.0",
+    "pypdf>=6.21.2",
 ]
 
 [dependency-groups]
 dev = [
     # CLI/interactive tools (not needed in production)
-    "strands-agents-builder>=0.1.10",
     "bedrock-agentcore-starter-toolkit>=0.3.11",
     "uv>=0.13.4",
 
@@ -88,7 +87,7 @@ dev = [
 
     # Code quality tools
     "pre-commit>=4.6.1",
-    "black>=26.5.1",
+    "black>=26.10.1",
     "isort>=8.0.1",
     "mypy>=2.3.0",
 ]
