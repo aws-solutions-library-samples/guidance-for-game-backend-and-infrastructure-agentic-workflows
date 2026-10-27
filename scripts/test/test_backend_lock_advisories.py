@@ -32,6 +32,7 @@ MINIMUM_PATCHED = {
     "filelock": ((4, 2, 1), "GHSA-v4x8-3wr5-3wq8", False),
     "fastmcp": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
     "fastmcp-slim": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
+    "mcp": ((1, 30, 0), "GHSA-84m7-p3x7-pcfv", True),
     "setuptools": ((84, 1, 0), "GHSA-xmj3-9gf7-h52w", True),
 }
 
