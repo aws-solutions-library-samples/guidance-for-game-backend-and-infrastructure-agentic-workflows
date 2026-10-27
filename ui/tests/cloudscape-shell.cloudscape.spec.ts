@@ -30,6 +30,31 @@ async function setTheme(page: import('@playwright/test').Page, mode: 'light' | '
   }, mode);
 }
 
+/**
+ * Whether an error comes from a page read that raced a full document load. The
+ * shell-boundary reload replaces the document, which destroys the execution
+ * context that a pending `page.evaluate` was running in.
+ */
+function isDocumentReplacedError(error: unknown): boolean {
+  return error instanceof Error && /Execution context was destroyed/.test(error.message);
+}
+
+/**
+ * Read the document's `data-ga-shell` attribute, or `null` while the document is
+ * being replaced, so a poll keeps waiting through a full document load instead
+ * of failing on the destroyed context.
+ */
+async function documentShellAttribute(page: import('@playwright/test').Page): Promise<string | null> {
+  try {
+    return await page.evaluate(() => document.documentElement.getAttribute('data-ga-shell'));
+  } catch (error) {
+    if (isDocumentReplacedError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 /** Parse an `rgb()/rgba()` or `#rrggbb` color into a perceived luminance (0 dark … 255 light). */
 function luminanceOf(color: string): number {
   const trimmed = color.trim();
@@ -144,24 +169,29 @@ test.describe('Cloudscape shell', { tag: ['@e2e', '@cloudscape', '@a11y'] }, () 
 
     // Use the actual Pages Router; a full-navigation fallback would conceal a
     // broken boundary hook and make the document-request assertion meaningless.
-    await page.evaluate(async () => {
-      const next = (window as Window & { next?: { router?: Pick<NextRouter, 'push'> } }).next;
-      if (!next?.router) {
-        throw new Error('The hydrated Pages Router is required for the shell-boundary test');
-      }
-      await next.router.push('/');
-    });
+    // The push is expected to trigger the boundary reload, which can destroy
+    // this evaluation's context before it returns; any other error fails.
+    await page
+      .evaluate(async () => {
+        const next = (window as Window & { next?: { router?: Pick<NextRouter, 'push'> } }).next;
+        if (!next?.router) {
+          throw new Error('The hydrated Pages Router is required for the shell-boundary test');
+        }
+        await next.router.push('/');
+      })
+      .catch((error: unknown) => {
+        if (!isDocumentReplacedError(error)) {
+          throw error;
+        }
+      });
 
     // Wait until the Cloudscape document is in place. The shell attribute only
     // flips to `cloudscape` after the full reload loads the Cloudscape
     // document, so polling it (rather than the shared "Game Agent" heading,
     // which the current shell's own navigation also renders) guarantees the
-    // reload has completed before the count is read.
-    await expect
-      .poll(() => page.evaluate(() => document.documentElement.getAttribute('data-ga-shell')), {
-        timeout: 15000,
-      })
-      .toBe('cloudscape');
+    // reload has completed before the count is read. A read that races the
+    // reload returns `null` and the poll retries.
+    await expect.poll(() => documentShellAttribute(page), { timeout: 15000 }).toBe('cloudscape');
     page.off('request', countDocuments);
     expect(documentRequests).toBe(1);
     // The current shell's CopilotKit markup must not be present in the
@@ -172,9 +202,7 @@ test.describe('Cloudscape shell', { tag: ['@e2e', '@cloudscape', '@a11y'] }, () 
     // shell with no Cloudscape markup left attached.
     await page.goBack();
     await page.waitForLoadState('load');
-    await expect
-      .poll(() => page.evaluate(() => document.documentElement.getAttribute('data-ga-shell')))
-      .toBe('current');
+    await expect.poll(() => documentShellAttribute(page)).toBe('current');
     await expect.poll(() => page.locator('[class*="awsui_"]').count()).toBe(0);
   });
 });
