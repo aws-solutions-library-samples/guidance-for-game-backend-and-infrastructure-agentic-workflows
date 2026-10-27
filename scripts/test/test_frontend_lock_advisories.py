@@ -16,8 +16,9 @@ PROJECT_ROOT = Path(__file__).parents[2]
 PACKAGE_JSON = PROJECT_ROOT / "ui" / "package.json"
 PACKAGE_LOCK = PROJECT_ROOT / "ui" / "package-lock.json"
 
-# package -> first patched version (GHSA-238p-pmpm-9mq7 fixes katex in 0.18.2).
-MINIMUM_PATCHED = {"katex": (0, 18, 2)}
+# package -> first patched version. GHSA-238p-pmpm-9mq7 fixes katex in 0.18.2, and
+# GHSA-mrhx-c7xc-m3w5 fixes zod in 4.6.6; CopilotKit still declares zod 3.
+MINIMUM_PATCHED = {"katex": (0, 18, 2), "zod": (4, 6, 6)}
 
 # Direct dependency -> (first patched version, advisories). The declared range in
 # ui/package.json must not admit an affected release.
