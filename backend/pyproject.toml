@@ -11,7 +11,8 @@ dependencies = [
     # incompatibility (awslabs/mcp#1577: mcp 1.19 added stricter type
     # validation that broke eks-mcp-server's Union[CallToolResult] pattern).
     # Fixed upstream: eks-mcp-server>=0.1.32 now requires mcp[cli]>=1.23.0,
-    # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
+    # which also resolves GHSA-9h52-p55h-vw2f. The current floor additionally
+    # requires the patched release for GHSA-84m7-p3x7-pcfv.
     "mcp>=1.30.0",
 
     # AWS SDK. The floor tracks the locked boto3/botocore versions so a fresh
