@@ -11,8 +11,9 @@ dependencies = [
     # incompatibility (awslabs/mcp#1577: mcp 1.19 added stricter type
     # validation that broke eks-mcp-server's Union[CallToolResult] pattern).
     # Fixed upstream: eks-mcp-server>=0.1.32 now requires mcp[cli]>=1.23.0,
-    # which also resolves GHSA-9h52-p55h-vw2f. Floor raised accordingly.
-    "mcp>=1.28.1",
+    # which also resolves GHSA-9h52-p55h-vw2f. The current floor additionally
+    # requires the patched release for GHSA-84m7-p3x7-pcfv.
+    "mcp>=1.30.0",
 
     # AWS SDK. Floors at 1.43.32 (not .33) so the resolver can satisfy the
     # awscli==1.45.32 bundled by awslabs.aws-api-mcp-server, which pins
