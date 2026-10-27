@@ -33,6 +33,13 @@ MINIMUM_PATCHED = {
     "fastmcp": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
     "fastmcp-slim": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
     "setuptools": ((84, 1, 0), "GHSA-xmj3-9gf7-h52w", True),
+    "authlib": (
+        (1, 9, 1),
+        "GHSA-6v38-4h7w-rj9h, GHSA-7vr2-2fgp-9w7p, GHSA-8m4g-j4wp-wgcg, GHSA-x4rv-c3wx-4cr8, "
+        "GHSA-c5mf-xmp2-59rc, GHSA-fch4-3c6x-j4gc, GHSA-q686-2qmg-hqc7, GHSA-jj7h-c3hg-m23x",
+        True,
+    ),
+    "dnspython": ((2, 9, 0), "GHSA-45c3-73f7-pv4m", True),
 }
 
 
