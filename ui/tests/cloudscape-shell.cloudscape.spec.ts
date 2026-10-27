@@ -20,6 +20,7 @@
 
 import AxeBuilder from '@axe-core/playwright';
 import { test, expect } from '@playwright/test';
+import type { NextRouter } from 'next/router';
 import { cloudscapeContentBackground, cloudscapeShell, gaTokenOnBody } from './helpers/shells';
 
 async function setTheme(page: import('@playwright/test').Page, mode: 'light' | 'dark' | 'system') {
@@ -116,15 +117,18 @@ test.describe('Cloudscape shell', { tag: ['@e2e', '@cloudscape', '@a11y'] }, () 
     await cloudscapeShell.goto(page);
     await cloudscapeShell.expectShellAttribute(page);
 
-    // Navigate to a current-shell page and wait for its chrome (the logo link)
-    // to actually render, so the client-side click below exercises the real
-    // in-app navigation rather than a full document load fallback.
-    await page.goto('/admin/users');
-    const logoLink = page.locator('a[href="/"]').first();
-    await expect(logoLink).toBeVisible();
+    // The current shell has no secondary product page after the admin UI was
+    // removed. Use Next's real 404 page, then its hydrated client router, to
+    // cross the boundary without introducing a route just for this test.
+    await page.goto('/cloudscape-boundary-missing-page');
+    await expect(page.getByRole('heading', { name: '404', exact: true })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.getAttribute('data-ga-shell'))).toBe('current');
+    await page.waitForFunction(() => {
+      const next = (window as Window & { next?: { router?: Pick<NextRouter, 'isReady'> } }).next;
+      return next?.router?.isReady === true;
+    });
 
-    // Count document-level requests triggered by the logo click. The click is a
+    // Count document-level requests triggered by the router push. The push is a
     // client-side navigation to `/`; the shell-boundary reload must turn it into
     // exactly one full document load so the Cloudscape document is served (never
     // the Cloudscape page inside the current-shell document). Removing the hook
@@ -138,8 +142,15 @@ test.describe('Cloudscape shell', { tag: ['@e2e', '@cloudscape', '@a11y'] }, () 
     };
     page.on('request', countDocuments);
 
-    // Click the real logo link with an auto-waiting locator (no manual fallback).
-    await logoLink.click();
+    // Use the actual Pages Router; a full-navigation fallback would conceal a
+    // broken boundary hook and make the document-request assertion meaningless.
+    await page.evaluate(async () => {
+      const next = (window as Window & { next?: { router?: Pick<NextRouter, 'push'> } }).next;
+      if (!next?.router) {
+        throw new Error('The hydrated Pages Router is required for the shell-boundary test');
+      }
+      await next.router.push('/');
+    });
 
     // Wait until the Cloudscape document is in place. The shell attribute only
     // flips to `cloudscape` after the full reload loads the Cloudscape
@@ -157,7 +168,7 @@ test.describe('Cloudscape shell', { tag: ['@e2e', '@cloudscape', '@a11y'] }, () 
     // Cloudscape document.
     await expect(page.locator('.copilotKitMessages')).toHaveCount(0);
 
-    // Browser Back returns to `/admin/users`; it must render as the current
+    // Browser Back returns to the missing page; it must render as the current
     // shell with no Cloudscape markup left attached.
     await page.goBack();
     await page.waitForLoadState('load');
