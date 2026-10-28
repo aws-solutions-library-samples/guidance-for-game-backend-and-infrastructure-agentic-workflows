@@ -4,8 +4,9 @@
  * The application ships two UI shells behind one set of URLs. The current shell
  * is the default and is served at `/` unless the server-only `GBAW_UI_SHELL`
  * value selects the Cloudscape shell. The Cloudscape shell lives on its own
- * internal page; it is directly addressable but authentication-gated and
- * presentation-only, and it is served at `/` only when selected; see `proxy.ts`.
+ * internal page; a direct request to it returns the app's 404 page unless the
+ * Cloudscape shell is selected, it does no gating of its own, and it is
+ * presentation-only. It is served at `/` only when selected; see `proxy.ts`.
  */
 
 export type Shell = 'current' | 'cloudscape';

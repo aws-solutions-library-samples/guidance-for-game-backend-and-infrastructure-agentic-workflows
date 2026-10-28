@@ -2,9 +2,10 @@
  * Internal entry page for the Cloudscape shell.
  *
  * The server proxy rewrites `/` to this route when `GBAW_UI_SHELL=cloudscape`;
- * no deployment default selects it and nothing links to it. The route is
- * directly addressable, but it is authentication-gated and presentation-only:
- * it reuses the same session and sign-in flow as the current shell and adds no
+ * no deployment default selects it and nothing links to it. A direct request
+ * returns the app's 404 page unless the Cloudscape shell is selected; the route
+ * does no gating of its own and is presentation-only: it reuses the same session
+ * and sign-in flow as the current shell and adds no
  * API route or data of its own. The heavy Cloudscape layout and
  * `@cloudscape-design/global-styles` load only through this entry (via
  * `next/dynamic`), so no Cloudscape code enters `_app` or any current-UI page.

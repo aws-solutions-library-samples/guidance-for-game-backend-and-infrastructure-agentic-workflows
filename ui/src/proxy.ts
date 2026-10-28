@@ -11,7 +11,8 @@
  *
  * This proxy rewrites `/` and guards the internal Cloudscape route. The matcher
  * covers only `/` and `/shell-cloudscape`, so API routes, static assets, and all
- * other pages are untouched. It never sets, removes, or weakens a response
+ * other pages are untouched, and the proxy itself passes any other path through
+ * unchanged. It never sets, removes, or weakens a response
  * header or the Content Security Policy, and it adds no authentication: the
  * rewritten page runs through exactly the same session and sign-in flow as the
  * current shell. When the Cloudscape shell is not selected, a direct request to
@@ -47,6 +48,13 @@ export function proxy(request: NextRequest) {
     const notFoundUrl = request.nextUrl.clone();
     notFoundUrl.pathname = NOT_FOUND_PAGE;
     return NextResponse.rewrite(notFoundUrl, { status: 404 });
+  }
+
+  // Only `/` is ever rewritten. The matcher already keeps the proxy off every
+  // other path; this check keeps a widened matcher from rewriting an API route
+  // such as `/api/copilot/chat` or `/api/auth/*`.
+  if (request.nextUrl.pathname !== '/') {
+    return NextResponse.next();
   }
 
   if (shell === 'cloudscape') {
