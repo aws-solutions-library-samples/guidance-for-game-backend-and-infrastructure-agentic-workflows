@@ -180,6 +180,77 @@ class TestToolCycle:
         assert _MEMORY_TEXT not in guarded
 
 
+_IMAGE_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+def _image_block(**extra) -> dict:
+    """A user image block, optionally carrying extra keys such as the private marker."""
+    return {"image": {"format": "png", "source": {"bytes": _IMAGE_BYTES}}, **extra}
+
+
+def _guarded_images(content: list) -> list:
+    """Return the guarded image payloads of a formatted message."""
+    return [b["guardContent"]["image"] for b in content if "image" in b.get("guardContent", {})]
+
+
+class TestMarkingEdgeCases:
+    """Only a marked text block in the latest user text message leaves Guardrail scope."""
+
+    def test_marked_block_in_an_earlier_message_is_untouched_and_unmarked(self):
+        # Only the latest user text message is wrapped, so an earlier message is
+        # sent exactly as the base formatter sends it; the private key never
+        # reaches Bedrock from any message.
+        messages = [
+            {"role": "user", "content": [_marked_memory_block(_MEMORY_TEXT), {"text": "first question"}]},
+            {"role": "assistant", "content": [{"text": "first answer"}]},
+            {"role": "user", "content": [{"text": _USER_QUESTION}]},
+        ]
+
+        request = _guard_model().format_request(messages)
+        earlier, latest = request["messages"][0]["content"], request["messages"][-1]["content"]
+
+        assert [_collect_text(b) for b in earlier] == [_MEMORY_TEXT, "first question"]
+        assert all("guardContent" not in b for b in earlier)
+        assert [_guard_text(b) for b in latest] == [_USER_QUESTION]
+        for message in request["messages"]:
+            assert all(MEMORY_CONTEXT_MARKER_KEY not in b for b in message["content"])
+
+    def test_marked_image_block_stays_guarded(self):
+        # Only a marked block with text is sent unwrapped. A marked image is
+        # still wrapped, so it stays an input the Guardrail evaluates.
+        messages = [
+            {
+                "role": "user",
+                "content": [_image_block(**{MEMORY_CONTEXT_MARKER_KEY: True}), {"text": _USER_QUESTION}],
+            }
+        ]
+
+        request = _guard_model().format_request(messages)
+        content = request["messages"][-1]["content"]
+
+        assert len(_guarded_images(content)) == 1
+        assert _USER_QUESTION in [_guard_text(b) for b in content if "guardContent" in b]
+        assert all("image" not in b for b in content), "the image must not be sent outside guardContent"
+        assert all(MEMORY_CONTEXT_MARKER_KEY not in b for b in content)
+
+    def test_image_beside_the_marked_block_stays_guarded(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [_marked_memory_block(_MEMORY_TEXT), _image_block(), {"text": _USER_QUESTION}],
+            }
+        ]
+
+        request = _guard_model().format_request(messages)
+        content = request["messages"][-1]["content"]
+
+        assert len(_guarded_images(content)) == 1
+        assert _USER_QUESTION in [_guard_text(b) for b in content if "guardContent" in b]
+        assert _MEMORY_TEXT in [_collect_text(b) for b in content if "text" in b]
+        assert _MEMORY_TEXT not in [_guard_text(b) for b in content if "guardContent" in b]
+        assert all(MEMORY_CONTEXT_MARKER_KEY not in b for b in content)
+
+
 class TestFormatterSignatureCompatibility:
     """The formatter override tolerates the base signature of every supported version.
 
