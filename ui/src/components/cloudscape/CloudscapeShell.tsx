@@ -41,7 +41,10 @@ export default function CloudscapeShell() {
     // tokens live) so first-party component CSS resolves to Cloudscape colors
     // everywhere, including chrome such as IdleWarningDialog that renders
     // outside this shell's root element. Also bridge the shell root so a nested
-    // element resolves the same values without walking up to <body>.
+    // element resolves the same values without walking up to <body>. The bridge
+    // maps --ga-accent to a text-color token, so in dark mode the idle dialog's
+    // primary button (white text on that color) is below WCAG contrast; #548
+    // replaces that dialog with a Cloudscape one.
     applyGaTokenBridge(document.body);
     applyGaTokenBridge(rootRef.current);
   }, [resolvedTheme]);
