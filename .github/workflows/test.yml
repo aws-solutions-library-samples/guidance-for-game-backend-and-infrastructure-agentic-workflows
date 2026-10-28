@@ -137,6 +137,15 @@ jobs:
       env:
         NEXT_PUBLIC_SKIP_AUTH: 'true'
 
+    # The Cloudscape shell suite (ADR 0007): the shell served through the
+    # server-side selector, light, dark, and system themes, axe checks, and the
+    # cross-shell navigation that must never mix design systems. Its config
+    # serves `next dev` on 127.0.0.1:3100 with its own selector and skip-auth
+    # settings, so it does not share the smoke tests' server.
+    - name: Run Cloudscape shell browser tests
+      working-directory: ./ui
+      run: npx playwright test -c playwright.cloudscape.config.ts
+
     - name: Upload E2E test results
       uses: actions/upload-artifact@v7
       if: always()
