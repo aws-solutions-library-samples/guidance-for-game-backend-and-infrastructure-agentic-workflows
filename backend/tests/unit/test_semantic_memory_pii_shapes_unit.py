@@ -161,14 +161,20 @@ def test_mixed_message_keeps_safe_fact_and_logs_only_a_count():
 
 
 def test_every_anonymize_regex_in_the_guardrail_template_is_mirrored():
-    """The template's ANONYMIZE regexes must appear verbatim in the write-time check."""
+    """The template's ANONYMIZE regexes must appear in the write-time check.
+
+    A template regex may be mirrored by a declared bounded form that matches the
+    same real values without unbounded repetition, so the write-time scan stays
+    linear on long messages.
+    """
     # Local modules
     from utils.semantic_memory import _ANONYMIZED_VALUE_PATTERNS
 
+    bounded_mirrors = {r"\b[a-z0-9-]+\.internal\b": r"\b[a-z0-9-]{1,63}\.internal\b"}
     template = _GUARDRAIL_TEMPLATE.read_text(encoding="utf-8")
     anonymize_regexes = re.findall(r"Pattern:\s*'([^']+)'\s*\n\s*Action:\s*'ANONYMIZE'", template)
     assert anonymize_regexes, "expected ANONYMIZE regexes in the Guardrail template"
 
     mirrored = {pattern.pattern for pattern in _ANONYMIZED_VALUE_PATTERNS}
     for regex in anonymize_regexes:
-        assert regex in mirrored
+        assert bounded_mirrors.get(regex, regex) in mirrored

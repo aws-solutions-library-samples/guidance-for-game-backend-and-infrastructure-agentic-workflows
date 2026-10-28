@@ -499,11 +499,18 @@ _RESOURCE_PATTERNS = [
 # these values is never stored: once stored, it would reach the model unmasked on
 # every later turn. The first two mirror the template's regexes; the rest
 # approximate the EMAIL, IP_ADDRESS and PHONE entities and err toward rejecting.
+#
+# Internal hostname: the template's `\b[a-z0-9-]+\.internal\b` with the label
+# bounded at 63 characters, the DNS label limit. Every pattern here scans the
+# whole message on each turn that stores memory, and the unbounded form restarts
+# at every hyphen and scans to the end of the run, so a long hyphenated prompt
+# would cost seconds of CPU. Every real hostname still matches.
+_INTERNAL_HOSTNAME_PATTERN = re.compile(r"\b[a-z0-9-]{1,63}\.internal\b", re.IGNORECASE)
 _ANONYMIZED_VALUE_PATTERNS = (
     # AWS account ID (template regex)
     re.compile(r"\b\d{12}\b"),
-    # Internal hostname (template regex; matched case-insensitively here)
-    re.compile(r"\b[a-z0-9-]+\.internal\b", re.IGNORECASE),
+    # Internal hostname (template regex, label bounded; matched case-insensitively here)
+    _INTERNAL_HOSTNAME_PATTERN,
     # Email address
     re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}"),
     # IPv4 address, optionally a CIDR block

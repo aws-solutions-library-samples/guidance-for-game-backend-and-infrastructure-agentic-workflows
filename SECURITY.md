@@ -286,7 +286,9 @@ both directions, and none of them runs on retrieved memory. A `BLOCK` entity
 such as `PASSWORD` stops its turn, so extraction is skipped and it is never
 stored. For `ANONYMIZE` values, the write path refuses any candidate fact that
 carries a value shaped like one: it matches the template's AWS account ID
-(`\b\d{12}\b`) and internal hostname (`\b[a-z0-9-]+\.internal\b`) regexes plus
+(`\b\d{12}\b`) regex and its internal hostname regex with the label bounded at
+the DNS limit of 63 characters (`\b[a-z0-9-]{1,63}\.internal\b`, so a long
+hyphenated message cannot make the scan quadratic), plus
 local approximations of the `EMAIL`, `IP_ADDRESS` (IPv4 addresses, CIDR
 blocks, and IPv6 addresses) and `PHONE` entities, and rejects the fact if a captured value overlaps
 a match anywhere in the message. Retrieved memory therefore carries none of the
@@ -294,8 +296,12 @@ values those patterns recognize. The refusal logs only a count. The residual is
 what the patterns do not recognize: the `USERNAME` entity is model-detected and
 has no local equivalent, so the name capture (`\w+`, up to two words) can store
 a handle such as `player_one42` as a name, and an email, IP or phone value in a
-format the approximations miss can still be stored. Existing records are not
-rewritten. Such a value reaches the model unmasked on later turns.
+format the approximations miss can still be stored; such a value reaches the
+model unmasked on later turns. Existing records are not rewritten or rechecked:
+a record stored before these write-time checks existed, including one from a
+turn the Guardrail stopped, reaches the model unscanned on every later turn
+until an operator deletes it with `DeleteMemoryRecord` or
+`BatchDeleteMemoryRecords` (the runtime role cannot delete records).
 The output-side Guardrail policies still evaluate every reply, so anything the
 model repeats from retrieved memory gets the same output
 checks as the rest of the reply. Those checks are not a defense against an
