@@ -354,6 +354,15 @@ build_agentcore_env_args() {
     -env "GBAW_HOSTED_RUNTIME=true"
     -env "GBAW_ORCHESTRATOR_MODEL_ID=$GBAW_ORCHESTRATOR_MODEL_ID"
     -env "GBAW_SPECIALIST_MODEL_ID=$GBAW_SPECIALIST_MODEL_ID"
+    # Keep model and tool content out of exported telemetry (spans, span events,
+    # and the OpenTelemetry log records derived from GenAI events). The runtime
+    # also applies these at startup before any tracer is built; passing them here
+    # means the AWS OpenTelemetry distro sees them at process start too. An
+    # explicit "false" wins over the distro's AGENT_OBSERVABILITY_ENABLED
+    # setdefault; the empty unredacted-attributes list turns on Strands redaction
+    # of prompt, response, and system-prompt attributes.
+    -env "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false"
+    -env "OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_unredacted_attributes="
   )
 
   if is_resolved_deployment_value "${GUARDRAIL_ID:-}"; then

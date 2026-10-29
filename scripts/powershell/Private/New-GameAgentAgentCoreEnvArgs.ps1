@@ -23,7 +23,17 @@ function New-GameAgentAgentCoreEnvArgs {
     $result = @(
         '-env', 'GBAW_HOSTED_RUNTIME=true',
         '-env', "GBAW_ORCHESTRATOR_MODEL_ID=$OrchestratorModelId",
-        '-env', "GBAW_SPECIALIST_MODEL_ID=$SpecialistModelId"
+        '-env', "GBAW_SPECIALIST_MODEL_ID=$SpecialistModelId",
+        # Keep model and tool content out of exported telemetry (spans, span
+        # events, and the OpenTelemetry log records derived from GenAI events).
+        # The runtime also applies these at startup before any tracer is built;
+        # passing them here means the AWS OpenTelemetry distro sees them at
+        # process start too. An explicit 'false' wins over the distro's
+        # AGENT_OBSERVABILITY_ENABLED setdefault; the empty unredacted-attributes
+        # list turns on Strands redaction of prompt, response, and system-prompt
+        # attributes.
+        '-env', 'OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false',
+        '-env', 'OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_unredacted_attributes='
     )
     $hasGuardrail = $GuardrailId -and $GuardrailId -ne 'None'
     $optionalValues = [ordered]@{
