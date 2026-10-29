@@ -4,7 +4,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 ## Overview
 
-- **Last Updated**: 2026-08-13
+- **Last Updated**: 2026-10-12
 - **Python Version**: >=3.13.9
 - **Node.js Version**: 18+
 
@@ -107,6 +107,21 @@ This document provides a comprehensive overview of major dependencies, their ver
 | @copilotkit/react-ui | ^1.10.6 | AI copilot UI components | MIT | - |
 | @copilotkit/shared | ^1.10.4 | Shared utilities | MIT | - |
 
+### Cloudscape Design System
+
+Added for the parallel-shell migration (ADR 0007). All versions are pinned
+exactly. These packages are imported only from the Cloudscape shell entry
+module, so no Cloudscape code or global CSS reaches the current UI's bundle.
+`npm audit` reports no new findings after adding them.
+
+| Package | Version | Purpose | License | Security Notes |
+|---------|---------|---------|---------|----------------|
+| @cloudscape-design/components | 3.0.1396 | AWS-style UI components for the new shell | Apache-2.0 | Pinned exact; in `transpilePackages` (ESM, per-component entries) |
+| @cloudscape-design/global-styles | 1.0.71 | Global styles and visual-mode (light/dark) support | Apache-2.0 | Pinned exact; imported only from the new-shell entry |
+| @cloudscape-design/chat-components | 1.0.178 | Chat surface components for the new shell | Apache-2.0 | Pinned exact; in `transpilePackages` |
+| @cloudscape-design/design-tokens | 3.0.114 | Design-token values for the theme bridge | Apache-2.0 | Pinned exact; token names read at runtime, not hard-coded |
+| @cloudscape-design/component-toolkit | 1.0.0-beta.189 | Component toolkit (Cloudscape Next.js guidance) | Apache-2.0 | Pinned exact; in `transpilePackages` per Cloudscape guidance |
+
 ### Observability (OpenTelemetry)
 
 | Package | Version | Purpose | License | Security Notes |
@@ -129,6 +144,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 | Package | Version | Purpose | License | Security Notes |
 |---------|---------|---------|---------|----------------|
 | @playwright/test | ^1.56.1 | E2E testing | Apache-2.0 | - |
+| @axe-core/playwright | 4.13.0 | Automated accessibility checks for both shells | MPL-2.0 | Pinned exact; dev-only, drives axe-core (already present transitively) |
 | jest | ^30.1.3 | Unit testing | MIT | - |
 | @testing-library/react | ^16.3.0 | React testing | MIT | - |
 | typescript | 5.9.2 | Type checking | Apache-2.0 | - |
@@ -138,9 +154,10 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 | License Type | Count | Notes |
 |--------------|-------|-------|
-| Apache-2.0 | 35+ | Most AWS SDKs and tools |
+| Apache-2.0 | 40+ | Most AWS SDKs and tools, plus the Cloudscape Design System |
 | MIT | 25+ | Common open source |
 | BSD-3-Clause | 5+ | Utilities |
+| MPL-2.0 | 1 | @axe-core/playwright (test-only accessibility checks) |
 | GPL-3.0 | 1 | html2text (documentation only) |
 
 ## Security Recommendations
@@ -161,6 +178,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 | Date | Changes |
 |------|---------|
+| 2026-10-12 | Added the Cloudscape Design System packages and @axe-core/playwright for the dormant parallel-shell foundation (ADR 0007) |
 | 2026-08-13 | Added JSON Schema and RFC 8785 support for versioned operations contracts |
 | 2026-01-12 | Initial security audit, updated Next.js to fix CVE |
 

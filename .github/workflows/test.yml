@@ -124,11 +124,27 @@ jobs:
       env:
         REQUIRE_NEXT_BUILD_MANIFEST: 'true'
 
+    # The bundle budget needs a build to measure, so it runs here (not in the
+    # build-free unit jobs): it fails the build if a current-UI page gains
+    # Cloudscape code/CSS or grows past its per-page ceiling.
+    - name: Check bundle budget
+      working-directory: ./ui
+      run: node scripts/measure-bundles.mjs
+
     - name: Run E2E smoke tests
       working-directory: ./ui
       run: npx playwright test tests/e2e-smoke.spec.ts
       env:
         NEXT_PUBLIC_SKIP_AUTH: 'true'
+
+    # The Cloudscape shell suite (ADR 0007): the shell served through the
+    # server-side selector, light, dark, and system themes, axe checks, and the
+    # cross-shell navigation that must never mix design systems. Its config
+    # serves `next dev` on 127.0.0.1:3100 with its own selector and skip-auth
+    # settings, so it does not share the smoke tests' server.
+    - name: Run Cloudscape shell browser tests
+      working-directory: ./ui
+      run: npx playwright test -c playwright.cloudscape.config.ts
 
     - name: Upload E2E test results
       uses: actions/upload-artifact@v7
