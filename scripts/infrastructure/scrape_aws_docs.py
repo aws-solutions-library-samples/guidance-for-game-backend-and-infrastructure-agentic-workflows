@@ -25,7 +25,7 @@ CACHE_DAYS = 7
 
 # Bump when the generated document format changes; cached entries written by an
 # older format are regenerated instead of kept.
-OUTPUT_FORMAT_VERSION = 3
+OUTPUT_FORMAT_VERSION = 4
 
 # Query parameters that only track a click; removed from link targets.
 TRACKING_PARAMETERS = re.compile(r"^(utm_[a-z]+|trk|trkCampaign|sc_channel|sc_campaign|sc_medium|sc_content|sc_detail|sc_country|sc_geo|sc_outcome|sc_publisher|sc_category|sc_segment|sc_icampaign|sc_ichannel|sc_icontent|sc_iplace)$", re.IGNORECASE)
@@ -37,10 +37,13 @@ TRACKING_PARAMETERS = re.compile(r"^(utm_[a-z]+|trk|trkCampaign|sc_channel|sc_ca
 #                replaced; kept only as background.
 #   sample     - walks through one specific sample, starter kit, or demo
 #                implementation rather than the service's general guidance.
-# Non-current documents repeat a short qualifier at every heading, on its own
-# line before every code block (and after long ones), and at least every
-# QUALIFIER_SPACING characters of prose, so every Knowledge Base chunk outside
-# a long code block carries it. Code lines and inline code are never changed.
+# Non-current documents repeat a short qualifier at every heading, at the start
+# of every paragraph, list item, and table, on its own line before every code
+# block (and after long ones), and at least every QUALIFIER_SPACING characters
+# of prose. Knowledge Base chunking starts a chunk at a paragraph boundary when
+# the next paragraph does not fit, so a short chunk is usually one or two whole
+# paragraphs; the spacing rule covers chunks inside long paragraphs. Code lines
+# and inline code are never changed.
 LIFECYCLE_NOTES = {
     "current": "Current guidance.",
     "historical": (
@@ -439,10 +442,12 @@ class DocScraper:
 
         Knowledge Base chunking splits a document into fixed-size pieces, and only
         the first piece holds the header. The qualifier is appended to every
-        heading, put on its own line before every code block and after any code
-        block longer than QUALIFIER_SPACING, and inserted at a word boundary
-        outside inline code at least every QUALIFIER_SPACING characters of
-        prose. Code lines are never changed.
+        heading, starts every paragraph and list item (after the list or quote
+        marker), is put on its own line directly above every table, on its own line before
+        every code block, and
+        after any code block longer than QUALIFIER_SPACING, and is inserted at a
+        word boundary outside inline code at least every QUALIFIER_SPACING
+        characters of prose. Code lines are never changed.
         """
         label = QUALIFIER_LABELS.get(lifecycle)
         if not label:
@@ -453,6 +458,8 @@ class DocScraper:
         fenced = False
         indented = False
         block = 0
+        previous_blank = True
+        in_table = False
 
         def open_block() -> None:
             nonlocal since, block
@@ -475,6 +482,7 @@ class DocScraper:
                 if fence:
                     fenced = False
                     close_block()
+                    previous_blank = True
                 continue
             if indented:
                 if not line.strip() or DocScraper._is_indented_code(line):
@@ -484,6 +492,7 @@ class DocScraper:
                     continue
                 indented = False
                 close_block()
+                previous_blank = True
             if fence:
                 open_block()
                 fenced = True
@@ -501,9 +510,25 @@ class DocScraper:
             if line.startswith("#"):
                 out.append(f"{line} {qualifier}")
                 since = 0
+                previous_blank = in_table = False
                 continue
             rebuilt = []
             ticks = 0
+            table_row = "|" in line and ticks == 0 and not line.lstrip().startswith(">")
+            if not line.strip():
+                in_table = False
+            elif table_row and not in_table:
+                # On its own line directly above the table, with no blank line
+                # between, so chunking keeps it with the table.
+                out.append(qualifier)
+                since = 0
+                in_table = True
+            elif previous_blank and not table_row:
+                marker = re.match(r"\s*(?:>\s*)*(?:(?:[*+-]|\d+\.)\s+)?", line).group(0)
+                rebuilt.append(f"{marker}{qualifier} ")
+                line = line[len(marker):]
+                since = 0
+            previous_blank = not line.strip() and not rebuilt
             for piece in re.split(r"(\s+)", line):
                 rebuilt.append(piece)
                 ticks += piece.count("`")
