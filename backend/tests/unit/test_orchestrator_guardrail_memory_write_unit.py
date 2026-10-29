@@ -16,6 +16,7 @@ from strands.telemetry.metrics import EventLoopMetrics
 
 # Local modules
 import agents.orchestrator as orch
+from utils.memory_identity import memory_actor_id
 
 # conftest's autouse `mock_all_mcp_and_agents` fixture replaces
 # `agents.orchestrator.run_orchestrator` in unit tests; keep the real one.
@@ -63,7 +64,7 @@ def test_completed_turn_still_writes_long_term_memory():
     """A turn that completed normally still extracts facts from the user's message."""
     extract, response = _run(_agent_result("end_turn", "You have 2 fleets."))
 
-    extract.assert_called_once_with(_CONTEXT["user_id"], _QUERY, str(response))
+    extract.assert_called_once_with(memory_actor_id(_CONTEXT["user_id"]), _QUERY, str(response))
 
 
 @pytest.mark.parametrize("stop_reason", ["max_tokens", "limit_turns", "tool_use"])
