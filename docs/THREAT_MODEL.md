@@ -171,7 +171,7 @@ detail in [`SECURITY.md`](../SECURITY.md#trust-boundaries--data-flow).
 | I1 | Sensitive data in AI responses | AI Backend | Bedrock Guardrails PII filters | Deployed |
 | I2 | AWS credentials exposure | MCP Servers | IAM roles, no static credentials | Deployed |
 | I3 | Log data leakage | CloudWatch | `sanitize_log_data()`, access control, no raw tokens/PII | Deployed |
-| I4 | Conversation history exposure | Memory System | User-scoped sessions (`actor_id`), encryption at rest | Deployed |
+| I4 | Conversation history exposure | Memory System | User-scoped sessions keyed by a pseudonymous `actor_id` (a digest of the verified subject), encryption at rest | Deployed |
 | I5 | Internal infrastructure details | AI Responses | Guardrails regex filters | Deployed |
 | I6 | Customer data cross-contamination | Multi-tenant | User-scoped sessions, separate contexts | Deployed |
 
