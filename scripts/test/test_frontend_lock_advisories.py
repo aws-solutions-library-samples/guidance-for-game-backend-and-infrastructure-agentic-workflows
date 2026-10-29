@@ -4,7 +4,10 @@
 caps it, so the fix is an ``overrides`` entry in ``ui/package.json``. These
 tests keep the override and the resolved lockfile version from regressing.
 Direct dependencies are fixed by raising their range in ``ui/package.json``;
-those tests keep the declared floor and every resolved copy patched.
+those tests keep the declared floor and every resolved copy patched. A
+transitive dependency whose parent's range already admits the patched release
+is raised in ``ui/package-lock.json`` alone; those tests keep every resolved
+copy patched.
 """
 
 import json
@@ -24,6 +27,13 @@ MINIMUM_PATCHED = {"katex": (0, 18, 2), "zod": (4, 6, 6)}
 # ui/package.json must not admit an affected release.
 DIRECT_MINIMUM_PATCHED = {
     "next": ((16, 4, 1), "GHSA-2464-fhr4-w9xw, GHSA-p3m5-59mp-jv5r"),
+}
+
+# Transitive dependency -> (first patched version, advisories). The parent's range
+# already admits the patched release, so the lockfile alone carries the fix:
+# @opentelemetry/instrumentation-host-metrics requires systeminformation ^5.31.6.
+TRANSITIVE_MINIMUM_PATCHED = {
+    "systeminformation": ((5, 33, 16), "GHSA-3f7j-7jwc-fxfj, GHSA-7648-jmwf-vw7j, GHSA-4vjg-vx72-qq4g"),
 }
 
 
@@ -73,6 +83,17 @@ class FrontendLockAdvisoryTests(unittest.TestCase):
         for name, (minimum, advisories) in DIRECT_MINIMUM_PATCHED.items():
             copies = _installed_copies(self.lock, name)
             self.assertTrue(copies, f"{name} is no longer in the lockfile; remove it from DIRECT_MINIMUM_PATCHED")
+            for path, version in copies.items():
+                self.assertGreaterEqual(
+                    _version_tuple(version),
+                    minimum,
+                    f"{path} resolves to {version}, below the release that fixes {advisories}",
+                )
+
+    def test_transitive_dependencies_resolve_to_a_patched_version(self) -> None:
+        for name, (minimum, advisories) in TRANSITIVE_MINIMUM_PATCHED.items():
+            copies = _installed_copies(self.lock, name)
+            self.assertTrue(copies, f"{name} is no longer in the lockfile; remove it from TRANSITIVE_MINIMUM_PATCHED")
             for path, version in copies.items():
                 self.assertGreaterEqual(
                     _version_tuple(version),
