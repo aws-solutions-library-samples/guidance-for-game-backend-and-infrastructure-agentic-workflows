@@ -54,7 +54,12 @@ from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 try:
     # Third-party packages
     from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
-    from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+
+    # Local modules
+    # `AgentCoreMemorySessionManager` here is the memory-scoped subclass; the
+    # alias keeps the `orch.AgentCoreMemorySessionManager` patch target used by
+    # existing tests.
+    from utils.memory_context import MemoryScopedSessionManager as AgentCoreMemorySessionManager
 
     MEMORY_INTEGRATION_AVAILABLE = True
 except ImportError:
@@ -488,8 +493,10 @@ def run_orchestrator(query: str, context: dict = None):
         logger.debug("🚀 Running agent...")
         cost_report_capture = begin_cost_report_capture()
         specialist_capture = begin_specialist_capture()
+        guardrail_intervened = False
         try:
             response: Any = agent(query)
+            guardrail_intervened = getattr(response, "stop_reason", None) == "guardrail_intervened"
         except Exception as exc:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
@@ -590,8 +597,13 @@ def run_orchestrator(query: str, context: dict = None):
                 elif contains_unvalidated_financial_content(str(response)):
                     response = sanitize_advisory_section("Cost", str(response))
 
-        # Extract and save semantic memories for LTM (non-blocking)
-        if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and memory_actor:
+        # Extract and save semantic memories for LTM (non-blocking). Retrieved
+        # memory reaches the model outside the input Guardrail, so a turn the
+        # Guardrail stopped is never written: its input may not have passed the
+        # input checks.
+        if guardrail_intervened:
+            logger.info("Skipping long-term memory extraction for a turn the Guardrail stopped")
+        elif USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and memory_actor:
             if SEMANTIC_MEMORY_AVAILABLE:
                 try:
                     extract_and_save_user_info(memory_actor, query, str(response))

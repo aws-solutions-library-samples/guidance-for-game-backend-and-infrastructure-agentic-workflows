@@ -88,6 +88,10 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
         logger.warning("⚠️ Memory ID not configured, skipping semantic memory save")
         return False
 
+    if contains_anonymized_value(content):
+        logger.debug("Skipping long-term memory containing a sensitive identifier")
+        return False
+
     # Deduplication check
     if _is_duplicate_memory(actor_id, content):
         logger.debug("♻️ Skipping duplicate memory save")
@@ -318,6 +322,69 @@ _RESOURCE_PATTERNS = [
 ]
 
 
+# Shapes of the values the input Guardrail anonymizes
+# (infrastructure/cloudformation/04-bedrock-guardrails.yaml). Retrieved memory is
+# sent to the model outside the input Guardrail, so a fact that carries one of
+# these values is never stored: once stored, it would reach the model unmasked on
+# every later turn. The first two mirror the template's regexes; the rest
+# approximate the EMAIL, IP_ADDRESS and PHONE entities and err toward rejecting.
+#
+# Internal hostname: the template's `\b[a-z0-9-]+\.internal\b` with the label
+# bounded at 63 characters, the DNS label limit. Every pattern here scans the
+# whole message on each turn that stores memory, and the unbounded form restarts
+# at every hyphen and scans to the end of the run, so a long hyphenated prompt
+# would cost seconds of CPU. Every real hostname still matches.
+_INTERNAL_HOSTNAME_PATTERN = re.compile(r"\b[a-z0-9-]{1,63}\.internal\b", re.IGNORECASE)
+_ANONYMIZED_VALUE_PATTERNS = (
+    # AWS account ID (template regex)
+    re.compile(r"\b\d{12}\b"),
+    # Internal hostname (template regex, label bounded; matched case-insensitively here)
+    _INTERNAL_HOSTNAME_PATTERN,
+    # Email address
+    re.compile(r"[\w.+-]{1,64}@[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}"),
+    # IPv4 address, optionally a CIDR block
+    re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?(?!\d|\.\d)"),
+    # IPv6, including compressed documentation-range addresses.
+    re.compile(r"(?<![a-f0-9:])(?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}(?![a-f0-9:])", re.IGNORECASE),
+    # IPv4 address encoded in an EC2 private DNS label (ip-10-0-0-1)
+    re.compile(r"\bip-\d{1,3}(?:-\d{1,3}){3}\b", re.IGNORECASE),
+    # Phone number: 10 to 15 digits, optionally with a leading + and
+    # space, dot, hyphen or parenthesis separators
+    re.compile(r"(?<![\w+])\+?\(?\d(?:[ \t().-]{0,2}\d){9,14}(?!\w)"),
+)
+
+
+def contains_anonymized_value(text: str) -> bool:
+    """Return True if ``text`` contains a value shaped like a Guardrail-anonymized entity."""
+    return any(pattern.search(text) for pattern in _ANONYMIZED_VALUE_PATTERNS)
+
+
+def _anonymized_value_spans(text: str) -> list:
+    """Return the ``(start, end)`` spans of every anonymized-shape value in ``text``."""
+    return [m.span() for pattern in _ANONYMIZED_VALUE_PATTERNS for m in pattern.finditer(text)]
+
+
+def _fact_carries_anonymized_value(match: "re.Match[str]", memory_content: str, sensitive_spans: list) -> bool:
+    """Return True if a candidate fact must not be stored.
+
+    A fact is rejected when its formatted text contains an anonymized-shape
+    value, or when any captured group overlaps such a value in the source
+    message or begins immediately after a captured delimiter. The overlap check
+    catches a capture that holds only part of the
+    value (for example, ``[a-zA-Z0-9-]+`` stops at the first dot of an IP
+    address or internal hostname).
+    """
+    if contains_anonymized_value(memory_content):
+        return True
+    for group in range(1, match.re.groups + 1):
+        start, end = match.span(group)
+        if start < 0:
+            continue
+        if any(start < s_end and s_start <= end for s_start, s_end in sensitive_spans):
+            return True
+    return False
+
+
 def _format_game_type(match, label) -> str:
     """Format game type extraction."""
     return f"Game type: {match.group(1).upper()}"
@@ -382,6 +449,8 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
 
     extracted_any = False
     saved_count = 0
+    skipped_count = 0
+    sensitive_spans = _anonymized_value_spans(user_message)
 
     # Extract name (keep natural sentence format for consistency)
     for pattern in _NAME_PATTERNS:
@@ -393,6 +462,9 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
                 logger.debug("ℹ️ Skipping false-positive name match")
                 continue
             memory_content = f"User's name is {name}"
+            if _fact_carries_anonymized_value(match, memory_content, sensitive_spans):
+                skipped_count += 1
+                continue
             success = save_semantic_memory(actor_id, memory_content)
             if success:
                 saved_count += 1
@@ -416,6 +488,9 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
             match = pattern.search(user_message)
             if match:
                 memory_content = formatter(match, label)
+                if memory_content and _fact_carries_anonymized_value(match, memory_content, sensitive_spans):
+                    skipped_count += 1
+                    continue
                 if memory_content:
                     success = save_semantic_memory(actor_id, memory_content)
                     if success:
@@ -423,6 +498,10 @@ def extract_and_save_user_info(actor_id: str, user_message: str, ai_response: st
                     else:
                         logger.warning("⚠️ Failed to save an extracted fact to LTM")
                     extracted_any = True
+
+    if skipped_count:
+        # Count only: the skipped facts are exactly the values that must stay out of logs.
+        logger.info(f"🛡️ Skipped {skipped_count} memory fact(s) shaped like a Guardrail-anonymized value")
 
     if extracted_any:
         logger.info(f"📝 Extracted and saved-or-already-present {saved_count} user info fact(s)")
