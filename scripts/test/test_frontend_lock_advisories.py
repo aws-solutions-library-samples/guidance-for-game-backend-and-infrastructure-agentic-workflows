@@ -8,8 +8,9 @@ those tests keep the declared floor and every resolved copy patched. A
 transitive dependency whose parent's range already admits the patched release
 is raised in ``ui/package-lock.json`` alone, or leaves the lockfile with the
 only parent that required it; those tests allow it to be absent but keep every
-resolved copy patched. Packages that nothing in ``ui/`` loads stay undeclared,
-because the required vulnerability scan reads every package in the lockfile.
+resolved copy patched. Packages listed in ``UNUSED_PACKAGES`` stay undeclared:
+nothing in ``ui/`` loads them, and the required vulnerability scan reads every
+production entry in the lockfile.
 """
 
 import json
@@ -40,8 +41,8 @@ ABSENT_OR_PATCHED = {
 }
 
 # Package -> what declaring it adds to the lockfile. Nothing in ui/ imports or
-# preloads these packages, so declaring one widens the scanned dependency tree
-# with no runtime use.
+# preloads these packages. Declared as a production dependency, one widens the
+# dependency tree that the required vulnerability scan reads, with no runtime use.
 UNUSED_PACKAGES = {
     "@opentelemetry/auto-instrumentations-node": "about 77 lockfile entries, including systeminformation",
 }
