@@ -59,7 +59,7 @@ The architecture follows these 12 steps:
 | **7** | The Specialist agent queries the relevant **Bedrock Knowledge Base** for domain-specific context. Knowledge bases contain curated AWS documentation for GameLift, EKS, and Cost Optimization, stored in S3 and indexed with Titan embeddings. |
 | **8** | The Specialist agent invokes **MCP Servers** (EKS, Cost Explorer) or **boto3 tools** (GameLift) for AWS integration. MCP servers use stdio transport for standardized AWS API access; GameLift uses native boto3 SDK tools directly. |
 | **9** | Read-only API calls to target **AWS Services**: Amazon GameLift for fleet capacity and game sessions, Amazon EKS for cluster and node information, or AWS Cost Explorer for cost analysis and recommendations. IAM policies enforce least-privilege access. |
-| **10** | **Amazon CloudWatch** captures structured logs from all components, while **AWS X-Ray** provides distributed tracing for request flow visualization. OpenTelemetry instrumentation enables end-to-end observability. |
+| **10** | **Amazon CloudWatch** captures structured logs from all components. In the AgentCore runtime, ADOT (AWS Distro for OpenTelemetry) exports traces of each request's agent, model, and tool calls to **AWS X-Ray**. The frontend exports no traces. |
 | **11** | All container images are stored in **Amazon ECR** with vulnerability scanning enabled (ScanOnPush). Lifecycle policies automatically clean up old images, and private repository access is enforced. |
 | **12** | Knowledge Base source documents are stored in **Amazon S3** with server-side encryption (AES-256), access logging enabled, and public access blocked. Documents are automatically chunked and embedded during ingestion. |
 
@@ -577,12 +577,14 @@ export MEMORY_LONG_TERM_ENABLED=true
 # Main runtime
 aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT --follow
 
-# Frontend
-aws logs tail /ecs/game-agent-frontend --follow
+# Frontend: ECS Express adds a generated suffix to the log group name
+aws logs describe-log-groups --log-group-name-prefix /aws/ecs/default/game-agent-frontend --query 'logGroups[].logGroupName'
+aws logs tail /aws/ecs/default/game-agent-frontend-<SUFFIX> --follow
 ```
 
 ### X-Ray Tracing
 
+- **Scope**: Traces start at the AgentCore runtime; the frontend exports none
 - **Dashboard**: AWS Console > CloudWatch > Gen AI Observability > AgentCore
 - **Transaction Search**: Query by user ID, session ID, or time range
 - **Trace Details**: Full request flow including MCP calls

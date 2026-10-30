@@ -445,18 +445,21 @@ npm run test:e2e:smoke      # Smoke tests only
 
 ## Monitoring and Observability
 
-The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing.
+The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing. Tracing covers the AgentCore runtime. The Next.js frontend writes logs to CloudWatch but exports no traces.
 
 - **CloudWatch Logs**: Structured JSON logs from all components (14-day retention for application logs, 90-day for audit logs)
-- **AWS X-Ray**: Distributed tracing across the full request flow, from frontend through AgentCore to AWS service calls
-- **OpenTelemetry**: Instrumentation for traces and metrics exported via ADOT (AWS Distro for OpenTelemetry)
+- **AWS X-Ray**: Distributed tracing for each request inside the AgentCore runtime, covering the orchestrator, the specialist agents, and their model and tool calls
+- **OpenTelemetry**: The AgentCore runtime exports traces and metrics through ADOT (AWS Distro for OpenTelemetry); the frontend has no OpenTelemetry instrumentation
 
 ```bash
 # View runtime logs
 aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT --follow
 
+# Find the frontend log group; ECS Express adds a generated suffix to its name
+aws logs describe-log-groups --log-group-name-prefix /aws/ecs/default/game-agent-frontend --query 'logGroups[].logGroupName'
+
 # View frontend logs
-aws logs tail /ecs/game-agent-frontend --follow
+aws logs tail /aws/ecs/default/game-agent-frontend-<SUFFIX> --follow
 ```
 
 X-Ray traces are available in the AWS Console under CloudWatch > Gen AI Observability > AgentCore.
