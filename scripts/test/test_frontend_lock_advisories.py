@@ -6,8 +6,10 @@ tests keep the override and the resolved lockfile version from regressing.
 Direct dependencies are fixed by raising their range in ``ui/package.json``;
 those tests keep the declared floor and every resolved copy patched. A
 transitive dependency whose parent's range already admits the patched release
-is raised in ``ui/package-lock.json`` alone; those tests keep every resolved
-copy patched.
+is raised in ``ui/package-lock.json`` alone, or leaves the lockfile with the
+only parent that required it; those tests allow it to be absent but keep every
+resolved copy patched. Packages that nothing in ``ui/`` loads stay undeclared,
+because the required vulnerability scan reads every package in the lockfile.
 """
 
 import json
@@ -29,11 +31,19 @@ DIRECT_MINIMUM_PATCHED = {
     "next": ((16, 4, 1), "GHSA-2464-fhr4-w9xw, GHSA-p3m5-59mp-jv5r"),
 }
 
-# Transitive dependency -> (first patched version, advisories). The parent's range
-# already admits the patched release, so the lockfile alone carries the fix:
-# @opentelemetry/instrumentation-host-metrics requires systeminformation ^5.31.6.
-TRANSITIVE_MINIMUM_PATCHED = {
+# Transitive dependency -> (first patched version, advisories). The package may be
+# absent from the lockfile, but any resolved copy must be patched. OpenTelemetry's
+# host-metrics instrumentation requires systeminformation ^5.31.6, which admits the
+# patched release.
+ABSENT_OR_PATCHED = {
     "systeminformation": ((5, 33, 16), "GHSA-3f7j-7jwc-fxfj, GHSA-7648-jmwf-vw7j, GHSA-4vjg-vx72-qq4g"),
+}
+
+# Package -> what declaring it adds to the lockfile. Nothing in ui/ imports or
+# preloads these packages, so declaring one widens the scanned dependency tree
+# with no runtime use.
+UNUSED_PACKAGES = {
+    "@opentelemetry/auto-instrumentations-node": "about 77 lockfile entries, including systeminformation",
 }
 
 
@@ -90,15 +100,22 @@ class FrontendLockAdvisoryTests(unittest.TestCase):
                     f"{path} resolves to {version}, below the release that fixes {advisories}",
                 )
 
-    def test_transitive_dependencies_resolve_to_a_patched_version(self) -> None:
-        for name, (minimum, advisories) in TRANSITIVE_MINIMUM_PATCHED.items():
-            copies = _installed_copies(self.lock, name)
-            self.assertTrue(copies, f"{name} is no longer in the lockfile; remove it from TRANSITIVE_MINIMUM_PATCHED")
-            for path, version in copies.items():
+    def test_absent_or_patched_dependencies_have_no_affected_copy(self) -> None:
+        for name, (minimum, advisories) in ABSENT_OR_PATCHED.items():
+            for path, version in _installed_copies(self.lock, name).items():
                 self.assertGreaterEqual(
                     _version_tuple(version),
                     minimum,
                     f"{path} resolves to {version}, below the release that fixes {advisories}",
+                )
+
+    def test_unused_packages_stay_undeclared(self) -> None:
+        declared = {**self.package.get("dependencies", {}), **self.package.get("devDependencies", {})}
+        for name, footprint in UNUSED_PACKAGES.items():
+            if name in declared:
+                self.fail(
+                    f"nothing in ui/ loads {name}, which adds {footprint}; declare it only in a change that also "
+                    "loads it, and remove it from UNUSED_PACKAGES there"
                 )
 
     def test_direct_dependency_ranges_exclude_affected_releases(self) -> None:
