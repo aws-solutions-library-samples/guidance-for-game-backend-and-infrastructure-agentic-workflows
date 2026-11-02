@@ -568,7 +568,7 @@ psutil==7.2.2
     #   opentelemetry-instrumentation-system-metrics
 py-key-value-aio==0.4.5
     # via fastmcp-slim
-pyasn1==0.6.4
+pyasn1==0.6.5
     # via rsa
 pycparser==2.23 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
