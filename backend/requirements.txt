@@ -172,7 +172,7 @@ jmespath==1.0.1
     # via
     #   boto3
     #   botocore
-joserfc==1.7.1
+joserfc==1.7.6
     # via
     #   authlib
     #   fastmcp-slim
@@ -568,7 +568,7 @@ psutil==7.2.2
     #   opentelemetry-instrumentation-system-metrics
 py-key-value-aio==0.4.5
     # via fastmcp-slim
-pyasn1==0.6.4
+pyasn1==0.6.5
     # via rsa
 pycparser==2.23 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
@@ -598,7 +598,7 @@ pyjwt==2.15.1
     # via
     #   game-agent-backend
     #   mcp
-pypdf==6.21.2
+pypdf==6.21.4
     # via game-agent-backend
 pyperclip==1.11.0
     # via fastmcp-slim
