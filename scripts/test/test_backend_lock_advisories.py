@@ -23,9 +23,11 @@ MINIMUM_PATCHED = {
     "uv": ((0, 13, 4), "GHSA-hq85-5cpj-mr62", False),
     "virtualenv": ((21, 14, 13), "GHSA-vxj4-q4g9-crj7, GHSA-c978-59m8-c77v, GHSA-cx6f-vjhg-g3cc", False),
     "pypdf": (
-        (6, 21, 2),
+        (6, 21, 4),
         "GHSA-39mj-jf6j-2qj3, GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, GHSA-qfv9-64jg-mh7p, "
-        "GHSA-6c7f-9265-g8fw, GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4",
+        "GHSA-6c7f-9265-g8fw, GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4, GHSA-4vqv-7265-gm2w, "
+        "GHSA-5849-834g-hvw5, GHSA-mfr5-77xh-9j7h, GHSA-42gh-23hr-vphw, GHSA-62m5-6wh8-28x7, "
+        "GHSA-cggf-277g-3q54, GHSA-x3rh-gjgm-fmqc",
         True,
     ),
     "black": ((26, 10, 1), "GHSA-cg8m-r9f2-5wm2", False),
@@ -41,6 +43,12 @@ MINIMUM_PATCHED = {
         True,
     ),
     "dnspython": ((2, 9, 0), "GHSA-45c3-73f7-pv4m", True),
+    "pyasn1": (
+        (0, 6, 5),
+        "GHSA-9m75-vc3g-4x39, GHSA-mm57-4v3p-rchx, GHSA-2qm8-x737-gmw5, GHSA-fm9c-5rcf-2q5p",
+        True,
+    ),
+    "joserfc": ((1, 7, 6), "GHSA-jpxq-7h8p-2q76, GHSA-9pg5-8c7x-5hfx", True),
 }
 
 
