@@ -18,8 +18,37 @@ REQUIREMENTS = PROJECT_ROOT / "backend" / "requirements.txt"
 # package -> (first patched version, advisories, exported to requirements.txt)
 MINIMUM_PATCHED = {
     "aiohttp": ((3, 14, 4), "GHSA-2g87-pp6c-29x5, GHSA-5wr8-gcqf-gqf3", True),
+    "multidict": ((6, 9, 1), "GHSA-54p9-h82j-f925", True),
     "certifi": ((2026, 10, 19), "GHSA-6q48-6c7w-9gw2", True),
     "uv": ((0, 13, 4), "GHSA-hq85-5cpj-mr62", False),
+    "virtualenv": ((21, 14, 13), "GHSA-vxj4-q4g9-crj7, GHSA-c978-59m8-c77v, GHSA-cx6f-vjhg-g3cc", False),
+    "pypdf": (
+        (6, 21, 4),
+        "GHSA-39mj-jf6j-2qj3, GHSA-7mh2-4gg2-979f, GHSA-9mx8-4j7g-633p, GHSA-qfv9-64jg-mh7p, "
+        "GHSA-6c7f-9265-g8fw, GHSA-gmh7-3g9r-mjh5, GHSA-jr96-gvgh-j3r4, GHSA-4vqv-7265-gm2w, "
+        "GHSA-5849-834g-hvw5, GHSA-mfr5-77xh-9j7h, GHSA-42gh-23hr-vphw, GHSA-62m5-6wh8-28x7, "
+        "GHSA-cggf-277g-3q54, GHSA-x3rh-gjgm-fmqc",
+        True,
+    ),
+    "black": ((26, 10, 1), "GHSA-cg8m-r9f2-5wm2", False),
+    "filelock": ((4, 2, 1), "GHSA-v4x8-3wr5-3wq8", False),
+    "fastmcp": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
+    "fastmcp-slim": ((3, 4, 10), "GHSA-7xgj-8392-5q4r", True),
+    "mcp": ((1, 30, 0), "GHSA-84m7-p3x7-pcfv", True),
+    "setuptools": ((84, 1, 0), "GHSA-xmj3-9gf7-h52w", True),
+    "authlib": (
+        (1, 9, 1),
+        "GHSA-6v38-4h7w-rj9h, GHSA-7vr2-2fgp-9w7p, GHSA-8m4g-j4wp-wgcg, GHSA-x4rv-c3wx-4cr8, "
+        "GHSA-c5mf-xmp2-59rc, GHSA-fch4-3c6x-j4gc, GHSA-q686-2qmg-hqc7, GHSA-jj7h-c3hg-m23x",
+        True,
+    ),
+    "dnspython": ((2, 9, 0), "GHSA-45c3-73f7-pv4m", True),
+    "pyasn1": (
+        (0, 6, 5),
+        "GHSA-9m75-vc3g-4x39, GHSA-mm57-4v3p-rchx, GHSA-2qm8-x737-gmw5, GHSA-fm9c-5rcf-2q5p",
+        True,
+    ),
+    "joserfc": ((1, 7, 6), "GHSA-jpxq-7h8p-2q76, GHSA-9pg5-8c7x-5hfx", True),
 }
 
 

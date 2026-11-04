@@ -25,7 +25,8 @@ class TestInferenceConfigModelRoles:
         from config.model_settings import DEFAULT_ORCHESTRATOR_MODEL_ID, DEFAULT_SPECIALIST_MODEL_ID
 
         assert DEFAULT_ORCHESTRATOR_MODEL_ID != DEFAULT_SPECIALIST_MODEL_ID
-        assert DEFAULT_SPECIALIST_MODEL_ID == "global.anthropic.claude-sonnet-4-6"
+        assert DEFAULT_ORCHESTRATOR_MODEL_ID == "global.anthropic.claude-haiku-5-5"
+        assert DEFAULT_SPECIALIST_MODEL_ID == "global.anthropic.claude-sonnet-5-5"
 
 
 class TestCreateModelHonorsModelId:

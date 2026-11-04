@@ -24,7 +24,7 @@ describe('Logger Utility', () => {
 
   it('should log errors', () => {
     logError('Test error')
-    expect(console.error).toHaveBeenCalledWith('%s', 'Test error', undefined)
+    expect(console.error).toHaveBeenCalledWith('%s', 'Test error')
   })
 
   it('should log warnings', () => {

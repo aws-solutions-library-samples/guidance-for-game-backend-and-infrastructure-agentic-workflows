@@ -51,6 +51,22 @@ Parameters:
     Description: The environment's cluster name; the operator role allows GameLift changes only on resources with this demo-env tag.
     AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
 Resources:
+  # Fleet logs go to a group the stack owns, so deleting the stack deletes them.
+  # Without LogConfiguration, GameLift writes to a default
+  # gamelift-<fleet ID>-<Region> group that outlives the stack. GameLift
+  # requires the group name to start with "gamelift-".
+  FleetLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub gamelift-${AWS::StackName}
+      RetentionInDays: 7
+      Tags:
+        - Key: demo
+          Value: agones-gamelift-migration
+        - Key: demo-env
+          Value: !Ref DemoEnv
   FleetRole:
     Type: AWS::IAM::Role
     Properties:
@@ -101,6 +117,9 @@ Resources:
       InstanceType: !Ref InstanceType
       BillingType: ON_DEMAND
       NewGameSessionProtectionPolicy: FullProtection
+      LogConfiguration:
+        LogDestination: CLOUDWATCH
+        LogGroupArn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${FleetLogGroup}
       # Set explicitly so the fleet never gets the default rule, which is open
       # to every address. The permission must match the connection port range.
       InstanceConnectionPortRange:

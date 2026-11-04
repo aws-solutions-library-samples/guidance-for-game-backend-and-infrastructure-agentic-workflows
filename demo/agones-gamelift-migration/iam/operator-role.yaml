@@ -1,11 +1,12 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Operator role for the Agones-to-GameLift reference environment. Use it only in
-  a dedicated sandbox account with no other workloads: its EC2 permissions (the
-  eksctl minimum) apply to every EC2 resource in the Region. Its IAM, EKS,
-  CloudFormation, GameLift, and ECR permissions are scoped to this environment,
-  and every role it creates must carry the workload permissions boundary below.
-  It is never used by the assistant.
+  a dedicated sandbox account with no other workloads; that account, not this
+  policy, is what contains EC2: the eksctl minimum applies to every EC2
+  resource in the Region. Every role it creates must carry the workload
+  boundary below, which is the effective ceiling for code the operator runs on
+  instances it launches. Its CloudFormation, EKS, GameLift, ECR, and IAM role
+  permissions are scoped by name or tag. It is never used by the assistant.
 
 Parameters:
   OperatorPrincipalArn:
@@ -34,10 +35,16 @@ Parameters:
 
 Resources:
   # Ceiling for every role this environment creates (EKS cluster role, node
-  # role, GameLift fleet roles). It covers the services their allowlisted AWS
+  # role, GameLift fleet roles). This boundary, not the attach allowlist, is
+  # the effective limit: the operator can write its own eksctl-<cluster>-*
+  # policy, attach it to a bounded role, and run code with that role on an
+  # instance it launches. The boundary covers the services the allowlisted AWS
   # managed policies use and nothing else: no IAM beyond service-linked roles,
-  # no Systems Manager commands, and no S3 reads. It also denies the EC2
-  # actions that can run code as another role. AmazonEKSClusterPolicy lists
+  # no Systems Manager commands, no S3 reads, EKS reads of this cluster only,
+  # and this Region only. It denies the most direct EC2 routes to running code
+  # as another role, but not all of them (launch template versions, root
+  # volume replacement, and volume swaps remain), so the dedicated account is
+  # what contains EC2. AmazonEKSClusterPolicy lists
   # ec2:ModifyInstanceAttribute for load balancer security groups; this
   # environment creates no load balancers, so the deny costs nothing here.
   WorkloadBoundary:
@@ -54,12 +61,17 @@ Resources:
               - ec2:*
               - elasticloadbalancing:*
               - autoscaling:*
-              - eks:*
-              - eks-auth:AssumeRoleForPodIdentity
               - kms:CreateGrant
               - kms:DescribeKey
               - iam:CreateServiceLinkedRole
             Resource: "*"
+          # AmazonEKSWorkerNodePolicy's EKS actions, for this cluster only.
+          - Sid: EksThisClusterOnly
+            Effect: Allow
+            Action:
+              - eks:DescribeCluster
+              - eks-auth:AssumeRoleForPodIdentity
+            Resource: !Sub "arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}"
           - Sid: PullImages
             Effect: Allow
             Action:
@@ -119,6 +131,15 @@ Resources:
               - ec2:CreateSnapshots
               - ec2:GetPasswordData
             Resource: "*"
+          - Sid: DenyOtherRegions
+            Effect: Deny
+            NotAction:
+              - iam:*
+              - sts:*
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:RequestedRegion: !Ref AWS::Region
 
   OperatorRole:
     Type: AWS::IAM::Role
@@ -263,6 +284,39 @@ Resources:
                 Effect: Allow
                 Action: logs:PutRetentionPolicy
                 Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/eks/${ClusterName}/*"
+              # Fleet log groups the reference template creates and deletes
+              # (AWS::Logs::LogGroup handler actions), scoped to this prefix.
+              - Sid: FleetLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:TagLogGroup
+                  - logs:UntagLogGroup
+                  - logs:ListTagsForResource
+                  - logs:ListTagsLogGroup
+                  - logs:GetDataProtectionPolicy
+                  - logs:DeleteDataProtectionPolicy
+                  - logs:DescribeIndexPolicies
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:gamelift-${StackPrefix}-*"
+              # The default gamelift-<fleet ID>-<Region> group that `down`
+              # removes for each fleet it deletes. Fleet IDs are generated, so
+              # this is scoped by the name pattern only, and only for deletion.
+              - Sid: DeleteDefaultFleetLogGroups
+                Effect: Allow
+                Action: logs:DeleteLogGroup
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:gamelift-containerfleet-*"
+              - Sid: ListLogGroups
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeResourcePolicies
+                Resource: "*"
 
               # ----------------------------------------------------------------
               # IAM: only the roles this environment creates, always under the
@@ -400,11 +454,25 @@ Resources:
                   - gamelift:CreateContainerGroupDefinition
                   - gamelift:CreateGameSessionQueue
                   - gamelift:CreateContainerFleet
-                  - gamelift:TagResource
                 Resource: "*"
                 Condition:
                   StringEquals:
                     aws:RequestTag/demo-env: !Ref ClusterName
+              # Tagging must not bring another environment's resource into
+              # scope: a resource that already has a demo-env tag can be tagged
+              # only if it is this environment's. On create the resource has no
+              # tags yet, so the IfExists condition passes. A GameLift resource
+              # with no demo-env tag at all could still be adopted; the
+              # dedicated account is what rules that out.
+              - Sid: GameLiftTagThisEnvironmentOnly
+                Effect: Allow
+                Action: gamelift:TagResource
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/demo-env: !Ref ClusterName
+                  StringEqualsIfExists:
+                    aws:ResourceTag/demo-env: !Ref ClusterName
               # No tag condition: a rollback deletes definitions it never
               # finished creating, which carry no tags yet.
               - Sid: GameLiftChangeNamedOnly

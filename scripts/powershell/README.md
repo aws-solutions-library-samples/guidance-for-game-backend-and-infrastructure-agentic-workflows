@@ -159,6 +159,8 @@ Deploys Game Agent infrastructure to AWS.
 - `-ProjectName` - Project name for resource naming (default: "game-agent")
 - `-Region` - AWS region (default: "us-west-2")
 - `-SkipKnowledgeBases` - Skip KB deployment
+- `-ConfigureAccountObservability` - Opt in to this repository's account-wide X-Ray / CloudWatch Logs changes: the shared Logs resource policy, the trace segment destination, and the default indexing rule only when `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` is set. Without it, this repository's scripts make no account-wide Transaction Search change. `agentcore launch` can still make its own unless `-StopOnAccountObservabilityChange` stops the deployment first.
+- `-StopOnAccountObservabilityChange` - Fail-closed stop switch. Runs a read-only preflight before each `agentcore launch` and stops the deployment if the AgentCore starter toolkit would (or might) change account-wide X-Ray / CloudWatch Logs settings. Equivalent to the shell `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` opt-in; only the exact value `true` enables the environment form. See [Deployment Guide](../../docs/DEPLOYMENT_GUIDE.md#agentcore-starter-toolkit-transaction-search-launch-time-exception).
 - `-WhatIf` - Preview without deploying
 
 **Example:**

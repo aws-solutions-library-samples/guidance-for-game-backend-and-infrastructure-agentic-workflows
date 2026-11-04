@@ -199,6 +199,25 @@ if name == "aws":
                     stack["settle_after"] = None
         elif "FleetId" in query:
             print(stack.get("fleet_id", "None"))
+    elif (service, op) == ("cloudformation", "list-change-sets"):
+        stack = stacks[opt("--stack-name")]
+        ids = [f"{opt('--stack-name')}/{i}" for i in range(len(stack.get("change_sets", [])))]
+        print("\t".join(ids) if ids else "None")
+    elif (service, op) == ("cloudformation", "describe-change-set"):
+        stack_name, index = opt("--change-set-name").rsplit("/", 1)
+        print(json.dumps(tag_list(stacks[stack_name]["change_sets"][int(index)])))
+    elif (service, op) == ("cloudformation", "describe-stack-resources"):
+        stack = stacks[opt("--stack-name")]
+        print("\t".join(stack.get("fleets", [])) if stack.get("fleets") else "None")
+    elif (service, op) == ("logs", "delete-log-group"):
+        group = opt("--log-group-name")
+        if group not in state.setdefault("log_groups", []):
+            fail("(ResourceNotFoundException) when calling the DeleteLogGroup operation: The specified log group does not exist.")
+        state["log_groups"].remove(group)
+    elif (service, op) == ("logs", "describe-log-groups"):
+        prefix = opt("--log-group-name-prefix", "")
+        found = [g for g in state.setdefault("log_groups", []) if g.startswith(prefix)]
+        print("\t".join(found) if found else "None")
     elif (service, op) == ("cloudformation", "delete-stack"):
         stacks[opt("--stack-name")]["status"] = "DELETE_IN_PROGRESS"
     elif (service, op) == ("cloudformation", "wait"):
@@ -247,6 +266,7 @@ if name == "aws":
 elif name == "eksctl":
     if args[:2] == ["delete", "cluster"]:
         state["cluster"] = None
+        state["eksctl_deleted"] = True
         for stack_name in list(stacks):
             if stack_name.startswith("eksctl-"):
                 stacks[stack_name]["status"] = "DELETE_COMPLETE"
@@ -494,7 +514,106 @@ class DemoScriptBehavior(unittest.TestCase):
                 call, r"termination-protection|deletion-protection|retention|put-bucket-versioning|--retain", call
             )
 
+    def test_down_deletes_a_stack_left_in_review_in_progress_without_waiting(self) -> None:
+        state = self.read_state()
+        state["stacks"]["gl-demo-migration"].update(status="REVIEW_IN_PROGRESS", settle_after=1000)
+        self.write_state(stacks=state["stacks"])
+        result = self.run_script("down", DEMO_CONFIRM=ENV, WAIT_MINUTES="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(any(c.startswith("aws cloudformation delete-stack") and "gl-demo-migration" in c
+                            for c in self.calls()))
+
+    def test_review_in_progress_stacks_are_matched_by_their_change_set_tags(self) -> None:
+        self.clean_state(stacks={
+            "gl-demo-review": {"status": "REVIEW_IN_PROGRESS", "tags": {}, "change_sets": [DEMO_TAGS]},
+            "gl-demo-colleague-review": {"status": "REVIEW_IN_PROGRESS", "tags": {}, "change_sets": [OTHER_ENV_TAGS]},
+            "gl-demo-mixed-review": {"status": "REVIEW_IN_PROGRESS", "tags": {},
+                                     "change_sets": [DEMO_TAGS, OTHER_ENV_TAGS]},
+        })
+        result = self.run_script("verify-clean")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gl-demo-review REVIEW_IN_PROGRESS", result.stdout)
+        self.assertNotIn("colleague", result.stdout)
+        self.assertNotIn("mixed", result.stdout)
+        result = self.run_script("down", DEMO_CONFIRM=ENV)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        deleted = [c for c in self.calls() if c.startswith("aws cloudformation delete-stack")]
+        self.assertEqual([re.search(r"--stack-name (\S+)", c).group(1) for c in deleted], ["gl-demo-review"])
+
+    def test_change_set_lookup_errors_fail_closed(self) -> None:
+        for prefix in ("aws cloudformation list-change-sets", "aws cloudformation describe-change-set"):
+            for command in ("verify-clean", "down"):
+                self.clean_state(
+                    stacks={"gl-demo-review": {"status": "REVIEW_IN_PROGRESS", "tags": {}, "change_sets": [DEMO_TAGS]}},
+                    errors={prefix: "(AccessDeniedException) when calling the operation"},
+                )
+                result = self.run_script(command, DEMO_CONFIRM=ENV)
+                self.assertNotEqual(result.returncode, 0, (prefix, command))
+                self.assertNotIn("No resources", result.stdout, (prefix, command))
+
+    def test_change_sets_that_differ_only_in_unrelated_tags_still_match(self) -> None:
+        self.clean_state(stacks={"gl-demo-review": {"status": "REVIEW_IN_PROGRESS", "tags": {},
+                                                    "change_sets": [{**DEMO_TAGS, "owner": "a"},
+                                                                    {**DEMO_TAGS, "owner": "b"}]}})
+        result = self.run_script("verify-clean")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gl-demo-review REVIEW_IN_PROGRESS", result.stdout)
+
+    def test_down_deletes_fleet_log_groups_after_the_cluster_and_repository(self) -> None:
+        fleet = "containerfleet-00000000-0000-0000-0000-000000000000"
+        state = self.read_state()
+        state["stacks"]["gl-demo-migration"]["fleets"] = [fleet]
+        self.write_state(stacks=state["stacks"], log_groups=[f"gamelift-{fleet}-us-east-1"])
+        result = self.run_script("down", DEMO_CONFIRM=ENV)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls()
+        logs = next(i for i, c in enumerate(calls) if c.startswith("aws logs delete-log-group"))
+        self.assertLess(next(i for i, c in enumerate(calls) if c.startswith("eksctl delete cluster")), logs)
+        self.assertLess(next(i for i, c in enumerate(calls) if c.startswith("aws ecr delete-repository")), logs)
+
+    def test_down_removes_eksctl_stacks_left_by_a_failed_cluster_up(self) -> None:
+        self.write_state(cluster=None, repo=None, tagged=[], stacks={
+            f"eksctl-{ENV}-cluster": {"status": "ROLLBACK_COMPLETE", "tags": DEMO_TAGS},
+            f"eksctl-other-env-cluster": {"status": "ROLLBACK_COMPLETE", "tags": OTHER_ENV_TAGS},
+        })
+        result = self.run_script("down", DEMO_CONFIRM=ENV)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"eksctl stack eksctl-{ENV}-cluster (ROLLBACK_COMPLETE), left by a failed cluster-up", result.stdout)
+        self.assertNotIn("other-env", result.stdout)
+        self.assertTrue(self.read_state().get("eksctl_deleted"))
+        self.assertIn(f"No resources of environment {ENV} remain", result.stdout)
+
+    def test_down_does_not_remove_another_environments_eksctl_stacks(self) -> None:
+        self.write_state(cluster=None, repo=None, tagged=[], stacks={
+            f"eksctl-{ENV}-cluster": {"status": "ROLLBACK_COMPLETE", "tags": OTHER_ENV_TAGS},
+        })
+        result = self.run_script("down", DEMO_CONFIRM=ENV)
+        self.assertFalse(any(c.startswith("eksctl delete") for c in self.calls()))
+        self.assertNotEqual(result.returncode, 0)  # verify-clean still reports the name match
+
+    def test_down_deletes_the_default_log_group_of_each_fleet_it_deletes(self) -> None:
+        fleet = "containerfleet-00000000-0000-0000-0000-000000000000"
+        other = "containerfleet-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        state = self.read_state()
+        state["stacks"]["gl-demo-migration"]["fleets"] = [fleet]
+        state["stacks"]["gl-demo-colleague"]["fleets"] = [other]
+        self.write_state(stacks=state["stacks"],
+                         log_groups=[f"gamelift-{fleet}-us-east-1", f"gamelift-{other}-us-east-1"])
+        result = self.run_script("down", DEMO_CONFIRM=ENV)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.read_state()["log_groups"], [f"gamelift-{other}-us-east-1"])
+        # A fleet whose default group never existed is not an error.
+        deleted = [c for c in self.calls() if c.startswith("aws logs delete-log-group")]
+        self.assertEqual(len(deleted), 1)
+
     # -- verify-clean -------------------------------------------------------
+
+    def test_verify_clean_reports_remaining_fleet_log_groups(self) -> None:
+        self.clean_state(log_groups=["gamelift-gl-demo-reference", "gamelift-other-reference"])
+        result = self.run_script("verify-clean")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("gamelift-gl-demo-reference", result.stdout)
+        self.assertNotIn("other-reference", result.stdout)
 
     def test_verify_clean_fails_when_anything_remains(self) -> None:
         result = self.run_script("verify-clean")
