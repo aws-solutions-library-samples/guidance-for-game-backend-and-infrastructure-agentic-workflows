@@ -50,6 +50,8 @@ MINIMUM_PATCHED = {
         True,
     ),
     "joserfc": ((1, 7, 6), "GHSA-jpxq-7h8p-2q76, GHSA-9pg5-8c7x-5hfx", True),
+    "opentelemetry-api": ((1, 45, 1), "GHSA-xcq7-p3pf-p88h", True),
+    "opentelemetry-propagator-jaeger": ((1, 45, 0), "GHSA-f5m9-jfrj-jjj7", True),
 }
 
 
