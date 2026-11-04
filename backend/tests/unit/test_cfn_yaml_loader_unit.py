@@ -16,7 +16,12 @@ import pytest
 import yaml
 
 # Local modules
-from _cfn_yaml import CloudFormationSafeLoader, load_cfn_template
+from _cfn_yaml import (
+    CloudFormationIntrinsicLoader,
+    CloudFormationSafeLoader,
+    load_cfn_template,
+    load_cfn_template_with_intrinsics,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -128,4 +133,68 @@ def test_loader_is_disposed_even_on_parse_error():
             load_cfn_template("!!python/module:os\n")
     finally:
         CloudFormationSafeLoader.dispose = original_dispose
+    assert disposed["count"] == 1
+
+
+# --- Intrinsic-preserving loader ---------------------------------------------
+#
+# Tests that assert on the shape of a policy (for example an ``Fn::If``-gated
+# statement or a ``Ref`` to a parameter) need the intrinsic kept as a mapping,
+# not flattened to a plain value. The same scoped-helper pattern applies.
+
+
+def test_intrinsic_preserving_ref_keeps_the_ref_key():
+    template = load_cfn_template_with_intrinsics("Value: !Ref MyResource\n")
+    assert template == {"Value": {"Ref": "MyResource"}}
+
+
+def test_intrinsic_preserving_condition_keeps_the_condition_key():
+    template = load_cfn_template_with_intrinsics("Value: !Condition IsEnabled\n")
+    assert template == {"Value": {"Condition": "IsEnabled"}}
+
+
+def test_intrinsic_preserving_functions_use_the_fn_prefix():
+    template = load_cfn_template_with_intrinsics("Arn: !GetAtt Bucket.Arn\nName: !Sub '${Project}-web'\n")
+    assert template == {"Arn": {"Fn::GetAtt": "Bucket.Arn"}, "Name": {"Fn::Sub": "${Project}-web"}}
+
+
+def test_intrinsic_preserving_nested_if_is_fully_constructed():
+    template = load_cfn_template_with_intrinsics(
+        "Policies:\n  - !If\n    - IsEnabled\n    - PolicyName: Read\n      Actions: [a, b]\n    - !Ref AWS::NoValue\n"
+    )
+    assert template == {
+        "Policies": [{"Fn::If": ["IsEnabled", {"PolicyName": "Read", "Actions": ["a", "b"]}, {"Ref": "AWS::NoValue"}]}]
+    }
+
+
+def test_intrinsic_preserving_loader_rejects_python_object_tags():
+    for payload in ("!!python/object/apply:os.system ['true']", "!!python/module:os", "!!python/name:os.system"):
+        with pytest.raises(yaml.YAMLError):
+            load_cfn_template_with_intrinsics(payload + "\n")
+
+
+def test_intrinsic_preserving_constructor_is_isolated_to_its_subclass():
+    assert "!" in CloudFormationIntrinsicLoader.yaml_multi_constructors
+    assert "!" not in yaml.SafeLoader.yaml_multi_constructors
+    # The two scoped loaders must not share a constructor registry.
+    assert (
+        CloudFormationIntrinsicLoader.yaml_multi_constructors["!"]
+        is not CloudFormationSafeLoader.yaml_multi_constructors["!"]
+    )
+
+
+def test_intrinsic_preserving_loader_is_disposed_even_on_parse_error():
+    disposed = {"count": 0}
+    original_dispose = CloudFormationIntrinsicLoader.dispose
+
+    def counting_dispose(self):
+        disposed["count"] += 1
+        return original_dispose(self)
+
+    CloudFormationIntrinsicLoader.dispose = counting_dispose
+    try:
+        with pytest.raises(yaml.YAMLError):
+            load_cfn_template_with_intrinsics("!!python/module:os\n")
+    finally:
+        CloudFormationIntrinsicLoader.dispose = original_dispose
     assert disposed["count"] == 1
