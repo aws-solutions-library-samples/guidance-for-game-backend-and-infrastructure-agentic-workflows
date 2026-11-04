@@ -65,6 +65,17 @@ updates:
     commit-message:
       prefix: "chore(deps)"
       include: "scope"
+    # React requires react and react-dom to be the exact same version at
+    # runtime, but npm only checks react-dom's caret peer range, so separate
+    # PRs drift apart (a react-only bump fails Jest with "Incompatible React
+    # versions"). Propose the runtime and its type packages as one update.
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
     # GA freeze: keep frontend dependency PRs narrow and reviewable. Runtime UI
     # dependency sweeps need deliberate validation, not one broad grouped bump.
     ignore:
