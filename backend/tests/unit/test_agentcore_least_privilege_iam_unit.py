@@ -579,9 +579,9 @@ CONDITIONAL_POLICIES: dict[str, dict] = {
             }
         ],
     },
-    # Audit log group configured: write to that one log group only.
+    # Connector enabled AND an audit log group configured: write to that one log group only.
     "ScmAuditLogAccess": {
-        "condition": "ScmAuditLogGroupConfigured",
+        "condition": "ScmAuditLogWriteActive",
         "statements": [
             {
                 "Sid": "ScmAuditLogWrite",
