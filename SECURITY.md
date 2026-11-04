@@ -649,6 +649,18 @@ project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
 | ObservabilityAccess | `logs:CreateLogGroup/CreateLogStream/PutLogEvents`, `DescribeLogStreams` (this runtime's `runtimes/gameagentruntime-*` group only), `DescribeLogGroups` (metadata), `cloudwatch:GetMetricData`, `xray:PutTraceSegments/PutTelemetryRecords/GetSamplingRules/GetSamplingTargets` | Runtime logging, eks-mcp metrics, ADOT/X-Ray | runtime log groups; `DescribeLogStreams` scoped to `runtimes/gameagentruntime-*`; `log-group:*` for `DescribeLogGroups` metadata only; `*` + `aws:RequestedRegion` for GetMetricData; `*` for X-Ray |
 | CostReportSnapshotStoreAccess | `dynamodb:GetItem`, `PutItem` | Shared cost-report snapshot store (#365) | snapshot table ARN |
 
+Two opt-in Source Control Connector policies are added only by template
+conditions, so a default deployment carries neither (see
+[SOURCE_CONTROL_CONNECTOR.md](docs/SOURCE_CONTROL_CONNECTOR.md)):
+
+| Policy (condition) | Actions | Caller | Resource scope |
+|--------------------|---------|--------|----------------|
+| ScmReadCredentialAccess (`ScmReadCredentialActive`: connector enabled and a read-credential ARN set) | `secretsmanager:GetSecretValue` | Connector provider adapter, read token fetch | the one `ScmReadCredentialSecretArn` |
+| ScmAuditLogAccess (`ScmAuditLogWriteActive`: connector enabled and an audit log group name set) | `logs:CreateLogStream`, `PutLogEvents` | Connector durable audit sink | the dedicated `ScmAuditLogGroup` and its streams |
+
+`test_agentcore_least_privilege_iam_unit.py` pins both: each policy's
+condition, its exact statements, and an empty false branch.
+
 **Justification for remaining account-scoped (`Resource: '*'`) reads.** Two
 distinct reasons apply, and the role never mixes them silently:
 

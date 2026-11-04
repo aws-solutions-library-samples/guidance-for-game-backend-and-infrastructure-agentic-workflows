@@ -128,6 +128,8 @@ REVIEWED_ACTIONS: dict[str, str] = {
     # cost_snapshot_dynamodb.py shared snapshot store (#365)
     "dynamodb:GetItem": "cost-report snapshot read",
     "dynamodb:PutItem": "cost-report snapshot write",
+    # Opt-in Source Control Connector read credential (ScmReadCredentialAccess)
+    "secretsmanager:GetSecretValue": "Source Control Connector read-credential fetch (opt-in)",
 }
 
 # Every reviewed API operation mapped to the FULL set of IAM actions its
@@ -232,6 +234,11 @@ SAR_REQUIRED_ACTIONS: dict[str, set[str]] = {
     # which the single-Region snapshot table does not use.
     "dynamodb:GetItem": {"dynamodb:GetItem"},
     "dynamodb:PutItem": {"dynamodb:PutItem"},
+    # GetSecretValue also needs kms:Decrypt when the secret is encrypted with a
+    # customer-managed key. The role grants no KMS action, so a connector secret
+    # under the AWS managed key works and a customer-managed key must grant the
+    # role through its own key policy.
+    "secretsmanager:GetSecretValue": {"secretsmanager:GetSecretValue"},
 }
 
 # Actions permitted to use Resource: '*'. Each has no scopable resource type, a
@@ -556,6 +563,36 @@ EXPECTED_STATEMENTS: dict[str, dict] = {
     },
 }
 
+# Opt-in policies gated by a template Condition. A default deployment carries
+# none of them, so EXPECTED_STATEMENTS above is the default role; each opt-in
+# policy's gating condition and exact statements are pinned here instead.
+CONDITIONAL_POLICIES: dict[str, dict] = {
+    # Connector enabled AND a read-credential ARN configured: one secret only.
+    "ScmReadCredentialAccess": {
+        "condition": "ScmReadCredentialActive",
+        "statements": [
+            {
+                "Sid": "ScmReadCredentialRead",
+                "Effect": "Allow",
+                "Action": "secretsmanager:GetSecretValue",
+                "Resource": "ScmReadCredentialSecretArn",
+            }
+        ],
+    },
+    # Connector enabled AND an audit log group configured: write to that one log group only.
+    "ScmAuditLogAccess": {
+        "condition": "ScmAuditLogWriteActive",
+        "statements": [
+            {
+                "Sid": "ScmAuditLogWrite",
+                "Effect": "Allow",
+                "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+                "Resource": ["ScmAuditLogGroup.Arn", "${ScmAuditLogGroup.Arn}:*"],
+            }
+        ],
+    },
+}
+
 # Templates whose IAM Policy/ManagedPolicy/RolePolicy resources must never
 # reference the AgentCore execution role out of band of its inline Properties.
 INFRASTRUCTURE_DIR = PROJECT_ROOT / "infrastructure"
@@ -570,9 +607,45 @@ def role() -> dict:
     return properties
 
 
-def _statements(role: dict) -> list[dict]:
-    out: list[dict] = []
+def _split_policies(role: dict) -> tuple[list[dict], dict[str, dict]]:
+    """Return (default policies, conditional policies by name).
+
+    A conditional policy is written ``!If [Condition, Policy, !Ref AWS::NoValue]``,
+    which the loader renders as a three-item list. Only the reviewed opt-in
+    policies in CONDITIONAL_POLICIES may take that form, each under its own
+    condition and with no grant in the false branch.
+    """
+    default: list[dict] = []
+    conditional: dict[str, dict] = {}
     for policy in role.get("Policies", []):
+        if isinstance(policy, dict):
+            default.append(policy)
+            continue
+        assert isinstance(policy, list) and len(policy) == 3, f"unexpected policy shape: {policy!r}"
+        condition, granted, otherwise = policy
+        assert otherwise == "AWS::NoValue", f"conditional policy must grant nothing otherwise: {otherwise!r}"
+        assert isinstance(granted, dict), f"conditional policy is not a mapping: {granted!r}"
+        name = granted.get("PolicyName")
+        assert name in CONDITIONAL_POLICIES, f"unreviewed conditional policy: {name!r}"
+        assert condition == CONDITIONAL_POLICIES[name]["condition"], f"{name} is gated by {condition!r}"
+        assert name not in conditional, f"duplicate conditional policy: {name}"
+        conditional[name] = granted
+    return default, conditional
+
+
+def _default_statements(role: dict) -> list[dict]:
+    """Statements a default deployment carries (no opt-in condition is true)."""
+    out: list[dict] = []
+    for policy in _split_policies(role)[0]:
+        out.extend(policy["PolicyDocument"]["Statement"])
+    return out
+
+
+def _statements(role: dict) -> list[dict]:
+    """Every statement the role can carry: the default ones plus every reviewed
+    opt-in policy, so the safety checks below also cover the conditional grants."""
+    out = _default_statements(role)
+    for policy in _split_policies(role)[1].values():
         out.extend(policy["PolicyDocument"]["Statement"])
     return out
 
@@ -808,8 +881,9 @@ def test_statement_set_matches_exact_contract(role):
     exactly one Sid here, a reviewed feature re-granted through a NEW statement
     (new Sid or no Sid), a widened ARN, or a dropped or loosened region
     condition changes the statement set and fails this test — the gap a
-    Sid-keyed or action-only check would miss."""
-    statements = _statements(role)
+    Sid-keyed or action-only check would miss. This is the default role; the
+    opt-in policies are pinned by the next test."""
+    statements = _default_statements(role)
     actual_sids = {s.get("Sid") for s in statements}
     expected_sids = set(EXPECTED_STATEMENTS)
     assert actual_sids == expected_sids, {
@@ -844,6 +918,18 @@ def test_statement_set_matches_exact_contract(role):
         assert (
             statement.get("Condition") == spec["condition"]
         ), f"statement {sid!r} condition changed; expected {spec['condition']}, found {statement.get('Condition')}"
+
+
+def test_conditional_policies_match_exact_contract(role):
+    """Each opt-in policy is present, gated by its reviewed condition, grants
+    nothing when the condition is false, and carries exactly its pinned
+    statements. Widening the secret ARN, adding an action, or moving the grant
+    out from under its condition fails here."""
+    conditional = _split_policies(role)[1]
+    assert set(conditional) == set(CONDITIONAL_POLICIES)
+    for name, spec in CONDITIONAL_POLICIES.items():
+        document = conditional[name]["PolicyDocument"]
+        assert document["Statement"] == spec["statements"], f"{name} statements changed: {document['Statement']}"
 
 
 def _looks_like_cfn_template(text: str) -> bool:
