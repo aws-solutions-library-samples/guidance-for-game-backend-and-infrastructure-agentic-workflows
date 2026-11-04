@@ -6,9 +6,6 @@ const nextConfig = {
   // Standalone output for Docker/container deployment
   output: 'standalone',
 
-  // Note: instrumentation.ts (OpenTelemetry/ADOT) auto-loads in Next 16;
-  // the former experimental.instrumentationHook flag was removed upstream.
-
   // Transpile CopilotKit packages (required for proper bundling).
   // Cloudscape publishes ESM with per-component entry points that Next must
   // transpile; its Next.js guidance lists components, chat-components, and
