@@ -179,19 +179,35 @@ jobs:
         dirname "${{ steps.syft.outputs.cmd }}" >> "$GITHUB_PATH"
         dirname "${{ steps.grype.outputs.cmd }}" >> "$GITHUB_PATH"
 
-    # scripts/scan-vulnerabilities.sh generates SBOMs (syft dir:backend, dir:ui —
-    # reads uv.lock / package-lock.json, no build needed) then greps them with
-    # grype. FAIL_ON=high so the build fails only on high/critical findings;
-    # medium/low are surfaced in the log without blocking. Output is teed so the
-    # scheduled-run alert step below can attach the findings to the issue.
-    - name: Scan dependencies for vulnerabilities
+    # Keep the source/lockfile scans and also scan the final frontend image:
+    # its base OS and bundled tooling are absent from package-lock.json.
+    # The same High/Critical gate and scheduled alert cover both artifacts.
+    - name: Scan dependencies and runtime image for vulnerabilities
       id: scan
       # Explicit `shell: bash` enables pipefail (the implicit default `bash -e`
       # does not) — without it, `| tee` would mask the scan's failing exit code.
       shell: bash
-      run: bash scripts/scan-vulnerabilities.sh 2>&1 | tee /tmp/scan-output.txt
+      run: |
+        {
+          bash scripts/scan-vulnerabilities.sh &&
+            docker build --platform linux/amd64 --target runner \
+              --tag "$FRONTEND_SCAN_IMAGE" ui &&
+            syft "docker:$FRONTEND_SCAN_IMAGE" \
+              -o spdx-json=sbom/frontend-runtime-sbom.spdx.json \
+              --source-name game-agent-frontend-runtime &&
+            grype sbom:sbom/frontend-runtime-sbom.spdx.json --fail-on "$FAIL_ON"
+        } 2>&1 | tee /tmp/scan-output.txt
       env:
         FAIL_ON: high
+        FRONTEND_SCAN_IMAGE: game-agent-frontend-scan:ci
+
+    - name: Upload vulnerability SBOMs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: vulnerability-sboms
+        path: sbom/*.spdx.json
+        retention-days: 7
 
     - name: Upload failed scheduled scan output
       if: ${{ always() && github.event_name == 'schedule' && steps.scan.outcome == 'failure' }}
@@ -234,7 +250,7 @@ jobs:
           grep -iE 'high|critical|vulnerab|GHSA|CVE' /tmp/scan-output.txt | head -50 || tail -50 /tmp/scan-output.txt
           echo '```'
           echo ""
-          echo "Fix guidance: bump the affected package (pyproject.toml + uv.lock + regenerated requirements.txt, or ui/package.json + package-lock.json) — do not add grype ignore rules."
+          echo "Fix guidance: update the affected source dependency (pyproject.toml + uv.lock + regenerated requirements.txt, or ui/package.json + package-lock.json) or final runtime image dependency in ui/Dockerfile — do not add grype ignore rules."
         } > "$BODY_FILE"
         EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
         if [ -n "$EXISTING" ]; then

@@ -23,6 +23,12 @@ RUN npm run build
 FROM base AS runner
 WORKDIR /app
 
+# The standalone server runs Node directly; package managers are build tooling.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+    /usr/local/lib/node_modules/corepack /opt/yarn-* \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+        /usr/local/bin/yarn /usr/local/bin/yarnpkg
+
 ENV NODE_ENV=production
 # Default to 3000 for local dev, ECS Express overrides via task definition
 ENV PORT=3000
