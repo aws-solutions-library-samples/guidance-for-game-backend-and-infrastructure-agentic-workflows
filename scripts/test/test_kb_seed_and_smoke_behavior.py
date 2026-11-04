@@ -46,6 +46,8 @@ if (service, op) == ("cloudformation", "describe-stacks"):
     if mode == "expired":
         print("An error occurred (ExpiredToken) when calling the AssumeRole operation: "
               "The security token included in the request is expired", file=sys.stderr); sys.exit(254)
+    if mode == "sso-missing":
+        print("\nError loading SSO Token: Token for example-sso does not exist", file=sys.stderr); sys.exit(255)
     if "KnowledgeBaseId" in query: print("KBEXAMPLE01")
     elif "DataSourceId" in query: print("KBEXAMPLE01|DSEXAMPLE01")
     elif "DocumentBucketName" in query: print("example-kb-bucket")
@@ -124,6 +126,15 @@ class SeedScriptBehavior(_FakeAwsCase):
                 self.assertIn("ExpiredToken", result.stdout)
                 self.assertFalse(any(c.startswith("s3 sync") for c in self.calls()))
 
+    def test_a_cli_credential_error_mentioning_does_not_exist_fails(self) -> None:
+        for domain in DOMAINS:
+            with self.subTest(domain=domain):
+                self.write_state(stack="sso-missing")
+                result = self.seed(domain)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn("not found, skipping seeding", result.stdout)
+                self.assertFalse(any(c.startswith("s3 sync") for c in self.calls()))
+
     def test_completed_ingestion_with_failed_documents_fails(self) -> None:
         for domain in DOMAINS:
             with self.subTest(domain=domain):
@@ -147,7 +158,7 @@ class SeedScriptBehavior(_FakeAwsCase):
         text = (REPOSITORY_ROOT / "scripts" / "powershell" / "Private" / "Invoke-GameAgentKBSeed.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("-match 'does not exist'", text)
+        self.assertIn("-match 'Stack with id \\S+ does not exist'", text)
         self.assertIn("throw \"Could not read stack", text)
         self.assertIn("ingestionJob.statistics.numberOfDocumentsFailed", text)
         self.assertIn("if ($failedDocs -ne '0')", text)

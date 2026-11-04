@@ -12,12 +12,13 @@ function Invoke-GameAgentKBSeed {
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
     $stackName = "$ProjectName-kb-$KBName"
 
-    # Check if stack exists. Only "does not exist" means skip; any other failure
-    # (expired credentials, access denied, throttling) stops the deploy instead of
-    # reporting a Knowledge Base that was never seeded as done.
+    # Check if stack exists. Only CloudFormation's "Stack with id ... does not exist"
+    # means skip; any other failure (expired or missing SSO credentials, access
+    # denied, throttling) stops the deploy instead of reporting a Knowledge Base
+    # that was never seeded as done.
     $stackCheck = (& aws cloudformation describe-stacks --stack-name $stackName --region $Region @ProfileArgs 2>&1) | Out-String
     if ($LASTEXITCODE -ne 0) {
-        if ($stackCheck -match 'does not exist') {
+        if ($stackCheck -match 'Stack with id \S+ does not exist') {
             Write-GameAgentStatus "Stack $stackName not found, skipping seeding" -Type Warning
             return
         }
@@ -83,7 +84,7 @@ function Invoke-GameAgentKBSeed {
             & aws bedrock-agent get-ingestion-job --knowledge-base-id $kbId --data-source-id $dsId `
                 --ingestion-job-id $jobId --region $Region @ProfileArgs `
                 --query 'ingestionJob.statistics' --output table 2>$null
-            # A COMPLETE job can still have skipped documents; any failed
+            # A COMPLETE job can still report failed documents; any failed
             # document means part of this Knowledge Base is missing.
             $failedDocs = ((& aws bedrock-agent get-ingestion-job --knowledge-base-id $kbId --data-source-id $dsId `
                 --ingestion-job-id $jobId --region $Region @ProfileArgs `
