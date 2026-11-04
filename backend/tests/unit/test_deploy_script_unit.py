@@ -196,6 +196,10 @@ def test_agentcore_env_args_omit_unresolved_optional_values(unresolved_value):
         "GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model",
         "-env",
         "GBAW_SPECIALIST_MODEL_ID=specialist-model",
+        "-env",
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false",
+        "-env",
+        "OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_unredacted_attributes=",
     ]
 
 
@@ -227,6 +231,10 @@ def test_agentcore_env_args_include_resolved_optional_values():
         "GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model",
         "-env",
         "GBAW_SPECIALIST_MODEL_ID=specialist-model",
+        "-env",
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false",
+        "-env",
+        "OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_unredacted_attributes=",
         "-env",
         "GBAW_BEDROCK_GUARDRAIL_ID=guardrail-id",
         "-env",
@@ -283,6 +291,10 @@ def test_agentcore_env_args_filter_optional_values_independently():
         "GBAW_ORCHESTRATOR_MODEL_ID=orchestrator-model",
         "-env",
         "GBAW_SPECIALIST_MODEL_ID=specialist-model",
+        "-env",
+        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false",
+        "-env",
+        "OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_unredacted_attributes=",
         "-env",
         "GBAW_ORCHESTRATOR_PROMPT_ARN=orchestrator-prompt",
         "-env",
