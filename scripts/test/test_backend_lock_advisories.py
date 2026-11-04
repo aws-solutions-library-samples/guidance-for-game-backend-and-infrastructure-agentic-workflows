@@ -4,6 +4,7 @@ Dependabot cannot raise a transitive uv dependency in ``backend/uv.lock``, so
 these fixes are made with ``uv lock --upgrade-package``. These tests keep each
 locked version, and the runtime pin exported to ``backend/requirements.txt``,
 at or above the first patched release, so a later re-lock cannot regress them.
+They also keep the lock at the format revision those fixes were written with.
 """
 
 from pathlib import Path
@@ -60,6 +61,15 @@ ABSENT_OR_PATCHED = {
     "pillow": ((13, 0, 0), "GHSA-8g5g-8vmr-9782 and the other Pillow advisories fixed in 13.0.0"),
 }
 
+# uv.lock format revision: uv 0.13.4 writes 5, uv 0.10 writes 3. An older uv that re-resolves
+# the project (for example after a pyproject.toml change) rewrites the file at its own
+# revision without changing any locked version, so the regression is easy to miss in review.
+# A current uv leaves a lock that already satisfies pyproject.toml untouched, so restoring
+# the revision needs a forced re-resolve: naming the virtual project in --upgrade-package
+# keeps every locked version.
+MINIMUM_LOCK_REVISION = 5
+RELOCK_COMMAND = "cd backend && uvx --from 'uv>=0.13.4' uv lock --upgrade-package game-agent-backend"
+
 
 def _version_tuple(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in re.findall(r"\d+", version)[:3])
@@ -68,12 +78,21 @@ def _version_tuple(version: str) -> tuple[int, ...]:
 class BackendLockAdvisoryTests(unittest.TestCase):
     def setUp(self) -> None:
         lock = tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))
+        self.revision: int = lock.get("revision", 0)
         self.locked: dict[str, list[str]] = {}
         for package in lock["package"]:
             self.locked.setdefault(package["name"].lower(), []).append(package["version"])
         self.pins = dict(
             match.groups()
             for match in re.finditer(r"^([A-Za-z0-9_.-]+)==(\S+)", REQUIREMENTS.read_text(encoding="utf-8"), re.M)
+        )
+
+    def test_lock_keeps_the_current_format_revision(self) -> None:
+        self.assertGreaterEqual(
+            self.revision,
+            MINIMUM_LOCK_REVISION,
+            f"uv.lock is at format revision {self.revision}, below {MINIMUM_LOCK_REVISION}: an older uv rewrote it. "
+            f"Re-lock with a current uv without upgrading anything: {RELOCK_COMMAND}",
         )
 
     def test_every_locked_copy_is_at_or_above_the_patched_version(self) -> None:
