@@ -1,0 +1,19 @@
+{
+  "description": "Recorded gzip-6 first-load baselines for current-UI pages (pages[route] UNION pages['/_app'], .js files, divided by 1024). The `pages` values, which measure-bundles.mjs enforces with a +2 KiB per-page JS ceiling, were measured from origin/main before the Cloudscape shell, in the CI e2e image (mcr.microsoft.com/playwright:v1.63.0-noble, linux/amd64) after `npm ci --ignore-scripts` and `npm run build`. Gzip sizes depend on the zlib build in the Node that runs the check: the same build output measures about 6 KiB smaller for / under Node with zlib 1.2.12 than under the image's zlib 1.3.2.1. Re-record these values in the CI image, including whenever that image is bumped, and compare growth only against a measurement from the same image. The `shared` and `cloudscapeShell` figures are informational, are not enforced, and came from a local macOS measurement. CSS first-load for current-UI pages is about 10.7 KiB.",
+  "unit": "KiB (1024 bytes), gzip level 6",
+  "pages": {
+    "/": { "jsFirstLoadKiB": 828.4, "cssFirstLoadKiB": 10.6 }
+  },
+  "shared": {
+    "/_app": { "jsFirstLoadKiB": 140.0 }
+  },
+  "cloudscapeShell": {
+    "description": "The Cloudscape shell route (/shell-cloudscape). Its synchronous first-load is small because the Cloudscape layout and global styles load through next/dynamic as async chunks; those async chunks are the real Cloudscape payload and are recorded here so the per-shell CSS budget reflects them.",
+    "syncFirstLoad": { "jsKiB": 152.5, "cssKiB": 10.7 },
+    "asyncCloudscapeChunks": { "jsKiB": 143.9, "cssKiB": 206.3 }
+  },
+  "cssBudget": {
+    "note": "No hard CSS ceiling is enforced yet. The Cloudscape shell's async CSS (~206 KiB gzip) is expected to change as the chat, chart, and operator surfaces are added in later changes, so a CSS ceiling is deferred to the shell-cutover readiness work tracked by #552. The current-UI CSS first-load (10.7 KiB) is unaffected by the Cloudscape shell."
+  },
+  "growthNote": "The current-UI pages' first-load JS grew ~1 KiB over the pre-Cloudscape build. The cause is a Turbopack chunk regrouping that duplicated a shared react-dom module into the pages' shared chunk (that chunk grew ~11.6 to ~12.5 KiB gzip; prefetchDNS now appears twice in the first-load instead of once). No Cloudscape code is in any current-UI first-load; the growth is unrelated to the Cloudscape packages and stays within the +2 KiB per-page ceiling."
+}

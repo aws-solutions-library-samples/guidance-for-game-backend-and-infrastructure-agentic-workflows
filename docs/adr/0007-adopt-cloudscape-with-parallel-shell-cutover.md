@@ -826,6 +826,16 @@ Commands: `git archive HEAD ui | tar -x`; `npm ci`;
 - **Harness auth.** The spike ran without a live Cognito backend, so the
   authenticated journeys (sign-in, refresh, idle warning) were not exercised
   end to end; #547 and #548 validate those against both shells.
+- **Pre-auth screens and the idle dialog in the Cloudscape shell (#548).** With
+  the Cloudscape shell selected, `_app` still renders the current UI's loading
+  screen and sign-in form inside the Cloudscape document. Their resets are
+  scoped to the current shell, and Cloudscape's CSS loads only with the shell's
+  own chunk, so those screens render unstyled before sign-in. In dark mode the
+  theme bridge maps `--ga-accent` to a text-color token, so the shared idle
+  dialog's primary button (white text on that color) is below WCAG contrast.
+  Both are reachable only when `GBAW_UI_SHELL=cloudscape`, which no deployment
+  sets. #548 builds the Cloudscape sign-in, loading, and idle-dialog
+  presentation and closes both before the shell can be selected.
 - **Full chat parity bundle.** The 323.3 KiB new-shell measurement is a minimal
   client-rendered conversation. The 500 KiB ceiling is provisional and must be
   re-measured as markdown, charts, and code-block behavior are added, with
