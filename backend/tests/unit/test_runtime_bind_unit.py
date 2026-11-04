@@ -35,7 +35,23 @@ from unittest.mock import patch
 # Third-party packages
 import pytest
 
+# Local modules
+from _guard_state import telemetry_guard_isolation
+
 pytestmark = [pytest.mark.unit]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_telemetry_guard_state():
+    """Snapshot and restore the content guard's process-wide state per test.
+
+    Several tests here import ``agentcore_main``, which runs the telemetry
+    content guard against the real environment and installs process-wide Strands
+    tracer wrappers and an MCP logger filter. This fixture restores those after
+    each test so the guard's installs do not leak into the rest of the session.
+    """
+    yield from telemetry_guard_isolation()
+
 
 LOOPBACK = "127.0.0.1"
 ALL_INTERFACES = "0.0.0.0"  # nosec B104 - test constant, not a bind
