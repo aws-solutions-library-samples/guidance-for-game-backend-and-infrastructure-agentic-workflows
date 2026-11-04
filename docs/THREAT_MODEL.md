@@ -174,6 +174,7 @@ detail in [`SECURITY.md`](../SECURITY.md#trust-boundaries--data-flow).
 | I4 | Conversation history exposure | Memory System | User-scoped sessions keyed by a pseudonymous `actor_id` (a digest of the verified subject), encryption at rest | Deployed |
 | I5 | Internal infrastructure details | AI Responses | Guardrails regex filters | Deployed |
 | I6 | Customer data cross-contamination | Multi-tenant | User-scoped sessions, separate contexts | Deployed |
+| I7 | Prompt/response content in exported traces | Observability | Startup redaction guard: GenAI content capture off, span attributes redacted, agent-span system prompt dropped or redacted (by Strands version) and error-path text dropped, and MCP tool-content instrumentation suppressed by default; opt-in fails closed. Fail-open on a skipped guard path: a missing or renamed internal leaves that content exportable until fixed, surfaced by one content-free WARNING per path and an incomplete-redaction startup posture line, with the signature-pin and direct-import tests as the CI drift guard. SDK- and service-produced spans (AWS SDK error text, memory service spans) stay open and are documented in SECURITY.md. | Residual |
 
 ### Denial of Service
 
