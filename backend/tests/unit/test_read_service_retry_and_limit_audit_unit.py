@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Unit tests for two connector read-service hardening findings (PR #319 review).
+
+Finding #4 — **use the configured retry count**: ``read_iac_files`` retries a
+``ProviderTransientError`` from the reader up to ``retry_max_attempts`` total calls
+(provider rate limits, temporary 5xx, read timeouts), but never retries a
+``ProviderAuthError`` or a permanent validation failure.
+
+Finding #8 — **write file-count rejections to the durable audit log**: a request whose path
+count exceeds ``max_files_per_request`` is recorded through the durable audit sink
+(requester/tenant/workspace/result/reason), not merely a local ``logger.warning``. The audit
+carries no credential or file content.
+
+Both are exercised with a purpose-built config injected via ``config=`` and a programmable
+``FakeProvider`` injected via ``reader=``; the durable sink is replaced with an in-memory
+fake so no AWS call occurs.
+
+Validates: PR #319 review findings 4 and 8.
+"""
+
+# Standard library
+from typing import Any
+
+# Third-party packages
+import httpx
+import pytest
+
+# Local modules
+import utils.security as security
+from connector import github_provider
+from connector import service as service_module
+from connector.config import AllowlistEntry
+from connector.github_provider import GitHubProvider
+from connector.models import FileContent, FileFetchResult
+from connector.provider import ProviderAuthError, ProviderError, ProviderTransientError
+from connector.service import read_iac_files
+from support.config_factory import make_source_control_config
+from support.fake_provider import FakeProvider
+from utils.request_context import reset_request_context, set_request_context
+
+pytestmark = pytest.mark.unit
+
+_REPO = "org/iac"
+_BRANCH = "main"
+_AUTHORIZED_CONTEXT = {"user_id": "reader-1", "groups": ["scm-writers"], "tenant": "acme", "workspace": "prod"}
+
+
+class _FakeAuditSink:
+    """In-memory audit sink capturing every event written (confirmed write)."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    def write(self, event: dict[str, Any]) -> bool:
+        self.events.append(event)
+        return True
+
+
+@pytest.fixture
+def captured_audit(monkeypatch) -> _FakeAuditSink:
+    """Replace the durable sink lookup so audit events are captured in memory."""
+    sink = _FakeAuditSink()
+    monkeypatch.setattr(service_module, "_get_audit_sink", lambda _config: sink)
+    return sink
+
+
+@pytest.fixture
+def retry_delays(monkeypatch) -> list[float]:
+    """Capture connector retry sleeps so tests stay deterministic and never wait."""
+    delays: list[float] = []
+    monkeypatch.setattr(service_module, "_sleep", delays.append)
+    return delays
+
+
+def _config(*, max_files: int = 20, retry_max_attempts: int = 3):
+    """Build an enabled config whose single allowlist entry is org/iac@main (any path)."""
+    return make_source_control_config(
+        enabled=True,
+        read_credential_secret_arn="arn:aws:secretsmanager:us-west-2:123456789012:secret:x-AbCdEf",
+        allowlist=[AllowlistEntry(repo=_REPO, target_branches=(_BRANCH,))],
+        authorized_groups=["scm-writers"],
+        max_files_per_request=max_files,
+        retry_max_attempts=retry_max_attempts,
+        audit_log_group="/scm/audit",
+    )
+
+
+def _read(paths, *, config, reader):
+    """Invoke read_iac_files inside the authorized request context with a clean rate window."""
+    security._rate_limit_windows.clear()
+    token = set_request_context(dict(_AUTHORIZED_CONTEXT))
+    try:
+        return read_iac_files(paths, config=config, reader=reader)
+    finally:
+        reset_request_context(token)
+
+
+# --- Finding #4: configured retry count ---------------------------------------------------
+
+
+def test_transient_error_retried_then_succeeds(captured_audit, retry_delays):
+    """A transient failure on the first get_files is retried and the retry's result is served."""
+    served = FileFetchResult(
+        files=(FileContent(path="a.yaml", content="Resources: {}"),),
+        missing=(),
+        limit_exceeded=False,
+    )
+    reader = FakeProvider()
+    # First call raises transient, the second returns the served result.
+    reader.program("get_files", side_effects=[ProviderTransientError("429 rate limited"), served])
+
+    result = _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    assert result is served
+    assert len(reader.calls_for("get_files")) == 2, "expected exactly one retry after the transient failure"
+    assert retry_delays == [0.5]
+
+
+def test_transient_error_exhausts_attempts_then_raises(captured_audit, retry_delays):
+    """A transient failure on every attempt propagates after exactly retry_max_attempts calls."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderTransientError("still throttled"))
+
+    with pytest.raises(ProviderTransientError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    assert len(reader.calls_for("get_files")) == 3, "must attempt exactly retry_max_attempts times"
+    assert retry_delays == [0.5, 1.0]
+
+
+def test_auth_error_is_not_retried(captured_audit, retry_delays):
+    """A ProviderAuthError is a permanent failure: it propagates on the first call, no retry."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderAuthError("credential rejected"))
+
+    with pytest.raises(ProviderAuthError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    assert len(reader.calls_for("get_files")) == 1, "auth failures must never be retried"
+    assert retry_delays == []
+
+
+def test_provider_retry_hint_is_honored_and_bounded(captured_audit, retry_delays):
+    """A provider delay longer than the exponential floor is honored up to the hard cap."""
+    served = FileFetchResult(
+        files=(FileContent(path="a.yaml", content="Resources: {}"),),
+        missing=(),
+        limit_exceeded=False,
+    )
+    reader = FakeProvider()
+    reader.program(
+        "get_files",
+        side_effects=[ProviderTransientError("throttled", retry_after_seconds=60), served],
+    )
+
+    result = _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    assert result is served
+    assert retry_delays == [5.0]
+
+
+def test_single_attempt_never_sleeps_after_terminal_failure(captured_audit, retry_delays):
+    """The final configured attempt re-raises immediately without a trailing sleep."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderTransientError("still throttled", retry_after_seconds=5))
+
+    with pytest.raises(ProviderTransientError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=1), reader=reader)
+
+    assert len(reader.calls_for("get_files")) == 1
+    assert retry_delays == []
+
+
+# --- Finding #3: durable audit on a terminal provider failure -----------------------------
+
+
+def _terminal_failure_audit_events(captured: _FakeAuditSink) -> list[dict[str, Any]]:
+    """Return the durable ``scm_read`` error-outcome events captured on a terminal failure."""
+    return [e for e in captured.events if e.get("event") == "scm_read" and e.get("outcome") == "error"]
+
+
+def _assert_secret_free(event: dict[str, Any]) -> None:
+    """Assert a terminal-failure audit event leaks no credential or file content."""
+    assert "content" not in event
+    assert "token" not in event
+    assert not any("secret" in str(k).lower() for k in event), "audit must not carry a secret field"
+    # The reason is a sanitized exception category, never a raw provider payload/message.
+    for value in event.values():
+        assert "Bearer" not in str(value), "audit must not echo a credential"
+
+
+def test_exhausted_transient_failure_writes_durable_audit(captured_audit, retry_delays):
+    """An exhausted-transient terminal failure is durably audited before it propagates."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderTransientError("still throttled"))
+
+    with pytest.raises(ProviderTransientError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    # Retry policy preserved: exactly retry_max_attempts calls before the terminal failure,
+    # with no sleep after the final attempt.
+    assert len(reader.calls_for("get_files")) == 3
+    assert retry_delays == [0.5, 1.0]
+
+    events = _terminal_failure_audit_events(captured_audit)
+    assert len(events) == 1, "a terminal transient failure must be durably audited exactly once"
+    event = events[0]
+    assert event["reason"] == "ProviderTransientError"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    _assert_secret_free(event)
+
+
+def test_auth_error_writes_durable_audit(captured_audit):
+    """A non-retried ProviderAuthError is durably audited before it propagates."""
+    reader = FakeProvider()
+    reader.fail("get_files", ProviderAuthError("credential rejected"))
+
+    with pytest.raises(ProviderAuthError):
+        _read(["a.yaml"], config=_config(retry_max_attempts=3), reader=reader)
+
+    # Auth failures are never retried.
+    assert len(reader.calls_for("get_files")) == 1
+
+    events = _terminal_failure_audit_events(captured_audit)
+    assert len(events) == 1, "a terminal auth failure must be durably audited exactly once"
+    event = events[0]
+    assert event["reason"] == "ProviderAuthError"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    _assert_secret_free(event)
+
+
+def test_malformed_github_payload_writes_sanitized_terminal_audit(monkeypatch, captured_audit):
+    """A malformed 2xx GitHub payload becomes one permanent typed failure and audit event."""
+    payload_marker = "DO_NOT_LOG_PROVIDER_PAYLOAD_7f31"
+    credential_marker = "DO_NOT_LOG_PROVIDER_CREDENTIAL_7f31"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=f'{{"content":"{payload_marker}"'.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+
+    def client_with_mock_transport(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(github_provider.httpx, "Client", client_with_mock_transport)
+    monkeypatch.setattr(github_provider, "get_secret", lambda *args, **kwargs: credential_marker)
+
+    config = _config(retry_max_attempts=3)
+    reader = GitHubProvider(config)
+    with pytest.raises(ProviderError, match="invalid Contents API response") as exc:
+        _read(["a.yaml"], config=config, reader=reader)
+
+    assert type(exc.value) is ProviderError
+    assert len(requests) == 1, "malformed provider payloads are permanent and must not be retried"
+    events = _terminal_failure_audit_events(captured_audit)
+    assert len(events) == 1
+    event = events[0]
+    assert event["reason"] == "ProviderError"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    assert payload_marker not in repr(event)
+    assert credential_marker not in repr(event)
+    _assert_secret_free(event)
+
+
+# --- Finding #8: durable audit of a file-count rejection ----------------------------------
+
+
+def test_file_count_rejection_writes_durable_audit(captured_audit):
+    """An over-limit request writes a durable rejection audit and performs no provider read."""
+    reader = FakeProvider()
+    # max_files=1 but two paths requested -> limit exceeded before any provider read.
+    result = _read(["a.yaml", "b.yaml"], config=_config(max_files=1), reader=reader)
+
+    assert result.limit_exceeded is True
+    assert reader.calls == [], "no provider read may occur on an over-limit request"
+
+    limit_events = [e for e in captured_audit.events if e.get("reason") == "limit_exceeded"]
+    assert len(limit_events) == 1, "the file-count rejection must be durably audited exactly once"
+    event = limit_events[0]
+    assert event["event"] == "scm_read"
+    assert event["outcome"] == "rejected"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    # Defense-in-depth: no credential or file-content field is present in the audit event.
+    assert "content" not in event
+    assert not any("secret" in str(k).lower() for k in event), "audit must not carry a secret field"

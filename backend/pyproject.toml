@@ -87,6 +87,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.3.1",
+    "hypothesis>=6.130.0",  # property-based tests (source-control connector)
 
     # Code quality tools
     "pre-commit>=4.6.2",
