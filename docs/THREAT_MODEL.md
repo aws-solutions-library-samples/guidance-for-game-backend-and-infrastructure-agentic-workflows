@@ -590,6 +590,60 @@ the issue requires:
 | Conversation History | Manipulated history | Server-side history management | Deployed |
 | Observation Poisoning | Poisoned/stale provider state triggers remediation | Re-observe; fail closed on staleness/uncertainty (OP-AU1) | Planned |
 
+## Source Control Connector
+
+The Source Control Connector is an **opt-in, disabled-by-default** capability. When disabled, none
+of the threats below apply because the connector tool path is not exposed and no credential grant
+or outbound path exists. When enabled, it adds a controlled **read-only** IaC-context path that reads
+approved IaC sources so the agent can review the current source of truth; it never mutates live
+AWS resources and exposes no provider-write operation. The operator must supply a provider-scoped,
+fine-grained read-only credential; the connector cannot independently verify the credential's
+provider-side grants. Per **Architecture Update v1.3**, no write credential is intended or required
+in the chat runtime — the provider-write path (branch/commit/unmerged change proposal) has been
+**removed from the chat runtime** and is **future work tracked by the isolated executor (#314,
+still open)**. This section covers the threats specific to the read path. See
+[`ARCHITECTURE.md`](ARCHITECTURE.md#source-control-connector-read-only-iac-context-path) for the
+architecture and [`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md) for the deep-dive.
+
+### Additional Trust Boundary: Outbound Provider
+
+- **Entry/Exit Points**: Outbound HTTPS from the AgentCore Runtime to a third-party source-control
+  provider (for example `api.github.com` or a configured enterprise base URL).
+- **Trust Level**: External third party, outside the AWS control plane and IAM trust domain.
+- **Blast radius**: Connector-mediated reads remain constrained by the seven-dimension allowlist.
+  If the provider credential itself is compromised, however, an attacker can call the provider
+  directly and bypass connector policy; the compromise blast radius is therefore the credential's
+  provider-side grants. Operators must provision and periodically verify a fine-grained read-only
+  token scoped to only the required repositories. The connector exposes no write operation and the
+  runtime role remains read-only against live AWS, but those controls cannot reduce an over-broad
+  provider token's direct-access permissions. The write path is **future work tracked by the
+  isolated #314 executor (still open)**, outside this runtime and trust boundary.
+
+### Connector Threats
+
+| Threat ID | Threat | Component | Mitigation | Status |
+|-----------|--------|-----------|------------|--------|
+| SC1 | Read credential compromise or exposure | Provider Adapter | Operator-provisioned, fine-grained read-only provider token; single scoped Secrets Manager ARN; adapter-owned acquisition; never logged; IAM `GetSecretValue` scoped to that ARN; credential never in env or tool output. The connector cannot verify provider-side grants, so direct-compromise blast radius remains an operator responsibility. | Mitigated / shared responsibility |
+| SC2 | Unauthorized tenant/workspace/repo/branch/path/extension read | Service Layer | Seven-dimension authorization (tenant · workspace · repository · branch · path · extension · group) enforced on connector-mediated reads; fail-closed; disabled by default | Mitigated |
+| SC3 | Prompt injection redirecting a read or forging identity | Service Layer / AI Backend | For hosted requests, requester and groups come from independently verified Cognito claims; tenant and workspace are server-bound deployment values. These trusted values use request context, never model input; effective repo/branch come from the matched allowlist entry. | Mitigated |
+| SC4 | Duplicate or ambiguous read audit from retries | Service Layer | A read is **non-mutating**, so a retried read is safe to repeat and duplicate `scm_read` events are benign — no double-counted mutation is possible. Only transient provider errors are retried, bounded by `retry_max_attempts`. The read carries **no** `base_revision` snapshot, **no** idempotency key, and performs **no** reconciliation (those are future #314-executor concerns, not shipped). | Accepted (benign for reads) |
+| SC5 | Audit gaps or overclaimed atomicity | Audit Sink | Durable **best-effort** `scm_read` event attempts (`served` / `not_found` / `error` / `rejected`); **no cross-system atomicity claim** and the read is **not gated** on audit-write success, so a served read is never aborted for an unconfirmed audit write; terminal provider failures attempt a sanitized `error` event before re-raising. There is **no** pre-read intent event, idempotency key, or reconciliation on the read path. Residual sink failures can leave audit gaps. | Accepted residual risk |
+| SC6 | Secrets or sensitive fields leaking into audit/logs | Audit Sink | No secrets recorded in `scm_read` events (the read credential is never placed in a field); sanitized fields (`sanitize_log_data`) as defense-in-depth | Mitigated |
+| SC7 | Escalation from read to write / live mutation | Service Layer | No create/commit/propose/merge/approve/close/delete/force-push operation or `SourceControlWriter` interface is exposed, and no separate write credential is configured. Operators must ensure the opaque provider token is read-only. The write path is future work tracked by the isolated #314 executor (still open); runtime IAM remains read-only against live AWS. | Mitigated / shared responsibility |
+
+### No Write Path in the Runtime
+
+The runtime's **structural containment boundary** is that the connector cannot write: it can only
+read approved files and exposes no operation to create, commit, propose, merge, approve, or close a
+change, and has no `SourceControlWriter` interface. When provisioned as required, its provider
+credential is fine-grained and read-only; operators remain responsible for verifying those
+provider-side grants. Any real change would still be gated on a human reviewer and the existing
+CI/CD pipeline, but that write-and-review path is **future work tracked by the isolated executor
+(#314, still open)** rather than a shipped part of this runtime. The read path itself carries **no** `base_revision` snapshot, idempotency key, or
+reconciliation — a read is non-mutating, so a retried read is safe to repeat and its best-effort
+`scm_read` audit events (`served` / `not_found` / `error` / `rejected`) carry no mutation-oriented
+guarantees.
+
 ## Risk Assessment
 
 ### High Risk Items
