@@ -12,7 +12,7 @@ import handler from '../../../pages/api/auth/user';
 // Mock the JWT verifier. user.ts calls CognitoJwtVerifier.create() at module
 // load, so the factory must not reference an outer (not-yet-initialized)
 // variable — use an inline mockReturnValue and fetch the verify mock in
-// beforeEach (same pattern as the admin-route tests).
+// beforeEach.
 jest.mock('aws-jwt-verify', () => ({
   CognitoJwtVerifier: {
     create: jest.fn().mockReturnValue({ verify: jest.fn() }),

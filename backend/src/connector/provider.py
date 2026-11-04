@@ -33,6 +33,7 @@ types are imported only under ``TYPE_CHECKING``.
 from __future__ import annotations
 
 # Standard library
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     # Local modules
     from connector.models import FileContent, FileFetchResult
+
+
+# Provider-directed retry delays are bounded below the specialist timeout so an untrusted
+# response header cannot stall the model-reachable read path indefinitely.
+MAX_PROVIDER_RETRY_DELAY_SECONDS = 5.0
 
 
 class ProviderError(Exception):
@@ -69,8 +75,21 @@ class ProviderTransientError(ProviderError):
     """A transient/temporary Provider failure that can be safely retried.
 
     Connection timeouts, network failures, provider-reported temporary unavailability
-    (e.g. HTTP 5xx/429) for read operations that can be repeated safely.
+    (e.g. HTTP 5xx/429) for read operations that can be repeated safely. An adapter may
+    attach a sanitized numeric ``retry_after_seconds`` hint; invalid, negative, non-finite,
+    or excessive values are discarded/capped at the shared bounded delay.
     """
+
+    def __init__(self, message: str = "", *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        try:
+            delay = float(retry_after_seconds) if retry_after_seconds is not None else None
+        except (TypeError, ValueError):
+            delay = None
+        if delay is None or not math.isfinite(delay) or delay < 0:
+            self.retry_after_seconds: float | None = None
+        else:
+            self.retry_after_seconds = min(delay, MAX_PROVIDER_RETRY_DELAY_SECONDS)
 
 
 class UnsupportedProviderError(ProviderError):

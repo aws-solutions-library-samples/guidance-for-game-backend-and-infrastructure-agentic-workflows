@@ -5,12 +5,13 @@
 
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { CopilotKit } from "@copilotkit/react-core";
 import { CopilotChat } from "@copilotkit/react-ui";
 import { NewChatButton } from "./NewChatButton";
 import { MarkdownCodeRenderer } from "@/components/MarkdownCodeRenderer";
+import { installChatSubmitGuard } from "@/utils/chatSubmitGuard";
 
 // Override the markdown `code` renderer. It (1) renders fenced code blocks
 // (e.g. IaC) readably on the dark surface with a filename derived from the
@@ -36,12 +37,19 @@ const PROGRESS_MESSAGES = [
 interface ChatProps {
   className?: string;
   onThinkingChange?: (isThinking: boolean) => void;
+  /**
+   * When true (e.g. once idle logout begins, #310), block new submissions.
+   * A transparent overlay intercepts pointer/keyboard interaction with the
+   * CopilotKit input, which does not expose its own disabled prop.
+   */
+  disabled?: boolean;
 }
 
-export function Chat({ className, onThinkingChange }: ChatProps) {
+export function Chat({ className, onThinkingChange, disabled = false }: ChatProps) {
   const [isThinking, setIsThinking] = useState(false);
   const [messagesContainer, setMessagesContainer] = useState<Element | null>(null);
   const [messageIndex, setMessageIndex] = useState(0);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
   const progressMessage = PROGRESS_MESSAGES[Math.min(messageIndex, PROGRESS_MESSAGES.length - 1)];
 
   // Wrap CopilotChat's progress callback so the rotation resets at the start of
@@ -98,6 +106,30 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
     return () => clearInterval(interval);
   }, []);
 
+  // Functionally block chat submission once idle logout begins (#310). The
+  // capture-phase key/submit guard is attached to the wrapper (which exists
+  // immediately), and because CopilotKit mounts its textarea asynchronously we
+  // observe the subtree and re-run the guard so the *actual* input is disabled
+  // and blurred — not merely covered by the overlay. The guard is torn down and
+  // re-installed cleanly if `disabled` toggles.
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!disabled || !wrapper) return;
+
+    let teardown = installChatSubmitGuard(wrapper);
+    // Re-apply when CopilotKit (re)renders the input subtree.
+    const observer = new MutationObserver(() => {
+      teardown();
+      teardown = installChatSubmitGuard(wrapper);
+    });
+    observer.observe(wrapper, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+      teardown();
+    };
+  }, [disabled]);
+
   return (
     <>
       {/* Progress bar - React managed */}
@@ -107,7 +139,17 @@ export function Chat({ className, onThinkingChange }: ChatProps) {
         runtimeUrl="/api/copilot/chat"
         showDevConsole={false}
       >
-        <div className="ga-chat-wrapper">
+        <div className="ga-chat-wrapper" ref={wrapperRef} aria-disabled={disabled || undefined}>
+          {/* Block new submissions once logout begins (#310). The overlay sits
+              above the CopilotKit input and swallows interaction; the chat
+              transcript itself stays visible so context is not lost. */}
+          {disabled && (
+            <div
+              className="ga-chat-disabled-overlay"
+              aria-hidden="true"
+              data-testid="chat-disabled-overlay"
+            />
+          )}
           {/* Must live inside the CopilotKit provider: it consumes the chat
               context to reset messages AND rotate the threadId (#253). */}
           <NewChatButton />

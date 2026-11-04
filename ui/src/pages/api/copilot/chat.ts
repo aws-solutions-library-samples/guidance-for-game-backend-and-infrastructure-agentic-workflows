@@ -1,9 +1,10 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { logInfo, logError, logDebug, redact } from '@/utils/logger';
+import { logInfo, logError, logDebug, redact, normalizeLogValue } from '@/utils/logger';
 import { STSClient, GetCallerIdentityCommand } from '@aws-sdk/client-sts';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
 import { fetchWithTimeout } from '@/utils/fetchWithTimeout';
 import { parse } from '@/utils/cookieCompat';
+import { isSameOrigin } from '@/utils/csrf';
 import {
   buildTrustedPrincipal,
   TrustedPrincipalClaimsError,
@@ -211,6 +212,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     logInfo(`[${requestId}] ========================================`);
     logInfo(`[${requestId}] Received ${sanitizedMethod} request to /api/copilot/chat`);
 
+    // CSRF defense-in-depth: reject cross-origin state-changing requests before
+    // any token verification, body handling, or runtime call. GET/HEAD are
+    // read-only connectivity probes and are not gated here. This mirrors the
+    // same-origin gate on the auth and admin state-changing routes.
+    if (req.method === 'POST' && !isSameOrigin(req)) {
+      logError(`[${requestId}] ❌ Cross-origin request blocked`);
+      return res.status(403).json({ error: 'Cross-origin request blocked' });
+    }
+
     // Validate JWT in production
     const { ok: isAuthenticated, payload: accessPayload, token: accessToken } = await verifyAccessToken(req);
     if (!isAuthenticated) {
@@ -246,10 +256,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         !trustedPrincipal.groups.includes('admin') &&
         !trustedPrincipal.groups.includes('users')
       ) {
-        logError(`[${requestId}] ❌ User not approved`);
+        logError(`[${requestId}] ❌ Caller not in an authorized group`);
         return res.status(403).json({
-          error: 'Account pending approval',
-          message: 'Your account is awaiting admin approval. Please contact an administrator.',
+          error: 'Access not provisioned',
+          message: 'Your account is not provisioned for access. Contact an administrator to be granted access.',
           requestId
         });
       }
@@ -257,9 +267,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Fail closed: outside the explicit local-dev bypass, a trusted principal MUST have been
     // built from the verified access token before the request proceeds. Without this, the
-    // approval gate above is only reached when `accessPayload` happens to be truthy — so any
-    // future path that returns ok-but-null (e.g. a misconfigured hosted env) would silently
-    // skip the admin/users check and let an unapproved caller through. The dev bypass
+    // group gate above is only reached when `accessPayload` happens to be truthy — so any
+    // path that returns ok-but-null (e.g. a misconfigured hosted env) would silently
+    // skip the admin-or-users group check and let an unauthorized caller through. The dev bypass
     // (NODE_ENV !== 'production' && NEXT_PUBLIC_SKIP_AUTH === 'true') is the ONLY case allowed
     // to run without a trusted principal; identity there comes from STS, not Cognito.
     const isDevAuthBypass =
@@ -408,7 +418,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const threadId = data.threadId || `thread-${Date.now()}`;
 
     logInfo(`[${requestId}] 📦 Messages array length: ${messages.length}`);
-    logInfo(`[${requestId}] 📦 ThreadId: ${threadId}`);
+    logInfo(`[${requestId}] 📦 Thread: ${redact(threadId)}`);
 
     // Convert CopilotKit messages to conversation history format
     const conversationHistory = messages
@@ -500,15 +510,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     logInfo(`[${requestId}] 🔗 Thread/Session:`);
     logInfo(`[${requestId}]   Environment: ${envPrefix}`);
-    logInfo(`[${requestId}]   Original Thread ID: ${threadId}`);
-    logInfo(`[${requestId}]   Isolated Thread ID: ${isolatedThreadId}`);
+    logInfo(`[${requestId}]   Thread: ${redact(threadId)}`);
     logInfo(`[${requestId}]   Memory isolation: Dev and prod sessions are separate`);
 
     // Call AgentCore Runtime
     let responseContent: string;
 
     if (isProduction) {
-      // Production: Use AWS SDK to invoke AgentCore Runtime
+      // Production: invoke the AgentCore Runtime over HTTPS with the end user's
+      // verified Cognito access token as an Authorization: Bearer header (plain
+      // fetch, not an AWS SDK invoke client / SigV4). The runtime verifies the
+      // token independently. The only AWS SDK caller on this path is STS
+      // GetCallerIdentity (getAccountId), used to build the runtime ARN.
       logInfo(`[${requestId}] 🚀 Calling AgentCore Runtime with Cognito JWT authorization`);
       logInfo(`[${requestId}] 📤 Sending prompt: ${message.length} chars`);
 
@@ -546,7 +559,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
       logInfo(`[${requestId}] 📦 Payload to AgentCore:`);
       logInfo(`[${requestId}]   prompt: ${message.length} chars`);
-      logInfo(`[${requestId}]   thread_id: ${isolatedThreadId}`);
       logInfo(`[${requestId}]   user_context.user_id: ${redact(payload.user_context.user_id)}`);
       logInfo(`[${requestId}]   user_context.session_id: ${redact(payload.user_context.session_id)}`);
 
@@ -570,7 +582,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       }
 
       responseContent = await runtimeResponse.text();
-      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed`);
+      // Record AgentCore's service request ID (the `x-amzn-RequestId` response
+      // header) next to the proxy requestId, so a single invocation can be
+      // identified to the service, for example in a support case. The value is
+      // generated by AgentCore, not derived from caller identity or content, so
+      // it is logged normalized (control characters collapsed) rather than
+      // redacted. It comes from a different header than the request ID the
+      // runtime container logs (that one reads a request header on a separate
+      // hop), so the two are not known to match and this value is treated as a
+      // service-call identifier, not a cross-tier correlation key. The runtime
+      // session-id response header is the environment-isolated thread ID and is
+      // deliberately NOT logged.
+      const serviceRequestId = runtimeResponse.headers?.get?.('x-amzn-requestid') ?? 'unknown';
+      logInfo(`[${requestId}] ✅ AgentCore JWT invocation completed (AgentCore request ${normalizeLogValue(serviceRequestId)})`);
 
       // AgentCore serializes a string return value as a JSON string.
       try {

@@ -125,7 +125,13 @@ routes to the connector tool; it is not itself part of the connector core:
 
 `run_orchestrator` builds the available tool set for each request. It calls
 `SourceControlConfig.load()`, which reads and validates the `GBAW_SCM_*` variables, and exposes the
-connector path only when the resulting configuration is enabled. `SourceControlConfig` composes
+connector path only when the resulting configuration is enabled.
+
+Valid configuration does not expose the connector on every request. A cost-report identifier
+follow-up is routed through the cost specialist alone, so the deterministic report can be reused,
+and `run_orchestrator` does not append the Source Control path for that request.
+
+`SourceControlConfig` composes
 **three** cohesive sub-contracts, each of which reads its own slice of the `GBAW_SCM_*` values and
 accumulates its own `config_errors`:
 
@@ -230,10 +236,24 @@ rejection path fails closed before a provider read and attempts to emit an `scm_
    partial found/missing result), and `not_found` when no files are returned and paths are missing.
    The result carries **no** write-usable revision.
 
-Failure-mode mapping (GitHub adapter): connect error / connect-timeout → `ProviderUnavailableError`;
-read/transport timeout → `ProviderTransientError`; HTTP 401/403 → `ProviderAuthError` (no retry);
-HTTP 429/5xx → `ProviderTransientError` (retryable); other 4xx → `ProviderError` (no retry). A
-`404` on a read is treated as "file absent" and reported as a missing path, not an error.
+Failure-mode mapping (GitHub adapter):
+
+- connect error / connect-timeout → `ProviderUnavailableError` (no retry);
+- read/transport timeout → `ProviderTransientError` (retryable);
+- HTTP 401, or a 403 without a throttle header → `ProviderAuthError` (no retry);
+- a 403 carrying `Retry-After` or `X-RateLimit-Remaining: 0`, and any HTTP 429 or 5xx →
+  `ProviderTransientError` (retryable);
+- a successful Contents response with a malformed shape or encoding → `ProviderError` with a
+  fixed, payload-free message (permanent, no retry);
+- other 4xx → `ProviderError` (no retry).
+
+A `404` on a read is treated as "file absent" and reported as a missing path, not an error.
+
+Only `ProviderTransientError` is retried, up to `retry_max_attempts` total calls (default 3,
+range 1–10). Before each retry the service waits for an exponential backoff (0.5 s, doubling),
+or for the provider's hint when that is longer: a numeric `Retry-After`, or the time until
+`X-RateLimit-Reset` when the remaining quota is `0`. Every wait is capped at
+`MAX_PROVIDER_RETRY_DELAY_SECONDS` (5 s), so an untrusted header cannot stall the read path.
 
 ## Authorization
 
@@ -337,8 +357,11 @@ neutral core never imports a concrete adapter module.
 from `GBAW_SCM_PROVIDER_TIMEOUT_SECONDS`; **no local `git clone`** (the container FS is read-only) —
 it calls the GitHub Contents REST endpoint. The adapter requests the read credential through
 `get_secret(config.adapter.read_credential_secret_arn, source="secretsmanager")` for each connector
-operation; the shared helper may serve the value from its five-minute TTL cache, so credential
-rotation or revocation can take up to that cache window to be observed. The adapter places the
+operation; the shared helper may serve the value from its five-minute in-process TTL cache. That
+cache affects only Secrets Manager changes: after a secret value is rotated or the secret is
+deleted, the runtime can keep using the previous token for up to five minutes. Revoking the token
+at the provider takes effect on the next request, because the provider checks the token on every
+call. The adapter places the
 value in the `Authorization: Bearer <token>` header and never logs it. Outbound HTTPS to the
 provider host
 (`api.github.com`, or a configured enterprise base URL) must be allowed from the AgentCore runtime.
@@ -467,8 +490,9 @@ example provider):
 
 6. **Verify.** For each request, `run_orchestrator` validates connector configuration while
    building its tool set. Valid enabled configuration exposes `get_iac_file`, currently through the
-   compatibility wrapper. Invalid configuration leaves the connector path unexposed and emits a
-   sanitized application audit/log event describing the reason.
+   compatibility wrapper, on every request except a cost-report identifier follow-up (see
+   [Enablement Gate](#enablement-gate)). Invalid configuration leaves the connector path unexposed
+   and emits a sanitized application audit/log event describing the reason.
 
 ## Audit
 
@@ -545,8 +569,9 @@ infrastructure/cloudformation/01-base-infrastructure.yaml   # scoped secret-read
 scripts/deploy.sh                                           # GBAW_SCM_* env wiring
 ```
 
-> Note: `connector/iac_validation.py` exists in the package but is **not** part of the read path —
+> Note: the read-only package ships **no** infrastructure-as-code parser —
 > `service.py` performs no IaC parse/validation on reads (reads only fetch existing content).
+> A parser with hard input limits belongs to the prepare-only work in #419, not this package.
 
 > Note: there is **no** `connector/executor/` directory in the shipped package on this branch. The
 > isolated write-path executor is **future work tracked by #314 (still open)** and lives only in

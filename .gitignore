@@ -153,3 +153,6 @@ sbom/
 
 # GameLift Documentation PDFs (downloaded during deployment)
 docs/gamelift/*.pdf
+
+# Local investigation scratch notes (never committed)
+.investigation/

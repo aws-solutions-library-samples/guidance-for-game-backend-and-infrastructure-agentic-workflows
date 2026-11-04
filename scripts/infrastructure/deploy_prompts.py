@@ -25,6 +25,7 @@ from agents.optimized_prompts import (
     ORCHESTRATOR_PROMPT,
     SOURCE_CONTROL_PROMPT,
 )
+from config.model_capabilities import get_model_capabilities
 from config.settings import INFERENCE_CONFIG
 
 # Prompt definitions keyed by env-var name
@@ -110,11 +111,18 @@ def deploy_prompt(client, env_key, vp):
     agent_key = vp.name.replace("_specialist", "").replace("_", "")
     inf = INFERENCE_CONFIG[agent_key]
 
+    # Models that reject the temperature parameter must not record one on the
+    # published variant: the signature omits it so idempotency still holds, and
+    # running the published prompt directly would otherwise fail.
+    inference_text: dict = {}
+    if get_model_capabilities(inf["model_id"]).send_temperature:
+        inference_text["temperature"] = inf.get("temperature", 0.1)
+
     variant = {
         "name": "default",
         "modelId": inf["model_id"],
         "templateType": "TEXT",
-        "inferenceConfiguration": {"text": {"temperature": inf.get("temperature", 0.1)}},
+        "inferenceConfiguration": {"text": inference_text},
         "templateConfiguration": {"text": {"text": vp.text}},
     }
 

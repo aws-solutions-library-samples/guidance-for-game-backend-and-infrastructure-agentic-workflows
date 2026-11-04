@@ -20,6 +20,7 @@ provides the code-level foundation for traceability.
 # Standard library
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # Local modules
 from agents.chart_directive import CHART_DIRECTIVE, with_chart_directive
@@ -43,7 +44,7 @@ class VersionedPrompt:
 
 GAMELIFT_PROMPT = VersionedPrompt(
     name="gamelift_specialist",
-    version="2.2.0",
+    version="2.3.0",
     text=(
         "You are a GameLift specialist. Help with AWS GameLift fleet management, "
         "monitoring, and optimization.\n\n"
@@ -56,6 +57,9 @@ GAMELIFT_PROMPT = VersionedPrompt(
         "- For classic fleet utilization, capacity, and scaling: Use the GameLift "
         "tools (get_fleet_utilization, get_fleet_capacity, "
         "get_scaling_policies)\n\n"
+        "Do not discuss pricing, costs, savings, or billing, and never state a monetary "
+        "amount; the cost specialist answers money questions. Describe capacity and "
+        "utilization in operational terms only.\n\n"
         "Provide specific, actionable recommendations. "
         "Use markdown formatting: ## headers, **bold**, bullet points."
     ),
@@ -63,7 +67,7 @@ GAMELIFT_PROMPT = VersionedPrompt(
 
 EKS_PROMPT = VersionedPrompt(
     name="eks_specialist",
-    version="2.1.0",
+    version="2.2.0",
     text=(
         "You are an EKS specialist. Help with Amazon EKS cluster management "
         "and Kubernetes operations.\n\n"
@@ -83,6 +87,9 @@ EKS_PROMPT = VersionedPrompt(
         "- For YAML examples, show only essential fields (5-10 lines max)\n"
         "- Limit kubectl examples to 2-3 most relevant commands\n"
         "- Omit verbose explanations when a brief answer suffices\n\n"
+        "Do not discuss pricing, costs, savings, or billing, and never state a monetary "
+        "amount; the cost specialist answers money questions. Describe capacity and "
+        "utilization in operational terms only.\n\n"
         "Use markdown formatting: ## headers, **bold**, bullet points."
     ),
 )
@@ -129,7 +136,7 @@ SOURCE_CONTROL_PROMPT = VersionedPrompt(
 
 ORCHESTRATOR_PROMPT = VersionedPrompt(
     name="orchestrator",
-    version="2.1.0",
+    version="2.2.0",
     text=(
         "You are the AI orchestrator (v2). Route queries to specialists:\n\n"
         "- cost_agent: ANY spending, billing, monetary amount, cost report, report ID, "
@@ -139,7 +146,8 @@ ORCHESTRATOR_PROMPT = VersionedPrompt(
         '  Examples: "list EKS", "EKS clusters", "Kubernetes", "cluster status"\n\n'
         "- gamelift_agent: Operational GameLift questions about fleets and game servers\n"
         '  Examples: "GameLift", "fleets", "game server"\n\n'
-        "Never calculate or rewrite financial values. Cost report IDs must go to cost_agent.\n\n"
+        "Never calculate or rewrite financial values. Cost report IDs must go to cost_agent. "
+        "Do not add cost, pricing, or savings commentary to a GameLift or EKS answer.\n\n"
         "Be concise. Use markdown formatting."
     ),
 )
@@ -220,7 +228,7 @@ def _load_from_bedrock_pm():
         # Local modules
         from utils.logger import logger
 
-        logger.warning("Bedrock Prompt Management load failed; using code-defined prompts", exc_info=True)
+        logger.opt(exception=True).warning("Bedrock Prompt Management load failed; using code-defined prompts")
 
 
 # Run at import time (container startup)
@@ -230,6 +238,20 @@ _load_from_bedrock_pm()
 def _get_prompt(name: str, fallback: VersionedPrompt) -> str:
     """Return Bedrock PM prompt if available, else code-defined fallback."""
     return _runtime_prompts.get(name, fallback.text)
+
+
+def _utc_now() -> datetime:
+    """Return the current UTC time. Patched in tests for a deterministic date."""
+    return datetime.now(timezone.utc)
+
+
+def _current_date_directive() -> str:
+    """Build a concise directive stating today's UTC date for relative ranges."""
+    today = _utc_now().astimezone(timezone.utc).date().isoformat()
+    return (
+        f"\n\nToday (UTC) is {today}. Derive relative periods "
+        "(e.g. current month, last N days) from this date, not prior knowledge."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +270,13 @@ def get_optimized_eks_prompt() -> str:
 
 
 def get_optimized_cost_prompt() -> str:
-    """Get the optimized cost specialist system prompt."""
-    return with_chart_directive(_get_prompt("cost_specialist", COST_PROMPT))
+    """Get the cost prompt with the shared chart contract and runtime UTC date.
+
+    The current UTC date is appended at call time so the specialist derives
+    relative ranges from real time rather than stale model knowledge. The
+    shared chart directive remains composed into the managed/base prompt.
+    """
+    return with_chart_directive(_get_prompt("cost_specialist", COST_PROMPT)) + _current_date_directive()
 
 
 def get_optimized_source_control_prompt() -> str:

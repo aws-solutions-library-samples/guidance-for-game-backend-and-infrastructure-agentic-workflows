@@ -24,8 +24,9 @@ Design guarantees encoded here (see
 - **Typed error mapping**:
     - connection error / connect-timeout → :class:`ProviderUnavailableError`
     - read/write/pool timeout or other transport failure → :class:`ProviderTransientError`
-    - HTTP 401 / 403 → :class:`ProviderAuthError` (never retried)
-    - HTTP 5xx / 429 → :class:`ProviderTransientError` (retryable)
+    - HTTP 401 or non-throttle 403 → :class:`ProviderAuthError` (never retried)
+    - throttle-shaped 403, HTTP 429, or HTTP 5xx → :class:`ProviderTransientError`
+      (retryable with bounded provider-directed delay/backoff)
 
 Only provider-agnostic dataclasses from ``connector.models`` and Python primitives cross
 the method boundary; no GitHub-specific type escapes this layer.
@@ -35,6 +36,8 @@ from __future__ import annotations
 
 # Standard library
 import base64
+import binascii
+from time import time as _time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -45,6 +48,7 @@ import httpx
 from connector import registry
 from connector.models import FileContent, FileFetchResult
 from connector.provider import (
+    MAX_PROVIDER_RETRY_DELAY_SECONDS,
     OutboundRequest,
     ProviderAuth,
     ProviderAuthError,
@@ -68,6 +72,12 @@ _DEFAULT_API_BASE_URL = "https://api.github.com"
 # Pinned Accept header + API version keep responses stable across GitHub API changes.
 _ACCEPT = "application/vnd.github+json"
 _API_VERSION = "2022-11-28"
+
+# Successful Contents API responses are untrusted provider input. Every malformed shape or
+# encoding maps to the same payload-free permanent error so raw response data and decoder
+# details never cross the adapter boundary or enter logs.
+_INVALID_CONTENTS_RESPONSE = "Provider returned an invalid Contents API response"
+_BASE64_WHITESPACE_TRANSLATION = str.maketrans("", "", " \t\r\n")
 
 
 class GitHubReadTokenAuth(ProviderAuth):
@@ -143,9 +153,9 @@ class GitHubProvider(SourceControlReader):
         if response.status_code == 404:
             return None
 
-        payload = response.json()
+        payload = self._parse_contents_payload(response)
         # A directory path returns a JSON array; treat that as "not a file".
-        if isinstance(payload, list):
+        if payload is None:
             return None
 
         content = self._decode_contents_payload(payload)
@@ -172,8 +182,8 @@ class GitHubProvider(SourceControlReader):
             if response.status_code == 404:
                 missing.append(path)
                 continue
-            payload = response.json()
-            if isinstance(payload, list):
+            payload = self._parse_contents_payload(response)
+            if payload is None:
                 missing.append(path)
                 continue
             found.append(FileContent(path=path, content=self._decode_contents_payload(payload)))
@@ -261,42 +271,110 @@ class GitHubProvider(SourceControlReader):
         return response
 
     @staticmethod
+    def _is_throttle_response(response: httpx.Response) -> bool:
+        """Return whether a 403 carries a reliable header-only throttle signal."""
+        if response.headers.get("Retry-After") is not None:
+            return True
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        return remaining is not None and remaining.strip() == "0"
+
+    @staticmethod
+    def _retry_delay_seconds(response: httpx.Response) -> float | None:
+        """Parse a bounded numeric retry hint without reading untrusted response bodies."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                delay = float(retry_after.strip())
+            except (TypeError, ValueError):
+                return None
+            if delay < 0:
+                return None
+            return min(delay, MAX_PROVIDER_RETRY_DELAY_SECONDS)
+
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        reset = response.headers.get("X-RateLimit-Reset")
+        if remaining is None or remaining.strip() != "0" or reset is None:
+            return None
+        try:
+            delay = max(0.0, float(reset.strip()) - _time())
+        except (TypeError, ValueError):
+            return None
+        return min(delay, MAX_PROVIDER_RETRY_DELAY_SECONDS)
+
+    @classmethod
     def _raise_for_status(
+        cls,
         response: httpx.Response,
         method: str,
         path: str,
         *,
         allow_404: bool,
     ) -> None:
-        """Map an HTTP status code to a typed provider exception.
+        """Map HTTP status and throttle headers to typed provider exceptions.
 
-        Success (2xx) and an allowed 404 return normally. Auth (401/403) is non-retryable;
-        429 and 5xx are transient/retryable. Any other 4xx is a non-retryable provider
-        error. Response bodies are not logged so no secret leaks.
+        Success (2xx) and an allowed 404 return normally. A 401 and a 403 without a
+        reliable throttle header are permanent credential/permission failures. A 403 with
+        ``Retry-After`` or exhausted ``X-RateLimit-Remaining``, plus every 429/5xx, is
+        transient and may carry a bounded numeric retry hint. Response bodies and raw
+        header values never enter the exception.
         """
         status = response.status_code
         if 200 <= status < 300:
             return
         if status == 404 and allow_404:
             return
-        if status in (401, 403):
+        if status == 401:
+            raise ProviderAuthError(f"Provider rejected the credential ({status}): {method} {path}")
+        if status == 403:
+            if cls._is_throttle_response(response):
+                raise ProviderTransientError(
+                    f"Provider throttled the request ({status}): {method} {path}",
+                    retry_after_seconds=cls._retry_delay_seconds(response),
+                )
             raise ProviderAuthError(f"Provider rejected the credential ({status}): {method} {path}")
         if status == 429 or 500 <= status < 600:
-            raise ProviderTransientError(f"Provider temporarily unavailable ({status}): {method} {path}")
+            raise ProviderTransientError(
+                f"Provider temporarily unavailable ({status}): {method} {path}",
+                retry_after_seconds=cls._retry_delay_seconds(response),
+            )
         raise ProviderError(f"Provider request failed ({status}): {method} {path}")
 
     @staticmethod
-    def _decode_contents_payload(payload: dict[str, Any]) -> str:
-        """Decode a Contents API response body into UTF-8 text.
+    def _parse_contents_payload(response: httpx.Response) -> dict[str, Any] | None:
+        """Return a validated Contents API object, or ``None`` for a directory array.
 
-        Only base64-encoded content is supported (the encoding GitHub returns for regular
-        files). Anything else (e.g. very large files served as ``"none"``) is surfaced as
-        a provider error rather than silently returning empty content.
+        Response bodies are untrusted provider input. Invalid JSON and non-object JSON values
+        are translated to one payload-free permanent :class:`ProviderError`, ensuring the
+        service records its sanitized terminal audit. GitHub directory responses are arrays
+        and retain their existing "not a file" behavior.
         """
-        if payload.get("encoding") == "base64":
-            raw = base64.b64decode(payload.get("content", ""))
+        try:
+            payload = response.json()
+        except (ValueError, UnicodeDecodeError):
+            raise ProviderError(_INVALID_CONTENTS_RESPONSE) from None
+        if isinstance(payload, list):
+            return None
+        if not isinstance(payload, dict):
+            raise ProviderError(_INVALID_CONTENTS_RESPONSE)
+        return payload
+
+    @staticmethod
+    def _decode_contents_payload(payload: dict[str, Any]) -> str:
+        """Decode a validated Contents API object into UTF-8 text.
+
+        GitHub returns regular file content as line-wrapped base64. Only ASCII base64
+        whitespace is removed before strict decoding; missing/wrong fields, invalid base64,
+        and non-UTF-8 bytes all map to the same payload-free permanent provider error.
+        """
+        content = payload.get("content")
+        if payload.get("encoding") != "base64" or not isinstance(content, str):
+            raise ProviderError(_INVALID_CONTENTS_RESPONSE)
+        encoded = content.translate(_BASE64_WHITESPACE_TRANSLATION)
+        try:
+            raw = base64.b64decode(encoded, validate=True)
             return raw.decode("utf-8")
-        raise ProviderError(f"Unsupported content encoding for '{payload.get('path', '<unknown>')}'")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            raise ProviderError(_INVALID_CONTENTS_RESPONSE) from None
 
 
 # Self-register the bundled GitHub adapter with the provider-neutral registry so that

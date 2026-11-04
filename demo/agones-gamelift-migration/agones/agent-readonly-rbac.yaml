@@ -1,0 +1,38 @@
+# Read-only access to Agones resources for the assistant.
+#
+# The canonical enrollment (infrastructure/kubernetes/enroll-cluster.sh) gives
+# the assistant's runtime role read-only access to core Kubernetes resources and
+# maps it into a Kubernetes group. This file adds read-only access to the Agones
+# custom resources for that same group, so the assistant can inspect the fleet
+# it is asked to migrate. Verbs are get/list/watch only; no Secrets.
+#
+# `scripts/demo.sh enroll-agent` replaces __AGENT_GROUP__ with the group the
+# enrollment script created.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agones-demo-readonly
+  labels:
+    demo: agones-gamelift-migration
+rules:
+  - apiGroups: ["agones.dev"]
+    resources: ["fleets", "gameservers", "gameserversets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling.agones.dev"]
+    resources: ["fleetautoscalers"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agones-demo-readonly
+  labels:
+    demo: agones-gamelift-migration
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agones-demo-readonly
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: __AGENT_GROUP__

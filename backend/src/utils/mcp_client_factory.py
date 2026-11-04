@@ -20,7 +20,7 @@ import shutil
 import sys
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, TextIO
 
 # Third-party packages
 from mcp import StdioServerParameters, stdio_client
@@ -38,6 +38,43 @@ from utils.logger import logger
 # each attempt involves spawning a subprocess via stdio).
 MCP_CREATE_MAX_ATTEMPTS = min(RETRY_MAX_ATTEMPTS, 2)
 MCP_CREATE_RETRY_DELAY = 1.0  # seconds between attempts
+
+# EKS specialist's two stdio MCP servers whose handlers log provider-/Kubernetes-
+# authored error bodies at ERROR. We pin their loguru sink above ERROR so those
+# bodies never reach our logs (issue #466). Billing is deliberately excluded — it
+# manages its own FASTMCP_LOG_FILE and is unrelated to the EKS boundary.
+_EKS_LOG_SUPPRESSED_SERVERS = frozenset({"aws-api-mcp-server", "eks-mcp-server"})
+
+
+# ``mcp.stdio_client(server, errlog=...)`` wires the child transport's stderr to
+# ``errlog`` (default ``sys.stderr``). ``mcp_wrapper.py`` forwards the provider
+# child's stderr to its own stderr, so provider-/Kubernetes-authored error BODIES
+# would otherwise reach the parent logs. For the two EKS stdio servers ONLY we
+# pass an ``os.devnull`` handle so the kernel discards that stderr. The sink must
+# be a real file: stdio_client passes errlog to subprocess.Popen, which calls
+# ``fileno()`` (a pure-Python sink fails every spawn, issue #516). One handle is
+# shared for the process lifetime, so transport re-creation never leaks fds. The
+# ``FASTMCP_LOG_LEVEL=CRITICAL`` env pin remains as defense in depth.
+_devnull_errlog: Optional[TextIO] = None
+_devnull_errlog_lock = threading.Lock()
+
+
+def _devnull_errlog_sink() -> TextIO:
+    """Return the shared, process-lifetime ``os.devnull`` errlog handle."""
+    global _devnull_errlog
+    with _devnull_errlog_lock:
+        if _devnull_errlog is None or _devnull_errlog.closed:
+            _devnull_errlog = open(os.devnull, "w", encoding="utf-8")
+        return _devnull_errlog
+
+
+def _errlog_for(server_name: str) -> Optional[TextIO]:
+    """Return the discarding errlog sink for the two EKS stdio servers, else None
+    (meaning: use stdio_client's default of sys.stderr, e.g. for Billing)."""
+    if server_name in _EKS_LOG_SUPPRESSED_SERVERS:
+        return _devnull_errlog_sink()
+    return None
+
 
 # Module-level MCP client cache for performance
 # Thread-safe cache to reuse MCP clients across specialist calls
@@ -203,6 +240,24 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
                 # restricted-egress runtime it falls back to rejecting all calls.
                 env["READ_OPERATIONS_ONLY"] = "true"
 
+            # EKS specialist provider-error log suppression (issue #466).
+            #
+            # The eks-mcp-server and aws-api-mcp-server handlers log provider- and
+            # Kubernetes-authored error BODIES at ERROR via loguru
+            # (e.g. k8s_handler "Failed to list ...: <raw>", aws-api service
+            # "Error while ...: <raw>"). Their loguru stderr sink level is taken
+            # from FASTMCP_LOG_LEVEL. mcp_wrapper.py forwards child stderr to the
+            # parent, so those bodies would land in our logs. Pin these two stdio
+            # subprocesses to a level ABOVE ERROR so provider-authored error text
+            # is never emitted. This is a log-verbosity setting only: it does NOT
+            # touch READ_OPERATIONS_ONLY, auth, or any behavior, and it is scoped
+            # by server name; the Billing subprocess receives the same loguru
+            # level pin in its own env block below. The EKS-owned guard remains
+            # the source of typed, sanitized outcomes the model sees.
+            if server_name in _EKS_LOG_SUPPRESSED_SERVERS:
+                env["FASTMCP_LOG_LEVEL"] = "CRITICAL"
+                env["LOGURU_LEVEL"] = "CRITICAL"
+
             # billing-cost-management-mcp-server writes to its own package dir in
             # TWO places that fail on the read-only container:
             #   1) a log file under <pkg>/logs at IMPORT time (logging_utils) — but
@@ -221,6 +276,16 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
                 os.makedirs(billing_log_dir, exist_ok=True)
                 env["GBAW_BILLING_MCP_DB_DIR"] = billing_db_dir
                 env["FASTMCP_LOG_FILE"] = os.path.join(billing_log_dir, "billing-cost-management-mcp-server.log")
+                # The Billing MCP server's handlers log raw provider error bodies
+                # (ARNs, account IDs) at INFO/ERROR via loguru on BOTH its stderr
+                # and file sinks, whose level is taken from FASTMCP_LOG_LEVEL.
+                # mcp_wrapper.py forwards the child's stderr to the parent, so
+                # those bodies would reach the runtime's logs. Pin the subprocess
+                # above ERROR so the server never emits provider-authored error
+                # text (issue #465). This is a log-verbosity setting only; it does
+                # not change behavior. LOGURU_LEVEL is set as defense in depth.
+                env["FASTMCP_LOG_LEVEL"] = "CRITICAL"
+                env["LOGURU_LEVEL"] = "CRITICAL"
 
             # Use wrapper to filter non-JSON stdout (AWS Labs MCP servers print diagnostics)
             wrapper_path = os.path.join(os.path.dirname(__file__), "mcp_wrapper.py")
@@ -231,6 +296,16 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
             # Closing over the loop locals is safe here — we return immediately below,
             # so they can't be rebound before the factory is first called.
             def _transport() -> MCPTransport:
+                # For the two EKS stdio servers, route the child transport's
+                # stderr to os.devnull so provider-authored error bodies cannot
+                # enter parent logs (issues #466, #516). Other servers (Billing)
+                # keep stdio_client's default (sys.stderr).
+                errlog = _errlog_for(server_name)
+                if errlog is not None:
+                    return stdio_client(
+                        StdioServerParameters(command=sys.executable, args=[wrapper_path] + mcp_cmd, env=env),
+                        errlog=errlog,
+                    )
                 return stdio_client(
                     StdioServerParameters(command=sys.executable, args=[wrapper_path] + mcp_cmd, env=env)
                 )
@@ -248,16 +323,33 @@ def create_mcp_client(server_name: str, use_cache: bool = True) -> Optional[MCPC
 
         except Exception as e:
             last_error = e
+            # For the two EKS stdio servers, a startup/transport exception can
+            # embed provider-/Kubernetes-authored child text; log a TYPE-ONLY
+            # fixed message so that text never enters parent logs (issue #466).
+            # Billing (and any other server) keeps its existing diagnostic text.
+            suppress_text = server_name in _EKS_LOG_SUPPRESSED_SERVERS
             if attempt < MCP_CREATE_MAX_ATTEMPTS:
-                logger.warning(
-                    f"⚠️ {server_name} MCP client attempt {attempt}/{MCP_CREATE_MAX_ATTEMPTS} "
-                    f"failed: {e}, retrying in {MCP_CREATE_RETRY_DELAY}s"
-                )
+                if suppress_text:
+                    logger.warning(
+                        f"⚠️ {server_name} MCP client attempt {attempt}/{MCP_CREATE_MAX_ATTEMPTS} "
+                        f"failed ({type(e).__name__}), retrying in {MCP_CREATE_RETRY_DELAY}s"
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ {server_name} MCP client attempt {attempt}/{MCP_CREATE_MAX_ATTEMPTS} "
+                        f"failed: {e}, retrying in {MCP_CREATE_RETRY_DELAY}s"
+                    )
                 time.sleep(MCP_CREATE_RETRY_DELAY)
             else:
-                logger.error(
-                    f"❌ Failed to create {server_name} MCP client after {MCP_CREATE_MAX_ATTEMPTS} attempts: {e}"
-                )
+                if suppress_text:
+                    logger.error(
+                        f"❌ Failed to create {server_name} MCP client after "
+                        f"{MCP_CREATE_MAX_ATTEMPTS} attempts ({type(e).__name__})"
+                    )
+                else:
+                    logger.error(
+                        f"❌ Failed to create {server_name} MCP client after {MCP_CREATE_MAX_ATTEMPTS} attempts: {e}"
+                    )
 
     return None
 

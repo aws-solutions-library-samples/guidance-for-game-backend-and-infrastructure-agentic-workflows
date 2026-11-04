@@ -28,7 +28,13 @@ from utils.request_context import reset_request_context, set_request_context
 
 pytestmark = pytest.mark.unit
 
-_AUTHORIZED_CONTEXT = {"user_id": "reader-1", "groups": ["scm-writers"], "session_id": "s-read"}
+_AUTHORIZED_CONTEXT = {
+    "user_id": "reader-1",
+    "groups": ["scm-writers"],
+    "session_id": "s-read",
+    "tenant": "acme",
+    "workspace": "prod",
+}
 
 
 @pytest.mark.parametrize(
@@ -114,6 +120,7 @@ def _read_authorized(paths, *, config, reader):
     "unsafe_path",
     [
         "../../etc/passwd",  # plain ../ escape
+        "../DO_NOT_LOG_RAW_SECRET_7f31.tf",  # raw unsafe input must not enter audit fields
         "a/../../b",  # nested parent traversal
         "/etc/passwd",  # absolute path
         # URL-resolution-altering characters must also fail closed with no provider read.
@@ -143,6 +150,13 @@ def test_read_iac_files_rejects_unsafe_path_fails_closed_with_audit(unsafe_path,
     event = invalid_events[0]
     assert event["event"] == "scm_read"
     assert event["outcome"] == "rejected"
+    assert event["requester"] == "reader-1"
+    assert event["tenant"] == "acme"
+    assert event["workspace"] == "prod"
+    # The untrusted raw path must not enter either a named path field or any audit value.
+    assert not {"requested_path", "paths", "normalized_paths"}.intersection(event)
+    assert unsafe_path not in repr(event)
+    assert "DO_NOT_LOG_RAW_SECRET_7f31" not in repr(event)
     # Defense-in-depth: the audit carries no credential or file-content field.
     assert "content" not in event
     assert not any("secret" in str(k).lower() for k in event), "audit must not carry a secret field"

@@ -7,6 +7,7 @@ and optimization using the AWS API and EKS MCP servers.
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.eks_mcp_guard import guard_eks_mcp_client
 from agents.optimized_prompts import get_optimized_eks_prompt
 from config.settings import AWS_REGION, EKS_KB_ID
 from utils.mcp_client_factory import create_mcp_client
@@ -62,4 +63,5 @@ eks_agent = create_specialist_agent(
     prompt_fn=get_optimized_eks_prompt,
     fallback_fn=_get_eks_aws_cli_fallback,
     additional_tools=None,
+    mcp_client_transform=guard_eks_mcp_client,
 )

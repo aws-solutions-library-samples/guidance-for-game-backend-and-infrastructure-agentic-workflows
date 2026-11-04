@@ -54,7 +54,10 @@ All data in transit is encrypted using TLS:
 
 **API Gateway / AgentCore:**
 - TLS 1.2+ enforced by AWS Bedrock AgentCore
-- All API calls use HTTPS with AWS SigV4 authentication
+- All hops use HTTPS. The frontend→AgentCore invocation authenticates with the
+  end user's Cognito access token as an `Authorization: Bearer` header (verified
+  independently by the runtime), not SigV4. AgentCore→AWS service calls use AWS
+  SigV4 under the AgentCore execution role.
 
 **AWS Documentation**:
 - [ECS Security Best Practices](https://docs.aws.amazon.com/AmazonECS/latest/bestpracticesguide/security.html)
@@ -208,6 +211,51 @@ Health check path `/api/health` is configured in the template; interval, timeout
 **AWS Documentation**:
 - [CloudWatch Logs Retention](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Working-with-log-groups-and-streams.html)
 
+### Exported Telemetry Content
+
+The runtime is traced with OpenTelemetry under the AWS OpenTelemetry distro and AgentCore observability. Trace spans and the OpenTelemetry log records derived from GenAI events are governed separately from application logs, so they have their own content boundary.
+
+**Exported by default** (needed for latency, cost, and error analysis):
+
+- Span and request structure, timing, and latency
+- Token-count attributes (input, output, total, and cache read/write counts)
+- Model id, operation name, and finish/stop reason
+- Error type and status
+
+**Redacted by default** (not exported in the hosted default; an operator opt-in, or a skipped guard path, can leave a path open — see Residual risk):
+
+- Prompt text and conversation messages (`gen_ai.input.messages`)
+- Model and tool responses (`gen_ai.output.messages`)
+- System prompts (`gen_ai.system_instructions`; on Strands versions that copy a raw `system_prompt` keyword onto the agent span, the guard drops that attribute, and on versions that route the system prompt through the redaction policy it is redacted there)
+- Tool inputs and results, including MCP tool arguments and results
+- Tool and model error text in span status descriptions and `exception` events, and the exception message and stack trace in the Strands MCP client's exception log records (the error type is kept)
+- Knowledge Base passages, which reach telemetry as model/tool message content and are covered by the message-content switch and the redaction token
+
+**How it is enforced**: A startup guard (`backend/src/config/telemetry_guard.py`) runs at application import, before the first Strands tracer and the first MCP client are created, and sets two switches regardless of the deploy environment:
+
+- `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false` — the Bedrock instrumentation attaches no message content to GenAI events, so the OpenTelemetry log records derived from them carry none either. An explicit `false` wins over the distro's observability default.
+- `OTEL_SEMCONV_STABILITY_OPT_IN` carries `gen_ai_unredacted_attributes=` (an empty allowlist) — the tracer redacts every sensitive span attribute and legacy per-message event. Any unrelated semantic-convention tokens already present are preserved. The deployment environment builders (`scripts/deploy.sh` and the PowerShell equivalent) pass the same two settings so the distro also sees them at process start.
+
+One Strands content path, and on Strands versions that copy a raw `system_prompt` keyword onto the agent span a second, lies outside that redaction token, so while redacting the guard also installs narrow wrappers on the tracer. The wrapper drops the `system_prompt` keyword: on Strands versions that copy a raw `system_prompt` keyword onto the agent span (which the distro's log-record handler would turn into a `system` message), dropping it stops that raw attribute; on versions that route the system prompt through the redaction policy instead of a raw attribute, `Agent` passes `system_prompt` by keyword, so dropping it removes only the agent span's redacted system-prompt event. Either way the system prompt is still reported, redacted, through `gen_ai.system_instructions` on model spans. Tool and model error paths otherwise record the error text as the span status description and, for exceptions, as an `exception` event; the wrapper keeps the error status and the exception type but removes the message and stack trace. Under agent observability the distro also routes library `logging.exception` calls into OpenTelemetry log records, so the guard attaches a filter to the Strands MCP client logger (`strands.tools.mcp.mcp_client`) that keeps the exception type as a non-content `exception.type` attribute but removes the exception message and stack trace. Because a logging filter runs before any handler, that filter also removes the traceback from the stdout application log, including in local development. The exception type is preserved as a non-content `exception.type` OpenTelemetry log-record attribute, which the OpenTelemetry logging handler exports under agent observability; the plain stdout/console log in local development (loguru's last-resort handler, which is not the OpenTelemetry handler) shows only the static log message, not the exception type. The MCP SDK's own validation and receive-loop errors are logged on the root logger with the exception interpolated directly into the message string, so a named-logger filter cannot reach them; those paths run only on protocol validation failures or unexpected receive-loop errors and are recorded as a residual risk below rather than filtered.
+
+The distro's own MCP instrumentor records MCP tool arguments and results (`gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`) on MCP protocol spans unconditionally, with no capture switch. The same startup guard closes that path: it uninstruments the MCP instrumentor in the runtime process, and adds the MCP instrumentor's entry point (`aws_mcp`) to the auto-instrumentation exclusion list (`OTEL_PYTHON_DISABLED_INSTRUMENTATIONS`) so the auto-instrumented MCP server subprocesses — which inherit a copy of this process's environment — exclude it too. The guard appends to the list the distro sets under agent observability; in a hosted runtime where the list is unset it sets the list to `aws_mcp`. Because the list matches entry-point names, the guard also checks at startup that the installed distro still registers `aws_mcp` for its MCP instrumentor module and no other name loads it; if not, or if the check itself fails, the subprocess exclusion is reported as a skipped guard path, so the startup posture line says redaction is incomplete. A unit test pins the installed entry point so a distro upgrade that renames it fails CI. Uninstrumenting also removes the instrumentor's trace-context injection, so botocore spans from the MCP subprocesses start their own traces instead of nesting under the tool call, and MCP JSON-RPC error codes are not recorded as span attributes; the tool name, call id, status, and timing remain on the Strands tool span.
+
+The AgentCore Memory SDK logs the long-term-memory namespace, which embeds the memory actor ID, at INFO on every successful lookup (logger `bedrock_agentcore.memory.client`), and under agent observability the distro exports root-logger records. In a hosted runtime, while redacting, the guard attaches a filter to that one logger that drops its records below WARNING, which also drops the client's other INFO lines, such as initialization and event creation. The filter sits on the logger rather than setting a level, so it holds whatever the root logger is set to and whenever logging is configured. It is not installed in a local run or under the opt-in. Records at WARNING and above still flow so that SDK failures stay visible; the failure paths this leaves open are listed under Residual risk.
+
+**Operator opt-in (non-production only)**: Set `GBAW_CAPTURE_TRACE_CONTENT` to the exact value `capture-content-nonprod` on the runtime to export message content for debugging. The deployment environment builders do not forward this variable, so the supported way to enable it is to set it directly on the AgentCore runtime (for example, redeploy a disposable integration build with the variable in the runtime environment). The switch fails closed: any other value, including `true` or an empty string, keeps content redacted. Under the opt-in the Strands wrappers, the MCP client logging filter, the memory SDK logging filter, the MCP instrumentor, and the auto-instrumentation exclusion list are left untouched. Enabling it in a hosted runtime exports prompt and response content to CloudWatch and should be used only in a disposable, non-production environment.
+
+**Residual risk**: Redaction removes message content, but a span still records that an operation happened, its timing, and its token counts. The runtime session identifier is the conversation thread ID chosen by the frontend proxy (`prod-<threadId>`), carried on spans and content log records as `session.id` baggage for trace stitching; it is a correlation identifier, not user content, and is retained by design. The runtime's own code does not add actor id, Cognito subject, email, or raw session content as span attributes, and user content is redacted as above. Telemetry that SDKs and AWS services create themselves is outside that control, and these paths remain:
+
+- *A skipped redaction guard path.* Each guard path (the Strands span wrappers, the MCP uninstrument, the MCP subprocess exclusion's entry-point check, the MCP and memory logging filters) catches a broad exception so a missing or renamed internal, or attribute drift, cannot crash startup. The trade-off is fail-open: a skipped path keeps startup running and leaves the content it covers exportable until the drift is fixed. The skip is not silent — the guard logs one bounded, content-free WARNING per skipped path (naming the path and the exception type, never the exception message or stack trace), and the startup posture line reports that redaction is incomplete and names the open paths instead of claiming no content is exported. The signature-pin and direct-import unit tests are the drift guard that fails in CI before a deploy.
+
+- *AWS SDK error text.* The botocore instrumentation records a failed AWS call's exception type and message as the span status description and as an `exception` span event (message and stack trace). A service error message can echo a value from the request (a not-found error can repeat a resource name the user typed) or identify the caller (an access-denied error names the role session that made the call). This reaches exported spans from the runtime process and from the embedded MCP server subprocesses, and the guard does not remove it. A scrubber at the span-exporter boundary is the intended fix; it has to run in the MCP subprocesses as well as the runtime, and it is tracked in #578.
+- *Memory service spans.* When tracing is enabled on the memory resource (the AgentCore CLI enables it for a memory it creates while observability is on), the service emits its own spans for memory calls. The event spans carry the actor ID as `actor.id`, and the retrieval spans carry the namespace, which embeds it ([AgentCore memory observability data](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-memory-metrics.html)). The service produces these spans, so the runtime cannot redact them. The actor ID is stable for a given user, so the spans carry a per-user identifier that anyone who can read the memory resource's trace data can use to correlate that user's activity. When the memory has long-term strategies and service logs are enabled, the extraction logs also carry `actor_id` and `namespace` fields.
+- *Strands memory-span events (latent here).* Strands memory stores emit their own span events through `start_memory_*` / `end_memory_*`, which attach the raw `memory.query`, `memory.content`, and `memory.results` outside the tracer's redaction policy, so the empty `gen_ai_unredacted_attributes=` token does not reach them. This runtime uses only `AgentCoreMemorySessionManager` and no Strands memory store, so these events are not emitted and the gap is latent; it would open if a Strands memory store were introduced without extending the guard to those events.
+- *Failed memory calls.* On a service error during a lookup, the memory client logs a WARNING that can include the resolved namespace (resource not found) or the service's error text. When creating or listing events fails, it logs the service's error text at ERROR. The filter passes WARNING and above by design. The Strands session manager's ERROR for other lookup failures carries the retrieval template key and the exception text.
+- *MCP SDK errors.* The MCP SDK's own validation and receive-loop errors (logged on the root logger with the exception interpolated into the message string) are not reachable by the named-logger filter; if an MCP message that fails protocol validation carried content, the interpolated text could appear in a log record on that uncommon path.
+
+If content capture is opted in, exported telemetry is only as protected as the CloudWatch log group and X-Ray data holding it.
+
 ### S3 Lifecycle Policies
 
 **CloudTrail Logs**: 90-day expiration policy  
@@ -246,11 +294,72 @@ EVENT_MEMORY_STRATEGY = "BEDROCK_AGENTCORE"
 SEMANTIC_MEMORY_STRATEGY = "BEDROCK_AGENTCORE"
 ```
 
-**Data Isolation**: Memory is isolated per user (actor_id) with no cross-user access.
+**Data Isolation**: Memory is isolated per user (actor ID) with no cross-user access.
+
+**Memory Actor Identifier**: The runtime does not give AgentCore Memory the raw Cognito subject. It derives the actor ID as a SHA-256 digest of the verified subject with a fixed domain-separation prefix (`backend/src/utils/memory_identity.py`), so the same user always maps to the same opaque 64-character hexadecimal ID. This matters because the memory service can emit its own trace spans. When tracing is enabled on the memory resource (the AgentCore CLI enables it for a memory it creates while observability is on), the `CreateEvent`, `GetEvent`, `ListEvents`, and `DeleteEvent` spans carry the actor ID as `actor.id`, and the memory-record retrieval spans carry the namespace, which embeds it ([AgentCore memory observability data](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-memory-metrics.html)). The service produces those spans, so the runtime cannot redact them, and a raw subject would put a stable user identifier into exported traces. The same ID is the long-term-memory namespace and the namespace for semantic memories the runtime saves. A subject that is not a usable string (not a string, empty or whitespace-only, or not encodable as UTF-8) disables memory for the request; there is no fallback to the raw value.
+
+- *Pseudonymous, not anonymous.* Anyone who already knows a subject can compute its actor ID, which lets an operator locate or delete one user's memory: `cd backend/src && python3 -c "from utils.memory_identity import memory_actor_id as m; print(m('<subject>'))"` prints it. Cognito subjects are random UUIDs, so an actor ID does not reveal its user without a list of candidate subjects. Anyone who already holds a list of subjects — a Cognito `ListUsers` result, a copy of a JWT, or older logs — can map a trace entry back to a user by computing each subject's actor ID. The digest is domain-separated, not keyed: the prefix is a public constant, so there is no secret, no key to lose, and no rotation. A keyed construction (an HMAC with a server-owned secret) would also stop a reader who holds subjects but not the key from linking trace entries to users, at the cost of distributing the secret and making memory continuity depend on it. It is not used because the trace audience in scope does not hold subject lists. It would be reconsidered if that audience comes to include readers who hold or can obtain subjects.
+- *Tenant and workspace are deliberately not part of the digest input.* The input is the subject prefixed by the domain string, with no tenant or workspace component. Cognito subjects are unique within one user pool, so this is correct for one user pool per deployment. It does not separate two pools that share a single memory resource: a subject colliding across two pools would map to the same actor ID. This deployment uses one pool, so the input is intentionally kept minimal.
+- *Upgrade effect.* Memory stored under a raw subject (written by a runtime that does not use this scheme) is not read, so each user starts with an empty memory once. Nothing migrates or deletes that data. Events expire on the memory resource's event expiry, which the service applies to each event when it is written (the AgentCore CLI creates the memory with 30 days unless configured otherwise). Long-term records do not expire by default. The records the runtime saves are written with `BatchCreateMemoryRecords`, which takes a time-to-live only from the request (a strategy-level setting does not apply to batch-written records), and the runtime sends none, so they do not expire ([long-term record TTL](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/long-term-record-ttl.html)). The runtime's IAM role cannot delete records, so an operator removes them with `BatchDeleteMemoryRecords` or `DeleteMemoryRecord`, or by deleting the memory resource. The operator who deploys the upgrade cleans up the orphaned records from an operator or administrator session; the step-by-step commands are in [Clean Up Memory Records Left Under Raw-Subject Actor IDs](docs/DEPLOYMENT_GUIDE.md#clean-up-memory-records-left-under-raw-subject-actor-ids).
+- *Changing the scheme* (the domain prefix or the hash) has the same effect: every user gets a new actor ID.
 
 **AWS Documentation**:
 - [Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-memory.html)
 - [Bedrock Data Protection](https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html)
+
+### Retrieved Memory and the Input Guardrail
+
+The Guardrail's input-side policies do not evaluate retrieved long-term memory.
+Models are attached with `guardrail_latest_message`, so Strands wraps the text
+and image blocks of the latest user message in `guardContent`, and Bedrock then
+evaluates only `guardContent` blocks as input. The AgentCore session manager
+adds retrieved memory to that message as an extra text block, and the backend
+sends that block as plain text, so only the user's own words are input-checked.
+A block is sent unwrapped only when it carries the private marker that the
+session manager sets on the context it injects; a user who types the context tag
+is still input-checked.
+
+Retrieved memory consists of the facts that
+`backend/src/utils/semantic_memory.py` extracts with fixed patterns from the
+user's own messages and stores in that user's namespace: a name of up to two
+words, a game type from a fixed list, fleet or cluster IDs, player counts, and
+similar. The patterns fix each fact's shape but not its length; a name word or
+an ID can be as long as the prompt allows. Extraction is skipped for any turn
+the Guardrail stopped. A local admission check also refuses facts containing
+recognizable account IDs, email addresses, phone numbers, IPv4/IPv6 addresses,
+or `.internal` hostnames. It checks the original spans before any extraction
+pattern can truncate a sensitive value, and checks content again before a memory
+write. Ordinary names and game facts in the same message remain eligible.
+Stored facts are not input-checked again when retrieved on later turns.
+Because the prompt-attack filter is input-only, it never evaluates retrieved memory.
+Each sensitive-information entity and regex in
+`infrastructure/cloudformation/04-bedrock-guardrails.yaml` has one action for
+both directions, and none of them runs on retrieved memory. A `BLOCK` entity
+such as `PASSWORD` stops its turn, so extraction is skipped and it is never
+stored. For `ANONYMIZE` values, the write path refuses any candidate fact that
+carries a value shaped like one: it matches the template's AWS account ID
+(`\b\d{12}\b`) regex and its internal hostname regex with the label bounded at
+the DNS limit of 63 characters (`\b[a-z0-9-]{1,63}\.internal\b`, so a long
+hyphenated message cannot make the scan quadratic), plus
+local approximations of the `EMAIL`, `IP_ADDRESS` (IPv4 addresses, CIDR
+blocks, and IPv6 addresses) and `PHONE` entities, and rejects the fact if a captured value overlaps
+a match anywhere in the message. Retrieved memory therefore carries none of the
+values those patterns recognize. The refusal logs only a count. The residual is
+what the patterns do not recognize: the `USERNAME` entity is model-detected and
+has no local equivalent, so the name capture (`\w+`, up to two words) can store
+a handle such as `player_one42` as a name, and an email, IP or phone value in a
+format the approximations miss can still be stored; such a value reaches the
+model unmasked on later turns. Existing records are not rewritten or rechecked:
+a record stored before these write-time checks existed, including one from a
+turn the Guardrail stopped, reaches the model unscanned on every later turn
+until an operator deletes it with `DeleteMemoryRecord` or
+`BatchDeleteMemoryRecords` (the runtime role cannot delete records).
+The output-side Guardrail policies still evaluate every reply, so anything the
+model repeats from retrieved memory gets the same output
+checks as the rest of the reply. Those checks are not a defense against an
+instruction stored in memory, because the prompt-attack filter does not run on
+output. A per-fact length limit and a system-prompt line that marks retrieved
+memory as data are tracked in #624.
 
 ---
 
@@ -431,9 +540,9 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
                         TRUST BOUNDARY 1               TRUST BOUNDARY 2
                      (Internet → Frontend)         (Frontend → Backend)
                               │                             │
-  ┌──────────┐    HTTPS/TLS   │   ┌──────────────┐  SigV4   │   ┌──────────────────┐
+  ┌──────────┐    HTTPS/TLS   │   ┌──────────────┐  Bearer  │   ┌──────────────────┐
   │  User    │───────────────►│──►│  ECS Express  │─────────►│──►│  Bedrock         │
-  │  Browser │  JWT in cookie  │   │  (Frontend)   │  (IAM)   │   │  AgentCore       │
+  │  Browser │  JWT in cookie  │   │  (Frontend)   │  (JWT)   │   │  AgentCore       │
   └──────────┘                 │   └──────────────┘          │   │  Runtime         │
                                │                             │   └────────┬─────────┘
                                │                             │            │
@@ -457,15 +566,28 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | Boundary | From → To | Mechanism | Details |
 |----------|-----------|-----------|---------|
 | **1** | User → ECS Express (ALB) | **Cognito JWT** | HttpOnly/Secure/SameSite cookies; `CognitoJwtVerifier` validates signature, expiration, and audience. Users must be in `admin` or `users` group. |
-| **2** | ECS Express → AgentCore | **AWS SigV4** | ECS task role signs requests automatically via AWS SDK. No tokens on the wire — signature covers URL, headers, and body. Timestamp prevents replay. |
-| **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with `aws:SourceAccount` condition. Read-only for GameLift, EKS, Cost Explorer. Scoped by region. |
-| **4** | Prompts → Model | **Bedrock Guardrails** | Input/output content filtering: topic blocking, PII anonymization, prompt injection detection, profanity filtering. |
+| **2** | ECS Express → AgentCore | **Cognito JWT (bearer)** | The proxy forwards the end user's verified Cognito **access token** as an `Authorization: Bearer` header over HTTPS (TLS 1.2+). The AgentCore runtime independently verifies the token and reconstructs authority. No SigV4 and no task-role signing — the bearer token is the credential, so the ECS task role needs no `bedrock-agentcore` grant and has no identity policies. |
+| **3** | AgentCore → AWS Services | **IAM Role** | AgentCore execution role assumed by `bedrock-agentcore.amazonaws.com` with an `aws:SourceAccount` condition. Rebuilt from reviewed callers (#482): no AWS managed read policies; scoped Bedrock, AgentCore memory, Cost Explorer / Cost Optimization Hub / Compute Optimizer, GameLift, EKS, EC2, ECR, logs, and X-Ray reads. See **AgentCore Execution Role (Least Privilege)** below. |
+| **4** | Prompts → Model | **Bedrock Guardrails** | Input and output: Personal Advice topic blocking, harmful-content filters, the managed profanity word list, and blocking of AWS access and secret keys, passwords, card numbers, SSNs, and the Kubernetes-secret regex. Output only: anonymization of email, phone, IP address, and username, and the AWS account ID and internal-hostname regexes; user input containing them reaches the model unmasked. Input only: prompt-attack detection. The scope topics (General Programming Help, Entertainment and Casual Chat) block on input only; on output they are detect-only (`OutputAction: NONE`), and a match appears only in the per-request Guardrail trace. See [Guardrail residual risk](#guardrail-residual-risk). |
 
 **Configuration Locations**:
 - Cognito: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 12-73)
 - ECS task role: `infrastructure/cloudformation/01-base-infrastructure.yaml`
-- AgentCore execution role: `infrastructure/cloudformation/01-base-infrastructure.yaml` (lines 145-399)
+- AgentCore execution role: `infrastructure/cloudformation/01-base-infrastructure.yaml` (`AgentCoreExecutionRole`)
 - Guardrails: `infrastructure/cloudformation/04-bedrock-guardrails.yaml`
+
+### Guardrail Residual Risk
+
+The two scope topics (General Programming Help, Entertainment and Casual Chat) block on user input and are detect-only on model output (#530). Valid infrastructure answers (kubectl commands, GameLift Server SDK steps, CloudFormation templates) were being blocked on output as off-topic. Accepted residual risk:
+
+- **Only the latest user message is scope-checked.** The runtime sets `guardrail_latest_message=True`, so tool results, Knowledge Base passages, retrieved long-term memory, and earlier turns are never evaluated by the topic policy. An off-topic answer derived from that content is returned instead of blocked.
+- **Language coverage.** The Guardrail uses the default CLASSIC topic tier, which supports English, French, and Spanish. An off-topic request in another language can pass the input check, and the output check will not catch it.
+- **No user-visible fallback for scope detections on output.** The answer is returned unchanged. Personal Advice, content-filter, PII, and regex blocks still replace the entire response with the blocked-output message.
+- **Detections are not recorded.** A scope-topic match on output appears only in the per-request Guardrail trace. The application does not log or store it.
+- **Anonymize-type values in user input are not masked.** Email, phone, IP address, account ID, and internal hostnames in a user's message reach the model unchanged; anonymization applies to model output. Blocked types (keys, passwords, card numbers, SSNs, the Kubernetes-secret regex) are blocked on input too.
+- **Masked values in generated templates.** `IP_ADDRESS` anonymization rewrites addresses and CIDR ranges in generated templates (for example `0.0.0.0/0` becomes `{IP_ADDRESS}`). Those templates do not deploy as written.
+
+Every other protection is unchanged. `backend/tests/unit/test_guardrail_template_unit.py` pins the whole policy, including topic definitions, examples, and the blocked messages. `backend/tests/fixtures/guardrail_eval_corpus.json` is the evaluation corpus; `backend/tests/integration/test_guardrail_corpus_cloud.py` runs it against a deployed Guardrail with `ApplyGuardrail`.
 
 ### Data Classification by Stage
 
@@ -475,16 +597,163 @@ Game Agent has four trust boundaries. Every hop uses a distinct authentication m
 | Frontend (ECS Express) | JWT claims, validated prompt | **Authenticated** | HttpOnly cookies, Cognito verification |
 | Backend (AgentCore) | Sanitized prompt, user context | **Validated** | Input validation, rate limiting, guardrails |
 | AWS service responses | Fleet/cluster info, costs | **Internal** | IAM-scoped read-only access |
-| Logs (CloudWatch) | Sanitized excerpts | **Redacted** | PII/credentials stripped by `sanitize_log_data()`, encrypted at rest |
-| Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation (`actor_id`), encrypted at rest, TTL-enforced |
+| Logs (CloudWatch) | Request IDs, bounded metrics, outcomes | **Redacted** | No prompt text or raw identifiers; sensitive patterns and control characters stripped by `sanitize_log_data()`/`normalize_log_value()`, correlation via `redact_identifier()`, encrypted at rest |
+| Traces and OpenTelemetry log records | Latency, token counts, model id, finish reason, error type, span structure | **Redacted** | Prompt, response, tool, and system-prompt content redacted by default; the memory namespace INFO line is filtered in a hosted runtime; see Exported Telemetry Content for the memory paths left open |
+| Memory (AgentCore) | Conversation history, user facts | **Personal** | Per-user isolation by a pseudonymous actor ID (a digest of the verified subject, not the subject), encrypted at rest, event expiry |
 
 ### Service-to-Service Credentials
 
-No static credentials (access keys, passwords, tokens) exist in the codebase or deployment configuration. All service-to-service authentication uses IAM roles with automatic credential rotation:
+No static credentials (access keys, passwords, tokens) exist in the codebase or deployment configuration. Service-to-service authentication uses IAM roles with automatic credential rotation, except the frontend→AgentCore hop, which carries the end user's short-lived Cognito access token:
 
-- **ECS Express → AgentCore**: ECS task role (`ecs-tasks.amazonaws.com`) with `aws:SourceAccount` condition
+- **ECS Express → AgentCore**: the user's verified Cognito access token as a bearer token over HTTPS (no SigV4, no task-role grant). The ECS task role (`ecs-tasks.amazonaws.com`, `aws:SourceAccount` condition) has no identity-based permissions; it exists only so ECS can vend task credentials to the container. The supported chat path's one AWS call, `sts:GetCallerIdentity` (to build the runtime ARN), requires no IAM allow, so no policy is attached. The sample ships no in-app account-management route, so the role is never granted Cognito administrator permissions; access is administrator-provisioned with `add-admin-user.sh` or the PowerShell `Add-GameAgentAdmin`.
 - **AgentCore → AWS Services**: AgentCore execution role (`bedrock-agentcore.amazonaws.com`) with `aws:SourceAccount` condition
 - **MCP Servers**: Run as subprocesses via stdio transport (no network access), inherit the AgentCore execution role credentials
+
+### AgentCore Execution Role (Least Privilege)
+
+Issue #482 rebuilt `AgentCoreExecutionRole` from its reviewed callers upward. It
+attaches **no AWS managed read policies** (the former
+`AWSBillingReadOnlyAccess`, `AWSCloudFormationReadOnlyAccess`,
+`CloudWatchReadOnlyAccess`, `CloudWatchLogsReadOnlyAccess`, and
+`CostOptimizationHubReadOnlyAccess` grants allowed reading any log group, stack
+template/parameter, and metric in the account). Every statement below names a
+concrete reviewed caller. For every action except three, that caller worked on
+the prior role, so the rebuild only removes, scopes, or makes explicit what the
+managed policies previously supplied implicitly. The three exceptions are
+read-only: `compute-optimizer:GetEnrollmentStatus` (the Billing MCP
+compute-optimizer tool's enrollment check) and `eks:ListInsights` /
+`eks:DescribeInsight` (the eks-mcp `get_eks_insights` tool). Their callers were
+already offered to the model and failed only because the prior role denied
+them. The rebuild adds **no write capability**. No runtime path reads log
+**content** or deletes memory **records**; the only provider mutations are the
+scoped memory/event writes (including session-event `DeleteEvent` within this
+project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
+`PutItem`.
+
+| Statement | Actions | Caller | Resource scope |
+|-----------|---------|--------|----------------|
+| BedrockModelInvocation | `bedrock:InvokeModel`, `InvokeModelWithResponseStream` | Strands Bedrock model | foundation-model + account inference-profile ARNs |
+| BedrockKnowledgeBaseAccess | `bedrock:Retrieve` | Knowledge Base RAG (`kb_tools.py`) | `knowledge-base/*` |
+| BedrockGuardrailAccess | `bedrock:ApplyGuardrail` | Guardrails on model invocation | `guardrail/*` |
+| BedrockPromptManagementAccess | `bedrock:GetPrompt` | Managed prompts (`optimized_prompts.py`) | `prompt/*` |
+| AgentCoreMemoryAccess | `bedrock-agentcore:CreateEvent`, `GetEvent`, `ListEvents`, `DeleteEvent`, `RetrieveMemoryRecords`, `BatchCreateMemoryRecords` | Strands session manager (STM events) + `semantic_memory.py` (LTM write/retrieve) | `memory/gameagent*` |
+| CostExplorerReadAccess | `ce:GetCostAndUsage`, `GetCostForecast`, `aws-portal:ViewBilling` | Owned deterministic report + Billing MCP cost forecast | `*` (global endpoint) |
+| CostOptimizationHubReadAccess | `cost-optimization-hub:ListRecommendationSummaries`, `ListRecommendations`, `GetRecommendation` | Billing MCP cost-optimization | `*` (global; no resource type) |
+| ComputeOptimizerReadAccess | `compute-optimizer:GetEC2InstanceRecommendations`, `GetAutoScalingGroupRecommendations`, `GetEnrollmentStatus` | Billing MCP compute-optimizer (EC2 + Auto Scaling rightsizing, and its enrollment probe) | `*` + `aws:RequestedRegion` (regional service, no resource type) |
+| AutoScalingReadAccess | `autoscaling:DescribeAutoScalingGroups`, `DescribeAutoScalingInstances` | Compute Optimizer Auto Scaling dependent reads | `*` + `aws:RequestedRegion` (no resource type) |
+| GameLiftReadAccess | 10 reviewed `gamelift:List*/Describe*` ops | GameLift specialist | `*` + `aws:RequestedRegion` (no fleet-ARN scoping for collection/capacity reads) |
+| EKSReadAccess | `eks:ListClusters`, `DescribeCluster`, `List/DescribeNodegroup(s)`, `List/DescribeFargateProfile(s)`, `List/DescribeAddon(s)`, `ListInsights`, `DescribeInsight` | aws-api-mcp `call_aws` + eks-mcp (including `get_eks_insights`) | `*` + `aws:RequestedRegion` (dynamic cluster names) |
+| EC2ReadAccess | `ec2:DescribeInstances` | Compute Optimizer EC2 dependent read | `*` + `aws:RequestedRegion` (EC2 describes have no resource type) |
+| ECRImageAccess | `ecr:BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability` | container-mode image pull | `repository/bedrock-agentcore-gameagentruntime` |
+| ECRTokenAccess | `ecr:GetAuthorizationToken` | container-mode registry auth | `*` + `aws:RequestedRegion` (no resource type) |
+| ObservabilityAccess | `logs:CreateLogGroup/CreateLogStream/PutLogEvents`, `DescribeLogStreams` (this runtime's `runtimes/gameagentruntime-*` group only), `DescribeLogGroups` (metadata), `cloudwatch:GetMetricData`, `xray:PutTraceSegments/PutTelemetryRecords/GetSamplingRules/GetSamplingTargets` | Runtime logging, eks-mcp metrics, ADOT/X-Ray | runtime log groups; `DescribeLogStreams` scoped to `runtimes/gameagentruntime-*`; `log-group:*` for `DescribeLogGroups` metadata only; `*` + `aws:RequestedRegion` for GetMetricData; `*` for X-Ray |
+| CostReportSnapshotStoreAccess | `dynamodb:GetItem`, `PutItem` | Shared cost-report snapshot store (#365) | snapshot table ARN |
+
+Two opt-in Source Control Connector policies are added only by template
+conditions, so a default deployment carries neither (see
+[SOURCE_CONTROL_CONNECTOR.md](docs/SOURCE_CONTROL_CONNECTOR.md)):
+
+| Policy (condition) | Actions | Caller | Resource scope |
+|--------------------|---------|--------|----------------|
+| ScmReadCredentialAccess (`ScmReadCredentialActive`: connector enabled and a read-credential ARN set) | `secretsmanager:GetSecretValue` | Connector provider adapter, read token fetch | the one `ScmReadCredentialSecretArn` |
+| ScmAuditLogAccess (`ScmAuditLogGroupConfigured`) | `logs:CreateLogStream`, `PutLogEvents` | Connector durable audit sink | the dedicated `ScmAuditLogGroup` and its streams |
+
+`test_agentcore_least_privilege_iam_unit.py` pins both: each policy's
+condition, its exact statements, and an empty false branch.
+
+**Justification for remaining account-scoped (`Resource: '*'`) reads.** Two
+distinct reasons apply, and the role never mixes them silently:
+
+*Actions with no resource-level scoping in the AWS Service Authorization
+Reference, or that address a global endpoint:*
+
+- **Cost Explorer** (`ce:GetCostAndUsage`, `ce:GetCostForecast`, with their
+  dependent `aws-portal:ViewBilling`) and **Cost Optimization Hub** — global
+  us-east-1 endpoints; no `aws:RequestedRegion` condition is applied and the SAR
+  exposes no per-report resource type. `aws-portal:ViewBilling` is listed by the
+  SAR operation table as a dependent action of every Cost Explorer read; it was
+  previously supplied only by the now-removed `AWSBillingReadOnlyAccess` managed
+  policy.
+- **`cloudwatch:GetMetricData`**, **`ecr:GetAuthorizationToken`**, and **X-Ray
+  sampling/put** — no scopable resource type. GetMetricData and the ECR token
+  are additionally constrained with an `aws:RequestedRegion` condition (their
+  only callers run in the deployment region); the ECR token is implicitly scoped
+  to the caller's own registry.
+- **`logs:DescribeLogGroups` on `log-group:*`** — returns only group metadata
+  (names/ARNs), never log content; required by the AgentCore toolkit for group
+  discovery and is the only log read on the account-wide resource.
+- **EC2** `DescribeInstances` — no resource-type support; constrained by an
+  `aws:RequestedRegion` condition.
+- **Compute Optimizer** `GetEC2InstanceRecommendations` /
+  `GetAutoScalingGroupRecommendations` / `GetEnrollmentStatus` and the
+  **Auto Scaling** describes
+  (`DescribeAutoScalingGroups`, `DescribeAutoScalingInstances`) — no resource
+  types; constrained by an `aws:RequestedRegion` condition.
+
+*Actions that DO support ARNs but use `*` because the resource names are dynamic
+and account-owned, constrained instead by an `aws:RequestedRegion` condition to
+the deployment region:*
+
+- **GameLift** `DescribeContainerFleet`, `DescribeContainerGroupDefinition`, and
+  `DescribeScalingPolicies` support ARNs, but fleet/definition names are created
+  at runtime; the collection and capacity reads (`List*`, `DescribeFleetCapacity`,
+  `DescribeFleetUtilization`) have no ARN scoping at all.
+- **EKS** per-resource reads support an ARN of the matching resource type
+  (`DescribeCluster` a `cluster*` ARN; `DescribeNodegroup`, `DescribeFargateProfile`,
+  and `DescribeAddon` their nodegroup, fargateprofile, and addon ARNs), but those
+  names are dynamic. Among the `List*` reads, only `ListClusters` has no resource
+  type; `ListNodegroups`, `ListFargateProfiles`, and `ListAddons` take a `cluster`
+  ARN but use `*` because cluster names are created at runtime, constrained
+  instead by the `aws:RequestedRegion` condition. The Insights reads
+  (`ListInsights`, `DescribeInsight`) also take a `cluster` ARN and use `*` for
+  the same reason.
+
+> **Region narrowing (behavior change from the prior role).** On the prior role
+> the Compute Optimizer and Auto Scaling grants carried no region condition (the
+> latter came unconditioned from `CloudWatchReadOnlyAccess`), so a model-supplied
+> `region` could run rightsizing in another region. The reviewed role constrains
+> both to the deployment region, matching the single-region posture of the
+> GameLift and EKS reads. Cross-region rightsizing is no longer available.
+
+**Not granted (pre-existing gaps).** These actions were either never granted on
+the prior role, or had a reviewed caller that never actually worked on it, so
+adding them now would expand provider capability and is out of scope for the
+least-privilege rebuild. The three reads named above were granted after their
+denials were observed and reviewed for issue #583; each action below still
+needs its own review before it is granted. Each is tracked as a follow-up, with
+its runtime impact:
+
+- `ce:GetUsageForecast` — the Billing MCP cost-explorer **usage** forecast.
+  `AWSBillingReadOnlyAccess` carried no forecast action, so usage forecasts never
+  worked on the prior role; only cost forecasts (`ce:GetCostForecast`) are
+  granted. Impact: the operation is removed from the model-visible catalog by the
+  Billing MCP guard, and is denied if called.
+- EBS and Lambda rightsizing — the Billing MCP compute-optimizer
+  `GetEBSVolumeRecommendations` / `GetLambdaFunctionRecommendations` operations
+  and their SAR-dependent reads (`ec2:DescribeVolumes`, `lambda:ListFunctions`,
+  `lambda:ListProvisionedConcurrencyConfigs`) never worked. Impact: these two
+  rightsizing categories are off the reviewed surface and are removed from the
+  model-visible catalog by the Billing MCP guard.
+- `eks-mcpserver:QueryKnowledgeBase` (the EKS troubleshooting-guide search tool).
+  Impact: the troubleshooting-guide search returns nothing / fails.
+- `get_eks_vpc_config` (the eks-mcp VPC tool) is **wholly non-functional**: it
+  reads VPCs, subnets, **and** route tables in one error path, and
+  `ec2:DescribeRouteTables` was never granted, so the whole tool always failed.
+  Its `ec2:DescribeVpcs` / `ec2:DescribeSubnets` reads therefore had no working
+  caller and are not granted; restoring the tool needs all three EC2 reads (or a
+  decision to remove the tool). Impact: any VPC-config request fails.
+- `cloudwatch:PutMetricData` (namespace `bedrock-agentcore`) and
+  `logs:PutResourcePolicy` — listed by the AgentCore direct-deploy execution-role
+  documentation but granted by neither the prior nor the reviewed role. Impact:
+  if the platform ever emits these, they would be denied; no reviewed caller
+  needs them today.
+
+**Container-fallback ECR grant.** The deployed runtime uses AgentCore
+`direct_code_deploy` and pulls no image, but the toolkit prints a warning and
+continues with container deployment when `zip` is unavailable (e.g. the
+native-Windows PowerShell path). The scoped ECR pull/auth grant is retained so
+that fallback keeps working; making the Windows path force `direct_code_deploy`
+would let the grant be dropped later.
 
 ---
 
@@ -605,21 +874,64 @@ When a CI/CD pipeline is introduced, the existing scripts (`scripts/generate-sbo
 
 ### Network Binding Configuration
 
-**AgentCore Runtime 0.0.0.0 Binding:**
+**Local development binds to loopback (`127.0.0.1`).**
 
-Game Agent's AgentCore Runtime binds to `0.0.0.0:8080` to accept external connections. This is an **intentional design requirement** for the following reasons:
+Local development enables an identity-verification bypass
+(`GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true`, set by `scripts/dev/start.sh`) so a
+developer can exercise the runtime without Cognito. Because that backend is
+unauthenticated, it must not be reachable from other machines: local execution
+always binds to `127.0.0.1`. A machine that could reach a non-loopback bind
+would be able to invoke agents using the developer's active AWS credentials.
+There is no host or port override — the listen address is decided solely by
+the runtime mode, and the port is the fixed AgentCore platform port `8080`.
 
-- **AgentCore Architecture**: AWS Bedrock AgentCore Runtime requires binding to all interfaces (`0.0.0.0`) to accept connections from the AWS-managed infrastructure
-- **Container Environment**: The application runs in a containerized environment where `0.0.0.0` binding is necessary for proper network routing
-- **Security Controls**: Network access is protected by multiple layers:
-  - AWS-managed VPC with security groups
-  - ECS Express service-level access controls
-  - Amazon Cognito authentication (production mode)
-  - WAF rate limiting and attack protection
+The bind decision is made in one place — `resolve_runtime_host()` in
+`backend/src/config/settings.py` — and both entrypoints
+(`backend/src/agentcore_main.py` and the thin wrapper
+`backend/agentcore_main.py`) call the shared `run_server()`, so they cannot
+diverge.
 
-**Configuration Location**: `backend/src/agentcore_main.py` and `backend/agentcore_main.py`
+**Hosted AgentCore Runtime binds to all interfaces (`0.0.0.0`) — intentionally.**
 
-**Security Scanners**: Tools like Bandit (B104) and Semgrep may flag `0.0.0.0` binding as a potential security risk. This is a false positive in the context of AgentCore Runtime's architecture.
+The hosted runtime selects the all-interface bind through an explicit
+condition (`GBAW_HOSTED_RUNTIME=true`). Inside the AWS-managed AgentCore
+container the port is **not published** to the host or the internet, so the
+in-container `0.0.0.0` bind is not exposure — it lets the AWS-managed container
+network route to the application. Narrowing it would break that routing. The
+real boundary is the unpublished container network plus the AgentCore JWT
+verifier (a Cognito access token checked per request), backed by:
+
+- AWS-managed VPC with security groups
+- ECS Express service-level access controls
+- Amazon Cognito authentication (verified per request in application code)
+- WAF rate limiting and attack protection
+
+**Fail-closed invariant (defense-in-depth).** The all-interface bind is never
+granted while the identity bypass is active. If `GBAW_HOSTED_RUNTIME=true` is
+combined with `GBAW_ALLOW_LOCAL_IDENTITY_BYPASS=true`, `resolve_runtime_host()`
+raises `RuntimeBindError` and the process refuses to start. This is a
+config-drift guard rather than the sole barrier to exposure: `invoke_agent`
+already disregards the bypass whenever `GBAW_HOSTED_RUNTIME=true` (it computes
+`ALLOW_LOCAL_IDENTITY_BYPASS and not HOSTED_RUNTIME`), so the per-request
+Cognito JWT verifier runs in hosted mode regardless of the bypass flag.
+Refusing the contradictory combination at startup keeps a drifted configuration
+from taking effect silently. The deployment selectors set the hosted flag and
+never set the bypass, so hosted configuration cannot reach this combination.
+
+| Mode | Selector | Bind | Boundary |
+|------|----------|------|----------|
+| Local development | default (bypass on) | `127.0.0.1` | Loopback only — not reachable off-host |
+| Hosted AgentCore | `GBAW_HOSTED_RUNTIME=true`, bypass off | `0.0.0.0` | Unpublished container network + per-request JWT verifier |
+| Hosted + bypass | contradictory (config drift) | refuses to start | Fail-closed guard (`RuntimeBindError`); hosted mode ignores the bypass anyway |
+
+**Configuration Location**: `backend/src/config/settings.py` (`resolve_runtime_host`),
+`backend/src/agentcore_main.py` (`run_server`), and `backend/agentcore_main.py`.
+
+**Security Scanners**: Tools like Bandit (B104) and Semgrep may flag the
+`0.0.0.0` constant used for the hosted container bind. In that hosted,
+port-unpublished context it is a false positive; the local default is loopback.
+The constant is annotated `# nosec B104` at its single definition with a
+reference to `resolve_runtime_host`.
 
 **AWS Documentation**:
 - [Amazon ECS Security](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/security.html)
@@ -630,6 +942,66 @@ Game Agent's AgentCore Runtime binds to `0.0.0.0:8080` to accept external connec
 - CloudTrail logs all AWS API calls
 - CloudWatch logs all application activity
 - Logs retained per compliance requirements
+
+### Application Log Minimization
+
+Application logs are limited to request/correlation IDs, bounded metrics, and
+operation outcomes. They do not contain prompt text, extracted names,
+semantic-memory content, email addresses, display names, raw Cognito subjects,
+or raw session/thread identifiers.
+
+- Agents run without the default Strands stdout printer
+  (`callback_handler=None`), so streamed model text and tool names are not
+  written to stdout, which the hosted runtime ships to its log group. A static
+  test checks every `Agent(...)` construction.
+- Correlation uses a per-request ID. The backend binds the AgentCore runtime
+  request ID into every log record for the duration of an invocation, so lines
+  from one request can be correlated without any raw identifier. A value that
+  must stay tied to a principal or session across lines is emitted as a
+  bounded, non-reversible token: `redact_identifier()`
+  (`backend/src/utils/security.py`, a keyed HMAC-SHA-256 prefix over a random
+  per-process key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
+  the frontend. The HMAC key is random per process and is never read from the
+  environment, so a token is stable only within a single process and does not
+  correlate across processes, restarts, or tiers. The frontend additionally
+  records AgentCore's service request ID from the `x-amzn-RequestId` response
+  header, which identifies the invocation to the service (for example in a
+  support case). It comes from a different header than the request ID the
+  runtime container logs, so the two are not known to match and it is treated
+  as a service-call identifier rather than a cross-tier correlation key. It is
+  not derived from caller identity or content and is logged normalized rather
+  than redacted.
+- Externally influenced fields are normalized before emission so carriage
+  returns, line feeds, other C0/C1/DEL control characters, the Unicode line and
+  paragraph separators, and bidirectional-formatting controls cannot inject
+  additional log records or reorder a rendered line. The backend normalizes
+  every record at the logging sink (`normalize_log_value()` applied by the
+  logger patcher in `backend/src/utils/logger.py`); the frontend logger strips
+  the same classes in `logInfo`, `logWarning`, `logError`, `logDebug`, and
+  `redact`.
+- The AgentCore SDK installs its own log handler whose formatter would emit the
+  raw runtime session ID on every invocation. `agentcore_main` wraps that
+  formatter so the serialized `sessionId` is replaced with a bounded token while
+  `requestId` is preserved.
+- Semantic-memory logging records only outcomes and counts.
+- The request-handling error paths that can see prompt or identity values — the
+  AgentCore entrypoint, the orchestrator (including the model-loop failure over
+  the user prompt), the specialists, agent timing, and semantic memory — record
+  the exception class name, a typed, sanitized error code, the request ID, and a
+  bounded list of `module:function:lineno` raise-site frames (no message,
+  locals, arguments, source text, or file paths) through
+  `log_sanitized_exception()`, never the exception message, which can embed a
+  provider validation payload or caller value. The raise-site frames restore
+  bug triage without reintroducing caller- or provider-authored content, and the
+  frame count and each component are bounded so a deep stack cannot produce an
+  unbounded line. The full rendered traceback is emitted only when debug logging
+  is explicitly enabled (a non-production switch). Separately governed diagnostic
+  paths that cannot carry prompt or identity values do retain the exception
+  message to classify the failure: startup credential and container pre-warm
+  checks and the memory-ID config read in `agentcore_main`, the GameLift
+  specialist's AWS SDK describe/list calls, the Cost Explorer diagnostic path,
+  the cost-report snapshot store's DynamoDB failure paths, and the Bedrock Prompt
+  Management load fallback.
 
 ### Secrets Management
 
@@ -651,7 +1023,16 @@ Game Agent's AgentCore Runtime binds to `0.0.0.0:8080` to accept external connec
 
 - User data isolated per actor_id
 - Memory can be cleared via API (`/api/memory/clear`)
-- No PII stored in logs (filtered by guardrails)
+- No PII in application log messages (prompt text and identifiers excluded; see
+  Application Log Minimization). Distributed-trace span content is governed
+  separately: by default the startup telemetry guard redacts prompt, response,
+  system-prompt, and tool content from exported spans and OpenTelemetry log
+  records (`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=false` and an
+  empty `gen_ai_unredacted_attributes=` allowlist in
+  `OTEL_SEMCONV_STABILITY_OPT_IN`), and excludes the MCP instrumentor that would
+  record tool arguments and results. See Exported Telemetry Content for the
+  enforced paths, the non-production opt-in, and the residual identifiers that
+  remain.
 
 ### SOC 2 / ISO 27001
 
@@ -662,6 +1043,51 @@ Game Agent's AgentCore Runtime binds to `0.0.0.0:8080` to accept external connec
 
 **AWS Compliance Programs**:
 - [AWS Compliance Programs](https://aws.amazon.com/compliance/programs/)
+
+---
+
+## Account-Wide Observability Blast Radius
+
+X-Ray Transaction Search depends on account-wide, cross-application settings — the
+X-Ray trace segment destination, the default X-Ray indexing (sampling) rule, and a
+shared CloudWatch Logs resource policy on the AWS-reserved `aws/spans` log group.
+Changing them affects every X-Ray and Transaction Search consumer in the account,
+so this project treats them as a blast-radius concern:
+
+- **This repository's own setup is opt-in and read-only by default.**
+  `scripts/infrastructure/setup-account-observability.sh` (and the
+  `Invoke-GameAgentAccountObservability` PowerShell function) make no account-wide
+  change unless the operator sets `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true`
+  (PowerShell `-ConfigureAccountObservability`). They read existing state first,
+  enable Transaction Search additively (never a disable/re-enable toggle), and refuse
+  to write when a state they need cannot be read, rather than guessing.
+- **`agentcore launch` is a separate source of account-wide change.** When runtime
+  observability is enabled (the setting that also selects the
+  `opentelemetry-instrument` entrypoint), the AgentCore starter toolkit (0.3.11)
+  runs its own `enable_transaction_search_if_needed` step on every launch. Version
+  0.3.11 has no flag to keep the OTEL entrypoint while skipping only that account
+  step. The deployment therefore runs a **read-only preflight before every
+  `agentcore launch`** that predicts, using the toolkit's own conditions, which
+  account-wide settings the toolkit would change — a `TransactionSearchXRayAccess`
+  resource policy (name-only check), the trace segment destination, and the shared
+  `Default` X-Ray indexing rule, which the toolkit sets to 1% via
+  `UpdateIndexingRule`. The preflight prints either a single no-change line or the
+  per-item detail with a prominent warning and only the relevant cleanup commands.
+  A read failure is reported as **unknown** (a possible change), never as "no
+  change"; the toolkit writes on doubt, so the warning states that for each unknown
+  item it will perform the write. The default deploy is non-blocking; operators who
+  require no shared account change set the fail-closed
+  `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` (PowerShell
+  `-StopOnAccountObservabilityChange`), which halts the deploy before launch when
+  the toolkit would — or might — change account-wide settings. Only the exact value
+  `true` enables it (`TRUE`, `1`, and empty are treated as off in both shells).
+  Note that the toolkit checks for a policy named literally
+  `TransactionSearchXRayAccess`, so it adds its own policy even when this project's
+  `GameAgentTransactionSearchXRayAccess` policy already grants the access.
+
+See [Deployment Guide — Account-wide Observability](docs/DEPLOYMENT_GUIDE.md#account-wide-observability-scoped-and-opt-in)
+and the launch-time exception section that follows it for the full behavior,
+warning text, and rollback commands.
 
 ---
 

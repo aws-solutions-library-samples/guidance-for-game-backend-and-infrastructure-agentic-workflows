@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-AGENTCORE_CONFIG="backend/.bedrock_agentcore.yaml"
+AGENTCORE_CONFIG="${GBAW_AGENTCORE_CONFIG_FILE:-backend/.bedrock_agentcore.yaml}"
 
 # Resolve AWS profile from environment or ui/.env.local (same as backend settings.py)
 if [ -z "$AWS_PROFILE" ]; then

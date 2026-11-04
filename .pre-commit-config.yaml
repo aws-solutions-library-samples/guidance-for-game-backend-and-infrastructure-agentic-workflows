@@ -28,6 +28,7 @@ repos:
         additional_dependencies:
           - types-boto3
           - types-requests
+          - types-cachetools
 
   # TypeScript/JavaScript linting
   - repo: https://github.com/pre-commit/mirrors-eslint

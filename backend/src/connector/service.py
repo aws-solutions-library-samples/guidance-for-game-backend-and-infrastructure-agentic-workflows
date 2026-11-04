@@ -24,15 +24,17 @@ Read_Path_Contract_278 seam (:func:`_read_path_context`) — never from tool/mod
 from __future__ import annotations
 
 # Standard library
+import contextvars
 import posixpath
 from datetime import datetime, timedelta, timezone
+from time import sleep as _sleep
 from typing import TYPE_CHECKING, Sequence
 
 # Local modules
 from connector.audit import AuditSink
 from connector.config import AuthorizationPolicy, Decision, SourceControlConfig
 from connector.models import FileFetchResult
-from connector.provider import ProviderError, ProviderTransientError
+from connector.provider import MAX_PROVIDER_RETRY_DELAY_SECONDS, ProviderError, ProviderTransientError
 from connector.registry import get_provider
 from utils.logger import logger
 from utils.request_context import get_request_context
@@ -51,6 +53,10 @@ __all__ = ["read_iac_files"]
 
 # The rate-limit endpoint label for per-requester READ limiting.
 _RATE_LIMIT_ENDPOINT = "scm_read"
+
+# Retry delays are intentionally internal and bounded: no deployment/configuration surface is
+# added for this hardening, and an untrusted provider header cannot stall the tool indefinitely.
+_PROVIDER_RETRY_BASE_DELAY_SECONDS = 0.5
 
 
 class PathTraversalError(ValueError):
@@ -76,10 +82,14 @@ class PathTraversalError(ValueError):
 # reads reuse one boto3 client and its chained sequence token. ``_active_config`` holds the
 # config resolved by the current ``read_iac_files`` call so the signature-stable ``_audit``
 # helper can reach ``config.connector.audit_log_group`` without threading it through every
-# call site. Tests may monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to
-# inject a fake sink.
+# call site. It is a :class:`~contextvars.ContextVar` rather than a plain module global so a
+# per-request (or injected) config is isolated to the calling context — concurrent reads on
+# the same worker (async tasks or threads) never observe each other's config. Tests may
+# monkeypatch ``_get_audit_sink`` (or call ``_reset_audit_sinks``) to inject a fake sink.
 _audit_sinks: dict[str, AuditSink] = {}
-_active_config: SourceControlConfig | None = None
+_active_config: contextvars.ContextVar[SourceControlConfig | None] = contextvars.ContextVar(
+    "scm_active_config", default=None
+)
 
 
 def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
@@ -103,9 +113,8 @@ def _get_audit_sink(config: SourceControlConfig | None) -> AuditSink | None:
 
 def _reset_audit_sinks() -> None:
     """Clear the cached sinks and active config (test hook)."""
-    global _active_config
     _audit_sinks.clear()
-    _active_config = None
+    _active_config.set(None)
 
 
 def _resolve_config(config: SourceControlConfig | None) -> SourceControlConfig:
@@ -246,7 +255,7 @@ def _audit(level: str, message: str, /, **fields: object) -> bool:
     except Exception:  # noqa: BLE001 - local logging must never affect the read
         pass
 
-    sink = _get_audit_sink(_active_config)
+    sink = _get_audit_sink(_active_config.get())
     if sink is None:
         return False
     event = {"message": message, "level": level, **safe_fields}
@@ -300,7 +309,9 @@ def _fetch_files_with_retry(
 
     A :class:`~connector.provider.ProviderTransientError` (provider rate limits, temporary
     5xx/unavailability, read timeouts) is safe to repeat for a read, so it is retried up to
-    ``max_attempts`` total calls before the final failure propagates. Every other exception —
+    ``max_attempts`` total calls before the final failure propagates. Before each retry the
+    service applies bounded exponential backoff and honors a longer sanitized provider delay
+    up to :data:`~connector.provider.MAX_PROVIDER_RETRY_DELAY_SECONDS`. Every other exception —
     including :class:`~connector.provider.ProviderAuthError` (credential rejected; retrying
     cannot help) and any permanent validation failure — propagates on the first raise with no
     retry, so the read still fails closed. ``max_attempts`` is the connector's configured
@@ -315,13 +326,24 @@ def _fetch_files_with_retry(
             last_exc = exc
             if attempt >= attempts:
                 raise
+            exponential_delay = min(
+                _PROVIDER_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+                MAX_PROVIDER_RETRY_DELAY_SECONDS,
+            )
+            provider_delay = getattr(exc, "retry_after_seconds", None)
+            retry_delay = min(
+                max(exponential_delay, provider_delay or 0.0),
+                MAX_PROVIDER_RETRY_DELAY_SECONDS,
+            )
             logger.warning(
                 "IaC file read: transient provider failure, retrying",
                 event="scm_read",
                 action="read",
                 attempt=attempt,
                 max_attempts=attempts,
+                retry_delay_seconds=retry_delay,
             )
+            _sleep(retry_delay)
     # Unreachable: the loop either returns, or re-raises on the final attempt.
     raise last_exc  # type: ignore[misc]  # pragma: no cover
 
@@ -375,11 +397,37 @@ def read_iac_files(
     omit them so the validated config is loaded and the concrete read adapter selected
     automatically.
     """
-    global _active_config
     resolved_config = _resolve_config(config)
-    # Publish the resolved config so the signature-stable ``_audit`` helper can reach the
-    # durable sink's audit log group.
-    _active_config = resolved_config
+    # Bind the resolved config for exactly this read. Reset the matching token in a
+    # ``finally`` so every early return, terminal provider exception, and nested/reentrant
+    # invocation restores the caller's previous audit target.
+    active_config_token = _active_config.set(resolved_config)
+    try:
+        return _read_iac_files_resolved(
+            paths,
+            repository=repository,
+            target_branch=target_branch,
+            resolved_config=resolved_config,
+            reader=reader,
+        )
+    finally:
+        _active_config.reset(active_config_token)
+
+
+def _read_iac_files_resolved(
+    paths: list[str],
+    *,
+    repository: str | None,
+    target_branch: str | None,
+    resolved_config: SourceControlConfig,
+    reader: "SourceControlReader | None",
+) -> FileFetchResult:
+    """Execute one read while the public wrapper owns active-config lifecycle."""
+    # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
+    # context, never from model/tool input. Resolve them before path normalization so even
+    # an unsafe-path rejection can be attributed to the trusted requester and scope.
+    user_id, groups, tenant, workspace = _read_path_context()
+    requester = user_id or "anonymous"
 
     # Normalize each requested path BEFORE the count check, authorization, and any read so
     # every downstream stage operates on the canonical form. A path that attempts to escape
@@ -394,16 +442,13 @@ def read_iac_files(
             event="scm_read",
             action="read",
             outcome="rejected",
+            requester=requester,
+            tenant=tenant,
+            workspace=workspace,
             reason="path_invalid",
             detail=exc.reason,
         )
         return FileFetchResult(files=(), missing=(), limit_exceeded=False)
-
-    # Identity, tenant, workspace, and groups come ONLY from the trusted #278 request
-    # context, never from model/tool input. Resolved before the file-count check so the
-    # rejection audit can name the requester/tenant/workspace.
-    user_id, groups, tenant, workspace = _read_path_context()
-    requester = user_id or "anonymous"
 
     # Reject an over-limit request BEFORE contacting the provider. This is a policy
     # rejection, so it is written to the durable audit sink (requester/tenant/workspace/
