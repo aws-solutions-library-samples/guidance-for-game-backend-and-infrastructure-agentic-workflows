@@ -137,6 +137,29 @@ def pytest_collection_modifyitems(config, items):
 
 
 @pytest.fixture(autouse=True)
+def _remove_memory_client_filter_after_each_test():
+    """Remove the telemetry guard's memory-client filter a test may have installed.
+
+    ``apply_trace_content_guard`` installs the filter process-wide when the
+    environment marks a hosted runtime. Tests normally run without that flag, but
+    a shell that exports it would otherwise leave the filter on the SDK logger for
+    the rest of the session. The filter is removed after the test, so it is still
+    in place for any assertion the test makes about it.
+    """
+    yield
+    # Standard library
+    import logging
+
+    # Local modules
+    from config.telemetry_guard import MEMORY_CLIENT_LOGGER_NAME, _MemoryClientInfoFilter
+
+    target = logging.getLogger(MEMORY_CLIENT_LOGGER_NAME)
+    for flt in list(target.filters):
+        if getattr(flt, "marker", None) == _MemoryClientInfoFilter.marker:
+            target.removeFilter(flt)
+
+
+@pytest.fixture(autouse=True)
 def mock_all_mcp_and_agents(request):
     """
     Comprehensively mock all MCP clients and agents to prevent real calls.
@@ -210,6 +233,35 @@ def mock_all_mcp_and_agents(request):
 
         mock_get_server.return_value = mock_client
         yield mock_client
+
+
+@pytest.fixture(autouse=True)
+def confirmed_audit_sink(request):
+    """Provide a confirming in-memory audit sink to connector unit tests by default.
+
+    The connector now routes every audit entry through a durable, confirmed CloudWatch Logs
+    sink (``connector.audit.AuditSink``); a terminal ``propose_change`` outcome is only
+    reported when the audit write is confirmed (Req 13.2, 13.3). Unit tests must never touch
+    AWS, so unless a test installs its own sink, ``connector.service.propose_change`` is given
+    a confirming in-memory sink here — mirroring the durable-logger behavior the suite relied
+    on before. Tests that exercise audit-write success/failure semantics patch
+    ``connector.service._get_audit_sink`` themselves, which overrides this default within
+    their own context. Integration/cloud/e2e tests are excluded so real wiring is exercised.
+    """
+    if request.keywords.get("integration") or request.keywords.get("cloud") or request.keywords.get("e2e"):
+        yield
+        return
+
+    class _ConfirmingAuditSink:
+        def write(self, event):
+            return True
+
+    try:
+        with patch("connector.service._get_audit_sink", return_value=_ConfirmingAuditSink()):
+            yield
+    except Exception:
+        # connector.service may not be importable in some minimal environments; never block.
+        yield
 
 
 @pytest.fixture

@@ -25,6 +25,17 @@ import boto3
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Local modules
+from config.telemetry_guard import apply_trace_content_guard
+
+# Keep model and tool content out of exported telemetry before any tracer is
+# built. This runs at import, ahead of prewarm_container() and the first Strands
+# Tracer, so the hosted default redacts prompt/response/system-prompt content in
+# spans and OpenTelemetry log records regardless of the deploy environment. An
+# operator can opt into capture for non-production debugging via
+# GBAW_CAPTURE_TRACE_CONTENT; see config/telemetry_guard.py and SECURITY.md.
+_TRACE_CONTENT_DECISION = apply_trace_content_guard()
+
 # Third-party packages
 from bedrock_agentcore.runtime import BedrockAgentCoreApp  # type: ignore[import-untyped]
 
@@ -56,6 +67,7 @@ from config.settings import (
 )
 from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
 from utils.logger import _REQUEST_ID_VAR, logger
+from utils.request_context import reset_request_context, set_request_context
 from utils.response_parser import ResponseParser
 from utils.security import (
     InputValidationError,
@@ -166,6 +178,36 @@ _CREDENTIALS_OK = validate_aws_credentials()
 prewarm_container()
 
 app = BedrockAgentCoreApp()
+
+
+def _log_trace_content_posture(decision, log) -> None:
+    """Log the exported-telemetry content posture. No content values are logged.
+
+    A clean redacting run reports that exported telemetry carries no content. A
+    run with skipped guard paths reports, at WARNING, that redaction is
+    incomplete and names the open paths rather than claiming no content. The
+    opt-in reports that content capture is enabled.
+    """
+    if decision.capture_enabled:
+        log.warning(
+            "⚠️ Trace content capture is ENABLED (GBAW_CAPTURE_TRACE_CONTENT opt-in). "
+            "For non-production use only: exported spans and OpenTelemetry log records "
+            "may carry prompt and response content."
+        )
+    elif decision.skipped_paths:
+        open_paths = "; ".join(decision.skipped_paths)
+        log.warning(
+            "⚠️ Trace content redaction incomplete: "
+            f"{len(decision.skipped_paths)} guard path(s) were skipped, so some exported telemetry "
+            "may carry content or identifiers that the skipped path would remove, until fixed. "
+            f"Open path(s): {open_paths}"
+        )
+    else:
+        log.info("🔒 Trace content redaction active: exported telemetry carries no prompt or response content")
+
+
+# Record the exported-telemetry content posture (no content values are logged).
+_log_trace_content_posture(_TRACE_CONTENT_DECISION, logger)
 
 
 def _current_request_id() -> str:
@@ -345,6 +387,16 @@ def invoke_agent(prompt, context=None):
             logger.info(f"📦 Prompt type: {type(prompt)}")
 
         # Security: Validate and sanitize input
+        #
+        # TRUST BOUNDARY (PR #319 finding F2 / PR #320): the requester, tenant, workspace,
+        # and groups in `user_context` are the VERIFIED frontend identity forwarded to this
+        # AgentCore runtime entry. `validate_user_context` only allow-lists the permitted
+        # keys and sanitizes their values (length/type) — it does NOT itself re-verify the
+        # origin or authenticity of that identity. The validated values are what get placed
+        # into the request context below (`set_request_context`) and are the ONLY identity
+        # the downstream Source Control Connector authorization gate trusts. Therefore this
+        # runtime endpoint must remain reachable only via that verified boundary; a caller
+        # that could invoke it directly would be trusted as the forwarded principal.
         logger.info("🔒 Security: Validating input...")
         try:
             user_prompt = validate_prompt(user_prompt, strict_mode=False)
@@ -429,6 +481,14 @@ def invoke_agent(prompt, context=None):
         # body claims cannot elevate or replace them.
         agent_context = {
             "user_id": persistent_user_id,
+            # Hosted-authority fields are reconstructed from the VERIFIED runtime
+            # identity (validated JWT + deployment bindings), never from spoofable
+            # agent/model input. Top-level groups/scopes carry the validated claims
+            # into the request contextvar so downstream components (e.g. the Source
+            # Control Connector authorization gate, which reads ctx.get("groups"))
+            # resolve real membership; they fall back to the validated user_context
+            # only when no verified identity is present, and default to empty so the
+            # gate fails closed rather than KeyError-ing.
             "client_id": verified_client_id,
             "audience": verified_client_id if verified_runtime_identity is not None else user_context.get("audience"),
             "groups": verified_groups,
@@ -485,10 +545,20 @@ def invoke_agent(prompt, context=None):
             tenant=DEPLOYMENT_TENANT_ID,
             workspace=DEPLOYMENT_WORKSPACE_ID,
         )
+        # Set both request-scoped contexts immediately before running the
+        # orchestrator. The cost-report scope (#365) binds report reuse to the
+        # trusted tenant/workspace/actor; the connector identity context lets
+        # downstream components (e.g. the Source Control Connector service) read the
+        # validated user_id/groups/session_id without relying on spoofable
+        # model/tool arguments. Both tokens are reset in the finally block so the
+        # scope and identity are isolated per invocation and never leak across
+        # requests handled by the same worker.
         scope_token = set_request_scope(report_scope)
+        _context_token = set_request_context(agent_context)
         try:
             response = run_orchestrator(query=user_prompt, context=agent_context)
         finally:
+            reset_request_context(_context_token)
             reset_request_scope(scope_token)
 
         logger.info(f"✅ Orchestrator returned response")
