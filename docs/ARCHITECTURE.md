@@ -265,7 +265,7 @@ if (isProduction) {
   // AGENTCORE_RUNTIME_ID is required here and is used to build the runtime ARN;
   // the request fails if it is unset.
 } else {
-  // Development: HTTP to localhost:8080
+  // Development: HTTP to localhost:8080, even if a runtime ID is present
 }
 ```
 
@@ -292,7 +292,7 @@ ARN), not the mode selector itself.
 4. Orchestrator analyzes query and delegates to specialist agents
 5. Specialists use MCP servers or AWS SDK for operations
 6. Response flows back through orchestrator to AgentCore Runtime
-7. AgentCore Runtime streams response to frontend
+7. AgentCore Runtime returns the response to the frontend, which buffers and formats it for CopilotKit
 
 **Key Code Pattern**:
 ```python
@@ -419,6 +419,119 @@ This architecture implements the following security measures:
 - **GenAI**: Prompt validation, guardrails, data leakage protection
 
 See [`SECURITY.md`](../SECURITY.md) and [`THREAT_MODEL.md`](THREAT_MODEL.md) for detailed security documentation.
+
+---
+
+## Source Control Connector (Read-Only IaC Context Path)
+
+The Source Control Connector is an optional, disabled-by-default **tool capability** that lets the
+platform read approved Infrastructure-as-Code (IaC) sources. It is not a fourth domain specialist
+agent. When disabled or invalidly configured, its tool path is not exposed to the Orchestrator.
+
+The connector is read-only: it cannot mutate live AWS resources or the source-control provider,
+exposes no create/commit/propose/merge/approve/close operation, and has no `SourceControlWriter`
+interface. It requires no write credential: operators must supply a provider-scoped, fine-grained
+read-only credential and verify its provider-side grants, which the connector cannot independently
+inspect. Provider-write execution remains future work tracked by open issue #314 and is outside the
+chat runtime.
+
+For the full connector deep-dive, see
+[`SOURCE_CONTROL_CONNECTOR.md`](SOURCE_CONTROL_CONNECTOR.md).
+
+### External Provider Trust Boundary
+
+The GameLift, EKS, and Cost specialists reach AWS services through the AWS control plane using the
+runtime IAM role. The optional connector instead crosses an outbound HTTPS boundary to a
+third-party source-control provider such as GitHub or a configured enterprise endpoint.
+
+The current runtime topology is:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                 AWS Bedrock AgentCore Runtime                    │
+│                                                                  │
+│  Orchestrator                                                    │
+│      │                                                           │
+│      └── source_control_agent                                    │
+│          (current model-backed compatibility specialist)         │
+│                    │                                             │
+│                    ▼                                             │
+│          optional get_iac_file connector tool                    │
+│                    │                                             │
+│                    ▼                                             │
+│          read_iac_files service / policy enforcement             │
+│                    │                                             │
+│                    ▼                                             │
+│          provider-neutral SourceControlReader                    │
+│                    │                                             │
+│                    ▼                                             │
+│          GitHub adapter (first adapter; ProviderAuth)            │
+└────────────────────┬─────────────────────────────────────────────┘
+                     │ Outbound HTTPS ─ PROVIDER TRUST BOUNDARY ─►
+                     ▼
+┌──────────────────────────────────────────────────────────────────┐
+│       Third-party source-control provider (for example GitHub)   │
+│       Read existing IaC files at an approved repo / branch       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+The connector core is provider-neutral. GitHub is the first adapter; another adapter can implement
+`SourceControlReader` without changing the connector tool or service contracts.
+
+> **Current compatibility plumbing:** `run_orchestrator` conditionally appends
+> `source_control_agent`, and `agents/source_control_specialist.py` uses the shared
+> `create_specialist_agent` factory. Each invocation creates a nested, model-backed Strands Agent
+> with its compatibility-named Source Control prompt and `get_iac_file` as its sole connector tool.
+> This is a real execution/model hop in the current implementation, but it is legacy exposure
+> plumbing rather than a fourth long-term AWS domain in the product architecture.
+
+### Read Credential
+
+The provider read credential is stored in AWS Secrets Manager and referenced by
+`GBAW_SCM_READ_CREDENTIAL_SECRET_ARN`. The adapter acquires it through `ProviderAuth` when making an
+outbound read. The runtime receives only a scoped `secretsmanager:GetSecretValue` grant for that
+secret. Operators must ensure the secret contains a fine-grained read-only provider token; the
+connector cannot inspect provider-side grants, and compromise of the token permits direct provider
+access up to those grants. No provider-write interface or live-infrastructure write permission is
+introduced by the connector.
+
+### Authorization Policy (Seven Dimensions)
+
+Every read is authorized before provider access across tenant, workspace, repository, branch, path,
+extension, and group. For hosted requests, requester identity and groups come from independently
+verified Cognito identity; tenant and workspace are server-bound deployment values. The trusted
+values are transported through a request-scoped `ContextVar`, never model/tool arguments. The
+explicit, non-hosted local-development bypass instead uses validated body context and must never be
+exposed as a trusted hosted boundary. Effective repository and branch come from the matched
+allowlist entry.
+
+The connector depends on the trusted identity boundaries established by **closed #278** and
+**merged #334**. Its read authorization directly consumes the #278 request-scoped identity seam;
+#334 hardens approval identity for future governed operations and does not add a connector read or
+write capability. **Open #314** tracks the isolated future write executor.
+
+### Audit Flow (Best-Effort `scm_read` Events, Not Atomic)
+
+Handled read outcomes attempt to emit/persist a sanitized `scm_read` event with outcome `served`,
+`not_found`, `error`, or `rejected`. Events do not contain credentials or file contents. The
+read is **not gated** on audit-write success: persistence is best-effort, so an unconfirmed write
+cannot turn a successful provider read into a failure. Terminal provider errors and fail-closed
+rejections likewise attempt to persist their final outcome. Intermediate transient retries
+generate local warnings rather than one `scm_read` outcome per attempt.
+
+The read returns no write-usable revision. It also has no pre-read intent event, correlated
+intent/outcome pair, or idempotency key. There is no reconciliation of ambiguous outcomes on this
+read path. Those mutation-oriented controls belong to future governed operations, not this
+non-mutating connector.
+
+### No Write Path in the Runtime
+
+The connector returns only approved file content and missing-path information. It exposes no
+provider-write interface or operation and configures no separate write credential. The provider
+credential itself is opaque to the connector, so a misprovisioned token could still carry authority
+outside the connector's tool surface; operators must enforce its read-only provider grants. Human
+approval and CI/CD merge gates would belong to the future isolated executor tracked by open #314;
+they are not shipped here.
 
 ---
 
