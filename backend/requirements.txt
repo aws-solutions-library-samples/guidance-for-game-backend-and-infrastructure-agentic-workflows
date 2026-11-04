@@ -117,7 +117,7 @@ fastmcp==3.4.11
     # via
     #   awslabs-aws-api-mcp-server
     #   awslabs-billing-cost-management-mcp-server
-fastmcp-slim==3.4.11
+fastmcp-slim==4.1.4
     # via fastmcp
 frozenlist==1.8.0
     # via
