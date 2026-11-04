@@ -12,12 +12,14 @@ Performance Optimization:
 import hashlib
 import os
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, Set
 
 # Third-party packages
 import boto3
+from botocore.config import Config as BotocoreConfig
 from cachetools import TTLCache
 
 # Local modules
@@ -27,6 +29,29 @@ from utils.security import log_sanitized_exception
 
 # Module-level boto3 client cache for performance
 _memory_client = None
+
+# Dedicated client for the cross-session existence check. The check fails open,
+# runs inline on the response path, and only reads a boolean, so it gets a short
+# connect/read timeout and one total attempt (``total_max_attempts`` counts the
+# first attempt; botocore's ``max_attempts`` counts retries) rather than the
+# write client's longer, retrying config, bounding how long a degraded read can
+# hold the reply.
+_EXISTENCE_CHECK_CLIENT_CONFIG = BotocoreConfig(
+    connect_timeout=3,
+    read_timeout=5,
+    retries={"mode": "standard", "total_max_attempts": 1},
+)
+_existence_check_client = None
+_client_init_lock = threading.Lock()
+
+# Serializes the in-process dedup state and the in-flight set so concurrent
+# same-process saves of the same fact collapse to one write. Never held across a
+# network call.
+_dedup_lock = threading.Lock()
+
+# Content hashes for which a save is currently writing in this process. A second
+# caller for a hash already in flight returns without issuing its own write.
+_inflight_hashes: Set[str] = set()
 
 # Deduplication cache: per-actor set of saved-content hashes, format
 # {actor_id: {content_hash, ...}}. Bounded by a TTLCache on the actor dimension
@@ -48,24 +73,133 @@ def _get_memory_client():
     return _memory_client
 
 
+def _get_existence_check_client():
+    """Get or create the cached short-timeout client for the existence check."""
+    global _existence_check_client
+    if _existence_check_client is None:
+        with _client_init_lock:
+            if _existence_check_client is None:
+                _existence_check_client = boto3.client(
+                    "bedrock-agentcore", region_name=AWS_REGION, config=_EXISTENCE_CHECK_CLIENT_CONFIG
+                )
+    return _existence_check_client
+
+
+def _reset_clients_for_test() -> None:
+    """Reset cached boto3 clients. Intended for tests only."""
+    global _memory_client, _existence_check_client
+    _memory_client = None
+    _existence_check_client = None
+
+
 def _get_content_hash(actor_id: str, content: str) -> str:
-    """Generate a hash for deduplication. Normalizes content to lowercase."""
-    key = f"{actor_id}:{content.lower().strip()}"
+    """Generate a deduplication hash from the actor id and normalized content.
+
+    Normalization lowercases the content and collapses runs of whitespace, so
+    casing and spacing variants of the same fact share one hash.
+    """
+    key = f"{actor_id}:{_normalize_content(content)}"
     return hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()
 
 
+def _normalize_content(content: str) -> str:
+    """Normalize fact content for equality: lowercase, whitespace-collapsed."""
+    return re.sub(r"\s+", " ", content).strip().lower()
+
+
+# Cap the cross-session existence check: a small topK keeps the read cheap and
+# the records returned are short pattern-extracted facts.
+_MEMORY_EXISTENCE_TOPK = 5
+
+
+def _normalize_namespace(namespace: str) -> str:
+    """Compare namespaces without leading or trailing slashes.
+
+    Records written with ``namespaces=[actor_id]`` come back in that raw form in
+    this deployment, but AgentCore Memory also documents a slash-delimited form
+    (``/actor/``); stripping the slashes treats both spellings as one value while
+    a child path (``actor/child``) stays distinct.
+    """
+    return namespace.strip("/")
+
+
+def _store_has_content(client, actor_id: str, content: str) -> bool:
+    """Best-effort check for an equal fact already in the actor's namespace.
+
+    Uses ``retrieve_memory_records`` (the same read action used for retrieval)
+    so no additional IAM action is required. The candidate fact is the search
+    query; a returned record counts only when one of its ``namespaces`` equals
+    the saving ``actor_id`` after both are normalized (the request ``namespace``
+    is a prefix filter, so a child or sibling path can appear) and its
+    normalized content matches. The check is best-effort, not exact: a duplicate
+    can still slip through on approximate-search recall or before a freshly
+    written record becomes searchable. Raises on a client error so the caller
+    can fail open.
+    """
+    target = _normalize_content(content)
+    target_namespace = _normalize_namespace(actor_id)
+    response = client.retrieve_memory_records(
+        memoryId=BEDROCK_AGENTCORE_MEMORY_ID,
+        namespace=actor_id,
+        searchCriteria={"searchQuery": content, "topK": _MEMORY_EXISTENCE_TOPK},
+        maxResults=_MEMORY_EXISTENCE_TOPK,
+    )
+    for summary in response.get("memoryRecordSummaries", []):
+        namespaces = summary.get("namespaces") or []
+        if not any(isinstance(ns, str) and _normalize_namespace(ns) == target_namespace for ns in namespaces):
+            continue
+        record_content = summary.get("content") or {}
+        text = record_content.get("text")
+        if isinstance(text, str) and _normalize_content(text) == target:
+            return True
+    return False
+
+
+def _write_confirmed(response: Dict, request_id: str) -> bool:
+    """True only when the batch-create response confirms this request succeeded.
+
+    A write is confirmed when the request is not listed among ``failedRecords``
+    and at least one record succeeded. When the response echoes
+    ``requestIdentifier`` values, the request's own identifier must be present
+    in ``successfulRecords``; responses that omit the identifier are accepted on
+    a non-empty ``successfulRecords`` with no matching failure. Any other
+    outcome (listed as failed, or no successful records) is not confirmed.
+    """
+    failed = response.get("failedRecords") or []
+    failed_ids = {r.get("requestIdentifier") for r in failed}
+    if request_id in failed_ids:
+        return False
+    successful = response.get("successfulRecords") or []
+    if not successful:
+        return False
+    successful_ids = {r.get("requestIdentifier") for r in successful if r.get("requestIdentifier") is not None}
+    if successful_ids:
+        return request_id in successful_ids
+    # The response does not echo request identifiers; a non-empty success list
+    # with no matching failure counts as confirmed.
+    return True
+
+
 def _is_duplicate_memory(actor_id: str, content: str) -> bool:
-    """Check if this memory was already saved for this actor."""
+    """Return True if this fact was already saved for this actor in this process.
+
+    Reads the shared dedup cache under :data:`_dedup_lock`.
+    """
     content_hash = _get_content_hash(actor_id, content)
-    return actor_id in _saved_memory_hashes and content_hash in _saved_memory_hashes[actor_id]
+    with _dedup_lock:
+        return actor_id in _saved_memory_hashes and content_hash in _saved_memory_hashes[actor_id]
 
 
 def _mark_memory_saved(actor_id: str, content: str) -> None:
-    """Mark a memory as saved to prevent future duplicates."""
+    """Mark a fact as saved for this actor to prevent future duplicates.
+
+    Writes the shared dedup cache under :data:`_dedup_lock`.
+    """
     content_hash = _get_content_hash(actor_id, content)
-    if actor_id not in _saved_memory_hashes:
-        _saved_memory_hashes[actor_id] = set()
-    _saved_memory_hashes[actor_id].add(content_hash)
+    with _dedup_lock:
+        if actor_id not in _saved_memory_hashes:
+            _saved_memory_hashes[actor_id] = set()
+        _saved_memory_hashes[actor_id].add(content_hash)
 
 
 def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] = None) -> bool:
@@ -82,7 +216,8 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
         metadata: Optional metadata dict
 
     Returns:
-        bool: True if successful (or skipped as duplicate), False on error
+        bool: True if saved, already present, or being saved by a concurrent call
+        in this process; False on error or an unconfirmed write
     """
     if not BEDROCK_AGENTCORE_MEMORY_ID:
         logger.warning("⚠️ Memory ID not configured, skipping semantic memory save")
@@ -92,43 +227,79 @@ def save_semantic_memory(actor_id: str, content: str, metadata: Optional[Dict] =
         logger.debug("Skipping long-term memory containing a sensitive identifier")
         return False
 
-    # Deduplication check
+    # Fast path: this process already confirmed this fact for this actor.
     if _is_duplicate_memory(actor_id, content):
         logger.debug("♻️ Skipping duplicate memory save")
         return True  # Return True since this is expected behavior, not an error
 
+    # In-flight guard: if another caller in this process is already writing this
+    # exact fact, let it be the single writer. Claim the hash under the lock,
+    # which is never held across a network call.
+    content_hash = _get_content_hash(actor_id, content)
+    with _dedup_lock:
+        saved = _saved_memory_hashes.get(actor_id)
+        if (saved and content_hash in saved) or content_hash in _inflight_hashes:
+            logger.debug("♻️ Skipping duplicate memory: already saved or a concurrent save is in flight")
+            return True
+        _inflight_hashes.add(content_hash)
+
     try:
-        client = _get_memory_client()
-        request_id = str(uuid.uuid4())
-        short_request_id = request_id[:8]
+        try:
+            write_client = _get_memory_client()
+        except Exception as e:
+            log_sanitized_exception(logger, "❌ Failed to save semantic memory", e)
+            return False
 
-        logger.info(f"💾 Saving semantic memory record (req {short_request_id})")
+        # Cross-session check: a fresh process starts with an empty cache, so the
+        # same fact would otherwise be written again every session. Ask the store
+        # whether an equal fact already exists in the actor's namespace. The read
+        # uses a dedicated short-timeout client and fails open on any error, so an
+        # unavailable or slow read never blocks a legitimate write.
+        try:
+            if _store_has_content(_get_existence_check_client(), actor_id, content):
+                _mark_memory_saved(actor_id, content)
+                logger.debug("♻️ Memory already present in store, skipping write")
+                return True
+        except Exception as e:
+            # Best-effort check: a persistent failure silently disables dedupe,
+            # so log at WARNING. Log only the exception class name — never the
+            # message, fact text, or actor id.
+            logger.warning(f"⚠️ Memory existence check failed, writing without it: {type(e).__name__}")
 
-        # Create memory record using AWS SDK
-        response = client.batch_create_memory_records(
-            memoryId=BEDROCK_AGENTCORE_MEMORY_ID,
-            records=[
-                {
-                    "requestIdentifier": request_id,
-                    "namespaces": [actor_id],  # Scoped to user
-                    "content": {"text": content},
-                    "timestamp": datetime.now(timezone.utc),  # Required field
-                }
-            ],
-        )
+        try:
+            request_id = str(uuid.uuid4())
 
-        # Mark as saved after successful API call
-        _mark_memory_saved(actor_id, content)
-        logger.info(f"✅ Semantic memory saved (req {short_request_id})")
-        return True
+            logger.info(f"💾 Saving semantic memory record (req {request_id[:8]})")
 
-    except Exception as e:
-        # Record the exception class, a sanitized error code, and bounded
-        # raise-site frames. The raw message is withheld: an AgentCore Memory
-        # validation error can quote the record text or actor namespace, which
-        # are exactly the values this function must keep out of logs.
-        log_sanitized_exception(logger, "❌ Failed to save semantic memory", e)
-        return False
+            # Create memory record using AWS SDK
+            response = write_client.batch_create_memory_records(
+                memoryId=BEDROCK_AGENTCORE_MEMORY_ID,
+                records=[
+                    {
+                        "requestIdentifier": request_id,
+                        "namespaces": [actor_id],  # Scoped to user
+                        "content": {"text": content},
+                        "timestamp": datetime.now(timezone.utc),  # Required field
+                    }
+                ],
+            )
+
+            # Mark saved only when the write is confirmed, so a rejected record is
+            # retried on the next call instead of being treated as stored.
+            if not _write_confirmed(response, request_id):
+                logger.warning("⚠️ Semantic memory write not confirmed; will retry")
+                return False
+
+            _mark_memory_saved(actor_id, content)
+            logger.info(f"✅ Semantic memory saved (req {request_id[:8]})")
+            return True
+
+        except Exception as e:
+            log_sanitized_exception(logger, "❌ Failed to save semantic memory", e)
+            return False
+    finally:
+        with _dedup_lock:
+            _inflight_hashes.discard(content_hash)
 
 
 # Words that are commonly mistaken for names in patterns like "I'm running" or "I am building"
