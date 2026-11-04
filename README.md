@@ -30,6 +30,10 @@ Key capabilities:
 - **GameLift Management** -- Fleet monitoring, scaling configuration, and game session analysis
 - **EKS/Kubernetes Operations** -- Cluster management, pod monitoring, and troubleshooting
 - **Cost Intelligence** -- Spending analysis, forecasting, and optimization recommendations
+- **Optional Source Control Connector** -- Disabled-by-default, read-only IaC retrieval through a
+  connector tool capability rather than a fourth long-term domain agent; the current runtime uses a
+  model-backed compatibility specialist to route to the tool. See
+  [Source Control Connector](docs/SOURCE_CONTROL_CONNECTOR.md)
 - **Conversation Memory** -- Session-scoped context with optional cross-session long-term memory
 - **Guardrails** -- Content filtering, PII protection, and prompt injection detection via Amazon Bedrock Guardrails
 
@@ -58,8 +62,12 @@ The solution uses AWS Bedrock AgentCore Runtime with embedded stdio MCP servers.
 6. Orchestrator classifies the query and delegates to the appropriate specialist agent
 7. Specialist queries its Bedrock Knowledge Base for domain-specific context (RAG)
 8. Specialist invokes MCP servers or owned boto3 tools for live AWS data
-9. Read-only API calls execute against target AWS services with least-privilege IAM policies
-10. Response flows back through the chain to the user
+9. For enabled IaC requests, the Orchestrator can route through the current model-backed
+   `source_control_agent` compatibility specialist to the optional `get_iac_file` Source Control
+   connector tool for authorized, read-only IaC retrieval; this is legacy exposure plumbing, not a
+   fourth long-term domain
+10. Read-only API calls execute against target services with least-privilege permissions
+11. Response flows back through the chain to the user
 
 ### Technology Stack
 
@@ -445,18 +453,21 @@ npm run test:e2e:smoke      # Smoke tests only
 
 ## Monitoring and Observability
 
-The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing.
+The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing. Tracing covers the AgentCore runtime. The Next.js frontend writes logs to CloudWatch but exports no traces.
 
 - **CloudWatch Logs**: Structured JSON logs from all components (14-day retention for application logs, 90-day for audit logs)
-- **AWS X-Ray**: Distributed tracing across the full request flow, from frontend through AgentCore to AWS service calls
-- **OpenTelemetry**: Instrumentation for traces and metrics exported via ADOT (AWS Distro for OpenTelemetry)
+- **AWS X-Ray**: Distributed tracing for each request inside the AgentCore runtime, covering the orchestrator, the specialist agents, and their model and tool calls
+- **OpenTelemetry**: The AgentCore runtime exports traces and metrics through ADOT (AWS Distro for OpenTelemetry); the frontend has no OpenTelemetry instrumentation
 
 ```bash
 # View runtime logs
 aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT --follow
 
+# Find the frontend log group; ECS Express adds a generated suffix to its name
+aws logs describe-log-groups --log-group-name-prefix /aws/ecs/default/game-agent-frontend --query 'logGroups[].logGroupName'
+
 # View frontend logs
-aws logs tail /ecs/game-agent-frontend --follow
+aws logs tail /aws/ecs/default/game-agent-frontend-<SUFFIX> --follow
 ```
 
 X-Ray traces are available in the AWS Console under CloudWatch > Gen AI Observability > AgentCore.
@@ -468,6 +479,7 @@ sample-game-backend-agentic-workflows/
 ├── backend/                        # Python AgentCore Runtime backend
 │   ├── src/
 │   │   ├── agents/                 # Orchestrator and specialist agents
+│   │   ├── connector/              # Optional read-only Source Control connector/tool
 │   │   ├── config/                 # Configuration (settings.py)
 │   │   ├── models/                 # AI model configurations
 │   │   ├── utils/                  # MCP client factory, logging, timing
@@ -491,6 +503,7 @@ sample-game-backend-agentic-workflows/
 │   └── infrastructure/             # Infrastructure utilities
 ├── docs/                           # Additional documentation
 │   ├── ARCHITECTURE.md             # Detailed architecture documentation
+│   ├── SOURCE_CONTROL_CONNECTOR.md # Optional read-only connector deep-dive
 │   ├── DEPLOYMENT_GUIDE.md         # Step-by-step deployment guide
 │   ├── SECURITY.md                 # Security controls and compliance
 │   ├── THREAT_MODEL.md             # STRIDE threat analysis
@@ -516,12 +529,12 @@ This solution implements defense-in-depth security controls across all layers:
 | **Authentication** | Amazon Cognito with JWT tokens, group-based authorization, admin-only user creation |
 | **Transport** | TLS 1.2+ enforced on all connections (AWS-managed certificates) |
 | **Encryption** | AES-256 encryption at rest for all data (S3, CloudWatch, AgentCore Memory) |
-| **Authorization** | IAM least-privilege policies with read-only access to target services |
+| **Authorization** | IAM least-privilege policies with read-only access to target AWS services; the optional Source Control Connector reads its provider with a provider-scoped read-only token instead of IAM |
 | **AI Safety** | Amazon Bedrock Guardrails for content filtering, PII anonymization, and prompt injection detection |
 | **Input Validation** | Prompt sanitization, injection pattern detection, sensitive data redaction ([utils/security.py](backend/src/utils/security.py)) |
 | **Audit** | CloudTrail logging for all AWS API calls, CloudWatch for application activity |
 | **Vulnerability Scanning** | AWS Inspector for container images, Dependabot for dependency updates |
-| **No Static Credentials** | All service-to-service authentication uses IAM roles with automatic credential rotation |
+| **No Static Credentials** | AWS service-to-service authentication uses IAM roles with automatically rotated temporary credentials. The one exception is opt-in: the [Source Control Connector](docs/SOURCE_CONTROL_CONNECTOR.md) reads an operator-managed, read-only provider token from Secrets Manager, which the operator rotates and revokes |
 
 ## Cleanup
 

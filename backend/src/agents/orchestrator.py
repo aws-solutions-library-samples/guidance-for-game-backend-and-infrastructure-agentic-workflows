@@ -31,7 +31,7 @@ from agents.cost_report import CapturedCostRendering, begin_cost_report_capture,
 from agents.cost_request_periods import requested_historical_periods
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
-from agents.financial_guard import contains_unvalidated_financial_content, sanitize_advisory_section
+from agents.financial_guard import contains_unvalidated_financial_content, withheld_financial_reply_notice
 from agents.gamelift_specialist import gamelift_agent
 from agents.optimized_prompts import get_optimized_orchestrator_prompt, get_prompt_versions
 from agents.specialist_capture import begin_specialist_capture, finish_specialist_capture
@@ -43,6 +43,7 @@ from config.settings import (
     INFERENCE_CONFIG,
     USE_BEDROCK_SESSIONS,
 )
+from connector.config import SourceControlConfig
 from models.cached_bedrock import create_bedrock_model_with_overrides, create_cached_bedrock_model
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
@@ -54,7 +55,12 @@ from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 try:
     # Third-party packages
     from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig, RetrievalConfig
-    from bedrock_agentcore.memory.integrations.strands.session_manager import AgentCoreMemorySessionManager
+
+    # Local modules
+    # `AgentCoreMemorySessionManager` here is the memory-scoped subclass; the
+    # alias keeps the `orch.AgentCoreMemorySessionManager` patch target used by
+    # existing tests.
+    from utils.memory_context import MemoryScopedSessionManager as AgentCoreMemorySessionManager
 
     MEMORY_INTEGRATION_AVAILABLE = True
 except ImportError:
@@ -394,6 +400,33 @@ def run_orchestrator(query: str, context: dict = None):
         inf = INFERENCE_CONFIG.get("orchestrator")
         orch_model = create_bedrock_model_with_overrides(**inf) if inf else create_cached_bedrock_model()
 
+        # Conditionally register the Source Control Connector specialist. It is a read-only
+        # IaC-context capability, so the specialist is added to the orchestrator tool set
+        # ONLY when the Connector is enabled and validly configured. When disabled, the
+        # baseline specialist set is unchanged, so the platform behaves exactly as it does
+        # today. Built once and reused in both Agent constructions below to avoid divergence
+        # between the memory and fallback paths.
+        #
+        # Derives from agent_tools so the cost-report-ID follow-up routing is preserved: on
+        # a follow-up the tool set is exclusively the cost specialist, and the source-control
+        # specialist is NOT appended (never dilute the deterministic cost-report path).
+        specialist_tools = list(agent_tools)
+        orchestrator_prompt = get_optimized_orchestrator_prompt()
+        if not cost_report_followup and SourceControlConfig.load().enabled:
+            # Local import: keeps the connector out of the import graph for deployments where
+            # the Connector is disabled and avoids a hard dependency then.
+            # Local modules
+            from agents.source_control_specialist import source_control_agent
+
+            specialist_tools.append(source_control_agent)
+            # Register the specialist for read-only IaC-context questions. Appended only when
+            # enabled so the base prompt (and its version) is untouched when disabled.
+            orchestrator_prompt = (
+                orchestrator_prompt + "\n\n- sourcecontrol_agent: read-only IaC context — "
+                "read and explain existing Infrastructure-as-Code (CloudFormation, Terraform). "
+                "Never mutates live AWS and never opens pull requests."
+            )
+
         # Extract memory parameters from context
         actor_id = None
         session_id = None
@@ -450,8 +483,8 @@ def run_orchestrator(query: str, context: dict = None):
                 # Create session manager and agent with memory
                 session_manager = AgentCoreMemorySessionManager(agentcore_memory_config=config, region_name=AWS_REGION)
                 agent = Agent(
-                    system_prompt=get_optimized_orchestrator_prompt(),
-                    tools=agent_tools,
+                    system_prompt=orchestrator_prompt,
+                    tools=specialist_tools,
                     model=orch_model,
                     session_manager=session_manager,
                     # The default Strands handler prints streamed model text and tool
@@ -474,8 +507,8 @@ def run_orchestrator(query: str, context: dict = None):
         # Fallback: Create agent without memory
         if agent is None:
             agent = Agent(
-                system_prompt=get_optimized_orchestrator_prompt(),
-                tools=agent_tools,
+                system_prompt=orchestrator_prompt,
+                tools=specialist_tools,
                 model=orch_model,
                 callback_handler=None,
                 hooks=[
@@ -488,8 +521,10 @@ def run_orchestrator(query: str, context: dict = None):
         logger.debug("🚀 Running agent...")
         cost_report_capture = begin_cost_report_capture()
         specialist_capture = begin_specialist_capture()
+        guardrail_intervened = False
         try:
             response: Any = agent(query)
+            guardrail_intervened = getattr(response, "stop_reason", None) == "guardrail_intervened"
         except Exception as exc:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
@@ -583,15 +618,21 @@ def run_orchestrator(query: str, context: dict = None):
                 # If the routing model answers a cost topic directly, discard
                 # its prose and return deterministic nonnumeric guidance. For a
                 # non-cost query, inspect the actual model output as the final
-                # defense: volunteered monetary claims must not escape merely
-                # because the query classifier did not predict them.
+                # defense: a volunteered monetary claim is replaced with a
+                # dedicated, number-free notice so a non-cost question is not
+                # answered with cost guidance.
                 if _has_cost_topic(query):
                     response = _cost_guidance(forecast_request)
                 elif contains_unvalidated_financial_content(str(response)):
-                    response = sanitize_advisory_section("Cost", str(response))
+                    response = withheld_financial_reply_notice()
 
-        # Extract and save semantic memories for LTM (non-blocking)
-        if USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and memory_actor:
+        # Extract and save semantic memories for LTM (non-blocking). Retrieved
+        # memory reaches the model outside the input Guardrail, so a turn the
+        # Guardrail stopped is never written: its input may not have passed the
+        # input checks.
+        if guardrail_intervened:
+            logger.info("Skipping long-term memory extraction for a turn the Guardrail stopped")
+        elif USE_BEDROCK_SESSIONS and BEDROCK_AGENTCORE_MEMORY_ID and memory_actor:
             if SEMANTIC_MEMORY_AVAILABLE:
                 try:
                     extract_and_save_user_info(memory_actor, query, str(response))

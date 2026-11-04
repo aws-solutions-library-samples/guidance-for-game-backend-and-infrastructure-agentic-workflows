@@ -722,7 +722,8 @@ def test_direct_operational_response_with_explicit_financial_label_is_withheld()
         response = orchestrator.run_orchestrator("List my GameLift fleets and their status")
 
     assert "999" not in response
-    assert "Unvalidated financial figures were withheld." in response
+    assert "## Cost" not in response
+    assert "did not come from the validated cost report" in response
 
 
 def test_direct_operational_model_response_withholds_volunteered_financial_value():
@@ -742,8 +743,9 @@ def test_direct_operational_model_response_withholds_volunteered_financial_value
 
     assert orchestrator._has_cost_topic("List my EKS cluster utilization") is False
     assert "USD 999.00" not in response
-    assert "Unvalidated financial figures were withheld." in response
-    assert "validated cost report path" in response
+    assert "## Cost" not in response
+    assert "did not come from the validated cost report" in response
+    assert "Ask a cost question to get validated figures" in response
 
 
 def test_direct_cost_topic_never_returns_number_words_from_model():
@@ -762,3 +764,44 @@ def test_direct_cost_topic_never_returns_number_words_from_model():
 
     assert response == orchestrator._COST_ADVISORY_GUIDANCE
     assert "five dollars" not in response
+
+
+def test_non_cost_query_with_real_amount_gets_withheld_notice_not_cost_heading():
+    """A non-cost reply that volunteers a real amount is replaced by the
+    dedicated withheld notice, not the Cost advisory heading or guidance."""
+    model_response = "EKS is healthy, and its projected monthly cost is USD 999.00."
+
+    class StubOrchestratorAgent:
+        def __call__(self, query: str) -> str:
+            return model_response
+
+    with (
+        patch.object(orchestrator, "Agent", return_value=StubOrchestratorAgent()),
+        patch.object(orchestrator, "USE_BEDROCK_SESSIONS", False),
+        patch.object(orchestrator, "create_bedrock_model_with_overrides", return_value=MagicMock()),
+    ):
+        response = orchestrator.run_orchestrator("List my EKS cluster utilization")
+
+    assert orchestrator._has_cost_topic("List my EKS cluster utilization") is False
+    assert "USD 999.00" not in response
+    assert "## Cost" not in response
+    assert "right-sizing" not in response
+    assert "did not come from the validated cost report" in response
+
+
+def test_non_cost_query_with_operational_numbers_is_returned_unchanged():
+    """A non-cost reply whose numbers are purely operational is not withheld."""
+    operational = "Set the scale-in rate to 2 instances per minute across 3 fleets."
+
+    class StubOrchestratorAgent:
+        def __call__(self, query: str) -> str:
+            return operational
+
+    with (
+        patch.object(orchestrator, "Agent", return_value=StubOrchestratorAgent()),
+        patch.object(orchestrator, "USE_BEDROCK_SESSIONS", False),
+        patch.object(orchestrator, "create_bedrock_model_with_overrides", return_value=MagicMock()),
+    ):
+        response = orchestrator.run_orchestrator("Explain my GameLift scaling configuration")
+
+    assert response == operational
