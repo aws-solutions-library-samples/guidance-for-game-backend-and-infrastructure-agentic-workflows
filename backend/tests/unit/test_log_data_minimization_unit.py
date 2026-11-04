@@ -803,9 +803,16 @@ def test_semantic_memory_save_logs_no_content_or_actor(monkeypatch):
     import utils.semantic_memory as sm
 
     fake_client = MagicMock()
-    fake_client.batch_create_memory_records.return_value = {"successfulRecords": [], "failedRecords": []}
+    fake_client.batch_create_memory_records.return_value = {
+        "successfulRecords": [{"memoryRecordId": "synthetic-record"}],
+        "failedRecords": [],
+    }
+    fake_client.retrieve_memory_records.return_value = {"memoryRecordSummaries": []}
     monkeypatch.setattr(sm, "_get_memory_client", lambda: fake_client)
+    monkeypatch.setattr(sm, "_get_existence_check_client", lambda: fake_client)
     monkeypatch.setattr(sm, "BEDROCK_AGENTCORE_MEMORY_ID", "mem-test", raising=False)
+    monkeypatch.setattr(sm, "_saved_memory_hashes", {})
+    monkeypatch.setattr(sm, "_inflight_hashes", set())
 
     with _CaptureSink() as buffer:
         result = sm.save_semantic_memory(SUBJECT_MARKER, f"User's name is {NAME_MARKER}")
@@ -828,9 +835,13 @@ def test_semantic_memory_save_failure_hides_exception_payload(monkeypatch):
     fake_client.batch_create_memory_records.side_effect = RuntimeError(
         f"ValidationException: namespace={SUBJECT_MARKER} content='{NAME_MARKER}'\nFORGED"
     )
+    fake_client.retrieve_memory_records.return_value = {"memoryRecordSummaries": []}
     monkeypatch.setattr(sm, "_get_memory_client", lambda: fake_client)
+    monkeypatch.setattr(sm, "_get_existence_check_client", lambda: fake_client)
     monkeypatch.setattr(sm, "BEDROCK_AGENTCORE_MEMORY_ID", "mem-test", raising=False)
     monkeypatch.setattr(sm, "_is_duplicate_memory", lambda *a, **k: False)
+    monkeypatch.setattr(sm, "_saved_memory_hashes", {})
+    monkeypatch.setattr(sm, "_inflight_hashes", set())
 
     with _CaptureSink() as buffer:
         result = sm.save_semantic_memory(SUBJECT_MARKER, f"User's name is {NAME_MARKER}")
