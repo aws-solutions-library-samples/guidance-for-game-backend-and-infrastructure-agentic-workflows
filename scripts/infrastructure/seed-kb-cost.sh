@@ -19,10 +19,17 @@ echo "=================================================="
 echo "💰 Seeding Cost Knowledge Base"
 echo "=================================================="
 
-# Check if stack exists
-if ! aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" &>/dev/null; then
-  echo "⚠️  Stack $STACK_NAME not found, skipping seeding"
-  exit 0
+# Check if stack exists. Only CloudFormation's "Stack with id ... does not exist"
+# means skip; any other failure (expired or missing SSO credentials, access
+# denied, throttling) stops the deploy instead of reporting a Knowledge Base
+# that was never seeded as done.
+if ! STACK_CHECK=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" 2>&1 >/dev/null); then
+  if grep -q "Stack with id .* does not exist" <<<"$STACK_CHECK"; then
+    echo "⚠️  Stack $STACK_NAME not found, skipping seeding"
+    exit 0
+  fi
+  echo "❌ Could not read stack $STACK_NAME: $(head -c 300 <<<"$STACK_CHECK")"
+  exit 1
 fi
 
 # Get stack outputs
@@ -126,6 +133,26 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
       --region "$REGION" \
       --query 'ingestionJob.statistics' \
       --output table 2>/dev/null || true
+    # A COMPLETE job can still report failed documents; any failed document
+    # means part of this Knowledge Base is missing.
+    FAILED_DOCS=$(aws bedrock-agent get-ingestion-job \
+      --knowledge-base-id "$KB_ID" \
+      --data-source-id "$DATASOURCE_ID" \
+      --ingestion-job-id "$INGESTION_JOB" \
+      --region "$REGION" \
+      --query 'ingestionJob.statistics.numberOfDocumentsFailed' \
+      --output text 2>/dev/null || echo "unknown")
+    if [ "$FAILED_DOCS" != "0" ]; then
+      echo "❌ Ingestion completed with failed documents: $FAILED_DOCS"
+      aws bedrock-agent get-ingestion-job \
+        --knowledge-base-id "$KB_ID" \
+        --data-source-id "$DATASOURCE_ID" \
+        --ingestion-job-id "$INGESTION_JOB" \
+        --region "$REGION" \
+        --query 'ingestionJob.failureReasons' \
+        --output text 2>/dev/null || true
+      exit 1
+    fi
     exit 0
   elif [ "$STATUS" = "FAILED" ]; then
     echo "❌ Ingestion failed!"
