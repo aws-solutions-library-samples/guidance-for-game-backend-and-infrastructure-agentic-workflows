@@ -19,6 +19,8 @@ from utils.kb_tools import create_kb_retrieve_tool
 from utils.logger import logger
 from utils.max_turns_hook import MaxTurnsHook
 from utils.mcp_client_factory import create_mcp_client
+from utils.mcp_provider_lock import serialize_mcp_client_start
+from utils.security import log_sanitized_exception
 from utils.timing import time_operation
 from utils.wall_clock_timeout_hook import WallClockTimeoutHook
 
@@ -77,9 +79,15 @@ def create_specialist_agent(
                     for server_name in mcp_server_names:
                         mcp_client = create_mcp_client(server_name)
                         if mcp_client:
+                            # Serialize start and last-consumer stop of the shared
+                            # cached client so two specialist calls in one turn do
+                            # not race its start window. Applied to the RAW client
+                            # before the guard transform so the guard wrappers sit
+                            # outside the lock and delegate through it unchanged.
+                            tool_provider: Any = serialize_mcp_client_start(mcp_client)
                             if mcp_client_transform:
-                                mcp_client = mcp_client_transform(server_name, mcp_client)
-                            tools.append(mcp_client)
+                                tool_provider = mcp_client_transform(server_name, tool_provider)
+                            tools.append(tool_provider)
                             mcp_clients_created += 1
 
                     # If no MCP clients created and fallback exists, use it
@@ -116,6 +124,9 @@ def create_specialist_agent(
                             system_prompt=prompt_fn(),
                             tools=tools,
                             model=model,
+                            # Keep streamed model text and tool names out of stdout,
+                            # which the hosted runtime ships to its logs.
+                            callback_handler=None,
                             hooks=[
                                 MaxTurnsHook(AGENT_MAX_TURNS_SPECIALIST),
                                 WallClockTimeoutHook(AGENT_TIMEOUT_SPECIALIST_SECONDS),
@@ -130,12 +141,15 @@ def create_specialist_agent(
                     record_specialist_output(service_name, result)
                     return result
 
-                except Exception:
-                    # Log the full exception (with traceback) server-side, but do
-                    # NOT interpolate it into the user-facing string — the raw
-                    # message can leak internal details (ARNs, stack frames, SDK
-                    # errors). Return a generic message instead.
-                    logger.exception(f"❌ {service_name} agent failed")
+                except Exception as exc:
+                    # Record a bounded, non-sensitive failure server-side: the
+                    # exception class, a typed sanitized code, and bounded
+                    # raise-site frames, never the raw message. A provider or SDK
+                    # error body can embed ARNs, stack frames, or caller values;
+                    # the full rendered traceback is emitted only when debug
+                    # logging is explicitly enabled. The user-facing string is
+                    # always generic.
+                    log_sanitized_exception(logger, f"❌ {service_name} agent failed", exc)
                     if fallback_fn:
                         fallback_message = fallback_fn(AWS_REGION)
                         record_specialist_output(service_name, fallback_message)

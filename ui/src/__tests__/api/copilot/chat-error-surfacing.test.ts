@@ -40,7 +40,7 @@ const mockStsSend = jest.fn();
 function chatRequest(cookie = 'cognito_id_token=header.payload.signature') {
   return createMocks({
     method: 'POST',
-    headers: { cookie },
+    headers: { host: 'app.example.com', origin: 'https://app.example.com', cookie },
     body: {
       operationName: 'generateCopilotResponse',
       variables: {

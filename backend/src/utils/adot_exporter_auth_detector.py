@@ -98,9 +98,9 @@ _CREDENTIAL_LOAD_FAILURE = re.compile(r"failed to load aws credentials", re.IGNO
 # HTTP status codes that indicate an authentication/authorization failure.
 _AUTH_STATUS_CODES = {"401", "403"}
 
-# Signatures that look similar but are a DIFFERENT, already-handled failure
-# (upstream starter-toolkit #457: missing ``aws/spans`` log group). These must
-# NOT be classified as #420 auth failures.
+# Signatures that look similar but are a DIFFERENT failure mode
+# (upstream starter-toolkit issue 457: missing ``aws/spans`` log group). These
+# must NOT be classified as #420 auth failures.
 _EXCLUDE_PATTERNS = (
     re.compile(r"resourcenotfound", re.IGNORECASE),
     re.compile(r"log group does not exist", re.IGNORECASE),
@@ -152,7 +152,8 @@ def _has_exporter_context(scope: str, body: str) -> bool:
 def is_exporter_auth_failure(event: dict[str, Any]) -> bool:
     """Return True if ``event`` is an ADOT OTLP exporter authentication failure.
 
-    Matching rules (any one qualifies), after excluding the #457 case:
+    Matching rules (any one qualifies), after excluding the starter-toolkit
+    issue 457 case:
       1. A batch-export failure with a 401/403 status code, e.g.
          ``Failed to export span batch code: 403, reason: Forbidden``.
       2. ``Failed to load AWS Credentials`` (exporter credential gap).

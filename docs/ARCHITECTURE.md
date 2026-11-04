@@ -50,7 +50,7 @@ The architecture follows these 12 steps:
 
 | Step | Description |
 |:----:|-------------|
-| **1** | User authenticates with **Amazon Cognito** User Pool. The frontend validates JWT tokens and stores them in HttpOnly cookies. Password policies enforce strong credentials, and admin approval is required for new users. |
+| **1** | User authenticates with **Amazon Cognito** User Pool. The frontend validates JWT tokens and stores them in HttpOnly cookies. Password policies enforce strong credentials. Self-signup is disabled; accounts are administrator-provisioned. The bootstrap script (`add-admin-user.sh` or the PowerShell `Add-GameAgentAdmin`) creates a confirmed user and places it in the `admin` group. A chat-only user is created the same way and added to the `users` group instead (see the deployment guide for the AWS CLI commands). |
 | **2** | User sends a natural language query (e.g., "What's the status of my EKS clusters?") through the **Next.js frontend** hosted on **Amazon ECS Express** (Fargate + ALB). The frontend provides a conversational chat interface powered by CopilotKit. |
 | **3** | The frontend constructs trusted principal context from the verified Cognito access token and deployment-bound tenant/workspace, then invokes **Bedrock AgentCore Runtime** over HTTPS, passing the user's Cognito access token as an `Authorization: Bearer` header (`fetch`, not an AWS SDK invoke client / SigV4); the runtime verifies the token independently. Browser and model input cannot supply principal fields. |
 | **4** | AgentCore routes the request to the **Orchestrator** agent, which analyzes the query intent and determines the appropriate specialist to handle the request. The orchestrator maintains conversation context across turns. |
@@ -326,8 +326,8 @@ ignores the bypass whenever hosted mode is on.
 
 **Environment Variables**:
 - `AWS_REGION` - AWS region (default: us-west-2)
-- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 4.5)
-- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 4.6)
+- `GBAW_ORCHESTRATOR_MODEL_ID` - Orchestrator model/profile (default: Claude Haiku 5.5)
+- `GBAW_SPECIALIST_MODEL_ID` - Specialist model/profile (default: Claude Sonnet 5.5)
 - `GBAW_BEDROCK_MODEL_ID` / `GBAW_BEDROCK_MODEL_ID_SECONDARY` - Legacy compatibility aliases
 - `GBAW_TENANT_ID` - Server-side tenant binding (default: `default-tenant`)
 - `GBAW_WORKSPACE_ID` - Server-side workspace binding (default: `default-workspace`)
@@ -368,6 +368,17 @@ same data without silently mixing Cost Explorer query times.
 The cost specialist rejects the Billing MCP server's historical
 `getCostAndUsage` operations so they cannot bypass this path; forecast and
 optimization operations remain available.
+Forecast detection is pattern-based. A question the orchestrator recognizes as
+a forecast gets the fixed, non-numeric cost guidance, because forecast figures
+are not validated; that guidance says the assistant does not show numeric cost
+forecasts (#625 tracks an owned forecast rendering). A historical report
+captured during that turn is kept only
+when its period equals a period the question names.
+`agents/cost_request_periods.py` recognizes only phrases that normally name a
+past period rather than the forecast target, such as "last month", "last
+quarter", "month to date", a month with its year once that month has ended
+("July 2026"), and ISO dates before today; every other captured report is
+dropped.
 
 Snapshot correctness and billing finality are separate. A validated report is
 internally consistent with Cost Explorer at its `queriedAt` timestamp, while an
@@ -603,10 +614,14 @@ credential provider and carries no inline or managed policy. Cognito JWT
 verification uses `aws-jwt-verify`, which fetches the public JWKS over HTTPS and
 requires no IAM permission.
 
-The dormant account-administration routes still reference IAM-authorized Cognito
-Admin/List operations, but the default deployment has never granted them and
-they are not a supported provisioning path. Issue #473 removes that surface
-after #469; this role deliberately does not make it reachable.
+Access is administrator-provisioned: an operator runs `add-admin-user.sh` (or
+the PowerShell `Add-GameAgentAdmin`) to create a confirmed user and place it in
+the `admin` group. A chat-only user is created the same way (the user, then a
+permanent password) and added to the `users` group instead; the deployment
+guide lists the AWS CLI commands.
+The sample ships no in-app account-management
+page or Cognito administrator API, so this role is never granted Cognito
+Admin/List permissions and the chat path reaches no such operation.
 
 ---
 
@@ -675,7 +690,7 @@ export MEMORY_LONG_TERM_ENABLED=true
 - **Load**: Previous conversations loaded from AgentCore Memory on each request
 - **Persist**: Each interaction saved to AgentCore Memory after completion
 - **Cross-Session**: Same user sees conversation history across browser sessions
-- **User-Scoped**: Each user has isolated memory (based on `actor_id`)
+- **User-Scoped**: Each user has isolated memory, keyed by a pseudonymous `actor_id` (a SHA-256 digest of the verified subject; see `utils/memory_identity.py`)
 
 **Memory Settings**:
 - `MEMORY_LONG_TERM_ENABLED`: Enable/disable (default: false)
