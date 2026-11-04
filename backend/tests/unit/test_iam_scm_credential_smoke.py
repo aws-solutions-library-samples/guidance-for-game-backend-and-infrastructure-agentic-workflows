@@ -405,6 +405,13 @@ def test_scm_audit_policy_is_conditional_on_audit_log_group_configured(role_poli
     ), "audit grant condition must be independent of Knowledge Base configuration"
 
 
+def test_scm_audit_condition_requires_a_non_empty_log_group_name(template: dict):
+    """``ScmAuditLogGroupConfigured`` is exactly "ScmAuditLogGroupName is not empty", so a
+    deployment that leaves the name unset gets neither the log group nor its write grant."""
+    condition = template.get("Conditions", {})[_SCM_AUDIT_CONDITION_NAME]
+    assert condition == {"Fn::Not": [{"Fn::Equals": [{"Ref": "ScmAuditLogGroupName"}, ""]}]}
+
+
 def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list):
     """(Req 9.5) The audit statement grants ONLY logs:CreateLogStream + logs:PutLogEvents
     scoped to the dedicated audit log group ARN (and its ``:*`` stream children) — nothing

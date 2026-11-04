@@ -742,10 +742,12 @@ _RATE_LIMIT_MAX_KEYS = int(os.getenv("GBAW_RATE_LIMIT_MAX_KEYS", "10000"))
 # valid) and touches only the in-memory store's retention. The env override still allows a
 # larger TTL for any future window bound.
 #
-# The override can only raise the TTL. A value below the longest permitted window
-# (connector.config._RATE_WINDOW_MAX; a unit test keeps the two equal) would evict an
-# active key mid-window and reset its quota, so it is raised to that floor. A
-# non-integer value falls back to the floor instead of failing the import.
+# The override can only raise the TTL. A value below the connector's longest permitted
+# window (connector.config._RATE_WINDOW_MAX; a unit test keeps the two equal) would evict
+# an active key mid-window and reset its quota, so it is raised to that floor. A
+# non-integer value falls back to the floor instead of failing the import. The runtime's
+# own GBAW_RATE_LIMIT_WINDOW_SECONDS (default 60s) is not bounded here; a value above
+# the TTL needs a matching GBAW_RATE_LIMIT_KEY_TTL_SECONDS.
 _RATE_LIMIT_MIN_KEY_TTL_SECONDS = 86400
 
 
@@ -758,8 +760,8 @@ def _resolve_rate_limit_key_ttl_seconds() -> int:
         return _RATE_LIMIT_MIN_KEY_TTL_SECONDS
     if configured < _RATE_LIMIT_MIN_KEY_TTL_SECONDS:
         _get_logger().warning(
-            "GBAW_RATE_LIMIT_KEY_TTL_SECONDS is below the longest rate-limit window; using %ss",
-            _RATE_LIMIT_MIN_KEY_TTL_SECONDS,
+            f"GBAW_RATE_LIMIT_KEY_TTL_SECONDS is below the longest connector rate-limit window; "
+            f"using {_RATE_LIMIT_MIN_KEY_TTL_SECONDS}s"
         )
         return _RATE_LIMIT_MIN_KEY_TTL_SECONDS
     return configured
@@ -801,3 +803,8 @@ def check_rate_limit(
                 f"Rate limit exceeded ({max_requests} requests per {window_seconds}s). Please try again shortly."
             )
         window.append(now)
+        # TTLCache sets an entry's expiry only on assignment, so write the deque back:
+        # expiry then follows the last accepted request instead of the key's first one,
+        # and an active key is never evicted mid-window. Every stored timestamp is at
+        # most this request's, so the TTL floor above still covers the full window.
+        _rate_limit_windows[key] = window

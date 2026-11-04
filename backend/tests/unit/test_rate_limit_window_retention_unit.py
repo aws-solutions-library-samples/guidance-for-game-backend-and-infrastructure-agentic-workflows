@@ -131,3 +131,34 @@ def test_quota_survives_a_short_ttl_override(monkeypatch):
     clock["now"] += 61.0
     with pytest.raises(RateLimitExceeded):
         check_rate_limit(key, 5, 3600)
+
+
+def test_an_active_key_is_not_evicted_at_its_first_insertion_deadline(monkeypatch):
+    """Expiry follows the last accepted request, not the key's first insertion.
+
+    TTLCache sets expiry only on assignment. Without the write-back in
+    check_rate_limit, a key first used at t0 is dropped at t0 + TTL even while its
+    caller is mid-burst, and the next request starts an empty window.
+    """
+    clock = {"now": 1000.0}
+
+    def _fake_monotonic() -> float:
+        return clock["now"]
+
+    monkeypatch.setattr(security._time, "monotonic", _fake_monotonic)
+    ttl = security._RATE_LIMIT_KEY_TTL_SECONDS
+    cache: "TTLCache[str, collections.deque]" = TTLCache(
+        maxsize=security._RATE_LIMIT_MAX_KEYS, ttl=ttl, timer=_fake_monotonic
+    )
+    monkeypatch.setattr(security, "_rate_limit_windows", cache)
+
+    key = get_rate_limit_key("reader-1", "scm_read")
+    check_rate_limit(key, 5, 3600)  # first insertion at t0
+
+    clock["now"] += ttl - 10.0  # 10s before the first-insertion deadline; t0 has aged out
+    for _ in range(5):
+        check_rate_limit(key, 5, 3600)  # fill the quota for this window
+
+    clock["now"] += 20.0  # 10s past t0 + TTL, still inside this window
+    with pytest.raises(RateLimitExceeded):
+        check_rate_limit(key, 5, 3600)
