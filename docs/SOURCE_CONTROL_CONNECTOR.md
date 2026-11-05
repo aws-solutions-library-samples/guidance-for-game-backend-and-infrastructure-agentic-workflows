@@ -448,9 +448,13 @@ Relevant template parameters and conditions:
   `ScmReadCredentialConfigured`. The `GetSecretValue` statement is added **only** when both hold, so
   a disabled deployment carries no connector secret permission even if an ARN is otherwise present.
 - **`ScmAuditLogGroupName`** (parameter) + **`ScmAuditLogGroupConfigured`** (condition) — when set,
-  the template creates the `ScmAuditLogGroup` (`AWS::Logs::LogGroup`, 90-day retention) and adds a
-  scoped `ScmAuditLogAccess` policy (`Sid: ScmAuditLogWrite`) granting `logs:CreateLogStream` +
-  `logs:PutLogEvents` on that log group only.
+  the template creates the `ScmAuditLogGroup` (`AWS::Logs::LogGroup`, 90-day retention) whether or
+  not the connector is enabled, so turning the connector off does not delete retained audit history.
+- **`ScmAuditLogWriteActive`** (condition) = `ScmConnectorIsEnabled` **AND**
+  `ScmAuditLogGroupConfigured`. The scoped `ScmAuditLogAccess` policy (`Sid: ScmAuditLogWrite`),
+  granting `logs:CreateLogStream` + `logs:PutLogEvents` on that log group only, is added **only**
+  when both hold, so a disabled deployment carries no connector audit write permission even if a
+  log group name is passed.
 
 ## Deployment Steps
 

@@ -35,9 +35,10 @@ Parameters:
       Optional. Name of the dedicated CloudWatch Logs log group that backs the
       Source Control Connector durable audit sink. Leave empty for read-only
       deployments (connector audit disabled) — such deployments are unaffected.
-      When set, this template creates the log group and grants the AgentCore
-      execution role logs:CreateLogStream + logs:PutLogEvents scoped to that log
-      group ONLY, with no live-infrastructure write permissions.
+      When set, this template creates the log group. The AgentCore execution
+      role is granted logs:CreateLogStream + logs:PutLogEvents scoped to that log
+      group ONLY, and only while ScmConnectorEnabled is 'true', with no
+      live-infrastructure write permissions.
 
   ScmConnectorEnabled:
     Type: String
@@ -50,9 +51,10 @@ Parameters:
       Defaults to 'false' so a disabled deployment grants NO connector secret
       permission even if a read-credential ARN is otherwise present. The scoped
       secretsmanager:GetSecretValue grant is added ONLY when this is 'true' AND a
-      read-credential ARN is configured, so a disabled deployment carries no
-      connector secret IAM permission. deploy.sh passes 'true' only when
-      GBAW_SCM_CONNECTOR_ENABLED is truthy.
+      read-credential ARN is configured, and the scoped audit-log write grant ONLY
+      when this is 'true' AND ScmAuditLogGroupName is set, so a disabled
+      deployment carries no connector secret or audit-write IAM permission.
+      deploy.sh passes 'true' only when GBAW_SCM_CONNECTOR_ENABLED is truthy.
 
   SessionAbsoluteLifetimeHours:
     Type: Number
@@ -78,9 +80,17 @@ Conditions:
     - !Condition ScmConnectorIsEnabled
     - !Condition ScmReadCredentialConfigured
 
-  # Gate the dedicated audit log group + its scoped logs grant on a non-empty name.
+  # Gate the dedicated audit log group on a non-empty name.
   # Read-only deployments that never set ScmAuditLogGroupName are unaffected.
   ScmAuditLogGroupConfigured: !Not [!Equals [!Ref ScmAuditLogGroupName, '']]
+
+  # The scoped audit-log write grant is applied ONLY when the connector is enabled AND an
+  # audit log group is configured, so a disabled deployment carries NO connector audit write
+  # permission even if a log group name is passed. The log group itself stays on
+  # ScmAuditLogGroupConfigured, so disabling the connector keeps its retained audit history.
+  ScmAuditLogWriteActive: !And
+    - !Condition ScmConnectorIsEnabled
+    - !Condition ScmAuditLogGroupConfigured
 
 Resources:
   # Cognito User Pool
@@ -228,7 +238,9 @@ Resources:
   # durable audit sink (#SCM). Created ONLY when ScmAuditLogGroupName is set, so
   # read-only deployments that never enable the connector are unaffected. This is
   # the sole log group the connector is granted write access to (see the scoped
-  # ScmAuditLogAccess policy on AgentCoreExecutionRole). 90-day retention matches
+  # ScmAuditLogAccess policy on AgentCoreExecutionRole), and only while the connector
+  # is enabled. It is deliberately not gated on enablement, so disabling the
+  # connector does not delete retained audit history. 90-day retention matches
   # the platform's audit-log retention convention.
   ScmAuditLogGroup:
     Type: AWS::Logs::LogGroup
@@ -619,10 +631,12 @@ Resources:
         # Security: Source Control Connector durable audit sink (opt-in, #SCM).
         # Grants ONLY logs:CreateLogStream + logs:PutLogEvents scoped to the
         # dedicated connector audit log group (and its log-stream children).
-        # Added only when ScmAuditLogGroupName is set; adds NO live-infrastructure
-        # write actions. The runtime role stays read-only against live AWS.
+        # Added only when the connector is ENABLED AND ScmAuditLogGroupName is set
+        # (ScmAuditLogWriteActive); a disabled deployment carries no connector audit
+        # write permission. Adds NO live-infrastructure write actions. The runtime
+        # role stays read-only against live AWS.
         - !If
-          - ScmAuditLogGroupConfigured
+          - ScmAuditLogWriteActive
           - PolicyName: ScmAuditLogAccess
             PolicyDocument:
               Version: '2012-10-17'
