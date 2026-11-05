@@ -631,8 +631,8 @@ function Deploy-GameAgent {
                 "WorkspaceId=$workspaceId"
             )
 
-        $frontendUrl = Get-StackOutput "$ProjectName-frontend" 'ServiceUrl'
-        Write-GameAgentStatus "Frontend deployed: https://$frontendUrl" -Type Success
+        $frontendUrl = ConvertTo-GameAgentFrontendUrl -ServiceUrl (Get-StackOutput "$ProjectName-frontend" 'ServiceUrl')
+        Write-GameAgentStatus "Frontend deployed: $frontendUrl" -Type Success
         Write-Host ''
 
         # Step 7b: App observability
@@ -683,7 +683,7 @@ function Deploy-GameAgent {
     Write-Host ('=' * 60) -ForegroundColor Green
     Write-Host ''
 
-    if ($frontendUrl) { Write-Host "Frontend: https://$frontendUrl" -ForegroundColor Green; Write-Host '' }
+    if ($frontendUrl) { Write-Host "Frontend: $frontendUrl" -ForegroundColor Green; Write-Host '' }
 
     Write-Host 'Infrastructure IDs:' -ForegroundColor Cyan
     Write-Host "   Runtime ID:   $runtimeId"
@@ -696,7 +696,7 @@ function Deploy-GameAgent {
     if ($dockerAvailable) {
         Write-Host 'Next Steps:' -ForegroundColor Cyan
         Write-Host "   1. Create admin user: Add-GameAgentAdmin -Profile $($Profile ?? 'default')"
-        Write-Host "   2. Access frontend: https://$frontendUrl"
+        Write-Host "   2. Access frontend: $frontendUrl"
     } else {
         Write-Host 'Frontend was not deployed — Docker is required for Steps 6-8.' -ForegroundColor Yellow
     }

@@ -1339,6 +1339,10 @@ FRONTEND_URL=$(aws cloudformation describe-stacks \
   --region $AWS_REGION \
   --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' \
   --output text)
+# ServiceUrl may be a bare host or already include https:// (#641); use one scheme.
+FRONTEND_URL="${FRONTEND_URL#https://}"
+FRONTEND_URL="${FRONTEND_URL#http://}"
+FRONTEND_URL="https://${FRONTEND_URL%/}"
 
 echo "✅ Frontend deployed"
 echo ""
@@ -1444,7 +1448,7 @@ echo ""
 
 if [ "$DOCKER_AVAILABLE" = true ]; then
 echo "📍 Access URL:"
-echo "   Frontend: https://$FRONTEND_URL"
+echo "   Frontend: $FRONTEND_URL"
 echo ""
 fi
 
@@ -1472,7 +1476,7 @@ echo "   ✅ CloudTrail API audit logging enabled"
 echo ""
 echo "🚀 Next Steps:"
 echo "   1. Create admin user: ./scripts/infrastructure/add-admin-user.sh"
-echo "   2. Access frontend: https://$FRONTEND_URL"
+echo "   2. Access frontend: $FRONTEND_URL"
 echo "   3. Subscribe to security alerts:"
 echo "      aws sns subscribe --topic-arn \$(aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-security --region $AWS_REGION --query 'Stacks[0].Outputs[?OutputKey==\`SecurityAlertsTopicArn\`].OutputValue' --output text) --protocol email --notification-endpoint YOUR_EMAIL"
 else

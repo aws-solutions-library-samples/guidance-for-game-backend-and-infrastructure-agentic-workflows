@@ -29,6 +29,18 @@ if os.path.exists(backend_env):
 os.environ.setdefault("GBAW_ALLOW_LOCAL_IDENTITY_BYPASS", "true")
 
 
+def frontend_url_from_service_url(service_url: str) -> str:
+    """Return ``https://<host>`` for the frontend stack's ServiceUrl output.
+
+    The ECS Express output has been returned both as a bare host and with its
+    ``https://`` scheme (issue #641). Like the deployment scripts, remove one
+    leading ``https://``, then one leading ``http://``, and one trailing slash
+    before adding the scheme once.
+    """
+    host = service_url.strip().removeprefix("https://").removeprefix("http://").removesuffix("/")
+    return f"https://{host}"
+
+
 def get_deployment_info():
     """
     Get deployment info from environment or .bedrock_agentcore.yaml.
@@ -82,7 +94,7 @@ def get_deployment_info():
             response = cf_client.describe_stacks(StackName="game-agent-frontend")
             for output in response["Stacks"][0]["Outputs"]:
                 if output["OutputKey"] == "ServiceUrl":
-                    frontend_url = f"https://{output['OutputValue']}"
+                    frontend_url = frontend_url_from_service_url(output["OutputValue"])
                     break
         except Exception:
             pass  # Frontend URL optional
