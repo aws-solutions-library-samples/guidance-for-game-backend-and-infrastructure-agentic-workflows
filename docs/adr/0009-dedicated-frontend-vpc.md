@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-04
-- **Decision issue:** To be linked when the tracking issue is opened
+- **Decision issue:** #728
 - **Related:** [#588](https://github.com/aws-solutions-library-samples/guidance-for-game-backend-and-infrastructure-agentic-workflows/issues/588)
   (private network path for read-only cluster inspection)
 
