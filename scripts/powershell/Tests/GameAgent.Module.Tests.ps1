@@ -51,6 +51,8 @@ Describe 'GameAgent Module' {
             'Invoke-GameAgentTransactionSearchPreflight'
             'New-GameAgentAwsInvoker'
             'New-GameAgentAgentCoreEnvArgs'
+            'Resolve-GameAgentPlatformVersion'
+            'Invoke-GameAgentPlatformVersion'
         )
         $exported = (Get-Module -Name GameAgent).ExportedCommands.Keys
         foreach ($fn in $privateFunctions) {

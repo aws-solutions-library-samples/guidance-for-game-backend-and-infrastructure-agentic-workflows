@@ -6,6 +6,11 @@ function Deploy-GameAgent {
         Full deployment matching deploy.sh: base infra, guardrails, prompts,
         account observability, AgentCore Runtime, CW delivery, observability stack,
         Knowledge Bases, seed KBs, wire KBs, frontend (Docker), security.
+
+        The AgentCore Runtime platform version comes from the shared
+        GBAW_AGENTCORE_PLATFORM_VERSION environment setting (V1 by default, or
+        V2), validated before any AWS change and applied after the final
+        `agentcore launch`, exactly as in deploy.sh.
     .PARAMETER ProjectName
         Project name for resource naming. Default: "game-agent".
     .PARAMETER Region
@@ -84,6 +89,12 @@ function Deploy-GameAgent {
         $deliveryRetryArgs['RetrySeconds'] = $parsedDelay
     }
 
+    # AgentCore Runtime platform version (V1 default, or V2), resolved with the
+    # same rule as scripts/deploy.sh before any AWS change so an invalid value
+    # stops the deployment immediately. Applied in Step 5b after the final
+    # `agentcore launch` (the starter toolkit has no platform-version option).
+    $agentCorePlatformVersion = Resolve-GameAgentPlatformVersion -Value $env:GBAW_AGENTCORE_PLATFORM_VERSION
+
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '../../..')).Path
     $infraPath = Join-Path $repoRoot 'infrastructure/cloudformation'
     $backendPath = Join-Path $repoRoot 'backend'
@@ -135,6 +146,7 @@ function Deploy-GameAgent {
     Write-Host ('=' * 60) -ForegroundColor Cyan
     Write-Host "Region:  $Region"
     Write-Host "Profile: $($Profile ?? 'default')"
+    Write-Host "AgentCore Runtime platform version: $agentCorePlatformVersion"
     Write-Host ''
 
     # ── Prerequisites ──
@@ -563,9 +575,23 @@ function Deploy-GameAgent {
         # and the toolkit re-runs its account-wide Transaction Search step on
         # every launch.
         Assert-GameAgentTransactionSearchPreflight -Region $Region -ProfileArgs $profileArgs -StopOnAccountObservabilityChange:$StopOnAccountObservabilityChange
+        # On platform version V2 a create or update takes several minutes, and an
+        # update issued before the runtime reaches a terminal status fails with
+        # ConflictException. Wait (read-only) before the launch below updates it.
+        Write-GameAgentStatus 'Waiting for the AgentCore Runtime to reach a terminal status...' -Type Info
+        Invoke-GameAgentPlatformVersion -RuntimeId $runtimeId -Region $Region -WaitOnly
         uv run agentcore launch --auto-update-on-conflict @agentCoreEnvArgs
         if ($LASTEXITCODE -ne 0) { throw "agentcore launch (runtime environment update) failed (exit code $LASTEXITCODE)" }
         Write-GameAgentStatus 'AgentCore Runtime updated with role models and available service configuration' -Type Success
+
+        # Converge on the requested platform version after the final launch. The
+        # shared helper reads the runtime and sends back every other field
+        # unchanged, makes no update when the version already matches, and fails
+        # closed on any error. An update without platformVersion (as
+        # `agentcore launch` sends) keeps the current version, so later launches
+        # do not undo this step.
+        Write-GameAgentStatus "Applying AgentCore Runtime platform version $agentCorePlatformVersion..." -Type Info
+        Invoke-GameAgentPlatformVersion -RuntimeId $runtimeId -Region $Region -PlatformVersion $agentCorePlatformVersion
 
         # ── Step 5c: Post-launch Transaction Search recheck (read-only) ──
         # agentcore launch performs its own Transaction Search enable on every
@@ -687,6 +713,7 @@ function Deploy-GameAgent {
 
     Write-Host 'Infrastructure IDs:' -ForegroundColor Cyan
     Write-Host "   Runtime ID:   $runtimeId"
+    Write-Host "   Platform:     $agentCorePlatformVersion"
     Write-Host "   Guardrail ID: $guardrailId"
     Write-Host "   GameLift KB:  $gameliftKbId"
     Write-Host "   EKS KB:       $eksKbId"
