@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Recognized forecast questions keep historical reports only for periods the question names.
+"""Recognized forecast and cost-advice questions keep historical reports only for periods they name.
 
 The Cost specialist may build validated historical reports while it works on a
-forecast (for example, baseline months). Those reports are captured as
-authoritative renderings, so without a period check the orchestrator would
-return the last one as the answer to the forecast question. These tests drive
-the real orchestrator composition with the real report tools and a stubbed
-Cost Explorer client (no network).
+forecast (for example, baseline months) or on cost advice (for example, last
+month's spend). Those reports are captured as authoritative renderings, so
+without a period check the orchestrator would return the last one as the
+answer to the question. These tests drive the real orchestrator composition
+with the real report tools and a stubbed Cost Explorer client (no network).
 """
 
 # Standard library
@@ -505,6 +505,140 @@ class TestForecastDetection:
     )
     def test_historical_and_advisory_phrasings_are_not_detected(self, query):
         assert not orchestrator._is_forecast_request(query)
+
+
+ADVICE = "How do I reduce data transfer costs for my game?"
+ADVICE_PHRASINGS = [
+    ADVICE,
+    "How can I lower my EC2 bill?",
+    "How can we cut our AWS spend?",
+    "How do I save on data transfer costs?",
+    "What are some ways to reduce my AWS bill?",
+    "Optimize my EC2 spend.",
+    "Help me optimize our GameLift spending.",
+    "Any tips for reducing our data transfer charges?",
+    "Is there a way to lower the cost of our EKS nodes?",
+    "Show me cost optimization opportunities",
+    "What are AWS spending optimization strategies?",
+]
+# Each of these asks what was spent, or asks for a report, or describes a change
+# already seen, so it is not an advice request.
+SPEND_QUESTIONS = [
+    "What did I spend on data transfer last month?",
+    "How much did I spend on data transfer last month, and how can I reduce those costs?",
+    "What is costing me the most, and how do I cut those costs?",
+    "Show my costs by service and how to reduce data transfer costs.",
+    "What's my current AWS spending and how can I reduce it?",
+    "Did rightsizing reduce my bill last month?",
+]
+
+
+class TestCostAdviceRequest:
+    """A how-to or optimization cost question gets the cost guidance, not an unrequested report (#620).
+
+    The Cost specialist can build a validated report (live runs built the last
+    complete month) while it works on the advice. Like a forecast, an advice
+    question keeps a report only for a past period it names.
+    """
+
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    def test_last_month_report_is_not_the_answer(self, raise_after):
+        response = _run(ADVICE, [("2026-09-01", "2026-09-30")], raise_after=raise_after, cost_ran=True)
+
+        assert response == ADVISORY_GUIDANCE
+        assert "Report ID" not in response
+        assert "USD" not in response
+
+    @pytest.mark.parametrize("query", ADVICE_PHRASINGS)
+    def test_advice_phrasings_get_the_guidance(self, query):
+        assert _run(query, LIVE_BASELINES, cost_ran=True) == ADVISORY_GUIDANCE
+
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    def test_advice_without_a_report_is_not_a_failed_report_request(self, raise_after):
+        """'My bill' in an advice question does not make it a report request that failed."""
+        response = _run("How can I lower my EC2 bill?", [], raise_after=raise_after, cost_ran=True)
+
+        assert response == ADVISORY_GUIDANCE
+
+    def test_production_route_keeps_specialist_markers_and_guidance(self):
+        service = _service(1)
+
+        def body() -> str:
+            record_specialist_output("GameLift", "The fleet runs 4 instances.")
+            record_specialist_output("Cost", "Data transfer cost USD 999.00 last month.")
+            tools, _ = create_cost_report_tool_bundle(service)
+            tools[0]("2026-09-01", "2026-09-30")
+            return "Data transfer cost USD 999.00 last month."
+
+        response = _orchestrate(ADVICE, body)
+
+        assert response.startswith("## GameLift")
+        assert response.endswith(ADVISORY_GUIDANCE)
+        assert "Report ID" not in response
+        assert "USD" not in response
+
+    def test_raised_turn_that_drops_its_reports_logs_one_warning(self):
+        with patch.object(orchestrator.logger, "warning") as warning:
+            _run(ADVICE, [("2026-09-01", "2026-09-30")], raise_after=True, cost_ran=True)
+
+        messages = [str(c) for c in warning.call_args_list]
+        assert any("Cost advice request failed after a validated cost report" in m for m in messages)
+        assert not any("request raised before a validated cost report" in m for m in messages)
+
+    @pytest.mark.parametrize("raise_after", [False, True], ids=["completed", "raised"])
+    def test_report_for_a_named_past_period_is_kept_with_the_guidance(self, raise_after):
+        response = _run(
+            "How do I reduce last month's data transfer costs?",
+            [("2026-09-01", "2026-09-30"), ("2026-07-01", "2026-07-31")],
+            raise_after=raise_after,
+        )
+
+        assert "**Report ID:** `cost-report-0`" in response
+        assert "cost-report-1" not in response
+        assert response.endswith(ADVISORY_GUIDANCE)
+        assert FORECAST_SENTENCE not in response
+
+    @pytest.mark.parametrize("query", SPEND_QUESTIONS)
+    def test_question_about_spend_keeps_its_report(self, query):
+        response = _run(query, [("2026-08-01", "2026-08-31"), ("2026-09-01", "2026-09-30")])
+
+        assert "**Report ID:** `cost-report-1`" in response
+        assert "## Cost Guidance" not in response
+
+    def test_forecast_with_advice_wording_gets_the_forecast_guidance(self):
+        response = _run("How can I reduce my AWS costs next month?", LIVE_BASELINES, cost_ran=True)
+
+        assert response == GUIDANCE
+
+
+class TestCostAdviceDetection:
+    @pytest.mark.parametrize("query", ADVICE_PHRASINGS + ["How do I reduce last month's data transfer costs?"])
+    def test_advice_phrasings_are_detected(self, query):
+        assert orchestrator._is_cost_advice_request(query)
+        assert not orchestrator._has_cost_intent(query)
+
+    @pytest.mark.parametrize(
+        "query",
+        SPEND_QUESTIONS
+        + [
+            "Show my AWS costs by service for last month.",
+            "Show the months with lower spend.",
+            "We cut our fleet size, so show my costs by service.",
+            "How do I reduce latency for my game servers?",
+        ],
+    )
+    def test_spend_questions_are_not_detected(self, query):
+        assert not orchestrator._is_cost_advice_request(query)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "How much did I spend on data transfer last month, and how can I reduce those costs?",
+            "What is costing me the most, and how do I cut those costs?",
+        ],
+    )
+    def test_a_question_that_also_asks_what_was_spent_still_requires_its_report(self, query):
+        assert orchestrator._has_cost_intent(query)
 
 
 def _periods(query: str, today: date = TODAY) -> set[tuple[str, str, str]]:
