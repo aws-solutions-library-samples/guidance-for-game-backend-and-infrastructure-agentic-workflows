@@ -8,12 +8,26 @@ function Invoke-GameAgentAppObservability {
     # Helper: set retention if log group exists but has none
     function Set-LogGroupRetention {
         param([string]$LogGroup, [string]$Desc)
-        $lg = (& aws logs describe-log-groups --region $Region @ProfileArgs --log-group-name-exact $LogGroup --query 'logGroups[0]' --output json 2>$null) | Out-String
-        if ($lg.Trim() -eq 'null' -or -not $lg.Trim()) {
+        # describe-log-groups has no exact-name option, so list the groups that
+        # start with the name and keep only the exact match. A failed lookup is
+        # reported instead of being mistaken for a missing log group. The call is
+        # wrapped so a redirected native stderr cannot become a terminating error
+        # under an inherited 'Stop' preference (PowerShell 7.0/7.1).
+        $groups = $null
+        try {
+            $raw = (& aws logs describe-log-groups --region $Region @ProfileArgs --log-group-name-prefix $LogGroup `
+                --query "logGroups[?logGroupName=='$LogGroup']" --output json 2>$null) | Out-String
+            if ($LASTEXITCODE -eq 0) { $groups = @($raw | ConvertFrom-Json) }
+        } catch { $groups = $null }
+        if ($null -eq $groups) {
+            Write-Host "  $Desc`: could not read $LogGroup; retention unchanged"
+            return
+        }
+        $info = $groups | Where-Object { $_.logGroupName -eq $LogGroup } | Select-Object -First 1
+        if (-not $info) {
             Write-Host "  $Desc`: log group not found (will be created on first use)"
             return
         }
-        $info = $lg | ConvertFrom-Json
         if ($info.retentionInDays -eq $RetentionDays) {
             Write-Host "  $Desc`: already has ${RetentionDays}-day retention"
         } else {
