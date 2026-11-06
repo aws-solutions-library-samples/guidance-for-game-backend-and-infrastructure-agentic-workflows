@@ -924,6 +924,17 @@ never set the bypass, so hosted configuration cannot reach this combination.
 | Hosted AgentCore | `GBAW_HOSTED_RUNTIME=true`, bypass off | `0.0.0.0` | Unpublished container network + per-request JWT verifier |
 | Hosted + bypass | contradictory (config drift) | refuses to start | Fail-closed guard (`RuntimeBindError`); hosted mode ignores the bypass anyway |
 
+The local frontend has the same loopback boundary. `ui/package.json` starts
+`next dev` and `next start` with `--hostname 127.0.0.1`, because Next.js
+otherwise listens on all interfaces (#740). With the dev-only
+`NEXT_PUBLIC_SKIP_AUTH` bypass, the chat proxy admits requests without a
+Cognito token and forwards them to the loopback backend. An all-interfaces
+frontend would therefore let any host on the network use the local agent with
+the developer's AWS credentials. To reach a dev server from another device, use
+an SSH local port forward instead of widening the bind. The container image is
+unaffected: it runs `node server.js` behind the ECS service and never uses
+`npm start`.
+
 **Configuration Location**: `backend/src/config/settings.py` (`resolve_runtime_host`),
 `backend/src/agentcore_main.py` (`run_server`), and `backend/agentcore_main.py`.
 
