@@ -530,6 +530,12 @@ SPEND_QUESTIONS = [
     "Show my costs by service and how to reduce data transfer costs.",
     "What's my current AWS spending and how can I reduce it?",
     "Did rightsizing reduce my bill last month?",
+    # Advice plus a figure request phrased with "spend" or a period the resolver
+    # does not recognize: the report is still what was asked for.
+    "We need to cut costs. Show EC2 spend by service for this month.",
+    "I want to save on charges. Which services had the highest spend in September?",
+    "We need to cut costs. What did we spend on EC2 in Q3?",
+    "How do I reduce costs? List the top services by spend this month.",
 ]
 
 

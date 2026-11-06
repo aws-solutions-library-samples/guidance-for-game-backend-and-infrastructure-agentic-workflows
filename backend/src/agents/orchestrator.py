@@ -230,15 +230,22 @@ def _is_operational_identifier_query(query: str) -> bool:
 def _is_cost_advice_request(query: str) -> bool:
     """Return whether a query asks how to lower or optimize cost rather than what was spent.
 
-    A question that, with its advice phrases removed, still reads as a report
-    request is not advice: "How much did I spend last month, and how do I
-    reduce those costs?" and "Show my costs by service and how to reduce data
-    transfer costs" keep their reports.
+    A question that, with its advice phrases removed, still mentions cost or
+    reads as a report request is not advice: "How much did I spend last month,
+    and how do I reduce those costs?", "Show my costs by service and how to
+    reduce data transfer costs" and "How do I reduce costs? List the top
+    services by spend this month." keep their reports. Checking for any
+    remaining cost word, not only the report patterns, keeps a figure request
+    phrased with "spend" or an unrecognized period on the report path.
     """
     if _COST_ADVICE_PATTERN.search(query) is None:
         return False
     rest = _COST_ADVICE_PATTERN.sub(" ", query)
-    return _EXPLICIT_ACTUAL_COST_PATTERN.search(rest) is None and _COST_INTENT_PATTERN.search(rest) is None
+    return (
+        _COST_TOPIC_PATTERN.search(rest) is None
+        and _EXPLICIT_ACTUAL_COST_PATTERN.search(rest) is None
+        and _COST_INTENT_PATTERN.search(rest) is None
+    )
 
 
 def _has_cost_intent(query: str) -> bool:
