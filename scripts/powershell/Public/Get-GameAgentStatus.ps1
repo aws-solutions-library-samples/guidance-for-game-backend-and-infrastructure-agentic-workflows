@@ -108,7 +108,8 @@ function Get-GameAgentStatus {
         $frontendUrl = & aws cloudformation describe-stacks --stack-name "$ProjectName-frontend" --region $Region @profileArgs `
             --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' --output text 2>$null
         if ($LASTEXITCODE -eq 0 -and $frontendUrl) {
-            Write-Host "Frontend: https://$frontendUrl" -ForegroundColor Green
+            $frontendUrl = ConvertTo-GameAgentFrontendUrl -ServiceUrl $frontendUrl
+            Write-Host "Frontend: $frontendUrl" -ForegroundColor Green
             Write-Host ''
         }
     }

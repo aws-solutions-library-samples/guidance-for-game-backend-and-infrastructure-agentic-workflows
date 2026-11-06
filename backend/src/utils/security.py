@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import os
 import re
+import threading
 import unicodedata
 from typing import TYPE_CHECKING, Any
 
@@ -295,18 +296,55 @@ def hash_sensitive_data(data: str, salt: str = "") -> str:
     return hashlib.sha256((salt + data).encode()).hexdigest()
 
 
-# Per-process redaction key. Correlation tokens must let an operator tie several
+# Per-instance redaction key. Correlation tokens must let an operator tie several
 # log lines back to the same principal or session within one running process,
 # while never being reversible to the underlying identifier. A random key,
-# generated once per process and never logged or configured, keeps a token
-# stable within that process and makes it a non-dictionary-attackable value:
-# without the key, a bare SHA-256 of a Cognito subject or thread id could be
-# precomputed from guessable inputs. The key is intentionally not read from the
-# environment — an environment-pinned value would sit in plaintext in the
+# generated once per process instance and never logged or configured, keeps a
+# token stable within that instance and makes it a non-dictionary-attackable
+# value: without the key, a bare SHA-256 of a Cognito subject or thread id could
+# be precomputed from guessable inputs. The key is intentionally not read from
+# the environment — an environment-pinned value would sit in plaintext in the
 # runtime and would be inherited by every MCP subprocess through the process
-# environment. Because the key is random per process, tokens correlate only
-# within a single process and never across processes, restarts, or tiers.
-_LOG_REDACTION_KEY = os.urandom(32)
+# environment. Because the key is random per instance, tokens correlate only
+# within a single instance and never across instances, restarts, or tiers.
+#
+# The key is created on first use, never at import. On AgentCore Runtime
+# platform version V2 every instance is restored from one snapshot taken after
+# startup, so a key generated at import would be identical in every instance
+# and tokens would correlate across them. The runtime's per-instance
+# initialization (``utils.runtime_instance.ensure_instance_initialized``, run at
+# the first invocation) also discards any key created before that point, so a
+# token emitted while serving requests always uses a key generated after the
+# restore, from os.urandom.
+_LOG_REDACTION_KEY: bytes | None = None
+_LOG_REDACTION_KEY_LOCK = threading.Lock()
+
+
+def _log_redaction_key() -> bytes:
+    """Return this instance's log-redaction key, generating it on first use."""
+    global _LOG_REDACTION_KEY
+    key = _LOG_REDACTION_KEY
+    if key is None:
+        with _LOG_REDACTION_KEY_LOCK:
+            key = _LOG_REDACTION_KEY
+            if key is None:
+                key = os.urandom(32)
+                _LOG_REDACTION_KEY = key
+    return key
+
+
+def rotate_log_redaction_key() -> None:
+    """Discard the current log-redaction key; the next token uses a fresh key.
+
+    Called once per instance by ``utils.runtime_instance`` at the first
+    invocation, so a key created during startup (and therefore captured in an
+    AgentCore V2 snapshot) is never used for request-time tokens. Tokens emitted
+    before and after a rotation do not match.
+    """
+    global _LOG_REDACTION_KEY
+    with _LOG_REDACTION_KEY_LOCK:
+        _LOG_REDACTION_KEY = None
+
 
 # Bounds for the correlation token length (hex characters). A caller cannot
 # request the full digest (which would widen the surface for offline matching)
@@ -352,9 +390,9 @@ def redact_identifier(value: Any, length: int = 12) -> str:
 
     Use for values that must stay stable across log lines for correlation
     (actor/subject, session/thread id) but must never appear in plaintext. The
-    token is a keyed HMAC-SHA-256 prefix over a per-process random key, so it is
+    token is a keyed HMAC-SHA-256 prefix over a per-instance random key, so it is
     not a plain reversible hash of a guessable value and cannot be joined across
-    processes, restarts, or tiers. Prefer request IDs where correlation does not
+    instances, restarts, or tiers. Prefer request IDs where correlation does not
     require tying log lines to a specific principal.
 
     Args:
@@ -374,7 +412,7 @@ def redact_identifier(value: Any, length: int = 12) -> str:
     # surrogates that strict UTF-8 encoding rejects, and a log helper must not
     # fail the request. Each such code point becomes a distinct escape, so
     # different inputs still get different tokens.
-    digest = hmac.new(_LOG_REDACTION_KEY, text.encode("utf-8", "backslashreplace"), hashlib.sha256).hexdigest()
+    digest = hmac.new(_log_redaction_key(), text.encode("utf-8", "backslashreplace"), hashlib.sha256).hexdigest()
     return f"id:{digest[:clamped]}"
 
 

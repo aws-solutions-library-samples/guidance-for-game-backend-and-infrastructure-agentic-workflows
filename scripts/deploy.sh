@@ -93,6 +93,32 @@ if [ "$DOCKER_AVAILABLE" = false ]; then
     echo ""
 fi
 
+# AgentCore Runtime platform version: V1 (default) or V2. Validated here, before
+# any AWS change, and applied in Step 5b after the final `agentcore launch` by
+# scripts/infrastructure/agentcore_platform_version.py (the starter toolkit has
+# no platform-version option). The PowerShell Deploy-GameAgent path resolves the
+# same variable with the same rule (Resolve-GameAgentPlatformVersion).
+resolve_agentcore_platform_version() {
+  local requested="${1:-}"
+  if [ -z "$requested" ]; then
+    requested="V1"
+  fi
+  case "$requested" in
+    V1|V2)
+      printf '%s\n' "$requested"
+      ;;
+    *)
+      echo "❌ GBAW_AGENTCORE_PLATFORM_VERSION='$requested' must be V1 or V2." >&2
+      return 1
+      ;;
+  esac
+}
+
+if ! AGENTCORE_PLATFORM_VERSION="$(resolve_agentcore_platform_version "${GBAW_AGENTCORE_PLATFORM_VERSION:-}")"; then
+  exit 1
+fi
+echo "   AgentCore Runtime platform version: ${AGENTCORE_PLATFORM_VERSION}"
+
 echo "✅ All required prerequisites met"
 echo ""
 
@@ -429,6 +455,19 @@ build_agentcore_env_args() {
   append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_REQUIRED" "${COST_SNAPSHOT_REQUIRED:-}"
   append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TTL_SECONDS" "${COST_SNAPSHOT_TTL_SECONDS:-}"
   return 0
+}
+
+# Run the shared platform-version helper from the backend project so it uses the
+# locked boto3/botocore. $1 is the runtime ID; the rest are helper arguments
+# (--wait-only, or --platform-version V1|V2). A non-zero exit stops the deploy.
+run_agentcore_platform_version_helper() {
+  local runtime_id="$1"
+  shift
+  (
+    cd "$PROJECT_ROOT/backend" || exit 1
+    uv run python "$SCRIPT_DIR/infrastructure/agentcore_platform_version.py" \
+      --runtime-id "$runtime_id" --region "$AWS_REGION" "$@"
+  )
 }
 
 is_transient_waf_error() {
@@ -1246,8 +1285,21 @@ echo "🚀 Updating AgentCore Runtime environment..."
 if ! run_toolkit_preflight; then
   exit 1
 fi
+# On platform version V2 a create or update takes several minutes, and an update
+# issued before the runtime reaches a terminal status fails with
+# ConflictException. Wait (read-only) before the launch below updates it.
+echo "⏳ Waiting for the AgentCore Runtime to reach a terminal status..."
+run_agentcore_platform_version_helper "$RUNTIME_ID" --wait-only
 uv run agentcore launch --auto-update-on-conflict "${LAUNCH_ENV_ARGS[@]}"
 echo "✅ AgentCore Runtime updated with role models and available service configuration"
+
+# Converge on the requested platform version after the final launch. The helper
+# reads the runtime and sends back every other field unchanged, makes no update
+# when the version already matches, and exits non-zero (stopping this deploy) on
+# any error. An update without platformVersion (as `agentcore launch` sends)
+# keeps the current version, so later launches do not undo this step.
+echo "🧭 Applying AgentCore Runtime platform version ${AGENTCORE_PLATFORM_VERSION}..."
+run_agentcore_platform_version_helper "$RUNTIME_ID" --platform-version "$AGENTCORE_PLATFORM_VERSION"
 
 cd "$PROJECT_ROOT"
 echo ""
@@ -1339,6 +1391,10 @@ FRONTEND_URL=$(aws cloudformation describe-stacks \
   --region $AWS_REGION \
   --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' \
   --output text)
+# ServiceUrl may be a bare host or already include https:// (#641); use one scheme.
+FRONTEND_URL="${FRONTEND_URL#https://}"
+FRONTEND_URL="${FRONTEND_URL#http://}"
+FRONTEND_URL="https://${FRONTEND_URL%/}"
 
 echo "✅ Frontend deployed"
 echo ""
@@ -1444,12 +1500,13 @@ echo ""
 
 if [ "$DOCKER_AVAILABLE" = true ]; then
 echo "📍 Access URL:"
-echo "   Frontend: https://$FRONTEND_URL"
+echo "   Frontend: $FRONTEND_URL"
 echo ""
 fi
 
 echo "🔑 Infrastructure IDs:"
 echo "   Runtime ID:    $RUNTIME_ID"
+echo "   Platform:      $AGENTCORE_PLATFORM_VERSION"
 echo "   Guardrail ID:  $GUARDRAIL_ID"
 echo "   GameLift KB:   $GAMELIFT_KB_ID"
 echo "   EKS KB:        $EKS_KB_ID"
@@ -1472,7 +1529,7 @@ echo "   ✅ CloudTrail API audit logging enabled"
 echo ""
 echo "🚀 Next Steps:"
 echo "   1. Create admin user: ./scripts/infrastructure/add-admin-user.sh"
-echo "   2. Access frontend: https://$FRONTEND_URL"
+echo "   2. Access frontend: $FRONTEND_URL"
 echo "   3. Subscribe to security alerts:"
 echo "      aws sns subscribe --topic-arn \$(aws cloudformation describe-stacks --stack-name ${PROJECT_NAME}-security --region $AWS_REGION --query 'Stacks[0].Outputs[?OutputKey==\`SecurityAlertsTopicArn\`].OutputValue' --output text) --protocol email --notification-endpoint YOUR_EMAIL"
 else

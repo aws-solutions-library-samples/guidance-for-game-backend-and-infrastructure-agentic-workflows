@@ -960,10 +960,16 @@ or raw session/thread identifiers.
   must stay tied to a principal or session across lines is emitted as a
   bounded, non-reversible token: `redact_identifier()`
   (`backend/src/utils/security.py`, a keyed HMAC-SHA-256 prefix over a random
-  per-process key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
-  the frontend. The HMAC key is random per process and is never read from the
-  environment, so a token is stable only within a single process and does not
-  correlate across processes, restarts, or tiers. The frontend additionally
+  per-instance key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
+  the frontend. The HMAC key is random per runtime instance and is never read
+  from the environment, so a token is stable only within a single instance and
+  does not correlate across instances, restarts, or tiers. The backend key is
+  generated from `os.urandom` on first use, never at import, and the runtime
+  discards any key created before an instance's first invocation
+  (`backend/src/utils/runtime_instance.py`). On AgentCore Runtime platform
+  version V2, where every instance is restored from one startup snapshot, each
+  instance therefore uses its own key rather than one copied from the snapshot.
+  The frontend additionally
   records AgentCore's service request ID from the `x-amzn-RequestId` response
   header, which identifies the invocation to the service (for example in a
   support case). It comes from a different header than the request ID the

@@ -1765,7 +1765,7 @@ case "$svc $op" in
       *CostReportSnapshotTableName*) echo "game-agent-cost-snapshots";;
       *AgentCoreExecutionRoleArn*) echo "arn:aws:iam::123456789012:role/example-exec";;
       *FrontendRepositoryUri*) echo "123456789012.dkr.ecr.us-west-2.amazonaws.com/example";;
-      *ServiceUrl*) echo "example.us-west-2.elb.amazonaws.com";;
+      *ServiceUrl*) echo "${STUB_SERVICE_URL:-example.us-west-2.elb.amazonaws.com}";;
       *LoadBalancerArn*) echo "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/app/example/00";;
       *WebACLArn*) echo "arn:aws:wafv2:us-west-2:123456789012:regional/webacl/example/00";;
       *CloudTrailArn*) echo "arn:aws:cloudtrail:us-west-2:123456789012:trail/example";;
@@ -1990,6 +1990,7 @@ def _run_deploy_e2e(
     trace_dest_first_count: int = 1,
     policies_json: str = '{"resourcePolicies":[{"policyName":"TransactionSearchXRayAccess","policyDocument":"{}"}]}',
     indexing_json: str = '{"IndexingRules":[{"Name":"Default"}]}',
+    service_url: str = "",
 ) -> "subprocess.CompletedProcess[str]":
     repo = _build_deploy_tree(tmp_path)
     bindir = tmp_path / "bin"
@@ -2047,6 +2048,8 @@ def _run_deploy_e2e(
         env["STUB_TRACE_DEST_COUNTER"] = str(tmp_path / "trace_dest_counter")
     if stop_switch:
         env["GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE"] = "true"
+    if service_url:
+        env["STUB_SERVICE_URL"] = service_url
 
     result = subprocess.run(
         [shell, str(repo / "scripts" / "deploy.sh")],
@@ -2080,6 +2083,18 @@ def test_deploy_e2e_default_completes_and_launches(tmp_path, shell, docker, runt
         assert "Deployment Complete!" in result.stdout
     else:
         assert "Deployment Partially Complete (backend only)" in result.stdout
+
+
+@pytest.mark.parametrize("shell", _E2E_SHELLS)
+@pytest.mark.parametrize("service_url", ["example.ecs.us-west-2.on.aws", "https://example.ecs.us-west-2.on.aws"])
+def test_deploy_e2e_prints_the_frontend_url_with_one_scheme(tmp_path, shell, service_url):
+    """The frontend ServiceUrl output may be a bare host or already include its
+    scheme (issue #641); the deployment summary prints https://<host> once."""
+    result = _run_deploy_e2e(tmp_path, shell=shell, docker=True, service_url=service_url)
+    assert result.returncode == 0, f"stdout tail:\n{result.stdout[-800:]}\nstderr:\n{result.stderr[-800:]}"
+    assert "   Frontend: https://example.ecs.us-west-2.on.aws\n" in result.stdout
+    assert "   2. Access frontend: https://example.ecs.us-west-2.on.aws\n" in result.stdout
+    assert "https://https://" not in result.stdout
 
 
 @pytest.mark.parametrize("shell", _E2E_SHELLS)

@@ -240,6 +240,47 @@ belongs in the exporter/platform credential lifecycle (wait for a ready
 provider before the first export, or retry the signed request once credentials
 resolve); the application should not disable or suppress the exporter.
 
+## AgentCore Runtime V2: telemetry identity across restored instances
+
+On AgentCore Runtime platform version V2 (see
+[AgentCore Runtime Platform Version](DEPLOYMENT_GUIDE.md#agentcore-runtime-platform-version-v1-and-v2)),
+every instance of a runtime version is restored from one snapshot taken after
+startup. The OpenTelemetry SDK is initialized during that startup, so values it
+generates then are the same in every instance.
+
+**Known limitation: `service.instance.id` is shared.** The SDK generates the
+`service.instance.id` resource attribute as a random UUID when it initializes
+and regenerates it only when the process ID changes (after a fork). Restored
+instances share the snapshot's process ID, so every instance of a V2 runtime
+version reports the same `service.instance.id`, and the same `host.name` and
+`process.pid`. A resource cannot be changed after the SDK is initialized without
+replacing SDK internals, so the runtime leaves the resource as it is.
+
+**Mitigation: a per-instance span attribute.** The entrypoint registers a span
+processor (`backend/src/utils/runtime_instance.py`) that adds
+`gbaw.runtime.instance_id` to every span started after the instance's first
+invocation. The value is 64 random bits created at that invocation, after the
+restore; the instance also logs it once at INFO (`Runtime instance initialized`).
+To tell V2 instances apart, group or filter on this attribute or on the session
+ID, not on `service.instance.id`. Spans started earlier carry no instance
+attribute: startup spans and the inbound server span of each instance's first
+request. The attribute holds no content, and the processor does not change the
+trace-content redaction described in [`SECURITY.md`](../SECURITY.md).
+
+**Trace and span IDs.** The distro's X-Ray ID generator, like the SDK default,
+draws from Python's `random` module, whose state is part of the snapshot, so
+restored instances would generate the same ID sequence. At import the entrypoint
+makes the tracer provider's generator draw every trace and span ID from
+operating-system entropy instead (X-Ray trace IDs keep their epoch-seconds
+prefix), and the first invocation also reseeds the `random` module for other
+users such as retry jitter.
+
+**Not covered.** OpenTelemetry log records and metrics keep the shared resource
+attributes and carry no instance attribute; log records correlate to spans
+through their trace and span IDs. The MCP server subprocesses start during
+requests, after the restore, so their own SDK resources and ID generators are
+created per instance.
+
 ## Rollback / disable path
 
 There is no repository-owned exporter configuration to roll back — the exporter
