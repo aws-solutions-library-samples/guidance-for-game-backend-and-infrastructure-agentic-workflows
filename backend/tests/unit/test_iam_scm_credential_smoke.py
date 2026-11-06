@@ -14,8 +14,9 @@ This parses ``infrastructure/cloudformation/01-base-infrastructure.yaml`` and as
   grant targets the read ARN (``!Ref ScmReadCredentialSecretArn``) scoped to the
   chat-runtime role.
 * **Minimal audit grant** (task 11.5) — ``ScmAuditLogAccess`` permits only
-  ``logs:CreateLogStream`` + ``logs:PutLogEvents``, is KB-independent, and remains the
-  read-audit target (the dedicated connector audit log group).
+  ``logs:CreateLogStream`` + ``logs:PutLogEvents``, is KB-independent, remains the
+  read-audit target (the dedicated connector audit log group), and is granted only while the
+  connector is enabled.
 
 The template uses CloudFormation intrinsic short tags (``!Ref``, ``!Sub``, ``!If``,
 ``!GetAtt``, ``!Not``, ``!Equals``). The shared ``_cfn_yaml.load_cfn_template_with_intrinsics``
@@ -63,9 +64,15 @@ _REMOVED_WRITE_POLICY_NAME = "ScmCredentialAccess"
 _REMOVED_WRITE_CONDITION_NAME = "ScmCredentialConfigured"
 _REMOVED_WRITE_PARAMETER_NAME = "ScmCredentialSecretArn"
 
-# The dedicated audit-sink grant (KB-independent, opt-in via ScmAuditLogGroupName).
+# The dedicated audit-sink grant (KB-independent, opt-in via ScmAuditLogGroupName). Like the
+# read grant, it is gated on the connector being ENABLED *and* a log group configured, so a
+# disabled deployment carries no connector audit write permission. The log group itself stays
+# on the name-presence condition ScmAuditLogGroupConfigured, so disabling the connector does
+# not delete the retained audit history.
 _SCM_AUDIT_POLICY_NAME = "ScmAuditLogAccess"
-_SCM_AUDIT_CONDITION_NAME = "ScmAuditLogGroupConfigured"
+_SCM_AUDIT_CONDITION_NAME = "ScmAuditLogWriteActive"
+_SCM_AUDIT_CONFIGURED_CONDITION_NAME = "ScmAuditLogGroupConfigured"
+_SCM_AUDIT_LOG_GROUP_PARAMETER_NAME = "ScmAuditLogGroupName"
 _SCM_AUDIT_LOG_GROUP_LOGICAL_ID = "ScmAuditLogGroup"
 
 
@@ -201,6 +208,52 @@ def _action_verb(action: str) -> str:
     """Return the verb portion of a ``service:Verb`` action (empty for wildcard)."""
     _, _, verb = action.partition(":")
     return verb
+
+
+def _parameter_values(template: dict, **overrides: str) -> dict[str, str]:
+    """Return every template parameter's default, with ``overrides`` applied."""
+    values = {name: str(spec.get("Default", "")) for name, spec in template.get("Parameters", {}).items()}
+    for name, value in overrides.items():
+        assert name in values, f"unknown template parameter {name!r}"
+        values[name] = value
+    return values
+
+
+def _condition_is_true(conditions: dict, name: str, parameters: dict[str, str]) -> bool:
+    """Evaluate the named template Condition for ``parameters``.
+
+    Supports the condition functions this template uses (``Fn::And``, ``Fn::Or``,
+    ``Fn::Not``, ``Fn::Equals``, nested ``Condition`` references, and parameter ``Ref``s).
+    Any other construct fails the test rather than being guessed at.
+    """
+
+    def value(node):
+        if isinstance(node, str):
+            return node
+        if isinstance(node, dict) and set(node) == {"Ref"}:
+            assert node["Ref"] in parameters, f"condition references unknown parameter {node['Ref']!r}"
+            return parameters[node["Ref"]]
+        raise AssertionError(f"unsupported condition value: {node!r}")
+
+    def truth(node) -> bool:
+        assert isinstance(node, dict) and len(node) == 1, f"unsupported condition node: {node!r}"
+        ((function, args),) = node.items()
+        if function == "Condition":
+            return _condition_is_true(conditions, args, parameters)
+        if function == "Fn::And":
+            return all(truth(term) for term in args)
+        if function == "Fn::Or":
+            return any(truth(term) for term in args)
+        if function == "Fn::Not":
+            (term,) = args
+            return not truth(term)
+        if function == "Fn::Equals":
+            left, right = args
+            return value(left) == value(right)
+        raise AssertionError(f"unsupported condition function: {function!r}")
+
+    assert name in conditions, f"unknown condition {name!r}"
+    return truth(conditions[name])
 
 
 # --- Task 11.3: no write surface ----------------------------------------------------------
@@ -391,25 +444,84 @@ def test_no_mutating_live_infrastructure_actions_present(role_policies: list):
 # --- Task 11.5: minimal, KB-independent audit grant ---------------------------------------
 
 
-def test_scm_audit_policy_is_conditional_on_audit_log_group_configured(role_policies: list):
-    """(Req 9.3, 9.5) The audit-sink grant is added only via the ``ScmAuditLogGroupConfigured``
-    condition — a non-empty ``ScmAuditLogGroupName``, independent of any Knowledge Base."""
+def test_scm_audit_policy_is_conditional_on_audit_log_write_active(role_policies: list):
+    """(Req 9.3, 9.5) The audit-sink grant is added only via the combined
+    ``ScmAuditLogWriteActive`` condition (connector enabled AND a non-empty
+    ``ScmAuditLogGroupName``), independent of any Knowledge Base."""
     found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
     assert found is not None, f"{_SCM_AUDIT_POLICY_NAME} policy is not present as an Fn::If entry"
     condition_name, _policy = found
     assert (
         condition_name == _SCM_AUDIT_CONDITION_NAME
-    ), "audit grant must gate on ScmAuditLogGroupConfigured, not a KB condition"
+    ), "audit grant must gate on ScmAuditLogWriteActive, not on the log group name alone or a KB condition"
     assert (
         "KB" not in condition_name and "KnowledgeBase" not in condition_name
     ), "audit grant condition must be independent of Knowledge Base configuration"
 
 
+def test_scm_audit_grant_gated_on_enabled_and_configured(template: dict):
+    """``ScmAuditLogWriteActive`` must be ``Fn::And`` of the connector-enabled condition and
+    the log-group-configured condition, mirroring the read grant's ``ScmReadCredentialActive``."""
+    conditions = template.get("Conditions", {})
+    assert _SCM_AUDIT_CONDITION_NAME in conditions, f"missing condition {_SCM_AUDIT_CONDITION_NAME}"
+    and_terms = conditions[_SCM_AUDIT_CONDITION_NAME].get("Fn::And")
+    assert (
+        isinstance(and_terms, list) and len(and_terms) == 2
+    ), "ScmAuditLogWriteActive must be an Fn::And of two conditions"
+    referenced = {term.get("Condition") for term in and_terms if isinstance(term, dict)}
+    assert referenced == {
+        _SCM_CONNECTOR_ENABLED_CONDITION_NAME,
+        _SCM_AUDIT_CONFIGURED_CONDITION_NAME,
+    }, "the audit grant must require BOTH connector-enabled and a configured audit log group"
+
+
 def test_scm_audit_condition_requires_a_non_empty_log_group_name(template: dict):
     """``ScmAuditLogGroupConfigured`` is exactly "ScmAuditLogGroupName is not empty", so a
     deployment that leaves the name unset gets neither the log group nor its write grant."""
-    condition = template.get("Conditions", {})[_SCM_AUDIT_CONDITION_NAME]
-    assert condition == {"Fn::Not": [{"Fn::Equals": [{"Ref": "ScmAuditLogGroupName"}, ""]}]}
+    condition = template.get("Conditions", {})[_SCM_AUDIT_CONFIGURED_CONDITION_NAME]
+    assert condition == {"Fn::Not": [{"Fn::Equals": [{"Ref": _SCM_AUDIT_LOG_GROUP_PARAMETER_NAME}, ""]}]}
+
+
+@pytest.mark.parametrize(
+    ("connector_enabled", "audit_log_group_name", "log_group_created", "write_granted"),
+    [
+        pytest.param("false", "", False, False, id="disabled-unconfigured"),
+        pytest.param("false", "/synthetic/scm-audit", True, False, id="disabled-configured"),
+        pytest.param("true", "", False, False, id="enabled-unconfigured"),
+        pytest.param("true", "/synthetic/scm-audit", True, True, id="enabled-configured"),
+    ],
+)
+def test_scm_audit_write_grant_requires_an_enabled_connector(
+    template: dict,
+    role_policies: list,
+    connector_enabled: str,
+    audit_log_group_name: str,
+    log_group_created: bool,
+    write_granted: bool,
+):
+    """Evaluate the template's conditions for each enablement/configuration combination.
+
+    deploy.sh and Deploy-GameAgent.ps1 pass ``ScmAuditLogGroupName`` whenever
+    ``GBAW_SCM_AUDIT_LOG_GROUP`` is set, even with the connector disabled, so a disabled
+    deployment with a configured log group must get NO audit write grant. The log group itself
+    is still created, so disabling the connector keeps the retained audit history, and the
+    grant is never active without the log group it targets.
+    """
+    parameters = _parameter_values(
+        template,
+        **{
+            _SCM_CONNECTOR_ENABLED_PARAMETER_NAME: connector_enabled,
+            _SCM_AUDIT_LOG_GROUP_PARAMETER_NAME: audit_log_group_name,
+        },
+    )
+    conditions = template.get("Conditions", {})
+    found = _find_conditional_policy(role_policies, _SCM_AUDIT_POLICY_NAME)
+    assert found is not None, f"{_SCM_AUDIT_POLICY_NAME} policy is not present as an Fn::If entry"
+    grant_condition, _policy = found
+    log_group_condition = template["Resources"][_SCM_AUDIT_LOG_GROUP_LOGICAL_ID]["Condition"]
+
+    assert _condition_is_true(conditions, grant_condition, parameters) is write_granted
+    assert _condition_is_true(conditions, log_group_condition, parameters) is log_group_created
 
 
 def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list):
@@ -456,9 +568,9 @@ def test_scm_audit_policy_only_actions_are_scoped_log_writes(role_policies: list
 def test_scm_audit_log_group_is_dedicated_resource(template: dict):
     """(Req 9.3, 9.5) The read-audit destination is a dedicated CloudWatch Logs log group
     provisioned independently of Knowledge Base configuration (gated on
-    ScmAuditLogGroupConfigured)."""
+    ScmAuditLogGroupConfigured, not on the connector being enabled)."""
     resources = template.get("Resources", {})
     log_group = resources.get(_SCM_AUDIT_LOG_GROUP_LOGICAL_ID)
     assert log_group is not None, f"missing {_SCM_AUDIT_LOG_GROUP_LOGICAL_ID} resource"
     assert log_group.get("Type") == "AWS::Logs::LogGroup"
-    assert log_group.get("Condition") == _SCM_AUDIT_CONDITION_NAME
+    assert log_group.get("Condition") == _SCM_AUDIT_CONFIGURED_CONDITION_NAME

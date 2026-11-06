@@ -7,7 +7,9 @@ set -e
 #   1. Resolves KnowledgeBaseId from the per-domain CloudFormation stack
 #      (game-agent-kb-<domain>, same pattern as seed-kb-<domain>.sh)
 #   2. Runs one domain-appropriate retrieval query against the KB
-#   3. Requires at least one retrieval result
+#   3. Requires at least one retrieval result, and every result to come from
+#      the domain's own document prefix (s3://<bucket>/<domain>/), so content
+#      from another corpus or from outside the seeded prefix fails the check
 #
 # Exits non-zero if any stack is missing, any KB ID cannot be resolved, or
 # any retrieval fails or returns no results, so it can gate deployments as
@@ -76,7 +78,7 @@ for domain in "${DOMAINS[@]}"; do
         --retrieval-query "{\"text\": \"$QUERY\"}" \
         --retrieval-configuration '{"vectorSearchConfiguration": {"numberOfResults": 3}}' \
         --region "$REGION" \
-        --query '[length(retrievalResults), retrievalResults[0].score]' \
+        --query '[length(retrievalResults), retrievalResults[0].score, join(`,`, retrievalResults[].location.s3Location.uri)]' \
         --output text 2>"$ERR_FILE"); then
         echo "  ❌ Retrieval call failed:"
         sed 's/^/     /' "$ERR_FILE"
@@ -84,7 +86,7 @@ for domain in "${DOMAINS[@]}"; do
         continue
     fi
 
-    read -r RESULT_COUNT TOP_SCORE <<< "$RETRIEVE_OUTPUT"
+    read -r RESULT_COUNT TOP_SCORE SOURCE_URIS <<< "$RETRIEVE_OUTPUT"
 
     if [ "${RESULT_COUNT:-0}" = "0" ] || [ "${RESULT_COUNT:-None}" = "None" ]; then
         echo "  ❌ No retrieval results (KB may still be ingesting)"
@@ -93,7 +95,18 @@ for domain in "${DOMAINS[@]}"; do
         continue
     fi
 
-    echo "  ✅ ${RESULT_COUNT} result(s), top score: ${TOP_SCORE}"
+    WRONG_PREFIX=""
+    IFS=',' read -r -a URIS <<< "${SOURCE_URIS:-}"
+    for uri in "${URIS[@]}"; do
+        [[ "$uri" =~ ^s3://[^/]+/${domain}/[^/]+$ ]] || WRONG_PREFIX+="     ${uri}"$'\n'
+    done
+    if [ -n "$WRONG_PREFIX" ]; then
+        echo "  ❌ Results outside the ${domain}/ prefix:"
+        printf '%s' "$WRONG_PREFIX"
+        FAILURES=$((FAILURES + 1))
+        continue
+    fi
+    echo "  ✅ ${RESULT_COUNT} result(s), top score: ${TOP_SCORE}, all under ${domain}/"
 done
 
 echo ""
