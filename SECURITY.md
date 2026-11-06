@@ -656,7 +656,7 @@ conditions, so a default deployment carries neither (see
 | Policy (condition) | Actions | Caller | Resource scope |
 |--------------------|---------|--------|----------------|
 | ScmReadCredentialAccess (`ScmReadCredentialActive`: connector enabled and a read-credential ARN set) | `secretsmanager:GetSecretValue` | Connector provider adapter, read token fetch | the one `ScmReadCredentialSecretArn` |
-| ScmAuditLogAccess (`ScmAuditLogGroupConfigured`) | `logs:CreateLogStream`, `PutLogEvents` | Connector durable audit sink | the dedicated `ScmAuditLogGroup` and its streams |
+| ScmAuditLogAccess (`ScmAuditLogWriteActive`: connector enabled and an audit log group name set) | `logs:CreateLogStream`, `PutLogEvents` | Connector durable audit sink | the dedicated `ScmAuditLogGroup` and its streams |
 
 `test_agentcore_least_privilege_iam_unit.py` pins both: each policy's
 condition, its exact statements, and an empty false branch.
