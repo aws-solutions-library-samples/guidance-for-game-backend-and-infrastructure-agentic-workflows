@@ -11,6 +11,14 @@ import { sendAndAwaitReply } from './helpers/live-chat';
 
 const LOCAL_URL = 'http://localhost:3000';
 
+// Every recall assertion below needs the local backend running with AgentCore
+// Memory. Without a memory resource the backend logs "Memory configured: False"
+// and these tests can only fail, so skip them with the setup they need.
+test.skip(
+  !process.env.BEDROCK_AGENTCORE_MEMORY_ID,
+  'Requires AgentCore Memory: start the local backend with BEDROCK_AGENTCORE_MEMORY_ID set, and export the same value for this Playwright run'
+);
+
 test.describe('Memory System - Local Environment', { tag: ['@e2e', '@memory', '@integration', '@ai', '@slow'] }, () => {
   test.setTimeout(300000); // Multiple real agent turns per test
 
