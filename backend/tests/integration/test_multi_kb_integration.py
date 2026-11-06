@@ -11,8 +11,10 @@ import os
 import pytest
 
 # Local modules
+from agents import orchestrator
 from agents.cost_specialist import cost_agent
 from agents.eks_specialist import eks_agent
+from agents.financial_guard import contains_unvalidated_financial_content
 from agents.gamelift_specialist import gamelift_agent
 
 
@@ -193,17 +195,24 @@ class TestCostKB:
         assert any(term in response_lower for term in ["gamelift", "eks", "cost", "pricing", "comparison"])
 
     def test_data_transfer_cost_reduction(self):
-        """Test: How do I reduce data transfer costs for my game?"""
+        """A how-to cost question gets the fixed cost guidance, not a historical report (#620).
+
+        The Cost specialist may build a validated report while it works on the
+        advice, so the words in its reply depend on which services lead that
+        month. Assert the kind of answer the orchestrator returns instead.
+        """
         query = "How do I reduce data transfer costs for my game?"
 
-        response = cost_agent(query)
+        response = str(orchestrator.run_orchestrator(query))
 
-        assert isinstance(response, str)
-        assert len(response) > 100
-
-        # Should mention data transfer strategies
-        response_lower = response.lower()
-        assert any(term in response_lower for term in ["data", "transfer", "cloudfront", "region", "vpc"])
+        # Compare kinds rather than text, so a failure never prints a cost report.
+        kind = {
+            "guidance": response.endswith(orchestrator._COST_ADVISORY_GUIDANCE),
+            "report": "**Report ID:**" in response,
+            "report_unavailable": "Cost Report Unavailable" in response,
+            "monetary_figure": contains_unvalidated_financial_content(response),
+        }
+        assert kind == {"guidance": True, "report": False, "report_unavailable": False, "monetary_figure": False}
 
     def test_spot_instance_savings(self):
         """Test: How much can I save using Spot instances?"""
