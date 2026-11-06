@@ -68,7 +68,10 @@ get_deployment_urls() {
         --output text 2>/dev/null || echo "")
 
     if [ -n "$FRONTEND_URL" ]; then
-        FRONTEND_URL="https://$FRONTEND_URL"
+        # ServiceUrl may be a bare host or already include https:// (#641); use one scheme.
+        FRONTEND_URL="${FRONTEND_URL#https://}"
+        FRONTEND_URL="${FRONTEND_URL#http://}"
+        FRONTEND_URL="https://${FRONTEND_URL%/}"
     fi
 
     echo "FRONTEND_URL=$FRONTEND_URL"

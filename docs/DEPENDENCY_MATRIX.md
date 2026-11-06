@@ -4,7 +4,7 @@ This document provides a comprehensive overview of major dependencies, their ver
 
 ## Overview
 
-- **Last Updated**: 2026-10-12
+- **Last Updated**: 2026-11-04
 - **Python Version**: >=3.13.9
 - **Node.js Version**: 18+
 
@@ -122,15 +122,6 @@ module, so no Cloudscape code or global CSS reaches the current UI's bundle.
 | @cloudscape-design/design-tokens | 3.0.114 | Design-token values for the theme bridge | Apache-2.0 | Pinned exact; token names read at runtime, not hard-coded |
 | @cloudscape-design/component-toolkit | 1.0.0-beta.189 | Component toolkit (Cloudscape Next.js guidance) | Apache-2.0 | Pinned exact; in `transpilePackages` per Cloudscape guidance |
 
-### Observability (OpenTelemetry)
-
-| Package | Version | Purpose | License | Security Notes |
-|---------|---------|---------|---------|----------------|
-| @opentelemetry/api | ^1.9.0 | OTEL API | Apache-2.0 | - |
-| @opentelemetry/sdk-node | ^0.206.0 | OTEL Node.js SDK | Apache-2.0 | - |
-| @opentelemetry/exporter-trace-otlp-http | ^0.206.0 | Trace exporter | Apache-2.0 | - |
-| @opentelemetry/propagator-aws-xray | ^2.1.3 | X-Ray propagation | Apache-2.0 | AWS managed |
-
 ### Authentication
 
 | Package | Version | Purpose | License | Security Notes |
@@ -178,6 +169,7 @@ module, so no Cloudscape code or global CSS reaches the current UI's bundle.
 
 | Date | Changes |
 |------|---------|
+| 2026-11-04 | Removed the frontend OpenTelemetry packages. Nothing in the frontend loaded them; tracing starts at the AgentCore runtime (ADOT) |
 | 2026-10-12 | Added the Cloudscape Design System packages and @axe-core/playwright for the dormant parallel-shell foundation (ADR 0007) |
 | 2026-08-13 | Added JSON Schema and RFC 8785 support for versioned operations contracts |
 | 2026-01-12 | Initial security audit, updated Next.js to fix CVE |

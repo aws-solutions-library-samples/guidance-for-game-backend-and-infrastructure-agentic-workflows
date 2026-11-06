@@ -53,6 +53,7 @@ Describe 'GameAgent Module' {
             'New-GameAgentAgentCoreEnvArgs'
             'Resolve-GameAgentPlatformVersion'
             'Invoke-GameAgentPlatformVersion'
+            'ConvertTo-GameAgentFrontendUrl'
         )
         $exported = (Get-Module -Name GameAgent).ExportedCommands.Keys
         foreach ($fn in $privateFunctions) {
