@@ -380,7 +380,9 @@ month") gets fixed, non-numeric cost guidance that says the assistant does not
 show numeric cost forecasts. A historical report built during that turn is
 shown only when the question names its period, such as "last
 month", "month to date", or a past month with its year ("July 2026"); reports
-for any other period are dropped.
+for any other period are dropped. A question that asks how to lower or optimize
+cost, such as "How do I reduce data transfer costs?", is answered the same way
+with the general cost guidance, unless it also asks what was spent.
 
 ### Enrolling EKS Clusters
 
