@@ -1,12 +1,13 @@
-"""Resolve the historical periods a forecast question names explicitly.
+"""Resolve the historical periods a forecast or cost-advice question names explicitly.
 
-A forecast turn can produce validated historical reports the user never asked
-for (for example, baseline months the Cost specialist fetched while working on
-the forecast). The orchestrator keeps such a report only when its period equals
-a period the question names. This resolver runs only for forecast questions, so
-it recognizes only phrases that normally name a past period rather than the
-forecast target. Anything it does not recognize names no period, and the report
-is dropped rather than guessed at.
+A forecast or cost-advice turn can produce validated historical reports the
+user never asked for (for example, baseline months the Cost specialist fetched
+while working on the forecast, or the last complete month it fetched while
+working on advice). The orchestrator keeps such a report only when its period
+equals a period the question names. This resolver runs only for forecast and
+cost-advice questions, so it recognizes only phrases that normally name a past
+period rather than the forecast target. Anything it does not recognize names no
+period, and the report is dropped rather than guessed at.
 
 Recognized phrases (case-insensitive), relative to today's UTC date:
 
