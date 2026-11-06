@@ -9,8 +9,24 @@ import pytest
 
 # Local modules
 from agents.orchestrator import run_orchestrator
+from config.settings import BEDROCK_GUARDRAIL_ENABLED, BEDROCK_GUARDRAIL_ID, BEDROCK_GUARDRAIL_VERSION
 
-pytestmark = [pytest.mark.integration, pytest.mark.cloud]
+# The model applies a guardrail only when it is enabled and has an ID (see
+# models/cached_bedrock.py). Without one, the orchestrator runs unguarded and
+# these assertions would test model wording instead of the guardrail, so skip.
+GUARDRAIL_CONFIGURED = bool(BEDROCK_GUARDRAIL_ENABLED and BEDROCK_GUARDRAIL_ID and BEDROCK_GUARDRAIL_VERSION)
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.cloud,
+    pytest.mark.skipif(
+        not GUARDRAIL_CONFIGURED,
+        reason=(
+            "No guardrail configured: set GBAW_BEDROCK_GUARDRAIL_ID (GBAW_BEDROCK_GUARDRAIL_VERSION defaults to "
+            "DRAFT) and leave GBAW_BEDROCK_GUARDRAIL_ENABLED on; otherwise the orchestrator runs unguarded"
+        ),
+    ),
+]
 
 
 class TestGuardrailsDeniedTopics:
@@ -34,7 +50,7 @@ class TestGuardrailsDeniedTopics:
                 "infrastructure",
                 "cannot provide that information",
             ]
-        ), f"Expected guardrail block or redirect, got: {response[:200]}"
+        ), f"Expected guardrail block or redirect, got: {str(response)[:200]}"
 
     def test_blocks_non_aws_infrastructure(self):
         """Guardrails should block non-AWS cloud provider questions."""
@@ -46,7 +62,7 @@ class TestGuardrailsDeniedTopics:
         # Should block or redirect
         assert any(
             phrase in response_lower for phrase in ["can only help with aws", "gamelift", "eks", "cannot provide"]
-        ), f"Expected guardrail block, got: {response[:200]}"
+        ), f"Expected guardrail block, got: {str(response)[:200]}"
 
     def test_blocks_general_programming(self):
         """Guardrails should block general programming questions."""
@@ -58,7 +74,7 @@ class TestGuardrailsDeniedTopics:
         # Should block or redirect to AWS topics
         assert any(
             phrase in response_lower for phrase in ["aws", "gamelift", "eks", "infrastructure"]
-        ), f"Expected redirect to AWS topics, got: {response[:200]}"
+        ), f"Expected redirect to AWS topics, got: {str(response)[:200]}"
 
 
 class TestGuardrailsAllowLegitimate:
@@ -72,12 +88,12 @@ class TestGuardrailsAllowLegitimate:
         response_lower = str(response).lower()
 
         # Should not be blocked
-        assert "cannot provide" not in response_lower, f"Legitimate query was blocked: {response[:200]}"
+        assert "cannot provide" not in response_lower, f"Legitimate query was blocked: {str(response)[:200]}"
 
         # Should contain GameLift-related content
         assert any(
             phrase in response_lower for phrase in ["fleet", "gamelift", "game server"]
-        ), f"Expected GameLift response, got: {response[:200]}"
+        ), f"Expected GameLift response, got: {str(response)[:200]}"
 
     def test_allows_eks_queries(self):
         """Guardrails should allow EKS queries."""
@@ -87,12 +103,12 @@ class TestGuardrailsAllowLegitimate:
         response_lower = str(response).lower()
 
         # Should not be blocked
-        assert "cannot provide" not in response_lower, f"Legitimate query was blocked: {response[:200]}"
+        assert "cannot provide" not in response_lower, f"Legitimate query was blocked: {str(response)[:200]}"
 
         # Should contain EKS-related content
         assert any(
             phrase in response_lower for phrase in ["eks", "cluster", "kubernetes"]
-        ), f"Expected EKS response, got: {response[:200]}"
+        ), f"Expected EKS response, got: {str(response)[:200]}"
 
     def test_allows_cost_queries(self):
         """Guardrails should allow cost analysis queries."""
@@ -102,12 +118,12 @@ class TestGuardrailsAllowLegitimate:
         response_lower = str(response).lower()
 
         # Should not be blocked
-        assert "cannot provide" not in response_lower, f"Legitimate query was blocked: {response[:200]}"
+        assert "cannot provide" not in response_lower, f"Legitimate query was blocked: {str(response)[:200]}"
 
         # Should contain cost-related content
         assert any(
             phrase in response_lower for phrase in ["cost", "spending", "dollar", "$"]
-        ), f"Expected cost response, got: {response[:200]}"
+        ), f"Expected cost response, got: {str(response)[:200]}"
 
 
 class TestGuardrailsPIIProtection:
@@ -122,7 +138,7 @@ class TestGuardrailsPIIProtection:
         response_lower = str(response).lower()
         assert any(
             phrase in response_lower for phrase in ["fleet", "gamelift"]
-        ), f"Query with email should still work: {response[:200]}"
+        ), f"Query with email should still work: {str(response)[:200]}"
 
     def test_anonymizes_sensitive_data_in_response(self):
         """Guardrails should anonymize PII in responses if present."""
