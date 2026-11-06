@@ -378,7 +378,10 @@ when its period equals a period the question names.
 past period rather than the forecast target, such as "last month", "last
 quarter", "month to date", a month with its year once that month has ended
 ("July 2026"), and ISO dates before today; every other captured report is
-dropped.
+dropped. A cost-advice question, which asks how to lower or optimize cost ("How
+do I reduce data transfer costs?", "optimize my EC2 spend"), is handled the same
+way with the general cost guidance; a question that also asks what was spent
+keeps its report.
 
 Snapshot correctness and billing finality are separate. A validated report is
 internally consistent with Cost Explorer at its `queriedAt` timestamp, while an
