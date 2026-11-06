@@ -12,8 +12,8 @@ its final ``agentcore launch`` to converge the runtime on
 artifact and role, so the helper reads the runtime with ``GetAgentRuntime`` and
 sends back every configuration field exactly as returned (artifact, role,
 network, protocol, authorizer, request-header allowlist, lifecycle, environment
-variables, MMDS metadata, description, filesystem, and capacity provider
-settings), changing only ``platformVersion``.
+variables, MMDS metadata, description, filesystem, capacity provider, and
+additional session-port settings), changing only ``platformVersion``.
 
 Safety properties:
 
@@ -67,6 +67,9 @@ PRESERVED_FIELDS = (
     "description",
     "filesystemConfigurations",
     "capacityProviderConfiguration",
+    # Additional ports reachable through the runtime's session URL. Copied as
+    # read, like every field here: the helper never opens or closes a port.
+    "allowedPorts",
 )
 REQUIRED_FIELDS = ("agentRuntimeArtifact", "roleArn")
 

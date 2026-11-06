@@ -86,6 +86,7 @@ def _full_configuration() -> dict:
         "description": "Game Agent runtime",
         "filesystemConfigurations": [],
         "capacityProviderConfiguration": {"capacityProviderArn": "arn:aws:bedrock-agentcore:example:capacity"},
+        "allowedPorts": [{"port": 8080}, {"portRange": {"from": 9000, "to": 9010}}],
     }
 
 
@@ -193,6 +194,21 @@ class FakeAgentCoreControl:
             self._endpoint_polls -= 1
             return {"status": "UPDATING", "liveVersion": str(int(self.runtime["agentRuntimeVersion"]) - 1)}
         return {"status": "READY", "liveVersion": self.runtime["agentRuntimeVersion"]}
+
+
+def _client_with_allowed_ports_in_the_model(runtime: dict, **kwargs) -> FakeAgentCoreControl:
+    """A fake whose model accepts and returns allowedPorts, as the locked botocore does.
+
+    The default fake derives its model from the helper's own field list. This one
+    adds allowedPorts independently, so a helper that does not preserve the field
+    fails its model check instead of passing unnoticed.
+    """
+    return FakeAgentCoreControl(
+        runtime,
+        update_members=UPDATE_MEMBERS | {"allowedPorts"},
+        read_members=READ_MEMBERS | {"allowedPorts"},
+        **kwargs,
+    )
 
 
 class FakeClock:
@@ -326,6 +342,43 @@ class ApplyPlatformVersionTests(unittest.TestCase):
         ):
             self.assertNotIn(name, sent)
         self.assertEqual(sent["environmentVariables"], runtime["environmentVariables"])
+
+    def test_allowed_ports_are_sent_back_unchanged(self):
+        before = _runtime("V1")
+        client = _client_with_allowed_ports_in_the_model(before)
+
+        exit_code, out, err, _clock, _calls = _run(client, "--platform-version", "V2")
+
+        self.assertEqual(exit_code, 0, err)
+        self.assertEqual(client.updates[0]["allowedPorts"], before["allowedPorts"])
+        self.assertEqual(client.runtime["allowedPorts"], before["allowedPorts"])
+        self.assertIn("allowedPorts", out)
+        self.assert_no_configuration_values(out, err)
+
+    def test_unconfigured_allowed_ports_stay_unset(self):
+        runtime = _runtime("V1")
+        del runtime["allowedPorts"]
+        client = _client_with_allowed_ports_in_the_model(runtime)
+
+        exit_code, _out, err, _clock, _calls = _run(client, "--platform-version", "V2")
+
+        self.assertEqual(exit_code, 0, err)
+        # The helper never opens a port: nothing is sent, so nothing is configured.
+        self.assertNotIn("allowedPorts", client.updates[0])
+        self.assertNotIn("allowedPorts", client.runtime)
+
+    def test_allowed_ports_changed_by_the_update_fail_closed_without_printing_values(self):
+        def drop_a_port(runtime: dict) -> None:
+            runtime["allowedPorts"] = runtime["allowedPorts"][:1]
+
+        client = _client_with_allowed_ports_in_the_model(_runtime("V1"), mutate_after_update=drop_a_port)
+
+        exit_code, out, err, _clock, _calls = _run(client, "--platform-version", "V2")
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("was not preserved", err)
+        self.assertIn("allowedPorts", err)
+        self.assertNotIn("9010", out + err)
 
     def test_waits_for_an_in_progress_runtime_before_updating(self):
         client = FakeAgentCoreControl(_runtime("V1"), initial_in_progress_polls=2)

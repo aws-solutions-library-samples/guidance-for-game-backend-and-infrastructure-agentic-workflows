@@ -71,6 +71,7 @@ def _synthetic_runtime():
         "capacityProviderConfiguration": {
             "capacityProviderArn": "arn:aws:bedrock-agentcore:us-west-2:123456789012:capacity-provider/example"
         },
+        "allowedPorts": [{"port": 8080}, {"portRange": {"from": 9000, "to": 9010}}],
     }
 
 
@@ -124,3 +125,18 @@ def test_a_built_update_request_validates_against_the_locked_model():
     assert not report.has_errors(), report.generate_report()
     assert request["platformVersion"] == "V2"
     assert set(request) == {"agentRuntimeId", "platformVersion", *helper.PRESERVED_FIELDS}
+
+
+def test_allowed_ports_are_sent_back_unchanged_in_a_valid_update_request():
+    helper = _helper()
+    runtime = _synthetic_runtime()
+    input_shape = _model().operation_model("UpdateAgentRuntime").input_shape
+
+    request = helper.build_update_request(runtime, "gameagentruntime-EXAMPLE123", "V1")
+
+    # The additional session-URL ports are copied exactly: no entry is added,
+    # removed, or rewritten, and the request owns its copy of the list.
+    assert request.get("allowedPorts") == runtime["allowedPorts"]
+    assert request["allowedPorts"] is not runtime["allowedPorts"]
+    report = ParamValidator().validate(request, input_shape)
+    assert not report.has_errors(), report.generate_report()

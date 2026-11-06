@@ -477,8 +477,8 @@ How the deployment applies it:
   runtime with `GetAgentRuntime` and calls `UpdateAgentRuntime` with every other
   field exactly as read (artifact, role, network, protocol, authorizer,
   request-header allowlist, lifecycle, environment variables, MMDS metadata,
-  description, filesystem, and capacity settings), changing only
-  `platformVersion`. It makes no update when the runtime already reports the
+  description, filesystem, capacity, and additional session-port settings),
+  changing only `platformVersion`. It makes no update when the runtime already reports the
   requested version. It then waits for the runtime and its `DEFAULT` endpoint to
   serve the new version and checks that every field it read is unchanged.
 - Any API error, unexpected field, failed update, or a wait longer than 20
