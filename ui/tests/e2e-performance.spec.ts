@@ -3,7 +3,7 @@
  *
  * Tests the complete user journey from UI interaction to backend response,
  * measuring real-world performance from a user perspective.
- * Tags: @e2e @performance @slow
+ * Tags: @e2e @localhost @performance @slow
  */
 
 import { test, expect, Page } from '@playwright/test';
@@ -106,7 +106,7 @@ class GameAgentPerformanceTester {
   }
 }
 
-test.describe('Game Agent E2E Performance Tests', { tag: ['@e2e', '@performance', '@slow'] }, () => {
+test.describe('Game Agent E2E Performance Tests', { tag: ['@e2e', '@localhost', '@performance', '@slow'] }, () => {
   let tester: GameAgentPerformanceTester;
 
   test.beforeEach(async ({ page }) => {
@@ -156,7 +156,7 @@ test.describe('Game Agent E2E Performance Tests', { tag: ['@e2e', '@performance'
   });
 });
 
-test.describe('Performance Regression Tests', { tag: ['@e2e', '@performance', '@slow'] }, () => {
+test.describe('Performance Regression Tests', { tag: ['@e2e', '@localhost', '@performance', '@slow'] }, () => {
   test('should meet performance benchmarks', async ({ page }) => {
     const tester = new GameAgentPerformanceTester(page);
 

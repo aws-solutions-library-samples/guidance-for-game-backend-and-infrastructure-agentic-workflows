@@ -1,11 +1,11 @@
 /**
  * Optimized UI Interaction Tests - Fast execution
- * Tags: @e2e @integration @ai @slow
+ * Tags: @e2e @localhost @integration @ai @slow
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('Game Agent - UI Interaction Tests', { tag: ['@e2e', '@integration', '@ai', '@slow'] }, () => {
+test.describe('Game Agent - UI Interaction Tests', { tag: ['@e2e', '@localhost', '@integration', '@ai', '@slow'] }, () => {
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/');
