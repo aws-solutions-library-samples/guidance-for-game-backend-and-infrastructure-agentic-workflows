@@ -21,21 +21,30 @@ echo "🔍 Setting up observability for runtime: $RUNTIME_ID"
 ensure_log_group_retention() {
     local log_group="$1"
     local description="$2"
+    local state found retention
 
-    if aws logs describe-log-groups --region $AWS_REGION \
-         --log-group-name-exact "$log_group" \
-         --query 'logGroups[0].retentionInDays' --output text 2>/dev/null | grep -q "^${RETENTION_DAYS}$"; then
+    # describe-log-groups has no exact-name option, so list the groups that
+    # start with the name and keep only the exact match. A failed lookup is
+    # reported instead of being mistaken for a missing log group.
+    if ! state=$(aws logs describe-log-groups --region "$AWS_REGION" \
+        --log-group-name-prefix "$log_group" \
+        --query "logGroups[?logGroupName=='${log_group}'].[logGroupName, retentionInDays]" \
+        --output text 2>/dev/null); then
+        echo "⚠️  $description: could not read $log_group; retention unchanged"
+        return
+    fi
+    read -r found retention <<< "$state"
+
+    if [ "$found" != "$log_group" ]; then
+        echo "⏭️  $description: log group not found (will be created by AWS on first use)"
+    elif [ "$retention" = "$RETENTION_DAYS" ]; then
         echo "✅ $description: already has ${RETENTION_DAYS}-day retention"
-    elif aws logs describe-log-groups --region $AWS_REGION \
-         --log-group-name-exact "$log_group" \
-         --query 'logGroups[0].logGroupName' --output text 2>/dev/null | grep -q "$log_group"; then
+    else
         aws logs put-retention-policy \
             --log-group-name "$log_group" \
             --retention-in-days $RETENTION_DAYS \
             --region $AWS_REGION
         echo "✅ $description: set ${RETENTION_DAYS}-day retention"
-    else
-        echo "⏭️  $description: log group not found (will be created by AWS on first use)"
     fi
 }
 
