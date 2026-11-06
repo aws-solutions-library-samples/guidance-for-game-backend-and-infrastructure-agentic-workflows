@@ -198,6 +198,24 @@ _COST_INTENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Detection of requests for advice on lowering or optimizing cost ("How do I
+# reduce data transfer costs?", "ways to cut our bill", "optimize my EC2
+# spend"), which ask for guidance rather than a historical report even when
+# they say "my bill" or "our spend". A cost-cutting verb counts only where the
+# question asks for it: at the start of a sentence, after "to", "how", a pronoun,
+# or a modal, or as "for reducing" and similar, and only with a cost noun at most
+# four words later in the same clause. "Did rightsizing reduce my bill?" and
+# "the months with lower spend" are not advice. "Cost optimization" and "spend
+# optimization" count on their own.
+_COST_ADVICE_PATTERN = re.compile(
+    r"(?:(?:(?:^|[.?!:;])\s*|\b(?:to|how|i|we|you|me|us|can|could|should|would)\s+)"
+    r"(?:reduce|lower|cut|decrease|minimi[sz]e|optimi[sz]e|save\s+on)"
+    r"|\b(?:for|about|on)\s+(?:reducing|lowering|cutting|decreasing|minimi[sz]ing|optimi[sz]ing|saving\s+on))"
+    r"\b(?:\s+[^\s.,;:?!]+){0,4}?\s+(?:costs?|spend|spending|bills?|charges?|expenses?)\b"
+    r"|\b(?:cost|spend|spending)\s+optimi[sz]ation\b",
+    re.IGNORECASE,
+)
+
 
 def _is_cost_report_followup(query: str) -> bool:
     """Return whether a query references a production-format cost report ID."""
@@ -209,9 +227,32 @@ def _is_operational_identifier_query(query: str) -> bool:
     return _OPERATIONAL_IDENTIFIER_PATTERN.search(query) is not None
 
 
+def _is_cost_advice_request(query: str) -> bool:
+    """Return whether a query asks how to lower or optimize cost rather than what was spent.
+
+    A question that, with its advice phrases removed, still mentions cost or
+    reads as a report request is not advice: "How much did I spend last month,
+    and how do I reduce those costs?", "Show my costs by service and how to
+    reduce data transfer costs" and "How do I reduce costs? List the top
+    services by spend this month." keep their reports. Checking for any
+    remaining cost word, not only the report patterns, keeps a figure request
+    phrased with "spend" or an unrecognized period on the report path.
+    """
+    if _COST_ADVICE_PATTERN.search(query) is None:
+        return False
+    rest = _COST_ADVICE_PATTERN.sub(" ", query)
+    return (
+        _COST_TOPIC_PATTERN.search(rest) is None
+        and _EXPLICIT_ACTUAL_COST_PATTERN.search(rest) is None
+        and _COST_INTENT_PATTERN.search(rest) is None
+    )
+
+
 def _has_cost_intent(query: str) -> bool:
     """Return whether a query requires an authoritative historical cost report."""
     if _FORECAST_COST_PATTERN.search(query):
+        return False
+    if _is_cost_advice_request(query):
         return False
     if _EXPLICIT_ACTUAL_COST_PATTERN.search(query):
         return True
@@ -232,24 +273,28 @@ def _utc_today() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRendering], today: date) -> str | None:
-    """Return the authoritative section for a forecast request, or ``None``.
+def _named_period_section(
+    query: str, renderings: list[CapturedCostRendering], today: date, *, forecast_request: bool
+) -> str | None:
+    """Return the authoritative section for a forecast or cost-advice request, or ``None``.
 
-    Forecast figures are never validated, so a forecast turn's only validated
-    content is a historical report. A rendering is kept only when its period (or,
-    for a typed report-creation error, its requested dates) equals a historical
-    period the question names; renderings for any other period (for example,
-    baseline months) are dropped. For each named period the most recent matching
+    Neither request asks for a historical report: forecast figures are never
+    validated, and cost advice is the fixed guidance. A rendering is kept only
+    when its period (or, for a typed report-creation error, its requested dates)
+    equals a historical period the question names; renderings for any other
+    period (for example, baseline months, or the last complete month built for
+    advice) are dropped. For each named period the most recent matching
     rendering is kept, and the kept renderings are followed by the fixed
-    non-numeric forecast guidance, which says no numeric forecast is shown.
+    non-numeric guidance; the forecast variant says no numeric forecast is shown.
     ``None`` means no rendering matches or the named periods could not be
     resolved; the caller then returns its advisory composition: markers for any
-    consulted GameLift or EKS specialist plus the forecast guidance.
+    consulted GameLift or EKS specialist plus the guidance.
     """
+    kind = "Forecast" if forecast_request else "Cost advice"
     try:
         periods = requested_historical_periods(query, today)
     except Exception:  # The resolver reads user text; never fail the request on it.
-        logger.warning("Forecast period resolution failed; returning the cost guidance")
+        logger.warning(f"{kind} period resolution failed; returning the cost guidance")
         return None
     kept: list[str] = []
     for period in periods:
@@ -259,12 +304,12 @@ def _forecast_authoritative_section(query: str, renderings: list[CapturedCostRen
                     kept.append(entry.rendering)
                 break
     logger.info(
-        f"Forecast request: kept {len(kept)} of {len(renderings)} captured cost rendering(s) "
+        f"{kind} request: kept {len(kept)} of {len(renderings)} captured cost rendering(s) "
         f"for {len(periods)} named historical period(s)"
     )
     if not kept:
         return None
-    return "\n\n".join([*(section.strip() for section in kept), _FORECAST_COST_GUIDANCE])
+    return "\n\n".join([*(section.strip() for section in kept), _cost_guidance(forecast_request)])
 
 
 def _has_cost_topic(query: str) -> bool:
@@ -389,6 +434,10 @@ def run_orchestrator(query: str, context: dict = None):
 
         cost_report_followup = _is_cost_report_followup(query)
         forecast_request = _is_forecast_request(query) and not cost_report_followup
+        # Cost advice ("How do I reduce data transfer costs?") does not ask for a
+        # historical report either, so like a forecast it keeps only the reports
+        # for past periods it names.
+        advice_request = not (forecast_request or cost_report_followup) and _is_cost_advice_request(query)
         # Read the date once, before the turn, so a turn that crosses UTC
         # midnight still resolves "last month" against the day it started.
         request_today = _utc_today()
@@ -528,12 +577,13 @@ def run_orchestrator(query: str, context: dict = None):
         except Exception as exc:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
-            if forecast_request and authoritative_cost_response is not None:
-                authoritative_cost_response = _forecast_authoritative_section(
-                    query, cost_report_capture.renderings, request_today
+            if (forecast_request or advice_request) and authoritative_cost_response is not None:
+                authoritative_cost_response = _named_period_section(
+                    query, cost_report_capture.renderings, request_today, forecast_request=forecast_request
                 )
                 if authoritative_cost_response is None:
-                    logger.warning("Forecast request failed after a validated cost report; returning the cost guidance")
+                    kind = "Forecast" if forecast_request else "Cost advice"
+                    logger.warning(f"{kind} request failed after a validated cost report; returning the cost guidance")
             if authoritative_cost_response is not None:
                 logger.warning(
                     "Orchestrator failed after a validated cost report; returning the deterministic rendering"
@@ -582,9 +632,9 @@ def run_orchestrator(query: str, context: dict = None):
         else:
             authoritative_cost_response = finish_cost_report_capture(cost_report_capture)
             specialist_outputs = finish_specialist_capture(specialist_capture)
-            if forecast_request and authoritative_cost_response is not None:
-                authoritative_cost_response = _forecast_authoritative_section(
-                    query, cost_report_capture.renderings, request_today
+            if (forecast_request or advice_request) and authoritative_cost_response is not None:
+                authoritative_cost_response = _named_period_section(
+                    query, cost_report_capture.renderings, request_today, forecast_request=forecast_request
                 )
             if authoritative_cost_response is not None:
                 # A cost-report tool produced the authoritative financial section.
