@@ -223,7 +223,7 @@ multidict==6.9.1
     # via
     #   aiohttp
     #   yarl
-oauthlib==4.0.0
+oauthlib==4.0.1
     # via requests-oauthlib
 openapi-pydantic==0.6.0
     # via fastmcp-slim
