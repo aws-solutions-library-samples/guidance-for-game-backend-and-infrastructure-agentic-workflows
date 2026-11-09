@@ -38,8 +38,8 @@
     "aws-jwt-verify": "^5.2.1",
     "cookie": "^2.0.1",
     "next": "^16.4.2",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.8",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "react-syntax-highlighter": "^16.1.1"
   },
   "devDependencies": {
@@ -50,8 +50,8 @@
     "@testing-library/user-event": "^14.6.1",
     "@types/jest": "^30.0.0",
     "@types/node": "^26.5.0",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.7",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@types/react-syntax-highlighter": "^15.5.13",
     "babel-jest": "^30.4.1",
     "eslint": "9.39.4",

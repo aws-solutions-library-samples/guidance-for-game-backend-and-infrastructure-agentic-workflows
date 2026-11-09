@@ -450,6 +450,92 @@ If the launch set the shared `Default` indexing rule to 1%, restore a prior
 percentage with
 `aws xray update-indexing-rule --name Default --rule '{"Probabilistic":{"DesiredSamplingPercentage":<prior>}}' --region <region>`.
 
+### AgentCore Runtime Platform Version (V1 and V2)
+
+AgentCore Runtime has two [platform versions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions).
+V1 starts the agent in each new session's microVM. V2 starts it once per runtime
+version, takes a snapshot after the first healthy `/ping`, and restores that
+snapshot for each new instance, so cold starts stay consistent. The deployment
+selects the version with `GBAW_AGENTCORE_PLATFORM_VERSION`: `V1` (the default
+when unset or empty) or `V2`. Both deployment paths read the same variable:
+
+```bash
+GBAW_AGENTCORE_PLATFORM_VERSION=V2 ./deploy-all.sh
+```
+
+```powershell
+$env:GBAW_AGENTCORE_PLATFORM_VERSION = 'V2'; Deploy-GameAgent
+```
+
+How the deployment applies it:
+
+- The value is checked before any AWS change. Any value other than exactly `V1`
+  or `V2` (for example `v2`) stops the deployment.
+- The AgentCore starter toolkit has no platform-version option, so after the
+  final `agentcore launch` in Step 5b the deployment runs
+  `scripts/infrastructure/agentcore_platform_version.py`. The helper reads the
+  runtime with `GetAgentRuntime` and calls `UpdateAgentRuntime` with every other
+  field exactly as read (artifact, role, network, protocol, authorizer,
+  request-header allowlist, lifecycle, environment variables, MMDS metadata,
+  description, filesystem, capacity, and additional session-port settings),
+  changing only `platformVersion`. It makes no update when the runtime already reports the
+  requested version. It then waits for the runtime and its `DEFAULT` endpoint to
+  serve the new version and checks that every field it read is unchanged.
+- Any API error, unexpected field, failed update, or a wait longer than 20
+  minutes stops the deployment. The helper prints field names, versions, and
+  statuses, never configuration values. Re-running the deployment is safe.
+- An update that omits `platformVersion`, which is what `agentcore launch`
+  sends, keeps the runtime's current platform version, so later deployments with
+  the same setting make no extra update.
+- On V2, a create or update prepares a snapshot and takes several minutes, and an
+  update issued before the runtime reaches a terminal status fails with
+  `ConflictException`. Step 5b therefore waits, read-only, for a terminal status
+  before its `agentcore launch`.
+- Changing the platform version creates a new runtime version (on V2, with a new
+  snapshot). Sessions that are already running finish on the version they
+  started on.
+- V2 is available only in some AWS Regions; the platform versions page lists
+  them. An unsupported Region fails the update with a validation error.
+
+To roll back, set `GBAW_AGENTCORE_PLATFORM_VERSION=V1` and redeploy, or run the
+helper directly (it uses your current AWS credentials). Rollback also works
+after a failed V2 update, for example a startup that did not report healthy
+within 120 seconds: when the runtime's last update failed and it reports a
+different platform version than the one requested, the helper applies the
+requested version as a recovery update. A failed runtime that already reports
+the requested version stops the deployment instead. During a redeploy, Step 5b's
+`agentcore launch` still runs on the failed version before the helper; if that
+launch itself fails, run the helper directly as shown below, then redeploy.
+
+```bash
+cd backend
+uv run python ../scripts/infrastructure/agentcore_platform_version.py \
+  --runtime-id <runtime-id> --region <region> --platform-version V1
+```
+
+What the runtime does so that V2 snapshots stay correct (no configuration is
+needed, and V1 behaves the same):
+
+- Values that must differ per instance are created at the instance's first
+  invocation, never at import: the process-wide `random` generator is reseeded
+  from operating-system entropy, the log-redaction key is generated, and a random
+  instance identifier is attached to spans as `gbaw.runtime.instance_id`. Trace
+  and span IDs are drawn from operating-system entropy. See
+  [`SECURITY.md`](../SECURITY.md#application-log-minimization) and
+  [`OBSERVABILITY_ADOT_EXPORTER.md`](OBSERVABILITY_ADOT_EXPORTER.md#agentcore-runtime-v2-telemetry-identity-across-restored-instances).
+- Managed prompts are loaded once at startup. Each `GBAW_*_PROMPT_ARN` names a
+  published prompt version, which is immutable, and only a runtime update
+  changes the ARNs; on V2 that update also takes a new snapshot.
+  `scripts/infrastructure/deploy-prompts.sh` on its own publishes versions and
+  records their ARNs in `backend/.env.local`, but does not change a running
+  runtime on either platform version; run the full deployment to apply them. If
+  Prompt Management cannot be read during startup, the runtime uses the
+  code-defined prompt text, which is the text that is published. On V2 that
+  fallback lasts until the next runtime update instead of the next session.
+- Startup work (imports and container pre-warming) must report healthy within
+  120 seconds. On V2 a slower startup fails the create or update with a health
+  check error, which the helper reports with the runtime's failure reason.
+
 
 ## Post-Deployment Configuration
 
@@ -907,6 +993,7 @@ The profile names track the current model generation (`GameAgent-Orchestrator-Cl
 | `GBAW_TRACE_DESTINATION_ACTIVE_MAX_ATTEMPTS` | No | 30 | Step 2b: polls for the X-Ray trace destination to reach `ACTIVE` before creating the trace delivery |
 | `GBAW_TRACE_DESTINATION_ACTIVE_RETRY_SECONDS` | No | 10 | Step 2b: delay between trace-destination `ACTIVE` polls, in seconds |
 | `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE` | No | false | Fail-closed: stop before `agentcore launch` if the AgentCore starter toolkit would change account-wide X-Ray / CloudWatch Logs settings. Only the exact value `true` enables it. See [AgentCore Starter Toolkit Transaction Search](#agentcore-starter-toolkit-transaction-search-launch-time-exception) |
+| `GBAW_AGENTCORE_PLATFORM_VERSION` | No | `V1` | AgentCore Runtime platform version, exactly `V1` or `V2`; any other value stops the deployment. Applied after the final `agentcore launch` while every other runtime setting is kept. See [AgentCore Runtime Platform Version](#agentcore-runtime-platform-version-v1-and-v2) |
 
 ## Security Notes
 

@@ -16,6 +16,13 @@ BACKEND_DIR="$PROJECT_ROOT/backend"
 
 # Default settings
 REGION="${AWS_REGION:-us-west-2}"
+PROJECT_NAME="${PROJECT_NAME:-game-agent}"
+# The frontend is the ECS Express service "${PROJECT_NAME}-frontend" in the
+# "default" cluster; ECS Express names its log group
+# /aws/ecs/<cluster>/<service>-<generated suffix>.
+FRONTEND_CLUSTER="default"
+FRONTEND_SERVICE="${PROJECT_NAME}-frontend"
+FRONTEND_LOG_GROUP_PREFIX="/aws/ecs/${FRONTEND_CLUSTER}/${FRONTEND_SERVICE}"
 QUIET_MODE=false
 ERRORS_ONLY=false
 FRONTEND=false
@@ -62,17 +69,46 @@ if [ -z "$RUNTIME_ID" ]; then
   exit 1
 fi
 
+# Print the frontend's log group, read from the awslogs-group option of the
+# service's current (PRIMARY) task definition. Fails when the service, the task
+# definition, or a valid CloudWatch Logs group name cannot be read.
+resolve_frontend_log_group() {
+  local task_definition log_group
+  local name_pattern='^[A-Za-z0-9._/#-]+$'
+
+  task_definition=$(aws ecs describe-services --region "$REGION" \
+    --cluster "$FRONTEND_CLUSTER" --services "$FRONTEND_SERVICE" \
+    --query "services[?status=='ACTIVE'] | [0].deployments[?status=='PRIMARY'] | [0].taskDefinition" \
+    --output text 2>/dev/null) || return 1
+  if [ -z "$task_definition" ] || [ "$task_definition" = "None" ]; then
+    return 1
+  fi
+
+  log_group=$(aws ecs describe-task-definition --region "$REGION" \
+    --task-definition "$task_definition" \
+    --query "taskDefinition.containerDefinitions[?logConfiguration.logDriver=='awslogs'] | [0].logConfiguration.options.\"awslogs-group\"" \
+    --output text 2>/dev/null) || return 1
+  if [ "$log_group" = "None" ] || [ "${#log_group}" -gt 512 ] || ! [[ "$log_group" =~ $name_pattern ]]; then
+    return 1
+  fi
+  printf '%s\n' "$log_group"
+}
+
 # Determine log group and filter
 if [ "$FRONTEND" = true ]; then
-  # Find the ECS Express frontend log group
-  FRONTEND_LOG_GROUP=$(aws logs describe-log-groups \
-    --log-group-name-prefix "/ecs/game-agent-frontend" \
-    --region "$REGION" \
-    --query 'logGroups[0].logGroupName' \
-    --output text 2>/dev/null)
+  # Use the log group the service's task definition names; otherwise follow the
+  # newest log group under the ECS Express name prefix.
+  FRONTEND_LOG_GROUP=$(resolve_frontend_log_group || true)
+  if [ -z "$FRONTEND_LOG_GROUP" ]; then
+    FRONTEND_LOG_GROUP=$(aws logs describe-log-groups \
+      --log-group-name-prefix "$FRONTEND_LOG_GROUP_PREFIX" \
+      --region "$REGION" \
+      --query 'logGroups[].[creationTime, logGroupName]' \
+      --output text 2>/dev/null | sort -n | tail -n 1 | cut -f2)
+  fi
 
-  if [ -z "$FRONTEND_LOG_GROUP" ] || [ "$FRONTEND_LOG_GROUP" = "None" ]; then
-    echo "❌ No ECS frontend log group found matching /ecs/game-agent-frontend"
+  if [ -z "$FRONTEND_LOG_GROUP" ]; then
+    echo "❌ No ECS frontend log group found for service ${FRONTEND_SERVICE} (matching ${FRONTEND_LOG_GROUP_PREFIX}*)"
     echo "   The frontend may not have started yet, or logs may not have been created."
     exit 1
   fi
@@ -114,6 +150,7 @@ else
 fi
 echo "🆔 Runtime: $RUNTIME_ID"
 echo "🌍 Region: $REGION"
+echo "📜 Log group: $LOG_GROUP"
 if [ "$QUIET_MODE" = true ]; then
   echo "📊 Filter: Quiet mode (OTEL noise hidden)"
 elif [ "$ERRORS_ONLY" = true ]; then
