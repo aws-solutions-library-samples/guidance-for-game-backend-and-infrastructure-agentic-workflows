@@ -46,5 +46,4 @@ USER nextjs
 
 EXPOSE 3000
 
-# Next.js automatically loads instrumentation.ts
 CMD ["node", "server.js"]

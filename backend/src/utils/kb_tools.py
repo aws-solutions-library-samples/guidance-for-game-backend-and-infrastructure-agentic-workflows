@@ -136,6 +136,12 @@ _RETRY_ATTEMPTS_HARD_MAX = 5
 _RETRY_DELAY_MAX_SECONDS = 30.0
 _RETRY_BASE_DELAY_MAX = 5.0
 
+# Jitter draws from os.urandom on every call. The module-level ``random``
+# generator is seeded at import, so on AgentCore Runtime V2 (instances restored
+# from one startup snapshot) it would give every instance the same jitter
+# sequence and synchronize their retries.
+_JITTER_RANDOM = random.SystemRandom()
+
 
 def _bounded_env_int(name: str, *, default: int, minimum: int, maximum: int) -> int:
     """Read a hard-bounded int from the environment for cache config.
@@ -187,7 +193,7 @@ def _sleep_backoff(attempt: int) -> None:
     # Cap the exponent so 2 ** attempt cannot overflow into a huge float.
     exponent = min(safe_attempt - 1, 16)
     delay = min(base * (2**exponent), _RETRY_DELAY_MAX_SECONDS)
-    jitter = random.uniform(0, delay * 0.25) if delay > 0 else 0.0
+    jitter = _JITTER_RANDOM.uniform(0, delay * 0.25) if delay > 0 else 0.0
     total = delay + jitter
     if not math.isfinite(total):
         total = 0.0

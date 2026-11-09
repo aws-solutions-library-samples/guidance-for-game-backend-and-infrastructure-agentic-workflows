@@ -31,6 +31,11 @@ resolve_game_agent_deployment_targets() {
     runtime_arn=$(yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_arn' \
         "$agentcore_config") || return 1
 
+    # ServiceUrl may be a bare host or already include https:// (#641). Reduce it
+    # to the host so the strict check below still applies, then add one scheme.
+    frontend_host="${frontend_host#https://}"
+    frontend_host="${frontend_host#http://}"
+    frontend_host="${frontend_host%/}"
     if [[ ! "$frontend_host" =~ ^[A-Za-z0-9-]+\.ecs\.${AWS_REGION}\.on\.aws$ ]]; then
         echo "❌ Refusing unrecognized frontend target: $frontend_host" >&2
         return 1

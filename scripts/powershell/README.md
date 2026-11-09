@@ -163,9 +163,16 @@ Deploys Game Agent infrastructure to AWS.
 - `-StopOnAccountObservabilityChange` - Fail-closed stop switch. Runs a read-only preflight before each `agentcore launch` and stops the deployment if the AgentCore starter toolkit would (or might) change account-wide X-Ray / CloudWatch Logs settings. Equivalent to the shell `GBAW_STOP_ON_ACCOUNT_OBSERVABILITY_CHANGE=true` opt-in; only the exact value `true` enables the environment form. See [Deployment Guide](../../docs/DEPLOYMENT_GUIDE.md#agentcore-starter-toolkit-transaction-search-launch-time-exception).
 - `-WhatIf` - Preview without deploying
 
+**Environment settings:**
+- `GBAW_AGENTCORE_PLATFORM_VERSION` - AgentCore Runtime platform version, exactly `V1` (default when unset or empty) or `V2`. The same variable and rule as `scripts/deploy.sh`: it is checked before any AWS change and applied after the final `agentcore launch` by the shared `scripts/infrastructure/agentcore_platform_version.py` helper, which keeps every other runtime setting. See [AgentCore Runtime Platform Version](../../docs/DEPLOYMENT_GUIDE.md#agentcore-runtime-platform-version-v1-and-v2).
+
 **Example:**
 ```powershell
 Deploy-GameAgent -ProjectName "prod-game-agent" -Region "us-west-2"
+
+# Run the AgentCore Runtime on platform version V2
+$env:GBAW_AGENTCORE_PLATFORM_VERSION = 'V2'
+Deploy-GameAgent
 ```
 
 ### Start-GameAgentDev
