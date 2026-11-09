@@ -162,6 +162,20 @@ _ALL_PROMPTS: dict[str, VersionedPrompt] = {
 # Bedrock Prompt Management integration (WA GenAI Lens: Reliability 4)
 # At startup, try fetching prompts from Bedrock PM using ARNs from env vars.
 # Fallback to code-defined VersionedPrompt if unavailable.
+#
+# Loading once at import is deliberate and stays correct on AgentCore Runtime
+# platform version V2, where import runs once per runtime version and every
+# instance is restored from the resulting snapshot. The deployment pins each
+# GBAW_*_PROMPT_ARN to a published prompt version (deploy_prompts.py records
+# version ARNs, and a published version is immutable), and the runtime only
+# sees a different ARN through a runtime update (the full deployment's
+# `agentcore launch`), which creates a new runtime version and, on V2, a new
+# snapshot. Re-reading Prompt Management on a timer would return the same
+# immutable version, so the cache never needs a refresh. Publishing with
+# deploy-prompts.sh alone does not change a running runtime on either platform
+# version. A startup load failure falls back to the code-defined text, which is
+# the text deploy_prompts.py publishes; on V2 that fallback lasts until the next
+# runtime update instead of the next session.
 # ---------------------------------------------------------------------------
 
 _runtime_prompts: dict[str, str] = {}  # name → text (populated at startup)

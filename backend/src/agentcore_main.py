@@ -71,6 +71,11 @@ from utils.logger import _REQUEST_ID_VAR, logger
 from utils.memory_identity import memory_session_id_for_runtime_session
 from utils.request_context import reset_request_context, set_request_context
 from utils.response_parser import ResponseParser
+from utils.runtime_instance import (
+    ensure_instance_initialized,
+    harden_trace_id_generator,
+    install_instance_id_span_processor,
+)
 from utils.security import (
     InputValidationError,
     RateLimitExceeded,
@@ -146,7 +151,13 @@ def prewarm_container():
     - MCP clients for all known servers
     - Knowledge Base retrieval tools
 
-    Called at module load time (container startup).
+    Called at module load time (container startup). On AgentCore Runtime
+    platform version V2 this runs once per runtime version, before the startup
+    snapshot that every instance is restored from, and must finish (with the
+    rest of import) within the 120-second health-check limit. Build reusable
+    clients here; never create per-request, per-instance, or expiring values
+    (random values, keys, identifiers, timestamps, cached credentials) here; see
+    utils/runtime_instance.py.
     """
     start_time = time.perf_counter()
     logger.info("🔥 Pre-warming container...")
@@ -234,6 +245,14 @@ def _log_trace_content_posture(decision, log) -> None:
 
 # Record the exported-telemetry content posture (no content values are logged).
 _log_trace_content_posture(_TRACE_CONTENT_DECISION, logger)
+
+# AgentCore Runtime V2 restores every instance from one startup snapshot (see
+# utils/runtime_instance.py). Draw trace and span IDs from os.urandom instead of
+# the snapshot-shared ``random`` state, and register the span processor that
+# stamps spans with this instance's identifier. The identifier itself is created
+# at the first invocation, not here, so spans from startup work carry none.
+harden_trace_id_generator()
+install_instance_id_span_processor()
 
 
 def _current_request_id() -> str:
@@ -370,6 +389,14 @@ def invoke_agent(prompt, context=None):
     request_id = _current_request_id()
     _request_id_token = _REQUEST_ID_VAR.set(request_id)
     try:
+        # Per-instance initialization, once per process, before any other work.
+        # On AgentCore Runtime platform version V2 every instance is restored
+        # from one startup snapshot; the first invocation is the earliest point
+        # that is guaranteed to run after the restore. This reseeds the shared
+        # pseudo-random generator, rotates the log-redaction key, and mints the
+        # instance identifier (utils/runtime_instance.py). Later calls are no-ops.
+        ensure_instance_initialized()
+
         logger.info("=" * 80)
         logger.info("🚀 AGENTCORE INVOCATION START")
         logger.info("=" * 80)

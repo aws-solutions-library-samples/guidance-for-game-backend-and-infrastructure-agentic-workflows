@@ -278,3 +278,62 @@ def test_normalize_temperature_boundaries():
     assert deploy_prompts._normalize_temperature(0.1000001) == deploy_prompts._normalize_temperature(0.1)
     # ...but a change at the 1e-6 resolution is preserved.
     assert deploy_prompts._normalize_temperature(0.100001) != deploy_prompts._normalize_temperature(0.1)
+
+
+def _run_main(monkeypatch, env_file, published):
+    """Run deploy_prompts.main() with every prompt 'published' at the given ARNs."""
+    # Third-party packages
+    from scripts.infrastructure import deploy_prompts
+
+    monkeypatch.setattr(deploy_prompts, "boto3", SimpleNamespace(client=lambda *args, **kwargs: MagicMock()))
+    monkeypatch.setattr(deploy_prompts, "deploy_prompt", lambda client, env_key, vp: published[env_key])
+    monkeypatch.setattr(sys, "argv", ["deploy_prompts.py", "--region", "us-west-2", "--env-file", str(env_file)])
+    deploy_prompts.main()
+    return deploy_prompts
+
+
+def test_main_reports_that_changed_version_arns_need_a_runtime_update(monkeypatch, tmp_path, capsys):
+    """Publishing never changes a running runtime: a changed ARN prints the update notice."""
+    # Third-party packages
+    from scripts.infrastructure import deploy_prompts
+
+    keys = list(deploy_prompts.PROMPTS)
+    published = {
+        key: f"arn:aws:bedrock:us-west-2:123456789012:prompt/EXAMPLE{index}:2" for index, key in enumerate(keys)
+    }
+    env_file = tmp_path / ".env.local"
+    # One key still records the previous version; the others were never recorded.
+    env_file.write_text(f"{keys[0]}=arn:aws:bedrock:us-west-2:123456789012:prompt/EXAMPLE0:1\nUNRELATED=1\n")
+
+    _run_main(monkeypatch, env_file, published)
+
+    out = capsys.readouterr().out
+    assert f"{len(keys)} prompt version ARN(s) changed" in out
+    assert "take effect only after a runtime update" in out
+    # The env file now records the published version ARNs and keeps other lines.
+    assert deploy_prompts.read_env_values(str(env_file), keys) == published
+    assert "UNRELATED=1" in env_file.read_text()
+
+
+def test_main_prints_no_update_notice_when_recorded_arns_are_unchanged(monkeypatch, tmp_path, capsys):
+    # Third-party packages
+    from scripts.infrastructure import deploy_prompts
+
+    published = {
+        key: f"arn:aws:bedrock:us-west-2:123456789012:prompt/EXAMPLE{index}:2"
+        for index, key in enumerate(deploy_prompts.PROMPTS)
+    }
+    env_file = tmp_path / ".env.local"
+    env_file.write_text("".join(f"{key}={arn}\n" for key, arn in published.items()))
+
+    _run_main(monkeypatch, env_file, published)
+
+    assert "changed" not in capsys.readouterr().out
+
+
+def test_changed_keys_compares_each_recorded_value():
+    # Third-party packages
+    from scripts.infrastructure import deploy_prompts
+
+    assert deploy_prompts.changed_keys({"A": "1", "B": "2"}, {"A": "1", "B": "3", "C": "4"}) == ["B", "C"]
+    assert deploy_prompts.changed_keys({"A": "1"}, {"A": "1"}) == []
