@@ -689,7 +689,7 @@ six==1.17.0
     # via
     #   kubernetes
     #   python-dateutil
-soupsieve==2.10
+soupsieve==4.0.1
     # via beautifulsoup4
 sqlglot==30.27.0
     # via awslabs-billing-cost-management-mcp-server
