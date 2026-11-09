@@ -136,7 +136,11 @@ echo "Frontend (ECS Express):"
 FRONTEND_URL=$(aws cloudformation describe-stacks --stack-name "${PROJECT_NAME}-frontend" --region $AWS_REGION --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' --output text 2>/dev/null || echo "")
 if [ -n "$FRONTEND_URL" ] && [ "$FRONTEND_URL" != "None" ]; then
     check "ECS Express service exists" test -n "$FRONTEND_URL"
-    warn_check "Health endpoint" curl -sf "https://${FRONTEND_URL}/api/health"
+    # ServiceUrl may be a bare host or already include https:// (#641); use one scheme.
+    FRONTEND_URL="${FRONTEND_URL#https://}"
+    FRONTEND_URL="${FRONTEND_URL#http://}"
+    FRONTEND_URL="https://${FRONTEND_URL%/}"
+    warn_check "Health endpoint" curl -sf "${FRONTEND_URL}/api/health"
 else
     echo -e "  ${RED}FAIL${NC} ECS Express frontend service not found"
     ((FAIL++))

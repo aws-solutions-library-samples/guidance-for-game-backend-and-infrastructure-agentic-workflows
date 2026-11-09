@@ -53,7 +53,9 @@ function Test-GameAgentFull {
                 $runtimeArn = ((yq eval '.agents.gameagentruntime.bedrock_agentcore.agent_arn' $agentcoreConfig 2>$null) | Out-String).Trim()
                 $frontendUrl = (& aws cloudformation describe-stacks --stack-name game-agent-frontend --region $Region @profileArgs `
                     --query 'Stacks[0].Outputs[?OutputKey==`ServiceUrl`].OutputValue' --output text 2>$null) | Out-String
-                $frontendUrl = $frontendUrl.Trim()
+                # The deployed tests need a full https:// URL in FRONTEND_URL, as
+                # scripts/test/resolve-deployment-targets.sh exports it.
+                $frontendUrl = ConvertTo-GameAgentFrontendUrl -ServiceUrl $frontendUrl
                 Write-GameAgentStatus "Deployed stack available (Runtime: $runtimeId)" -Type Success
             }
         }
