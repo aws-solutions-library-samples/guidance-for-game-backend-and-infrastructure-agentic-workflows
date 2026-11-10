@@ -62,3 +62,52 @@ def memory_actor_id(subject: str) -> str:
     if encoded is None:
         raise ValueError("memory actor subject must be encodable as UTF-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+# Separates the session digest below from the actor digest and any other digest of
+# the same value. Changing it moves runtime-session conversations to new memory
+# sessions; their earlier short-term history becomes unreachable.
+_SESSION_ID_DOMAIN = "gbaw:agentcore-memory-session:v1:"
+_SESSION_ID_PREFIX = "rt-"
+
+
+def memory_session_id_for_runtime_session(runtime_session_id: str) -> str:
+    """Return the AgentCore Memory session ID for an AgentCore runtime session.
+
+    The runtime uses this only when a caller names no conversation. The frontend
+    sends its per-thread ID as ``user_context.session_id`` and ``thread_id``; other
+    callers (direct API clients, evaluations, probes) get the session AgentCore
+    assigned to the invocation. Without it, every such invocation of one user
+    would share one memory conversation, and concurrent invocations would replay
+    each other's unanswered questions (#743).
+
+    The ID is:
+
+    * deterministic, so repeat invocations in one runtime session keep one
+      conversation;
+    * one-way, because the raw runtime session ID is kept out of logs (#472) and
+      the memory SDK logs the session ID it is given;
+    * domain-separated from :func:`memory_actor_id`;
+    * within the memory service's session-ID rules: it starts with a letter and
+      has 67 characters drawn from letters, digits, and hyphens.
+
+    Args:
+        runtime_session_id: The AgentCore runtime session ID of the invocation.
+
+    Returns:
+        ``"rt-"`` followed by a 64-character lowercase hexadecimal digest.
+
+    Raises:
+        ValueError: If ``runtime_session_id`` is not a string with a
+            non-whitespace character or cannot be encoded as UTF-8. The error
+            never carries the value.
+    """
+    if not isinstance(runtime_session_id, str) or not runtime_session_id.strip():
+        raise ValueError("runtime session ID must be a string with a non-whitespace character")
+    try:
+        encoded = (_SESSION_ID_DOMAIN + runtime_session_id).encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = None
+    if encoded is None:
+        raise ValueError("runtime session ID must be encodable as UTF-8")
+    return _SESSION_ID_PREFIX + hashlib.sha256(encoded).hexdigest()
