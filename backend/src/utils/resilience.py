@@ -14,6 +14,12 @@ import time
 # Local modules
 from utils.logger import logger
 
+# Jitter draws from os.urandom on every call. The module-level ``random``
+# generator is seeded at import, so on AgentCore Runtime V2 (instances restored
+# from one startup snapshot) it would give every instance the same jitter
+# sequence and synchronize their retries.
+_JITTER_RANDOM = random.SystemRandom()
+
 # Retryable boto3/Bedrock exception names
 _RETRYABLE_ERRORS = (
     "ThrottlingException",
@@ -52,7 +58,7 @@ def retry_with_backoff(max_attempts: int = 3, base_delay: float = 1.0, max_delay
                         raise
 
                     delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-                    jitter = random.uniform(0, delay * 0.25)
+                    jitter = _JITTER_RANDOM.uniform(0, delay * 0.25)
                     sleep_time = delay + jitter
                     logger.warning(
                         f"⚠️ {fn.__name__} attempt {attempt}/{max_attempts} failed "

@@ -18,6 +18,7 @@ Performance Optimization:
 import os
 import sys
 import time
+import uuid
 
 # Third-party packages
 import boto3
@@ -67,8 +68,14 @@ from config.settings import (
 )
 from runtime_identity import RuntimeIdentityError, verify_cognito_runtime_identity
 from utils.logger import _REQUEST_ID_VAR, logger
+from utils.memory_identity import memory_session_id_for_runtime_session
 from utils.request_context import reset_request_context, set_request_context
 from utils.response_parser import ResponseParser
+from utils.runtime_instance import (
+    ensure_instance_initialized,
+    harden_trace_id_generator,
+    install_instance_id_span_processor,
+)
 from utils.security import (
     InputValidationError,
     RateLimitExceeded,
@@ -84,6 +91,30 @@ from utils.security import (
     validate_user_context,
     verify_request_authorization,
 )
+
+
+def resolve_memory_session_id(user_session_id: object, thread_id: object, context: object) -> str:
+    """Return the AgentCore Memory session for one invocation.
+
+    The frontend names its conversation with one per-thread ID, sent as
+    ``user_context.session_id`` and ``thread_id``; either one is used as given.
+    A caller that names no conversation keeps the session AgentCore assigned to
+    the invocation, mapped to an opaque memory session ID. With no runtime session
+    either, the invocation gets a conversation of its own.
+
+    This must never fall back to a shared constant: every unnamed invocation of
+    one user would then share a single memory conversation, and concurrent
+    invocations would replay each other's unanswered questions (#743).
+    """
+    if isinstance(user_session_id, str) and user_session_id:
+        return user_session_id
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+    runtime_session_id = getattr(context, "session_id", None) if context is not None else None
+    try:
+        return memory_session_id_for_runtime_session(runtime_session_id)
+    except ValueError:
+        return f"req-{uuid.uuid4().hex}"
 
 
 def validate_aws_credentials():
@@ -120,7 +151,13 @@ def prewarm_container():
     - MCP clients for all known servers
     - Knowledge Base retrieval tools
 
-    Called at module load time (container startup).
+    Called at module load time (container startup). On AgentCore Runtime
+    platform version V2 this runs once per runtime version, before the startup
+    snapshot that every instance is restored from, and must finish (with the
+    rest of import) within the 120-second health-check limit. Build reusable
+    clients here; never create per-request, per-instance, or expiring values
+    (random values, keys, identifiers, timestamps, cached credentials) here; see
+    utils/runtime_instance.py.
     """
     start_time = time.perf_counter()
     logger.info("🔥 Pre-warming container...")
@@ -208,6 +245,14 @@ def _log_trace_content_posture(decision, log) -> None:
 
 # Record the exported-telemetry content posture (no content values are logged).
 _log_trace_content_posture(_TRACE_CONTENT_DECISION, logger)
+
+# AgentCore Runtime V2 restores every instance from one startup snapshot (see
+# utils/runtime_instance.py). Draw trace and span IDs from os.urandom instead of
+# the snapshot-shared ``random`` state, and register the span processor that
+# stamps spans with this instance's identifier. The identifier itself is created
+# at the first invocation, not here, so spans from startup work carry none.
+harden_trace_id_generator()
+install_instance_id_span_processor()
 
 
 def _current_request_id() -> str:
@@ -344,6 +389,14 @@ def invoke_agent(prompt, context=None):
     request_id = _current_request_id()
     _request_id_token = _REQUEST_ID_VAR.set(request_id)
     try:
+        # Per-instance initialization, once per process, before any other work.
+        # On AgentCore Runtime platform version V2 every instance is restored
+        # from one startup snapshot; the first invocation is the earliest point
+        # that is guaranteed to run after the restore. This reseeds the shared
+        # pseudo-random generator, rotates the log-redaction key, and mints the
+        # instance identifier (utils/runtime_instance.py). Later calls are no-ops.
+        ensure_instance_initialized()
+
         logger.info("=" * 80)
         logger.info("🚀 AGENTCORE INVOCATION START")
         logger.info("=" * 80)
@@ -453,8 +506,9 @@ def invoke_agent(prompt, context=None):
             return str(e)
 
         # Use session_id from frontend (environment-isolated: dev-{threadId} or prod-{threadId})
-        # This prevents dev/prod memory collision while maintaining conversation continuity
-        session_id = user_context.get("session_id") or thread_id or "default"
+        # This prevents dev/prod memory collision while maintaining conversation continuity.
+        # A caller that names no conversation keeps its own runtime session (#743).
+        session_id = resolve_memory_session_id(user_context.get("session_id"), thread_id, context)
 
         logger.info(f"👤 Authenticated user context [{auth_type}]")
         logger.info(f"🆔 Actor: {redact_identifier(actor_id)}")

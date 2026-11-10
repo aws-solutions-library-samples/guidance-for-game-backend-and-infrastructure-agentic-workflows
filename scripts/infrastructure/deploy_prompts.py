@@ -2,8 +2,13 @@
 """Deploy prompts to Bedrock Prompt Management.
 
 Creates or updates 5 managed prompts (orchestrator, gamelift, eks, cost, source_control).
-Writes prompt ARNs to backend/.env.local for runtime consumption.
+Writes prompt version ARNs to backend/.env.local for runtime consumption.
 Idempotent: re-runs publish only when text, model, or inference settings change.
+
+Publishing does not change a running AgentCore runtime: the runtime loads the
+pinned version ARNs from its environment, which only a runtime update (the full
+deployment's ``agentcore launch``) changes. The script prints a notice when a
+recorded ARN changed.
 """
 
 # Standard library
@@ -38,6 +43,16 @@ PROMPTS = {
 }
 
 PREFIX = "game-agent"
+
+# Printed when a run records a version ARN that differs from the one already in
+# the env file. The runtime keeps the ARNs it was launched with, so publishing
+# alone never changes a running runtime (on either AgentCore platform version).
+RUNTIME_UPDATE_NOTICE = (
+    "ℹ️  {count} prompt version ARN(s) changed. A running AgentCore runtime keeps the prompt "
+    "version ARNs in its environment, so these versions take effect only after a runtime update: "
+    "run scripts/deploy.sh (PowerShell: Deploy-GameAgent), which passes them to `agentcore launch`. "
+    "On AgentCore Runtime platform version V2 that update also creates a new startup snapshot."
+)
 
 
 def _prompt_resource_name(vp):
@@ -172,6 +187,24 @@ def deploy_prompt(client, env_key, vp):
         return ver_resp["arn"]
 
 
+def read_env_values(env_file, keys):
+    """Return the values recorded in ``env_file`` for ``keys`` (missing keys omitted)."""
+    values = {}
+    if not os.path.exists(env_file):
+        return values
+    with open(env_file, "r") as f:
+        for line in f:
+            for key in keys:
+                if line.startswith(key + "="):
+                    values[key] = line[len(key) + 1 :].strip()
+    return values
+
+
+def changed_keys(previous, current):
+    """Return the keys whose value in ``current`` differs from ``previous``."""
+    return [key for key, value in current.items() if previous.get(key) != value]
+
+
 def update_env_file(env_file, updates):
     """Write/update prompt ARN entries in .env.local."""
     lines = []
@@ -200,6 +233,7 @@ def main():
 
     client = boto3.client("bedrock-agent", region_name=args.region)
 
+    previous = read_env_values(args.env_file, PROMPTS)
     arns = {}
     for env_key, vp in PROMPTS.items():
         arn = deploy_prompt(client, env_key, vp)
@@ -209,6 +243,10 @@ def main():
     print(f"\n📋 Prompt ARNs written to {args.env_file}")
     for k, v in arns.items():
         print(f"   {k}={v}")
+
+    changed = changed_keys(previous, arns)
+    if changed:
+        print("\n" + RUNTIME_UPDATE_NOTICE.format(count=len(changed)))
 
 
 if __name__ == "__main__":

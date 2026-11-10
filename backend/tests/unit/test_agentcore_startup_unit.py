@@ -930,3 +930,91 @@ class TestTraceContentPostureLine:
         assert "redaction incomplete" in rendered.lower()
         assert MCP_SUBPROCESS_EXCLUSION_PATH in rendered
         assert "carries no prompt or response content" not in rendered
+
+
+class TestEntrypointSnapshotSafety:
+    """Per-instance state is created at the first invocation, never at import.
+
+    On AgentCore Runtime platform version V2 the import (startup) runs once per
+    runtime version and every instance is restored from the resulting snapshot.
+    The first invocation is the earliest point that always runs after the
+    restore, so the entrypoint initializes the instance there, before any other
+    request work, including identity verification.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_instance_state(self):
+        # Standard library
+        import random
+
+        # Local modules
+        from utils import runtime_instance, security
+
+        saved = (
+            random.getstate(),
+            security._LOG_REDACTION_KEY,
+            runtime_instance._initialized,
+            runtime_instance._instance_id,
+        )
+        runtime_instance.reset_instance_state()
+        security.rotate_log_redaction_key()
+        yield
+        random.setstate(saved[0])
+        security._LOG_REDACTION_KEY = saved[1]
+        runtime_instance._initialized = saved[2]
+        runtime_instance._instance_id = saved[3]
+
+    def test_fresh_import_creates_no_redaction_key_and_no_instance_identity(self):
+        # Local modules
+        from utils import runtime_instance, security
+
+        TestEntrypointTelemetryGuardWiring()._fresh_import_with_recording()
+
+        assert security._LOG_REDACTION_KEY is None
+        assert runtime_instance.is_instance_initialized() is False
+        assert runtime_instance.instance_id() is None
+
+    def test_invocation_initializes_the_instance_before_identity_verification(self):
+        # Local modules
+        import agentcore_main
+        from utils import runtime_instance
+
+        order = []
+        real_initialize = runtime_instance.ensure_instance_initialized
+
+        def recording_initialize():
+            order.append("initialize")
+            return real_initialize()
+
+        def recording_verify(*args, **kwargs):
+            order.append("verify")
+            return _verified_identity()
+
+        with (
+            patch.object(agentcore_main, "ensure_instance_initialized", side_effect=recording_initialize),
+            patch.object(agentcore_main, "verify_cognito_runtime_identity", side_effect=recording_verify),
+            patch.object(agentcore_main, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+            patch("agentcore_main.run_orchestrator", return_value="ok"),
+        ):
+            result = agentcore_main.invoke_agent({"prompt": "hi"}, context=_jwt_context())
+
+        assert result == "ok"
+        assert order == ["initialize", "verify"]
+        assert runtime_instance.is_instance_initialized() is True
+        assert runtime_instance.instance_id() is not None
+
+    def test_initialization_failure_fails_the_request_closed(self):
+        # Local modules
+        import agentcore_main
+
+        with (
+            patch.object(agentcore_main, "ensure_instance_initialized", side_effect=RuntimeError("no entropy")),
+            patch.object(agentcore_main, "verify_cognito_runtime_identity") as verify,
+            patch.object(agentcore_main, "ALLOW_LOCAL_IDENTITY_BYPASS", False),
+            patch("agentcore_main.run_orchestrator") as orchestrator,
+        ):
+            result = agentcore_main.invoke_agent({"prompt": "hi"}, context=_jwt_context())
+
+        verify.assert_not_called()
+        orchestrator.assert_not_called()
+        assert "error" in result.lower()

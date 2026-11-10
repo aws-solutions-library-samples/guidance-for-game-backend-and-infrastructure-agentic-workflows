@@ -317,6 +317,8 @@ npm install
 npm run dev
 ```
 
+The dev server listens on `127.0.0.1:3000` only. To reach it from another device, use an SSH local port forward rather than binding it to all interfaces.
+
 ## Usage
 
 Once the application is running (locally or deployed), interact with the AI assistant through the chat interface.

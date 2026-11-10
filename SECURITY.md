@@ -924,6 +924,17 @@ never set the bypass, so hosted configuration cannot reach this combination.
 | Hosted AgentCore | `GBAW_HOSTED_RUNTIME=true`, bypass off | `0.0.0.0` | Unpublished container network + per-request JWT verifier |
 | Hosted + bypass | contradictory (config drift) | refuses to start | Fail-closed guard (`RuntimeBindError`); hosted mode ignores the bypass anyway |
 
+The local frontend has the same loopback boundary. `ui/package.json` starts
+`next dev` and `next start` with `--hostname 127.0.0.1`, because Next.js
+otherwise listens on all interfaces (#740). With the dev-only
+`NEXT_PUBLIC_SKIP_AUTH` bypass, the chat proxy admits requests without a
+Cognito token and forwards them to the loopback backend. An all-interfaces
+frontend would therefore let any host on the network use the local agent with
+the developer's AWS credentials. To reach a dev server from another device, use
+an SSH local port forward instead of widening the bind. The container image is
+unaffected: it runs `node server.js` behind the ECS service and never uses
+`npm start`.
+
 **Configuration Location**: `backend/src/config/settings.py` (`resolve_runtime_host`),
 `backend/src/agentcore_main.py` (`run_server`), and `backend/agentcore_main.py`.
 
@@ -960,10 +971,16 @@ or raw session/thread identifiers.
   must stay tied to a principal or session across lines is emitted as a
   bounded, non-reversible token: `redact_identifier()`
   (`backend/src/utils/security.py`, a keyed HMAC-SHA-256 prefix over a random
-  per-process key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
-  the frontend. The HMAC key is random per process and is never read from the
-  environment, so a token is stable only within a single process and does not
-  correlate across processes, restarts, or tiers. The frontend additionally
+  per-instance key) on the backend and `redact()` (`ui/src/utils/logger.ts`) on
+  the frontend. The HMAC key is random per runtime instance and is never read
+  from the environment, so a token is stable only within a single instance and
+  does not correlate across instances, restarts, or tiers. The backend key is
+  generated from `os.urandom` on first use, never at import, and the runtime
+  discards any key created before an instance's first invocation
+  (`backend/src/utils/runtime_instance.py`). On AgentCore Runtime platform
+  version V2, where every instance is restored from one startup snapshot, each
+  instance therefore uses its own key rather than one copied from the snapshot.
+  The frontend additionally
   records AgentCore's service request ID from the `x-amzn-RequestId` response
   header, which identifies the invocation to the service (for example in a
   support case). It comes from a different header than the request ID the
