@@ -1,11 +1,15 @@
 /**
  * Optimized UI Interaction Tests - Fast execution
- * Tags: @e2e @localhost @integration @ai @slow
+ * Tags: @e2e @integration @ai @slow (only the empty-message check is @localhost)
+ *
+ * The reply checks need a running backend: before anything is sent, the welcome
+ * message already matches `.copilotKitAssistantMessage`, so without a backend
+ * they would pass on the welcome text. They stay out of the @localhost gate.
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('Game Agent - UI Interaction Tests', { tag: ['@e2e', '@localhost', '@integration', '@ai', '@slow'] }, () => {
+test.describe('Game Agent - UI Interaction Tests', { tag: ['@e2e', '@integration', '@ai', '@slow'] }, () => {
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/');
@@ -63,7 +67,7 @@ test.describe('Game Agent - UI Interaction Tests', { tag: ['@e2e', '@localhost',
     await expect(page.locator('.copilotKitAssistantMessage').last()).toBeVisible({ timeout: 30000 });
   });
 
-  test('should validate empty messages', async ({ page }) => {
+  test('should validate empty messages', { tag: '@localhost' }, async ({ page }) => {
     const chatInput = page.locator('.copilotKitInput textarea');
     const sendButton = page.locator('.copilotKitInputControlButton');
 

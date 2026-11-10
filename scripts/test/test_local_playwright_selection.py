@@ -62,6 +62,24 @@ class LocalPlaywrightSelectionTests(unittest.TestCase):
         # must not be part of the fast local selection.
         self.assertNotIn(MEMORY_SPEC.name, selected)
         self.assertNotIn("full-system-test.spec.ts", selected)
+        # Reply and performance checks pass vacuously without a backend (the
+        # welcome message satisfies their waits), so they are not selected.
+        self.assertNotIn("e2e-performance.spec.ts", selected)
+
+    def test_only_backend_independent_interaction_checks_are_selected(self):
+        source = (UI_TESTS / "e2e-interactions.spec.ts").read_text(encoding="utf-8")
+        describe_tags = TAG_ARRAY.search(source)
+        self.assertIsNotNone(describe_tags)
+        self.assertNotIn("@localhost", describe_tags.group(1), "the describe block holds reply checks")
+        tagged = re.findall(r"test\('([^']+)',\s*\{\s*tag:\s*'@localhost'", source)
+        self.assertEqual(tagged, ["should validate empty messages"])
+
+    def test_missing_frontend_config_fails_before_the_suites(self):
+        script = TEST_LOCAL.read_text(encoding="utf-8")
+        preflight = script.find("ui/.env.local")
+        self.assertNotEqual(preflight, -1, "test-local.sh should check for ui/.env.local")
+        self.assertLess(preflight, script.find("uv run pytest"), "the check must run before the unit suites")
+        self.assertIn("NEXT_PUBLIC_SKIP_AUTH", script[: script.find("uv run pytest")])
 
     def test_memory_specs_skip_without_configured_memory(self):
         source = MEMORY_SPEC.read_text(encoding="utf-8")

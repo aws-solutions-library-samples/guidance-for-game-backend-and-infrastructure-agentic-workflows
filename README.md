@@ -428,7 +428,7 @@ The project includes unit, integration, end-to-end, and AI evaluation tests.
 | Command | Description | Requirements |
 |---------|-------------|--------------|
 | `./test-unit.sh` | Backend + frontend unit tests | None |
-| `./test-local.sh` | Unit tests plus the `@localhost` Playwright UI specs | Playwright browsers (reuses or starts the local frontend) |
+| `./test-local.sh` | Unit tests plus the `@localhost` Playwright UI specs | Playwright browsers, and `ui/.env.local` (from `scripts/dev/start.sh` or `ui/.env.local.example`) or `NEXT_PUBLIC_SKIP_AUTH=true`; reuses or starts the local frontend, no backend needed |
 | `./test-cloud.sh` | Cloud integration tests | Deployed stack |
 | `./test-e2e.sh` | End-to-end browser tests | Running services |
 | `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack + short-lived Cognito access token |

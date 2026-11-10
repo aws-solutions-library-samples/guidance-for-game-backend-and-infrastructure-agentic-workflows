@@ -3,7 +3,10 @@
  *
  * Tests the complete user journey from UI interaction to backend response,
  * measuring real-world performance from a user perspective.
- * Tags: @e2e @localhost @performance @slow
+ * Tags: @e2e @performance @slow
+ *
+ * Not @localhost: these measure backend replies, and without a backend the
+ * welcome message satisfies the response wait, so they would pass vacuously.
  */
 
 import { test, expect, Page } from '@playwright/test';
@@ -106,7 +109,7 @@ class GameAgentPerformanceTester {
   }
 }
 
-test.describe('Game Agent E2E Performance Tests', { tag: ['@e2e', '@localhost', '@performance', '@slow'] }, () => {
+test.describe('Game Agent E2E Performance Tests', { tag: ['@e2e', '@performance', '@slow'] }, () => {
   let tester: GameAgentPerformanceTester;
 
   test.beforeEach(async ({ page }) => {
@@ -156,7 +159,7 @@ test.describe('Game Agent E2E Performance Tests', { tag: ['@e2e', '@localhost', 
   });
 });
 
-test.describe('Performance Regression Tests', { tag: ['@e2e', '@localhost', '@performance', '@slow'] }, () => {
+test.describe('Performance Regression Tests', { tag: ['@e2e', '@performance', '@slow'] }, () => {
   test('should meet performance benchmarks', async ({ page }) => {
     const tester = new GameAgentPerformanceTester(page);
 
