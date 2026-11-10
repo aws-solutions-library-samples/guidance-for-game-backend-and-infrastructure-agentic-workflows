@@ -692,7 +692,7 @@ shellingham==1.5.4
     # via typer
 six==1.17.0
     # via python-dateutil
-soupsieve==2.10
+soupsieve==4.1
     # via beautifulsoup4
 sqlglot==30.29.0
     # via awslabs-billing-cost-management-mcp-server
