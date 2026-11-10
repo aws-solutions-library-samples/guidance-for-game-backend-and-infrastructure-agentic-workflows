@@ -380,8 +380,9 @@ quarter", "month to date", a month with its year once that month has ended
 ("July 2026"), and ISO dates before today; every other captured report is
 dropped. A cost-advice question, which asks how to lower or optimize cost ("How
 do I reduce data transfer costs?", "optimize my EC2 spend"), is handled the same
-way with the general cost guidance; a question that also asks what was spent
-keeps its report.
+way with the general cost guidance. A question whose remaining text still
+mentions cost once the advice phrase is set aside, such as one that also asks
+what was spent, keeps its report.
 
 Snapshot correctness and billing finality are separate. A validated report is
 internally consistent with Cost Explorer at its `queriedAt` timestamp, while an
