@@ -4,6 +4,9 @@
  * Tests the complete user journey from UI interaction to backend response,
  * measuring real-world performance from a user perspective.
  * Tags: @e2e @performance @slow
+ *
+ * Not @localhost: these measure backend replies, and without a backend the
+ * welcome message satisfies the response wait, so they would pass vacuously.
  */
 
 import { test, expect, Page } from '@playwright/test';

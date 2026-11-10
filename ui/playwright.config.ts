@@ -18,8 +18,10 @@ export default defineConfig({
     timeout: 5000,
   },
 
+  // `npm run dev` binds 127.0.0.1 only (#740), so address it directly rather
+  // than through `localhost`, which can resolve to ::1 first.
   use: {
-    baseURL: 'http://localhost:3000',
+    baseURL: 'http://127.0.0.1:3000',
     trace: 'on-first-retry',
     actionTimeout: 10000,
     navigationTimeout: 10000,
@@ -34,7 +36,7 @@ export default defineConfig({
 
   webServer: {
     command: 'npm run dev',
-    url: 'http://localhost:3000',
+    url: 'http://127.0.0.1:3000',
     reuseExistingServer: !process.env.CI,
     timeout: 120000,
   },

@@ -33,7 +33,7 @@ attrs==26.1.0
     #   jsonschema
     #   jsonschema-path
     #   referencing
-authlib==1.9.1
+authlib==1.9.5
     # via fastmcp-slim
 aws-opentelemetry-distro==0.22.0
     # via game-agent-backend
@@ -51,7 +51,7 @@ beartype==0.23.1
     # via py-key-value-aio
 beautifulsoup4==4.15.0
     # via game-agent-backend
-bedrock-agentcore==1.25.2
+bedrock-agentcore==1.25.3
     # via game-agent-backend
 boto3==1.43.123
     # via
@@ -102,7 +102,7 @@ cryptography==50.0.2
     #   joserfc
     #   pyjwt
     #   secretstorage
-cyclopts==5.3.2
+cyclopts==5.3.3
     # via fastmcp-slim
 dnspython==2.9.1
     # via email-validator
@@ -179,7 +179,7 @@ jmespath==1.1.0
     #   awscli
     #   boto3
     #   botocore
-joserfc==1.7.7
+joserfc==1.8.0
     # via
     #   authlib
     #   fastmcp-slim
@@ -694,7 +694,7 @@ six==1.17.0
     # via python-dateutil
 soupsieve==2.10
     # via beautifulsoup4
-sqlglot==30.27.0
+sqlglot==30.29.0
     # via awslabs-billing-cost-management-mcp-server
 sse-starlette==3.6.0
     # via mcp
@@ -737,7 +737,7 @@ typing-inspection==0.4.4
     #   mcp
     #   pydantic
     #   pydantic-settings
-uncalled-for==0.4.1
+uncalled-for==0.4.2
     # via fastmcp-slim
 urllib3==2.8.0
     # via
