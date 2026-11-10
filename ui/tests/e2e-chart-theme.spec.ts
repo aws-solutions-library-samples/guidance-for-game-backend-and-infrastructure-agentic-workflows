@@ -2,7 +2,7 @@
  * Browser regression test for inline charts (#255) — real computed layout that
  * jsdom cannot measure: the chart stays legible on a narrow viewport (scrolls
  * rather than shrinking to nothing) and follows both themes.
- * Tags: @e2e @visual @fast
+ * Tags: @e2e @localhost @visual @fast
  */
 
 import { test, expect } from '@playwright/test';
@@ -46,7 +46,7 @@ async function injectChart(page: import('@playwright/test').Page) {
   }, CHART_JSON);
 }
 
-test.describe('#255 - inline chart rendering', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+test.describe('#255 - inline chart rendering', { tag: ['@e2e', '@localhost', '@visual', '@fast'] }, () => {
   for (const theme of ['dark', 'light'] as const) {
     test(`chart tick text is themed and legible (${theme})`, async ({ page }) => {
       await page.goto('/');

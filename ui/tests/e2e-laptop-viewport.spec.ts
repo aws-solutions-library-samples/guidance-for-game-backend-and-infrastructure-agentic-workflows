@@ -2,7 +2,7 @@
  * Browser regression tests for #251 — chat visibility on laptop-height viewports.
  * All pre-existing breakpoints were width-only; these tests pin the height-based
  * compaction at a 14" MacBook Pro logical viewport.
- * Tags: @e2e @visual @fast
+ * Tags: @e2e @localhost @visual @fast
  */
 
 import { test, expect } from '@playwright/test';
@@ -11,7 +11,7 @@ import { test, expect } from '@playwright/test';
 const LAPTOP_VIEWPORT = { width: 1512, height: 982 };
 const PHONE_VIEWPORT = { width: 390, height: 844 };
 
-test.describe('#251 - chat visibility on laptop-height viewport', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+test.describe('#251 - chat visibility on laptop-height viewport', { tag: ['@e2e', '@localhost', '@visual', '@fast'] }, () => {
   test.use({ viewport: LAPTOP_VIEWPORT });
 
   test('message area gets the majority of the viewport height', async ({ page }) => {
@@ -41,7 +41,7 @@ test.describe('#251 - chat visibility on laptop-height viewport', { tag: ['@e2e'
   });
 });
 
-test.describe('#251 - short mobile viewport', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+test.describe('#251 - short mobile viewport', { tag: ['@e2e', '@localhost', '@visual', '@fast'] }, () => {
   test.use({ viewport: PHONE_VIEWPORT });
 
   test('retains mobile horizontal padding', async ({ page }) => {

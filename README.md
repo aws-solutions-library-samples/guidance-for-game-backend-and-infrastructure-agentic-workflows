@@ -317,6 +317,8 @@ npm install
 npm run dev
 ```
 
+The dev server listens on `127.0.0.1:3000` only. To reach it from another device, use an SSH local port forward rather than binding it to all interfaces.
+
 ## Usage
 
 Once the application is running (locally or deployed), interact with the AI assistant through the chat interface.
@@ -382,7 +384,8 @@ shown only when the question names its period, such as "last
 month", "month to date", or a past month with its year ("July 2026"); reports
 for any other period are dropped. A question that asks how to lower or optimize
 cost, such as "How do I reduce data transfer costs?", is answered the same way
-with the general cost guidance, unless it also asks what was spent.
+with the general cost guidance, unless the rest of the question still mentions
+cost, for example by also asking what was spent. Those questions keep their report.
 
 ### Enrolling EKS Clusters
 
@@ -426,7 +429,7 @@ The project includes unit, integration, end-to-end, and AI evaluation tests.
 | Command | Description | Requirements |
 |---------|-------------|--------------|
 | `./test-unit.sh` | Backend + frontend unit tests | None |
-| `./test-local.sh` | Unit tests only | None |
+| `./test-local.sh` | Unit tests plus the `@localhost` Playwright UI specs | Playwright browsers, and `ui/.env.local` (from `scripts/dev/start.sh` or `ui/.env.local.example`) or `NEXT_PUBLIC_SKIP_AUTH=true`; reuses or starts the local frontend, no backend needed |
 | `./test-cloud.sh` | Cloud integration tests | Deployed stack |
 | `./test-e2e.sh` | End-to-end browser tests | Running services |
 | `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack + short-lived Cognito access token |

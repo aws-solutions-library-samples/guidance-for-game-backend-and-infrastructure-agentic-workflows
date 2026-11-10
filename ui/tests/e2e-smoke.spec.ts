@@ -4,12 +4,12 @@
  * Quick sanity checks to verify the system is basically working.
  * These should be FAST (<30s total) and cover only critical paths.
  *
- * Tags: @e2e @smoke @fast
+ * Tags: @e2e @localhost @smoke @fast
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('Game Agent Smoke Tests', { tag: ['@e2e', '@smoke', '@fast'] }, () => {
+test.describe('Game Agent Smoke Tests', { tag: ['@e2e', '@localhost', '@smoke', '@fast'] }, () => {
 
   test('should load the application', async ({ page }) => {
     // Navigate to the application

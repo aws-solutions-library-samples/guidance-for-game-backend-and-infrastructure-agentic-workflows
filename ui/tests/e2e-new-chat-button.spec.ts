@@ -2,12 +2,12 @@
  * Browser test for #253 — the new chat button renders in the live chat and is
  * clickable (z-index must clear CopilotKit's message stacking, which is why a
  * DOM-only unit test isn't sufficient here).
- * Tags: @e2e @visual @fast
+ * Tags: @e2e @localhost @visual @fast
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('#253 - new chat button', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+test.describe('#253 - new chat button', { tag: ['@e2e', '@localhost', '@visual', '@fast'] }, () => {
   test('button renders inside the chat and is clickable', async ({ page }) => {
     await page.goto('/');
     const button = page.getByRole('button', { name: /new chat/i });
