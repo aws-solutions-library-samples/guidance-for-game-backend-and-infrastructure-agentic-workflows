@@ -38,9 +38,10 @@ MINIMUM_PATCHED = {
     "mcp": ((1, 30, 0), "GHSA-84m7-p3x7-pcfv", True),
     "setuptools": ((84, 1, 0), "GHSA-xmj3-9gf7-h52w", True),
     "authlib": (
-        (1, 9, 1),
+        (1, 9, 5),
         "GHSA-6v38-4h7w-rj9h, GHSA-7vr2-2fgp-9w7p, GHSA-8m4g-j4wp-wgcg, GHSA-x4rv-c3wx-4cr8, "
-        "GHSA-c5mf-xmp2-59rc, GHSA-fch4-3c6x-j4gc, GHSA-q686-2qmg-hqc7, GHSA-jj7h-c3hg-m23x",
+        "GHSA-c5mf-xmp2-59rc, GHSA-fch4-3c6x-j4gc, GHSA-q686-2qmg-hqc7, GHSA-jj7h-c3hg-m23x, "
+        "GHSA-f3fg-34g9-v7jx, GHSA-gp2m-377p-m4j3, GHSA-9qr6-8289-9j56, GHSA-f7j6-p4qx-gq99",
         True,
     ),
     "dnspython": ((2, 9, 0), "GHSA-45c3-73f7-pv4m", True),
@@ -52,6 +53,11 @@ MINIMUM_PATCHED = {
     "joserfc": ((1, 7, 6), "GHSA-jpxq-7h8p-2q76, GHSA-9pg5-8c7x-5hfx", True),
     "opentelemetry-api": ((1, 45, 1), "GHSA-xcq7-p3pf-p88h", True),
     "opentelemetry-propagator-jaeger": ((1, 45, 0), "GHSA-f5m9-jfrj-jjj7", True),
+    "soupsieve": (
+        (4, 1),
+        "GHSA-mmhr-3c5m-f64f, GHSA-7g44-g9rc-x53w, GHSA-8jvp-3x96-xpqw, GHSA-f3mv-fm3p-593v",
+        True,
+    ),
 }
 
 

@@ -2,12 +2,12 @@
  * Basic End-to-End Tests for Game Agent
  *
  * Tests core functionality without performance requirements
- * Tags: @e2e @sanity
+ * Tags: @e2e @localhost @sanity
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('Game Agent Basic E2E Tests', { tag: ['@e2e', '@sanity'] }, () => {
+test.describe('Game Agent Basic E2E Tests', { tag: ['@e2e', '@localhost', '@sanity'] }, () => {
 
   test.beforeEach(async ({ page }) => {
     // Navigate to the application
