@@ -3,7 +3,8 @@
 deploy.sh Step 7b runs scripts/infrastructure/setup-app-observability.sh to set
 14-day retention on log groups that AgentCore creates without one. These tests
 run it against a fake ``aws`` command and check that the runtime and ADOT log
-groups are matched by exact name and get retention. Nothing here uses
+groups are matched by exact name and get retention only when they have none,
+so an existing policy is never shortened. Nothing here uses
 credentials or cloud resources.
 
 The fake rejects ``--log-group-name-exact`` the way the AWS CLI does. That
@@ -87,6 +88,8 @@ if command == ("logs", "describe-log-groups"):
     else:
         fail(2, "fake aws: unexpected query %r" % query)
 elif command == ("logs", "put-retention-policy"):
+    if option("--log-group-name") in state.get("put_errors", []):
+        fail(254, "An error occurred (AccessDeniedException) when calling the PutRetentionPolicy operation")
     for group in state["log_groups"]:
         if group["logGroupName"] == option("--log-group-name"):
             group["retentionInDays"] = int(option("--retention-in-days"))
@@ -114,8 +117,19 @@ class RuntimeLogRetention(unittest.TestCase):
         self.state_path = self.tmp / "state.json"
         self.write_state()
 
-    def write_state(self, *, log_groups: list[dict] | None = None, lookup_errors: list[str] | None = None) -> None:
-        state = {"calls": [], "log_groups": log_groups or [], "lookup_errors": lookup_errors or []}
+    def write_state(
+        self,
+        *,
+        log_groups: list[dict] | None = None,
+        lookup_errors: list[str] | None = None,
+        put_errors: list[str] | None = None,
+    ) -> None:
+        state = {
+            "calls": [],
+            "log_groups": log_groups or [],
+            "lookup_errors": lookup_errors or [],
+            "put_errors": put_errors or [],
+        }
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
     def calls(self) -> list[list[str]]:
@@ -131,9 +145,9 @@ class RuntimeLogRetention(unittest.TestCase):
             if call[:2] == ["logs", "put-retention-policy"]
         ]
 
-    def run_script(self) -> subprocess.CompletedProcess[str]:
+    def run_script(self, runtime_id: str = RUNTIME_ID) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            ["bash", str(SCRIPT), RUNTIME_ID],
+            ["bash", str(SCRIPT), runtime_id],
             env={
                 "PATH": os.pathsep.join((str(self.bin), "/usr/bin", "/bin")),
                 "HOME": str(self.tmp),
@@ -164,16 +178,35 @@ class RuntimeLogRetention(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.retention_updates(), [])
-        self.assertIn("AgentCore Runtime logs: already has 14-day retention", result.stdout)
+        self.assertIn(f"AgentCore Runtime logs: {RUNTIME_GROUP} already has 14-day retention", result.stdout)
 
-    def test_a_different_retention_is_still_reset_to_14_days(self) -> None:
-        # Unchanged behavior: this helper enforces 14 days rather than keeping another policy.
-        self.write_state(log_groups=[log_group(RUNTIME_GROUP, retention=30)])
+    def test_an_existing_longer_or_shorter_retention_is_kept(self) -> None:
+        # Shortening retention deletes older events, so an operator's policy is never changed.
+        for retention in (1, 30, 3653):
+            with self.subTest(retention=retention):
+                self.write_state(
+                    log_groups=[log_group(RUNTIME_GROUP, retention=retention), log_group(ADOT_GROUP, retention=retention)]
+                )
+
+                result = self.run_script()
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.retention_updates(), [])
+                self.assertIn(f"already has {retention}-day retention", result.stdout)
+
+    def test_a_failed_retention_update_stops_the_script(self) -> None:
+        self.write_state(log_groups=[log_group(RUNTIME_GROUP)], put_errors=[RUNTIME_GROUP])
 
         result = self.run_script()
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.retention_updates(), [(RUNTIME_GROUP, "14")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("AgentCore Runtime logs: set 14-day retention", result.stdout)
+
+    def test_an_invalid_runtime_id_is_refused_before_any_call(self) -> None:
+        result = self.run_script("bad'] | [*].logGroupName | ['x")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
 
     def test_only_the_exact_log_group_name_matches(self) -> None:
         self.write_state(log_groups=[log_group(f"{RUNTIME_GROUP}-previous")])
@@ -224,6 +257,16 @@ class RetentionLookupParity(unittest.TestCase):
         self.assertIn("logGroups[?logGroupName=='${log_group}']", shell)
         self.assertIn("--log-group-name-prefix $LogGroup", powershell)
         self.assertIn("logGroups[?logGroupName=='$LogGroup']", powershell)
+
+    def test_both_paths_route_runtime_groups_through_the_keep_existing_helper(self) -> None:
+        shell = SCRIPT.read_text(encoding="utf-8")
+        powershell = POWERSHELL_HELPER.read_text(encoding="utf-8")
+        self.assertIn('ensure_retention_if_unset \\\n    "/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}-DEFAULT"', shell)
+        self.assertIn('ensure_retention_if_unset \\\n    "/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}/adot-rt-logs"', shell)
+        self.assertIn("Set-RetentionIfUnset \"/aws/bedrock-agentcore/runtimes/$RuntimeId-DEFAULT\"", powershell)
+        self.assertIn("Set-RetentionIfUnset \"/aws/bedrock-agentcore/runtimes/$RuntimeId/adot-rt-logs\"", powershell)
+        for removed in ("ensure_log_group_retention", "Set-LogGroupRetention"):
+            self.assertNotIn(removed, shell + powershell)
 
 
 if __name__ == "__main__":

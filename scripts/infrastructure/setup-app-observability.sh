@@ -22,39 +22,14 @@ if [ -z "$RUNTIME_ID" ]; then
     echo "Usage: $0 <runtime-id>"
     exit 1
 fi
+# The runtime ID becomes part of a JMESPath filter below. AgentCore runtime IDs
+# use only letters, digits, underscores and hyphens; refuse anything else.
+if ! [[ "$RUNTIME_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "❌ Error: invalid runtime ID"
+    exit 1
+fi
 
 echo "🔍 Setting up observability for runtime: $RUNTIME_ID"
-
-# Helper: ensure a log group exists with retention
-ensure_log_group_retention() {
-    local log_group="$1"
-    local description="$2"
-    local state found retention
-
-    # describe-log-groups has no exact-name option, so list the groups that
-    # start with the name and keep only the exact match. A failed lookup is
-    # reported instead of being mistaken for a missing log group.
-    if ! state=$(aws logs describe-log-groups --region "$AWS_REGION" \
-        --log-group-name-prefix "$log_group" \
-        --query "logGroups[?logGroupName=='${log_group}'].[logGroupName, retentionInDays]" \
-        --output text 2>/dev/null); then
-        echo "⚠️  $description: could not read $log_group; retention unchanged"
-        return
-    fi
-    read -r found retention <<< "$state"
-
-    if [ "$found" != "$log_group" ]; then
-        echo "⏭️  $description: log group not found (will be created by AWS on first use)"
-    elif [ "$retention" = "$RETENTION_DAYS" ]; then
-        echo "✅ $description: already has ${RETENTION_DAYS}-day retention"
-    else
-        aws logs put-retention-policy \
-            --log-group-name "$log_group" \
-            --retention-in-days $RETENTION_DAYS \
-            --region $AWS_REGION
-        echo "✅ $description: set ${RETENTION_DAYS}-day retention"
-    fi
-}
 
 # Helper: find and set retention on log groups matching a prefix
 ensure_prefix_retention() {
@@ -151,13 +126,14 @@ ensure_frontend_log_retention() {
 echo ""
 echo "📋 Setting retention on auto-created log groups..."
 
-# 1. AgentCore Runtime logs (auto-created by AgentCore)
-ensure_log_group_retention \
+# 1. AgentCore Runtime logs (auto-created by AgentCore). Like every group here,
+#    retention is set only when the group has none; an existing policy is kept.
+ensure_retention_if_unset \
     "/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}-DEFAULT" \
     "AgentCore Runtime logs"
 
 # 2. ADOT runtime logs (auto-created by ADOT)
-ensure_log_group_retention \
+ensure_retention_if_unset \
     "/aws/bedrock-agentcore/runtimes/${RUNTIME_ID}/adot-rt-logs" \
     "ADOT runtime logs"
 
