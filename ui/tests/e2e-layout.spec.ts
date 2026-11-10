@@ -1,11 +1,11 @@
 /**
  * Layout and Visual Tests - Verify UI structure is correct
- * Tags: @e2e @visual @fast
+ * Tags: @e2e @localhost @visual @fast
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('Game Agent - Layout Tests', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+test.describe('Game Agent - Layout Tests', { tag: ['@e2e', '@localhost', '@visual', '@fast'] }, () => {
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/');

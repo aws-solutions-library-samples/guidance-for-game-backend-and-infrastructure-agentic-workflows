@@ -1,12 +1,12 @@
 /**
  * Browser regression test for #252 — code block legibility on light theme.
  * Asserts computed styles, which jsdom cannot do.
- * Tags: @e2e @visual @fast
+ * Tags: @e2e @localhost @visual @fast
  */
 
 import { test, expect } from '@playwright/test';
 
-test.describe('#252 - code block legibility on light theme', { tag: ['@e2e', '@visual', '@fast'] }, () => {
+test.describe('#252 - code block legibility on light theme', { tag: ['@e2e', '@localhost', '@visual', '@fast'] }, () => {
   test('code block text has readable contrast against its background', async ({ page }) => {
     await page.goto('/');
     await page.waitForSelector('.ga-chat-container', { timeout: 10000 });
