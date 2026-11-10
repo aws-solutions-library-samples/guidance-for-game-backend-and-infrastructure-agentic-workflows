@@ -33,6 +33,15 @@ _specialist_model = None
 _model_lock = threading.Lock()
 
 
+def guardrail_attached() -> bool:
+    """Return whether model calls carry the configured Bedrock Guardrail.
+
+    This is the one condition for attaching a guardrail; tests that need a
+    guarded model use it too, so they cannot drift from what the model does.
+    """
+    return bool(BEDROCK_GUARDRAIL_ENABLED and BEDROCK_GUARDRAIL_ID)
+
+
 def _model_config(model_id: str, temperature: float, max_tokens: int) -> dict:
     """Build shared Strands configuration without changing the selected role.
 
@@ -58,7 +67,7 @@ def _model_config(model_id: str, temperature: float, max_tokens: int) -> dict:
     if capabilities.thinking is not None:
         config["additional_request_fields"] = {"thinking": capabilities.thinking}
 
-    if BEDROCK_GUARDRAIL_ENABLED and BEDROCK_GUARDRAIL_ID:
+    if guardrail_attached():
         config["guardrail_id"] = BEDROCK_GUARDRAIL_ID
         config["guardrail_version"] = BEDROCK_GUARDRAIL_VERSION
         config["guardrail_trace"] = "enabled"
