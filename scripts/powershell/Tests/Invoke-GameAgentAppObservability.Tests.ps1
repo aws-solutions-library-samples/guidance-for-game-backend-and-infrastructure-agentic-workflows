@@ -229,3 +229,62 @@ Describe 'Invoke-GameAgentAppObservability frontend log group' {
         $script:Unexpected | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Invoke-GameAgentAppObservability runtime log groups' {
+    BeforeAll {
+        $script:RuntimeGroup = '/aws/bedrock-agentcore/runtimes/gameagentruntime-EXAMPLE-DEFAULT'
+        $script:AdotGroup = '/aws/bedrock-agentcore/runtimes/gameagentruntime-EXAMPLE/adot-rt-logs'
+    }
+    BeforeEach {
+        $script:StatusMessages = [System.Collections.Generic.List[string]]::new()
+        $script:HostMessages = [System.Collections.Generic.List[string]]::new()
+        $script:Puts = [System.Collections.Generic.List[string]]::new()
+        $script:Unexpected = [System.Collections.Generic.List[string]]::new()
+        $global:LASTEXITCODE = 0
+    }
+    AfterEach {
+        Remove-Item -Path function:aws -ErrorAction SilentlyContinue
+    }
+
+    It 'Sets retention on runtime and ADOT log groups that have none' {
+        Set-AppObsAwsMock -LogGroups @{ $script:RuntimeGroup = $null; $script:AdotGroup = $null } `
+            -Puts $script:Puts -Unexpected $script:Unexpected
+
+        Invoke-AppObservability
+
+        ($script:Puts -join ',') | Should -Be "$($script:RuntimeGroup)=14,$($script:AdotGroup)=14"
+        $script:Unexpected | Should -BeNullOrEmpty
+    }
+
+    It 'Keeps an existing runtime retention policy, longer or shorter' -TestCases @(
+        @{ Days = 1 }
+        @{ Days = 3653 }
+    ) {
+        param($Days)
+        Set-AppObsAwsMock -LogGroups @{ $script:RuntimeGroup = $Days; $script:AdotGroup = $Days } `
+            -Puts $script:Puts -Unexpected $script:Unexpected
+
+        Invoke-AppObservability
+
+        $script:Puts | Should -BeNullOrEmpty
+        ($script:HostMessages -join "`n") | Should -BeLike "*$($script:RuntimeGroup) already has $Days-day retention*"
+        $script:Unexpected | Should -BeNullOrEmpty
+    }
+
+    It 'Stops when a runtime retention update fails, as the shell script does' {
+        Set-AppObsAwsMock -LogGroups @{ $script:RuntimeGroup = $null } -PutFails $true `
+            -Puts $script:Puts -Unexpected $script:Unexpected
+
+        { Invoke-AppObservability } | Should -Throw "*Could not set 14-day retention on $($script:RuntimeGroup)*"
+        $script:Unexpected | Should -BeNullOrEmpty
+    }
+
+    It 'Refuses a runtime ID outside the AgentCore character set before any call' {
+        Set-AppObsAwsMock -Puts $script:Puts -Unexpected $script:Unexpected
+
+        { Invoke-GameAgentAppObservability -RuntimeId "bad'] | [*].logGroupName | ['x" -Region 'us-west-2' -ProfileArgs @() } |
+            Should -Throw '*Invalid runtime ID*'
+        $script:Puts | Should -BeNullOrEmpty
+        $script:Unexpected | Should -BeNullOrEmpty
+    }
+}
