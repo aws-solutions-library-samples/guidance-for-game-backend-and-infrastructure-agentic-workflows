@@ -11,8 +11,8 @@ cd "$PROJECT_ROOT"
 # deployed Cognito pool: ui/.env.local (written by scripts/dev/start.sh, or
 # copied from ui/.env.local.example) or NEXT_PUBLIC_SKIP_AUTH=true. Check up
 # front so a missing setup fails here, not after the unit suites.
-if [ ! -f ui/.env.local ] && [ -z "${NEXT_PUBLIC_SKIP_AUTH:-}" ]; then
-    echo "❌ ui/.env.local is missing and NEXT_PUBLIC_SKIP_AUTH is not set."
+if [ ! -f ui/.env.local ] && [ "${NEXT_PUBLIC_SKIP_AUTH:-}" != "true" ]; then
+    echo "❌ ui/.env.local is missing and NEXT_PUBLIC_SKIP_AUTH is not true."
     echo "   Run scripts/dev/start.sh once, or copy ui/.env.local.example to ui/.env.local."
     exit 1
 fi
