@@ -317,6 +317,8 @@ npm install
 npm run dev
 ```
 
+The dev server listens on `127.0.0.1:3000` only. To reach it from another device, use an SSH local port forward rather than binding it to all interfaces.
+
 ## Usage
 
 Once the application is running (locally or deployed), interact with the AI assistant through the chat interface.
@@ -427,7 +429,7 @@ The project includes unit, integration, end-to-end, and AI evaluation tests.
 | Command | Description | Requirements |
 |---------|-------------|--------------|
 | `./test-unit.sh` | Backend + frontend unit tests | None |
-| `./test-local.sh` | Unit tests only | None |
+| `./test-local.sh` | Unit tests plus the `@localhost` Playwright UI specs | Playwright browsers, and `ui/.env.local` (from `scripts/dev/start.sh` or `ui/.env.local.example`) or `NEXT_PUBLIC_SKIP_AUTH=true`; reuses or starts the local frontend, no backend needed |
 | `./test-cloud.sh` | Cloud integration tests | Deployed stack |
 | `./test-e2e.sh` | End-to-end browser tests | Running services |
 | `./test-ai-evals.sh` | AI behavior evaluation | Deployed stack + short-lived Cognito access token |
