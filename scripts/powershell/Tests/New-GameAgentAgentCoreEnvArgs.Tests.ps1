@@ -40,6 +40,7 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -OrchestratorModelId 'orchestrator-model' `
             -SpecialistModelId 'specialist-model' `
             -GuardrailId 'guardrail-id' `
+            -GuardrailVersion '3' `
             -OrchestratorPromptArn 'orchestrator-prompt' `
             -GameLiftPromptArn 'gamelift-prompt' `
             -EksPromptArn 'eks-prompt' `
@@ -68,7 +69,7 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             '-env'
             'GBAW_BEDROCK_GUARDRAIL_ID=guardrail-id'
             '-env'
-            'GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT'
+            'GBAW_BEDROCK_GUARDRAIL_VERSION=3'
             '-env'
             'GBAW_ORCHESTRATOR_PROMPT_ARN=orchestrator-prompt'
             '-env'
@@ -238,6 +239,23 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
         ) -join "`n")
         # No connector secret env var on a disabled deployment.
         ($result -join "`n") | Should -Not -Match 'GBAW_SCM_READ_CREDENTIAL_SECRET_ARN'
+    }
+
+    It 'Refuses a Guardrail ID without a published version (<Label>)' -TestCases @(
+        @{ Label = 'missing'; Version = '' }
+        @{ Label = 'the AWS CLI None sentinel'; Version = 'None' }
+        @{ Label = 'the mutable DRAFT'; Version = 'DRAFT' }
+        @{ Label = 'zero'; Version = '0' }
+    ) {
+        param($Label, $Version)
+
+        {
+            New-GameAgentAgentCoreEnvArgs `
+                -OrchestratorModelId 'orchestrator-model' `
+                -SpecialistModelId 'specialist-model' `
+                -GuardrailId 'guardrail-id' `
+                -GuardrailVersion $Version
+        } | Should -Throw '*no published version*'
     }
 
     It 'Emits no connector env when ScmEnv is empty (unaffected non-connector deployments)' {
