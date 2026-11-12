@@ -103,6 +103,16 @@ Its result reaches model context directly.
 | `call_aws` (`aws eks list-clusters`, `describe-cluster`, resource discovery) | Provider/CLI paging; **unbounded** to model | Cluster ARNs (account ID), endpoint URLs, VPC/subnet/security-group IDs, `certificateAuthority` data, OIDC issuer URLs, arbitrary CLI JSON | **None** — raw MCP tool result reaches the model | MCP/CLI error text reaches model | **Follow-up.** No code-owned projection; raw provider JSON and exception text are model-visible. |
 | `eks-mcp-server` in-cluster reads (pods, deployments, services) | Kubernetes API paging; unbounded to model | Pod IPs, node IPs, image references, env, annotations, labels | None (read-only RBAC excludes secrets) | MCP error text reaches model | **Follow-up.** RBAC bounds *what* is readable, not the projection shape. |
 
+## Read-only migration discovery (#529) — code-owned
+
+| Surface | Pagination / bounds | Sensitive fields possible | Transform | Error / partial | Disposition |
+| --- | --- | --- | --- | --- | --- |
+| `get_agones_inventory` (EKS specialist; `eks-mcp-server` `list_k8s_resources` + `manage_k8s_resource` pinned to `operation=read`) | 10 Fleets, 10 FleetAutoscalers, 20 GameServers; 8 ports and 4 containers per item; 128-character strings; nesting depth 8; 20,000-byte envelope; 45-second budget | Annotations, env values, commands, service accounts, node names, pod addresses, webhook URLs, registry hosts with account IDs | `agones_discovery` reviewed schemas; image references split by `image_reference`; cluster must be in the server-owned `GBAW_EKS_DISCOVERY_CLUSTERS` scope | `complete` / `empty` / `denied` / `unavailable` / `malformed` / `partial` / `truncated`, plus `stale` when an object disappears between list and read | **Controlled.** Kinds, operation, and inputs are fixed in code; `manage_k8s_resource` is never model-facing. |
+| `list_game_session_queues` (`describe_game_session_queues`) | 25 queues; 20 destinations, 10 latency policies, 20 locations per queue; serialized budget | Queue, fleet, alias, and SNS ARNs; account IDs; `CustomEventData` | Destination ARNs reduced to fleet/alias ID + Region; unparsable destinations counted | GameLift status vocabulary; read cap → `truncated` + `paginated` | **Controlled.** |
+| `get_fleet_locations` (`describe_fleet_location_attributes`, or `describe_container_fleet` for container fleets) | 100 locations; serialized budget | Fleet ARN | Location, status, gateway status only; fleet ID validated before the call | GameLift status vocabulary | **Controlled.** |
+| `get_container_group_definition` (`describe_container_group_definition`) | 8 support containers, 10 port ranges each; serialized budget | Definition ARN, ECR host with account ID, env overrides, mount paths, health-check commands, `StatusReason` | Reviewed fields only; image as repository/tag/digest | GameLift status vocabulary | **Controlled.** |
+| `get_container_fleet_ports` (`describe_container_fleet`) | 20 inbound permissions | Fleet and role ARNs, inbound IP ranges | Ports and protocol plus a code-owned `Scope` token; IP range dropped | GameLift status vocabulary | **Controlled.** |
+
 ## Cost specialist (owned `get_cost_report` + guarded Billing MCP) — partially controlled
 
 | Surface | Pagination / bounds | Sensitive fields possible | Transform | Error / partial | Disposition |

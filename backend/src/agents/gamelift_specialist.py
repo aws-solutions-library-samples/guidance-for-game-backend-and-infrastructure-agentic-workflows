@@ -16,12 +16,25 @@ from strands import tool
 
 # Local modules
 from agents.base_specialist import create_specialist_agent
+from agents.gamelift_migration_projections import (
+    MAX_FLEET_LOCATIONS,
+    MAX_QUEUES,
+    project_classic_fleet_locations,
+    project_container_fleet_locations,
+    project_container_fleet_ports,
+    project_container_group_definition,
+    project_game_session_queues,
+    valid_container_group_definition_name,
+)
 from agents.gamelift_projections import (
     ERROR_ACCESS_DENIED,
+    ERROR_INVALID_REQUEST,
     ERROR_MALFORMED_RESPONSE,
     ERROR_PROVIDER_ERROR,
     GAMELIFT_MAX_PROJECTED_ITEMS,
+    STATUS_INCOMPLETE,
     TYPED_ERROR_CODES,
+    _valid_fleet_id,
     build_fleet_list_result,
     classify_error,
     error_result,
@@ -39,9 +52,13 @@ from config.settings import AWS_REGION, BOTO3_CLIENT_CONFIG, GAMELIFT_KB_ID
 # Re-exported for callers/tests that reason about the projection item bound.
 __all__ = [
     "GAMELIFT_MAX_PROJECTED_ITEMS",
+    "get_container_fleet_ports",
+    "get_container_group_definition",
     "get_fleet_capacity",
+    "get_fleet_locations",
     "get_fleet_utilization",
     "get_scaling_policies",
+    "list_game_session_queues",
     "list_gamelift_fleets",
 ]
 
@@ -804,6 +821,124 @@ def get_scaling_policies(fleet_id: str) -> dict:  # type: ignore
 
 
 # ============================================================================
+# Read-only migration discovery (#529)
+#
+# Explicit, owned list/describe tools for the Agones-to-GameLift migration
+# advisor. Each calls exactly one reviewed GameLift read (no generic operation
+# dispatcher), validates its identifier argument before any provider call, and
+# returns a bounded projection from gamelift_migration_projections. The fleet
+# inventory itself stays list_gamelift_fleets (#464); these tools add queue,
+# location, container-definition, and container-port detail.
+# ============================================================================
+
+
+def _invalid_argument(collection_key: str) -> dict[str, Any]:
+    """Typed rejection for an identifier that fails its grammar (no provider call)."""
+    return {"status": STATUS_INCOMPLETE, collection_key: [], "error": {"code": ERROR_INVALID_REQUEST}}
+
+
+@tool
+def list_game_session_queues() -> dict:  # type: ignore
+    """List GameLift game session queues with bounded, sanitized output.
+
+    Each queue row keeps its name, timeout, destination fleet or alias IDs with
+    their Regions, player latency policies, priority order, and location filters.
+    Queue, destination, and notification ARNs, account IDs, and custom event data
+    never reach model context. At most 25 queues are read; more are reported as
+    ``truncated`` with ``paginated: true``. ``status`` is ok / empty / denied /
+    incomplete / truncated with a typed sanitized ``error`` code.
+    """
+    try:
+        client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+        items, residual, pages_malformed = _paginate_items(
+            client, "describe_game_session_queues", "GameSessionQueues", max_items=MAX_QUEUES
+        )
+    except Exception as e:  # noqa: BLE001 - sanitized below
+        log_sanitized_failure("describe_game_session_queues", uuid.uuid4().hex, e)
+        return error_result("GameSessionQueues", e)
+    return project_game_session_queues(items, residual, pages_malformed)
+
+
+@tool
+def get_fleet_locations(fleet_id: str) -> dict:  # type: ignore
+    """Get the Regions (locations) of one classic or container fleet.
+
+    Returns ``Locations`` rows with the location Region, its status, and the
+    player gateway status. ``fleet_id`` must be a GameLift fleet ID (never an
+    ARN); an invalid ID is rejected before any provider call. ``status`` is
+    ok / empty / denied / incomplete / truncated with a typed sanitized ``error``.
+    """
+    if not _valid_fleet_id(fleet_id):
+        return _invalid_argument("Locations")
+    container = fleet_id.startswith("containerfleet-")
+    operation = "describe_container_fleet" if container else "describe_fleet_location_attributes"
+    try:
+        client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+        if container:
+            response = client.describe_container_fleet(FleetId=fleet_id)
+        else:
+            response = client.describe_fleet_location_attributes(FleetId=fleet_id, Limit=MAX_FLEET_LOCATIONS)
+    except Exception as e:  # noqa: BLE001 - sanitized below
+        log_sanitized_failure(operation, uuid.uuid4().hex, e)
+        return error_result("Locations", e)
+    if container:
+        result = project_container_fleet_locations(response)
+    else:
+        result = project_classic_fleet_locations(response)
+    result["FleetId"] = fleet_id
+    return result
+
+
+@tool
+def get_container_group_definition(name: str, version_number: int | None = None) -> dict:  # type: ignore
+    """Describe one container group definition for migration planning.
+
+    Keeps the definition's type, OS, CPU and memory limits, and for each
+    container its name, image repository/tag/digest (never the registry host),
+    port ranges, and Server SDK version. Environment overrides, mount points,
+    health-check commands, ARNs, and status text are dropped. ``name`` must be a
+    plain definition name, not an ARN.
+    """
+    if not valid_container_group_definition_name(name):
+        return _invalid_argument("ContainerGroupDefinition")
+    kwargs: dict[str, Any] = {"Name": name}
+    if version_number is not None:
+        if (
+            isinstance(version_number, bool)
+            or not isinstance(version_number, int)
+            or not 1 <= version_number <= 100_000
+        ):
+            return _invalid_argument("ContainerGroupDefinition")
+        kwargs["VersionNumber"] = version_number
+    try:
+        client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+        response = client.describe_container_group_definition(**kwargs)
+    except Exception as e:  # noqa: BLE001 - sanitized below
+        log_sanitized_failure("describe_container_group_definition", uuid.uuid4().hex, e)
+        return error_result("ContainerGroupDefinition", e)
+    return project_container_group_definition(response)
+
+
+@tool
+def get_container_fleet_ports(fleet_id: str) -> dict:  # type: ignore
+    """Get the connection port range and inbound permissions of a container fleet.
+
+    Inbound permissions keep their ports and protocol plus a ``Scope`` token
+    (``any-address`` or ``restricted``); the IP range itself is never returned.
+    ``fleet_id`` must be a ``containerfleet-`` ID.
+    """
+    if not _valid_fleet_id(fleet_id) or not fleet_id.startswith("containerfleet-"):
+        return _invalid_argument("ContainerFleet")
+    try:
+        client = boto3.client("gamelift", region_name=AWS_REGION, config=BOTO3_CLIENT_CONFIG)
+        response = client.describe_container_fleet(FleetId=fleet_id)
+    except Exception as e:  # noqa: BLE001 - sanitized below
+        log_sanitized_failure("describe_container_fleet", uuid.uuid4().hex, e)
+        return error_result("ContainerFleet", e)
+    return project_container_fleet_ports(response)
+
+
+# ============================================================================
 # GameLift Agent (using factory pattern)
 # ============================================================================
 
@@ -817,6 +952,10 @@ GAMELIFT_AGENT_TOOLS = [
     get_fleet_utilization,
     get_fleet_capacity,
     get_scaling_policies,
+    list_game_session_queues,
+    get_fleet_locations,
+    get_container_group_definition,
+    get_container_fleet_ports,
 ]
 
 

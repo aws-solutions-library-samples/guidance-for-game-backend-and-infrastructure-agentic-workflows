@@ -75,6 +75,13 @@ GAMELIFT_KB_ID = os.getenv("GBAW_GAMELIFT_KB_ID")
 EKS_KB_ID = os.getenv("GBAW_EKS_KB_ID")
 COST_KB_ID = os.getenv("GBAW_COST_KB_ID")
 
+# Server-owned enrollment scope for bounded Agones discovery (#529): a
+# comma-separated list of EKS cluster names the read-only Agones inventory tool
+# may read. Unset or empty means no cluster is in scope and the tool fails
+# closed. A tool argument, request field, or model output can never add a
+# cluster; parsing and validation live in agents/agones_discovery.py.
+EKS_DISCOVERY_CLUSTERS_RAW = os.getenv("GBAW_EKS_DISCOVERY_CLUSTERS", "")
+
 # Legacy support: KNOWLEDGE_BASE_ID falls back to GAMELIFT_KB_ID
 KNOWLEDGE_BASE_ID = os.getenv("GBAW_KNOWLEDGE_BASE_ID") or GAMELIFT_KB_ID
 
