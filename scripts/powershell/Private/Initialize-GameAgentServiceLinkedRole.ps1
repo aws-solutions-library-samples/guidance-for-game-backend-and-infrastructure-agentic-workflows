@@ -51,7 +51,7 @@ function Initialize-GameAgentServiceLinkedRole {
         [string]$ServiceName,
 
         [Parameter(Mandatory)]
-        [ValidatePattern('^[A-Za-z0-9+=,.@_-]{1,64}$')]
+        [ValidatePattern('^AWSServiceRoleFor[A-Za-z0-9+=,.@_-]{1,47}$')]
         [string]$RoleName,
 
         [Parameter(Mandatory)]

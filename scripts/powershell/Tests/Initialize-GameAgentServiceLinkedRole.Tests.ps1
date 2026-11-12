@@ -173,6 +173,16 @@ Describe 'Initialize-GameAgentServiceLinkedRole' {
         $script:Sleeps | Should -HaveCount 0
     }
 
+    It 'Rejects a role name that is not a service-linked role before any AWS call' {
+        $calls = [System.Collections.Generic.List[string]]::new()
+        $invokeAws = New-TestIamInvoker -Calls $calls
+
+        { Initialize-GameAgentServiceLinkedRole -ServiceName 'ecs.amazonaws.com' -RoleName 'game-agent-agentcore-execution-role' -Region 'us-west-2' -InvokeAws $invokeAws -PropagationSeconds '0' -PollSeconds '0' } |
+            Should -Throw
+
+        $calls | Should -HaveCount 0
+    }
+
     It 'Rejects an invalid propagation delay before any AWS call' -ForEach @(
         @{ Value = '121' }
         @{ Value = '-1' }

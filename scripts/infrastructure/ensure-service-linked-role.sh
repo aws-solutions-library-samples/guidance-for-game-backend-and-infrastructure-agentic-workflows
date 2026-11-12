@@ -51,8 +51,10 @@ if ! [[ "$SERVICE_NAME" =~ ^[a-z0-9][a-z0-9.-]{0,127}$ ]]; then
     echo "❌ Error: invalid AWS service name"
     exit 1
 fi
-if ! [[ "$ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]]; then
-    echo "❌ Error: invalid role name"
+# Service-linked roles are always named AWSServiceRoleFor...; requiring the
+# prefix keeps the helper from being pointed at an ordinary role by mistake.
+if ! [[ "$ROLE_NAME" =~ ^AWSServiceRoleFor[A-Za-z0-9+=,.@_-]{1,47}$ ]]; then
+    echo "❌ Error: invalid service-linked role name (it must start with AWSServiceRoleFor)"
     exit 1
 fi
 

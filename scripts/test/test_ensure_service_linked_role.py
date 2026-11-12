@@ -284,7 +284,12 @@ class EnsureServiceLinkedRole(unittest.TestCase):
         self.assertIn("GBAW_SLR_POLL_SECONDS must be an integer from 0 to 30", result.stdout)
 
     def test_invalid_arguments_are_refused_before_any_call(self) -> None:
-        for args in ((SERVICE,), (SERVICE, "bad role"), ("ecs.amazonaws.com; true", ROLE)):
+        for args in (
+            (SERVICE,),
+            (SERVICE, "bad role"),
+            (SERVICE, "game-agent-agentcore-execution-role"),  # not a service-linked role
+            ("ecs.amazonaws.com; true", ROLE),
+        ):
             with self.subTest(args=args):
                 result = self.run_script(*args)
 
