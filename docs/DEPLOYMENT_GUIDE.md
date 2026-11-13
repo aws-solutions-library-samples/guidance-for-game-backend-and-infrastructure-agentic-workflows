@@ -585,9 +585,15 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
 # short-lived access token from a provisioned Cognito test user (in the
-# `admin` or `users` group)
-export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
+# `admin` or `users` group). The helper signs in with SRP, the only password
+# flow the app client allows, and prints only the access token. Run `npm ci`
+# in ui/ first. It prompts for the password, or reads GBAW_TEST_USER_PASSWORD;
+# it never takes the password as an argument.
+export GBAW_TEST_ACCESS_TOKEN="$(cd ui && node scripts/get-test-access-token.mjs --username <test-user>)"
 ./test-ai-evals.sh
+
+# Delete a temporary test user when validation is done
+aws cognito-idp admin-delete-user --user-pool-id <user-pool-id> --username <test-user>
 
 # Confirm startup logged both resolved model roles
 aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
