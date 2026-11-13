@@ -1,12 +1,15 @@
 """Run the Guardrail evaluation corpus through ApplyGuardrail (deployed Guardrail required).
 
 Usage (from backend/):
-    AWS_REGION=<guardrail region> GBAW_BEDROCK_GUARDRAIL_ID=<id> GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT \
+    AWS_REGION=<guardrail region> GBAW_BEDROCK_GUARDRAIL_ID=<id> GBAW_BEDROCK_GUARDRAIL_VERSION=<version> \
         uv run pytest tests/integration/test_guardrail_corpus_cloud.py -m cloud
 
-Set the Guardrail ID explicitly: ``./test-cloud.sh`` does not export
-``GBAW_BEDROCK_GUARDRAIL_ID``, so every row is skipped there. The Region
-defaults to ``us-west-2``, the repository default.
+Set the Guardrail ID and version explicitly: ``./test-cloud.sh`` does not
+export them, so every row is skipped there. Use the version the runtime pins
+(the Guardrails stack's ``GuardrailVersion`` output, also in the runtime's
+``GBAW_BEDROCK_GUARDRAIL_VERSION``); ``DRAFT`` evaluates the working copy, which
+the deployed runtime does not use. No version is assumed. The Region defaults
+to ``us-west-2``, the repository default.
 
 Each row's observed effect is derived only from the ApplyGuardrail response:
 ``pass`` (no intervention, no detection), ``detect`` (a policy matched with
@@ -74,12 +77,18 @@ def guardrail():
     guardrail_id = os.environ.get("GBAW_BEDROCK_GUARDRAIL_ID")
     if not guardrail_id:
         pytest.skip("GBAW_BEDROCK_GUARDRAIL_ID is not set")
+    version = os.environ.get("GBAW_BEDROCK_GUARDRAIL_VERSION", "").strip()
+    if not version:
+        pytest.skip(
+            "GBAW_BEDROCK_GUARDRAIL_VERSION is not set: use the Guardrails stack's GuardrailVersion output, "
+            "the version the runtime pins"
+        )
     # Third-party packages
     import boto3
 
     region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
     client = boto3.client("bedrock-runtime", region_name=region)
-    return client, guardrail_id, os.environ.get("GBAW_BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+    return client, guardrail_id, version
 
 
 @pytest.mark.parametrize("row", load_corpus()["rows"], ids=lambda row: row["id"])

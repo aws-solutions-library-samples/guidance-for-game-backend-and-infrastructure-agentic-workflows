@@ -1762,6 +1762,7 @@ case "$svc $op" in
       *UserPoolId*) echo "us-west-2_EXAMPLE";;
       *UserPoolClientId*) echo "exampleclientid000000000000";;
       *GuardrailId*) echo "gr-example0000";;
+      *GuardrailVersion*) echo "1";;
       *CostReportSnapshotTableName*) echo "game-agent-cost-snapshots";;
       *AgentCoreExecutionRoleArn*) echo "arn:aws:iam::123456789012:role/example-exec";;
       *FrontendRepositoryUri*) echo "123456789012.dkr.ecr.us-west-2.amazonaws.com/example";;

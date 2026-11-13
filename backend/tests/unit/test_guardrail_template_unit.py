@@ -130,6 +130,23 @@ def _guardrail_props() -> dict[str, Any]:
     return template["Resources"]["GameAgentGuardrail"]["Properties"]
 
 
+def test_runtime_pins_a_published_version_not_the_draft():
+    """The stack publishes a version the runtime pins, so draft edits cannot reach users (#782)."""
+    template = load_cfn_template(TEMPLATE.read_text(encoding="utf-8"))
+    version = template["Resources"]["GameAgentGuardrailVersion"]
+    assert version["Type"] == "AWS::Bedrock::GuardrailVersion"
+    assert version["Properties"]["GuardrailIdentifier"] == "GameAgentGuardrail.GuardrailId"
+    # Both properties force replacement and the Guardrail ID never changes, so the
+    # fingerprint in the description is what publishes a version per policy change.
+    assert "${GuardrailPolicyFingerprint}" in version["Properties"]["Description"]
+    assert template["Parameters"]["GuardrailPolicyFingerprint"]["AllowedPattern"] == "^[0-9a-f]{64}$"
+    assert "Default" not in template["Parameters"]["GuardrailPolicyFingerprint"]
+    # The running runtime pins the old version until its update; keep it on replacement.
+    assert version["UpdateReplacePolicy"] == "Retain"
+    # Deploy scripts read this output; it must be the published version, not DRAFT.
+    assert template["Outputs"]["GuardrailVersion"]["Value"] == "GameAgentGuardrailVersion.Version"
+
+
 def test_topic_policy_is_pinned():
     """Names, definitions, examples, and actions: replacing a definition would disable the topic."""
     assert _guardrail_props()["TopicPolicyConfig"] == {"TopicsConfig": EXPECTED_TOPICS}
