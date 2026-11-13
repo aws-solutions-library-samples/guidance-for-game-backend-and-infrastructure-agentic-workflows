@@ -270,16 +270,20 @@ environment variable are equivalent opt-in triggers.
 **Ownership and preservation.** This repository's opt-in reads existing state
 first and preserves it. It enables Transaction Search only additively (it never
 performs a disable/re-enable toggle of the shared destination) and leaves an
-already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
-enable does not create the AWS-reserved `aws/spans` log group (only the console
-or a destination toggle does), the opt-in **fails** — with the one-time console
-or toggle step — rather than reporting success when `aws/spans` is still absent
-after the enable. On a fresh account whose destination starts at `XRay`, the
+already-enabled `CloudWatchLogs` destination unchanged. A first-time API enable
+normally creates the AWS-reserved `aws/spans` log group as well: fresh-account
+runs created it, with AWS's default 30-day retention, at the moment the
+destination was set. This is not guaranteed, so the opt-in keeps a safety net.
+If `aws/spans` is still absent after the enable, the opt-in **fails** with the
+one-time console or toggle step rather than reporting success. In that case, on
+a fresh account whose destination starts at `XRay`, the
 opt-in has by then already written the shared resource policy and switched the
 trace destination to `CloudWatchLogs` (and, if you set
 `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`, changed the `Default` indexing rule); those
 changes stay in place (the destination rollback command was printed earlier in
-the run), and only the console or a destination toggle creates `aws/spans`. If it cannot read the
+the run), and the console or a destination toggle creates `aws/spans`. If the
+destination takes longer than the wait budget to reach `ACTIVE`, the opt-in
+warns without failing; a full deployment rechecks it in Step 5c. If it cannot read the
 current trace destination, the opt-in refuses to change it and fails rather than
 guessing. The
 account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
@@ -416,7 +420,7 @@ toolkit adds it.
 
 This repository's opt-in uses the project-owned name
 `GameAgentTransactionSearchXRayAccess` by default, which does **not** satisfy the
-toolkit's name-only check. The opt-in cannot create `aws/spans`, and it skips its
+toolkit's name-only check. The opt-in is not guaranteed to create `aws/spans`, and it skips its
 own policy write when another policy already grants `xray.amazonaws.com` access
 to `aws/spans`. So it reaches a passing state only when `aws/spans` already
 exists and no other policy grants that access. On such an account, run the opt-in
@@ -431,7 +435,7 @@ GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
 
 On an account **without** `aws/spans`, do not use the opt-in to clear the stop
 switch: it would write the shared policy (and switch an `XRay` destination) but
-still stop at Step 1.7, because it cannot create the group. Use the console
+still stop at Step 1.7 if the group is still missing. Use the console
 enable above instead.
 
 **Cleanup.** The warning prints only the rollback commands for the changes it

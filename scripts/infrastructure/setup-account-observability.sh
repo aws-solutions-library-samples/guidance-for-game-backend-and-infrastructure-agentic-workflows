@@ -18,20 +18,22 @@ set -euo pipefail
 # it does not, the default path recommends the opt-in only when the AWS-reserved
 # 'aws/spans' log group already exists and the destination was read (so the
 # opt-in can finish the job by switching the destination); otherwise it points
-# to the one-time console enable or a destination toggle keyed on the current
-# destination, because the opt-in cannot create 'aws/spans'.
+# to the deployment's own launch, the one-time console enable, or a destination
+# toggle keyed on the current destination (see print_spans_remedy).
 #
 # BACKGROUND: X-Ray Transaction Search writes spans to the AWS-reserved
 # 'aws/spans' log group. A first-time API enable of Transaction Search
-# (destination -> CloudWatchLogs) does NOT create that log group; it is created
-# only by enabling Transaction Search in the AWS console or by a disable ->
-# re-enable toggle of the shared destination. This script enables Transaction
-# Search additively and never toggles the shared destination, so when the
-# account starts from destination 'XRay' the opt-in cannot create 'aws/spans'
-# on its own. The opt-in therefore fails (rather than exiting 0) when 'aws/spans'
-# is still absent after the enable, and prints the console / toggle steps the
-# operator must run once. The runtime trace delivery (traces source -> X-Ray
-# destination) is handled separately and verified in scripts/deploy.sh (Step 2b).
+# (destination -> CloudWatchLogs) normally creates that log group: fresh-account
+# runs created it at the moment the destination was set (issue #788). It is not
+# guaranteed (starter-toolkit issue 457 reported it missing), so when the group
+# is still absent after the enable, the remedy is to enable Transaction Search in
+# the AWS console or to run a disable -> re-enable toggle of the shared
+# destination. This script enables Transaction Search additively and never
+# toggles the shared destination, so the opt-in keeps a safety net: it fails
+# (rather than exiting 0) when 'aws/spans' is still absent after the enable, and
+# prints the console / toggle steps the operator must run once. The runtime
+# trace delivery (traces source -> X-Ray destination) is handled separately and
+# verified in scripts/deploy.sh (Step 2b).
 # See: https://github.com/aws/bedrock-agentcore-starter-toolkit/issues/457
 
 AWS_REGION="${AWS_REGION:-us-west-2}"
@@ -144,18 +146,19 @@ print_account_scope() {
 #   $2 spans_state  : present | absent | unreadable
 #   $3 indent       : leading whitespace for the printed lines
 #   $4 mode         : default | recheck (the recheck runs AFTER the final launch)
-# A first-time API enable (destination -> CloudWatchLogs) does NOT create the
-# AWS-reserved 'aws/spans' group; only the console or a disable/re-enable toggle
-# of an already-CloudWatchLogs destination does (file header, starter-toolkit
-# issue 457). So:
+# A first-time API enable (destination -> CloudWatchLogs) normally creates the
+# AWS-reserved 'aws/spans' group; when the group is still missing, the console
+# or a disable/re-enable toggle of an already-CloudWatchLogs destination creates
+# it (file header, issue #788, starter-toolkit issue 457). So:
 #   - either read failed                       : confirm in the console, no
 #     toggle commands, because the current state is unknown;
 #   - destination XRay, group PRESENT          : the group already exists; only
 #     the trace destination needs switching to 'CloudWatchLogs', through the
 #     console or the opt-in Step 1.7 already offers for this state;
 #   - destination XRay, group absent, default  : with the stop switch off, the
-#     launch switches the destination (which does not create the group by
-#     itself) and Step 5c then prints the one-time toggle from 'CloudWatchLogs';
+#     launch switches the destination (which normally creates the group) and
+#     Step 5c rechecks, printing the one-time toggle from 'CloudWatchLogs' only
+#     if the group is still missing;
 #     with the stop switch set, the deploy halts before 'agentcore launch', so
 #     the advice is the one-time console enable instead;
 #   - destination XRay, group absent, recheck  : the launch already ran and did
@@ -200,10 +203,10 @@ print_spans_remedy() {
     fi
     echo "${indent}The trace destination is 'XRay' and the AWS-reserved 'aws/spans' log group"
     echo "${indent}is not present. The deployment's own 'agentcore launch' switches the"
-    echo "${indent}destination to 'CloudWatchLogs', which does NOT create the group by itself;"
-    echo "${indent}the post-launch recheck (Step 5c) then prints the one-time toggle. You can"
-    echo "${indent}instead enable Transaction Search once in the AWS X-Ray / CloudWatch console"
-    echo "${indent}now."
+    echo "${indent}destination to 'CloudWatchLogs', which normally creates the group too;"
+    echo "${indent}the post-launch recheck (Step 5c) confirms it and prints the one-time toggle"
+    echo "${indent}only if the group is still missing. You can instead enable Transaction Search"
+    echo "${indent}once in the AWS X-Ray / CloudWatch console now."
     return 0
   fi
   # destination CloudWatchLogs with the group absent: a disable/re-enable toggle
@@ -667,12 +670,13 @@ report_without_mutation() {
   echo "      shared settings automatically."
 
   # The opt-in enables Transaction Search ADDITIVELY and never toggles the shared
-  # destination. A first-time API enable does not create 'aws/spans', so the
-  # opt-in can finish the job (switch the destination / add the policy) only when
-  # 'aws/spans' already exists AND the destination is readable. When 'aws/spans'
-  # is absent or the destination is unknown, only the console or a destination
-  # toggle keyed on the current destination creates the group, so recommend that
-  # (via print_spans_remedy) instead of an opt-in that would fail.
+  # destination. A first-time API enable normally creates 'aws/spans', but that
+  # is not guaranteed, so this read-only path recommends the opt-in only when
+  # 'aws/spans' already exists AND the destination is readable (the opt-in is
+  # then sure to finish the job by switching the destination / adding the
+  # policy). When 'aws/spans' is absent or the destination is unknown, recommend
+  # the launch, the console, or a destination toggle keyed on the current
+  # destination (via print_spans_remedy) instead.
   if [ "$spans_state" = "present" ] && [ "$destination" != "UNREADABLE" ]; then
     echo "      The opt-in WOULD change these shared, account-wide settings"
     echo "      (every X-Ray / Transaction Search consumer):"
@@ -882,8 +886,8 @@ wait_for_destination_active() {
   done
   OBS_DESTINATION_WAIT_EXPIRED=1
   echo "  ⚠️  Trace segment destination did not reach ACTIVE within the wait budget;"
-  echo "      it may still converge shortly. Re-check in the AWS X-Ray console if traces"
-  echo "      do not appear."
+  echo "      it may still converge shortly. A full deployment rechecks it in Step 5c;"
+  echo "      when run alone, re-check in the AWS X-Ray console if traces do not appear."
   return 0
 }
 
@@ -1042,12 +1046,13 @@ configure_account_observability() {
     return 1
   fi
 
-  # 'aws/spans' is AWS-reserved: a first-time API enable does not create it (see
-  # the file header and starter-toolkit issue 457). An additive, no-toggle enable
-  # therefore cannot create it when the account started from destination 'XRay',
-  # so a missing group here is a hard failure with the one-time manual step, not
-  # a soft warning that lets the deploy report success it did not achieve. A read
-  # that fails is reported as its own, accurate failure rather than as "absent".
+  # 'aws/spans' is AWS-reserved: a first-time API enable normally creates it, but
+  # that is not guaranteed (see the file header, issue #788, and starter-toolkit
+  # issue 457). This script never toggles the destination, so a group still
+  # missing here is a hard failure with the one-time manual step (a safety net),
+  # not a soft warning that lets the deploy report success it did not achieve. A
+  # read that fails is reported as its own, accurate failure rather than as
+  # "absent".
   local spans_state
   spans_state="$(spans_log_group_state)"
   if [ "$spans_state" = "present" ]; then
@@ -1070,8 +1075,8 @@ configure_account_observability() {
       return 1
     fi
     echo "❌ Transaction Search is enabled (destination CloudWatchLogs) but the" >&2
-    echo "   AWS-reserved 'aws/spans' log group does not exist. A first-time API" >&2
-    echo "   enable does not create it; create it once with EITHER:" >&2
+    echo "   AWS-reserved 'aws/spans' log group does not exist. The API enable usually" >&2
+    echo "   creates it, but did not here; create it once with EITHER:" >&2
     echo "     - the AWS X-Ray / CloudWatch console (enable Transaction Search), OR" >&2
     echo "     - a one-time destination toggle:" >&2
     echo "         aws xray update-trace-segment-destination --destination XRay --region ${AWS_REGION}" >&2
