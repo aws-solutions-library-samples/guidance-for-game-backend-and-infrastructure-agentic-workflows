@@ -79,7 +79,9 @@ COST_KB_ID = os.getenv("GBAW_COST_KB_ID")
 # comma-separated list of EKS cluster names the read-only Agones inventory tool
 # may read. Unset or empty means no cluster is in scope and the tool fails
 # closed. A tool argument, request field, or model output can never add a
-# cluster; parsing and validation live in agents/agones_discovery.py.
+# cluster; parsing and validation live in agents/agones_discovery.py. Hosted
+# deployments set it only when the operator configures it (deploy.sh /
+# Deploy-GameAgent validate the format first; see docs/DEPLOYMENT_GUIDE.md).
 EKS_DISCOVERY_CLUSTERS_RAW = os.getenv("GBAW_EKS_DISCOVERY_CLUSTERS", "")
 
 # Legacy support: KNOWLEDGE_BASE_ID falls back to GAMELIFT_KB_ID

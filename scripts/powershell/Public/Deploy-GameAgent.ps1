@@ -333,6 +333,14 @@ function Deploy-GameAgent {
     }
     Write-Host "   Cost snapshot table: $costSnapshotTableName"
     Write-Host "   Cost snapshot TTL:   ${costSnapshotTtlSeconds}s (required=$costSnapshotRequired)"
+    # Optional Agones discovery enrollment scope (#529): env var first, then
+    # backend/.env.local, validated with the same rules as scripts/deploy.sh.
+    $eksDiscoveryClusters = ConvertTo-GameAgentEksDiscoveryClusters (Read-ScmSetting 'GBAW_EKS_DISCOVERY_CLUSTERS')
+    if ($eksDiscoveryClusters) {
+        Write-Host "   Agones discovery clusters: $eksDiscoveryClusters"
+    } else {
+        Write-Host '   Agones discovery clusters: none (inventory tool fails closed)'
+    }
     Write-Host ''
 
     # ── Step 1.5: Guardrails ──
@@ -429,7 +437,8 @@ function Deploy-GameAgent {
             -WorkspaceId $workspaceId `
             -CostSnapshotTableName $costSnapshotTableName `
             -CostSnapshotRequired $costSnapshotRequired `
-            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds
+            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds `
+            -EksDiscoveryClusters $eksDiscoveryClusters
         $agentCoreEnvArgs += @(
             '-env', "GBAW_COGNITO_ISSUER=$cognitoIssuer",
             '-env', "GBAW_COGNITO_CLIENT_ID=$cognitoClientId"
@@ -566,7 +575,8 @@ function Deploy-GameAgent {
             -WorkspaceId $workspaceId `
             -CostSnapshotTableName $costSnapshotTableName `
             -CostSnapshotRequired $costSnapshotRequired `
-            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds
+            -CostSnapshotTtlSeconds $costSnapshotTtlSeconds `
+            -EksDiscoveryClusters $eksDiscoveryClusters
         $agentCoreEnvArgs += @(
             '-env', "GBAW_COGNITO_ISSUER=$cognitoIssuer",
             '-env', "GBAW_COGNITO_CLIENT_ID=$cognitoClientId"

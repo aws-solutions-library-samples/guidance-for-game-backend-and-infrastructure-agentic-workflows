@@ -52,7 +52,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -WorkspaceId 'workspace-1' `
             -CostSnapshotTableName 'game-agent-cost-report-snapshots' `
             -CostSnapshotRequired 'true' `
-            -CostSnapshotTtlSeconds '1800'
+            -CostSnapshotTtlSeconds '1800' `
+            -EksDiscoveryClusters 'agones-demo,arena-west'
 
         ($result -join "`n") | Should -Be (@(
             '-env'
@@ -95,6 +96,8 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             'GBAW_COST_SNAPSHOT_REQUIRED=true'
             '-env'
             'GBAW_COST_SNAPSHOT_TTL_SECONDS=1800'
+            '-env'
+            'GBAW_EKS_DISCOVERY_CLUSTERS=agones-demo,arena-west'
         ) -join "`n")
     }
 
@@ -246,5 +249,16 @@ Describe 'New-GameAgentAgentCoreEnvArgs' {
             -SpecialistModelId 'specialist-model'
 
         ($result -join "`n") | Should -Not -Match 'GBAW_SCM_'
+    }
+
+    # --- #529: optional Agones discovery enrollment scope ---
+
+    It 'Omits GBAW_EKS_DISCOVERY_CLUSTERS when unset so discovery fails closed' {
+        $result = New-GameAgentAgentCoreEnvArgs `
+            -OrchestratorModelId 'orchestrator-model' `
+            -SpecialistModelId 'specialist-model' `
+            -EksDiscoveryClusters ''
+
+        ($result -join "`n") | Should -Not -Match 'GBAW_EKS_DISCOVERY_CLUSTERS'
     }
 }

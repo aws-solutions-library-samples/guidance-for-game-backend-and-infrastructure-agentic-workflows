@@ -24,7 +24,11 @@ function New-GameAgentAgentCoreEnvArgs {
         [string]$WorkspaceId = '',
         [string]$CostSnapshotTableName = '',
         [string]$CostSnapshotRequired = '',
-        [string]$CostSnapshotTtlSeconds = ''
+        [string]$CostSnapshotTtlSeconds = '',
+        # Optional Agones discovery enrollment scope (#529), already validated by
+        # ConvertTo-GameAgentEksDiscoveryClusters. Empty means not passed, so the
+        # Agones inventory tool fails closed (not_enrolled).
+        [string]$EksDiscoveryClusters = ''
     )
 
     $result = @(
@@ -60,6 +64,7 @@ function New-GameAgentAgentCoreEnvArgs {
         GBAW_COST_SNAPSHOT_TABLE_NAME   = $CostSnapshotTableName
         GBAW_COST_SNAPSHOT_REQUIRED     = $CostSnapshotRequired
         GBAW_COST_SNAPSHOT_TTL_SECONDS  = $CostSnapshotTtlSeconds
+        GBAW_EKS_DISCOVERY_CLUSTERS     = $EksDiscoveryClusters
     }
     foreach ($entry in $optionalValues.GetEnumerator()) {
         if ($entry.Value -and $entry.Value -ne 'None') {

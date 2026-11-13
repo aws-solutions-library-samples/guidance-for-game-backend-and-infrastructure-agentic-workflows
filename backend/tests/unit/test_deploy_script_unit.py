@@ -43,6 +43,7 @@ OPTIONAL_VARIABLES = (
     "COST_SNAPSHOT_TABLE_NAME",
     "COST_SNAPSHOT_REQUIRED",
     "COST_SNAPSHOT_TTL_SECONDS",
+    "EKS_DISCOVERY_CLUSTERS",
 )
 
 
@@ -223,6 +224,7 @@ def test_agentcore_env_args_include_resolved_optional_values():
             "COST_SNAPSHOT_TABLE_NAME": "game-agent-cost-report-snapshots",
             "COST_SNAPSHOT_REQUIRED": "true",
             "COST_SNAPSHOT_TTL_SECONDS": "1800",
+            "EKS_DISCOVERY_CLUSTERS": "agones-demo,arena-west",
         }
     )
 
@@ -271,6 +273,8 @@ def test_agentcore_env_args_include_resolved_optional_values():
         "GBAW_COST_SNAPSHOT_REQUIRED=true",
         "-env",
         "GBAW_COST_SNAPSHOT_TTL_SECONDS=1800",
+        "-env",
+        "GBAW_EKS_DISCOVERY_CLUSTERS=agones-demo,arena-west",
     ]
 
 
@@ -312,6 +316,70 @@ def test_agentcore_env_args_filter_optional_values_independently():
         "GBAW_COST_KB_ID=cost-kb",
     ]
 
+
+def _normalize_eks_discovery_clusters(raw: str) -> subprocess.CompletedProcess[str]:
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    function = _function_source(content, "normalize_eks_discovery_clusters")
+    return subprocess.run(
+        ["bash", "-c", f'{function}\nnormalize_eks_discovery_clusters "$1"', "_", raw],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", ""),
+        ("   ", ""),
+        ("agones-demo", "agones-demo"),
+        (" agones-demo , arena_west.2 ", "agones-demo,arena_west.2"),
+        (",".join(f"c{i}" for i in range(20)), ",".join(f"c{i}" for i in range(20))),
+    ],
+)
+def test_eks_discovery_clusters_accepts_and_normalizes_valid_values(raw, expected):
+    result = _normalize_eks_discovery_clusters(raw)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "agones-demo,",
+        ",agones-demo",
+        "a,,b",
+        "-starts-with-dash",
+        "has space",
+        "bad/char",
+        "agones-demo\narena",
+        "a" * 101,
+        "dup,dup",
+        ",".join(f"c{i}" for i in range(21)),
+    ],
+)
+def test_eks_discovery_clusters_rejects_invalid_values(raw):
+    result = _normalize_eks_discovery_clusters(raw)
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert "GBAW_EKS_DISCOVERY_CLUSTERS" in result.stderr
+
+
+def test_eks_discovery_clusters_unset_is_not_passed_to_the_runtime():
+    args = _build_agentcore_env_args({"EKS_DISCOVERY_CLUSTERS": ""})
+
+    assert not any(arg.startswith("GBAW_EKS_DISCOVERY_CLUSTERS") for arg in args)
+
+
+def test_deploy_script_validates_eks_discovery_clusters_before_launch():
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+
+    validate_at = content.index('EKS_DISCOVERY_CLUSTERS="$(normalize_eks_discovery_clusters')
+    launch_at = content.index("\nbuild_agentcore_env_args\n")
+    assert validate_at < launch_at
 
 def test_waf_reconciliation_skips_association_when_expected_acl_and_rules_are_active():
     result = _run_waf_reconciliation("expected-acl")
