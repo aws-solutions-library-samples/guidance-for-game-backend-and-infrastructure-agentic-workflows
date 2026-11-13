@@ -381,6 +381,7 @@ def test_deploy_script_validates_eks_discovery_clusters_before_launch():
     launch_at = content.index("\nbuild_agentcore_env_args\n")
     assert validate_at < launch_at
 
+
 def test_waf_reconciliation_skips_association_when_expected_acl_and_rules_are_active():
     result = _run_waf_reconciliation("expected-acl")
 
