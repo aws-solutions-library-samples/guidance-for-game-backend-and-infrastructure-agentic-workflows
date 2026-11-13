@@ -926,7 +926,8 @@ def get_container_fleet_ports(fleet_id: str) -> dict:  # type: ignore
     """Get the connection port range and inbound permissions of a container fleet.
 
     Inbound permissions keep their ports and protocol plus a ``Scope`` token
-    (``any-address`` or ``restricted``); the IP range itself is never returned.
+    (``open`` for every address, ``wide`` for a range larger than an IPv4 /16 or
+    IPv6 /48, ``restricted`` otherwise); the IP range itself is never returned.
     ``fleet_id`` must be a ``containerfleet-`` ID, taken from the ``FleetId`` of a
     ``list_gamelift_fleets`` ``ContainerFleets`` row.
     """

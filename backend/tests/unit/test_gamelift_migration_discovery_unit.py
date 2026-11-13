@@ -413,7 +413,7 @@ def test_container_fleet_ports_drop_ip_ranges_and_arns():
         result = gls.get_container_fleet_ports(CFLEET)
     fleet = result["ContainerFleet"]
     assert fleet["InstanceInboundPermissions"] == [
-        {"FromPort": 4192, "ToPort": 4200, "Protocol": "UDP", "Scope": "any-address"},
+        {"FromPort": 4192, "ToPort": 4200, "Protocol": "UDP", "Scope": "open"},
         {"FromPort": 4192, "ToPort": 4200, "Protocol": "TCP", "Scope": "restricted"},
     ]
     blob = json.dumps(result)
@@ -660,3 +660,56 @@ def test_trailing_newline_values_are_rejected():
     game["ResolvedImageDigest"] = "sha256:" + "a" * 64 + "\n"
     projected = gmp.project_container_group_definition(raw)["ContainerGroupDefinition"]["GameServerContainerDefinition"]
     assert "ServerSdkVersion" not in projected and "ResolvedImageDigest" not in projected
+
+
+# --------------------------------------------------------------------------- #
+# Scope buckets by prefix length (#781 review item 8)                         #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("ip_range", "scope"),
+    [
+        ("0.0.0.0/0", "open"),
+        ("::/0", "open"),
+        (" 0.0.0.0/0 ", "open"),
+        ("0.0.0.0/1", "wide"),
+        ("10.0.0.0/8", "wide"),
+        ("172.16.0.0/15", "wide"),
+        ("2001:db8::/32", "wide"),
+        ("172.16.0.0/16", "restricted"),
+        ("203.0.113.0/24", "restricted"),
+        ("203.0.113.7/32", "restricted"),
+        ("203.0.113.7", "restricted"),
+        ("2001:db8::/48", "restricted"),
+        ("10.1.2.3/8", "wide"),
+    ],
+)
+def test_inbound_scope_buckets_by_prefix_length(ip_range, scope):
+    result = gmp.project_container_fleet_ports(
+        {
+            "ContainerFleet": {
+                "FleetId": CFLEET,
+                "InstanceInboundPermissions": [
+                    {"FromPort": 4192, "ToPort": 4200, "Protocol": "UDP", "IpRange": ip_range}
+                ],
+            }
+        }
+    )
+    assert result["status"] == "ok"
+    assert result["ContainerFleet"]["InstanceInboundPermissions"][0]["Scope"] == scope
+    assert ip_range.strip().split("/")[0] not in json.dumps(result)
+
+
+@pytest.mark.parametrize("ip_range", ["not-a-range", "10.0.0.0/33", "0.0.0.0/0\n#", 42])
+def test_unparsable_inbound_range_is_incomplete_malformed(ip_range):
+    result = gmp.project_container_fleet_ports(
+        {
+            "ContainerFleet": {
+                "FleetId": CFLEET,
+                "InstanceInboundPermissions": [
+                    {"FromPort": 4192, "ToPort": 4200, "Protocol": "UDP", "IpRange": ip_range}
+                ],
+            }
+        }
+    )
+    assert "Scope" not in result["ContainerFleet"]["InstanceInboundPermissions"][0]
+    _assert_malformed(result)

@@ -365,7 +365,7 @@ def test_container_definition_and_ports_against_service_model():
         ports = get_container_fleet_ports(CFLEET_ID)
     blob = json.dumps([definition, ports])
     assert definition["ContainerGroupDefinition"]["GameServerContainerDefinition"]["Image"]["repository"] == "echo"
-    assert ports["ContainerFleet"]["InstanceInboundPermissions"][0]["Scope"] == "any-address"
+    assert ports["ContainerFleet"]["InstanceInboundPermissions"][0]["Scope"] == "open"
     for forbidden in (ACCOUNT, "TOKEN", "0.0.0.0", "arn:"):
         assert forbidden not in blob
 

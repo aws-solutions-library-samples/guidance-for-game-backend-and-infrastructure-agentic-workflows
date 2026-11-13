@@ -27,6 +27,7 @@ valid.
 from __future__ import annotations
 
 # Standard library
+import ipaddress
 import re
 from typing import Any
 
@@ -94,7 +95,13 @@ _CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _CONTAINER_GROUP_DEFINITION_NAME = re.compile(r"^[A-Za-z0-9-]{1,128}$")
 _SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
 _SDK_VERSION = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}$")
-_OPEN_RANGES = frozenset({"0.0.0.0/0", "::/0"})
+# Inbound exposure buckets by prefix length. ``open`` is every address (/0).
+# ``wide`` is a range larger than an IPv4 /16 or an IPv6 /48 (for example
+# 0.0.0.0/1). ``restricted`` is that size or smaller.
+SCOPE_OPEN = "open"
+SCOPE_WIDE = "wide"
+SCOPE_RESTRICTED = "restricted"
+_RESTRICTED_MIN_PREFIX = {4: 16, 6: 48}
 _MAX_PORT = 65_535
 
 
@@ -485,10 +492,21 @@ def project_container_group_definition(response: Any) -> dict[str, Any]:
 # Container fleet ports                                                       #
 # --------------------------------------------------------------------------- #
 def _inbound_scope(ip_range: Any) -> str | None:
-    """Code-owned exposure token. The address range itself is never returned."""
-    if not isinstance(ip_range, str):
+    """Code-owned exposure token by prefix length; the range itself is never returned.
+
+    ``None`` means the value is not a parsable CIDR range.
+    """
+    if not isinstance(ip_range, str) or len(ip_range) > 64:
         return None
-    return "any-address" if ip_range.strip() in _OPEN_RANGES else "restricted"
+    try:
+        network = ipaddress.ip_network(ip_range.strip(), strict=False)
+    except ValueError:
+        return None
+    if network.prefixlen == 0:
+        return SCOPE_OPEN
+    if network.prefixlen < _RESTRICTED_MIN_PREFIX[network.version]:
+        return SCOPE_WIDE
+    return SCOPE_RESTRICTED
 
 
 def project_container_fleet_ports(response: Any) -> dict[str, Any]:
@@ -533,9 +551,12 @@ def project_container_fleet_ports(response: Any) -> dict[str, Any]:
             if row is None:
                 nested.dropped = True
                 continue
-            scope = _inbound_scope(raw.get("IpRange"))
+            ip_range = raw.get("IpRange")
+            scope = _inbound_scope(ip_range)
             if scope:
                 row["Scope"] = scope
+            elif ip_range is not None:
+                nested.dropped = True
             kept.append(row)
         projected["InstanceInboundPermissions"] = kept
         if len(permissions) > MAX_INBOUND_PERMISSIONS:
@@ -554,6 +575,9 @@ __all__ = [
     "MAX_QUEUE_DESTINATIONS",
     "MAX_QUEUE_LOCATIONS",
     "MAX_SUPPORT_CONTAINERS",
+    "SCOPE_OPEN",
+    "SCOPE_RESTRICTED",
+    "SCOPE_WIDE",
     "project_classic_fleet_locations",
     "project_container_fleet_locations",
     "project_container_fleet_ports",
