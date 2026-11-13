@@ -337,12 +337,28 @@ function Deploy-GameAgent {
 
     # ── Step 1.5: Guardrails ──
     Write-GameAgentStatus 'Step 1.5: Deploying Bedrock Guardrails...' -Type Info
+    # SHA-256 of the template with line endings normalized to LF, matching
+    # deploy.sh. A template change publishes a new Guardrail version (#782).
+    $guardrailTemplate = Join-Path $infraPath '04-bedrock-guardrails.yaml'
+    $guardrailTemplateText = [System.IO.File]::ReadAllText($guardrailTemplate) -replace "`r", ''
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $guardrailHash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($guardrailTemplateText))
+    } finally {
+        $sha256.Dispose()
+    }
+    $guardrailPolicyFingerprint = ([System.BitConverter]::ToString($guardrailHash) -replace '-', '').ToLowerInvariant()
     Deploy-Stack -StackName "$ProjectName-guardrails" `
-        -TemplateFile (Join-Path $infraPath '04-bedrock-guardrails.yaml') `
-        -Params @("ProjectName=$ProjectName")
+        -TemplateFile $guardrailTemplate `
+        -Params @("ProjectName=$ProjectName", "GuardrailPolicyFingerprint=$guardrailPolicyFingerprint")
 
     $guardrailId = Get-StackOutput "$ProjectName-guardrails" 'GuardrailId'
-    Write-GameAgentStatus "Guardrails deployed: $guardrailId" -Type Success
+    # The runtime pins the published version, never the mutable DRAFT.
+    $guardrailVersion = Get-StackOutput "$ProjectName-guardrails" 'GuardrailVersion'
+    if ($guardrailId -and $guardrailId -ne 'None' -and $guardrailVersion -notmatch '^[1-9][0-9]*$') {
+        throw "Guardrails stack output GuardrailVersion='$guardrailVersion' is not a published version number; refusing to fall back to DRAFT."
+    }
+    Write-GameAgentStatus "Guardrails deployed: $guardrailId (version $guardrailVersion)" -Type Success
     Write-Host ''
 
     # ── Step 1.6: Managed Prompts ──
@@ -419,6 +435,7 @@ function Deploy-GameAgent {
             -OrchestratorModelId $orchestratorModelId `
             -SpecialistModelId $specialistModelId `
             -GuardrailId $guardrailId `
+            -GuardrailVersion $guardrailVersion `
             -OrchestratorPromptArn $orchestratorPromptArn `
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
@@ -553,6 +570,7 @@ function Deploy-GameAgent {
             -OrchestratorModelId $orchestratorModelId `
             -SpecialistModelId $specialistModelId `
             -GuardrailId $guardrailId `
+            -GuardrailVersion $guardrailVersion `
             -OrchestratorPromptArn $orchestratorPromptArn `
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `

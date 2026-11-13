@@ -1,6 +1,7 @@
 """Behavioral tests for deployment shell helpers."""
 
 # Standard library
+import hashlib
 import os
 import pathlib
 import re
@@ -16,6 +17,7 @@ PROJECT_ROOT = pathlib.Path(__file__).parents[3]
 DEPLOY_SCRIPT = PROJECT_ROOT / "scripts/deploy.sh"
 FUNCTION_NAMES = (
     "is_resolved_deployment_value",
+    "is_published_guardrail_version",
     "append_agentcore_env_if_resolved",
     "build_agentcore_env_args",
 )
@@ -28,6 +30,7 @@ WAF_FUNCTION_NAMES = (
 )
 OPTIONAL_VARIABLES = (
     "GUARDRAIL_ID",
+    "GUARDRAIL_VERSION",
     "GBAW_ORCHESTRATOR_PROMPT_ARN",
     "GBAW_GAMELIFT_PROMPT_ARN",
     "GBAW_EKS_PROMPT_ARN",
@@ -52,10 +55,10 @@ def _function_source(script: str, name: str) -> str:
     return match.group(0)
 
 
-def _build_agentcore_env_args(overrides: dict[str, str] | None = None) -> list[str]:
+def _run_agentcore_env_builder(overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
     functions = "\n".join(_function_source(content, name) for name in FUNCTION_NAMES)
-    command = f'{functions}\nbuild_agentcore_env_args\nprintf "%s\\n" "${{AGENTCORE_ENV_ARGS[@]}}"'
+    command = f'{functions}\nbuild_agentcore_env_args || exit\nprintf "%s\\n" "${{AGENTCORE_ENV_ARGS[@]}}"'
 
     env = os.environ.copy()
     for name in OPTIONAL_VARIABLES:
@@ -68,13 +71,18 @@ def _build_agentcore_env_args(overrides: dict[str, str] | None = None) -> list[s
     )
     env.update(overrides or {})
 
-    result = subprocess.run(
+    return subprocess.run(
         ["bash", "-c", command],
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+
+
+def _build_agentcore_env_args(overrides: dict[str, str] | None = None) -> list[str]:
+    result = _run_agentcore_env_builder(overrides)
+    assert result.returncode == 0, result.stderr
     return result.stdout.splitlines()
 
 
@@ -208,6 +216,7 @@ def test_agentcore_env_args_include_resolved_optional_values():
     args = _build_agentcore_env_args(
         {
             "GUARDRAIL_ID": "guardrail-id",
+            "GUARDRAIL_VERSION": "3",
             "GBAW_ORCHESTRATOR_PROMPT_ARN": "orchestrator-prompt",
             "GBAW_GAMELIFT_PROMPT_ARN": "gamelift-prompt",
             "GBAW_EKS_PROMPT_ARN": "eks-prompt",
@@ -240,7 +249,7 @@ def test_agentcore_env_args_include_resolved_optional_values():
         "-env",
         "GBAW_BEDROCK_GUARDRAIL_ID=guardrail-id",
         "-env",
-        "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT",
+        "GBAW_BEDROCK_GUARDRAIL_VERSION=3",
         "-env",
         "GBAW_ORCHESTRATOR_PROMPT_ARN=orchestrator-prompt",
         "-env",
@@ -311,6 +320,42 @@ def test_agentcore_env_args_filter_optional_values_independently():
         "-env",
         "GBAW_COST_KB_ID=cost-kb",
     ]
+
+
+@pytest.mark.parametrize("version", ["", "None", "DRAFT", "0", "01", "1.0", "3 "])
+def test_agentcore_env_args_refuse_a_guardrail_without_a_published_version(version):
+    # A resolved Guardrail must be pinned to a published version (#782). Emitting
+    # only the ID would let the runtime default to the mutable DRAFT.
+    result = _run_agentcore_env_builder({"GUARDRAIL_ID": "guardrail-id", "GUARDRAIL_VERSION": version})
+
+    assert result.returncode != 0
+    assert "GBAW_BEDROCK_GUARDRAIL" not in result.stdout
+    assert "no published version" in result.stderr
+
+
+def test_guardrail_template_fingerprint_ignores_line_endings_and_tracks_content():
+    content = DEPLOY_SCRIPT.read_text(encoding="utf-8")
+    function = _function_source(content, "guardrail_template_fingerprint")
+    body = "Resources:\n  GameAgentGuardrail:\n    Type: AWS::Bedrock::Guardrail\n"
+
+    def fingerprint(text: str) -> str:
+        with tempfile.NamedTemporaryFile("wb", suffix=".yaml", delete=False) as handle:
+            handle.write(text.encode("utf-8"))
+        try:
+            result = subprocess.run(
+                ["bash", "-c", f'{function}\nguardrail_template_fingerprint "$1"', "_", handle.name],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        finally:
+            os.unlink(handle.name)
+        return result.stdout.strip()
+
+    expected = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert fingerprint(body) == expected
+    assert fingerprint(body.replace("\n", "\r\n")) == expected
+    assert fingerprint(body + "# policy edit\n") != expected
 
 
 def test_waf_reconciliation_skips_association_when_expected_acl_and_rules_are_active():
