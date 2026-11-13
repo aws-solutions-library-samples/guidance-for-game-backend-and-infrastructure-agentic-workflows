@@ -566,7 +566,7 @@ $env:GBAW_EKS_DISCOVERY_CLUSTERS = 'your-cluster-name,another-cluster'; Deploy-G
 - The deploy stops with an error for an empty entry, a duplicate name, an invalid name, more than 20 names, or a value with a line break.
 - When the setting is unset or empty, it is not passed to the runtime, and the tool answers `not_enrolled` for every cluster. A model or a request cannot add a cluster.
 - Each redeploy passes the full runtime environment. To remove a cluster, redeploy without it.
-- The setting grants no Kubernetes access. The cluster must also be enrolled (above), and the runtime role needs read access to the Agones API groups. The demo's `demo/agones-gamelift-migration/agones/agent-readonly-rbac.yaml` grants `get`, `list`, and `watch` only. Without that access, the tool answers `denied`.
+- The setting grants no Kubernetes access. The cluster must also be enrolled (above), and the runtime role needs `get`, `list`, and `watch` on the `agones.dev` and `autoscaling.agones.dev` API groups. Enrollment does not grant those groups. Without that access, the tool answers `denied`.
 
 ### Verify Deployment Health
 
