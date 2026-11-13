@@ -68,16 +68,15 @@ def _gamelift_candidates(fleet_list: Mapping[str, Any]) -> dict[str, list[Candid
             continue
         key = row.get("GameServerContainerGroupDefinitionName")
         if _valid_typed_string(key, _NAME):
-            index.setdefault(key, []).append(
-                (
-                    position,
-                    {
-                        "FleetType": "container",
-                        "GameServerContainerGroupDefinitionName": key,
-                        "basis": "container_group_definition_name",
-                    },
-                )
-            )
+            candidate: dict[str, Any] = {"FleetType": "container"}
+            # The container fleet ID from the #464 row, so a match names the
+            # fleet the per-fleet tools take, not only its definition.
+            fleet_id = row.get("FleetId")
+            if _valid_fleet_id(fleet_id) and fleet_id.startswith("containerfleet-"):
+                candidate["FleetId"] = fleet_id
+            candidate["GameServerContainerGroupDefinitionName"] = key
+            candidate["basis"] = "container_group_definition_name"
+            index.setdefault(key, []).append((position, candidate))
             position += 1
     classics = fleet_list.get("ClassicFleets")
     for row in classics if isinstance(classics, list) else []:

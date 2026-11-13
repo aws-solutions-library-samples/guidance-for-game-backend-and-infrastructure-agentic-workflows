@@ -240,6 +240,7 @@ def _summarize_container_fleet(
     return _compact_dict(
         {
             "FleetType": "container",
+            "FleetId": fleet.get("FleetId"),
             "Status": fleet.get("Status"),
             "InstanceType": fleet.get("InstanceType"),
             "BillingType": fleet.get("BillingType"),
@@ -865,7 +866,8 @@ def get_fleet_locations(fleet_id: str) -> dict:  # type: ignore
 
     Returns ``Locations`` rows with the location Region, its status, and the
     player gateway status. ``fleet_id`` must be a GameLift fleet ID (never an
-    ARN); an invalid ID is rejected before any provider call. ``status`` is
+    ARN), taken from a ``list_gamelift_fleets`` ``ClassicFleets`` or
+    ``ContainerFleets`` row; an invalid ID is rejected before any provider call. ``status`` is
     ok / empty / denied / incomplete / truncated with a typed sanitized ``error``.
     """
     if not _valid_fleet_id(fleet_id):
@@ -925,7 +927,8 @@ def get_container_fleet_ports(fleet_id: str) -> dict:  # type: ignore
 
     Inbound permissions keep their ports and protocol plus a ``Scope`` token
     (``any-address`` or ``restricted``); the IP range itself is never returned.
-    ``fleet_id`` must be a ``containerfleet-`` ID.
+    ``fleet_id`` must be a ``containerfleet-`` ID, taken from the ``FleetId`` of a
+    ``list_gamelift_fleets`` ``ContainerFleets`` row.
     """
     if not _valid_fleet_id(fleet_id) or not fleet_id.startswith("containerfleet-"):
         return _invalid_argument("ContainerFleet")

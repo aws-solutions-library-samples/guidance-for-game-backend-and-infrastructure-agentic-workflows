@@ -27,11 +27,14 @@ def _agones(*names, outcome="complete", has_more=False, namespace="games"):
     return {"v": AGONES_ENVELOPE_VERSION, "fleets": section}
 
 
-def _gamelift(container_names=(), classic=(), status="ok", **flags):
+def _gamelift(container_names=(), classic=(), status="ok", container_ids=None, **flags):
+    ids = list(container_ids) if container_ids is not None else [None] * len(container_names)
     return {
         "status": status,
         "ContainerFleets": [
-            {"FleetType": "container", "GameServerContainerGroupDefinitionName": n} for n in container_names
+            {"FleetType": "container", "GameServerContainerGroupDefinitionName": n}
+            | ({"FleetId": fid} if fid is not None else {})
+            for n, fid in zip(container_names, ids)
         ],
         "ClassicFleets": [{"FleetId": fid, "Name": name} for fid, name in classic],
         **flags,
@@ -168,3 +171,29 @@ def test_unshared_candidate_still_matches_next_to_a_shared_one():
     assert by_key[("team-a", "lobby")]["match"] == MATCHED
     assert by_key[("team-a", "game")]["match"] == AMBIGUOUS
     assert by_key[("team-b", "game")]["match"] == AMBIGUOUS
+
+
+CFLEET = "containerfleet-0a1b2c3d-1111-2222-3333-4444aaaabbbb"
+
+
+def test_container_match_names_the_container_fleet_id():
+    result = correlate(_agones("echo"), _gamelift(container_names=["echo"], container_ids=[CFLEET]))
+
+    assert result["mappings"][0]["gameLift"] == {
+        "FleetType": "container",
+        "FleetId": CFLEET,
+        "GameServerContainerGroupDefinitionName": "echo",
+        "basis": "container_group_definition_name",
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [FLEET, f"arn:aws:gamelift:us-west-2:000000000000:containerfleet/{CFLEET}", "containerfleet-x\n", 7],
+)
+def test_container_match_drops_an_invalid_or_classic_fleet_id(bad_id):
+    result = correlate(_agones("echo"), _gamelift(container_names=["echo"], container_ids=[bad_id]))
+
+    row = result["mappings"][0]
+    assert row["match"] == MATCHED
+    assert "FleetId" not in row["gameLift"]

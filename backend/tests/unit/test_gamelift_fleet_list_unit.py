@@ -439,6 +439,8 @@ class TestContainerFleetProjection:
         assert "FleetArn" not in row
         assert "FleetRoleArn" not in row
         assert "LogGroupArn" not in row
+        # This fixture's "container-fleet-1" fails the fleet-ID grammar, so the
+        # field is dropped; a valid containerfleet- ID is kept (#529).
         assert "FleetId" not in row
         _assert_no_sensitive(result)
 
@@ -795,6 +797,55 @@ class TestContainerMarkerDoesNotMaskInvalidRows:
 
         projected = project_container_fleet_summary({"FleetType": "container", "Status": "ACTIVE"})
         assert projected == {"FleetType": "container", "Status": "ACTIVE"}
+
+
+class TestContainerFleetIdIsProjected:
+    """#529 review item 3: container rows carry a validated ``FleetId``."""
+
+    CFLEET = "containerfleet-0a1b2c3d-1111-2222-3333-4444aaaabbbb"
+
+    def test_valid_container_fleet_id_is_kept(self):
+        # Local modules
+        from agents.gamelift_projections import _CONTAINER_FLEET_FIELDS, project_container_fleet_summary
+
+        assert ("FleetId", "fleet_id") in _CONTAINER_FLEET_FIELDS
+        projected = project_container_fleet_summary(
+            {"FleetType": "container", "FleetId": self.CFLEET, "Status": "ACTIVE"}
+        )
+        assert projected == {"FleetType": "container", "FleetId": self.CFLEET, "Status": "ACTIVE"}
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            SYNTHETIC_FLEET_ARN,
+            "containerfleet-0a1b2c3d\n",
+            "containerfleet-123456789012",
+            SYNTHETIC_URL,
+            {"nested": "blob"},
+            42,
+        ],
+    )
+    def test_invalid_container_fleet_id_is_dropped(self, bad_id):
+        # Local modules
+        from agents.gamelift_projections import project_container_fleet_summary
+
+        projected = project_container_fleet_summary({"FleetType": "container", "FleetId": bad_id, "Status": "ACTIVE"})
+        assert projected == {"FleetType": "container", "Status": "ACTIVE"}
+
+    def test_fleet_id_alone_keeps_a_row(self):
+        # FleetId is provider-derived, so it alone is real evidence of a fleet.
+        # Local modules
+        from agents.gamelift_projections import project_container_fleet_summary
+
+        projected = project_container_fleet_summary({"FleetType": "container", "FleetId": self.CFLEET})
+        assert projected == {"FleetType": "container", "FleetId": self.CFLEET}
+
+    def test_list_gamelift_fleets_container_row_carries_fleet_id(self):
+        # Local modules
+        from agents.gamelift_specialist import _summarize_container_fleet
+
+        raw = _summarize_container_fleet({"FleetId": self.CFLEET, "Status": "ACTIVE"})
+        assert raw["FleetId"] == self.CFLEET
 
 
 class TestWarningsAreBoundedAndDeduplicated:
