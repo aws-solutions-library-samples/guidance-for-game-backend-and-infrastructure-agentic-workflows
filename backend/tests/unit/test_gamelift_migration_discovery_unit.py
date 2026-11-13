@@ -39,7 +39,8 @@ def _client_error(code: str) -> ClientError:
     return ClientError({"Error": {"Code": code, "Message": PROVIDER_TEXT}}, "Op")
 
 
-def _queue(name: str, destinations: int = 2) -> dict:
+def _queue(name: str, destinations: int = 2, dirty: bool = False) -> dict:
+    """A valid queue. ``dirty`` adds an invalid priority type and Region."""
     dests = []
     for i in range(destinations):
         if i % 2:
@@ -53,8 +54,8 @@ def _queue(name: str, destinations: int = 2) -> dict:
         "Destinations": dests,
         "PlayerLatencyPolicies": [{"MaximumIndividualPlayerLatencyMilliseconds": 100, "PolicyDurationSeconds": 30}],
         "PriorityConfiguration": {
-            "PriorityOrder": ["LATENCY", "COST", "BOGUS"],
-            "LocationOrder": ["us-west-2", "10.0.0.1"],
+            "PriorityOrder": ["LATENCY", "COST", "BOGUS"] if dirty else ["LATENCY", "COST"],
+            "LocationOrder": ["us-west-2", "10.0.0.1"] if dirty else ["us-west-2"],
         },
         "FilterConfiguration": {"AllowedLocations": ["us-west-2", "us-east-1"]},
         "CustomEventData": SECRET,
@@ -129,8 +130,15 @@ def test_specialist_calls_only_reviewed_read_operations_and_no_dynamic_dispatch(
 def test_queue_projection_derives_ids_and_regions_and_drops_arns():
     client = _client_with_pages([{"GameSessionQueues": [_queue("synthetic-queue")]}])
     with patch.object(gls.boto3, "client", return_value=client):
+        clean = gls.list_game_session_queues()
+    assert clean["status"] == "ok" and "error" not in clean and "truncated" not in clean
+
+    client = _client_with_pages([{"GameSessionQueues": [_queue("synthetic-queue", dirty=True)]}])
+    with patch.object(gls.boto3, "client", return_value=client):
         result = gls.list_game_session_queues()
-    assert result["status"] == "ok"
+    # The invalid priority type and the IP-shaped Region are dropped, so the
+    # collection is not ok.
+    assert result["status"] == "incomplete" and result["error"] == {"code": "malformed_response"}
     row = result["GameSessionQueues"][0]
     assert row["Destinations"] == [
         {"Type": "fleet", "FleetId": FLEET, "Region": "us-west-2"},
@@ -139,7 +147,6 @@ def test_queue_projection_derives_ids_and_regions_and_drops_arns():
     assert row["PriorityConfiguration"] == {
         "PriorityOrder": ["LATENCY", "COST"],
         "LocationOrder": ["us-west-2"],
-        "LocationOrderTruncated": True,
     }
     blob = json.dumps(result)
     for forbidden in (ACCOUNT, "arn:", SECRET, "sns", "10.0.0.1"):
@@ -453,3 +460,182 @@ def test_provider_text_never_logged():
     joined = "\n".join(messages)
     assert messages
     assert ACCOUNT not in joined and "assumed-role" not in joined and FLEET not in joined
+
+
+# --------------------------------------------------------------------------- #
+# Nested caps and drops never leave a collection ok (#781 review item 4)      #
+# --------------------------------------------------------------------------- #
+def _queues_status(queue: dict) -> dict:
+    return gmp.project_game_session_queues([queue], residual=False, pages_malformed=False)
+
+
+def _assert_truncated(result: dict) -> None:
+    assert result["status"] == "truncated" and result["truncated"] is True
+    assert "error" not in result
+
+
+def _assert_malformed(result: dict) -> None:
+    assert result["status"] == "incomplete" and result["truncated"] is True
+    assert result["error"] == {"code": "malformed_response"}
+
+
+def test_queue_with_24_destinations_is_truncated():
+    result = _queues_status(_queue("q", destinations=24))
+    assert len(result["GameSessionQueues"][0]["Destinations"]) == gmp.MAX_QUEUE_DESTINATIONS
+    _assert_truncated(result)
+
+
+def test_queue_with_an_unparsable_destination_is_incomplete_malformed():
+    queue = _queue("q")
+    queue["Destinations"].append({"DestinationArn": "fleet-guess"})
+    result = _queues_status(queue)
+    assert result["GameSessionQueues"][0]["UnresolvedDestinationCount"] == 1
+    _assert_malformed(result)
+
+
+def test_queue_with_25_entry_location_order_is_truncated():
+    queue = _queue("q")
+    queue["PriorityConfiguration"]["LocationOrder"] = ["us-west-2"] * 25
+    result = _queues_status(queue)
+    assert result["GameSessionQueues"][0]["PriorityConfiguration"]["LocationOrderTruncated"] is True
+    _assert_truncated(result)
+
+
+def test_queue_with_too_many_allowed_locations_or_policies_is_truncated():
+    queue = _queue("q")
+    queue["FilterConfiguration"]["AllowedLocations"] = ["us-west-2"] * (gmp.MAX_QUEUE_LOCATIONS + 1)
+    _assert_truncated(_queues_status(queue))
+
+    queue = _queue("q")
+    queue["PlayerLatencyPolicies"] = [{"PolicyDurationSeconds": 30}] * (gmp.MAX_LATENCY_POLICIES + 1)
+    _assert_truncated(_queues_status(queue))
+
+
+@pytest.mark.parametrize(
+    "policies",
+    [
+        ["not-a-mapping"],
+        [{"MaximumIndividualPlayerLatencyMilliseconds": "fast"}],
+        [{"MaximumIndividualPlayerLatencyMilliseconds": 100, "PolicyDurationSeconds": float("nan")}],
+        [{"MaximumIndividualPlayerLatencyMilliseconds": 100}, {"PolicyDurationSeconds": True}],
+    ],
+)
+def test_queue_with_an_invalid_latency_policy_is_incomplete_malformed(policies):
+    queue = _queue("q")
+    queue["PlayerLatencyPolicies"] = policies
+    _assert_malformed(_queues_status(queue))
+
+
+@pytest.mark.parametrize(
+    "priority",
+    [
+        {"PriorityOrder": ["LATENCY", "BOGUS"]},
+        {"LocationOrder": ["us-west-2", "10.0.0.1"]},
+        {"LocationOrder": "us-west-2"},
+    ],
+)
+def test_queue_with_an_invalid_priority_entry_is_incomplete_malformed(priority):
+    queue = _queue("q")
+    queue["PriorityConfiguration"] = priority
+    _assert_malformed(_queues_status(queue))
+
+
+def test_queue_with_an_invalid_allowed_location_is_incomplete_malformed():
+    queue = _queue("q")
+    queue["FilterConfiguration"]["AllowedLocations"] = ["us-west-2", "not a region"]
+    _assert_malformed(_queues_status(queue))
+
+
+def test_a_drop_wins_over_a_cap():
+    queue = _queue("q", destinations=24)
+    queue["Destinations"].insert(0, {"DestinationArn": "fleet-guess"})
+    _assert_malformed(_queues_status(queue))
+
+
+def test_nested_drop_keeps_the_envelope_within_budget(monkeypatch):
+    monkeypatch.setattr("agents.gamelift_projections.GAMELIFT_MAX_PROJECTED_CHARS", 1_500)
+    monkeypatch.setattr(gmp, "GAMELIFT_MAX_PROJECTED_CHARS", 1_500)
+    queues = [_queue(f"queue-{i}", destinations=10, dirty=True) for i in range(gmp.MAX_QUEUES)]
+    result = gmp.project_game_session_queues(queues, residual=False, pages_malformed=False)
+    assert len(json.dumps(result)) <= 1_500
+    _assert_malformed(result)
+
+
+@pytest.mark.parametrize(
+    "bad_range",
+    [
+        {"FromPort": 0, "ToPort": 7000, "Protocol": "UDP"},
+        {"FromPort": 7001, "ToPort": 7000, "Protocol": "UDP"},
+        {"FromPort": 7000, "ToPort": 70000, "Protocol": "UDP"},
+        {"FromPort": 7000, "ToPort": 7000, "Protocol": "ICMP"},
+        "not-a-mapping",
+    ],
+)
+def test_container_definition_with_an_invalid_port_range_is_incomplete_malformed(bad_range):
+    raw = _definition()
+    ranges = raw["ContainerGroupDefinition"]["GameServerContainerDefinition"]["PortConfiguration"][
+        "ContainerPortRanges"
+    ]
+    ranges.append(bad_range)
+    result = gmp.project_container_group_definition(raw)
+    assert result["ContainerGroupDefinition"]["GameServerContainerDefinition"]["PortRanges"] == [
+        {"FromPort": 7000, "ToPort": 7000, "Protocol": "UDP"}
+    ]
+    _assert_malformed(result)
+
+
+def test_container_definition_with_an_unprojectable_support_container_is_incomplete_malformed():
+    raw = _definition(support=1)
+    raw["ContainerGroupDefinition"]["SupportContainerDefinitions"].append("not-a-mapping")
+    _assert_malformed(gmp.project_container_group_definition(raw))
+
+
+def test_container_definition_port_range_cap_alone_is_truncated():
+    raw = _definition(port_ranges=gmp.MAX_PORT_RANGES + 1)
+    _assert_truncated(gmp.project_container_group_definition(raw))
+
+
+def test_clean_container_definition_is_ok():
+    result = gmp.project_container_group_definition(_definition())
+    assert result["status"] == "ok" and "truncated" not in result and "error" not in result
+
+
+@pytest.mark.parametrize(
+    "fleet_extra",
+    [
+        {"InstanceInboundPermissions": [{"FromPort": 4200, "ToPort": 4192, "Protocol": "UDP"}]},
+        {"InstanceInboundPermissions": [{"FromPort": 4192, "ToPort": 4200, "Protocol": "ICMP"}]},
+        {"InstanceInboundPermissions": ["not-a-mapping"]},
+        {"InstanceInboundPermissions": "not-a-list"},
+        {"InstanceConnectionPortRange": {"FromPort": 0, "ToPort": 4200}},
+        {"InstanceConnectionPortRange": "4192-4200"},
+    ],
+)
+def test_container_fleet_ports_with_an_invalid_port_entry_is_incomplete_malformed(fleet_extra):
+    fleet = {
+        "FleetId": CFLEET,
+        "InstanceInboundPermissions": [{"FromPort": 4192, "ToPort": 4200, "Protocol": "UDP"}],
+        **fleet_extra,
+    }
+    _assert_malformed(gmp.project_container_fleet_ports({"ContainerFleet": fleet}))
+
+
+def test_container_fleet_ports_inbound_cap_alone_is_truncated():
+    permissions = [{"FromPort": 1000, "ToPort": 1000, "Protocol": "UDP"}] * (gmp.MAX_INBOUND_PERMISSIONS + 1)
+    result = gmp.project_container_fleet_ports(
+        {"ContainerFleet": {"FleetId": CFLEET, "InstanceInboundPermissions": permissions}}
+    )
+    _assert_truncated(result)
+
+
+def test_clean_container_fleet_ports_are_ok():
+    result = gmp.project_container_fleet_ports(
+        {
+            "ContainerFleet": {
+                "FleetId": CFLEET,
+                "InstanceConnectionPortRange": {"FromPort": 4192, "ToPort": 4200},
+                "InstanceInboundPermissions": [{"FromPort": 4192, "ToPort": 4200, "Protocol": "UDP"}],
+            }
+        }
+    )
+    assert result["status"] == "ok" and "truncated" not in result and "error" not in result

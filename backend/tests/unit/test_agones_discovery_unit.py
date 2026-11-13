@@ -502,6 +502,71 @@ def test_nested_port_and_container_caps():
     assert len(template["containers"]) == ad.MAX_CONTAINERS
     assert body["fleets"]["nestedTruncated"] is True
     assert body["fleets"]["outcome"] == "truncated"
+    assert "nestedDropped" not in body["fleets"]
+
+
+def _fleet_with(mutate: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    fleet = _fleet("echo")
+    mutate(fleet)
+    return fleet
+
+
+def _template(fleet: dict[str, Any]) -> dict[str, Any]:
+    return fleet["spec"]["template"]["spec"]
+
+
+def _container(fleet: dict[str, Any]) -> dict[str, Any]:
+    return _template(fleet)["template"]["spec"]["containers"][0]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda f: _template(f)["ports"][0].update(portPolicy="Bogus"), id="invalid-port-policy"),
+        pytest.param(lambda f: _template(f)["ports"][0].update(containerPort=70_000), id="invalid-container-port"),
+        pytest.param(lambda f: _template(f)["ports"].append("not-a-mapping"), id="non-mapping-port"),
+        pytest.param(lambda f: _template(f)["ports"].append({"protocol": "ICMP"}), id="all-invalid-port"),
+        pytest.param(lambda f: _template(f).update(ports="7654"), id="ports-not-a-list"),
+        pytest.param(lambda f: _container(f).update(name="Bad_Name"), id="invalid-container-name"),
+        pytest.param(lambda f: _container(f)["resources"]["limits"].update(cpu="lots"), id="invalid-quantity"),
+        pytest.param(lambda f: _template(f)["template"]["spec"]["containers"].append(7), id="non-mapping-container"),
+    ],
+)
+def test_nested_drop_makes_the_section_partial_not_complete(mutate):
+    cluster = _FakeCluster()
+    cluster.objects["Fleet"] = [_fleet_with(mutate)]
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    fleets = body["fleets"]
+    assert fleets["outcome"] == "partial" and fleets["partial"] is True
+    assert fleets["nestedDropped"] >= 1
+    assert body["outcome"] == "partial" and body["partial"] is True
+
+
+def test_nested_drop_wins_over_a_nested_cap():
+    cluster = _FakeCluster()
+    fleet = _fleet("echo", ports=ad.MAX_PORTS + 1)
+    _template(fleet)["ports"][0]["portPolicy"] = "Bogus"
+    cluster.objects["Fleet"] = [fleet]
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert body["fleets"]["outcome"] == "partial"
+    assert body["fleets"]["nestedTruncated"] is True and body["fleets"]["nestedDropped"] >= 1
+
+
+def test_invalid_gameserver_status_port_makes_the_section_partial():
+    cluster = _FakeCluster()
+    server = _gameserver("echo-a")
+    server["status"]["ports"].append({"name": "extra", "port": 0})
+    cluster.objects["GameServer"] = [server]
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert body["gameServers"]["outcome"] == "partial"
+    assert body["gameServers"]["nestedDropped"] == 1
+
+
+def test_clean_inventory_has_no_nested_markers():
+    _, body, _ = _run(_inventory_tool(_populated()), {"cluster_name": CLUSTER})
+    assert body["outcome"] == "complete"
+    for section in ("fleets", "autoscalers", "gameServers"):
+        assert "nestedDropped" not in body[section] and "nestedTruncated" not in body[section]
 
 
 def test_string_cap_and_grammar_drop_oversized_values():

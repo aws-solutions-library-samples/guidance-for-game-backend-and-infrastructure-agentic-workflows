@@ -16,6 +16,12 @@ commands, Linux capabilities, free-text descriptions, ``StatusReason``, and
 A queue destination is reported as a fleet or alias ID plus its Region, parsed
 deterministically from the destination ARN. A destination that does not parse
 is counted, never guessed.
+
+Nested lists follow the #464 rule that a mixed collection is never ``ok``. A
+nested list cut at its cap makes an ``ok`` result ``truncated``. A nested entry
+dropped because it failed validation makes the result ``incomplete`` with
+``malformed_response`` and ``truncated``, even when every top-level row is
+valid.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ from agents.gamelift_projections import (
     _TIMESTAMP,
     ERROR_MALFORMED_RESPONSE,
     GAMELIFT_MAX_PROJECTED_CHARS,
+    STATUS_DENIED,
+    STATUS_EMPTY,
     STATUS_INCOMPLETE,
     STATUS_OK,
     STATUS_TRUNCATED,
@@ -104,12 +112,60 @@ def _port(value: Any) -> int | None:
     return value if 1 <= value <= _MAX_PORT else None
 
 
-def _regions(value: Any, cap: int) -> tuple[list[str], bool]:
-    """Validated Region list and whether the cap or a bad value cut it short."""
+class _Nested:
+    """Records nested-list bound hits and validation drops for one projection."""
+
+    def __init__(self) -> None:
+        self.capped = False
+        self.dropped = False
+
+
+def _apply_nested(result: dict[str, Any], nested: _Nested, collection_key: str | None = None) -> dict[str, Any]:
+    """Fold nested caps and drops into the result status.
+
+    A drop wins over a cap: ``incomplete`` + ``malformed_response`` +
+    ``truncated``. A cap alone moves ``ok`` to ``truncated`` and sets the
+    ``truncated`` flag. ``denied`` and ``empty`` results carry no rows and are
+    left unchanged. When ``collection_key`` is given, rows are trimmed from the
+    tail again so the added keys still fit the serialized budget.
+    """
+    if result.get("status") in (STATUS_DENIED, STATUS_EMPTY):
+        return result
+    if nested.dropped:
+        result["status"] = STATUS_INCOMPLETE
+        result["truncated"] = True
+        result.setdefault("error", {"code": ERROR_MALFORMED_RESPONSE})
+    elif nested.capped:
+        if result.get("status") == STATUS_OK:
+            result["status"] = STATUS_TRUNCATED
+        result["truncated"] = True
+    rows = result.get(collection_key) if collection_key else None
+    if isinstance(rows, list):
+        while len(rows) > 1 and _serialized_length(result) > GAMELIFT_MAX_PROJECTED_CHARS:
+            rows.pop()
+            result["truncated"] = True
+            if result.get("status") == STATUS_OK:
+                result["status"] = STATUS_TRUNCATED
+    return result
+
+
+def _regions(value: Any, cap: int, nested: _Nested) -> tuple[list[str], bool]:
+    """Validated Region list and whether the cap cut it short.
+
+    An invalid entry is dropped and recorded on ``nested``; a list longer than
+    ``cap`` is recorded as capped.
+    """
     if not isinstance(value, list):
+        if value is not None:
+            nested.dropped = True
         return [], False
     kept = [item for item in value[:cap] if _valid_typed_string(item, _REGION)]
-    return kept, len(value) > cap or len(kept) != min(len(value), cap)
+    capped = len(value) > cap
+    if len(kept) != min(len(value), cap):
+        nested.dropped = True
+    if capped:
+        nested.capped = True
+    return kept, capped
 
 
 # --------------------------------------------------------------------------- #
@@ -141,8 +197,16 @@ def project_queue_destination(value: Any) -> dict[str, Any] | None:
     return {"Type": "alias", "AliasId": resource_id, "Region": region}
 
 
-def project_queue_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Project one ``GameSessionQueue``. Rows without a valid name are dropped."""
+_LATENCY_POLICY_FIELDS = (("MaximumIndividualPlayerLatencyMilliseconds", _NUMBER), ("PolicyDurationSeconds", _NUMBER))
+
+
+def project_queue_item(item: dict[str, Any], nested: _Nested | None = None) -> dict[str, Any]:
+    """Project one ``GameSessionQueue``. Rows without a valid name are dropped.
+
+    Nested caps and drops are recorded on ``nested`` so the collection status
+    can report them.
+    """
+    nested = nested if nested is not None else _Nested()
     projected = _copy_validated(item, (("Name", _NAME), ("TimeoutInSeconds", _NUMBER)))
     if "Name" not in projected:
         return {}
@@ -160,24 +224,31 @@ def project_queue_item(item: dict[str, Any]) -> dict[str, Any]:
         projected["Destinations"] = destinations
         if unresolved:
             projected["UnresolvedDestinationCount"] = unresolved
+            nested.dropped = True
         if len(raw_destinations) > MAX_QUEUE_DESTINATIONS:
             projected["DestinationsTruncated"] = True
+            nested.capped = True
 
     raw_policies = item.get("PlayerLatencyPolicies")
     if isinstance(raw_policies, list):
         policies = []
         for raw in raw_policies[:MAX_LATENCY_POLICIES]:
-            if isinstance(raw, dict):
-                policy = _copy_validated(
-                    raw,
-                    (("MaximumIndividualPlayerLatencyMilliseconds", _NUMBER), ("PolicyDurationSeconds", _NUMBER)),
-                )
-                if policy:
-                    policies.append(policy)
+            if not isinstance(raw, dict):
+                nested.dropped = True
+                continue
+            policy = _copy_validated(raw, _LATENCY_POLICY_FIELDS)
+            present = {key for key, _ in _LATENCY_POLICY_FIELDS if raw.get(key) is not None}
+            if not policy or set(policy) != present:
+                # A policy with no valid value, or with a value that failed
+                # validation, is not a faithful copy of the provider's policy.
+                nested.dropped = True
+            if policy:
+                policies.append(policy)
         if policies:
             projected["PlayerLatencyPolicies"] = policies
         if len(raw_policies) > MAX_LATENCY_POLICIES:
             projected["PlayerLatencyPoliciesTruncated"] = True
+            nested.capped = True
 
     priority = item.get("PriorityConfiguration")
     if isinstance(priority, dict):
@@ -185,9 +256,11 @@ def project_queue_item(item: dict[str, Any]) -> dict[str, Any]:
         order = priority.get("PriorityOrder")
         if isinstance(order, list):
             kept = [value for value in order[: len(_PRIORITY_TYPES)] if value in _PRIORITY_TYPES]
+            if len(kept) != len(order):
+                nested.dropped = True
             if kept:
                 out["PriorityOrder"] = kept
-        locations, cut = _regions(priority.get("LocationOrder"), MAX_QUEUE_LOCATIONS)
+        locations, cut = _regions(priority.get("LocationOrder"), MAX_QUEUE_LOCATIONS, nested)
         if locations:
             out["LocationOrder"] = locations
         if cut:
@@ -197,7 +270,7 @@ def project_queue_item(item: dict[str, Any]) -> dict[str, Any]:
 
     filters = item.get("FilterConfiguration")
     if isinstance(filters, dict):
-        allowed, cut = _regions(filters.get("AllowedLocations"), MAX_QUEUE_LOCATIONS)
+        allowed, cut = _regions(filters.get("AllowedLocations"), MAX_QUEUE_LOCATIONS, nested)
         if allowed or cut:
             projected["FilterConfiguration"] = {"AllowedLocations": allowed}
             if cut:
@@ -214,7 +287,8 @@ def project_game_session_queues(items: list[Any], residual: bool, pages_malforme
     response: dict[str, Any] = {"GameSessionQueues": items}
     if residual:
         response["NextToken"] = "residual"
-    result = _project_collection(response, "GameSessionQueues", project_queue_item)
+    nested = _Nested()
+    result = _project_collection(response, "GameSessionQueues", lambda item: project_queue_item(item, nested))
     if residual and result["status"] == STATUS_INCOMPLETE and "error" not in result:
         result["status"] = STATUS_TRUNCATED
         result["truncated"] = True
@@ -223,7 +297,7 @@ def project_game_session_queues(items: list[Any], residual: bool, pages_malforme
         result["status"] = STATUS_INCOMPLETE
         result["truncated"] = True
         result["error"] = {"code": ERROR_MALFORMED_RESPONSE}
-    return result
+    return _apply_nested(result, nested, "GameSessionQueues")
 
 
 # --------------------------------------------------------------------------- #
@@ -284,27 +358,42 @@ def project_container_fleet_locations(response: Any) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Container group definitions                                                 #
 # --------------------------------------------------------------------------- #
-def _project_port_ranges(value: Any) -> tuple[list[dict[str, Any]], bool]:
-    if not isinstance(value, dict):
+def _valid_port_range(raw: Any) -> dict[str, Any] | None:
+    """``{FromPort, ToPort, Protocol}`` when the range is valid, else ``None``."""
+    if not isinstance(raw, dict):
+        return None
+    from_port, to_port = _port(raw.get("FromPort")), _port(raw.get("ToPort"))
+    protocol = raw.get("Protocol")
+    if from_port is None or to_port is None or from_port > to_port or protocol not in _IP_PROTOCOLS:
+        return None
+    return {"FromPort": from_port, "ToPort": to_port, "Protocol": protocol}
+
+
+def _project_port_ranges(value: Any, nested: _Nested) -> tuple[list[dict[str, Any]], bool]:
+    if value is None:
         return [], False
-    ranges = value.get("ContainerPortRanges")
+    ranges = value.get("ContainerPortRanges") if isinstance(value, dict) else None
     if not isinstance(ranges, list):
+        nested.dropped = True
         return [], False
     kept: list[dict[str, Any]] = []
     for raw in ranges[:MAX_PORT_RANGES]:
-        if not isinstance(raw, dict):
+        port_range = _valid_port_range(raw)
+        if port_range is None:
+            nested.dropped = True
             continue
-        from_port, to_port = _port(raw.get("FromPort")), _port(raw.get("ToPort"))
-        protocol = raw.get("Protocol")
-        if from_port is None or to_port is None or from_port > to_port or protocol not in _IP_PROTOCOLS:
-            continue
-        kept.append({"FromPort": from_port, "ToPort": to_port, "Protocol": protocol})
-    return kept, len(ranges) > MAX_PORT_RANGES
+        kept.append(port_range)
+    capped = len(ranges) > MAX_PORT_RANGES
+    if capped:
+        nested.capped = True
+    return kept, capped
 
 
-def _project_container(value: Any, support: bool) -> tuple[dict[str, Any], bool]:
+def _project_container(value: Any, support: bool, nested: _Nested) -> tuple[dict[str, Any], bool]:
     """Project one container definition. Env, mounts, and health checks are dropped."""
     if not isinstance(value, dict):
+        if value is not None:
+            nested.dropped = True
         return {}, False
     out: dict[str, Any] = {}
     name = value.get("ContainerName")
@@ -319,7 +408,7 @@ def _project_container(value: Any, support: bool) -> tuple[dict[str, Any], bool]
     vcpu = value.get("Vcpu")
     if vcpu is not None and _valid_number(vcpu):
         out["Vcpu"] = vcpu
-    ports, cut = _project_port_ranges(value.get("PortConfiguration"))
+    ports, cut = _project_port_ranges(value.get("PortConfiguration"), nested)
     if ports:
         out["PortRanges"] = ports
     if cut:
@@ -355,30 +444,27 @@ def project_container_group_definition(response: Any) -> dict[str, Any]:
             "error": {"code": ERROR_MALFORMED_RESPONSE},
         }
 
-    truncated = False
-    game_server, cut = _project_container(definition.get("GameServerContainerDefinition"), support=False)
-    truncated = truncated or cut
+    nested = _Nested()
+    game_server, _ = _project_container(definition.get("GameServerContainerDefinition"), False, nested)
     if game_server:
         projected["GameServerContainerDefinition"] = game_server
     raw_support = definition.get("SupportContainerDefinitions")
     if isinstance(raw_support, list):
         support_rows = []
         for raw in raw_support[:MAX_SUPPORT_CONTAINERS]:
-            row, cut = _project_container(raw, support=True)
-            truncated = truncated or cut
+            row, _ = _project_container(raw, True, nested)
             if row:
                 support_rows.append(row)
+            else:
+                nested.dropped = True
         if support_rows:
             projected["SupportContainerDefinitions"] = support_rows
         if len(raw_support) > MAX_SUPPORT_CONTAINERS:
-            truncated = True
+            nested.capped = True
+    elif raw_support is not None:
+        nested.dropped = True
 
-    result: dict[str, Any] = {
-        "status": STATUS_TRUNCATED if truncated else STATUS_OK,
-        "ContainerGroupDefinition": projected,
-    }
-    if truncated:
-        result["truncated"] = True
+    result: dict[str, Any] = _apply_nested({"status": STATUS_OK, "ContainerGroupDefinition": projected}, nested)
     while _serialized_length(result) > GAMELIFT_MAX_PROJECTED_CHARS:
         support_rows = projected.get("SupportContainerDefinitions")
         if not support_rows:
@@ -388,7 +474,8 @@ def project_container_group_definition(response: Any) -> dict[str, Any]:
                 "truncated": True,
             }
         support_rows.pop()
-        result["status"] = STATUS_TRUNCATED
+        if result["status"] == STATUS_OK:
+            result["status"] = STATUS_TRUNCATED
         result["truncated"] = True
     return result
 
@@ -427,34 +514,34 @@ def project_container_fleet_ports(response: Any) -> dict[str, Any]:
     if fleet.get("BillingType") in _CONTAINER_BILLING:
         projected["BillingType"] = fleet["BillingType"]
 
+    nested = _Nested()
     connection = fleet.get("InstanceConnectionPortRange")
-    if isinstance(connection, dict):
-        from_port, to_port = _port(connection.get("FromPort")), _port(connection.get("ToPort"))
+    if connection is not None:
+        from_port = _port(connection.get("FromPort")) if isinstance(connection, dict) else None
+        to_port = _port(connection.get("ToPort")) if isinstance(connection, dict) else None
         if from_port is not None and to_port is not None and from_port <= to_port:
             projected["InstanceConnectionPortRange"] = {"FromPort": from_port, "ToPort": to_port}
+        else:
+            nested.dropped = True
 
-    truncated = False
     permissions = fleet.get("InstanceInboundPermissions")
     if isinstance(permissions, list):
         kept = []
         for raw in permissions[:MAX_INBOUND_PERMISSIONS]:
-            if not isinstance(raw, dict):
+            row = _valid_port_range(raw)
+            if row is None:
+                nested.dropped = True
                 continue
-            from_port, to_port = _port(raw.get("FromPort")), _port(raw.get("ToPort"))
-            protocol = raw.get("Protocol")
-            if from_port is None or to_port is None or from_port > to_port or protocol not in _IP_PROTOCOLS:
-                continue
-            row: dict[str, Any] = {"FromPort": from_port, "ToPort": to_port, "Protocol": protocol}
             scope = _inbound_scope(raw.get("IpRange"))
             if scope:
                 row["Scope"] = scope
             kept.append(row)
         projected["InstanceInboundPermissions"] = kept
-        truncated = len(permissions) > MAX_INBOUND_PERMISSIONS
-    result: dict[str, Any] = {"status": STATUS_TRUNCATED if truncated else STATUS_OK, "ContainerFleet": projected}
-    if truncated:
-        result["truncated"] = True
-    return result
+        if len(permissions) > MAX_INBOUND_PERMISSIONS:
+            nested.capped = True
+    elif permissions is not None:
+        nested.dropped = True
+    return _apply_nested({"status": STATUS_OK, "ContainerFleet": projected}, nested)
 
 
 __all__ = [

@@ -47,6 +47,12 @@ Each section and the envelope carry one of ``complete``, ``empty``,
 ``denied``, ``unavailable``, ``malformed``, ``partial``, or ``truncated``,
 plus independent ``stale``, ``partial``, ``truncated``, and ``hasMore`` flags
 and code-owned failure counts. Provider text never reaches the model or logs.
+
+A mixed section is never ``complete`` (the #464 rule). A nested list cut at
+its cap makes a complete section ``truncated`` with ``nestedTruncated``. A
+nested port or container entry dropped because it failed validation makes the
+section ``partial`` with ``nestedDropped`` (this module's equivalent of
+GameLift's ``incomplete`` + ``malformed_response``).
 """
 
 from __future__ import annotations
@@ -261,40 +267,66 @@ def _metadata(obj: Mapping[str, Any]) -> dict[str, Any] | None:
 # Nested projections                                                          #
 # --------------------------------------------------------------------------- #
 class _Flags:
-    """Collects per-item bound hits so a section can report truncation."""
+    """Collects per-item bound hits and validation drops for one section."""
 
     def __init__(self) -> None:
         self.nested_truncated = False
+        self.nested_dropped = 0
+
+
+def _checked(raw: Mapping[str, Any], values: Mapping[str, Any], flags: _Flags) -> dict[str, Any]:
+    """Compact ``values`` and record a drop when a present raw field failed validation.
+
+    ``values`` maps each reviewed raw key to its validated value (``None`` when
+    it failed). A raw value that is present but failed counts as one dropped
+    nested entry, so the section cannot report ``complete``.
+    """
+    if any(raw.get(key) is not None and value is None for key, value in values.items()):
+        flags.nested_dropped += 1
+    return _compact(values)
+
+
+def _nested_list(value: Any, cap: int, flags: _Flags) -> list[Any]:
+    """The capped raw list. A non-list present value counts as a drop."""
+    if not isinstance(value, list):
+        if value is not None:
+            flags.nested_dropped += 1
+        return []
+    if len(value) > cap:
+        flags.nested_truncated = True
+    return value[:cap]
 
 
 def _project_ports(value: Any, flags: _Flags) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    if len(value) > MAX_PORTS:
-        flags.nested_truncated = True
     ports: list[dict[str, Any]] = []
-    for raw in value[:MAX_PORTS]:
-        port = _mapping(raw)
-        projected = _compact(
+    for raw in _nested_list(value, MAX_PORTS, flags):
+        if not isinstance(raw, Mapping):
+            flags.nested_dropped += 1
+            continue
+        projected = _checked(
+            raw,
             {
-                "name": _string(port.get("name"), _PORT_NAME),
-                "portPolicy": _enum(port.get("portPolicy"), _PORT_POLICIES),
-                "protocol": _enum(port.get("protocol"), _PROTOCOLS),
-                "containerPort": _int(port.get("containerPort"), 1, _MAX_PORT),
-                "hostPort": _int(port.get("hostPort"), 1, _MAX_PORT),
-                "container": _string(port.get("container"), _CONTAINER_NAME),
-            }
+                "name": _string(raw.get("name"), _PORT_NAME),
+                "portPolicy": _enum(raw.get("portPolicy"), _PORT_POLICIES),
+                "protocol": _enum(raw.get("protocol"), _PROTOCOLS),
+                "containerPort": _int(raw.get("containerPort"), 1, _MAX_PORT),
+                "hostPort": _int(raw.get("hostPort"), 1, _MAX_PORT),
+                "container": _string(raw.get("container"), _CONTAINER_NAME),
+            },
+            flags,
         )
         if projected:
             ports.append(projected)
+        else:
+            flags.nested_dropped += 1
     return ports
 
 
-def _project_resources(value: Any) -> dict[str, Any]:
+def _project_resources(value: Any, flags: _Flags) -> dict[str, Any]:
     resources = _mapping(value)
     requests = _mapping(resources.get("requests"))
     limits = _mapping(resources.get("limits"))
-    return _compact(
+    projected = _compact(
         {
             "cpuRequest": _string(requests.get("cpu"), _QUANTITY, 32),
             "memoryRequest": _string(requests.get("memory"), _QUANTITY, 32),
@@ -302,6 +334,15 @@ def _project_resources(value: Any) -> dict[str, Any]:
             "memoryLimit": _string(limits.get("memory"), _QUANTITY, 32),
         }
     )
+    raw = {
+        "cpuRequest": requests.get("cpu"),
+        "memoryRequest": requests.get("memory"),
+        "cpuLimit": limits.get("cpu"),
+        "memoryLimit": limits.get("memory"),
+    }
+    if any(raw_value is not None and key not in projected for key, raw_value in raw.items()):
+        flags.nested_dropped += 1
+    return projected
 
 
 def _project_containers(pod_spec: Mapping[str, Any], flags: _Flags) -> list[dict[str, Any]]:
@@ -310,23 +351,24 @@ def _project_containers(pod_spec: Mapping[str, Any], flags: _Flags) -> list[dict
     ``env``, ``envFrom``, ``command``, ``args``, ``volumeMounts``, and every
     other container field are dropped.
     """
-    value = pod_spec.get("containers")
-    if not isinstance(value, list):
-        return []
-    if len(value) > MAX_CONTAINERS:
-        flags.nested_truncated = True
     containers: list[dict[str, Any]] = []
-    for raw in value[:MAX_CONTAINERS]:
-        container = _mapping(raw)
-        projected = _compact(
+    for raw in _nested_list(pod_spec.get("containers"), MAX_CONTAINERS, flags):
+        if not isinstance(raw, Mapping):
+            flags.nested_dropped += 1
+            continue
+        projected = _checked(
+            raw,
             {
-                "name": _string(container.get("name"), _CONTAINER_NAME),
-                "image": project_image_reference(container.get("image")),
-                "resources": _project_resources(container.get("resources")),
-            }
+                "name": _string(raw.get("name"), _CONTAINER_NAME),
+                "image": project_image_reference(raw.get("image")),
+                "resources": _project_resources(raw.get("resources"), flags),
+            },
+            flags,
         )
         if projected:
             containers.append(projected)
+        else:
+            flags.nested_dropped += 1
     return containers
 
 
@@ -397,17 +439,19 @@ def project_gameserver(obj: Any, flags: _Flags | None = None) -> dict[str, Any] 
     spec = _mapping(resource.get("spec"))
     status = _mapping(resource.get("status"))
     status_ports: list[dict[str, Any]] = []
-    raw_status_ports = status.get("ports")
-    if isinstance(raw_status_ports, list):
-        if len(raw_status_ports) > MAX_PORTS:
-            flags.nested_truncated = True
-        for raw in raw_status_ports[:MAX_PORTS]:
-            port = _mapping(raw)
-            projected_port = _compact(
-                {"name": _string(port.get("name"), _PORT_NAME), "port": _int(port.get("port"), 1, _MAX_PORT)}
-            )
-            if projected_port:
-                status_ports.append(projected_port)
+    for raw in _nested_list(status.get("ports"), MAX_PORTS, flags):
+        if not isinstance(raw, Mapping):
+            flags.nested_dropped += 1
+            continue
+        projected_port = _checked(
+            raw,
+            {"name": _string(raw.get("name"), _PORT_NAME), "port": _int(raw.get("port"), 1, _MAX_PORT)},
+            flags,
+        )
+        if projected_port:
+            status_ports.append(projected_port)
+        else:
+            flags.nested_dropped += 1
     return _compact(
         {
             **meta,
@@ -794,7 +838,10 @@ class AgonesInventoryTool(AgentTool):
             items.append(projected)
 
         outcome = _section_outcome(len(selected), len(items), failures, has_more, list_partial)
-        if outcome == OUTCOME_COMPLETE and flags.nested_truncated:
+        if flags.nested_dropped and outcome in (OUTCOME_COMPLETE, OUTCOME_TRUNCATED):
+            # A dropped nested entry makes the view partial, never complete.
+            outcome = OUTCOME_PARTIAL
+        elif outcome == OUTCOME_COMPLETE and flags.nested_truncated:
             outcome = OUTCOME_TRUNCATED
         out: dict[str, Any] = {
             "outcome": outcome,
@@ -808,6 +855,8 @@ class AgonesInventoryTool(AgentTool):
         if flags.nested_truncated:
             out["truncated"] = True
             out["nestedTruncated"] = True
+        if flags.nested_dropped:
+            out["nestedDropped"] = flags.nested_dropped
         if failures:
             out["failures"] = dict(sorted(failures.items()))
         if failures.get(_READ_STALE):
