@@ -727,9 +727,9 @@ def test_account_obs_default_makes_no_mutation_when_supported():
 
 
 def test_account_obs_default_points_to_console_or_launch_when_xray_and_spans_absent():
-    # Destination XRay, 'aws/spans' absent: the opt-in cannot create the group,
-    # and a first-time enable FROM 'XRay' (XRay -> CloudWatchLogs) does not
-    # create it either. So the default warning must point to the console or the
+    # Destination XRay, 'aws/spans' absent: the opt-in is not guaranteed to
+    # create the group, and Step 1.7 cannot tell in advance whether a
+    # first-time enable will. So the default warning must point to the console or the
     # deploy's own launch + recheck, and must NOT print the XRay -> CloudWatchLogs
     # toggle pair or recommend the opt-in.
     result = _account_obs_harness("false", _obs_mock(destination="XRay", spans=False))
@@ -1421,7 +1421,7 @@ def test_preflight_stop_switch_halts_when_toolkit_would_change(shell):
 def test_preflight_stop_switch_remedy_leads_with_console_when_spans_absent(shell):
     """When the stop switch halts and 'aws/spans' is absent, the remedy must lead
     with the one-time console enable and must NOT recommend the opt-in run: the
-    opt-in cannot create 'aws/spans', so without it the opt-in writes the policy,
+    opt-in is not guaranteed to create 'aws/spans', so then the opt-in could write the policy,
     switches the destination, and still stops at Step 1.7."""
     result = _preflight_harness(
         _preflight_mock(destination="XRay", toolkit_policy_present=False, default_indexing_present=True, spans=False),
@@ -2206,10 +2206,11 @@ def test_deploy_e2e_stop_switch_halts_at_launch_guard_when_state_changes_later(t
 
 @pytest.mark.parametrize("shell", _OBS_SHELLS)
 def test_account_obs_optin_fails_when_spans_absent_after_enable(shell):
-    """A first-time API enable (destination XRay -> CloudWatchLogs) does not
-    create the AWS-reserved 'aws/spans' log group (starter-toolkit issue 457).
-    The opt-in enables additively and never toggles, so when 'aws/spans' is still
-    absent after the enable it must fail with the one-time manual step, not exit 0
+    """A first-time API enable (destination XRay -> CloudWatchLogs) normally
+    creates the AWS-reserved 'aws/spans' log group, but that is not guaranteed
+    (starter-toolkit issue 457). The opt-in enables additively and never toggles,
+    so when 'aws/spans' is still absent after the enable it must fail with the
+    one-time manual step, not exit 0
     with a soft warning that reports success it did not achieve.
     """
     result = _account_obs_harness("true", _obs_mock(destination="XRay", spans=False), shell=shell)
@@ -2230,7 +2231,7 @@ def test_account_obs_optin_names_pending_destination_when_wait_expires(shell):
     """When the destination never reaches ACTIVE within the wait budget and
     'aws/spans' is still absent, the failure must name the still-PENDING
     destination (wait and re-run, or check its status) rather than blaming a
-    first-time enable that cannot create the group. The trace-destination
+    first-time enable that did not create the group. The trace-destination
     transition can take longer than the wait budget, so this is the likely
     cause when the wait expired.
     """
