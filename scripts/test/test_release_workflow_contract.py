@@ -447,17 +447,81 @@ class ActionPinContractTests(unittest.TestCase):
         test_text = TEST_WORKFLOW_PATH.read_text(encoding="utf-8")
 
         for name in ("actions/checkout", "actions/upload-artifact", "actions/download-artifact"):
-            # Majors declared in test.yml (floating @vN form).
-            test_majors = {m.group(1) for m in re.finditer(rf"{re.escape(name)}@v(\d+)", test_text)}
-            # Majors declared in release.yml (SHA-pinned, major from the comment).
-            rel_majors = {m.group(1) for m in re.finditer(rf"{re.escape(name)}@[0-9a-f]{{40}}\s*#\s*v(\d+)", self.text)}
+            # Both workflows pin to a 40-hex sha; the major comes from the
+            # trailing `# vX.Y.Z` comment.
+            pinned = rf"{re.escape(name)}@[0-9a-f]{{40}}\s*#\s*v(\d+)"
+            test_majors = {m.group(1) for m in re.finditer(pinned, test_text)}
+            rel_majors = {m.group(1) for m in re.finditer(pinned, self.text)}
+            # An empty test.yml set would compare as consistent with anything.
+            self.assertTrue(test_majors, msg=f"test.yml must use {name} (SHA-pinned)")
             if name == "actions/download-artifact" and not rel_majors:
                 self.fail("release.yml must use actions/download-artifact (SHA-pinned)")
             if rel_majors:
-                self.assertTrue(
-                    rel_majors.issubset(test_majors) or test_majors.issubset(rel_majors) or rel_majors == test_majors,
+                self.assertEqual(
+                    rel_majors,
+                    test_majors,
                     msg=f"{name}: release majors {rel_majors} != test majors {test_majors}",
                 )
+
+
+WORKFLOWS_DIR = PROJECT_ROOT / ".github" / "workflows"
+
+
+def _unpinned_uses(text: str) -> list[str]:
+    """Return every `uses:` ref in ``text`` not pinned to a 40-hex commit sha.
+
+    Local actions (``./...``) and container refs (``docker://...``) are exempt.
+    """
+
+    bad = []
+    for match in re.finditer(r"^\s*-?\s*uses:\s*['\"]?([^\s'\"#]+)", text, re.MULTILINE):
+        ref = match.group(1)
+        if ref.startswith("./") or ref.startswith("docker://"):
+            continue
+        if not re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", ref):
+            bad.append(ref)
+    return bad
+
+
+class AllWorkflowsActionPinContractTests(unittest.TestCase):
+    """Every `uses:` in every workflow is pinned to a commit sha, not a tag."""
+
+    def test_workflows_exist(self):
+        self.assertTrue(sorted(WORKFLOWS_DIR.glob("*.yml")), "no workflows found")
+
+    def test_every_workflow_uses_is_sha_pinned(self):
+        for path in sorted(WORKFLOWS_DIR.glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                bad = _unpinned_uses(path.read_text(encoding="utf-8"))
+                self.assertEqual(bad, [], msg=f"{path.name}: unpinned actions: {bad}")
+
+    def test_floating_tag_is_rejected(self):
+        sample = textwrap.dedent(
+            """\
+            steps:
+              - uses: actions/checkout@v7
+              - uses: astral-sh/setup-uv@v7.6.0
+              - uses: actions/setup-node@main
+              - uses: actions/cache@55cc834 # short sha
+            """
+        )
+        self.assertEqual(
+            _unpinned_uses(sample),
+            ["actions/checkout@v7", "astral-sh/setup-uv@v7.6.0", "actions/setup-node@main", "actions/cache@55cc834"],
+        )
+
+    def test_sha_pin_and_exempt_refs_are_accepted(self):
+        sample = textwrap.dedent(
+            """\
+            steps:
+              - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                  persist-credentials: false
+              - uses: ./.github/actions/local
+              - uses: docker://alpine:3.20
+            """
+        )
+        self.assertEqual(_unpinned_uses(sample), [])
 
 
 class RunBlockInterpolationContractTests(unittest.TestCase):
