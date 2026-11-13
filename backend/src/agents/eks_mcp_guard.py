@@ -956,6 +956,7 @@ _LOGGABLE_OPS = _EKS_ALLOWED | frozenset({"call_aws", AGONES_INVENTORY_TOOL})
 # operation, kind, or body.
 _AGONES_LIST_DELEGATE = "list_k8s_resources"
 _AGONES_READ_DELEGATE = "manage_k8s_resource"
+_AGONES_VERSIONS_DELEGATE = "list_api_versions"  # already model-facing and read-only
 
 
 # --------------------------------------------------------------------------- #
@@ -2190,7 +2191,7 @@ class EksMcpGuardedProvider(_GuardedProviderBase):
             # Local modules
             from agents.agones_discovery import AgonesInventoryTool
 
-            guarded.append(AgonesInventoryTool(list_delegate, read_delegate))
+            guarded.append(AgonesInventoryTool(list_delegate, read_delegate, by_name.get(_AGONES_VERSIONS_DELEGATE)))
         return guarded
 
 

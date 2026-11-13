@@ -63,6 +63,17 @@ class _FakeCluster:
         self.list_calls: list[dict[str, Any]] = []
         self.read_calls: list[dict[str, Any]] = []
         self.hang = False
+        self.api_versions: Any = ["apps/v1", "agones.dev/v1", "autoscaling.agones.dev/v1"]
+        self.versions_error: str | None = None
+        self.versions_calls: list[dict[str, Any]] = []
+
+    def versions_result(self, inp: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+        self.versions_calls.append(dict(inp))
+        if self.versions_error is not None:
+            return "error", [{"text": self.versions_error}]
+        versions = self.api_versions
+        count = len(versions) if isinstance(versions, list) else 0
+        return "success", _success({"cluster_name": inp["cluster_name"], "api_versions": versions, "count": count})
 
     def list_result(self, inp: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
         self.list_calls.append(dict(inp))
@@ -159,6 +170,7 @@ def _tools(cluster: _FakeCluster) -> list[AgentTool]:
         _FakeTool("list_k8s_resources", cluster.list_result, cluster),
         _FakeTool("manage_k8s_resource", cluster.read_result, cluster),
         _FakeTool("apply_yaml", cluster.read_result, cluster),
+        _FakeTool("list_api_versions", cluster.versions_result, cluster),
     ]
     return list(asyncio.run(guard_eks_mcp_client("eks-mcp-server", _Provider(delegates)).load_tools()))
 
@@ -735,3 +747,57 @@ def test_outcomes_are_mutually_distinct():
     assert ad.combine_outcomes(["complete", "truncated"]) == "truncated"
     assert ad.combine_outcomes(["complete", "denied"]) == "partial"
     assert ad.combine_outcomes(["denied", "denied", "denied"]) == "denied"
+
+
+# --------------------------------------------------------------------------- #
+# Agones not installed (#781 review item 5)                                   #
+# --------------------------------------------------------------------------- #
+def test_agones_not_installed_is_distinct_and_reads_nothing():
+    cluster = _populated()
+    cluster.api_versions = ["apps/v1", "batch/v1", "networking.k8s.io/v1"]
+    status, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert status == "error"
+    assert body["outcome"] == ad.OUTCOME_NOT_INSTALLED == "not_installed"
+    assert body["errorCode"] == "AGONES_NOT_INSTALLED"
+    assert cluster.versions_calls == [{"cluster_name": CLUSTER}]
+    assert cluster.list_calls == [] and cluster.read_calls == []
+
+
+def test_not_installed_differs_from_unavailable():
+    cluster = _populated()
+    cluster.list_error = {kind: "Failed to list Fleet resources: timed out" for kind in cluster.objects}
+    _, unavailable, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert unavailable["outcome"] == "unavailable" and "errorCode" not in unavailable
+
+    cluster.api_versions = ["apps/v1"]
+    _, not_installed, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert not_installed["outcome"] == "not_installed"
+
+
+def test_agones_installed_reads_as_usual():
+    cluster = _populated()
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert body["outcome"] == "complete"
+    assert cluster.versions_calls == [{"cluster_name": CLUSTER}]
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        pytest.param(lambda c: setattr(c, "versions_error", "Failed to get API versions: (403) forbidden"), id="error"),
+        pytest.param(lambda c: setattr(c, "api_versions", "agones.dev/v1"), id="not-a-list"),
+        pytest.param(lambda c: setattr(c, "api_versions", []), id="empty-list"),
+    ],
+)
+def test_undecided_version_check_falls_back_to_the_reads(setup):
+    cluster = _populated()
+    setup(cluster)
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    assert body["outcome"] == "complete"
+    assert cluster.list_calls
+
+
+def test_version_check_is_not_made_for_an_unenrolled_cluster():
+    cluster = _populated()
+    _run(_inventory_tool(cluster), {"cluster_name": "other-cluster"})
+    assert cluster.versions_calls == []

@@ -22,6 +22,11 @@ Read-only by construction
 -------------------------
 * The model-facing schema has no ``operation``, ``kind``, ``api_version``,
   ``body``, or selector field. Those values are fixed in code.
+* ``list_api_versions`` is called first, with only the cluster name. When the
+  cluster answers and does not serve ``agones.dev/v1``, the tool returns a
+  distinct ``not_installed`` outcome (``AGONES_NOT_INSTALLED``) instead of
+  reading kinds that do not exist. If that check fails, the reads still run and
+  report their own typed outcomes.
 * ``list_k8s_resources`` is called with a pinned kind and API version.
   ``manage_k8s_resource`` is called ONLY with ``operation="read"``, a pinned
   Agones kind, a name taken from the list result, and no ``body``. That
@@ -44,7 +49,8 @@ registry hosts, and every unreviewed field are dropped.
 Outcomes
 --------
 Each section and the envelope carry one of ``complete``, ``empty``,
-``denied``, ``unavailable``, ``malformed``, ``partial``, or ``truncated``,
+``denied``, ``unavailable``, ``malformed``, ``partial``, or ``truncated``
+(the whole envelope can also be ``not_installed``),
 plus independent ``stale``, ``partial``, ``truncated``, and ``hasMore`` flags
 and code-owned failure counts. Provider text never reaches the model or logs.
 
@@ -126,6 +132,8 @@ _READ_PLAN: tuple[tuple[str, str, str, int], ...] = (
 )
 AGONES_READ_KINDS = frozenset((kind, api_version) for _, kind, api_version, _ in _READ_PLAN)
 READ_OPERATION = "read"
+AGONES_API_VERSION = "agones.dev/v1"
+MAX_API_VERSIONS = 2_000  # entries considered from one list_api_versions result
 
 # --------------------------------------------------------------------------- #
 # Fixed messages and codes                                                    #
@@ -133,9 +141,12 @@ READ_OPERATION = "read"
 _MSG_NOT_ENROLLED = "This cluster is not in the assistant's enrolled discovery scope."
 _MSG_BAD_INPUT = "This request was rejected because an argument is not permitted or out of bounds."
 _MSG_WITHHELD = "The Agones inventory exceeded the maximum size and was withheld."
+_MSG_NOT_INSTALLED = "Agones is not installed on this cluster: it does not serve the agones.dev/v1 API."
 
 _CODE_NOT_ENROLLED = "not_enrolled"
 _CODE_DENIED_INPUT = "denied_input"
+_CODE_NOT_INSTALLED = "AGONES_NOT_INSTALLED"
+OUTCOME_NOT_INSTALLED = "not_installed"
 
 # --------------------------------------------------------------------------- #
 # Grammars and enums                                                          #
@@ -674,10 +685,13 @@ def _list_names(
 class AgonesInventoryTool(AgentTool):
     """Code-owned, read-only Agones inventory over the guarded EKS MCP path."""
 
-    def __init__(self, list_delegate: AgentTool, read_delegate: AgentTool) -> None:
+    def __init__(
+        self, list_delegate: AgentTool, read_delegate: AgentTool, versions_delegate: AgentTool | None = None
+    ) -> None:
         super().__init__()
         self._list = list_delegate
         self._read = read_delegate
+        self._versions = versions_delegate
         self._calls = 0
 
     @property
@@ -696,7 +710,8 @@ class AgonesInventoryTool(AgentTool):
                 "Read-only, bounded Agones inventory for one enrolled EKS cluster: Fleets, FleetAutoscalers, "
                 "and a sample of GameServers with their replica, allocation, scaling, port, image, and Region "
                 "facts. Returns a versioned envelope whose outcome is complete, empty, denied, unavailable, "
-                "malformed, partial, or truncated. Creates or changes nothing."
+                "malformed, partial, or truncated, or not_installed when the cluster does not serve the "
+                "Agones API. Creates or changes nothing."
             ),
             "inputSchema": {
                 "json": {
@@ -759,6 +774,28 @@ class AgonesInventoryTool(AgentTool):
             "input": tool_input,
         }
         return await _drain_final_result(delegate, use, invocation_state, deadline_seconds=remaining, **kwargs)
+
+    async def _agones_installed(
+        self, tool_use_id: str, cluster: str, invocation_state: dict[str, Any], deadline: float, **kwargs: Any
+    ) -> bool | None:
+        """``False`` only when the cluster answered and lacks ``agones.dev/v1``.
+
+        ``None`` means the check could not decide (no delegate, error,
+        timeout, or an unexpected shape); the caller then reads as usual.
+        """
+        if self._versions is None:
+            return None
+        remaining = deadline - asyncio.get_running_loop().time()
+        result = await self._call(
+            self._versions, tool_use_id, {"cluster_name": cluster}, invocation_state, remaining, **kwargs
+        )
+        if result is None or result.get("status") == "error":
+            return None
+        payload = _extract_eks_payload(result)
+        versions = _mapping(payload).get("api_versions")
+        if not isinstance(versions, list) or not versions or len(versions) > MAX_API_VERSIONS:
+            return None
+        return AGONES_API_VERSION in versions
 
     async def _section(
         self,
@@ -885,6 +922,9 @@ class AgonesInventoryTool(AgentTool):
             return
 
         deadline = asyncio.get_running_loop().time() + INVENTORY_DEADLINE_SECONDS
+        if await self._agones_installed(tool_use_id, cluster, invocation_state, deadline, **kwargs) is False:
+            yield self._error(tool_use_id, OUTCOME_NOT_INSTALLED, _CODE_NOT_INSTALLED, _MSG_NOT_INSTALLED)
+            return
         envelope: dict[str, Any] = {
             "v": AGONES_ENVELOPE_VERSION,
             "operation": AGONES_INVENTORY_TOOL,
@@ -928,6 +968,7 @@ def combine_outcomes(outcomes: Sequence[str]) -> str:
 
 
 __all__ = [
+    "AGONES_API_VERSION",
     "AGONES_ENVELOPE_VERSION",
     "AGONES_READ_KINDS",
     "AgonesInventoryTool",
@@ -940,6 +981,7 @@ __all__ = [
     "MAX_GAMESERVERS",
     "MAX_PORTS",
     "MAX_STRING",
+    "OUTCOME_NOT_INSTALLED",
     "READ_OPERATION",
     "combine_outcomes",
     "enrolled_clusters",

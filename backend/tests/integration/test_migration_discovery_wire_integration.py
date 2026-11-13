@@ -52,9 +52,17 @@ CFLEET_ID = "containerfleet-0a1b2c3d-1111-2222-3333-4444aaaabbbb"
 class _InMemoryK8s:
     """Minimal stand-in for the handler's ``K8sApis`` client."""
 
-    def __init__(self, objects: dict[str, list[dict[str, Any]]]) -> None:
+    def __init__(self, objects: dict[str, list[dict[str, Any]]], api_versions: Sequence[str] | None = None) -> None:
         self.objects = objects
         self.operations: list[Operation] = []
+        self.api_versions = (
+            list(api_versions)
+            if api_versions is not None
+            else ["apps/v1", "agones.dev/v1", "autoscaling.agones.dev/v1"]
+        )
+
+    def get_api_versions(self):
+        return list(self.api_versions)
 
     def list_resources(self, kind, api_version, namespace=None, label_selector=None, field_selector=None):
         items = [ResourceInstance(None, obj) for obj in self.objects.get(kind, [])]
@@ -75,6 +83,7 @@ class _HandlerTool(AgentTool):
         "list_k8s_resources": {"namespace": None, "label_selector": None, "field_selector": None},
         "manage_k8s_resource": {"name": None, "namespace": None, "body": None},
         "apply_yaml": {},
+        "list_api_versions": {},
     }
 
     def __init__(self, handler: K8sHandler, name: str) -> None:
@@ -176,9 +185,10 @@ def _run_inventory(k8s: _InMemoryK8s) -> tuple[dict[str, Any], str]:
     handler = K8sHandler(MagicMock())
     assert handler.allow_write is False and handler.allow_sensitive_data_access is False
     handler.get_client = lambda cluster_name: k8s  # type: ignore[method-assign]
-    delegates = [_HandlerTool(handler, n) for n in ("list_k8s_resources", "manage_k8s_resource", "apply_yaml")]
+    names = ("list_k8s_resources", "manage_k8s_resource", "apply_yaml", "list_api_versions")
+    delegates = [_HandlerTool(handler, n) for n in names]
     tools = list(asyncio.run(guard_eks_mcp_client("eks-mcp-server", _Provider(delegates)).load_tools()))
-    assert {t.tool_name for t in tools} == {"list_k8s_resources", "get_agones_inventory"}
+    assert {t.tool_name for t in tools} == {"list_k8s_resources", "list_api_versions", "get_agones_inventory"}
     tool = next(t for t in tools if t.tool_name == "get_agones_inventory")
 
     async def _go():
@@ -229,6 +239,19 @@ def test_agones_stale_and_denied_over_real_handler(monkeypatch):
     body, text = _run_inventory(_Forbidden(_agones_objects()))
     assert body["outcome"] == "denied"
     assert ACCOUNT not in text and "assumed-role" not in text
+
+
+def test_agones_not_installed_over_real_handler(monkeypatch):
+    monkeypatch.setattr(ad.settings, "EKS_DISCOVERY_CLUSTERS_RAW", CLUSTER, raising=False)
+
+    class _NoAgones(_InMemoryK8s):
+        def list_resources(self, *args, **kwargs):
+            raise RuntimeError("No matches found for {'kind': 'Fleet', 'api_version': 'agones.dev/v1'}")
+
+    k8s = _NoAgones({}, api_versions=["apps/v1", "batch/v1"])
+    body, _ = _run_inventory(k8s)
+    assert body["outcome"] == "not_installed" and body["errorCode"] == "AGONES_NOT_INSTALLED"
+    assert k8s.operations == []
 
 
 # --------------------------------------------------------------------------- #
