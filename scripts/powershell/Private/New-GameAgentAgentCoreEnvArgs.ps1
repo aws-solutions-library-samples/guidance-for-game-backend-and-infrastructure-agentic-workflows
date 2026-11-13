@@ -6,6 +6,9 @@ function New-GameAgentAgentCoreEnvArgs {
         [Parameter(Mandatory)][string]$OrchestratorModelId,
         [Parameter(Mandatory)][string]$SpecialistModelId,
         [string]$GuardrailId = '',
+        # Published Guardrail version from the Guardrails stack. Required with a
+        # Guardrail ID: the runtime pins it and never falls back to DRAFT (#782).
+        [string]$GuardrailVersion = '',
         [string]$OrchestratorPromptArn = '',
         [string]$GameLiftPromptArn = '',
         [string]$EksPromptArn = '',
@@ -43,9 +46,12 @@ function New-GameAgentAgentCoreEnvArgs {
         '-env', 'OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_unredacted_attributes='
     )
     $hasGuardrail = $GuardrailId -and $GuardrailId -ne 'None'
+    if ($hasGuardrail -and $GuardrailVersion -notmatch '^[1-9][0-9]*$') {
+        throw "Guardrail $GuardrailId has no published version to pin (got '$GuardrailVersion')."
+    }
     $optionalValues = [ordered]@{
         GBAW_BEDROCK_GUARDRAIL_ID       = if ($hasGuardrail) { $GuardrailId } else { '' }
-        GBAW_BEDROCK_GUARDRAIL_VERSION  = if ($hasGuardrail) { 'DRAFT' } else { '' }
+        GBAW_BEDROCK_GUARDRAIL_VERSION  = if ($hasGuardrail) { $GuardrailVersion } else { '' }
         GBAW_ORCHESTRATOR_PROMPT_ARN    = $OrchestratorPromptArn
         GBAW_GAMELIFT_PROMPT_ARN        = $GameLiftPromptArn
         GBAW_EKS_PROMPT_ARN             = $EksPromptArn
