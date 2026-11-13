@@ -20,8 +20,8 @@ pytestmark = pytest.mark.unit
 FLEET = "fleet-0a1b2c3d-1111-2222-3333-4444aaaabbbb"
 
 
-def _agones(*names, outcome="complete", has_more=False):
-    section = {"outcome": outcome, "items": [{"name": n, "namespace": "games"} if n else {} for n in names]}
+def _agones(*names, outcome="complete", has_more=False, namespace="games"):
+    section = {"outcome": outcome, "items": [{"name": n, "namespace": namespace} if n else {} for n in names]}
     if has_more:
         section["hasMore"] = True
     return {"v": AGONES_ENVELOPE_VERSION, "fleets": section}
@@ -114,3 +114,57 @@ def test_invalid_gamelift_values_are_ignored():
     gamelift = _gamelift(classic=[("arn:aws:gamelift:us-west-2:000000000000:fleet/x", "echo")])
     result = correlate(_agones("echo"), gamelift)
     assert result["mappings"][0]["match"] == UNMATCHED
+
+
+def _agones_rows(*rows, outcome="complete"):
+    return {
+        "v": AGONES_ENVELOPE_VERSION,
+        "fleets": {"outcome": outcome, "items": [{"namespace": ns, "name": n} for ns, n in rows]},
+    }
+
+
+@pytest.mark.parametrize(
+    "gamelift",
+    [
+        _gamelift(container_names=["game"]),
+        _gamelift(classic=[(FLEET, "game")]),
+    ],
+)
+def test_same_name_in_two_namespaces_is_ambiguous_not_many_to_one(gamelift):
+    """team-a/game and team-b/game must not both map to one GameLift fleet."""
+    result = correlate(_agones_rows(("team-a", "game"), ("team-b", "game")), gamelift)
+
+    assert result["outcome"] == "complete"
+    assert [(m["namespace"], m["agonesFleet"]) for m in result["mappings"]] == [
+        ("team-a", "game"),
+        ("team-b", "game"),
+    ]
+    for row in result["mappings"]:
+        assert row["match"] == AMBIGUOUS
+        assert row["candidateCount"] == 1
+        assert row["sharedCandidate"] is True
+        assert "gameLift" not in row
+
+
+def test_same_name_in_two_namespaces_with_two_candidates_names_no_target():
+    gamelift = _gamelift(container_names=["game", "game"])
+    result = correlate(_agones_rows(("team-a", "game"), ("team-b", "game")), gamelift)
+
+    assert {m["match"] for m in result["mappings"]} == {AMBIGUOUS}
+    assert all("gameLift" not in m for m in result["mappings"])
+
+
+def test_duplicate_agones_rows_never_match():
+    result = correlate(_agones_rows(("games", "echo"), ("games", "echo")), _gamelift(container_names=["echo"]))
+
+    assert [m["match"] for m in result["mappings"]] == [AMBIGUOUS, AMBIGUOUS]
+
+
+def test_unshared_candidate_still_matches_next_to_a_shared_one():
+    gamelift = _gamelift(container_names=["game", "lobby"])
+    result = correlate(_agones_rows(("team-a", "game"), ("team-b", "game"), ("team-a", "lobby")), gamelift)
+
+    by_key = {(m["namespace"], m["agonesFleet"]): m for m in result["mappings"]}
+    assert by_key[("team-a", "lobby")]["match"] == MATCHED
+    assert by_key[("team-a", "game")]["match"] == AMBIGUOUS
+    assert by_key[("team-b", "game")]["match"] == AMBIGUOUS

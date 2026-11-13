@@ -10,9 +10,15 @@ Rules:
 * A mapping exists only on an exact, case-sensitive identifier match:
   an Agones Fleet name equal to a GameLift container fleet's
   ``GameServerContainerGroupDefinitionName``, or to a classic fleet's ``Name``.
-* Exactly one candidate is ``matched``. Two or more is ``ambiguous`` and names
-  no target. Zero is ``unmatched`` only when both inventories are complete;
-  otherwise it is ``undetermined``, because the missing row may be unread.
+* Agones Fleets are keyed by namespace and name, so ``team-a/game`` and
+  ``team-b/game`` are two fleets.
+* Exactly one candidate is ``matched``, but only when no other Agones Fleet
+  claims that same GameLift fleet. A candidate claimed by two or more Agones
+  Fleets makes every claiming row ``ambiguous`` with ``sharedCandidate`` and no
+  target: a name match cannot tell which Agones Fleet it migrated from.
+* Two or more candidates is ``ambiguous`` and names no target. Zero is
+  ``unmatched`` only when both inventories are complete; otherwise it is
+  ``undetermined``, because the missing row may be unread.
 * An Agones fleet without a valid name is ``unidentified``.
 * Output order is sorted by namespace and name, so the result is stable.
 
@@ -45,9 +51,17 @@ _AGONES_COMPLETE = frozenset({"complete", "empty"})
 _GAMELIFT_COMPLETE = frozenset({"ok", "empty"})
 
 
-def _gamelift_candidates(fleet_list: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
-    """Index validated GameLift rows by their exact correlation key."""
-    index: dict[str, list[dict[str, Any]]] = {}
+Candidate = tuple[int, dict[str, Any]]
+
+
+def _gamelift_candidates(fleet_list: Mapping[str, Any]) -> dict[str, list[Candidate]]:
+    """Index validated GameLift rows by their exact correlation key.
+
+    Each candidate carries a code-owned position so two GameLift rows with the
+    same projected fields are still counted as two candidates.
+    """
+    index: dict[str, list[Candidate]] = {}
+    position = 0
     containers = fleet_list.get("ContainerFleets")
     for row in containers if isinstance(containers, list) else []:
         if not isinstance(row, Mapping):
@@ -55,19 +69,26 @@ def _gamelift_candidates(fleet_list: Mapping[str, Any]) -> dict[str, list[dict[s
         key = row.get("GameServerContainerGroupDefinitionName")
         if _valid_typed_string(key, _NAME):
             index.setdefault(key, []).append(
-                {
-                    "FleetType": "container",
-                    "GameServerContainerGroupDefinitionName": key,
-                    "basis": "container_group_definition_name",
-                }
+                (
+                    position,
+                    {
+                        "FleetType": "container",
+                        "GameServerContainerGroupDefinitionName": key,
+                        "basis": "container_group_definition_name",
+                    },
+                )
             )
+            position += 1
     classics = fleet_list.get("ClassicFleets")
     for row in classics if isinstance(classics, list) else []:
         if not isinstance(row, Mapping):
             continue
         key, fleet_id = row.get("Name"), row.get("FleetId")
         if _valid_typed_string(key, _NAME) and _valid_fleet_id(fleet_id):
-            index.setdefault(key, []).append({"FleetType": "classic", "FleetId": fleet_id, "basis": "fleet_name"})
+            index.setdefault(key, []).append(
+                (position, {"FleetType": "classic", "FleetId": fleet_id, "basis": "fleet_name"})
+            )
+            position += 1
     return index
 
 
@@ -95,27 +116,40 @@ def correlate(agones_inventory: Any, gamelift_fleet_list: Any) -> dict[str, Any]
     )
     index = _gamelift_candidates(gamelift_fleet_list)
 
-    rows: list[tuple[str, str, dict[str, Any]]] = []
+    # First pass: identify each Agones Fleet by (namespace, name) and collect
+    # its candidates, counting how many Agones Fleets claim each candidate.
+    identified: list[tuple[str, str, list[Candidate]]] = []
+    unidentified = 0
+    claims: dict[int, int] = {}
     for fleet in raw_fleets:
         fleet = fleet if isinstance(fleet, Mapping) else {}
         name = fleet.get("name")
         namespace = fleet.get("namespace")
-        namespace = namespace if isinstance(namespace, str) and _NAMESPACE.match(namespace) else None
+        namespace = namespace if isinstance(namespace, str) and _NAMESPACE.match(namespace) else ""
         if not isinstance(name, str) or not _K8S_NAME.match(name):
-            rows.append(("", "", {"match": UNIDENTIFIED}))
+            unidentified += 1
             continue
         candidates = index.get(name, [])
+        for position, _ in candidates:
+            claims[position] = claims.get(position, 0) + 1
+        identified.append((namespace, name, candidates))
+
+    rows: list[tuple[str, str, dict[str, Any]]] = [("", "", {"match": UNIDENTIFIED}) for _ in range(unidentified)]
+    for namespace, name, candidates in identified:
         row: dict[str, Any] = {"agonesFleet": name, "candidateCount": len(candidates)}
         if namespace:
             row["namespace"] = namespace
-        if len(candidates) == 1:
+        shared = any(claims[position] > 1 for position, _ in candidates)
+        if len(candidates) == 1 and not shared:
             row["match"] = MATCHED
-            row["gameLift"] = dict(candidates[0])
-        elif len(candidates) > 1:
+            row["gameLift"] = dict(candidates[0][1])
+        elif candidates:
             row["match"] = AMBIGUOUS
+            if shared:
+                row["sharedCandidate"] = True
         else:
             row["match"] = UNMATCHED if complete else UNDETERMINED
-        rows.append((namespace or "", name, row))
+        rows.append((namespace, name, row))
 
     rows.sort(key=lambda entry: (entry[0], entry[1]))
     mappings = [row for _, _, row in rows[:MAX_CORRELATED_FLEETS]]
