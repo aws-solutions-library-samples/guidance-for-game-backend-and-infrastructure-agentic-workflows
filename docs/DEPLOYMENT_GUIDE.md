@@ -536,6 +536,25 @@ needed, and V1 behaves the same):
   Prompt Management cannot be read during startup, the runtime uses the
   code-defined prompt text, which is the text that is published. On V2 that
   fallback lasts until the next runtime update instead of the next session.
+- The Guardrail is pinned to a published version, the same way. The Guardrails
+  stack publishes a numbered version (`GameAgentGuardrailVersion`) and outputs
+  it as `GuardrailVersion`; the full deployment passes it to the runtime as
+  `GBAW_BEDROCK_GUARDRAIL_VERSION` and refuses to deploy without one. Edits to
+  the Guardrail's working draft, in the console or through the API, do not
+  reach users. To change the policy, edit
+  `infrastructure/cloudformation/04-bedrock-guardrails.yaml` and run the full
+  deployment: the deployment passes a SHA-256 of the template as
+  `GuardrailPolicyFingerprint`, so a changed template publishes a new version,
+  then the runtime update pins it. An unchanged template keeps the current
+  version. Roll back by reverting the template change and redeploying, which
+  publishes the earlier policy as a new version. Earlier versions are retained
+  on replacement, so the running runtime keeps working until its update
+  finishes; deleting the Guardrails stack deletes them all. Bedrock limits how
+  many versions one Guardrail can hold, so after many policy changes delete
+  versions nothing pins with `aws bedrock delete-guardrail
+  --guardrail-identifier <id> --guardrail-version <old-version>`. A local
+  backend with no `GBAW_BEDROCK_GUARDRAIL_VERSION` uses `DRAFT`, the working
+  copy, which suits iterating on a policy before you commit it.
 - Startup work (imports and container pre-warming) must report healthy within
   120 seconds. On V2 a slower startup fails the create or update with a health
   check error, which the helper reports with the runtime's failure reason.
@@ -570,9 +589,15 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
 # short-lived access token from a provisioned Cognito test user (in the
-# `admin` or `users` group)
-export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
+# `admin` or `users` group). The helper signs in with SRP, the only password
+# flow the app client allows, and prints only the access token. Run `npm ci`
+# in ui/ first. It prompts for the password, or reads GBAW_TEST_USER_PASSWORD;
+# it never takes the password as an argument.
+export GBAW_TEST_ACCESS_TOKEN="$(cd ui && node scripts/get-test-access-token.mjs --username <test-user>)"
 ./test-ai-evals.sh
+
+# Delete a temporary test user when validation is done
+aws cognito-idp admin-delete-user --user-pool-id <user-pool-id> --username <test-user>
 
 # Confirm startup logged both resolved model roles
 aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
@@ -987,6 +1012,7 @@ The profile names track the current model generation (`GameAgent-Orchestrator-Cl
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
+| `GBAW_BEDROCK_GUARDRAIL_VERSION` | No | deployment: the Guardrails stack's published `GuardrailVersion`; local: `DRAFT` | Guardrail version the runtime evaluates. Set by the deployment, not by operators; `DRAFT` is the mutable working copy and is for local iteration only |
 | `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` | No | false | Opt in to account-wide X-Ray / CloudWatch Logs changes (trace destination, indexing rule, shared Logs resource policy). See [Account-wide Observability](#account-wide-observability-scoped-and-opt-in) |
 | `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` | No | unset | Opt-in only: X-Ray default indexing (sampling) percent, integer [0, 100]. Left unchanged when unset |
 | `GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME` | No | `GameAgentTransactionSearchXRayAccess` | Opt-in only: project-owned CloudWatch Logs resource policy name |
