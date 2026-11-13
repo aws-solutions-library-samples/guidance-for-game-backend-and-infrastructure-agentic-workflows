@@ -853,3 +853,31 @@ def test_status_marker_and_server_text_still_classify(text, expected):
     result = {"status": "error", "content": [{"text": text}]}
     name = text.split("/", 1)[1].split(":", 1)[0]
     assert ad._classify_failure(result, (CLUSTER, "games", name)) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Anchored grammars reject a trailing newline (#781 review item 7)            #
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {"cluster_name": CLUSTER, "namespace": "games\n"},
+        {"cluster_name": CLUSTER + "\n"},
+    ],
+)
+def test_trailing_newline_input_is_denied_before_any_provider_call(tool_input):
+    cluster = _populated()
+    status, body, _ = _run(_inventory_tool(cluster), tool_input)
+    assert status == "error" and body["errorCode"] == "denied_input"
+    assert cluster.versions_calls == [] and cluster.list_calls == []
+
+
+def test_trailing_newline_values_are_not_projected():
+    fleet = _fleet("echo")
+    fleet["metadata"]["namespace"] = "games\n"
+    fleet["metadata"]["creationTimestamp"] = "2026-10-01T00:00:00Z\n"
+    projected = ad.project_fleet(fleet)
+    assert projected is not None
+    assert "namespace" not in projected and "creationTimestamp" not in projected
+    assert ad.project_fleet(_fleet("echo\n")) is None
+    assert ad.enrolled_clusters("ok-cluster,bad\ncluster") == frozenset({"ok-cluster"})

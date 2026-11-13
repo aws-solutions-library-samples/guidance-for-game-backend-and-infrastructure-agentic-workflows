@@ -45,6 +45,7 @@ UNMATCHED = "unmatched"
 UNDETERMINED = "undetermined"
 UNIDENTIFIED = "unidentified"
 
+# Applied with ``fullmatch`` so a trailing newline ("games\n") is rejected.
 _K8S_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,126}[a-z0-9])?$")
 _NAMESPACE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 _AGONES_COMPLETE = frozenset({"complete", "empty"})
@@ -124,8 +125,8 @@ def correlate(agones_inventory: Any, gamelift_fleet_list: Any) -> dict[str, Any]
         fleet = fleet if isinstance(fleet, Mapping) else {}
         name = fleet.get("name")
         namespace = fleet.get("namespace")
-        namespace = namespace if isinstance(namespace, str) and _NAMESPACE.match(namespace) else ""
-        if not isinstance(name, str) or not _K8S_NAME.match(name):
+        namespace = namespace if isinstance(namespace, str) and _NAMESPACE.fullmatch(namespace) else ""
+        if not isinstance(name, str) or not _K8S_NAME.fullmatch(name):
             unidentified += 1
             continue
         candidates = index.get(name, [])

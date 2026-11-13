@@ -197,3 +197,12 @@ def test_container_match_drops_an_invalid_or_classic_fleet_id(bad_id):
     row = result["mappings"][0]
     assert row["match"] == MATCHED
     assert "FleetId" not in row["gameLift"]
+
+
+def test_trailing_newline_namespace_and_name_are_rejected():
+    """``re.match`` with ``^...$`` accepts "games\\n"; fullmatch does not."""
+    result = correlate(_agones_rows(("games\n", "echo")), _gamelift(container_names=["echo"]))
+    assert "namespace" not in result["mappings"][0]
+
+    result = correlate(_agones_rows(("games", "echo\n")), _gamelift(container_names=["echo"]))
+    assert result["mappings"] == [{"match": UNIDENTIFIED}]

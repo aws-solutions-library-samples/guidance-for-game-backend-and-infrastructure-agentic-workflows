@@ -87,6 +87,7 @@ _PLAYER_GATEWAY_STATUS = frozenset({"DISABLED", "ENABLED"})
 _LOCATION_UPDATE_STATUS = frozenset({"PENDING_UPDATE"})
 _CONTAINER_BILLING = frozenset({"ON_DEMAND", "SPOT"})
 
+# Applied with ``fullmatch`` so a trailing newline is rejected.
 _DESTINATION_ARN = re.compile(r"^arn:aws[a-z-]*:gamelift:([a-z0-9-]{1,32}):\d{12}:(fleet|alias)/([A-Za-z0-9-]{1,128})$")
 _ALIAS_ID = re.compile(r"^alias-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -101,7 +102,7 @@ def valid_container_group_definition_name(value: Any) -> bool:
     """A plain definition name (never an ARN) within the service grammar."""
     return (
         isinstance(value, str)
-        and _CONTAINER_GROUP_DEFINITION_NAME.match(value) is not None
+        and _CONTAINER_GROUP_DEFINITION_NAME.fullmatch(value) is not None
         and _valid_typed_string(value, _NAME)
     )
 
@@ -182,7 +183,7 @@ def project_queue_destination(value: Any) -> dict[str, Any] | None:
     arn = value.get("DestinationArn")
     if not isinstance(arn, str):
         return None
-    match = _DESTINATION_ARN.match(arn)
+    match = _DESTINATION_ARN.fullmatch(arn)
     if match is None:
         return None
     region, resource_type, resource_id = match.groups()
@@ -192,7 +193,7 @@ def project_queue_destination(value: Any) -> dict[str, Any] | None:
         if not _valid_fleet_id(resource_id):
             return None
         return {"Type": "fleet", "FleetId": resource_id, "Region": region}
-    if _ALIAS_ID.match(resource_id) is None:
+    if _ALIAS_ID.fullmatch(resource_id) is None:
         return None
     return {"Type": "alias", "AliasId": resource_id, "Region": region}
 
@@ -397,13 +398,13 @@ def _project_container(value: Any, support: bool, nested: _Nested) -> tuple[dict
         return {}, False
     out: dict[str, Any] = {}
     name = value.get("ContainerName")
-    if isinstance(name, str) and _CONTAINER_NAME.match(name) and _valid_typed_string(name, _NAME):
+    if isinstance(name, str) and _CONTAINER_NAME.fullmatch(name) and _valid_typed_string(name, _NAME):
         out["ContainerName"] = name
     image = project_image_reference(value.get("ImageUri"))
     if image is not None:
         out["Image"] = image
     digest = value.get("ResolvedImageDigest")
-    if isinstance(digest, str) and _SHA256.match(digest):
+    if isinstance(digest, str) and _SHA256.fullmatch(digest):
         out["ResolvedImageDigest"] = digest
     vcpu = value.get("Vcpu")
     if vcpu is not None and _valid_number(vcpu):
@@ -422,7 +423,7 @@ def _project_container(value: Any, support: bool, nested: _Nested) -> tuple[dict
             out["Essential"] = essential
     else:
         sdk = value.get("ServerSdkVersion")
-        if isinstance(sdk, str) and _SDK_VERSION.match(sdk):
+        if isinstance(sdk, str) and _SDK_VERSION.fullmatch(sdk):
             out["ServerSdkVersion"] = sdk
     return out, cut
 

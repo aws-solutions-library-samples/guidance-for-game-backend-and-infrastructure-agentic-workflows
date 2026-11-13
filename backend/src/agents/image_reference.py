@@ -34,6 +34,7 @@ REGISTRY_DOCKER_HUB = "docker-hub"
 REGISTRY_OTHER = "other"
 
 _CONTROL_CHARS = re.compile(r"[\x00-\x20\x7f-\x9f]")
+# Grammars are applied with ``fullmatch`` so a trailing newline is rejected.
 _ECR_PRIVATE_HOST = re.compile(r"^\d{12}\.dkr\.ecr(?:-fips)?\.([a-z]{2,}(?:-[a-z0-9]+){1,4})\.amazonaws\.com(?:\.cn)?$")
 _DOCKER_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
 _REGION = re.compile(r"^[a-z]{2,}(-[a-z0-9]+){1,4}$")
@@ -61,10 +62,10 @@ def _classify_registry(host: str | None) -> tuple[str, str | None]:
         return REGISTRY_DOCKER_HUB, None
     if host == "public.ecr.aws":
         return REGISTRY_ECR_PUBLIC, None
-    match = _ECR_PRIVATE_HOST.match(host)
+    match = _ECR_PRIVATE_HOST.fullmatch(host)
     if match:
         region = match.group(1)
-        return REGISTRY_ECR_PRIVATE, region if _REGION.match(region) else None
+        return REGISTRY_ECR_PRIVATE, region if _REGION.fullmatch(region) else None
     return REGISTRY_OTHER, None
 
 
@@ -101,19 +102,19 @@ def project_image_reference(value: Any) -> dict[str, Any] | None:
     if (
         repository
         and len(repository) <= MAX_REPOSITORY_LENGTH
-        and _REPOSITORY.match(repository)
+        and _REPOSITORY.fullmatch(repository)
         and not _SENSITIVE.search(repository)
     ):
         out["repository"] = repository
     else:
         complete = False
     if tag is not None:
-        if len(tag) <= MAX_TAG_LENGTH and _TAG.match(tag) and not _SENSITIVE.search(tag):
+        if len(tag) <= MAX_TAG_LENGTH and _TAG.fullmatch(tag) and not _SENSITIVE.search(tag):
             out["tag"] = tag
         else:
             complete = False
     if at:
-        if _DIGEST.match(digest):
+        if _DIGEST.fullmatch(digest):
             out["digest"] = digest
         else:
             complete = False

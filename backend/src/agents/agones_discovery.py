@@ -151,6 +151,8 @@ OUTCOME_NOT_INSTALLED = "not_installed"
 # --------------------------------------------------------------------------- #
 # Grammars and enums                                                          #
 # --------------------------------------------------------------------------- #
+# Every grammar is applied with ``fullmatch``: ``re.match`` with ``^...$``
+# would accept a trailing newline ("games\n").
 _K8S_OBJECT_NAME = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,126}[a-z0-9])?$")
 _PORT_NAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$")
 _CONTAINER_NAME = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
@@ -199,7 +201,7 @@ def enrolled_clusters(raw: str | None = None) -> frozenset[str]:
     names: list[str] = []
     for part in value.split(","):
         name = part.strip()
-        if not name or not _EKS_NAME.match(name):
+        if not name or not _EKS_NAME.fullmatch(name):
             continue
         if any(shape.search(name) for shape in _SENSITIVE_SCALAR_SHAPES):
             continue
@@ -212,7 +214,7 @@ def enrolled_clusters(raw: str | None = None) -> frozenset[str]:
 
 def _runtime_region() -> str | None:
     region = settings.AWS_REGION
-    return region if isinstance(region, str) and _REGION.match(region) else None
+    return region if isinstance(region, str) and _REGION.fullmatch(region) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +228,7 @@ def _string(value: Any, grammar: "re.Pattern[str]", limit: int = MAX_STRING) -> 
     """A grammar-valid string with no control character or sensitive shape."""
     if not isinstance(value, str) or not value or len(value) > limit:
         return None
-    if _CONTROL_CHARS.search(value) or not grammar.match(value):
+    if _CONTROL_CHARS.search(value) or not grammar.fullmatch(value):
         return None
     if any(shape.search(value) for shape in _SENSITIVE_SCALAR_SHAPES):
         return None
@@ -248,7 +250,7 @@ def _bool(value: Any) -> bool | None:
 
 
 def _timestamp(value: Any) -> str | None:
-    if not isinstance(value, str) or len(value) > 40 or not _ISO_TIMESTAMP.match(value):
+    if not isinstance(value, str) or len(value) > 40 or not _ISO_TIMESTAMP.fullmatch(value):
         return None
     return value
 
@@ -776,12 +778,12 @@ class AgonesInventoryTool(AgentTool):
         if not isinstance(inp, Mapping) or set(inp) - {"cluster_name", "namespace"}:
             return None
         cluster = inp.get("cluster_name")
-        if not isinstance(cluster, str) or not _EKS_NAME.match(cluster):
+        if not isinstance(cluster, str) or not _EKS_NAME.fullmatch(cluster):
             return None
         if any(shape.search(cluster) for shape in _SENSITIVE_SCALAR_SHAPES):
             return None
         namespace = inp.get("namespace")
-        if namespace is not None and (not isinstance(namespace, str) or not _NAMESPACE.match(namespace)):
+        if namespace is not None and (not isinstance(namespace, str) or not _NAMESPACE.fullmatch(namespace)):
             return None
         return cluster, namespace
 

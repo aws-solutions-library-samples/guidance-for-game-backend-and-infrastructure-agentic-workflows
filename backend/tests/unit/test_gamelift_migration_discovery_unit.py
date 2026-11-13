@@ -639,3 +639,24 @@ def test_clean_container_fleet_ports_are_ok():
         }
     )
     assert result["status"] == "ok" and "truncated" not in result and "error" not in result
+
+
+# --------------------------------------------------------------------------- #
+# Anchored grammars reject a trailing newline (#781 review item 7)            #
+# --------------------------------------------------------------------------- #
+def test_trailing_newline_values_are_rejected():
+    arn = f"arn:aws:gamelift:us-west-2:{ACCOUNT}:fleet/{FLEET}"
+    assert gmp.project_queue_destination({"DestinationArn": arn}) is not None
+    assert gmp.project_queue_destination({"DestinationArn": arn + "\n"}) is None
+    assert (
+        gmp.project_queue_destination({"DestinationArn": f"arn:aws:gamelift:us-west-2:{ACCOUNT}:alias/{ALIAS}\n"})
+        is None
+    )
+    assert not gmp.valid_container_group_definition_name("echo\n")
+
+    raw = _definition()
+    game = raw["ContainerGroupDefinition"]["GameServerContainerDefinition"]
+    game["ServerSdkVersion"] = "5.2.0\n"
+    game["ResolvedImageDigest"] = "sha256:" + "a" * 64 + "\n"
+    projected = gmp.project_container_group_definition(raw)["ContainerGroupDefinition"]["GameServerContainerDefinition"]
+    assert "ServerSdkVersion" not in projected and "ResolvedImageDigest" not in projected
