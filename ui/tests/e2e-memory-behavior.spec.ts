@@ -20,6 +20,10 @@ test.skip(
 );
 
 test.describe('Memory System - Local Environment', { tag: ['@e2e', '@memory', '@integration', '@ai', '@slow'] }, () => {
+  // These tests share one local dev actor and its memory, and each one sends
+  // several real agent turns. Run them one at a time so parallel workers do not
+  // trip the local rate limit or interleave memory writes (#410).
+  test.describe.configure({ mode: 'serial' });
   test.setTimeout(300000); // Multiple real agent turns per test
 
   test.beforeEach(async ({ page }) => {
@@ -41,8 +45,9 @@ test.describe('Memory System - Local Environment', { tag: ['@e2e', '@memory', '@
     const response2 = await sendAndAwaitReply(page, "What's my name?");
     console.log('✅ Response 2:', response2.substring(0, 200));
 
-    // Verify name is remembered
-    expect(response2.toLowerCase()).toContain('test user');
+    // Verify name is remembered. Match the distinctive tokens, not the exact
+    // phrase, so "Test-User" or "TestUser" in the reply still counts (#410).
+    expect(response2).toMatch(/test[\s-]*user/i);
     console.log('✅ PASS: STM working - name remembered in same session');
   });
 
@@ -74,12 +79,14 @@ test.describe('Memory System - Local Environment', { tag: ['@e2e', '@memory', '@
     // Ask about first fact
     console.log('📝 Asking about name...');
     const response1 = await sendAndAwaitReply(page, "What's my name?");
-    expect(response1.toLowerCase()).toContain('multi fact user');
+    // The model may shorten the name ("your name is Multi Fact"), so require
+    // only its distinctive tokens rather than the full phrase (#410).
+    expect(response1).toMatch(/multi[\s-]*fact/i);
 
     // Ask about second fact
     console.log('📝 Asking about work...');
     const response2 = await sendAndAwaitReply(page, 'What do I work on?');
-    expect(response2.toLowerCase()).toContain('gamelift');
+    expect(response2).toMatch(/game[\s-]*lift/i);
 
     console.log('✅ PASS: Multiple facts stored and retrieved');
   });
