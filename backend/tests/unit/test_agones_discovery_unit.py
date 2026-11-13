@@ -801,3 +801,55 @@ def test_version_check_is_not_made_for_an_unenrolled_cluster():
     cluster = _populated()
     _run(_inventory_tool(cluster), {"cluster_name": "other-cluster"})
     assert cluster.versions_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Object names cannot steer error classification (#781 review item 6)         #
+# --------------------------------------------------------------------------- #
+def _timeout_text(namespace: str, name: str) -> str:
+    return (
+        f"Failed to read Fleet {namespace}/{name}: HTTPSConnectionPool(host='synthetic', port=443): "
+        f"Max retries exceeded with url: /apis/agones.dev/v1/namespaces/{namespace}/fleets/{name} "
+        "(Caused by ReadTimeoutError('Read timed out. (read timeout=25)'))"
+    )
+
+
+@pytest.mark.parametrize("name", ["forbidden-arena", "notfound-arena", "unauthorized-arena", "accessdenied-arena"])
+def test_read_timeout_on_a_steering_name_is_unavailable(name):
+    cluster = _FakeCluster()
+    cluster.objects["Fleet"] = [_fleet(name)]
+    cluster.read_error[("Fleet", name)] = _timeout_text("games", name)
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER})
+    fleets = body["fleets"]
+    assert fleets["failures"] == {"unavailable": 1}
+    assert fleets["outcome"] == "unavailable"
+    assert "stale" not in fleets
+
+
+def test_list_timeout_in_a_steering_namespace_is_unavailable():
+    cluster = _populated()
+    cluster.list_error = {
+        kind: (
+            f"Failed to list {kind} resources: HTTPSConnectionPool(host='synthetic', port=443): "
+            "Max retries exceeded with url: /apis/agones.dev/v1/namespaces/forbidden/fleets (Read timed out)"
+        )
+        for kind in cluster.objects
+    }
+    _, body, _ = _run(_inventory_tool(cluster), {"cluster_name": CLUSTER, "namespace": "forbidden"})
+    assert body["outcome"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Failed to read Fleet games/notfound-arena: (403)\nReason: Forbidden", "denied"),
+        ("Failed to read Fleet games/forbidden-arena: (404)\nReason: Not Found", "stale"),
+        ("Failed to read Fleet games/forbidden-arena: (500)\nReason: Internal Server Error", "unavailable"),
+        ("Failed to read Fleet games/notfound-arena: fleets.agones.dev is forbidden", "denied"),
+        ("Failed to read Fleet games/forbidden-arena: fleets.agones.dev not found", "stale"),
+    ],
+)
+def test_status_marker_and_server_text_still_classify(text, expected):
+    result = {"status": "error", "content": [{"text": text}]}
+    name = text.split("/", 1)[1].split(":", 1)[0]
+    assert ad._classify_failure(result, (CLUSTER, "games", name)) == expected

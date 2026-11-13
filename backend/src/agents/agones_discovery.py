@@ -533,8 +533,25 @@ _READ_MALFORMED = "malformed"
 _READ_SKIPPED = "skipped"
 
 
-def _classify_failure(result: Mapping[str, Any]) -> str:
+# eks-mcp-server error prefixes: "Failed to {operation} {kind} {ns}/{name}: "
+# for manage_k8s_resource and "Failed to list {kind} resources: " for
+# list_k8s_resources. The object name and namespace sit inside this prefix, so
+# it is removed before any marker is scanned.
+_SERVER_ERROR_PREFIX = re.compile(r"\AFailed to [a-z]+ [A-Za-z]+(?: [^:\s]*)?: ")
+# A Kubernetes ApiException renders as "(403)\nReason: Forbidden ...".
+_STATUS_MARKER = re.compile(r"\A\s*\((\d{3})\)")
+_DENIED_STATUS = frozenset({"401", "403"})
+_STALE_STATUS = frozenset({"404"})
+
+
+def _classify_failure(result: Mapping[str, Any], identifiers: Sequence[str] = ()) -> str:
     """Return a typed failure code from a bounded prefix; the text is discarded.
+
+    Object names cannot steer the code. The server's known prefix, which
+    carries the namespace and name, is removed first. A leading HTTP status
+    marker such as ``(403)`` or ``(404)`` then decides. Otherwise the words are
+    scanned after every caller-known identifier (cluster, namespace, object
+    name) is blanked out, because a timeout message can repeat the request URL.
 
     ``not found`` after a successful list means the object went away between
     list and read, so the listing is stale rather than unavailable.
@@ -543,7 +560,17 @@ def _classify_failure(result: Mapping[str, Any]) -> str:
     if isinstance(content, list):
         for item in content:
             if isinstance(item, Mapping) and isinstance(item.get("text"), str):
-                low = item["text"][:_CLASSIFY_ERROR_PREFIX].lower()
+                text = _SERVER_ERROR_PREFIX.sub("", item["text"][:_CLASSIFY_ERROR_PREFIX], count=1)
+                status = _STATUS_MARKER.match(text)
+                if status:
+                    if status.group(1) in _DENIED_STATUS:
+                        return _READ_DENIED
+                    if status.group(1) in _STALE_STATUS:
+                        return _READ_STALE
+                    return _READ_UNAVAILABLE
+                for identifier in sorted((i for i in identifiers if i), key=len, reverse=True):
+                    text = text.replace(identifier, " ")
+                low = text.lower()
                 if "forbidden" in low or "accessdenied" in low or "not authorized" in low or "unauthorized" in low:
                     return _READ_DENIED
                 if "not found" in low or "notfound" in low:
@@ -822,7 +849,7 @@ class AgonesInventoryTool(AgentTool):
         if listed is None:
             return {"outcome": OUTCOME_UNAVAILABLE, "items": [], "returned": 0}
         if listed.get("status") == "error":
-            code = _classify_failure(listed)
+            code = _classify_failure(listed, (cluster, namespace or ""))
             outcome = OUTCOME_DENIED if code == _READ_DENIED else OUTCOME_UNAVAILABLE
             return {"outcome": outcome, "items": [], "returned": 0}
         payload = _extract_eks_payload(listed)
@@ -858,7 +885,7 @@ class AgonesInventoryTool(AgentTool):
                 failures[_READ_UNAVAILABLE] = failures.get(_READ_UNAVAILABLE, 0) + 1
                 continue
             if result.get("status") == "error":
-                code = _classify_failure(result)
+                code = _classify_failure(result, (cluster, item_namespace or "", name))
                 failures[code] = failures.get(code, 0) + 1
                 continue
             data = _extract_eks_payload(result)
