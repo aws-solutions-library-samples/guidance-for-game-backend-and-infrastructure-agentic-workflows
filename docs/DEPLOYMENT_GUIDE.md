@@ -550,6 +550,24 @@ cd infrastructure/kubernetes
 
 This grants Game Agent read-only access to monitor pods, nodes, deployments, and services. The script uses EKS access entries for `API` and `API_AND_CONFIG_MAP` clusters and `aws-auth` for legacy `CONFIG_MAP` clusters. If the active identity cannot apply Kubernetes RBAC, pass `--kube-role-arn` with an administrator role.
 
+### Allow Agones Discovery on Enrolled Clusters (Optional)
+
+The EKS specialist's read-only Agones inventory tool (`get_agones_inventory`) reads only clusters named in `GBAW_EKS_DISCOVERY_CLUSTERS`. This is a deploy setting. Set it as an environment variable or in `backend/.env.local`, then deploy:
+
+```bash
+GBAW_EKS_DISCOVERY_CLUSTERS=your-cluster-name,another-cluster ./deploy-all.sh
+```
+
+```powershell
+$env:GBAW_EKS_DISCOVERY_CLUSTERS = 'your-cluster-name,another-cluster'; Deploy-GameAgent
+```
+
+- The value is a comma-separated list of up to 20 EKS cluster names. Each name starts with a letter or digit and then has up to 99 letters, digits, `.`, `_`, or `-`. Spaces around commas are removed.
+- The deploy stops with an error for an empty entry, a duplicate name, an invalid name, more than 20 names, or a value with a line break.
+- When the setting is unset or empty, it is not passed to the runtime, and the tool answers `not_enrolled` for every cluster. A model or a request cannot add a cluster.
+- Each redeploy passes the full runtime environment. To remove a cluster, redeploy without it.
+- The setting grants no Kubernetes access. The cluster must also be enrolled (above), and the runtime role needs `get`, `list`, and `watch` on the `agones.dev` and `autoscaling.agones.dev` API groups. Enrollment does not grant those groups. Without that access, the tool answers `denied`.
+
 ### Verify Deployment Health
 
 ```bash

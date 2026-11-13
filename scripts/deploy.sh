@@ -402,6 +402,65 @@ fi
 echo "   Cost snapshot table: ${COST_SNAPSHOT_TABLE_NAME}"
 echo "   Cost snapshot TTL:   ${COST_SNAPSHOT_TTL_SECONDS}s (required=${COST_SNAPSHOT_REQUIRED})"
 
+# Validate and normalize the optional Agones discovery enrollment scope (#529).
+# $1 is a comma-separated list of EKS cluster names. Each entry is trimmed and
+# must match the runtime grammar (agents/agones_discovery.py): a letter or digit,
+# then up to 99 letters, digits, '.', '_' or '-'. Empty entries, duplicates, and
+# more than 20 names are rejected, so a typo fails the deploy instead of being
+# silently dropped by the runtime. An empty value prints nothing: the variable is
+# then not passed and the Agones inventory tool fails closed (not_enrolled).
+normalize_eks_discovery_clusters() {
+  local raw="${1:-}"
+  local -a names=() entries=()
+  local entry name existing
+
+  if [ -z "${raw//[[:space:]]/}" ]; then
+    return 0
+  fi
+  if [[ "$raw" == *$'\n'* || "$raw" == *$'\r'* ]]; then
+    echo "❌ GBAW_EKS_DISCOVERY_CLUSTERS must be one line." >&2
+    return 1
+  fi
+  IFS=',' read -r -a entries <<< "$raw"
+  # A trailing comma leaves no final field for read; count commas to catch it.
+  local commas="${raw//[^,]/}"
+  if [ "${#entries[@]}" -ne $(( ${#commas} + 1 )) ]; then
+    echo "❌ GBAW_EKS_DISCOVERY_CLUSTERS has an empty entry." >&2
+    return 1
+  fi
+  for entry in "${entries[@]}"; do
+    name="${entry#"${entry%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then
+      echo "❌ GBAW_EKS_DISCOVERY_CLUSTERS entry '${name}' is not a valid EKS cluster name." >&2
+      return 1
+    fi
+    for existing in "${names[@]}"; do
+      if [ "$existing" = "$name" ]; then
+        echo "❌ GBAW_EKS_DISCOVERY_CLUSTERS lists '${name}' more than once." >&2
+        return 1
+      fi
+    done
+    names+=("$name")
+  done
+  if [ "${#names[@]}" -gt 20 ]; then
+    echo "❌ GBAW_EKS_DISCOVERY_CLUSTERS lists ${#names[@]} clusters; the limit is 20." >&2
+    return 1
+  fi
+  local IFS=','
+  printf '%s\n' "${names[*]}"
+}
+
+EKS_DISCOVERY_CLUSTERS_RAW="${GBAW_EKS_DISCOVERY_CLUSTERS:-$(grep "^GBAW_EKS_DISCOVERY_CLUSTERS=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2- || echo "")}"
+if ! EKS_DISCOVERY_CLUSTERS="$(normalize_eks_discovery_clusters "$EKS_DISCOVERY_CLUSTERS_RAW")"; then
+  exit 1
+fi
+if [ -n "$EKS_DISCOVERY_CLUSTERS" ]; then
+  echo "   Agones discovery clusters: ${EKS_DISCOVERY_CLUSTERS}"
+else
+  echo "   Agones discovery clusters: none (inventory tool fails closed)"
+fi
+
 is_resolved_deployment_value() {
   [ -n "${1:-}" ] && [ "$1" != "None" ]
 }
@@ -454,6 +513,8 @@ build_agentcore_env_args() {
   append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TABLE_NAME" "${COST_SNAPSHOT_TABLE_NAME:-}"
   append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_REQUIRED" "${COST_SNAPSHOT_REQUIRED:-}"
   append_agentcore_env_if_resolved "GBAW_COST_SNAPSHOT_TTL_SECONDS" "${COST_SNAPSHOT_TTL_SECONDS:-}"
+  # Optional Agones discovery enrollment scope (#529); unset means fail closed.
+  append_agentcore_env_if_resolved "GBAW_EKS_DISCOVERY_CLUSTERS" "${EKS_DISCOVERY_CLUSTERS:-}"
   return 0
 }
 

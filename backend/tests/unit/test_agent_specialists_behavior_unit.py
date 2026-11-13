@@ -217,6 +217,7 @@ class TestGameLiftSpecialistBehavior:
             assert result["ContainerFleets"] == [
                 {
                     "FleetType": "container",
+                    "FleetId": "containerfleet-1",
                     "Status": "ACTIVE",
                     "InstanceType": "c6i.large",
                     "BillingType": "ON_DEMAND",
@@ -237,7 +238,8 @@ class TestGameLiftSpecialistBehavior:
                 }
             ]
             row = result["ContainerFleets"][0]
-            assert "FleetId" not in row
+            # The validated container fleet ID is kept (#529); its ARN is not.
+            assert row["FleetId"] == "containerfleet-1"
             assert "FleetArn" not in row
             assert "LogGroupArn" not in row
 

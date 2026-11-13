@@ -453,7 +453,10 @@ Resources:
                   StringEquals:
                     aws:RequestedRegion: !Ref AWS::Region
               # Caller: GameLift specialist (gamelift_specialist.py). Exactly the
-              # ten reviewed operations; every other GameLift read was removed.
+              # twelve reviewed read operations; every other GameLift read was
+              # removed. DescribeGameSessionQueues and
+              # DescribeFleetLocationAttributes serve the read-only migration
+              # discovery tools (#529).
               # Account-scoped exception: collection and capacity reads do not
               # support fleet-ARN scoping, so Resource '*' is region-conditioned
               # instead.
@@ -470,6 +473,8 @@ Resources:
                   - gamelift:DescribeFleetUtilization
                   - gamelift:DescribeFleetCapacity
                   - gamelift:DescribeScalingPolicies
+                  - gamelift:DescribeGameSessionQueues
+                  - gamelift:DescribeFleetLocationAttributes
                 Resource: '*'
                 Condition:
                   StringEquals:

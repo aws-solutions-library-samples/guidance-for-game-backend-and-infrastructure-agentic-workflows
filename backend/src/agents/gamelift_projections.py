@@ -803,6 +803,10 @@ _CLASSIC_FLEET_FIELDS: tuple[tuple[str, str], ...] = (
 # projected by :data:`_CONTAINER_GROUP_FIELDS`.
 _CONTAINER_FLEET_FIELDS: tuple[tuple[str, str], ...] = (
     ("FleetType", _TOKEN),
+    # The ``containerfleet-`` ID, validated with the same fleet-ID grammar as
+    # classic rows. It is the code-owned source for the container fleet ID the
+    # per-fleet migration tools take (#529).
+    ("FleetId", _FLEET_ID),
     ("Status", _ENUM_CONTAINER_FLEET_STATUS),
     ("InstanceType", _INSTANCE_TYPE),
     ("BillingType", _ENUM_CONTAINER_BILLING_TYPE),
