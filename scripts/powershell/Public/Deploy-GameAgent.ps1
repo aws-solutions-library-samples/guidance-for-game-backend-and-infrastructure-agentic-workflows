@@ -666,6 +666,18 @@ function Deploy-GameAgent {
 
         # Step 7: Deploy frontend
         Write-GameAgentStatus 'Step 7: Deploying frontend...' -Type Info
+        # ECS creates its service-linked role on first use. In an account that
+        # has never used ECS, the new role is not yet usable when ECS Express
+        # assumes it, and the frontend stack fails and rolls back (#772). Create
+        # it first and let it propagate; a failure throws before the stack deploy.
+        $invokeAwsForIam = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS IAM command'
+        Initialize-GameAgentServiceLinkedRole `
+            -ServiceName 'ecs.amazonaws.com' `
+            -RoleName 'AWSServiceRoleForECS' `
+            -Region $Region `
+            -InvokeAws $invokeAwsForIam `
+            -PropagationSeconds $env:GBAW_SLR_PROPAGATION_SECONDS `
+            -PollSeconds $env:GBAW_SLR_POLL_SECONDS
         Deploy-Stack -StackName "$ProjectName-frontend" `
             -TemplateFile (Join-Path $infraPath '02-frontend-ecs-express.yaml') `
             -Params @(

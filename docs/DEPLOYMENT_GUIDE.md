@@ -27,6 +27,7 @@ Your AWS account needs the following:
 - **Bedrock Model Access**: Claude Sonnet 5.5 and Claude Haiku 5.5 enabled in your region
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
+- **ECS service-linked role**: In an account that has never used Amazon ECS, the frontend step (Step 7) creates the AWS-managed `AWSServiceRoleForECS` service-linked role when it is missing, then waits for it to propagate before deploying the frontend stack (`GBAW_SLR_PROPAGATION_SECONDS`, default 15, range 0-120). An existing role is left unchanged. The deploying identity needs `iam:GetRole` and `iam:CreateServiceLinkedRole`; if it cannot read the role, the deployment stops before the frontend stack and prints the one-time `aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com` command.
 
 ### Enable Bedrock Models
 

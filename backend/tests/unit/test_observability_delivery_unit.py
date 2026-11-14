@@ -1933,6 +1933,7 @@ def _build_deploy_tree(tmp_path: "pathlib.Path") -> "pathlib.Path":
         "scripts/infrastructure/seed-kb-eks.sh",
         "scripts/infrastructure/seed-kb-cost.sh",
         "scripts/infrastructure/setup-app-observability.sh",
+        "scripts/infrastructure/ensure-service-linked-role.sh",
         "scripts/generate-sbom.sh",
     ):
         p = repo / rel
