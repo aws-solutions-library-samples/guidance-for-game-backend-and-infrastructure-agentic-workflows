@@ -6,6 +6,12 @@ Parameters:
     Type: String
     Default: game-agent
     Description: Project name for resource naming
+  GuardrailPolicyFingerprint:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+    Description: >-
+      SHA-256 of this template (line endings normalized to LF), computed by the
+      deployment scripts. A new value publishes a new Guardrail version.
 
 Resources:
   # Bedrock Guardrail for Game Agent
@@ -147,6 +153,24 @@ Resources:
         - Key: Purpose
           Value: AI Safety and Security
 
+  # Published, immutable snapshot of the policy above. The runtime pins this
+  # version, so later edits to the working draft (console or API) do not reach
+  # users until a deployment publishes and pins a new one.
+  #
+  # Both properties require replacement, and the Guardrail ID never changes, so
+  # the Description carries the template fingerprint: a policy change in this
+  # template replaces this resource, which publishes a new version. The old
+  # version is retained on replacement because the running runtime still pins
+  # it until the deployment updates the runtime. Deleting the stack deletes the
+  # Guardrail, and with it every version.
+  GameAgentGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      GuardrailIdentifier: !GetAtt GameAgentGuardrail.GuardrailId
+      Description: !Sub 'Template fingerprint ${GuardrailPolicyFingerprint}'
+
 Outputs:
   GuardrailId:
     Description: Bedrock Guardrail ID
@@ -161,7 +185,7 @@ Outputs:
       Name: !Sub '${ProjectName}-GuardrailArn'
 
   GuardrailVersion:
-    Description: Bedrock Guardrail Version
-    Value: !GetAtt GameAgentGuardrail.Version
+    Description: Published Bedrock Guardrail version that the runtime pins
+    Value: !GetAtt GameAgentGuardrailVersion.Version
     Export:
       Name: !Sub '${ProjectName}-GuardrailVersion'

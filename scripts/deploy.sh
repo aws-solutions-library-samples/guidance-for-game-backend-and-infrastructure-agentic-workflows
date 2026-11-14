@@ -263,11 +263,30 @@ echo "✅ Cognito JWT authorizer resolved"
 echo ""
 
 # Step 1.5: Deploy Bedrock Guardrails
+# SHA-256 of the Guardrails template with line endings normalized to LF, so the
+# shell and PowerShell paths agree. It is the GuardrailVersion description: a
+# template change publishes a new version; an unchanged template keeps the pin.
+guardrail_template_fingerprint() {
+  # sha256sum on Linux; shasum ships with macOS instead.
+  if command -v sha256sum >/dev/null 2>&1; then
+    tr -d '\r' < "$1" | sha256sum | cut -c1-64
+  else
+    tr -d '\r' < "$1" | shasum -a 256 | cut -c1-64
+  fi
+}
+
+# A published Guardrail version is a positive integer; DRAFT is the mutable
+# working copy and is never pinned by a deployment.
+is_published_guardrail_version() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
 echo "🛡️  Step 1.5: Deploying Bedrock Guardrails..."
+GUARDRAIL_TEMPLATE="$PROJECT_ROOT/infrastructure/cloudformation/04-bedrock-guardrails.yaml"
+GUARDRAIL_POLICY_FINGERPRINT=$(guardrail_template_fingerprint "$GUARDRAIL_TEMPLATE")
 aws cloudformation deploy \
-  --template-file "$PROJECT_ROOT/infrastructure/cloudformation/04-bedrock-guardrails.yaml" \
+  --template-file "$GUARDRAIL_TEMPLATE" \
   --stack-name "${PROJECT_NAME}-guardrails" \
-  --parameter-overrides ProjectName="$PROJECT_NAME" \
+  --parameter-overrides ProjectName="$PROJECT_NAME" GuardrailPolicyFingerprint="$GUARDRAIL_POLICY_FINGERPRINT" \
   --region $AWS_REGION
 
 # Get guardrail ID for AgentCore configuration
@@ -277,7 +296,20 @@ GUARDRAIL_ID=$(aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs[?OutputKey==`GuardrailId`].OutputValue' \
   --output text)
 
-echo "✅ Guardrails deployed: $GUARDRAIL_ID"
+# The runtime pins the published version, never the mutable DRAFT (#782).
+GUARDRAIL_VERSION=$(aws cloudformation describe-stacks \
+  --stack-name "${PROJECT_NAME}-guardrails" \
+  --region $AWS_REGION \
+  --query 'Stacks[0].Outputs[?OutputKey==`GuardrailVersion`].OutputValue' \
+  --output text)
+if [ -n "${GUARDRAIL_ID:-}" ] && [ "$GUARDRAIL_ID" != "None" ] \
+    && ! is_published_guardrail_version "${GUARDRAIL_VERSION:-}"; then
+  echo "❌ Guardrails stack output GuardrailVersion='${GUARDRAIL_VERSION:-}' is not a published version number." >&2
+  echo "   The runtime must pin a published Guardrail version; refusing to fall back to DRAFT." >&2
+  exit 1
+fi
+
+echo "✅ Guardrails deployed: $GUARDRAIL_ID (version ${GUARDRAIL_VERSION:-none})"
 echo ""
 
 # Step 1.6: Deploy Bedrock Managed Prompts
@@ -433,9 +465,15 @@ build_agentcore_env_args() {
   )
 
   if is_resolved_deployment_value "${GUARDRAIL_ID:-}"; then
+    # Pin the published version from the Guardrails stack (#782). Never fall
+    # back to the runtime default (DRAFT, the mutable working copy).
+    if ! is_published_guardrail_version "${GUARDRAIL_VERSION:-}"; then
+      echo "❌ Guardrail $GUARDRAIL_ID has no published version to pin (got '${GUARDRAIL_VERSION:-}')." >&2
+      return 1
+    fi
     AGENTCORE_ENV_ARGS+=(
       -env "GBAW_BEDROCK_GUARDRAIL_ID=$GUARDRAIL_ID"
-      -env "GBAW_BEDROCK_GUARDRAIL_VERSION=DRAFT"
+      -env "GBAW_BEDROCK_GUARDRAIL_VERSION=$GUARDRAIL_VERSION"
     )
   fi
   append_agentcore_env_if_resolved "GBAW_ORCHESTRATOR_PROMPT_ARN" "${GBAW_ORCHESTRATOR_PROMPT_ARN:-}"

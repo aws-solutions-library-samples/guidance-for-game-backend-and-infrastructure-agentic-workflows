@@ -64,9 +64,10 @@ Resources:
   # NOTE: Account-wide resources are NOT managed by this stack
   #
   # aws/spans (NO leading /) - AWS-reserved log group for X-Ray Transaction Search
-  #   Created by AWS only when Transaction Search is enabled in the console or
-  #   toggled (destination disabled then re-enabled). A first-time API enable of
-  #   Transaction Search does NOT create this AWS-reserved log group.
+  #   Created by AWS when Transaction Search is enabled. A first-time API enable
+  #   normally creates it too; if it is still missing, enabling Transaction
+  #   Search in the console or a destination toggle (disable then re-enable)
+  #   creates it.
   #   The opt-in path in setup-account-observability.sh enables Transaction Search
   #   additively and never toggles the shared destination, so it fails (with the
   #   one-time console / toggle step) rather than silently succeeding when the

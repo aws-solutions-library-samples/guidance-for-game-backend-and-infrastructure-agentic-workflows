@@ -335,9 +335,10 @@ Describe 'Invoke-GameAgentAccountObservability' {
     }
 
     It 'Opt-in fails closed when aws/spans is still absent after a first-time enable' {
-        # A first-time API enable (destination XRay -> CloudWatchLogs) does not
-        # create the AWS-reserved aws/spans log group (starter-toolkit issue
-        # 457). The opt-in enables additively and never toggles, so a
+        # A first-time API enable (destination XRay -> CloudWatchLogs) normally
+        # creates the AWS-reserved aws/spans log group, but that is not
+        # guaranteed (starter-toolkit issue 457). The opt-in enables additively
+        # and never toggles, so a
         # still-absent group must fail with the one-time manual step, not report
         # success.
         $mutations = [System.Collections.Generic.List[string]]::new()
@@ -397,7 +398,7 @@ Describe 'Invoke-GameAgentAccountObservability' {
         # The disable/re-enable toggle is the correct remedy from CloudWatchLogs.
         $host_ | Should -Match 'update-trace-segment-destination --destination XRay'
         $host_ | Should -Match 'update-trace-segment-destination --destination CloudWatchLogs'
-        # The recheck never offers the opt-in (it cannot create the group).
+        # The recheck never offers the opt-in (it is not guaranteed to create the group).
         $host_ | Should -Not -Match 'Deploy-GameAgent -ConfigureAccountObservability'
     }
 
