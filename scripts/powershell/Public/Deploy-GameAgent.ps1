@@ -234,6 +234,15 @@ function Deploy-GameAgent {
     Invoke-GameAgentKBDocDownload -Region $Region -ProfileArgs $profileArgs
     Write-Host ''
 
+    # ── Step 0.5: Solution ID tracking stack (AWS Guidance deployment metrics) ──
+    # Mirrors Step 0.5 in scripts/deploy.sh. The stack description carries the
+    # Guidance ID, so a PowerShell deployment is counted like a bash one.
+    Write-GameAgentStatus 'Step 0.5: Deploying Solution ID tracking stack...' -Type Info
+    Deploy-Stack -StackName "$ProjectName-solution-tracking" `
+        -TemplateFile (Join-Path $infraPath '00-solution-tracking.yaml')
+    Write-GameAgentStatus 'Solution tracking deployed (SO9693)' -Type Success
+    Write-Host ''
+
     # ── Step 1: Base infrastructure ──
     Write-GameAgentStatus 'Step 1: Deploying base infrastructure...' -Type Info
 
