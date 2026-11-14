@@ -271,16 +271,20 @@ environment variable are equivalent opt-in triggers.
 **Ownership and preservation.** This repository's opt-in reads existing state
 first and preserves it. It enables Transaction Search only additively (it never
 performs a disable/re-enable toggle of the shared destination) and leaves an
-already-enabled `CloudWatchLogs` destination unchanged. Because a first-time API
-enable does not create the AWS-reserved `aws/spans` log group (only the console
-or a destination toggle does), the opt-in **fails** — with the one-time console
-or toggle step — rather than reporting success when `aws/spans` is still absent
-after the enable. On a fresh account whose destination starts at `XRay`, the
+already-enabled `CloudWatchLogs` destination unchanged. A first-time API enable
+normally creates the AWS-reserved `aws/spans` log group as well: fresh-account
+runs created it, with AWS's default 30-day retention, at the moment the
+destination was set. This is not guaranteed, so the opt-in keeps a safety net.
+If `aws/spans` is still absent after the enable, the opt-in **fails** with the
+one-time console or toggle step rather than reporting success. In that case, on
+a fresh account whose destination starts at `XRay`, the
 opt-in has by then already written the shared resource policy and switched the
 trace destination to `CloudWatchLogs` (and, if you set
 `GBAW_XRAY_DEFAULT_INDEXING_PERCENT`, changed the `Default` indexing rule); those
 changes stay in place (the destination rollback command was printed earlier in
-the run), and only the console or a destination toggle creates `aws/spans`. If it cannot read the
+the run), and the console or a destination toggle creates `aws/spans`. If the
+destination takes longer than the wait budget to reach `ACTIVE`, the opt-in
+warns without failing; a full deployment rechecks it in Step 5c. If it cannot read the
 current trace destination, the opt-in refuses to change it and fails rather than
 guessing. The
 account-wide X-Ray **default indexing (sampling) rule is left unchanged**; it is
@@ -417,7 +421,7 @@ toolkit adds it.
 
 This repository's opt-in uses the project-owned name
 `GameAgentTransactionSearchXRayAccess` by default, which does **not** satisfy the
-toolkit's name-only check. The opt-in cannot create `aws/spans`, and it skips its
+toolkit's name-only check. The opt-in is not guaranteed to create `aws/spans`, and it skips its
 own policy write when another policy already grants `xray.amazonaws.com` access
 to `aws/spans`. So it reaches a passing state only when `aws/spans` already
 exists and no other policy grants that access. On such an account, run the opt-in
@@ -432,7 +436,7 @@ GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY=true \
 
 On an account **without** `aws/spans`, do not use the opt-in to clear the stop
 switch: it would write the shared policy (and switch an `XRay` destination) but
-still stop at Step 1.7, because it cannot create the group. Use the console
+still stop at Step 1.7 if the group is still missing. Use the console
 enable above instead.
 
 **Cleanup.** The warning prints only the rollback commands for the changes it
@@ -533,6 +537,25 @@ needed, and V1 behaves the same):
   Prompt Management cannot be read during startup, the runtime uses the
   code-defined prompt text, which is the text that is published. On V2 that
   fallback lasts until the next runtime update instead of the next session.
+- The Guardrail is pinned to a published version, the same way. The Guardrails
+  stack publishes a numbered version (`GameAgentGuardrailVersion`) and outputs
+  it as `GuardrailVersion`; the full deployment passes it to the runtime as
+  `GBAW_BEDROCK_GUARDRAIL_VERSION` and refuses to deploy without one. Edits to
+  the Guardrail's working draft, in the console or through the API, do not
+  reach users. To change the policy, edit
+  `infrastructure/cloudformation/04-bedrock-guardrails.yaml` and run the full
+  deployment: the deployment passes a SHA-256 of the template as
+  `GuardrailPolicyFingerprint`, so a changed template publishes a new version,
+  then the runtime update pins it. An unchanged template keeps the current
+  version. Roll back by reverting the template change and redeploying, which
+  publishes the earlier policy as a new version. Earlier versions are retained
+  on replacement, so the running runtime keeps working until its update
+  finishes; deleting the Guardrails stack deletes them all. Bedrock limits how
+  many versions one Guardrail can hold, so after many policy changes delete
+  versions nothing pins with `aws bedrock delete-guardrail
+  --guardrail-identifier <id> --guardrail-version <old-version>`. A local
+  backend with no `GBAW_BEDROCK_GUARDRAIL_VERSION` uses `DRAFT`, the working
+  copy, which suits iterating on a policy before you commit it.
 - Startup work (imports and container pre-warming) must report healthy within
   120 seconds. On V2 a slower startup fails the create or update with a health
   check error, which the helper reports with the runtime's failure reason.
@@ -567,9 +590,15 @@ aws cloudformation list-stacks --query 'StackSummaries[?contains(StackName, `gam
 
 # Exercise Guardrail behavior and specialist routing/tool use with a
 # short-lived access token from a provisioned Cognito test user (in the
-# `admin` or `users` group)
-export GBAW_TEST_ACCESS_TOKEN='<short-lived-access-token>'
+# `admin` or `users` group). The helper signs in with SRP, the only password
+# flow the app client allows, and prints only the access token. Run `npm ci`
+# in ui/ first. It prompts for the password, or reads GBAW_TEST_USER_PASSWORD;
+# it never takes the password as an argument.
+export GBAW_TEST_ACCESS_TOKEN="$(cd ui && node scripts/get-test-access-token.mjs --username <test-user>)"
 ./test-ai-evals.sh
+
+# Delete a temporary test user when validation is done
+aws cognito-idp admin-delete-user --user-pool-id <user-pool-id> --username <test-user>
 
 # Confirm startup logged both resolved model roles
 aws logs tail /aws/bedrock-agentcore/runtimes/gameagentruntime-<ID>-DEFAULT \
@@ -984,6 +1013,7 @@ The profile names track the current model generation (`GameAgent-Orchestrator-Cl
 | `NEXT_PUBLIC_SKIP_AUTH` | No | false | Skip auth (dev only) |
 | `GBAW_MEMORY_LONG_TERM_ENABLED` | No | true | Enable cross-session memory |
 | `GBAW_BEDROCK_GUARDRAIL_ENABLED` | No | true | Enable AI safety Guardrails |
+| `GBAW_BEDROCK_GUARDRAIL_VERSION` | No | deployment: the Guardrails stack's published `GuardrailVersion`; local: `DRAFT` | Guardrail version the runtime evaluates. Set by the deployment, not by operators; `DRAFT` is the mutable working copy and is for local iteration only |
 | `GBAW_CONFIGURE_ACCOUNT_OBSERVABILITY` | No | false | Opt in to account-wide X-Ray / CloudWatch Logs changes (trace destination, indexing rule, shared Logs resource policy). See [Account-wide Observability](#account-wide-observability-scoped-and-opt-in) |
 | `GBAW_XRAY_DEFAULT_INDEXING_PERCENT` | No | unset | Opt-in only: X-Ray default indexing (sampling) percent, integer [0, 100]. Left unchanged when unset |
 | `GBAW_OBSERVABILITY_RESOURCE_POLICY_NAME` | No | `GameAgentTransactionSearchXRayAccess` | Opt-in only: project-owned CloudWatch Logs resource policy name |
