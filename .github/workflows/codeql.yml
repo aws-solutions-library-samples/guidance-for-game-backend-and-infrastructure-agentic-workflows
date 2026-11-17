@@ -9,6 +9,13 @@ on:
     # Weekly scan on Sundays at 00:00 UTC
     - cron: '0 0 * * 0'
 
+# Cancel superseded pull request runs (#790); see test.yml for the rationale.
+# Pushes to main and the weekly scheduled scan are never cancelled in progress,
+# and the event name in the group keeps a push from superseding the schedule.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Least-privilege permissions aligned with test.yml.
 # CodeQL needs security-events: write to upload SARIF results.
 permissions:

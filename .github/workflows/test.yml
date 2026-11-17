@@ -14,6 +14,16 @@ on:
     - cron: '0 15 * * 1-5'   # weekdays 8am PT (15:00 UTC)
   workflow_dispatch:
 
+# Cancel superseded pull request runs (#790). A new push to a PR makes the old
+# head's run irrelevant. Pushes to main never cancel in progress: that run is
+# the post-merge verification of main. GitHub still drops an older *pending*
+# run in the same group, so a burst of merges costs about two main runs. The
+# event name is in the group so a push never supersedes the scheduled scan or
+# a workflow_dispatch run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 # Least-privilege default token: jobs only read repo contents. Tightens the
 # GITHUB_TOKEN from the broad default (CodeQL: actions/missing-workflow-permissions).
 permissions:
