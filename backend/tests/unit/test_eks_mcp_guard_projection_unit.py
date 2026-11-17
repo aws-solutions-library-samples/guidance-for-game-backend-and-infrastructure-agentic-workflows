@@ -751,8 +751,11 @@ def test_full_installed_inventory_only_read_subset_survives():
         "get_policies_for_role",
     }
     assert survivors.isdisjoint(must_drop), f"leaked: {survivors & must_drop}"
-    # Every survivor must be a known, projector-backed read tool.
-    assert survivors <= set(installed)
+    # Every survivor must be a known, projector-backed read tool, or the
+    # code-owned read-only Agones inventory (#529), which wraps the dropped
+    # manage_k8s_resource with a pinned read operation.
+    assert survivors <= set(installed) | {"get_agones_inventory"}
+    assert "get_agones_inventory" in survivors
     assert "list_k8s_resources" in survivors
 
 

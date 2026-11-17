@@ -641,7 +641,7 @@ project's own `gameagent*` memory), telemetry writes, and the cost-snapshot
 | CostOptimizationHubReadAccess | `cost-optimization-hub:ListRecommendationSummaries`, `ListRecommendations`, `GetRecommendation` | Billing MCP cost-optimization | `*` (global; no resource type) |
 | ComputeOptimizerReadAccess | `compute-optimizer:GetEC2InstanceRecommendations`, `GetAutoScalingGroupRecommendations`, `GetEnrollmentStatus` | Billing MCP compute-optimizer (EC2 + Auto Scaling rightsizing, and its enrollment probe) | `*` + `aws:RequestedRegion` (regional service, no resource type) |
 | AutoScalingReadAccess | `autoscaling:DescribeAutoScalingGroups`, `DescribeAutoScalingInstances` | Compute Optimizer Auto Scaling dependent reads | `*` + `aws:RequestedRegion` (no resource type) |
-| GameLiftReadAccess | 10 reviewed `gamelift:List*/Describe*` ops | GameLift specialist | `*` + `aws:RequestedRegion` (no fleet-ARN scoping for collection/capacity reads) |
+| GameLiftReadAccess | 12 reviewed `gamelift:List*/Describe*` ops | GameLift specialist (incl. #529 queue and location discovery) | `*` + `aws:RequestedRegion` (no fleet-ARN scoping for collection/capacity reads) |
 | EKSReadAccess | `eks:ListClusters`, `DescribeCluster`, `List/DescribeNodegroup(s)`, `List/DescribeFargateProfile(s)`, `List/DescribeAddon(s)`, `ListInsights`, `DescribeInsight` | aws-api-mcp `call_aws` + eks-mcp (including `get_eks_insights`) | `*` + `aws:RequestedRegion` (dynamic cluster names) |
 | EC2ReadAccess | `ec2:DescribeInstances` | Compute Optimizer EC2 dependent read | `*` + `aws:RequestedRegion` (EC2 describes have no resource type) |
 | ECRImageAccess | `ecr:BatchGetImage`, `GetDownloadUrlForLayer`, `BatchCheckLayerAvailability` | container-mode image pull | `repository/bedrock-agentcore-gameagentruntime` |
@@ -694,10 +694,13 @@ Reference, or that address a global endpoint:*
 and account-owned, constrained instead by an `aws:RequestedRegion` condition to
 the deployment region:*
 
-- **GameLift** `DescribeContainerFleet`, `DescribeContainerGroupDefinition`, and
-  `DescribeScalingPolicies` support ARNs, but fleet/definition names are created
-  at runtime; the collection and capacity reads (`List*`, `DescribeFleetCapacity`,
-  `DescribeFleetUtilization`) have no ARN scoping at all.
+- **GameLift** `DescribeContainerFleet`, `DescribeContainerGroupDefinition`,
+  `DescribeScalingPolicies`, and `DescribeFleetLocationAttributes` support ARNs,
+  but fleet/definition names are created at runtime; the collection and capacity
+  reads (`List*`, `DescribeFleetCapacity`, `DescribeFleetUtilization`,
+  `DescribeGameSessionQueues`) are account-wide reads. The two migration
+  discovery reads (`DescribeGameSessionQueues`, `DescribeFleetLocationAttributes`,
+  #529) are read-only and add no write permission.
 - **EKS** per-resource reads support an ARN of the matching resource type
   (`DescribeCluster` a `cluster*` ARN; `DescribeNodegroup`, `DescribeFargateProfile`,
   and `DescribeAddon` their nodegroup, fargateprofile, and addon ARNs), but those

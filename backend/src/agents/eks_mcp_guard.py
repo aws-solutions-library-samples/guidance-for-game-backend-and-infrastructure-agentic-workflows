@@ -946,8 +946,17 @@ _EKS_TEXT_TOOLS = frozenset({"search_eks_troubleshoot_guide"})
 _EKS_ALLOWED = frozenset(_EKS_TOOL_PROJECTORS) | _EKS_TEXT_TOOLS
 
 # Now that the allowlist exists, fix up the loggable-operation set (EKS read
-# tools plus the single guarded aws-api tool).
-_LOGGABLE_OPS = _EKS_ALLOWED | frozenset({"call_aws"})
+# tools, the single guarded aws-api tool, and the code-owned Agones inventory).
+AGONES_INVENTORY_TOOL = "get_agones_inventory"
+_LOGGABLE_OPS = _EKS_ALLOWED | frozenset({"call_aws", AGONES_INVENTORY_TOOL})
+
+# The Agones inventory (agents/agones_discovery.py) reads through these two
+# delegate tools with code-owned, pinned inputs. ``manage_k8s_resource`` stays
+# OFF the model-facing allowlist: the model can never invoke it or choose its
+# operation, kind, or body.
+_AGONES_LIST_DELEGATE = "list_k8s_resources"
+_AGONES_READ_DELEGATE = "manage_k8s_resource"
+_AGONES_VERSIONS_DELEGATE = "list_api_versions"  # already model-facing and read-only
 
 
 # --------------------------------------------------------------------------- #
@@ -1709,12 +1718,19 @@ def _classify_call_aws_entry(command: str, entry: Mapping[str, Any]) -> tuple[st
 # Bounded delegate streaming with a deadline                                  #
 # --------------------------------------------------------------------------- #
 async def _drain_final_result(
-    delegate: AgentTool, tool_use: ToolUse, invocation_state: dict[str, Any], **kwargs: Any
+    delegate: AgentTool,
+    tool_use: ToolUse,
+    invocation_state: dict[str, Any],
+    *,
+    deadline_seconds: float | None = None,
+    **kwargs: Any,
 ) -> Mapping[str, Any] | None:
     """Stream the delegate and return only its final ToolResult mapping.
 
-    Bounded by DEADLINE_SECONDS. On timeout/cancel returns None so the caller
+    Bounded by DEADLINE_SECONDS, or by the smaller ``deadline_seconds`` when a
+    caller has less time left. On timeout/cancel returns None so the caller
     emits a typed unavailable outcome. Intermediate events are swallowed."""
+    timeout = DEADLINE_SECONDS if deadline_seconds is None else max(0.0, min(DEADLINE_SECONDS, deadline_seconds))
 
     async def _run() -> Mapping[str, Any] | None:
         final: Mapping[str, Any] | None = None
@@ -1740,7 +1756,7 @@ async def _drain_final_result(
     # typed code is logged. CancelledError (a BaseException, not Exception) still
     # propagates.
     try:
-        return await asyncio.wait_for(_run(), timeout=DEADLINE_SECONDS)
+        return await asyncio.wait_for(_run(), timeout=timeout)
     except asyncio.TimeoutError:
         return None
     except asyncio.CancelledError:
@@ -2161,11 +2177,21 @@ class EksMcpGuardedProvider(_GuardedProviderBase):
     async def load_tools(self, **kwargs: Any) -> Sequence[AgentTool]:
         tools = await self._delegate.load_tools(**kwargs)
         guarded: list[AgentTool] = []
+        by_name: dict[str, AgentTool] = {}
         for tool in tools:
+            by_name.setdefault(tool.tool_name, tool)
             if tool.tool_name in _EKS_ALLOWED:
                 guarded.append(_EksProjectedTool(tool))
             else:
                 logger.debug("eks_guard drop server=eks op=other")
+        list_delegate = by_name.get(_AGONES_LIST_DELEGATE)
+        read_delegate = by_name.get(_AGONES_READ_DELEGATE)
+        if list_delegate is not None and read_delegate is not None:
+            # Imported here: agones_discovery builds on this module's helpers.
+            # Local modules
+            from agents.agones_discovery import AgonesInventoryTool
+
+            guarded.append(AgonesInventoryTool(list_delegate, read_delegate, by_name.get(_AGONES_VERSIONS_DELEGATE)))
         return guarded
 
 

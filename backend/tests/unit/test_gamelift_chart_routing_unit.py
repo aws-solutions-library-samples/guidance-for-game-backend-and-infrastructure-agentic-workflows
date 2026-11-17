@@ -5,7 +5,7 @@ not silently break the two downstream contracts the GameLift specialist
 participates in:
 
 1. **Routing / registration.** The orchestrator routes to ``gamelift_agent`` and
-   the specialist exposes exactly four tools whose names and callables the
+   the specialist exposes exactly the registered tools whose names and callables the
    registration depends on. Renaming a tool, dropping one, or changing the
    projected operational field names would break routing and the model's ability
    to chart the result.
@@ -38,6 +38,20 @@ FLEET_B = "fleet-bbbb-0002"
 # ---------------------------------------------------------------------------
 # Routing / registration compatibility
 # ---------------------------------------------------------------------------
+# The exact runtime tool registration: the #464 fleet tools plus the #529
+# read-only migration discovery tools.
+_RUNTIME_TOOL_NAMES = (
+    "list_gamelift_fleets",
+    "get_fleet_utilization",
+    "get_fleet_capacity",
+    "get_scaling_policies",
+    "list_game_session_queues",
+    "get_fleet_locations",
+    "get_container_group_definition",
+    "get_container_fleet_ports",
+)
+
+
 class TestRoutingRegistrationCompatibility:
     def test_fake_factory_observes_exact_kwargs_passed_to_the_call(self):
         # Inject a fake agent_factory and assert on the ACTUAL call_args the
@@ -56,9 +70,9 @@ class TestRoutingRegistrationCompatibility:
         assert kwargs["service_name"] == "GameLift"
         registered = kwargs["additional_tools"]
         names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
-        for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
+        for name in _RUNTIME_TOOL_NAMES:
             assert name in names, f"{name} missing from the tools passed to the factory"
-        assert len(registered) == 4
+        assert len(registered) == len(_RUNTIME_TOOL_NAMES)
         # The canonical collection is what the runtime is built from.
         assert kwargs["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
 
@@ -75,7 +89,7 @@ class TestRoutingRegistrationCompatibility:
 
         _, kwargs = fake_factory.call_args
         observed = kwargs["additional_tools"]
-        assert len(observed) == 3
+        assert len(observed) == len(_RUNTIME_TOOL_NAMES) - 1
         dropped_name = getattr(
             gls.GAMELIFT_AGENT_TOOLS[-1], "__name__", getattr(gls.GAMELIFT_AGENT_TOOLS[-1], "tool_name", None)
         )
@@ -85,7 +99,7 @@ class TestRoutingRegistrationCompatibility:
     def test_production_build_uses_real_create_specialist_agent(self):
         # Production must default to the REAL factory. Patch it and confirm the
         # default build path (no injected factory) calls create_specialist_agent
-        # with the four canonical tools.
+        # with the canonical tools.
         # Local modules
         import agents.gamelift_specialist as gls
 
@@ -98,7 +112,7 @@ class TestRoutingRegistrationCompatibility:
         assert kwargs["service_name"] == "GameLift"
         assert kwargs["additional_tools"] == gls.GAMELIFT_AGENT_TOOLS
 
-    def test_registration_collection_holds_the_four_runtime_tools(self):
+    def test_registration_collection_holds_the_runtime_tools(self):
         # Model access is controlled by the exact tool collection passed to
         # create_specialist_agent, NOT by __all__.
         # Local modules
@@ -106,9 +120,9 @@ class TestRoutingRegistrationCompatibility:
 
         registered = gls.GAMELIFT_AGENT_TOOLS
         names = {getattr(t, "__name__", getattr(t, "tool_name", None)) for t in registered}
-        for name in ("list_gamelift_fleets", "get_fleet_utilization", "get_fleet_capacity", "get_scaling_policies"):
+        for name in _RUNTIME_TOOL_NAMES:
             assert name in names, f"{name} missing from GAMELIFT_AGENT_TOOLS (runtime registration contract)"
-        assert len(registered) == 4
+        assert len(registered) == len(_RUNTIME_TOOL_NAMES)
 
     def test_projected_field_names_the_router_and_charts_depend_on_are_stable(self):
         # These operational field names are the axis/series source for charts and
