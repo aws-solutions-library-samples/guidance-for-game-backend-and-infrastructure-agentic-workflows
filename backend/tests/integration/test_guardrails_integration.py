@@ -31,8 +31,9 @@ pytestmark = [
     pytest.mark.skipif(
         not GUARDRAIL_CONFIGURED,
         reason=(
-            "No guardrail configured: set GBAW_BEDROCK_GUARDRAIL_ID (GBAW_BEDROCK_GUARDRAIL_VERSION defaults to "
-            "DRAFT) and leave GBAW_BEDROCK_GUARDRAIL_ENABLED on; otherwise the orchestrator runs unguarded"
+            "No guardrail configured: set GBAW_BEDROCK_GUARDRAIL_ID and GBAW_BEDROCK_GUARDRAIL_VERSION (the "
+            "Guardrails stack's GuardrailVersion output; unset means DRAFT, the working copy the deployed runtime "
+            "does not use) and leave GBAW_BEDROCK_GUARDRAIL_ENABLED on; otherwise the orchestrator runs unguarded"
         ),
     ),
 ]

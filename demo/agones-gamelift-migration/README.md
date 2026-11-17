@@ -114,6 +114,16 @@ aws cloudformation deploy --stack-name "$CLUSTER_NAME-operator-role" \
   --tags demo=agones-gamelift-migration owner="$OWNER"
 ```
 
+In an account that has never run an EKS managed node group, also create the
+node group service-linked role once, with the same credentials. The operator
+role cannot check for it before it exists, so `cluster-up` would otherwise fail
+at the node group (#773). If the role already exists, the command reports that
+the name "has been taken in this account"; that is fine.
+
+```bash
+aws iam create-service-linked-role --aws-service-name eks-nodegroup.amazonaws.com
+```
+
 The stack creates the `<cluster>-operator` role and the
 `<cluster>-workload-boundary` policy. Every role the environment creates
 (the EKS cluster and node roles, and each GameLift fleet role) must carry that

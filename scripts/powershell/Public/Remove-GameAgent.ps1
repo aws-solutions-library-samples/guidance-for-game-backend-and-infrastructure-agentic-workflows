@@ -231,6 +231,12 @@ function Remove-GameAgent {
     Remove-Stack "$ProjectName-infrastructure"
     Write-Host ''
 
+    # ── Step 5c: Solution ID tracking stack ──
+    # Mirrors Step 5c in scripts/teardown.sh.
+    Write-GameAgentStatus 'Step 5c: Deleting Solution ID tracking stack...' -Type Info
+    Remove-Stack "$ProjectName-solution-tracking"
+    Write-Host ''
+
     # ── Step 6: KB docs cleanup ──
     Write-GameAgentStatus 'Step 6: Cleaning up downloaded documentation...' -Type Info
     $kbSourcesDir = Join-Path $repoRoot 'docs/kb-sources'

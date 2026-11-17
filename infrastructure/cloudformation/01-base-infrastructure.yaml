@@ -141,9 +141,11 @@ Resources:
         AccessToken: minutes
         IdToken: minutes
         RefreshToken: hours
+      # The UI signs in with SRP (amazon-cognito-identity-js authenticateUser)
+      # and refreshes with REFRESH_TOKEN_AUTH. Nothing sends a clear password
+      # through USER_PASSWORD_AUTH, so that flow stays off (#485).
       ExplicitAuthFlows:
         - ALLOW_USER_SRP_AUTH
-        - ALLOW_USER_PASSWORD_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
       PreventUserExistenceErrors: ENABLED
 

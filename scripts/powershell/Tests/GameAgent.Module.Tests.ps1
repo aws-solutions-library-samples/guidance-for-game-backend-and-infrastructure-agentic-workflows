@@ -55,6 +55,7 @@ Describe 'GameAgent Module' {
             'Invoke-GameAgentPlatformVersion'
             'ConvertTo-GameAgentFrontendUrl'
             'ConvertTo-GameAgentEksDiscoveryClusters'
+            'Initialize-GameAgentServiceLinkedRole'
         )
         $exported = (Get-Module -Name GameAgent).ExportedCommands.Keys
         foreach ($fn in $privateFunctions) {

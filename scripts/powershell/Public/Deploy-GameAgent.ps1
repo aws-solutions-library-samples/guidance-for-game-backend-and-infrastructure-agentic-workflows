@@ -234,6 +234,15 @@ function Deploy-GameAgent {
     Invoke-GameAgentKBDocDownload -Region $Region -ProfileArgs $profileArgs
     Write-Host ''
 
+    # ── Step 0.5: Solution ID tracking stack (AWS Guidance deployment metrics) ──
+    # Mirrors Step 0.5 in scripts/deploy.sh. The stack description carries the
+    # Guidance ID, so a PowerShell deployment is counted like a bash one.
+    Write-GameAgentStatus 'Step 0.5: Deploying Solution ID tracking stack...' -Type Info
+    Deploy-Stack -StackName "$ProjectName-solution-tracking" `
+        -TemplateFile (Join-Path $infraPath '00-solution-tracking.yaml')
+    Write-GameAgentStatus 'Solution tracking deployed (SO9693)' -Type Success
+    Write-Host ''
+
     # ── Step 1: Base infrastructure ──
     Write-GameAgentStatus 'Step 1: Deploying base infrastructure...' -Type Info
 
@@ -345,12 +354,28 @@ function Deploy-GameAgent {
 
     # ── Step 1.5: Guardrails ──
     Write-GameAgentStatus 'Step 1.5: Deploying Bedrock Guardrails...' -Type Info
+    # SHA-256 of the template with line endings normalized to LF, matching
+    # deploy.sh. A template change publishes a new Guardrail version (#782).
+    $guardrailTemplate = Join-Path $infraPath '04-bedrock-guardrails.yaml'
+    $guardrailTemplateText = [System.IO.File]::ReadAllText($guardrailTemplate) -replace "`r", ''
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $guardrailHash = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($guardrailTemplateText))
+    } finally {
+        $sha256.Dispose()
+    }
+    $guardrailPolicyFingerprint = ([System.BitConverter]::ToString($guardrailHash) -replace '-', '').ToLowerInvariant()
     Deploy-Stack -StackName "$ProjectName-guardrails" `
-        -TemplateFile (Join-Path $infraPath '04-bedrock-guardrails.yaml') `
-        -Params @("ProjectName=$ProjectName")
+        -TemplateFile $guardrailTemplate `
+        -Params @("ProjectName=$ProjectName", "GuardrailPolicyFingerprint=$guardrailPolicyFingerprint")
 
     $guardrailId = Get-StackOutput "$ProjectName-guardrails" 'GuardrailId'
-    Write-GameAgentStatus "Guardrails deployed: $guardrailId" -Type Success
+    # The runtime pins the published version, never the mutable DRAFT.
+    $guardrailVersion = Get-StackOutput "$ProjectName-guardrails" 'GuardrailVersion'
+    if ($guardrailId -and $guardrailId -ne 'None' -and $guardrailVersion -notmatch '^[1-9][0-9]*$') {
+        throw "Guardrails stack output GuardrailVersion='$guardrailVersion' is not a published version number; refusing to fall back to DRAFT."
+    }
+    Write-GameAgentStatus "Guardrails deployed: $guardrailId (version $guardrailVersion)" -Type Success
     Write-Host ''
 
     # ── Step 1.6: Managed Prompts ──
@@ -427,6 +452,7 @@ function Deploy-GameAgent {
             -OrchestratorModelId $orchestratorModelId `
             -SpecialistModelId $specialistModelId `
             -GuardrailId $guardrailId `
+            -GuardrailVersion $guardrailVersion `
             -OrchestratorPromptArn $orchestratorPromptArn `
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
@@ -562,6 +588,7 @@ function Deploy-GameAgent {
             -OrchestratorModelId $orchestratorModelId `
             -SpecialistModelId $specialistModelId `
             -GuardrailId $guardrailId `
+            -GuardrailVersion $guardrailVersion `
             -OrchestratorPromptArn $orchestratorPromptArn `
             -GameLiftPromptArn $gameliftPromptArn `
             -EksPromptArn $eksPromptArn `
@@ -658,6 +685,18 @@ function Deploy-GameAgent {
 
         # Step 7: Deploy frontend
         Write-GameAgentStatus 'Step 7: Deploying frontend...' -Type Info
+        # ECS creates its service-linked role on first use. In an account that
+        # has never used ECS, the new role is not yet usable when ECS Express
+        # assumes it, and the frontend stack fails and rolls back (#772). Create
+        # it first and let it propagate; a failure throws before the stack deploy.
+        $invokeAwsForIam = New-GameAgentAwsInvoker -ProfileArgs $profileArgs -Label 'AWS IAM command'
+        Initialize-GameAgentServiceLinkedRole `
+            -ServiceName 'ecs.amazonaws.com' `
+            -RoleName 'AWSServiceRoleForECS' `
+            -Region $Region `
+            -InvokeAws $invokeAwsForIam `
+            -PropagationSeconds $env:GBAW_SLR_PROPAGATION_SECONDS `
+            -PollSeconds $env:GBAW_SLR_POLL_SECONDS
         Deploy-Stack -StackName "$ProjectName-frontend" `
             -TemplateFile (Join-Path $infraPath '02-frontend-ecs-express.yaml') `
             -Params @(

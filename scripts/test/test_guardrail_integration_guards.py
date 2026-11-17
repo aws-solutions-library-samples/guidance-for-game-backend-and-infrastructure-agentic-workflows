@@ -74,6 +74,13 @@ class GuardrailIntegrationGuardTests(unittest.TestCase):
         self.assertIsNotNone(reason, "the skip must explain how to configure the guardrail")
         self.assertIn("GBAW_BEDROCK_GUARDRAIL_ID", ast.unparse(reason))
 
+    def test_corpus_test_assumes_no_guardrail_version(self) -> None:
+        # The deployed runtime pins a published version (#782); a DRAFT default
+        # would evaluate a policy users never see.
+        corpus = (MODULE.parent / "test_guardrail_corpus_cloud.py").read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("GBAW_BEDROCK_GUARDRAIL_VERSION", "")', corpus)
+        self.assertNotIn('"GBAW_BEDROCK_GUARDRAIL_VERSION", "DRAFT"', corpus)
+
     def test_no_assertion_mentions_the_reply(self) -> None:
         asserts = [node for node in ast.walk(self.tree) if isinstance(node, ast.Assert)]
         self.assertTrue(asserts, "expected assertions in the module")

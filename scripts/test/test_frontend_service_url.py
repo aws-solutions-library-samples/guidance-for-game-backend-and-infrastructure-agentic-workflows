@@ -55,6 +55,7 @@ if [ "$1 $2" = "cloudformation describe-stacks" ]; then
         *StackStatus*) printf '%s\\n' CREATE_COMPLETE ;;
         *UserPoolId*) printf '%s\\n' us-west-2_EXAMPLE ;;
         *GuardrailId*) printf '%s\\n' gr-example0000 ;;
+        *GuardrailVersion*) printf '%s\\n' 1 ;;
         *) printf '%s\\n' None ;;
     esac
     exit 0

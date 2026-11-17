@@ -460,7 +460,7 @@ npm run test:e2e:smoke      # Smoke tests only
 
 The solution integrates with Amazon CloudWatch and AWS X-Ray for monitoring and distributed tracing. Tracing covers the AgentCore runtime. The Next.js frontend writes logs to CloudWatch but exports no traces.
 
-- **CloudWatch Logs**: Structured JSON logs from all components (14-day retention for application logs, 90-day for audit logs)
+- **CloudWatch Logs**: The AgentCore runtime and the Next.js frontend write plain-text log lines to stdout, which land in CloudWatch Logs; only the AgentCore SDK's own request records are JSON. Deployment sets 14-day retention on the runtime, ADOT, frontend, and AgentCore Memory log groups when they have none, and keeps any existing policy. The CloudTrail log group and the optional source-control connector's audit log group keep 90 days by default
 - **AWS X-Ray**: Distributed tracing for each request inside the AgentCore runtime, covering the orchestrator, the specialist agents, and their model and tool calls
 - **OpenTelemetry**: The AgentCore runtime exports traces and metrics through ADOT (AWS Distro for OpenTelemetry); the frontend has no OpenTelemetry instrumentation
 

@@ -74,10 +74,11 @@ Search consumer. `scripts/infrastructure/setup-account-observability.sh` (and th
   All reads and input validation happen before the first write, and both shells
   check the AWS CLI exit status on every shared mutation: a failed write stops
   the opt-in with a bounded, public-safe diagnostic (operation name and error
-  code only) rather than reporting success. Because a first-time API enable does
-  not create the AWS-reserved `aws/spans` log group (only the console or a
-  destination toggle does), the opt-in fails with the one-time manual step rather
-  than reporting success when `aws/spans` is still absent after the enable.
+  code only) rather than reporting success. A first-time API enable normally
+  creates the AWS-reserved `aws/spans` log group, but that is not guaranteed.
+  As a safety net, the opt-in fails with the one-time console or toggle step
+  rather than reporting success when `aws/spans` is still absent after the
+  enable.
 
 ## Runtime trace delivery is verified
 
