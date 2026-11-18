@@ -1,9 +1,10 @@
 # Multi-stage build for Next.js frontend
 FROM node:24-alpine AS base
-# Take Alpine's zlib security fixes before the upstream node image picks them
-# up (#767: CVE-2026-4738, fixed in zlib 1.4-r0). Once the base image ships a
-# current zlib, this upgrade changes nothing.
-RUN apk upgrade --no-cache zlib
+# Take Alpine's zlib and openssl security fixes before the upstream node image
+# picks them up (#767: CVE-2026-4738; #797: CVE-2026-95692, CVE-2026-107496,
+# CVE-2026-95691, CVE-2026-88823 in libcrypto3/libssl3).
+# Once the base image ships patched packages these upgrades become no-ops.
+RUN apk upgrade --no-cache zlib openssl
 
 # Install dependencies only when needed
 FROM base AS deps
