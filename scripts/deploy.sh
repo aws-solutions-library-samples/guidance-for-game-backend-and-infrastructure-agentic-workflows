@@ -1411,6 +1411,16 @@ GAMELIFT_KB_ID=$(grep "^GBAW_GAMELIFT_KB_ID=" "$PROJECT_ROOT/backend/.env.local"
 EKS_KB_ID=$(grep "^GBAW_EKS_KB_ID=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 COST_KB_ID=$(grep "^GBAW_COST_KB_ID=" "$PROJECT_ROOT/backend/.env.local" 2>/dev/null | cut -d'=' -f2 || echo "")
 
+# ECS creates its service-linked role on first use. In an account that has never
+# used ECS, the new role is not yet usable when ECS Express assumes it, and the
+# frontend stack fails and rolls back (#772). Create it first and let it
+# propagate; any failure stops the deployment before the stack is touched.
+if ! AWS_REGION="$AWS_REGION" \
+  bash "$SCRIPT_DIR/infrastructure/ensure-service-linked-role.sh" ecs.amazonaws.com AWSServiceRoleForECS; then
+  echo "❌ The ECS service-linked role is not ready; the frontend was not deployed."
+  exit 1
+fi
+
 aws cloudformation deploy \
   --template-file "$PROJECT_ROOT/infrastructure/cloudformation/02-frontend-ecs-express.yaml" \
   --stack-name "${PROJECT_NAME}-frontend" \
