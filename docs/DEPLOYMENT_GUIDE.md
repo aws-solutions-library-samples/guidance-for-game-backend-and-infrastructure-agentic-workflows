@@ -28,6 +28,7 @@ Your AWS account needs the following:
 - **Service Quotas**: Default quotas are sufficient for most deployments
 - **IAM Permissions**: Administrator access (or equivalent) for initial deployment
 - **ECS service-linked role**: In an account that has never used Amazon ECS, the frontend step (Step 7) creates the AWS-managed `AWSServiceRoleForECS` service-linked role when it is missing, then waits for it to propagate before deploying the frontend stack (`GBAW_SLR_PROPAGATION_SECONDS`, default 15, range 0-120). An existing role is left unchanged. The deploying identity needs `iam:GetRole` and `iam:CreateServiceLinkedRole`; if it cannot read the role, the deployment stops before the frontend stack and prints the one-time `aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com` command.
+- **VPC Block Public Access** (frontend only): the frontend runs in the default VPC's public subnets behind an internet-facing Application Load Balancer, so it needs internet access in both directions. If VPC Block Public Access is enabled in the target Region (`block-ingress` or `block-bidirectional`), ask the account owner to add an exclusion for that VPC or its subnets before deploying. Otherwise the frontend tasks cannot pull their image, and users cannot reach the load balancer (#775). Check with `aws ec2 describe-vpc-block-public-access-options --region <region>`. The deployment never changes this setting.
 
 ### Enable Bedrock Models
 
